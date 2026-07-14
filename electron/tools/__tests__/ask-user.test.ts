@@ -111,4 +111,15 @@ describe('createAskUserTool headless fallback', () => {
     expect(result).toEqual({ success: true, answers: { Env: 'prod' } });
     expect(listAlerts(appHome)).toHaveLength(0);
   });
+
+  it('does not spawn a duplicate alert for the same conversation + question (loop guard)', async () => {
+    const tool = createAskUserTool(appHome);
+    const r1 = (await tool.execute!({ questions: [q] }, headlessCtx('tc-d1', 'conv-9'))) as Record<string, unknown>;
+    const r2 = (await tool.execute!({ questions: [q] }, headlessCtx('tc-d2', 'conv-9'))) as Record<string, unknown>;
+    expect(r1.suspended).toBe(true);
+    expect(r2.suspended).toBe(true);
+    // Same alert reused, only one created.
+    expect(r2.alertId).toBe(r1.alertId);
+    expect(listAlerts(appHome)).toHaveLength(1);
+  });
 });

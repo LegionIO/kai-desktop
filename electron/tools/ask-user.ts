@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
-import { createAlert, type AlertQuestion } from '../ipc/alert-store.js';
+import { createAlert, listAlerts, type AlertQuestion } from '../ipc/alert-store.js';
 import { notifyAlertCreated } from '../ipc/alert-notify.js';
 
 /**
@@ -78,9 +78,23 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
         if (context.isHeadless && appHome && context.conversationId) {
           const questions = (input as { questions?: AlertQuestion[] }).questions ?? [];
           const first = questions[0]?.question ?? 'A question';
+          const title = first.length > 80 ? `${first.slice(0, 77)}…` : first;
+          // Loop guard: if this run already has an open question alert with the
+          // same title in this conversation, don't spawn another — a model that
+          // keeps calling ask_user after suspending shouldn't flood the tab.
+          const dup = listAlerts(appHome, true).find(
+            (a) => a.kind === 'question' && a.conversationId === context.conversationId && a.title === title,
+          );
+          if (dup) {
+            return {
+              suspended: true,
+              alertId: dup.id,
+              note: 'An alert with this question is already open and awaiting the user. End your turn.',
+            };
+          }
           const alert = createAlert(appHome, {
             kind: 'question',
-            title: first.length > 80 ? `${first.slice(0, 77)}…` : first,
+            title,
             body: questions.map((q) => `• ${q.question}`).join('\n'),
             conversationId: context.conversationId,
             questions,

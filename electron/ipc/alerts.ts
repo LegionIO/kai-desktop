@@ -19,10 +19,12 @@ import {
   listAlerts,
   openAlertCount,
   resolveAlert,
+  reopenAlert,
   dismissAlert,
   type Alert,
   type CreateAlertInput,
 } from './alert-store.js';
+import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
@@ -127,10 +129,18 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
   return trimmed ? `${base}\nNote from the user: ${trimmed}` : base;
 }
 
-/** Append the user's response into the originating conversation and re-run the agent. */
+/** Append the user's response into the originating conversation and re-run the
+ *  agent. If the resume fails (conversation gone/busy), RE-OPEN the alert so the
+ *  user's answer isn't silently lost and they can retry. */
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
-  await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
+  try {
+    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
+  } catch (err) {
+    const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
+    if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
+    throw err;
+  }
 }
 
 export function registerAlertsHandlers(ipcMain: IpcMain): void {
@@ -161,6 +171,12 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
     if (existing.kind !== 'question') {
       return { ok: false, error: `alert ${id} is a "${existing.kind}", not a question` };
     }
+    // The answer resumes by re-injecting into the originating conversation; if
+    // that conversation no longer exists on disk (e.g. an ad-hoc plugin run's
+    // synthetic id), resuming is impossible — don't resolve into a lost answer.
+    if (!readConversation(deps.appHome, existing.conversationId)) {
+      return { ok: false, error: 'the conversation this alert belongs to no longer exists' };
+    }
     const resolved = resolveAlert(deps.appHome, id, clean);
     if (!resolved) return { ok: false, error: 'alert not open' };
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
@@ -184,6 +200,9 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
     if (!existing) return { ok: false, error: 'alert not found' };
     if (existing.kind !== 'approval') {
       return { ok: false, error: `alert ${id} is a "${existing.kind}", not an approval` };
+    }
+    if (!readConversation(deps.appHome, existing.conversationId)) {
+      return { ok: false, error: 'the conversation this alert belongs to no longer exists' };
     }
     const resolved = resolveAlert(deps.appHome, id, decision);
     if (!resolved) return { ok: false, error: 'alert not open' };

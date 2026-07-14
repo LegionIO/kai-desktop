@@ -216,6 +216,18 @@ export function resolveAlert(
   return persist(appHome, updated);
 }
 
+/** Re-open an answered alert (used when resuming the conversation failed, so the
+ *  user's answer isn't lost and they can retry). Clears the recorded answer.
+ *  Returns the updated alert, or null if it doesn't exist / isn't answered. */
+export function reopenAlert(appHome: string, id: string): Alert | null {
+  const alert = readAlert(appHome, id);
+  if (!alert || alert.status !== 'answered') return null;
+  const updated: Alert = { ...alert, status: 'open' };
+  delete updated.answer;
+  delete updated.answeredAt;
+  return persist(appHome, updated);
+}
+
 /** Dismiss an alert (fyi, or a question/approval the user chooses to drop).
  *  Returns the updated alert, or null if it doesn't exist. */
 export function dismissAlert(appHome: string, id: string): Alert | null {

@@ -8,6 +8,7 @@ import {
   listAlerts,
   openAlertCount,
   resolveAlert,
+  reopenAlert,
   dismissAlert,
   readAlertIndex,
 } from '../alert-store';
@@ -105,6 +106,22 @@ describe('alert-store', () => {
       approvalAction: 'deploy to prod',
     });
     expect(resolveAlert(appHome, a.id, 'approve')?.answer).toBe('approve');
+  });
+
+  it('reopenAlert restores an answered alert to open and clears the answer (retry after failed resume)', () => {
+    const a = q();
+    resolveAlert(appHome, a.id, { Region: 'us-east' });
+    const reopened = reopenAlert(appHome, a.id);
+    expect(reopened?.status).toBe('open');
+    expect(reopened?.answer).toBeUndefined();
+    expect(reopened?.answeredAt).toBeUndefined();
+    // index reflects it as open again + counted
+    expect(readAlertIndex(appHome).alerts[a.id].status).toBe('open');
+    expect(openAlertCount(appHome)).toBe(1);
+    // only answered alerts can be reopened
+    expect(reopenAlert(appHome, a.id)).toBeNull(); // already open
+    dismissAlert(appHome, a.id);
+    expect(reopenAlert(appHome, a.id)).toBeNull(); // dismissed, not answered
   });
 
   it('resolveAlert returns null for a non-open or missing alert', () => {
