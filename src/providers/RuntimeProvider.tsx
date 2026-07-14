@@ -1959,7 +1959,41 @@ export function RuntimeProvider({
 
       const acc = streamAccumulators.get(convId)!;
 
-      if (e.type === 'tool-call' || e.type === 'tool-result' || e.type === 'tool-compaction') {
+      if (e.type === 'user-message') {
+        // A user turn submitted into THIS conversation by ANOTHER client (the
+        // `kai` CLI via agent:submit, or a second GUI window). Insert it into the
+        // accumulator so it renders IMMEDIATELY, instead of only appearing when
+        // the server-persisted tree reloads at `done` (the reported bug: a
+        // CLI-driven prompt didn't show on the co-viewing GUI until the response
+        // finished). Our OWN submissions are already in the tree locally, so
+        // dedup against the last user turn's text (mirrors the sub-agent path).
+        const msgText = e.text ?? '';
+        if (msgText) {
+          const branch = getActiveBranch(acc.messages, acc.headId);
+          const last = branch[branch.length - 1];
+          const lastIsUser = last?.role === 'user';
+          const lastContent = lastIsUser && Array.isArray(last.content) ? last.content : [];
+          const lastText = lastContent.find((p: unknown) => (p as { type?: string }).type === 'text') as
+            | { text?: string }
+            | undefined;
+          const isDuplicate = lastIsUser && lastText?.text === msgText;
+          if (!isDuplicate) {
+            const userMsg: StoredMessage = {
+              id: msgId(),
+              parentId: acc.headId,
+              role: 'user',
+              content: toStoredContent([{ type: 'text', text: msgText }]),
+              createdAt: new Date(),
+            };
+            acc.messages.push(userMsg);
+            acc.headId = userMsg.id;
+          }
+        }
+        // Falls through to the shared setTree/setHeadId flush at the end of the
+        // handler, so the inserted user turn renders immediately for the active
+        // conversation. Not persisted here — the main process owns the
+        // server-persisted tree for a CLI/agent:submit turn.
+      } else if (e.type === 'tool-call' || e.type === 'tool-result' || e.type === 'tool-compaction') {
         logRuntimeToolDebug('stream-event', {
           conversationId: convId,
           eventType: e.type,
