@@ -157,4 +157,37 @@ describe('deepSanitizeMessages', () => {
     ];
     expect(deepSanitizeMessages(msgs)).toBe(msgs);
   });
+
+  it('does not crash on null / non-object message entries', () => {
+    const msgs = [null, 42, 'x', { role: 'assistant', content: 'a', providerMetadata: { m: 1 } }];
+    const out = deepSanitizeMessages(msgs) as Array<Record<string, unknown> | unknown>;
+    expect(out[0]).toBeNull();
+    expect((out[3] as Record<string, unknown>).providerMetadata).toBeUndefined();
+    const out2 = sanitizeMessagesForModel(msgs, 'target') as Array<Record<string, unknown> | unknown>;
+    expect(out2[0]).toBeNull();
+  });
+});
+
+describe('stripDisplayOnlyParts empty-content guard', () => {
+  it('keeps the original message when stripping displayOnly would leave no content', () => {
+    const msgs = [{ role: 'user', content: [{ type: 'file', displayOnly: true, name: 'x.json' }] }];
+    const out = stripDisplayOnlyParts(msgs);
+    expect(out).toBe(msgs); // unchanged reference — turn preserved, no content: []
+  });
+
+  it('still strips displayOnly when a sibling part remains', () => {
+    const msgs = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'inlined content' },
+          { type: 'file', displayOnly: true, name: 'x.json' },
+        ],
+      },
+    ];
+    const out = stripDisplayOnlyParts(msgs) as Array<Record<string, unknown>>;
+    expect(out).not.toBe(msgs);
+    expect((out[0].content as unknown[]).length).toBe(1);
+    expect((out[0].content as Array<Record<string, unknown>>)[0].type).toBe('text');
+  });
 });

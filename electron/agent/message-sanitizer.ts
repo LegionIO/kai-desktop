@@ -68,6 +68,7 @@ export function sanitizeMessagesForModel(messages: unknown[], targetModelId: str
   let changed = false;
   const result = messages.map((rawMsg) => {
     const msg = rawMsg as MessageLike;
+    if (!msg || typeof msg !== 'object') return rawMsg;
     if (msg.role !== 'assistant') return rawMsg;
 
     const sourceModel = msg.messageMeta?.sourceModel as string | undefined;
@@ -99,6 +100,10 @@ export function stripDisplayOnlyParts(messages: unknown[]): unknown[] {
       (p) => !(p && typeof p === 'object' && p.type === 'file' && p.displayOnly === true),
     );
     if (filtered.length === msg.content.length) return rawMsg;
+    // Guard: if stripping the displayOnly part(s) would leave the message with NO
+    // content, the expected inline sibling text is missing. Emitting `content: []`
+    // loses the turn and some providers reject it — keep the original instead.
+    if (filtered.length === 0) return rawMsg;
 
     changed = true;
     return { ...msg, content: filtered };
@@ -115,6 +120,7 @@ export function deepSanitizeMessages(messages: unknown[]): unknown[] {
   let changed = false;
   const result = messages.map((rawMsg) => {
     const msg = rawMsg as MessageLike;
+    if (!msg || typeof msg !== 'object') return rawMsg;
     const cleaned = sanitizeMessage(msg);
     if (cleaned === msg) return rawMsg;
 
