@@ -16,6 +16,7 @@ import {
 import { createModelSwitchTool } from './model-switch.js';
 import { createEnterPlanModeTool, createExitPlanModeTool } from './plan-mode.js';
 import { createAskUserTool } from './ask-user.js';
+import { createRequestReviewTool } from './request_review.js';
 import { createSubAgentTool } from './sub-agent.js';
 import { loadSkillsAsTools } from './skill-loader.js';
 import { createSkillManageTool } from './skill-manage.js';
@@ -221,6 +222,7 @@ export async function buildToolRegistry(
     tools.push(createEnterPlanModeTool());
     tools.push(createExitPlanModeTool());
     tools.push(createAskUserTool());
+    tools.push(createRequestReviewTool(appHome));
   }
 
   // Sub-agent tool
