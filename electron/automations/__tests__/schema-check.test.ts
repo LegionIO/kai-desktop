@@ -54,6 +54,23 @@ describe('validateRulePaths', () => {
     ).toEqual([]);
   });
 
+  it('accepts wildcard "*" source without warnings (matches all sources)', () => {
+    // A "*" source has no single catalog entry; must not warn "not in catalog".
+    expect(
+      validateRulePaths(
+        rule({
+          trigger: { source: '*', event: '*' },
+          conditions: [{ path: 'anything.at.all', op: 'exists', value: '', caseSensitive: false }],
+        }),
+        catalog,
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts wildcard "*" event on a real source without warnings', () => {
+    expect(validateRulePaths(rule({ trigger: { source: 'plugin.teams', event: '*' } }), catalog)).toEqual([]);
+  });
+
   it('warns with suggestion for typo', () => {
     const w = validateRulePaths(
       rule({ conditions: [{ path: 'fromEmail', op: 'equals', value: 'x', caseSensitive: false }] }),

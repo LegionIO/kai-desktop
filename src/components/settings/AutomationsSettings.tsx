@@ -360,10 +360,15 @@ const RuleEditor: FC<{
           <select
             className={settingsSelectClass}
             value={rule.trigger.source}
-            onChange={(e) => onChange({ trigger: { source: e.target.value, event: '' } })}
+            onChange={(e) =>
+              onChange({ trigger: { source: e.target.value, event: e.target.value === '*' ? '*' : '' } })
+            }
           >
             <option value="">— select source —</option>
-            {!source && rule.trigger.source && <option value={rule.trigger.source}>{rule.trigger.source}</option>}
+            <option value="*">✳ All sources (*)</option>
+            {!source && rule.trigger.source && rule.trigger.source !== '*' && (
+              <option value={rule.trigger.source}>{rule.trigger.source}</option>
+            )}
             {catalog.map((c) => (
               <option key={c.source} value={c.source}>
                 {c.displayName}
@@ -376,7 +381,10 @@ const RuleEditor: FC<{
             onChange={(e) => onChange({ trigger: { ...rule.trigger, event: e.target.value } })}
           >
             <option value="">— select event —</option>
-            {!eventDesc && rule.trigger.event && <option value={rule.trigger.event}>{rule.trigger.event}</option>}
+            <option value="*">✳ All events (*)</option>
+            {!eventDesc && rule.trigger.event && rule.trigger.event !== '*' && (
+              <option value={rule.trigger.event}>{rule.trigger.event}</option>
+            )}
             {(source?.events ?? []).map((ev) => (
               <option key={ev.event} value={ev.event}>
                 {ev.title}
@@ -386,6 +394,15 @@ const RuleEditor: FC<{
         </div>
         {eventDesc?.description && (
           <span className="mt-0.5 block text-[10px] text-muted-foreground/60">{eventDesc.description}</span>
+        )}
+        {(rule.trigger.source === '*' || rule.trigger.event === '*') && (
+          <span className="mt-0.5 block text-[10px] text-muted-foreground/60">
+            {rule.trigger.source === '*' && rule.trigger.event === '*'
+              ? 'Matches every event from every source — use conditions to narrow what fires.'
+              : rule.trigger.source === '*'
+                ? `Matches "${rule.trigger.event}" from every source.`
+                : 'Matches every event from this source.'}
+          </span>
         )}
       </div>
 

@@ -50,6 +50,12 @@ function closestPath(target: string, candidates: string[]): string | undefined {
 export function validateRulePaths(rule: AutomationRule, catalog: SourceCatalogEntry[]): string[] {
   const warnings: string[] = [];
 
+  // Wildcard triggers ("*" source and/or "*" event) match across sources/events,
+  // so there is no single catalog entry (and no single payload schema) to validate
+  // against. The engine honors "*" (engine.ts); accept it and skip path checks —
+  // a wildcard payload is heterogeneous, so condition paths can't be verified.
+  if (rule.trigger.source === '*') return warnings;
+
   const source = catalog.find((c) => c.source === rule.trigger.source);
   if (!source) {
     warnings.push(
@@ -57,6 +63,8 @@ export function validateRulePaths(rule: AutomationRule, catalog: SourceCatalogEn
     );
     return warnings;
   }
+
+  if (rule.trigger.event === '*') return warnings;
 
   const eventDesc = source.events.find((e) => e.event === rule.trigger.event);
   if (!eventDesc) {
