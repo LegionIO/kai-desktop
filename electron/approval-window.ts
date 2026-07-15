@@ -31,15 +31,23 @@ function loadApprovalRoute(win: BrowserWindow, query: Record<string, string>): v
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   const rendererHtmlPath = join(import.meta.dirname, '../renderer/index.html');
 
+  // Swallow load rejections: a load can fail/abort (ERR_ABORTED) if the window
+  // is closed or navigated while loading — that must not surface as an unhandled
+  // promise rejection. The window is cleaned up via its 'closed' handler.
+  const onLoadErr = (err: unknown): void => {
+    if (!win.isDestroyed()) {
+      console.warn('[approval-window] failed to load route:', err instanceof Error ? err.message : err);
+    }
+  };
   if (rendererUrl) {
     const targetUrl = new URL(rendererUrl);
     for (const [key, value] of Object.entries(query)) {
       targetUrl.searchParams.set(key, value);
     }
-    void win.loadURL(targetUrl.toString());
+    win.loadURL(targetUrl.toString()).catch(onLoadErr);
     return;
   }
-  void win.loadFile(rendererHtmlPath, { query });
+  win.loadFile(rendererHtmlPath, { query }).catch(onLoadErr);
 }
 
 function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
@@ -113,7 +121,12 @@ export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindo
   });
 
   win.on('closed', () => {
-    approvalWindows.delete(request.approvalId);
+    // Identity-guard the delete: only clear the map entry if it still points at
+    // THIS window, so a late 'closed' from a replaced window can't evict a newer
+    // window registered under the same approvalId.
+    if (approvalWindows.get(request.approvalId) === win) {
+      approvalWindows.delete(request.approvalId);
+    }
   });
 
   approvalWindows.set(request.approvalId, win);
