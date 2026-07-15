@@ -2955,10 +2955,22 @@ export function RuntimeProvider({
     // Automation-owned stream: abort the automation run instead of cancelling an
     // interactive agent stream. The main process persists the partial output and
     // broadcasts a terminal `done` that the automation-done handler reconciles.
+    //
+    // A mid-turn-INJECTED automation run (busy-target inject) is owned by
+    // activeStreams/streamHandler, not automationRunAborts — so automations.abort
+    // returns false for it. Fall through to agent:cancel-stream in that case so
+    // an injected run is still cancellable from the stop button.
     if (automationStreams.has(convId)) {
       setIsRunning(false);
+      let aborted = false;
       try {
-        await app.automations.abort(convId);
+        aborted = await app.automations.abort(convId);
+      } catch {
+        /* ignore */
+      }
+      if (aborted) return;
+      try {
+        await app.agent.cancelStream(convId);
       } catch {
         /* ignore */
       }

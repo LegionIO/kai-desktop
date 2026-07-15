@@ -28,6 +28,7 @@ import {
   setWorkspaceToolDefinitions,
   getWorkspaceToolDefinitions,
   hasActiveStreams,
+  getInjectUserTurnAndRestart,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { resetStaleRunStatus } from './ipc/conversation-store.js';
@@ -1619,6 +1620,14 @@ if (gotSingleInstanceLock) {
       getRegisteredTools,
       getWorkspaceTools: getWorkspaceToolDefinitions,
       handlePluginAction: (payload: PluginActionPayload) => pluginManager.handleAction(payload),
+      // Busy-target mid-turn injection (registerAgentHandlers ran at startup, so
+      // the helper is bound by now). Read lazily so a null during early init
+      // simply falls back to divert.
+      injectUserTurnAndRestart: (conversationId: string, userText: string, o?: Record<string, unknown>) => {
+        const fn = getInjectUserTurnAndRestart();
+        if (!fn) return Promise.resolve({ ok: false, error: 'inject-unavailable' });
+        return fn(conversationId, userText, o as never);
+      },
     };
     const automationEngine = initializeAutomationEngine(automationDeps);
     registerAutomationsHandlers(ipcMain, automationEngine, eventBus);

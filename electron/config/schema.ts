@@ -754,6 +754,15 @@ const automationActionSchema = z.discriminatedUnion('type', [
     conversationTitle: z.string().optional(),
     conversationTarget: automationConversationTargetSchema.default({ type: 'per-invocation' }),
     includeHistory: z.boolean().default(true),
+    /**
+     * What to do when a `conversation`-mode target (existing/singleton) is BUSY
+     * (a turn is already running). `'inject'` (default) appends this prompt and
+     * restarts the stream like a mid-turn user follow-up — the in-flight run is
+     * aborted and restarted with the combined branch (its partial reply is
+     * discarded, same as the GUI). `'divert'` sends it to a NEW chat instead
+     * (the older behavior). Only affects busy existing/singleton targets.
+     */
+    onBusyTarget: z.enum(['inject', 'divert']).default('inject'),
   }),
   z.object({
     type: z.literal('plugin-action'),

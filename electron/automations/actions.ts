@@ -26,6 +26,18 @@ export type ActionDeps = {
   getRegisteredTools: () => ToolDefinition[];
   getWorkspaceTools: () => ToolDefinition[];
   handlePluginAction: (payload: PluginActionPayload) => Promise<unknown>;
+  /**
+   * Inject a user turn into a BUSY target conversation and restart its stream
+   * (mid-turn follow-up behavior — the in-flight run is aborted+restarted with
+   * the combined branch). Bound to agent.ts's injectUserTurnAndRestart. When
+   * absent (or the rule opts out via onBusyTarget:'divert'), a busy target
+   * diverts to a new chat as before.
+   */
+  injectUserTurnAndRestart?: (
+    conversationId: string,
+    userText: string,
+    opts?: { modelKey?: string; reasoningEffort?: string; profileKey?: string; cwd?: string },
+  ) => Promise<{ ok: boolean; error?: string }>;
 };
 
 type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
@@ -74,6 +86,7 @@ export async function resumeConversationWithMessage(
     tools: opts?.tools ?? true,
     conversationTarget: { type: 'existing', conversationId },
     includeHistory: true,
+    onBusyTarget: 'inject',
     ...(opts?.modelKey ? { modelKey: opts.modelKey } : {}),
     ...(opts?.profileKey ? { profileKey: opts.profileKey } : {}),
   };
@@ -173,12 +186,17 @@ function resolveConversationTarget(
   rule: AutomationRule,
   appHome: string,
   title: string,
-): { targetId: string; created: boolean } | null {
+  canInject: boolean,
+): { targetId: string; created: boolean } | { busyInject: string } | null {
   const target = action.conversationTarget;
   if (target.type === 'per-invocation') return null;
 
   const isBusy = (c: { id: string; runStatus?: string }) =>
     c.runStatus === 'running' || c.runStatus === 'awaiting-approval' || inFlightAutomationTargets.has(c.id);
+  // A busy target injects a mid-turn follow-up (abort+restart) instead of
+  // diverting to a new chat, unless the rule opts out (onBusyTarget:'divert')
+  // or no inject helper is bound.
+  const injectOnBusy = canInject && action.onBusyTarget !== 'divert';
 
   if (target.type === 'existing') {
     const conv = readConversation(appHome, target.conversationId);
@@ -189,6 +207,10 @@ function resolveConversationTarget(
       return null;
     }
     if (isBusy(conv)) {
+      if (injectOnBusy) {
+        console.info(`[automations] rule "${rule.name}" target ${target.conversationId} busy; injecting mid-turn`);
+        return { busyInject: target.conversationId };
+      }
       console.warn(
         `[automations] rule "${rule.name}" target ${target.conversationId} is busy (${conv.runStatus}); diverting`,
       );
@@ -203,6 +225,10 @@ function resolveConversationTarget(
     const meta = conv.metadata as { automationRuleId?: unknown; automationSingleton?: unknown } | undefined;
     if (meta?.automationRuleId === rule.id && meta?.automationSingleton === true) {
       if (isBusy(conv)) {
+        if (injectOnBusy) {
+          console.info(`[automations] rule "${rule.name}" singleton ${conv.id} busy; injecting mid-turn`);
+          return { busyInject: conv.id };
+        }
         console.warn(`[automations] rule "${rule.name}" singleton ${conv.id} is busy (${conv.runStatus}); diverting`);
         return null;
       }
@@ -248,19 +274,38 @@ async function runAgentAction(
     return { text: result.text, modelKey: result.modelKey, toolCalls: result.toolCalls };
   }
 
-  const resolved = resolveConversationTarget(action, rule, deps.appHome, title);
+  const canInject = typeof deps.injectUserTurnAndRestart === 'function';
+  const resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+
+  // Busy target + inject enabled: append this prompt as a mid-turn follow-up and
+  // restart the stream (abort+restart with the combined branch), reusing the
+  // GUI/CLI stream path. Do NOT go through streamForPlugin or reserve
+  // inFlightAutomationTargets — the injected run is owned by activeStreams /
+  // streamHandler, and its assistant reply is written by the server-persist
+  // accumulator. The literal (already-interpolated) prompt is passed as-is.
+  if (resolved && 'busyInject' in resolved) {
+    const res = await deps.injectUserTurnAndRestart!(resolved.busyInject, prompt, {
+      modelKey: action.modelKey,
+      profileKey: action.profileKey,
+    });
+    return { injectedInto: resolved.busyInject, ok: res.ok, error: res.error };
+  }
+
   if (opts?.strictExistingTarget && action.conversationTarget?.type === 'existing' && !resolved) {
     // The caller demanded a specific existing conversation but it's gone/busy.
     // Diverting to a new chat would misroute the turn (e.g. an answered alert),
-    // so fail loudly rather than silently spawn a duplicate.
+    // so fail loudly rather than silently spawn a duplicate. (A busyInject
+    // resolve is handled above and is the desired outcome for a busy target.)
     const targetId =
       action.conversationTarget.type === 'existing' ? action.conversationTarget.conversationId : '(unknown)';
     throw new Error(`Target conversation ${targetId} is missing or busy; not diverting to a new conversation.`);
   }
   // Ensure a target conversation exists up front so the user prompt (and the
-  // live stream) can render immediately instead of after generation.
-  let conversationId = resolved?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
-  let created = resolved ? (resolved.created ?? false) : true;
+  // live stream) can render immediately instead of after generation. (busyInject
+  // was handled + returned above, so `resolved` here is a target or null.)
+  const target = resolved && 'targetId' in resolved ? resolved : null;
+  let conversationId = target?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
+  let created = target ? (target.created ?? false) : true;
   inFlightAutomationTargets.add(conversationId);
 
   const abortController = new AbortController();

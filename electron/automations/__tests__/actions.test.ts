@@ -212,6 +212,7 @@ describe('executeActions', () => {
           tools: false,
           conversationTarget: { type: 'per-invocation' },
           includeHistory: true,
+          onBusyTarget: 'inject',
         },
         {
           type: 'plugin-action',
@@ -273,6 +274,7 @@ describe('agent conversationTarget', () => {
         tools: false,
         conversationTarget: target,
         includeHistory,
+        onBusyTarget: 'inject',
       },
     ]);
 
@@ -334,6 +336,56 @@ describe('agent conversationTarget', () => {
     for (const call of vi.mocked(appendConversationMessages).mock.calls) {
       expect(call[1]).not.toBe('convA');
     }
+  });
+
+  it('busy existing target INJECTS mid-turn when a helper is bound (no divert, no streamForPlugin)', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const rec = await executeActions(
+      agentAction({ type: 'existing', conversationId: 'convA' }),
+      evt,
+      deps({ injectUserTurnAndRestart }),
+    );
+    // Injected into the busy conversation, NOT diverted to a new one.
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    const injectCall = injectUserTurnAndRestart.mock.calls.at(-1) as unknown as [string, string, ...unknown[]];
+    expect(injectCall[0]).toBe('convA');
+    expect(injectCall[1]).toBe('do the thing');
+    expect((rec.results[0].output as { injectedInto: string }).injectedInto).toBe('convA');
+    // Must NOT have gone through the normal streamForPlugin / append path.
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(appendConversationMessages).not.toHaveBeenCalled();
+  });
+
+  it('busy existing target with onBusyTarget:"divert" still diverts even when a helper is bound', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const action = agentAction({ type: 'existing', conversationId: 'convA' });
+    (action.actions[0] as { onBusyTarget?: string }).onBusyTarget = 'divert';
+    const rec = await executeActions(action, evt, deps({ injectUserTurnAndRestart }));
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    const divertedId = (rec.results[0].output as { conversationId: string }).conversationId;
+    expect(divertedId).not.toBe('convA');
+  });
+
+  it('idle existing target is unaffected by inject (normal append path)', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    await executeActions(
+      agentAction({ type: 'existing', conversationId: 'convA' }),
+      evt,
+      deps({ injectUserTurnAndRestart }),
+    );
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    // Normal path writes the user turn to convA (exactly one append in this path).
+    const [, appendedId] = vi.mocked(appendConversationMessages).mock.calls.at(-1) as [string, string, unknown[]];
+    expect(appendedId).toBe('convA');
   });
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {

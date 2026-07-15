@@ -238,6 +238,29 @@ const pendingServerPersistParent = new Map<string, string | null>();
 const serverPersistParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
 
+/**
+ * Inject a user turn into a conversation and (re)start the stream — the shared
+ * mechanism behind the GUI/CLI "mid-turn follow-up" behavior. When the target
+ * is busy, streamHandler aborts the in-flight run and restarts with the new
+ * combined branch (the aborted partial is discarded, same as the GUI). The
+ * assistant reply is written via the server-persist accumulator (there may be
+ * no renderer, e.g. an automation). Set by registerAgentHandlers (closes over
+ * streamHandler + module state); consumed by the automations busy-inject path.
+ * Returns { ok } — ok:false only for a genuinely missing conversation.
+ */
+export type InjectUserTurnFn = (
+  conversationId: string,
+  userText: string,
+  opts?: { modelKey?: string; reasoningEffort?: ReasoningEffort; profileKey?: string; cwd?: string },
+) => Promise<{ ok: boolean; error?: string }>;
+
+let injectUserTurnAndRestart: InjectUserTurnFn | null = null;
+
+/** Accessor for the automations engine (bound after registerAgentHandlers). */
+export function getInjectUserTurnAndRestart(): InjectUserTurnFn | null {
+  return injectUserTurnAndRestart;
+}
+
 /** True if the given conversation's active stream is the server-persist owner. */
 function isServerPersistOwner(conversationId: string, activeToken: string | undefined): boolean {
   const owner = serverPersistTokens.get(conversationId);
@@ -2452,6 +2475,54 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   };
 
   ipcMain.handle('agent:stream', streamHandler);
+
+  // Shared mid-turn-inject helper (see the exported InjectUserTurnFn doc). This
+  // is the same append-user-turn → server-persist → streamHandler sequence the
+  // CLI's agent:submit uses; here it's used by the automations busy-target
+  // inject path so an automation targeting a live conversation behaves like a
+  // consecutive user follow-up (streamHandler aborts the in-flight run and
+  // restarts with the combined branch) instead of diverting to a new chat.
+  // NO skipIfBusy — superseding the in-flight run is the intended behavior.
+  injectUserTurnAndRestart = async (conversationId, userText, opts) => {
+    const existingConv = readConversation(appHome, conversationId);
+    if (!existingConv) return { ok: false, error: 'conversation-not-found' };
+
+    const promptWrite = appendConversationMessages(
+      appHome,
+      conversationId,
+      [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+      { runStatus: 'running' },
+    );
+    if (!promptWrite) return { ok: false, error: 'conversation-not-found' };
+
+    // Mirror the injected prompt to any attached clients (GUI/CLI viewing this
+    // conversation) so the turn renders, not just the streamed reply.
+    broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+
+    const updated = readConversation(appHome, conversationId);
+    if (!updated) return { ok: false, error: 'conversation-not-found' };
+    const { tree, headId } = ensureConversationTree(updated);
+    const branch = getConversationBranch(tree, headId);
+
+    // Server-persist the assistant reply (no renderer for an automation turn).
+    // streamHandler binds this to the run's token so a superseding run can't
+    // inherit it; parent the reply on the injected user head.
+    pendingServerPersist.add(conversationId);
+    pendingServerPersistParent.set(conversationId, headId);
+
+    await streamHandler(
+      undefined,
+      conversationId,
+      branch,
+      opts?.modelKey ?? updated.selectedModelKey ?? undefined,
+      opts?.reasoningEffort,
+      opts?.profileKey ?? updated.selectedProfileKey ?? undefined,
+      updated.fallbackEnabled,
+      opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
+      undefined,
+    );
+    return { ok: true };
+  };
 
   // Thin server-side entry point for clients that don't manage the message tree
   // themselves (the `kai` CLI). Appends the user turn (server-authoritative
