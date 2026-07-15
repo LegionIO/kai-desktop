@@ -6,7 +6,13 @@
  * observer reasons over. Lock both.
  */
 import { describe, it, expect } from 'vitest';
-import { summarizeLatestUserRequest, summarizeThreadContext } from '../tool-observer.js';
+import {
+  summarizeLatestUserRequest,
+  summarizeThreadContext,
+  clampHeadTail,
+  oneLineCapped,
+  toResultSummary,
+} from '../tool-observer.js';
 
 describe('summarizeLatestUserRequest', () => {
   it('returns the most recent user message text', () => {
@@ -114,5 +120,61 @@ describe('summarizeThreadContext', () => {
     // absurdly small options must not throw or zero-out
     const out = summarizeThreadContext(msgs, { maxMessages: 0, maxCharsPerMessage: 1, maxTotalChars: 1 });
     expect(out).toContain('USER: hello world');
+  });
+});
+
+describe('clampHeadTail / oneLineCapped (huge-output bounding)', () => {
+  it('returns whitespace-collapsed value unchanged when under the cap', () => {
+    expect(clampHeadTail('a\t b\n c', 240)).toBe('a b c');
+    expect(oneLineCapped('a\t b\n c', 240)).toBe('a b c');
+  });
+
+  it('clamps a large value with a head+tail snip marker, staying near the cap', () => {
+    const big = 'H'.repeat(1000) + 'MIDDLE' + 'T'.repeat(1000);
+    const out = clampHeadTail(big, 280);
+    expect(out).toContain('[...snip...]');
+    expect(out.startsWith('H')).toBe(true);
+    expect(out.endsWith('T')).toBe(true);
+    // bounded — never the full 2006 chars
+    expect(out.length).toBeLessThanOrEqual(280);
+  });
+
+  it('does not scan/allocate the whole input: a huge input yields a bounded result', () => {
+    // 50MB single-char string — must return quickly and small. If the impl
+    // whitespace-normalized the whole thing first this would be slow/large.
+    const huge = 'x'.repeat(50 * 1024 * 1024);
+    const t0 = Date.now();
+    const capped = oneLineCapped(huge, 240);
+    const clamped = clampHeadTail(huge, 240);
+    expect(capped.length).toBeLessThanOrEqual(240);
+    expect(clamped.length).toBeLessThanOrEqual(240);
+    // generous ceiling — real impl slices before regex so this is milliseconds
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('maxChars<=0 yields empty', () => {
+    expect(clampHeadTail('abc', 0)).toBe('');
+    expect(clampHeadTail('abc', -5)).toBe('');
+  });
+});
+
+describe('toResultSummary', () => {
+  it('summarizes an error object as isError with capped text', () => {
+    const r = toResultSummary({ error: '  boom  \n  happened  ' });
+    expect(r.isError).toBe(true);
+    expect(r.summary).toBe('boom happened');
+  });
+
+  it('clamps a huge stdout with the snip marker', () => {
+    const r = toResultSummary({ stdout: 'A'.repeat(5000) + 'Z'.repeat(5000) });
+    expect(r.isError).toBe(false);
+    expect(r.summary).toContain('[...snip...]');
+    expect(r.summary.length).toBeLessThanOrEqual(240);
+  });
+
+  it('handles a bare string result and a non-string/opaque result', () => {
+    expect(toResultSummary('just a string').summary).toBe('just a string');
+    expect(toResultSummary(42).summary).toBe('[result captured]');
+    expect(toResultSummary(null).summary).toBe('[result captured]');
   });
 });

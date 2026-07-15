@@ -229,37 +229,53 @@ export function summarizeThreadContext(
   return joined.length > maxTotalChars ? joined.slice(-maxTotalChars) : joined;
 }
 
-function clampHeadTail(value: string, maxChars: number): string {
+export function clampHeadTail(value: string, maxChars: number): string {
   if (maxChars <= 0) return '';
-  if (value.length <= maxChars) return value;
+  if (value.length <= maxChars) return oneLine(value);
   const marker = '\n[...snip...]\n';
   if (marker.length >= maxChars) return marker.slice(0, maxChars);
   const body = maxChars - marker.length;
   const head = Math.floor(body * 0.7);
   const tail = Math.max(0, body - head);
-  return value.slice(0, head) + marker + value.slice(-tail);
+  // Slice the raw head/tail BEFORE whitespace-normalizing. Whitespace collapse
+  // can only shrink a segment, so slicing generously (2x) first guarantees we
+  // still have enough post-collapse while avoiding a full-string scan+copy of a
+  // potentially huge tool output on every observer tick. Re-clamp after collapse.
+  const rawHead = oneLine(value.slice(0, head * 2)).slice(0, head);
+  const rawTail = tail > 0 ? oneLine(value.slice(-tail * 2)).slice(-tail) : '';
+  return rawHead + marker + rawTail;
 }
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-function toResultSummary(result: unknown): { isError: boolean; summary: string } {
+/**
+ * Whitespace-normalize a string capped to `maxChars`, without scanning more of
+ * the input than needed. `oneLine` on a multi-hundred-MB tool output would
+ * allocate a full copy every tick; slicing to ~2x the cap first bounds that.
+ */
+export function oneLineCapped(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return oneLine(value);
+  return oneLine(value.slice(0, maxChars * 2)).slice(0, maxChars);
+}
+
+export function toResultSummary(result: unknown): { isError: boolean; summary: string } {
   if (result && typeof result === 'object') {
     const r = result as Record<string, unknown>;
     const isError = Boolean(r.isError || (typeof r.error === 'string' && r.error.length > 0));
     if (typeof r.error === 'string' && r.error.trim()) {
-      return { isError: true, summary: oneLine(r.error).slice(0, 240) };
+      return { isError: true, summary: oneLineCapped(r.error, 240) };
     }
     if (typeof r.stdout === 'string' && r.stdout.trim()) {
-      return { isError, summary: clampHeadTail(oneLine(r.stdout), 240) };
+      return { isError, summary: clampHeadTail(r.stdout, 240) };
     }
     if (typeof r.response === 'string' && r.response.trim()) {
-      return { isError, summary: oneLine(r.response).slice(0, 240) };
+      return { isError, summary: oneLineCapped(r.response, 240) };
     }
   }
   if (typeof result === 'string') {
-    return { isError: false, summary: oneLine(result).slice(0, 240) };
+    return { isError: false, summary: oneLineCapped(result, 240) };
   }
   return { isError: false, summary: '[result captured]' };
 }
@@ -405,17 +421,26 @@ export class ToolObserverManager {
         resolve();
       };
 
-      const timer = setTimeout(
-        () => {
-          done();
-        },
-        Math.max(1, timeoutMs),
-      );
-
       const wrappedDone = (): void => {
         clearTimeout(timer);
         done();
       };
+
+      const timer = setTimeout(
+        () => {
+          // On timeout, drop this waiter from its parent's queue so a launched
+          // tool that never completes doesn't leave resolved no-op closures
+          // accumulating in parentWaiters until dispose().
+          const queue = this.parentWaiters.get(parentToolCallId);
+          if (queue) {
+            const idx = queue.indexOf(wrappedDone);
+            if (idx !== -1) queue.splice(idx, 1);
+            if (queue.length === 0) this.parentWaiters.delete(parentToolCallId);
+          }
+          done();
+        },
+        Math.max(1, timeoutMs),
+      );
 
       const queue = this.parentWaiters.get(parentToolCallId) ?? [];
       queue.push(wrappedDone);
@@ -562,7 +587,7 @@ export class ToolObserverManager {
   private buildDynamicThreadContext(runningTools: ObservedToolState[]): string {
     const runningLines = runningTools.map((tool) => {
       const out = tool.stdout || tool.stderr || '';
-      const excerpt = out ? clampHeadTail(oneLine(out), 280) : '[no output yet]';
+      const excerpt = out ? clampHeadTail(out, 280) : '[no output yet]';
       return `${tool.toolName} (${tool.toolCallId}) running, bytes=${tool.bytesSeen}, truncated=${tool.truncated}, stopped=${tool.stopped}\n${excerpt}`;
     });
 
