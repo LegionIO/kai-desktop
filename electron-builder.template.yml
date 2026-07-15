@@ -9,6 +9,18 @@ appId: "{{appId}}"
 productName: "{{productName}}"
 executableName: "{{executableName}}"
 afterPack: scripts/after-pack.cjs
+# Do NOT let electron-builder recompile native deps from source at package time.
+# Every native dep we ship installs a prebuilt binary during `pnpm install`
+# (active-win → node-pre-gyp napi prebuilt on Windows / source-built on mac+linux
+# at install; sharp → prebuilt). @electron/rebuild otherwise recompiles active-win
+# from source on Windows, which needs a Visual Studio toolchain the CI runner
+# doesn't expose → build failure. active-win's .node is Windows-only anyway
+# (mac uses the bundled universal binary, Linux shells out to xprop/xdotool), and
+# all these prebuilts are NAPI (ABI-stable across the Node↔Electron boundary), so
+# reusing the install-time binary is correct on every platform.
+# TODO(#254): true RCA on why --frozen-lockfile flips @electron/rebuild from
+# reuse-prebuilt to recompile-from-source; revisit whether this can be narrower.
+npmRebuild: false
 directories:
   buildResources: build
   output: dist
