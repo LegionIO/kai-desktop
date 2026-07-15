@@ -39,6 +39,23 @@ const SHUTDOWN_SETTLE_MS = 400;
  *  Kept low so a half-open socket (Ctrl-C / crash where no FIN is delivered) is
  *  detected quickly and the backend can reap itself. The client pings ~5s. */
 const HEARTBEAT_TIMEOUT_MS = 12000;
+
+/**
+ * Broadcast channels that drive GUI-renderer-only surfaces and must NOT be
+ * mirrored to terminal CLI clients (they can't use them and some are large
+ * enough to flood the CLI socket + trip its heartbeat — see the sink wrapper).
+ * Keep this to genuinely GUI-only channels; anything the CLI subscribes to
+ * (conversation/stream/agent events) must NOT be listed.
+ */
+const CLI_EXCLUDED_BROADCAST_CHANNELS = new Set<string>(['plugin:ui-state-changed']);
+
+/**
+ * Whether a web-broadcast channel should be mirrored to terminal CLI clients.
+ * False for GUI-renderer-only channels the CLI can't use. Exported for testing.
+ */
+export function shouldMirrorToCliClients(channel: string): boolean {
+  return !CLI_EXCLUDED_BROADCAST_CHANNELS.has(channel);
+}
 /** Hard cap on a single newline-delimited inbound frame (and on total buffered
  *  bytes before a newline). A malformed/malicious same-user client must not be
  *  able to grow the singleton backend's memory without bound. 8 MiB comfortably
@@ -334,8 +351,19 @@ export function startLocalServer(options: LocalServerOptions = {}): Promise<stri
     }
   }
 
-  // Fan every web-client broadcast out to local clients too.
-  unregisterSink = registerBroadcastSink(broadcastToLocalClients);
+  // Fan every web-client broadcast out to local clients too — EXCEPT channels
+  // that only drive GUI-renderer surfaces the terminal CLI can't use. The CLI
+  // has no plugin UI, so `plugin:ui-state-changed` (a full plugin-UI-state dump,
+  // observed at ~2.9 MB and re-emitted on plugin state changes) is pure waste to
+  // it — and large enough that mirroring it to the CLI socket floods the pipe,
+  // delays the heartbeat pong past the liveness window, and makes the CLI
+  // falsely declare the backend dead + reconnect in a loop. Drop such channels
+  // at the CLI boundary. (The oversized/frequent emit itself is a separate
+  // plugin-side issue tracked for RCA; this stops it from ever reaching the CLI.)
+  unregisterSink = registerBroadcastSink((channel, data) => {
+    if (!shouldMirrorToCliClients(channel)) return;
+    broadcastToLocalClients(channel, data);
+  });
 
   const srv = net.createServer(attachClient);
   server = srv;

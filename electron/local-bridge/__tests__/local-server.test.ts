@@ -15,7 +15,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { IpcMain } from 'electron';
 import { installIpcCapture } from '../../web-server/ipc-bridge.js';
-import { startLocalServer, stopLocalServer } from '../local-server.js';
+import { startLocalServer, stopLocalServer, shouldMirrorToCliClients } from '../local-server.js';
 import { getBridgeToken, getSocketPath } from '../paths.js';
 
 const isWin = process.platform === 'win32';
@@ -187,5 +187,17 @@ describe.skipIf(isWin)('local-server auth gate', () => {
     const p1 = await startLocalServer();
     const p2 = await startLocalServer();
     expect(p2).toBe(p1);
+  });
+});
+
+describe('shouldMirrorToCliClients (CLI broadcast filter)', () => {
+  it('excludes GUI-renderer-only plugin:ui-state-changed (the CLI-flood culprit)', () => {
+    expect(shouldMirrorToCliClients('plugin:ui-state-changed')).toBe(false);
+  });
+
+  it('forwards channels the CLI actually consumes', () => {
+    for (const ch of ['agent:stream-event', 'conversations:changed', 'stream:token', 'alerts:changed']) {
+      expect(shouldMirrorToCliClients(ch)).toBe(true);
+    }
   });
 });
