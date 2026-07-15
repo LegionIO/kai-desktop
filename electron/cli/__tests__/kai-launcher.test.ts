@@ -21,13 +21,15 @@ const isWin = process.platform === 'win32';
 
 function runShim(env: NodeJS.ProcessEnv, args: string[]): { code: number; out: string } {
   try {
-    const out = execFileSync('sh', [SHIM, ...args], {
+    const res = execFileSync('sh', [SHIM, ...args], {
       env: { ...process.env, ...env },
       encoding: 'utf-8',
+      // Merge the child's stderr into stdout so tests can assert on both the
+      // TUI output and the (filtered) stderr in one string.
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10000,
     });
-    return { code: 0, out };
+    return { code: 0, out: res };
   } catch (err) {
     const e = err as { status?: number; stdout?: Buffer | string; stderr?: Buffer | string };
     return { code: e.status ?? 1, out: String(e.stdout ?? '') + String(e.stderr ?? '') };
@@ -44,6 +46,61 @@ describe.skipIf(isWin)('bin/kai POSIX launcher', () => {
       const { code, out } = runShim({ KAI_APP_BINARY: bin }, ['hello', 'world']);
       expect(code).toBe(0);
       expect(out).toContain('OVERRIDE args: --kai-cli hello world');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('filters the SQLite ExperimentalWarning from stderr but keeps real stderr + stdout', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kai-shim-'));
+    try {
+      const bin = join(dir, 'fakeapp');
+      // Mimic the child: TUI on stdout, the SQLite warning + its trace hint +
+      // a real error on stderr.
+      writeFileSync(
+        bin,
+        '#!/bin/sh\n' +
+          'echo "TUI OUTPUT"\n' +
+          'echo "(node:1) ExperimentalWarning: SQLite is an experimental feature and might change at any time" >&2\n' +
+          'echo "(Use \\`Electron --trace-warnings ...\\` to show where the warning was created)" >&2\n' +
+          'echo "a real error" >&2\n',
+        { mode: 0o755 },
+      );
+      chmodSync(bin, 0o755);
+      // Capture stdout+stderr merged so we can assert on both streams. Run the
+      // shim under `sh -c '... 2>&1'` so the child's (filtered) stderr joins stdout.
+      let merged = '';
+      let code = 0;
+      try {
+        merged = execFileSync('sh', ['-c', `"${SHIM}" 2>&1`], {
+          env: { ...process.env, KAI_APP_BINARY: bin },
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10000,
+        });
+      } catch (err) {
+        const e = err as { status?: number; stdout?: string; stderr?: string };
+        code = e.status ?? 1;
+        merged = String(e.stdout ?? '') + String(e.stderr ?? '');
+      }
+      expect(code).toBe(0);
+      expect(merged).toContain('TUI OUTPUT'); // stdout survives
+      expect(merged).toContain('a real error'); // non-SQLite stderr survives
+      expect(merged).not.toContain('SQLite is an experimental feature'); // filtered
+      expect(merged).not.toContain('trace-warnings'); // companion hint filtered
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the child exit code through the stderr filter', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kai-shim-'));
+    try {
+      const bin = join(dir, 'fakeapp');
+      writeFileSync(bin, '#!/bin/sh\necho hi\nexit 42\n', { mode: 0o755 });
+      chmodSync(bin, 0o755);
+      const { code } = runShim({ KAI_APP_BINARY: bin }, []);
+      expect(code).toBe(42);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

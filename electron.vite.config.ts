@@ -111,6 +111,12 @@ export default defineConfig({
           // function (e.g. runCliClient) is too late in the packaged app: main.ts's
           // large static import graph loads first and fires the warning to the
           // CLI's stderr before our code runs.
+          //
+          // (The SQLite ExperimentalWarning is handled separately: it's emitted
+          // by Node's internal path — not JS process.emitWarning, and not
+          // reachable via NODE_OPTIONS since that fuse is off — so it can't be
+          // intercepted here; the `kai` launcher (bin/kai) filters that one line
+          // out of the CLI's stderr instead.)
           banner: 'process.noDeprecation = true;',
         },
       },
