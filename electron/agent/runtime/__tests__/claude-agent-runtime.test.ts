@@ -8,8 +8,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { z } from 'zod';
 import type { AppConfig } from '../../../config/schema.js';
 import type { StreamOptions, StreamEvent } from '../types.js';
+import type { ToolDefinition } from '../../../tools/types.js';
 
 // ---------------------------------------------------------------------------
 // SDK mock — controls what `query()` yields per test.
@@ -61,6 +63,11 @@ vi.mock('../detect.js', () => ({
 // Imports — placed AFTER vi.mock so the mocks land first.
 // ---------------------------------------------------------------------------
 const { ClaudeAgentRuntime } = await import('../claude-agent-runtime.js');
+// Read the SDK mock's spies to assert what got bridged.
+const sdkMock = (await import('@anthropic-ai/claude-agent-sdk')) as unknown as {
+  createSdkMcpServer: ReturnType<typeof vi.fn>;
+  tool: ReturnType<typeof vi.fn>;
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,6 +105,8 @@ beforeEach(() => {
   sdkState.lastOptions = undefined;
   sdkState.queryCallCount = 0;
   sdkState.shouldThrow = undefined;
+  sdkMock.createSdkMcpServer.mockClear();
+  sdkMock.tool.mockClear();
 });
 
 // ---------------------------------------------------------------------------
@@ -277,6 +286,53 @@ describe('ClaudeAgentRuntime', () => {
       expect(errs.length).toBe(1);
       expect(errs[0].error).toContain('rate limit');
       expect(events[events.length - 1].type).toBe('done');
+    });
+  });
+
+  describe('stream — tool bridging', () => {
+    function tool(name: string, source: ToolDefinition['source']): ToolDefinition {
+      return {
+        name,
+        description: `${name} desc`,
+        source,
+        inputSchema: z.object({ q: z.string() }),
+        execute: async () => ({ ok: true }),
+      } as unknown as ToolDefinition;
+    }
+
+    it('bridges builtin/cli tools (web_search/web_fetch/memory) into the kai MCP server, skips sub_agent', async () => {
+      sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+      const rt = new ClaudeAgentRuntime();
+      await collect(
+        rt.stream(
+          makeOptions({
+            tools: [
+              tool('web_search', 'builtin'),
+              tool('web_fetch', 'builtin'),
+              tool('memory', 'builtin'),
+              tool('my_cli_tool', 'cli'),
+              tool('some_plugin_tool', 'plugin'),
+              tool('sub_agent', 'builtin'), // must be skipped
+            ],
+          }),
+        ),
+      );
+
+      // Each bridged tool becomes a tool() call; sub_agent is excluded.
+      const bridgedNames = sdkMock.tool.mock.calls.map((c) => c[0] as string);
+      expect(bridgedNames).toContain('web_search');
+      expect(bridgedNames).toContain('web_fetch');
+      expect(bridgedNames).toContain('memory');
+      expect(bridgedNames).toContain('my_cli_tool');
+      expect(bridgedNames).toContain('some_plugin_tool');
+      expect(bridgedNames).not.toContain('sub_agent');
+
+      // The kai MCP server was created with exactly those 5 tools.
+      expect(sdkMock.createSdkMcpServer).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'kai', tools: expect.arrayContaining([]) }),
+      );
+      const serverCall = sdkMock.createSdkMcpServer.mock.calls.at(-1)?.[0] as { tools?: unknown[] };
+      expect(serverCall.tools).toHaveLength(5);
     });
   });
 });

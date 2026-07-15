@@ -236,3 +236,14 @@ export const RUNTIME_LABELS: Record<RuntimeId, string> = {
   'codex-sdk': 'Codex SDK',
   pi: 'pi',
 };
+
+/**
+ * Kai tools NOT bridged into an external-CLI runtime (Codex / Claude Agent SDK).
+ * These runtimes have their own native equivalent, so bridging Kai's version
+ * would duplicate/confuse it. Everything else — including builtin tools like
+ * web_search / web_fetch / memory and cli-source tools — IS bridged, so the
+ * external runtime can call the same tools the native Mastra agent can.
+ *
+ * `sub_agent`: both SDKs have a native sub-agent/Agent primitive.
+ */
+export const RUNTIME_BRIDGE_SKIP_TOOLS = new Set<string>(['sub_agent']);

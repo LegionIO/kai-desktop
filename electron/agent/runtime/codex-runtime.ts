@@ -15,6 +15,7 @@
  */
 
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
+import { RUNTIME_BRIDGE_SKIP_TOOLS } from './types.js';
 import { detectCodexSdk } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import { buildCodexMcpPrompt, buildCodexMcpServerConfig, CodexMcpBridge } from './codex-mcp-bridge.js';
@@ -321,12 +322,15 @@ export class CodexRuntime implements AgentRuntime {
 
     // -----------------------------------------------------------------------
     // 4. Start MCP bridge for custom tools (before creating Codex instance)
-    //    Only bridge plugin/skill/mcp tools — Codex has its own built-in tools
+    //    Bridge ALL Kai tools (builtin web_search/web_fetch/memory, cli, skill,
+    //    plugin, mcp) except RUNTIME_BRIDGE_SKIP_TOOLS — Codex's own built-ins
+    //    are file/shell only, so without this the model can't reach Kai's
+    //    builtin/cli tools. Mirrors the Claude Agent SDK runtime.
     // -----------------------------------------------------------------------
     const bridge = new CodexMcpBridge();
     let bridgeUrl: string | undefined;
 
-    const customTools = tools?.filter((t) => t.source === 'plugin' || t.source === 'skill' || t.source === 'mcp');
+    const customTools = tools?.filter((t) => !RUNTIME_BRIDGE_SKIP_TOOLS.has(t.name));
 
     if (customTools && customTools.length > 0) {
       try {

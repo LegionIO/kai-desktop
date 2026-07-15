@@ -9,6 +9,7 @@ import {
   getCodexMcpToolEntries,
 } from '../codex-mcp-bridge.js';
 import type { ToolDefinition } from '../../../tools/types.js';
+import { RUNTIME_BRIDGE_SKIP_TOOLS } from '../types.js';
 
 function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
@@ -26,6 +27,36 @@ function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
     ...overrides,
   };
 }
+
+describe('codex bridge tool inclusion (all sources, not just plugin/skill/mcp)', () => {
+  it('bridges builtin + cli tools too, so codex can reach web_search/web_fetch/memory', () => {
+    const tools: ToolDefinition[] = [
+      createTool({ name: 'web_search', originalName: 'web_search', source: 'builtin', sourceId: undefined }),
+      createTool({ name: 'web_fetch', originalName: 'web_fetch', source: 'builtin', sourceId: undefined }),
+      createTool({ name: 'memory', originalName: 'memory', source: 'builtin', sourceId: undefined }),
+      createTool({ name: 'my_cli_tool', originalName: 'my_cli_tool', source: 'cli', sourceId: undefined }),
+      createTool(), // the plugin default
+    ];
+    const entries = getCodexMcpToolEntries(tools);
+    const names = entries.map((e) => e.name);
+    // The old filter (source==='plugin'||'skill'||'mcp') would have dropped the
+    // first four. getCodexMcpToolEntries itself is source-agnostic; the runtime
+    // now feeds it every non-skipped tool, so all survive.
+    expect(names).toContain('web_search');
+    expect(names).toContain('web_fetch');
+    expect(names).toContain('memory');
+    expect(names).toContain('my_cli_tool');
+    expect(entries).toHaveLength(5);
+  });
+});
+
+describe('RUNTIME_BRIDGE_SKIP_TOOLS', () => {
+  it('excludes sub_agent (SDK has its own) and nothing else by default', () => {
+    expect(RUNTIME_BRIDGE_SKIP_TOOLS.has('sub_agent')).toBe(true);
+    expect(RUNTIME_BRIDGE_SKIP_TOOLS.has('web_search')).toBe(false);
+    expect(RUNTIME_BRIDGE_SKIP_TOOLS.has('memory')).toBe(false);
+  });
+});
 
 describe('CodexMcpBridge', () => {
   let bridge: CodexMcpBridge | null = null;
