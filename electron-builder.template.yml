@@ -100,9 +100,12 @@ mac:
   # "unique file not covered by allowList" and fails the build. The package is
   # byte-identical across arches (no arch-specific content) and IS needed at
   # runtime, so allow it to appear in a single arch's asar rather than excluding
-  # it. mergeASARs matches the full relative asar path (leading slash stripped),
-  # so cover both a top-level and a nested node_modules position.
-  singleArchFiles: "{node_modules,**/node_modules}/@aws-sdk/xml-builder/**"
+  # it. mergeASARs flags the DIRECTORY entry "node_modules/@aws-sdk/xml-builder"
+  # (not a file within), so the glob must match the dir itself AND its contents:
+  # `{,/**}` = the bare dir OR any descendant. (A trailing `/**` alone matches
+  # only descendants and misses the dir entry — which slipped through once by
+  # install-order luck, then failed.)
+  singleArchFiles: "{node_modules,**/node_modules}/@aws-sdk/xml-builder{,/**}"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
