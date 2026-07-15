@@ -18,7 +18,7 @@ import { createEnterPlanModeTool, createExitPlanModeTool } from './plan-mode.js'
 import { createAskUserTool } from './ask-user.js';
 import { createRequestReviewTool } from './request_review.js';
 import { createSubAgentTool } from './sub-agent.js';
-import { loadSkillsAsTools } from './skill-loader.js';
+import { loadSkillsAsTools, resolveSkillsDir } from './skill-loader.js';
 import { createSkillManageTool } from './skill-manage.js';
 import { createCliToolManageTool } from './cli-tool-manage.js';
 import { createAutomationManageTool } from './automation-manage.js';
@@ -553,7 +553,7 @@ export async function buildToolRegistry(
 
   // Skill tools
   if (appHome) {
-    const skillsDir = config.skills?.directory || appHome + '/skills';
+    const skillsDir = resolveSkillsDir(config, appHome);
     const enabledSkills = config.skills?.enabled ?? [];
     const skillTools = loadSkillsAsTools(skillsDir, enabledSkills, getConfig, tools);
     tools.push(...skillTools);

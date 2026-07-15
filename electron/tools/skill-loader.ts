@@ -8,6 +8,20 @@ import { registerSkillWorkflow } from '../agent/mastra-instance.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { buildScopedToolName, findToolByName } from './naming.js';
 import type { AppConfig } from '../config/schema.js';
+import { expandTilde } from '../utils/expand-tilde.js';
+
+/**
+ * Resolve the skills directory from config, expanding a leading `~` to the real
+ * home. The config default is stored as `~/.<slug>/skills`, but `~` is a literal
+ * to fs/path — without this, `readdirSync` looks for a folder named "~" and
+ * finds no skills (esp. on homes with special chars like `first_last@corp.com`).
+ * Falls back to `<appHome>/skills` when unset. The single resolver for every
+ * skills-dir consumer so the path is consistent across list/load/containment.
+ */
+export function resolveSkillsDir(config: Pick<AppConfig, 'skills'> | undefined, appHome: string): string {
+  const configured = config?.skills?.directory;
+  return configured ? expandTilde(configured) : join(appHome, 'skills');
+}
 import { runCommandWithStreaming, resolveProcessStreamingConfig } from './process-runner.js';
 import { isCommandAllowed, scrubShellEnv } from './shell.js';
 import { runToolExecution } from './execution.js';

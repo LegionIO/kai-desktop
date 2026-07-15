@@ -2,7 +2,7 @@ import type { IpcMain } from 'electron';
 import { existsSync, readdirSync, rmSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { AppConfig } from '../config/schema.js';
-import { loadSkillsFromDisk, computeNextEnabledSkills } from '../tools/skill-loader.js';
+import { loadSkillsFromDisk, computeNextEnabledSkills, resolveSkillsDir } from '../tools/skill-loader.js';
 import { readContainedFileSync, SKILL_MANIFEST_MAX_BYTES, SKILL_FILE_MAX_BYTES } from '../tools/skill-fs.js';
 import { readEffectiveConfig, writeDesktopConfig } from './config.js';
 
@@ -30,7 +30,7 @@ function safeSkillDir(skillsDir: string, name: string): string | null {
 export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void {
   ipcMain.handle('skills:list', async () => {
     const config = readConfig(appHome);
-    const skillsDir = config.skills?.directory || join(appHome, 'skills');
+    const skillsDir = resolveSkillsDir(config, appHome);
     const skills = loadSkillsFromDisk(skillsDir);
     const enabled = config.skills?.enabled ?? [];
 
@@ -46,7 +46,7 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
   ipcMain.handle('skills:get', async (_event, name: string) => {
     const config = readConfig(appHome);
-    const skillsDir = config.skills?.directory || join(appHome, 'skills');
+    const skillsDir = resolveSkillsDir(config, appHome);
     const skillDir = safeSkillDir(skillsDir, name);
     if (!skillDir) return { error: 'Invalid skill name' };
     const manifestPath = join(skillDir, 'skill.json');
@@ -81,7 +81,7 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
   ipcMain.handle('skills:delete', async (_event, name: string) => {
     const config = readConfig(appHome);
-    const skillsDir = config.skills?.directory || join(appHome, 'skills');
+    const skillsDir = resolveSkillsDir(config, appHome);
     const skillDir = safeSkillDir(skillsDir, name);
     if (!skillDir) return { error: 'Invalid skill name' };
 
@@ -99,7 +99,7 @@ export function registerSkillsHandlers(ipcMain: IpcMain, appHome: string): void 
 
   ipcMain.handle('skills:toggle', async (_event, name: string, enable: boolean) => {
     const config = readConfig(appHome);
-    const skillsDir = config.skills?.directory || join(appHome, 'skills');
+    const skillsDir = resolveSkillsDir(config, appHome);
     const discovered = loadSkillsFromDisk(skillsDir).map((s) => s.manifest.name);
     // Use the shared helper so the "empty list = all enabled" sentinel is handled
     // correctly (disable-from-empty materializes the full set; enable-from-empty

@@ -37,7 +37,7 @@ import { buildCliTools } from './tools/cli-tools.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
-import { loadSkillsAsTools } from './tools/skill-loader.js';
+import { loadSkillsAsTools, resolveSkillsDir } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerPlatformHandlers } from './ipc/platform.js';
 import { registerAppshotHandlers } from './ipc/appshots.js';
@@ -1055,7 +1055,7 @@ if (gotSingleInstanceLock) {
       const newSkillsFp = JSON.stringify(config.skills?.enabled ?? []);
       if (newSkillsFp !== lastSkillsFingerprint) {
         lastSkillsFingerprint = newSkillsFp;
-        const skillsDir = config.skills?.directory || join(APP_HOME, 'skills');
+        const skillsDir = resolveSkillsDir(config, APP_HOME);
         const skillTools = loadSkillsAsTools(skillsDir, config.skills?.enabled ?? [], getConfig);
         updateSkillTools(skillTools);
         syncRealtimeTools();

@@ -131,7 +131,11 @@ function getDefaultConfig() {
       env?: Record<string, string>;
     }>,
     skills: {
-      directory: '~/.' + __BRAND_APP_SLUG + '/skills',
+      // Absolute (resolved from the real home), NOT a literal '~/…': `~` is not
+      // expanded by fs/path, so a stored tilde makes skills silently not load —
+      // esp. on homes with special chars like `first_last@corp.com`. Read sites
+      // also expandTilde() defensively (resolveSkillsDir) to heal older configs.
+      directory: join(homedir(), '.' + __BRAND_APP_SLUG, 'skills'),
       enabled: [] as string[],
     },
     systemPrompt: DEFAULT_SYSTEM_PROMPT,

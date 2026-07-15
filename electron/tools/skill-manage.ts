@@ -3,7 +3,13 @@ import { mkdirSync, rmSync, existsSync, readdirSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
-import { getSkillToolName, loadSkillsFromDisk, computeNextEnabledSkills, type SkillManifest } from './skill-loader.js';
+import {
+  getSkillToolName,
+  loadSkillsFromDisk,
+  computeNextEnabledSkills,
+  resolveSkillsDir,
+  type SkillManifest,
+} from './skill-loader.js';
 import {
   readContainedFileSync,
   writeContainedFileSync,
@@ -35,7 +41,7 @@ function readConfig(appHome: string): AppConfig {
 
 function getSkillsDir(appHome: string, config?: AppConfig): string {
   const cfg = config ?? readConfig(appHome);
-  return cfg.skills?.directory || join(appHome, 'skills');
+  return resolveSkillsDir(cfg, appHome);
 }
 
 export function createSkillManageTool(appHome: string): ToolDefinition {
