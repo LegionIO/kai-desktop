@@ -37,18 +37,14 @@ export function checkVersionMismatch(client: LocalBridgeClient): string | null {
  *  - **Dev / standalone node** (`fromElectron: false`): run the dev electron
  *    binary against `out/main/index.js`.
  */
-export function spawnHeadlessBackend(fromElectron: boolean): boolean {
+export function spawnHeadlessBackend(fromElectron: boolean): Promise<boolean> {
   if (fromElectron) {
     const child = spawn(process.execPath, ['--kai-headless'], {
       detached: true,
       stdio: 'ignore',
       env: { ...process.env, KAI_HEADLESS: '1', KAI_CLI: '' },
     });
-    child.on('error', (err) => {
-      cliLog(`failed to spawn headless backend: ${err instanceof Error ? err.message : String(err)}`);
-    });
-    child.unref();
-    return true;
+    return settleSpawn(child, 'headless backend');
   }
 
   // Dev: locate the built main bundle + node_modules/.bin/electron. Resolve
@@ -67,22 +63,44 @@ export function spawnHeadlessBackend(fromElectron: boolean): boolean {
       : join(root, 'node_modules', '.bin', 'electron');
   if (!existsSync(mainBundle)) {
     cliLog('cannot locate the Electron main bundle (out/main/index.js) — run `pnpm build` first');
-    return false;
+    return Promise.resolve(false);
   }
   if (!existsSync(electron)) {
     cliLog(`cannot locate the dev Electron binary at ${electron} — run \`pnpm install\` first`);
-    return false;
+    return Promise.resolve(false);
   }
   const child = spawn(electron, [mainBundle, '--kai-headless'], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, KAI_HEADLESS: '1', KAI_CLI: '' },
   });
-  child.on('error', (err) => {
-    cliLog(`failed to spawn dev backend: ${err instanceof Error ? err.message : String(err)}`);
+  return settleSpawn(child, 'dev backend');
+}
+
+/**
+ * Resolve a detached spawn's outcome from its async lifecycle: `true` once the
+ * child actually spawns, `false` on an `error` (ENOENT/EACCES) — so a failed
+ * launch fails FAST instead of leaving the caller to burn the full boot timeout
+ * polling a socket that will never appear. `unref()` after either event so the
+ * child stays independent of this process.
+ */
+function settleSpawn(child: ReturnType<typeof spawn>, label: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean, err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (!ok) cliLog(`failed to spawn ${label}: ${err ? (err.message ?? String(err)) : 'unknown error'}`);
+      try {
+        child.unref();
+      } catch {
+        /* ignore */
+      }
+      resolve(ok);
+    };
+    child.once('spawn', () => done(true));
+    child.once('error', (err: Error) => done(false, err));
   });
-  child.unref();
-  return true;
 }
 
 /** Poll the socket until a backend is listening, or the deadline passes. */
@@ -108,6 +126,6 @@ export async function waitForSocket(
 export async function recoverBackend(client: LocalBridgeClient, fromElectron: boolean): Promise<boolean> {
   if (await client.reconnect(6000)) return true;
   cliLog('backend gone — starting a new headless one…');
-  if (!spawnHeadlessBackend(fromElectron)) return false;
+  if (!(await spawnHeadlessBackend(fromElectron))) return false;
   return client.reconnect(BOOT_TIMEOUT_MS);
 }

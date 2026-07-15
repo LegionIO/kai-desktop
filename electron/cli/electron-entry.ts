@@ -62,7 +62,7 @@ export async function runCliClient(): Promise<void> {
   let client = await tryConnect(socketPath, token);
   if (!client) {
     if (!interactive) cliLog('no running Kai backend found — starting a headless one…');
-    if (!spawnHeadlessBackend(true)) {
+    if (!(await spawnHeadlessBackend(true))) {
       process.exit(1);
     }
     client = await waitForSocket(socketPath, BOOT_TIMEOUT_MS, token);
