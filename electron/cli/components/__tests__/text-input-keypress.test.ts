@@ -17,11 +17,20 @@ describe('reduceKeypress — #223 Ctrl/Meta combos are ignored (not typed)', () 
     expect(reduceKeypress(at('hi'), 'o', K({ ctrl: true }))).toBeNull();
   });
 
-  it('ignores any other Ctrl+letter and Meta+letter combo', () => {
-    for (const letter of ['a', 'k', 'z', 'w']) {
+  it('ignores other Ctrl+letter and Meta+letter combos (non-word-op ones)', () => {
+    // NOTE: the word-editing bindings are intentionally NOT ignored anymore —
+    // Ctrl-W (delete word back) and Meta-b/f/d (word nav / delete word fwd) are
+    // handled (see text-input-word-ops.test.ts). Everything else is still a
+    // no-insert app shortcut.
+    for (const letter of ['a', 'k', 'z']) {
       expect(reduceKeypress(at('hi'), letter, K({ ctrl: true })), `ctrl+${letter}`).toBeNull();
       expect(reduceKeypress(at('hi'), letter, K({ meta: true })), `meta+${letter}`).toBeNull();
     }
+    // Meta-w and Ctrl-b/f/d are NOT word ops (wrong modifier for the letter) → still ignored.
+    expect(reduceKeypress(at('hi'), 'w', K({ meta: true }))).toBeNull();
+    expect(reduceKeypress(at('hi'), 'b', K({ ctrl: true }))).toBeNull();
+    expect(reduceKeypress(at('hi'), 'f', K({ ctrl: true }))).toBeNull();
+    expect(reduceKeypress(at('hi'), 'd', K({ ctrl: true }))).toBeNull();
   });
 
   it('still ignores the navigation keys upstream skipped (up/down/tab/shift+tab/ctrl+c)', () => {
