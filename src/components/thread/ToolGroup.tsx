@@ -143,6 +143,10 @@ export const ToolCallDisplay: FC<{
   const isAgentTool = part.toolName === 'agent';
   const approvalStatus = localApproval ?? part.approvalStatus;
   const isPendingApproval = approvalStatus === 'pending' && !hasResult;
+  // After the user approves, the tool still has to execute + the turn resume —
+  // that gap can be several seconds. Show a spinner during it so the card
+  // doesn't look hung (a static "✓ Approved" reads as "done, nothing happening").
+  const isResolvingApproval = approvalStatus === 'approved' && !hasResult && !isError;
   // Some approvals attach a human-readable `reason` in the tool args (e.g. the
   // dangerous-automation gate). Surface it in the prompt so the user has the
   // context to consent without expanding the card.
@@ -215,6 +219,10 @@ export const ToolCallDisplay: FC<{
       : null;
 
   const handleApprove = useCallback(async () => {
+    // Idempotency: once a decision is recorded, ignore repeat clicks (a
+    // double-click, or the inline card + a dedicated approval window both firing)
+    // so we never send two approve/reject IPC calls for one approval.
+    if (localApproval) return;
     setLocalApproval('approved');
     void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
     // Bridge: create a task queue entry from approved plan
@@ -231,6 +239,7 @@ export const ToolCallDisplay: FC<{
     }
     refocusComposer();
   }, [
+    localApproval,
     part.toolCallId,
     part.approvalId,
     isPlanApproval,
@@ -241,10 +250,11 @@ export const ToolCallDisplay: FC<{
   ]);
 
   const handleReject = useCallback(() => {
+    if (localApproval) return;
     setLocalApproval('rejected');
     void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
     refocusComposer();
-  }, [part.toolCallId, part.approvalId]);
+  }, [localApproval, part.toolCallId, part.approvalId]);
 
   const handleDismiss = useCallback(() => {
     setLocalApproval('dismissed');
@@ -425,12 +435,18 @@ export const ToolCallDisplay: FC<{
       {!isPendingApproval &&
         (approvalStatus === 'approved' || (part.approvalStatus === 'pending' && hasResult)) &&
         !isAskUser &&
-        !(isPlanApproval && planContent) && (
+        !(isPlanApproval && planContent) &&
+        (isResolvingApproval ? (
+          <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <LoaderIcon className="h-3 w-3 animate-spin" />
+            <span>{isPlanApproval ? 'Plan accepted — starting…' : 'Approved — running…'}</span>
+          </div>
+        ) : (
           <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
             <CheckIcon className="h-3 w-3" />
             <span>{isPlanApproval ? 'Plan accepted — implementing' : 'Approved'}</span>
           </div>
-        )}
+        ))}
       {approvalStatus === 'rejected' && !isAskUser && !(isPlanApproval && planContent) && (
         <div className="ml-1 mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
           <SquareIcon className="h-3 w-3" />
