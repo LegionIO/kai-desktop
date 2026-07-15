@@ -44,6 +44,26 @@ export function nextWordOffset(value: string, cursor: number): number {
   return i;
 }
 
+/** True if `value[i]` is the HIGH half of a surrogate pair (an astral char like
+ *  an emoji), so cursor moves / deletes should step 2 code units, not 1. */
+function isSurrogatePairAt(value: string, i: number): boolean {
+  const hi = value.charCodeAt(i);
+  const lo = value.charCodeAt(i + 1);
+  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff;
+}
+
+/** Step one grapheme (surrogate-pair-aware) forward/back from `offset`. */
+function stepRight(value: string, offset: number): number {
+  return offset + (isSurrogatePairAt(value, offset) ? 2 : 1);
+}
+function stepLeft(value: string, offset: number): number {
+  // A low surrogate at offset-1 means offset-2 is the pair start.
+  const lo = value.charCodeAt(offset - 1);
+  const hi = value.charCodeAt(offset - 2);
+  const isPair = lo >= 0xdc00 && lo <= 0xdfff && hi >= 0xd800 && hi <= 0xdbff;
+  return offset - (isPair ? 2 : 1);
+}
+
 /**
  * Pure keystroke reducer for the composer. Returns the next {value,cursorOffset}
  * (plus `submit` on Enter), or null when the keystroke is IGNORED (navigation
@@ -69,10 +89,11 @@ export function reduceKeypress(
   // them). Only act when showing a live cursor.
   if (showCursor) {
     const lower = input.toLowerCase();
-    if (key.meta && lower === 'b') {
+    if ((key.meta && lower === 'b') || (key.meta && key.leftArrow)) {
+      // Word back (Meta-b, or terminals that send Option+Left as meta+leftArrow).
       return { ...state, cursorOffset: prevWordOffset(state.value, state.cursorOffset) };
     }
-    if (key.meta && lower === 'f') {
+    if ((key.meta && lower === 'f') || (key.meta && key.rightArrow)) {
       return { ...state, cursorOffset: nextWordOffset(state.value, state.cursorOffset) };
     }
     if (key.ctrl && lower === 'w') {
@@ -102,13 +123,22 @@ export function reduceKeypress(
   const { value: originalValue, cursorOffset } = state;
 
   if (key.leftArrow) {
-    if (showCursor) nextCursorOffset--;
+    if (showCursor && cursorOffset > 0) nextCursorOffset = stepLeft(originalValue, cursorOffset);
   } else if (key.rightArrow) {
-    if (showCursor) nextCursorOffset++;
-  } else if (key.backspace || key.delete) {
+    if (showCursor && cursorOffset < originalValue.length) nextCursorOffset = stepRight(originalValue, cursorOffset);
+  } else if (key.backspace) {
+    // Delete the grapheme BEFORE the cursor (surrogate-pair-aware so an emoji is
+    // removed whole, not split into an unpaired half).
     if (cursorOffset > 0) {
-      nextValue = originalValue.slice(0, cursorOffset - 1) + originalValue.slice(cursorOffset);
-      nextCursorOffset--;
+      const from = stepLeft(originalValue, cursorOffset);
+      nextValue = originalValue.slice(0, from) + originalValue.slice(cursorOffset);
+      nextCursorOffset = from;
+    }
+  } else if (key.delete) {
+    // Forward delete: remove the grapheme AFTER the cursor; cursor stays put.
+    if (cursorOffset < originalValue.length) {
+      const to = stepRight(originalValue, cursorOffset);
+      nextValue = originalValue.slice(0, cursorOffset) + originalValue.slice(to);
     }
   } else {
     nextValue = originalValue.slice(0, cursorOffset) + input + originalValue.slice(cursorOffset);
@@ -198,8 +228,11 @@ export function TextInput({
   if (!showCursor || !focus) return <Text>{value}</Text>;
 
   const before = value.slice(0, cursorOffset);
-  const atCursor = value[cursorOffset] ?? ' ';
-  const after = value.slice(cursorOffset + 1);
+  // Surrogate-pair-aware: highlight the whole grapheme under the cursor (an emoji
+  // is 2 code units) so we don't style/split half a surrogate pair.
+  const cursorEnd = cursorOffset < value.length ? stepRight(value, cursorOffset) : cursorOffset + 1;
+  const atCursor = value.slice(cursorOffset, cursorEnd) || ' ';
+  const after = value.slice(cursorEnd);
   return (
     <Text>
       {before}

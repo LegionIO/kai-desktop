@@ -65,4 +65,37 @@ describe('reduceKeypress — Option/Alt word editing (macOS bindings)', () => {
   it('does not act on word ops when showCursor is false', () => {
     expect(reduceKeypress(st('hello world', 11), 'b', k({ meta: true }), false)).toBeNull();
   });
+
+  it('meta+leftArrow / meta+rightArrow also do word nav (terminals that send arrows)', () => {
+    expect(reduceKeypress(st('hello world', 11), '', k({ meta: true, leftArrow: true }))?.cursorOffset).toBe(6);
+    expect(reduceKeypress(st('hello world', 0), '', k({ meta: true, rightArrow: true }))?.cursorOffset).toBe(5);
+  });
+});
+
+describe('reduceKeypress — surrogate-pair (emoji) + forward-delete', () => {
+  const emoji = '😀'; // 2 UTF-16 code units
+
+  it('backspace removes a whole emoji (not half a surrogate pair)', () => {
+    // "a😀" — cursor at end (offset 3). Backspace should leave "a" (offset 1).
+    const r = reduceKeypress(st(`a${emoji}`, 3), '', k({ backspace: true }));
+    expect(r).toEqual({ value: 'a', cursorOffset: 1 });
+  });
+
+  it('left/right arrows step over an emoji as one grapheme', () => {
+    // "😀b" — from offset 0, right arrow lands past the emoji (offset 2).
+    expect(reduceKeypress(st(`${emoji}b`, 0), '', k({ rightArrow: true }))?.cursorOffset).toBe(2);
+    // from offset 2 (after emoji), left arrow returns to 0.
+    expect(reduceKeypress(st(`${emoji}b`, 2), '', k({ leftArrow: true }))?.cursorOffset).toBe(0);
+  });
+
+  it('forward-delete removes the char AFTER the cursor, cursor stays', () => {
+    // "ab|cd" (offset 2), Delete → "ab|d" (offset 2), NOT "a|cd".
+    const r = reduceKeypress(st('abcd', 2), '', k({ delete: true }));
+    expect(r).toEqual({ value: 'abd', cursorOffset: 2 });
+  });
+
+  it('forward-delete removes a whole emoji after the cursor', () => {
+    const r = reduceKeypress(st(`a${emoji}b`, 1), '', k({ delete: true }));
+    expect(r).toEqual({ value: 'ab', cursorOffset: 1 });
+  });
 });
