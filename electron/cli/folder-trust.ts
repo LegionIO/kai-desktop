@@ -1,6 +1,6 @@
 import { realpathSync, readFileSync, existsSync, mkdirSync } from 'fs';
-import { homedir } from 'os';
-import { dirname, join } from 'path';
+import { homedir, userInfo } from 'os';
+import { dirname, join, isAbsolute } from 'path';
 import { getAppHome } from '../local-bridge/paths.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
@@ -51,9 +51,19 @@ export function canonicalizeDir(dir: string): string | null {
   }
 }
 
-/** The user's home directory, canonicalized — implicitly trusted. */
+/** The user's home directory, canonicalized — implicitly trusted.
+ *  Uses userInfo().homedir (the OS passwd entry), NOT homedir(), because
+ *  homedir() honors $HOME on POSIX — so `HOME=<untrusted dir> kai` would
+ *  otherwise make that dir implicitly trusted and skip the trust prompt.
+ *  Falls back to homedir() only if userInfo() throws (rare/edge platforms). */
 function canonicalHome(): string | null {
-  return canonicalizeDir(homedir());
+  let home: string;
+  try {
+    home = userInfo().homedir || homedir();
+  } catch {
+    home = homedir();
+  }
+  return home ? canonicalizeDir(home) : null;
 }
 
 function loadStore(): TrustStore {
@@ -61,8 +71,23 @@ function loadStore(): TrustStore {
   if (!existsSync(path)) return { version: 1, folders: [] };
   try {
     const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
-    if (raw && typeof raw === 'object' && Array.isArray((raw as TrustStore).folders)) {
-      const folders = (raw as TrustStore).folders.filter((f): f is string => typeof f === 'string');
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      (raw as TrustStore).version === 1 &&
+      Array.isArray((raw as TrustStore).folders)
+    ) {
+      // Keep only absolute-path strings, dedupe, and cap the count — a tampered
+      // or malformed store must not inject a bogus/relative trusted entry or
+      // grow unbounded. (The store lives in ~/.kai, so this is defense-in-depth.)
+      const seen = new Set<string>();
+      const folders: string[] = [];
+      for (const f of (raw as TrustStore).folders) {
+        if (typeof f !== 'string' || !isAbsolute(f) || seen.has(f)) continue;
+        seen.add(f);
+        folders.push(f);
+        if (folders.length >= 1000) break;
+      }
       return { version: 1, folders };
     }
   } catch {

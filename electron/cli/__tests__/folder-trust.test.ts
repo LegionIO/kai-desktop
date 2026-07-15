@@ -116,6 +116,40 @@ describe('folder-trust — fail closed', () => {
     writeFileSync(__internal.storePath(), 'garbage', 'utf-8');
     expect(isFolderTrusted(home)).toBe(true);
   });
+
+  it('does NOT trust a dir just because $HOME points at it (bypass defense)', async () => {
+    if (isWin) return; // $HOME semantics are POSIX
+    const sub = mkdtempSync(join(tmpdir(), 'kai-trust-fakehome-'));
+    const realHomeSaved = process.env.HOME;
+    try {
+      // A malicious wrapper could launch `HOME=<untrusted dir> kai` to make that
+      // dir look like HOME (implicitly trusted) and skip the prompt. canonicalHome
+      // uses userInfo().homedir (OS passwd), so the override must NOT grant trust.
+      process.env.HOME = sub;
+      vi.resetModules();
+      const { isFolderTrusted } = await load();
+      expect(isFolderTrusted(sub)).toBe(false);
+    } finally {
+      if (realHomeSaved === undefined) delete process.env.HOME;
+      else process.env.HOME = realHomeSaved;
+      rmSync(sub, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores a store with the wrong version or non-absolute entries', async () => {
+    const sub = join(work, 'proj-v');
+    mkdirSync(sub);
+    const real = realpathSync(sub);
+    const { __internal, isFolderTrusted } = await load();
+    mkdirSync(kaiHome, { recursive: true });
+    // Wrong version → whole store rejected.
+    writeFileSync(__internal.storePath(), JSON.stringify({ version: 2, folders: [real] }), 'utf-8');
+    expect(isFolderTrusted(sub)).toBe(false);
+    // Right version but a relative entry → that entry dropped.
+    writeFileSync(__internal.storePath(), JSON.stringify({ version: 1, folders: ['relative/path', real] }), 'utf-8');
+    expect(__internal.loadStore().folders).toEqual([real]);
+    expect(isFolderTrusted(sub)).toBe(true);
+  });
 });
 
 describe('confirmFolderTrust (the interactive gate)', () => {
