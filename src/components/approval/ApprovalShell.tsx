@@ -1,4 +1,5 @@
 import { useEffect, useState, type FC } from 'react';
+import { LoaderIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 
 type ApprovalRequest = {
@@ -36,14 +37,19 @@ export const ApprovalShell: FC<{ approvalId: string }> = ({ approvalId }) => {
   const prompt =
     typeof reason === 'string' && reason.trim() ? reason.trim() : 'This action requires your approval to continue.';
 
-  const resolve = (decision: 'approve' | 'reject') => {
+  const resolve = async (decision: 'approve' | 'reject') => {
     if (submitting) return;
     setSubmitting(true);
-
-    if (decision === 'approve') void app.agent.approveToolCall(approvalId);
-    else void app.agent.rejectToolCall(approvalId);
-    // Give the IPC a tick to flush, then close this window.
-    setTimeout(() => app.approval.close(approvalId), 50);
+    try {
+      // Await the IPC so the window stays up (showing the spinner) until main has
+      // actually resolved the pending approval, then close — rather than racing a
+      // fixed timer against the flush.
+      if (decision === 'approve') await app.agent.approveToolCall(approvalId);
+      else await app.agent.rejectToolCall(approvalId);
+    } catch {
+      /* main-side resolve is idempotent; close regardless */
+    }
+    app.approval.close(approvalId);
   };
 
   return (
@@ -66,8 +72,9 @@ export const ApprovalShell: FC<{ approvalId: string }> = ({ approvalId }) => {
           type="button"
           disabled={submitting || !request}
           onClick={() => resolve('approve')}
-          className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
         >
+          {submitting && <LoaderIcon className="h-3.5 w-3.5 animate-spin" />}
           {submitting ? 'Approving…' : 'Approve'}
         </button>
       </div>
