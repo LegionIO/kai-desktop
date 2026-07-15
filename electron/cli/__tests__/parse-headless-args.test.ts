@@ -11,6 +11,8 @@ const base = {
   profileKey: undefined,
   reasoningEffort: undefined,
   fallbackEnabled: false,
+  runtimeOverride: undefined,
+  list: undefined,
 } as const;
 
 describe('parseHeadlessArgs', () => {
@@ -76,6 +78,17 @@ describe('parseHeadlessArgs', () => {
 
   it('rejects an invalid --reasoning value', () => {
     expect(parseHeadlessArgs(['-p', 'x', '--reasoning', 'turbo']).reasoningEffort).toBeUndefined();
+  });
+
+  it('--runtime <id> and --runtime=<id>', () => {
+    expect(parseHeadlessArgs(['-p', 'x', '--runtime', 'codex-sdk']).runtimeOverride).toBe('codex-sdk');
+    expect(parseHeadlessArgs(['-p', 'x', '--runtime=pi']).runtimeOverride).toBe('pi');
+  });
+
+  it('--list-* discovery flags set the list mode', () => {
+    expect(parseHeadlessArgs(['--list-models']).list).toBe('models');
+    expect(parseHeadlessArgs(['--list-profiles']).list).toBe('profiles');
+    expect(parseHeadlessArgs(['--list-runtimes']).list).toBe('runtimes');
   });
 });
 

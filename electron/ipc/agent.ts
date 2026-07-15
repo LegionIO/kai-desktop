@@ -2541,6 +2541,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         fallbackEnabled?: boolean;
         cwd?: string;
         executionMode?: ExecutionMode;
+        /** Force a specific agent runtime for this turn (CLI --runtime). */
+        runtimeOverride?: string;
         /** Optional image attachments (CLI @image / paste / AppShots). Each
          *  `image` is a data URL or base64 string; appended as image parts to
          *  the user message so vision-capable models receive them. */
@@ -2692,6 +2694,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         opts?.fallbackEnabled ?? updated.fallbackEnabled,
         opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
         opts?.executionMode,
+        opts?.runtimeOverride ? { runtimeOverride: opts.runtimeOverride } : undefined,
       );
       return { ok: true, conversationId };
     },

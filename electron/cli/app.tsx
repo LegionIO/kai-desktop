@@ -679,7 +679,7 @@ export function App({
             kind: 'note',
             text:
               '/new  /resume [search]  /model [name]  /profile [name]  /rewind [n]  /compact  /clear\n' +
-              '/usage  /export [json|md] [path]  /mcp  /tools  /skills  /agents\n' +
+              '/usage  /export [json|md] [path]  /mcp [add|remove|toggle|test <name>]  /tools  /skills  /agents\n' +
               '/shot [caption]  /subagents  /subagent-stop [id]  /quit\n' +
               'attach an image inline with @path.png · keys: Esc cancel · Esc Esc rewind · Ctrl-O tools · Ctrl-C quit',
           });
@@ -937,16 +937,132 @@ export function App({
           break;
         }
         case 'mcp': {
-          const config = await client.invoke<{ mcpServers?: Array<{ name: string; enabled?: boolean }> }>('config:get');
-          const servers = Array.isArray(config?.mcpServers) ? config.mcpServers : [];
-          if (servers.length === 0) {
-            pushTurn({ kind: 'note', text: 'no MCP servers configured' });
+          // `/mcp`                     → list configured servers
+          // `/mcp add <name> <url>`    → add an HTTP/SSE server (url starts with http)
+          // `/mcp add <name> <cmd> [args…]` → add a stdio server
+          // `/mcp remove <name>`       → remove a server
+          // `/mcp toggle <name>`       → enable/disable a server
+          // `/mcp test <name>`         → test-connect a configured server
+          const parts = arg.trim().split(/\s+/).filter(Boolean);
+          const sub = parts[0]?.toLowerCase();
+          const readServers = async (): Promise<Array<Record<string, unknown>>> => {
+            const cfg = await client.invoke<{ mcpServers?: Array<Record<string, unknown>> }>('config:get');
+            return Array.isArray(cfg?.mcpServers) ? cfg.mcpServers : [];
+          };
+
+          if (!sub || sub === 'list') {
+            const servers = await readServers();
+            if (servers.length === 0) {
+              pushTurn({
+                kind: 'note',
+                text: 'no MCP servers configured. Add one: /mcp add <name> <url|command> [args…]',
+              });
+              break;
+            }
+            const lines = servers.map((sv) => {
+              const kind = sv.url
+                ? String(sv.url)
+                : `${String(sv.command ?? '?')} ${((sv.args as string[]) ?? []).join(' ')}`.trim();
+              return `  ${sv.enabled === false ? '○' : '●'} ${stripControl(String(sv.name ?? '?'))}  — ${stripControl(kind)}`;
+            });
+            pushTurn({ kind: 'note', text: `MCP servers:\n${lines.join('\n')}` });
             break;
           }
-          const lines = servers.map(
-            (sv) => `  ${sv.enabled === false ? '○' : '●'} ${stripControl(String(sv.name ?? '?'))}`,
-          );
-          pushTurn({ kind: 'note', text: `MCP servers:\n${lines.join('\n')}` });
+
+          if (sub === 'add') {
+            const name = parts[1];
+            const rest = parts.slice(2);
+            if (!name || rest.length === 0) {
+              pushTurn({ kind: 'note', text: 'usage: /mcp add <name> <url>   OR   /mcp add <name> <command> [args…]' });
+              break;
+            }
+            const servers = await readServers();
+            if (servers.some((s) => String(s.name) === name)) {
+              pushTurn({
+                kind: 'note',
+                text: `an MCP server named "${name}" already exists (use /mcp remove ${name} first)`,
+              });
+              break;
+            }
+            const isUrl = /^https?:\/\//i.test(rest[0]!);
+            const entry: Record<string, unknown> = isUrl
+              ? { name, url: rest[0], enabled: true }
+              : { name, command: rest[0], args: rest.slice(1), enabled: true };
+            await client.invoke('config:set', 'mcpServers', [...servers, entry]);
+            pushTurn({
+              kind: 'note',
+              text: `added MCP server "${name}" (${isUrl ? String(rest[0]) : `${rest[0]} ${rest.slice(1).join(' ')}`.trim()}). Test it with /mcp test ${name}`,
+            });
+            break;
+          }
+
+          if (sub === 'remove' || sub === 'rm') {
+            const name = parts[1];
+            const servers = await readServers();
+            if (!name || !servers.some((s) => String(s.name) === name)) {
+              pushTurn({
+                kind: 'note',
+                text: `no MCP server named "${name ?? ''}". /mcp list to see configured servers.`,
+              });
+              break;
+            }
+            await client.invoke(
+              'config:set',
+              'mcpServers',
+              servers.filter((s) => String(s.name) !== name),
+            );
+            pushTurn({ kind: 'note', text: `removed MCP server "${name}"` });
+            break;
+          }
+
+          if (sub === 'toggle') {
+            const name = parts[1];
+            const servers = await readServers();
+            const target = servers.find((s) => String(s.name) === name);
+            if (!name || !target) {
+              pushTurn({ kind: 'note', text: `no MCP server named "${name ?? ''}".` });
+              break;
+            }
+            const nextEnabled = target.enabled === false;
+            await client.invoke(
+              'config:set',
+              'mcpServers',
+              servers.map((s) => (String(s.name) === name ? { ...s, enabled: nextEnabled } : s)),
+            );
+            pushTurn({ kind: 'note', text: `MCP server "${name}" ${nextEnabled ? 'enabled' : 'disabled'}` });
+            break;
+          }
+
+          if (sub === 'test') {
+            const name = parts[1];
+            const servers = await readServers();
+            const target = servers.find((s) => String(s.name) === name);
+            if (!name || !target) {
+              pushTurn({
+                kind: 'note',
+                text: `no MCP server named "${name ?? ''}". /mcp list to see configured servers.`,
+              });
+              break;
+            }
+            pushTurn({ kind: 'note', text: `testing MCP server "${name}"…` });
+            const res = await client.invoke<{ status: string; toolCount?: number; error?: string }>(
+              'mcp:test-connection',
+              target,
+            );
+            pushTurn({
+              kind: 'note',
+              text:
+                res?.status === 'connected'
+                  ? `✓ "${name}" connected — ${res.toolCount ?? 0} tool(s)`
+                  : `✗ "${name}" failed: ${stripControl(String(res?.error ?? 'unknown error'))}`,
+            });
+            break;
+          }
+
+          pushTurn({
+            kind: 'note',
+            text: `unknown /mcp subcommand "${stripControl(sub)}". Use: list | add | remove | toggle | test`,
+          });
           break;
         }
         case 'tools': {

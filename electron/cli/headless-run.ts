@@ -24,6 +24,8 @@ export type HeadlessOptions = {
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   /** Enable the model fallback chain (--fallback). */
   fallbackEnabled?: boolean;
+  /** Force a specific agent runtime for the run (--runtime). */
+  runtimeOverride?: string;
   /**
    * Recover the backend after an unexpected disconnect (reconnect to the same
    * leader, or spawn + connect a fresh one). Returns true on success. When
@@ -57,6 +59,9 @@ export function parseHeadlessArgs(argv: string[]): {
   profileKey?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   fallbackEnabled: boolean;
+  runtimeOverride?: string;
+  /** A --list-* discovery request: print the list then exit (no turn). */
+  list?: 'models' | 'profiles' | 'runtimes';
 } {
   let print = false;
   let json = false;
@@ -66,6 +71,8 @@ export function parseHeadlessArgs(argv: string[]): {
   let modelKey: string | undefined;
   let profileKey: string | undefined;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | undefined;
+  let runtimeOverride: string | undefined;
+  let list: 'models' | 'profiles' | 'runtimes' | undefined;
 
   const REASONING = new Set(['low', 'medium', 'high', 'xhigh']);
   // Consume the value that follows a flag: prefers `--flag=value`, else the next
@@ -107,9 +114,19 @@ export function parseHeadlessArgs(argv: string[]): {
       const { value, nextI } = takeValue(a, '--reasoning=', i);
       if (value && REASONING.has(value)) reasoningEffort = value as 'low' | 'medium' | 'high' | 'xhigh';
       i = nextI;
+    } else if (a === '--runtime' || a.startsWith('--runtime=')) {
+      const { value, nextI } = takeValue(a, '--runtime=', i);
+      if (value) runtimeOverride = value;
+      i = nextI;
+    } else if (a === '--list-models') {
+      list = 'models';
+    } else if (a === '--list-profiles') {
+      list = 'profiles';
+    } else if (a === '--list-runtimes') {
+      list = 'runtimes';
     }
   }
-  return { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled };
+  return { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled, runtimeOverride, list };
 }
 
 /** The `kai --help` usage manual. */
@@ -131,7 +148,11 @@ export function helpText(): string {
     '      --model <key>            Model catalog key to run with.',
     '      --profile <key>          Profile key to run with.',
     '      --reasoning <level>      Reasoning effort: low | medium | high | xhigh.',
+    '      --runtime <id>           Agent runtime: mastra | claude-agent-sdk | codex-sdk | pi.',
     '      --fallback               Enable the model fallback chain.',
+    '      --list-models            Print available model catalog keys, then exit.',
+    '      --list-profiles          Print available profile keys, then exit.',
+    '      --list-runtimes          Print available runtimes (+ availability), then exit.',
     '  -h, --help                   Print this help and exit.',
     '',
     'NOTES:',
@@ -141,6 +162,47 @@ export function helpText(): string {
     '  • A mid-run backend reconnect is recovered automatically; the reply is read',
     '    from the persisted conversation if stream events were missed.',
   ].join('\n');
+}
+
+/**
+ * Handle a `--list-models|--list-profiles|--list-runtimes` request: query the
+ * backend and print the keys (one per line) to stdout, then return. Used for
+ * headless discovery of valid --model/--profile/--runtime values. Best-effort:
+ * a backend/IPC error prints a short note to stderr and returns (no throw).
+ */
+export async function listResources(
+  client: LocalBridgeClient,
+  what: 'models' | 'profiles' | 'runtimes',
+): Promise<void> {
+  try {
+    if (what === 'models') {
+      const res = (await client.invoke('agent:model-catalog')) as {
+        models?: Array<{ key: string; label?: string }>;
+        defaultKey?: string | null;
+      };
+      for (const m of res?.models ?? []) {
+        process.stdout.write(`${m.key}${m.key === res.defaultKey ? '  (default)' : ''}\n`);
+      }
+    } else if (what === 'profiles') {
+      const res = (await client.invoke('agent:profiles')) as {
+        profiles?: Array<{ key: string; label?: string }>;
+      };
+      for (const p of res?.profiles ?? []) process.stdout.write(`${p.key}\n`);
+    } else {
+      const runtimes = (await client.invoke('agent:get-available-runtimes')) as Array<{
+        id: string;
+        name: string;
+        available: boolean;
+        reason?: string;
+      }>;
+      for (const r of runtimes ?? []) {
+        const status = r.available ? 'available' : `unavailable${r.reason ? ` — ${r.reason}` : ''}`;
+        process.stdout.write(`${r.id}  (${r.name}) — ${status}\n`);
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`kai: could not list ${what}: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
 }
 
 /**
@@ -193,6 +255,7 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
     ...(opts.profileKey ? { profileKey: opts.profileKey } : {}),
     ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
     ...(opts.fallbackEnabled ? { fallbackEnabled: true } : {}),
+    ...(opts.runtimeOverride ? { runtimeOverride: opts.runtimeOverride } : {}),
   };
 
   let collected = ''; // full reply (for --json)

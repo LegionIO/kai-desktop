@@ -1,7 +1,7 @@
 import { getSocketPath, getBridgeToken } from '../local-bridge/paths.js';
 import { tryConnect } from './client.js';
 import { startRepl } from './ui.js';
-import { runHeadlessOnce, parseHeadlessArgs, helpText } from './headless-run.js';
+import { runHeadlessOnce, parseHeadlessArgs, helpText, listResources } from './headless-run.js';
 import {
   spawnHeadlessBackend,
   waitForSocket,
@@ -19,9 +19,8 @@ import { confirmFolderTrust } from './folder-trust.js';
  */
 async function main(): Promise<void> {
   process.noDeprecation = true; // silence Node DEP warnings (e.g. punycode) — noise to a `kai` user
-  const { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled } = parseHeadlessArgs(
-    process.argv.slice(2),
-  );
+  const { print, prompt, json, help, modelKey, profileKey, reasoningEffort, fallbackEnabled, runtimeOverride, list } =
+    parseHeadlessArgs(process.argv.slice(2));
 
   if (help) {
     process.stdout.write(helpText() + '\n');
@@ -66,6 +65,12 @@ async function main(): Promise<void> {
   const mismatch = checkVersionMismatch(activeClient);
   if (mismatch) cliLog(mismatch);
 
+  if (list) {
+    await listResources(activeClient, list);
+    activeClient.close();
+    process.exit(0);
+  }
+
   if (interactive) {
     await startRepl(activeClient, () => recoverBackend(activeClient, false));
     process.exit(0);
@@ -77,6 +82,7 @@ async function main(): Promise<void> {
       profileKey,
       reasoningEffort,
       fallbackEnabled,
+      runtimeOverride,
       recover: () => recoverBackend(activeClient, false),
     });
     await activeClient.requestShutdown();
