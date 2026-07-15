@@ -103,10 +103,23 @@ export function extractImageMentions(prompt: string, cwd: string): ImageMentionR
       notes.push(`@${raw}: unreadable (skipped)`);
       continue;
     }
-    totalBytes += st.size;
+    // Enforce the caps on the ACTUAL bytes read, not the earlier statSync size —
+    // a file that grew (or was replaced) between stat and read can't slip past
+    // the per-file or aggregate budget, and the total is accounted accurately.
+    if (buf.length > MAX_IMAGE_BYTES) {
+      notes.push(`@${raw}: too large (${Math.round(buf.length / 1024 / 1024)} MiB, skipped)`);
+      continue;
+    }
+    if (totalBytes + buf.length > MAX_IMAGE_TOTAL_BYTES) {
+      notes.push(
+        `@${raw}: skipped (total image budget ${Math.round(MAX_IMAGE_TOTAL_BYTES / 1024 / 1024)} MiB exceeded)`,
+      );
+      continue;
+    }
+    totalBytes += buf.length;
     const mime = IMAGE_EXT_MIME[extname(abs).toLowerCase()] ?? 'application/octet-stream';
     attachments.push({ image: `data:${mime};base64,${buf.toString('base64')}`, mimeType: mime });
-    notes.push(`@${raw}: attached image (${Math.round(st.size / 1024) || 1} KiB)`);
+    notes.push(`@${raw}: attached image (${Math.round(buf.length / 1024) || 1} KiB)`);
   }
 
   if (strip.length === 0) return { attachments, text: prompt, notes };

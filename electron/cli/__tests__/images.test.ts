@@ -2,7 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { extractImageMentions, isImagePath, MAX_IMAGE_BYTES, MAX_IMAGE_MENTIONS } from '../images.js';
+import {
+  extractImageMentions,
+  isImagePath,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_MENTIONS,
+  MAX_IMAGE_TOTAL_BYTES,
+} from '../images.js';
 
 describe('isImagePath', () => {
   it('recognizes image extensions (case-insensitive)', () => {
@@ -80,5 +86,16 @@ describe('extractImageMentions', () => {
     const r = extractImageMentions(names.join(' '), dir);
     expect(r.attachments.length).toBe(MAX_IMAGE_MENTIONS);
     expect(r.notes.some((n) => n.includes('image limit'))).toBe(true);
+  });
+
+  it('enforces the aggregate byte budget on actual bytes across mentions', () => {
+    // Two files each ~60% of the total budget: the first attaches, the second
+    // pushes past MAX_IMAGE_TOTAL_BYTES and is skipped with a budget note.
+    const each = Math.floor(MAX_IMAGE_TOTAL_BYTES * 0.6);
+    writeFileSync(join(dir, 'a.png'), Buffer.alloc(each, 1));
+    writeFileSync(join(dir, 'b.png'), Buffer.alloc(each, 2));
+    const r = extractImageMentions('@a.png @b.png', dir);
+    expect(r.attachments).toHaveLength(1);
+    expect(r.notes.some((n) => /total image budget/i.test(n))).toBe(true);
   });
 });
