@@ -131,7 +131,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build:mac
 
@@ -288,7 +288,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build:win
 
@@ -337,7 +337,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build:linux
 

@@ -150,7 +150,7 @@ jobs:
           restore-keys: |
             electron-${{ runner.os }}-
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       # Belt-and-suspenders against accidentally shipping debug switches that
       # would defeat the Electron Fuses. The packaged binary is validated by
@@ -263,7 +263,7 @@ jobs:
           restore-keys: |
             playwright-${{ runner.os }}-
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build
 
@@ -372,7 +372,7 @@ jobs:
           path: build/bin
           key: swift-helper-${{ runner.os }}-${{ hashFiles('electron/computer-use/helpers/LocalMacosHelper.swift', 'scripts/compile-swift-helper.sh') }}
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build:mac
 
@@ -398,7 +398,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - run: pnpm build:win
 
@@ -426,7 +426,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       # Rebuild native modules against the Electron ABI used by the app.
       # This invokes electron-builder install-app-deps under the hood —

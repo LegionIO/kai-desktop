@@ -89,7 +89,7 @@ jobs:
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       # Fail-closed gate on provider secrets. Without this the eval harness
       # would run with `RUN_REAL_EVALS=1` but no keys, fall through to

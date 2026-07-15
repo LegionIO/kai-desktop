@@ -78,7 +78,7 @@ jobs:
           restore-keys: |
             pnpm-store-${{ runner.os }}-
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
       - name: Prepare cost-ledger directory
         run: mkdir -p "${COST_LEDGER_DIR}"

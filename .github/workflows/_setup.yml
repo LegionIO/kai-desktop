@@ -82,4 +82,4 @@ jobs:
           restore-keys: |
             electron-${{ runner.os }}-
 
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile

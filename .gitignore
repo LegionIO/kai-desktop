@@ -9,7 +9,6 @@ build/bin/
 !.env.example
 .claude/settings.json
 pnpm-debug.log*
-pnpm-lock.yaml
 .npmrc
 *.tsbuildinfo
 

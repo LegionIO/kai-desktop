@@ -39,6 +39,7 @@
     "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
     "compare:fixture-shapes": "tsx scripts/compare-fixture-shapes.ts",
     "verify:fuses": "tsx scripts/verify-fuses.ts",
+    "check:lockfile-registry": "node scripts/check-lockfile-registry.mjs",
     "assert:update-verification": "tsx scripts/assert-update-verification.ts",
     "test:ipc-seam:linux": "playwright test --config playwright.config.ts",
     "validate:linux-cli": "docker run --rm -v \"$PWD/bin:/work/bin:ro\" -v \"$PWD/scripts/validate-linux-launcher.sh:/validate.sh:ro\" debian:stable-slim sh /validate.sh",
@@ -87,7 +88,7 @@
     "vitest": "4.1.5"
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "4.0.93",
+    "@ai-sdk/amazon-bedrock": "^4.0.93",
     "@ai-sdk/anthropic": "^3.0.69",
     "@ai-sdk/azure": "^3.0.53",
     "@ai-sdk/openai": "^3.0.52",
@@ -204,6 +205,9 @@
     ],
     "*.{js,json,md,yml,yaml}": [
       "prettier --write"
+    ],
+    "pnpm-lock.yaml": [
+      "node scripts/check-lockfile-registry.mjs"
     ]
   }
 }
