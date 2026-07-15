@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import { normalizeAgentCwd, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
@@ -322,6 +323,39 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     }
   }
 
+  // Dedicated approval window (flag-gated by ui.approvals.dedicatedWindow):
+  // open a small always-on-top window for an approval so answering it doesn't
+  // disturb the main window; close it once the tool resolves or the turn ends.
+  // The inline in-thread card still renders and resolves the same pending entry
+  // (whichever surface the user answers first wins — the resolve is idempotent).
+  if (event.conversationId) {
+    if (event.type === 'tool-approval-required' && event.toolCallId) {
+      let dedicated = false;
+      if (serverPersistAppHome) {
+        try {
+          dedicated = Boolean(readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow);
+        } catch {
+          dedicated = false;
+        }
+      }
+      if (dedicated) {
+        openApprovalWindow({
+          approvalId: event.toolCallId,
+          conversationId: event.conversationId,
+          toolName: event.toolName ?? 'tool',
+          args: event.args,
+        });
+      }
+    } else if (event.type === 'tool-result' && event.toolCallId) {
+      closeApprovalWindow(event.toolCallId);
+    } else if (event.type === 'done') {
+      // Turn ended (completed/cancelled) — no approval can still be pending.
+      // We don't have a per-id list here; the window's own resolve path + the
+      // tool-result close cover the normal case, and a stale window is harmless
+      // (it self-closes on answer). Nothing to do for the bulk case.
+    }
+  }
+
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
@@ -636,6 +670,9 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
   hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
   serverPersistAppHome = appHome;
+  // The dedicated approval window (flag-gated) posts answers through the
+  // existing agent:approve/reject/answer handlers, then asks to close itself.
+  registerApprovalWindowIpc();
 
   // Let the low-level raw broadcaster (used by the Claude SDK approval path)
   // tag events for CLI/headless-owned turns so a watching GUI renders live but

@@ -73,6 +73,18 @@ const appAPI = {
     getActiveRuntime: () => ipcRenderer.invoke('agent:get-active-runtime'),
   },
 
+  // Dedicated approval window (flag-gated). The window receives its request
+  // payload here and answers via the existing agent.approve/reject/answer
+  // methods, then calls close() to dismiss itself.
+  approval: {
+    onRequest: (callback: (request: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('approval:request', handler);
+      return () => ipcRenderer.removeListener('approval:request', handler);
+    },
+    close: (approvalId: string) => ipcRenderer.send('approval:close', approvalId),
+  },
+
   conversations: {
     list: () => ipcRenderer.invoke('conversations:list'),
     search: (term: string) => ipcRenderer.invoke('conversations:search', term),

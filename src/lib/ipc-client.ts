@@ -86,6 +86,10 @@ type AppAPI = {
     getAvailableRuntimes: () => Promise<Array<{ id: string; name: string; available: boolean; reason?: string }>>;
     getActiveRuntime: () => Promise<string>;
   };
+  approval: {
+    onRequest: (callback: (request: unknown) => void) => () => void;
+    close: (approvalId: string) => void;
+  };
   conversations: {
     list: () => Promise<unknown[]>;
     search: (term: string) => Promise<unknown[]>;

@@ -82,6 +82,7 @@ import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
 import { initOutputBuffer, flushAll as flushOutputBuffers } from './terminal/output-buffer.js';
 import { closeAllOverlayWindows } from './computer-use/overlay-window.js';
+import { closeAllApprovalWindows } from './approval-window.js';
 import { initDictation, updateDictationConfig, cleanupDictation } from './dictation/dictation-manager.js';
 import { initAppShots, updateAppShotsConfig, cleanupAppShots } from './app-shots/manager.js';
 import { registerAppShotsHandlers } from './ipc/app-shots.js';
@@ -2198,6 +2199,7 @@ app.on('before-quit', () => {
   // Stop the computer-use takeover monitor's native helper child (not auto-killed on exit).
   getExistingComputerUseManager()?.dispose();
   closeAllOverlayWindows();
+  closeAllApprovalWindows();
   taskTerminalManagerRef?.dispose();
   flushOutputBuffers();
   taskDispatcherRef?.stop();

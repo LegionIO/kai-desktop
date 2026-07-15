@@ -28,6 +28,16 @@ vi.mock('electron', () => ({
   },
 }));
 
+// The dedicated approval window pulls ipcMain/screen from electron; stub it so
+// this test's minimal electron mock doesn't need them.
+vi.mock('../../approval-window.js', () => ({
+  openApprovalWindow: vi.fn(),
+  closeApprovalWindow: vi.fn(),
+  closeAllApprovalWindows: vi.fn(),
+  registerApprovalWindowIpc: vi.fn(),
+  hasApprovalWindow: vi.fn(() => false),
+}));
+
 vi.mock('../../web-server/web-clients.js', () => ({
   broadcastToWebClients: vi.fn(),
   webClients: new Set(),

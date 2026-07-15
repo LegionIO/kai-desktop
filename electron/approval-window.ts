@@ -1,0 +1,156 @@
+import { BrowserWindow, ipcMain, screen } from 'electron';
+import { join } from 'node:path';
+import { applyBrandUserAgent } from './utils/user-agent.js';
+import { showMacDockWithPaddedIcon } from './utils/dock-icon.js';
+
+// Same app icon path as electron/main.ts + overlay-window.ts.
+const APP_ICON = join(import.meta.dirname, '../build/icon.png');
+
+/** Payload the approval window renders. Mirrors the tool-approval-required event. */
+export type ApprovalWindowRequest = {
+  approvalId: string;
+  conversationId: string;
+  toolName: string;
+  /** Tool args — may carry a human-readable `reason` and (for ask_user) questions. */
+  args?: unknown;
+};
+
+/**
+ * Open approval prompts in their own small always-on-top window so answering
+ * one does not raise/disturb the main Kai window. Flag-gated by
+ * `ui.approvals.dedicatedWindow`; the inline in-thread card remains the
+ * baseline and still resolves the same pendingToolApprovals entry, so whichever
+ * surface the user answers first wins (the main-process resolve is idempotent).
+ *
+ * Deduped by approvalId — a repeat request for the same id focuses the existing
+ * window instead of opening a second one.
+ */
+const approvalWindows = new Map<string, BrowserWindow>();
+
+function loadApprovalRoute(win: BrowserWindow, query: Record<string, string>): void {
+  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+  const rendererHtmlPath = join(import.meta.dirname, '../renderer/index.html');
+
+  if (rendererUrl) {
+    const targetUrl = new URL(rendererUrl);
+    for (const [key, value] of Object.entries(query)) {
+      targetUrl.searchParams.set(key, value);
+    }
+    void win.loadURL(targetUrl.toString());
+    return;
+  }
+  void win.loadFile(rendererHtmlPath, { query });
+}
+
+function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
+  try {
+    if (!win.isDestroyed() && win.webContents && !win.webContents.isDestroyed()) {
+      win.webContents.send(channel, data);
+    }
+  } catch {
+    // Window/frame disposed between check and send — ignore.
+  }
+}
+
+/**
+ * Open (or focus) the dedicated approval window for a request. Returns the
+ * window. Idempotent per approvalId.
+ */
+export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindow {
+  const existing = approvalWindows.get(request.approvalId);
+  if (existing && !existing.isDestroyed()) {
+    // Re-send the payload (renderer may have mounted late) and surface it.
+    safelySend(existing, 'approval:request', request);
+    if (!existing.isVisible()) existing.showInactive();
+    return existing;
+  }
+
+  const preloadPath = join(import.meta.dirname, '../preload/index.mjs');
+  const primary = screen.getPrimaryDisplay();
+  const width = 460;
+  const height = 300;
+  // Top-center of the primary display — visible without covering the main
+  // window's content area.
+  const x = Math.round(primary.workArea.x + (primary.workArea.width - width) / 2);
+  const y = Math.round(primary.workArea.y + 64);
+
+  const win = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    title: 'Kai — approval required',
+    webPreferences: {
+      preload: preloadPath,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+  applyBrandUserAgent(win.webContents);
+
+  // Float above normal windows across Spaces so it's answerable without
+  // switching to the main window.
+  win.setAlwaysOnTop(true, 'floating');
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+
+  loadApprovalRoute(win, { approval: '1', approvalId: request.approvalId });
+
+  win.once('ready-to-show', () => {
+    // show() (not showInactive) so the user can answer immediately, but we never
+    // touch the main window, so it stays where it was (minimized/behind).
+    win.show();
+    safelySend(win, 'approval:request', request);
+    showMacDockWithPaddedIcon(APP_ICON);
+  });
+
+  win.on('closed', () => {
+    approvalWindows.delete(request.approvalId);
+  });
+
+  approvalWindows.set(request.approvalId, win);
+  return win;
+}
+
+/** Close the approval window for an id once it's resolved/aborted. Idempotent. */
+export function closeApprovalWindow(approvalId: string): void {
+  const win = approvalWindows.get(approvalId);
+  approvalWindows.delete(approvalId);
+  if (win && !win.isDestroyed()) win.destroy();
+}
+
+/** Close every approval window (app quit / conversation cancel). */
+export function closeAllApprovalWindows(): void {
+  for (const [id, win] of approvalWindows) {
+    approvalWindows.delete(id);
+    if (!win.isDestroyed()) win.destroy();
+  }
+}
+
+export function hasApprovalWindow(approvalId: string): boolean {
+  const win = approvalWindows.get(approvalId);
+  return Boolean(win && !win.isDestroyed());
+}
+
+let closeIpcRegistered = false;
+/**
+ * Register the one IPC the approval window itself needs: a request from the
+ * renderer to close its own approval window after it has posted the answer
+ * through the existing agent:approve/reject/answer channels. Call once at
+ * startup. The answer channels themselves are already registered by ipc/agent.
+ */
+export function registerApprovalWindowIpc(): void {
+  if (closeIpcRegistered) return;
+  closeIpcRegistered = true;
+  ipcMain.on('approval:close', (_event, approvalId: unknown) => {
+    if (typeof approvalId === 'string' && approvalId) closeApprovalWindow(approvalId);
+  });
+}

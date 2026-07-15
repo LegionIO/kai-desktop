@@ -912,6 +912,17 @@ export const appConfigSchema = z.object({
         showModelProfileSelector: z.boolean(),
       })
       .default({ showModelProfileSelector: true }),
+    /**
+     * Tool/plan/ask_user approval prompts. When `dedicatedWindow` is on, an
+     * approval opens in its own small always-on-top window (so answering it
+     * doesn't disturb the main Kai window) in addition to the inline card.
+     * Default off — the inline card is the baseline experience.
+     */
+    approvals: z
+      .object({
+        dedicatedWindow: z.boolean().default(false),
+      })
+      .default({ dedicatedWindow: false }),
   }),
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,

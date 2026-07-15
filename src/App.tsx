@@ -26,6 +26,7 @@ import { PluginSettingsModal } from '@/components/plugins/PluginSettingsModal';
 import { DisablePluginModal } from '@/components/plugins/DisablePluginModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
+import { ApprovalShell } from '@/components/approval/ApprovalShell';
 import { DictationOverlay } from '@/components/dictation/DictationOverlay';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { useAppShots } from '@/hooks/useAppShots';
@@ -129,6 +130,8 @@ function AppRoot() {
   const isOperatorWindow = search?.get('operator') === '1';
   const isOverlayWindow = search?.get('overlay') === '1';
   const isDictationOverlay = search?.get('dictationOverlay') === '1';
+  const isApprovalWindow = search?.get('approval') === '1';
+  const approvalId = isApprovalWindow ? (search?.get('approvalId') ?? null) : null;
   const isComputerSetupWindow = isOperatorWindow && search?.get('setup') === '1';
   const operatorSessionId = isOperatorWindow && !isComputerSetupWindow ? search.get('sessionId') : null;
   const operatorConversationId = isComputerSetupWindow ? search?.get('conversationId') : null;
@@ -136,6 +139,10 @@ function AppRoot() {
 
   if (isDictationOverlay) {
     return <DictationOverlay />;
+  }
+
+  if (approvalId) {
+    return <ApprovalShell approvalId={approvalId} />;
   }
 
   if (overlaySessionId) {

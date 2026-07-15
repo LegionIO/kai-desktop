@@ -10,6 +10,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
     fullWidthContent?: boolean;
     splashBackground?: string;
     composer?: { showModelProfileSelector?: boolean };
+    approvals?: { dedicatedWindow?: boolean };
   };
   const titleGen =
     (config.titleGeneration as
@@ -185,6 +186,16 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
         />
         <p className="text-[10px] text-muted-foreground -mt-2">
           Display inline model and profile dropdowns in the chat composer toolbar.
+        </p>
+        <Toggle
+          id="ui.approvals.dedicatedWindow"
+          label="Open approval prompts in a dedicated window"
+          checked={!!ui.approvals?.dedicatedWindow}
+          onChange={(v) => updateConfig('ui.approvals.dedicatedWindow', v)}
+        />
+        <p className="text-[10px] text-muted-foreground -mt-2">
+          Show tool/plan approval prompts in their own always-on-top window so answering one doesn&apos;t disturb the
+          main Kai window. The inline in-chat prompt still appears too.
         </p>
       </fieldset>
 
