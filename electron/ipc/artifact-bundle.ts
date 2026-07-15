@@ -32,9 +32,18 @@ export type BundleReactResult = { ok: true; code: string } | { ok: false; error:
  * for unit testing.
  */
 export function artifactBindsReact(source: string): boolean {
-  const importRe = /^\s*import\s+([^;]*?)\s+from\s+['"]react['"]/gm;
-  let m: RegExpExecArray | null;
-  while ((m = importRe.exec(source)) !== null) {
+  // Scan line by line rather than one multiline regex: `([^;]*?)\s+from` can
+  // backtrack quadratically on a long import-like line that never matches
+  // `from 'react'` (a crafted near-512KB source could freeze the main process).
+  // Splitting on newlines bounds each match to a single line, and we only test
+  // lines that actually import from 'react'/"react".
+  const importRe = /^\s*import\s+(.+?)\s+from\s+['"]react['"]\s*;?\s*$/;
+  for (const line of source.split('\n')) {
+    // Cheap prefilter: skip any line that can't be a react import (avoids running
+    // the backtracking-capable regex on every line).
+    if (line.length > 2048 || !line.includes('import') || !line.includes('react')) continue;
+    const m = importRe.exec(line);
+    if (!m) continue;
     const clause = m[1];
     // Default import: `React` / `React, { ... }` (identifier before any `{`/`*`)
     if (/^\s*React\b/.test(clause)) return true;

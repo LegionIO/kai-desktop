@@ -44,6 +44,20 @@ describe('artifactBindsReact', () => {
   it('handles double-quoted and single-quoted specifiers', () => {
     expect(artifactBindsReact('import React from "react";')).toBe(true);
   });
+
+  it('returns quickly on a pathological input (no quadratic backtracking)', () => {
+    // Many long import-like lines that never resolve to `from 'react'` would
+    // catastrophically backtrack the old single multiline regex. Bounded now.
+    const evil = (`import ${'x'.repeat(3000)} `.repeat(1) + '\n').repeat(2000); // ~6MB of import-ish lines
+    const t0 = Date.now();
+    expect(artifactBindsReact(evil)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('still detects react binding mixed into a large non-matching source', () => {
+    const big = "import { foo } from 'other';\n".repeat(5000) + "import React from 'react';\n";
+    expect(artifactBindsReact(big)).toBe(true);
+  });
 });
 
 describe('bundleReact import allowlist (end-to-end esbuild)', () => {
