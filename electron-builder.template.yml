@@ -94,17 +94,17 @@ mac:
   # darwin-${process.arch} variant. The bundled esbuild extraResource is
   # host-arch-only and currently unused at runtime.
   x64ArchFiles: "Contents/Resources/{esbuild/bin/esbuild,app.asar.unpacked/**}"
-  # The AWS SDK's deep transitive tree (@aws-sdk/*, @smithy/*, @aws-crypto/*) is
-  # PURE JS (no arch-specific binaries) but pnpm can place individual packages at
-  # different positions in the x64 vs arm64 dependency tree during the universal
-  # build, so @electron/universal's mergeASARs flags a package DIRECTORY as a
-  # "unique file not covered by allowList" and fails — and it's whack-a-mole
-  # (xml-builder one build, @smithy/core the next). Since every package under
-  # these scopes is byte-identical across arches and needed at runtime (Bedrock),
-  # allow the whole family to appear in a single arch's asar; the universal merge
-  # keeps one copy. `{,/**}` matches the package/scope DIRECTORY entry itself AND
-  # its descendants (a trailing `/**` alone misses the dir entry mergeASARs flags).
-  singleArchFiles: "{node_modules,**/node_modules}/{@aws-sdk,@smithy,@aws-crypto}/**{,/**}"
+  # The AWS SDK's deep transitive tree is PURE JS (no arch-specific binaries) but
+  # @electron/universal's mergeASARs can flag a package DIRECTORY as a "unique
+  # file not covered by allowList" because pnpm places packages at slightly
+  # different positions in the x64 vs arm64 packed asar — whack-a-mole across the
+  # whole closure (xml-builder → @smithy/core → fast-xml-builder …). Every one of
+  # these is byte-identical across arches and needed at runtime (Bedrock), so
+  # allow the whole AWS SDK closure — the scoped packages AND its bare-name deps
+  # (fast-xml-*, strnum, bowser, mnemonist) — to appear in a single arch's asar;
+  # the universal merge keeps one copy. `{,/**}` matches the package DIRECTORY
+  # entry itself AND its descendants (a trailing `/**` alone misses the dir entry).
+  singleArchFiles: "{node_modules,**/node_modules}/{@aws-sdk,@smithy,@aws-crypto,fast-xml-parser,fast-xml-builder,strnum,bowser,mnemonist}{,/**}"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
