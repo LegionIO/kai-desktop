@@ -359,6 +359,22 @@ describe('agent conversationTarget', () => {
     expect(appendConversationMessages).not.toHaveBeenCalled();
   });
 
+  it('records a FAILED action (not success) when mid-turn injection fails', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: false, error: 'conversation-not-found' }));
+    const rec = await executeActions(
+      agentAction({ type: 'existing', conversationId: 'convA' }),
+      evt,
+      deps({ injectUserTurnAndRestart }),
+    );
+    // The action result must be marked failed (ok:false), carrying the error —
+    // NOT recorded as a success (which would silently lose e.g. an alert answer).
+    expect(rec.results[0].ok).toBe(false);
+    expect(String(rec.results[0].error ?? '')).toMatch(/injection into convA failed|conversation-not-found/);
+  });
+
   it('busy existing target with onBusyTarget:"divert" still diverts even when a helper is bound', async () => {
     resetMockStore({
       convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },

@@ -284,11 +284,22 @@ async function runAgentAction(
   // streamHandler, and its assistant reply is written by the server-persist
   // accumulator. The literal (already-interpolated) prompt is passed as-is.
   if (resolved && 'busyInject' in resolved) {
+    // If the busy target is held by a PRIOR automation run (streamForPlugin,
+    // tracked in automationRunAborts — NOT activeStreams), abort THAT run first.
+    // injectUserTurnAndRestart only aborts the activeStreams entry, so without
+    // this the old automation stream would run concurrently with the injected
+    // one — duplicating tool effects and racing persistence into the same convo.
+    abortAutomationRun(resolved.busyInject);
     const res = await deps.injectUserTurnAndRestart!(resolved.busyInject, prompt, {
       modelKey: action.modelKey,
       profileKey: action.profileKey,
     });
-    return { injectedInto: resolved.busyInject, ok: res.ok, error: res.error };
+    // Surface a failed injection as a failed action (don't record ok:false as
+    // success) so e.g. an alert answer that couldn't be delivered isn't lost.
+    if (!res.ok) {
+      throw new Error(`mid-turn injection into ${resolved.busyInject} failed: ${res.error ?? 'unknown error'}`);
+    }
+    return { injectedInto: resolved.busyInject, ok: true };
   }
 
   if (opts?.strictExistingTarget && action.conversationTarget?.type === 'existing' && !resolved) {
@@ -567,9 +578,16 @@ async function runAgentAction(
     // Surface a real failure to the engine's run record — but only AFTER the
     // conversation has been finalized above. A thrown stream error (or an
     // `error` event with no output) is a genuine failure; an abort is not. A
-    // persistence failure during finalize is also a genuine failure.
-    if (!aborted && (caughtStreamError || finalizeError || (error && !text))) {
-      const failMsg = error ?? (finalizeError instanceof Error ? finalizeError.message : null);
+    // persistence failure during finalize is also a genuine failure. And a
+    // `null` append with no error (appendConversationMessages returns null, not
+    // throws, when the target conversation was DELETED mid-stream) means the
+    // reply was silently dropped — also a genuine failure, not a success.
+    const persistDropped = appended === null && !finalizeError;
+    if (!aborted && (caughtStreamError || finalizeError || persistDropped || (error && !text))) {
+      const failMsg =
+        error ??
+        (finalizeError instanceof Error ? finalizeError.message : null) ??
+        (persistDropped ? `conversation ${conversationId} was removed before the reply could be saved` : null);
       throw new Error(failMsg ?? 'Automation agent run failed');
     }
     return { text, modelKey, toolCalls, conversationId };
