@@ -65,6 +65,12 @@ extraResources:
     filter:
       - "**/*"
       - "!.gitkeep"
+  # Prebuilt mermaid render runtime (scripts/build-mermaid-runtime.mjs, run in
+  # `pnpm build`). Landed at process.resourcesPath/mermaid-runtime.js and read by
+  # the artifact:bundle-mermaid IPC — so mermaid + its ~58 deps do NOT need to be
+  # asarUnpack'd and there's no runtime esbuild on the render path.
+  - from: resources/mermaid-runtime.js
+    to: mermaid-runtime.js
 {{esbuildExtraResources}}
 icon: build/icon
 # Electron Fuses — locked-down per ADR 0001 (docs/adr/0001-electron-fuses-policy.md).

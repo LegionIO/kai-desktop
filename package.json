@@ -12,7 +12,8 @@
   "license": "MIT",
   "scripts": {
     "dev": "node scripts/maybe-compile-swift.mjs && electron-vite dev",
-    "build": "node scripts/maybe-compile-swift.mjs && electron-vite build",
+    "build": "node scripts/maybe-compile-swift.mjs && node scripts/build-mermaid-runtime.mjs && electron-vite build",
+    "generate:mermaid": "node scripts/build-mermaid-runtime.mjs",
     "kai": "node out/main/cli.js",
     "kai:build": "electron-vite build && node out/main/cli.js",
     "preview": "electron-vite preview",
@@ -145,6 +146,7 @@
     "json5": "^2.2.3",
     "jsonrepair": "^3.13.3",
     "lucide-react": "^1.8.0",
+    "mermaid": "^11.4.1",
     "microsoft-cognitiveservices-speech-sdk": "^1.49.0",
     "node-forge": "^1.4.0",
     "openai": "^6.34.0",

@@ -277,7 +277,85 @@ export function registerArtifactBundleHandlers(ipcMain: IpcMain): void {
     const source = payload && typeof payload === 'object' ? payload.source : undefined;
     return bundleReact(source as string);
   });
+  ipcMain.handle('artifact:bundle-mermaid', (): Promise<BundleReactResult> => bundleMermaidRuntime());
+}
+
+// ---------------------------------------------------------------------------
+// Mermaid runtime bundle
+// ---------------------------------------------------------------------------
+
+/**
+ * The mermaid render runtime, bundled ONCE (independent of any diagram) into a
+ * self-contained IIFE that exposes `window.__renderMermaid(source, isDark)` →
+ * Promise. It initializes mermaid with `startOnLoad:false` + `securityLevel:
+ * 'strict'` (mermaid sanitizes labels; the diagram source is model-generated so
+ * we keep the strict default rather than the plugin's 'loose'), renders the
+ * source, and returns the SVG string. The diagram source itself is NEVER passed
+ * through esbuild — it's injected as a runtime string by the renderer wrapper —
+ * so there's no untrusted-import surface here; the only import is our trusted
+ * `mermaid`. Cached under a constant key (same bundle every call).
+ */
+const MERMAID_ENTRY = `
+import mermaid from 'mermaid';
+
+window.__renderMermaid = async function (source, isDark) {
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: isDark ? 'dark' : 'default',
+    fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+  });
+  const id = 'artifact-mermaid-' + Math.random().toString(36).slice(2, 10);
+  const { svg } = await mermaid.render(id, source);
+  return svg;
+};
+`;
+
+const MERMAID_CACHE_KEY = 'mermaid-runtime-v1';
+
+async function bundleMermaidRuntime(): Promise<BundleReactResult> {
+  const cached = cacheGet(MERMAID_CACHE_KEY);
+  if (cached !== undefined) return { ok: true, code: cached };
+
+  // Prefer the prebuilt runtime shipped as an app resource (built at package
+  // time by scripts/build-mermaid-runtime.mjs → resources/mermaid-runtime.js).
+  // This avoids esbuilding ~58 packages / ~3.3 MB at render time and avoids
+  // asarUnpacking the whole mermaid dep tree.
+  try {
+    const { readFileSync, existsSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const prebuilt = join(process.resourcesPath ?? '', 'mermaid-runtime.js');
+    if (process.resourcesPath && existsSync(prebuilt)) {
+      const code = readFileSync(prebuilt, 'utf8');
+      cacheSet(MERMAID_CACHE_KEY, code);
+      return { ok: true, code };
+    }
+  } catch {
+    // fall through to the dev-time live bundle
+  }
+
+  // Dev fallback (no packaged resource): esbuild the fixed runtime live from the
+  // repo's node_modules. Slow first time, but only hit in `pnpm dev`.
+  try {
+    const esbuild = await import('esbuild');
+    const resolveDir = app.getAppPath().replace(/app\.asar(?=[/\\]|$)/, 'app.asar.unpacked');
+    const result = await esbuild.build({
+      stdin: { contents: MERMAID_ENTRY, resolveDir, loader: 'ts', sourcefile: 'mermaid-entry.ts' },
+      bundle: true,
+      format: 'iife',
+      minify: true,
+      write: false,
+      define: { 'process.env.NODE_ENV': '"production"' },
+      logLevel: 'silent',
+    });
+    const out = result.outputFiles?.[0]?.text;
+    if (!out) return { ok: false, error: 'Bundler produced no output.' };
+    cacheSet(MERMAID_CACHE_KEY, out);
+    return { ok: true, code: out };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /** Test-only exposure of the bundler for end-to-end import-allowlist coverage. */
-export const __internal = { bundleReact };
+export const __internal = { bundleReact, bundleMermaidRuntime };

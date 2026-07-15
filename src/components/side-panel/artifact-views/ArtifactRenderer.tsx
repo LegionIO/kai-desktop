@@ -193,17 +193,94 @@ const ReactArtifact: FC<{ content: string; title: string }> = ({ content, title 
   return <SandboxedFrame srcDoc={state.srcDoc} title={title} />;
 };
 
-/** `mermaid` is not in package.json (npmjs.org is blocked) — render source with a note. */
-const MermaidStub: FC<{ content: string }> = ({ content }) => (
-  <div className="flex h-full flex-col">
-    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-400">
-      Mermaid rendering is not available in this build. Showing diagram source.
-    </div>
-    <div className="min-h-0 flex-1 overflow-auto p-3">
-      <CodeBlock code={content} language="mermaid" maxHeight="none" />
-    </div>
-  </div>
-);
+/**
+ * Wrap the bundled mermaid runtime IIFE + the diagram source into a sandboxed
+ * document. The runtime exposes `window.__renderMermaid(source, isDark)`; a
+ * second inline script calls it with the JSON-encoded source (never spliced as
+ * code) and injects the resulting SVG into #root, or shows the parse error.
+ * Network-free CSP + `sandbox="allow-scripts"` — same model as React artifacts.
+ */
+function wrapMermaidBundle(runtimeCode: string, source: string, isDark: boolean): string {
+  const escaped = runtimeCode.replace(/<\/script>/gi, '<\\/script>');
+  // JSON.stringify is safe to embed in a <script> except for the `</` sequence
+  // and JS line separators — neutralize those so the string can't break out.
+  const srcLiteral = JSON.stringify(source)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+  return [
+    '<!doctype html><html><head><meta charset="utf-8">',
+    cspMeta(),
+    `<style>${BASE_STYLES}#root{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:12px}svg{max-width:100%;height:auto}.err{color:#b91c1c;font:12px ui-monospace,monospace;white-space:pre-wrap;padding:12px}</style>`,
+    '</head><body><div id="root"></div>',
+    '<script>',
+    escaped,
+    '</script>',
+    '<script>',
+    `(function(){var s=${srcLiteral};var dark=${isDark ? 'true' : 'false'};`,
+    'var root=document.getElementById("root");',
+    'Promise.resolve().then(function(){return window.__renderMermaid(s,dark);})',
+    '.then(function(svg){root.innerHTML=svg;})',
+    '.catch(function(e){var d=document.createElement("div");d.className="err";d.textContent="Mermaid parse error: "+(e&&e.message?e.message:String(e));root.innerHTML="";root.appendChild(d);});',
+    '})();',
+    '</script>',
+    '</body></html>',
+  ].join('');
+}
+
+/**
+ * Render a mermaid diagram by bundling the mermaid runtime locally (esbuild in
+ * the main process, mirroring React artifacts) and running it in the sandboxed
+ * iframe. Falls back to showing the diagram source if bundling fails (e.g. a
+ * build without the mermaid dependency).
+ */
+const MermaidArtifact: FC<{ content: string }> = ({ content }) => {
+  const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+  const [state, setState] = useState<
+    { status: 'loading' } | { status: 'ready'; srcDoc: string } | { status: 'error'; error: string }
+  >({ status: 'loading' });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ status: 'loading' });
+    app.artifacts
+      .bundleMermaid()
+      .then((result) => {
+        if (cancelled) return;
+        if (result.ok) {
+          setState({ status: 'ready', srcDoc: wrapMermaidBundle(result.code, content, isDark) });
+        } else {
+          setState({ status: 'error', error: result.error });
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setState({ status: 'error', error: err instanceof Error ? err.message : String(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [content, isDark]);
+
+  if (state.status === 'loading') {
+    return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">Rendering…</div>;
+  }
+
+  if (state.status === 'error') {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-400">
+          Mermaid rendering is unavailable ({state.error}). Showing diagram source.
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-3">
+          <CodeBlock code={content} language="mermaid" maxHeight="none" />
+        </div>
+      </div>
+    );
+  }
+
+  return <SandboxedFrame srcDoc={state.srcDoc} title="Mermaid diagram" />;
+};
 
 export const ArtifactRenderer: FC<{ type: ArtifactType; content: string; title: string }> = ({
   type,
@@ -225,7 +302,7 @@ export const ArtifactRenderer: FC<{ type: ArtifactType; content: string; title: 
   }
 
   if (type === 'mermaid') {
-    return <MermaidStub content={content} />;
+    return <MermaidArtifact content={content} />;
   }
 
   if (type === 'react') {

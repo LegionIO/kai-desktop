@@ -7,7 +7,7 @@ vi.mock('electron', () => ({ app: { getAppPath: () => process.cwd() } }));
 
 import { artifactBindsReact, __internal } from '../artifact-bundle.js';
 
-const { bundleReact } = __internal;
+const { bundleReact, bundleMermaidRuntime } = __internal;
 
 describe('artifactBindsReact', () => {
   it('detects a default import', () => {
@@ -86,4 +86,25 @@ describe('bundleReact import allowlist (end-to-end esbuild)', () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toMatch(/512KB/i);
   });
+});
+
+describe('bundleMermaidRuntime (dev esbuild fallback)', () => {
+  // process.resourcesPath is undefined under vitest, so this exercises the
+  // dev-time live-esbuild path, bundling mermaid from the repo's node_modules.
+  it('bundles a self-contained runtime that exposes __renderMermaid', async () => {
+    const res = await bundleMermaidRuntime();
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.code).toContain('__renderMermaid');
+      // Non-trivial bundle (mermaid + deps), not an empty/error stub.
+      expect(res.code.length).toBeGreaterThan(500 * 1024);
+    }
+  }, 60000);
+
+  it('caches the runtime (second call returns the same code without rebuilding)', async () => {
+    const a = await bundleMermaidRuntime();
+    const b = await bundleMermaidRuntime();
+    expect(a.ok && b.ok).toBe(true);
+    if (a.ok && b.ok) expect(b.code).toBe(a.code);
+  }, 60000);
 });

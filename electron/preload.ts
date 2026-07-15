@@ -252,6 +252,10 @@ const appAPI = {
       ipcRenderer.invoke('artifact:bundle-react', { source }) as Promise<
         { ok: true; code: string } | { ok: false; error: string }
       >,
+    bundleMermaid: () =>
+      ipcRenderer.invoke('artifact:bundle-mermaid') as Promise<
+        { ok: true; code: string } | { ok: false; error: string }
+      >,
   },
 
   automations: {

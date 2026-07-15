@@ -206,6 +206,7 @@ type AppAPI = {
   };
   artifacts: {
     bundleReact: (source: string) => Promise<{ ok: true; code: string } | { ok: false; error: string }>;
+    bundleMermaid: () => Promise<{ ok: true; code: string } | { ok: false; error: string }>;
   };
   automations: {
     catalog: () => Promise<AutomationSourceCatalogEntry[]>;
