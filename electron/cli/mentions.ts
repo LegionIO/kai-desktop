@@ -75,8 +75,17 @@ export function expandFileMentions(prompt: string, cwd: string): MentionResult {
       notes.push(`@${raw}: unreadable (skipped)`);
       continue;
     }
+    // Enforce the cap on the ACTUAL bytes read, not the earlier statSync size —
+    // a file that grew (or was replaced) between stat and read can't slip a
+    // larger-than-cap body into the prompt/context. The pre-read st.size check
+    // above stays as a fast-path filter for the honest common case.
+    const bodyBytes = Buffer.byteLength(body, 'utf-8');
+    if (bodyBytes > MAX_MENTION_BYTES) {
+      notes.push(`@${raw}: too large (${Math.round(bodyBytes / 1024)} KiB > ${MAX_MENTION_BYTES / 1024} KiB, skipped)`);
+      continue;
+    }
     attachments.push({ display: raw, body });
-    notes.push(`@${raw}: attached (${Math.round(st.size / 1024) || 1} KiB)`);
+    notes.push(`@${raw}: attached (${Math.round(bodyBytes / 1024) || 1} KiB)`);
   }
 
   if (attachments.length === 0) return { text: prompt, notes };
