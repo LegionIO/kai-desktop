@@ -34,6 +34,12 @@ files:
   - "!**/node_modules/active-win/lib/binding/napi-*-darwin-*/**"
   - "!**/node_modules/active-win/lib/binding/napi-*-linux-*/**"
   - "!**/node_modules/active-win/build-tmp-*/**"
+  # node-addon-api is a BUILD-TIME header-only package (no `main`, no runtime JS/
+  # .node) pulled in transitively by active-win + node-mac-permissions. With
+  # npmRebuild:false its files differ between the x64 and arm64 dependency trees,
+  # tripping @electron/universal's "unique file not covered by allowList"
+  # symmetry check. Nothing require()s it at runtime, so drop it from the package.
+  - "!**/node_modules/node-addon-api/**"
 # smartUnpack auto-detects most native binaries, but the Codex CLI lives deep
 # under vendor/<triple>/codex/codex inside an optionalDependency and has been
 # missed — leaving it inside app.asar makes spawn() fail with ENOTDIR. List it
