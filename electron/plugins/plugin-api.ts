@@ -9,6 +9,23 @@ import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { appendFileSync, mkdirSync } from 'fs';
+
+// TEMP debug (KAI_DEBUG_AUTH=1): trace every URL the plugin auth window navigates
+// to, so we can see the EXACT callback the IdP returns (query vs fragment, token
+// present or not). Redacts obvious secrets. Writes ~/.kai/debug-logs/auth-flow.log.
+function debugAuth(msg: string): void {
+  if (!process.env.KAI_DEBUG_AUTH) return;
+  try {
+    const dir = join(homedir(), '.kai', 'debug-logs');
+    mkdirSync(dir, { recursive: true });
+    // Redact token-ish values so the log is safe to share.
+    const safe = msg.replace(/(token|access_token|id_token|code|secret)=[^&\s]+/gi, '$1=<redacted>');
+    appendFileSync(join(dir, 'auth-flow.log'), `[${new Date().toISOString()}] ${safe}\n`);
+  } catch {
+    /* ignore */
+  }
+}
 
 import type {
   PluginAPI,
@@ -1033,20 +1050,29 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
               try {
                 const parsed = new URL(redirectUrl);
                 const params: Record<string, string> = {};
-                parsed.searchParams.forEach((value, key) => {
+                const take = (key: string, value: string): void => {
                   if (!extractParams || extractParams.includes(key)) {
-                    params[key] = value;
+                    // First writer wins, but don't let an empty query value shadow a
+                    // real fragment value (or vice-versa).
+                    if (params[key] === undefined || params[key] === '') params[key] = value;
                   }
-                });
+                };
+                // Query string (?token=…&state=…) — the expected shape.
+                parsed.searchParams.forEach((value, key) => take(key, value));
+                // AND the URL fragment (#token=…&state=…) — OAuth implicit-style
+                // flows return credentials in the hash, which searchParams misses.
+                if (parsed.hash && parsed.hash.length > 1) {
+                  const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+                  hashParams.forEach((value, key) => take(key, value));
+                }
 
-                // A hidden-first auth attempt loads the auth URL invisibly, hoping an
-                // existing session silently redirects to the callback WITH the expected
-                // params (e.g. a token). If the IdP instead bounces to the callback with
-                // none of them (stale/expired session, `?error=login_required`, etc.),
-                // this is NOT a completed sign-in.
                 const gotExpectedParams = extractParams
                   ? extractParams.some((k) => params[k] !== undefined && params[k] !== '')
                   : Object.keys(params).length > 0;
+
+                debugAuth(
+                  `callback hit: ${redirectUrl.split('?')[0]}${parsed.hash ? '#…' : ''} | query keys=[${[...parsed.searchParams.keys()].join(',')}] hash=${parsed.hash ? 'yes' : 'no'} | extracted=[${Object.keys(params).join(',')}] gotExpected=${gotExpectedParams} wasShown=${wasShown} recovered=${hiddenRedirectRecovered}`,
+                );
 
                 // First hidden tokenless bounce: reload the login form + reveal the
                 // window for interactive login (never settle a bogus success while
@@ -1115,6 +1141,13 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             authWin.webContents.on('will-navigate', handleRedirect);
           }
 
+          // TEMP (KAI_DEBUG_AUTH): log the full navigation chain so we can see
+          // where the IdP sends the auth window and in what shape.
+          if (process.env.KAI_DEBUG_AUTH) {
+            authWin.webContents.on('did-navigate', (_e, u) => debugAuth(`did-navigate: ${u.split('?')[0]}`));
+            authWin.webContents.on('did-redirect-navigation', (_e, u) => debugAuth(`did-redirect: ${u.split('?')[0]}`));
+          }
+
           // Provide helpers to the caller for auto-login / webContents interaction
           if (onReady) {
             const helpers = {
@@ -1134,6 +1167,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             onReady(helpers);
           }
 
+          debugAuth(
+            `open auth window: url=${url.split('?')[0]} callbackMatch=${callbackMatch} extractParams=[${extractParams?.join(',') ?? ''}] showOnCreate=${showOnCreate} showAfterMs=${showAfterMs ?? ''}`,
+          );
           authWin.loadURL(url).catch((err) => {
             settle({ success: false, error: `Failed to load auth URL: ${err.message}` });
           });
