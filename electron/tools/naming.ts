@@ -27,8 +27,12 @@ export function isValidToolName(name: string): boolean {
 }
 
 export function makeSafeToolName(name: string, fallback = 'tool'): string {
-  if (isValidToolName(name)) return name;
-  return sanitizeToolSegment(name, fallback);
+  // Even a charset-valid name can exceed the length limit (the pattern doesn't
+  // constrain length), which after the SDK's `mcp__kai__` prefix blows the 64-
+  // char API cap. Always enforce the length; sanitize the fallback too so a bad
+  // caller-supplied fallback can't itself violate the pattern.
+  const safe = isValidToolName(name) ? name : sanitizeToolSegment(name, sanitizeToolSegment(fallback, 'tool'));
+  return capToolNameLength(safe);
 }
 
 export function buildScopedToolName(
@@ -72,7 +76,10 @@ export function getScopedToolPrefix(source: Extract<ToolSource, 'mcp' | 'skill' 
 }
 
 export function findToolByName(tools: ToolDefinition[], toolName: string): ToolDefinition | undefined {
-  return tools.find((tool) => tool.name === toolName || tool.aliases?.includes(toolName));
+  // Exact NAME wins over any alias: an alias on an earlier tool must never
+  // shadow a later tool whose real name is `toolName` (that would dispatch the
+  // call to the wrong tool). Two passes: all exact names first, then aliases.
+  return tools.find((tool) => tool.name === toolName) ?? tools.find((tool) => tool.aliases?.includes(toolName));
 }
 
 export function ensureSafeToolDefinition(tool: ToolDefinition): ToolDefinition {
@@ -111,15 +118,22 @@ export function dedupeToolNames(tools: ToolDefinition[]): ToolDefinition[] {
       return tool;
     }
     const basis = `${tool.source ?? ''}:${tool.sourceId ?? ''}:${tool.originalName ?? tool.name}`;
-    const suffix = '_' + createHash('sha1').update(basis).digest('hex').slice(0, 6);
-    // Fit the suffix within the length limit by trimming the base name if needed.
-    const base =
-      tool.name.length + suffix.length > MAX_TOOL_NAME_LENGTH
-        ? tool.name.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length).replace(/[_-]+$/, '')
-        : tool.name;
-    let disambiguated = base + suffix;
-    // Extremely unlikely, but guarantee uniqueness even if the hash collides.
-    while (seen.has(disambiguated)) disambiguated += 'x';
+    const hash = createHash('sha1').update(basis).digest('hex').slice(0, 6);
+    // Build a disambiguated name that ALWAYS stays within the length limit, even
+    // through the (astronomically unlikely) hash-collision retry: fold a bounded
+    // counter into the suffix and re-fit the base against the total suffix length
+    // each attempt — never just append chars (which would push a maxed-out name
+    // over the limit → API rejection / tool loss).
+    let disambiguated = '';
+    for (let n = 0; ; n++) {
+      const suffix = '_' + hash + (n === 0 ? '' : String(n));
+      const base =
+        tool.name.length + suffix.length > MAX_TOOL_NAME_LENGTH
+          ? tool.name.slice(0, MAX_TOOL_NAME_LENGTH - suffix.length).replace(/[_-]+$/, '')
+          : tool.name;
+      disambiguated = base + suffix;
+      if (!seen.has(disambiguated)) break;
+    }
     seen.add(disambiguated);
     console.warn(
       `[naming] Duplicate tool name "${tool.name}" (source=${tool.source ?? '?'} id=${tool.sourceId ?? '?'}) ` +

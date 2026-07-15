@@ -17,9 +17,11 @@ function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
     description: overrides.description ?? 'Get tasks under a Rally user story.',
     source: overrides.source ?? 'plugin',
     sourceId: overrides.sourceId ?? 'rally',
-    inputSchema: overrides.inputSchema ?? z.object({
-      formattedId: z.string().describe('User story FormattedID'),
-    }),
+    inputSchema:
+      overrides.inputSchema ??
+      z.object({
+        formattedId: z.string().describe('User story FormattedID'),
+      }),
     execute: overrides.execute ?? (async (input) => ({ ok: true, input })),
     ...overrides,
   };
@@ -37,14 +39,19 @@ describe('CodexMcpBridge', () => {
     let receivedAbortSignal: AbortSignal | undefined;
     const abortController = new AbortController();
     bridge = new CodexMcpBridge();
-    const url = await bridge.start([
-      createTool({
-        execute: async (_input, context) => {
-          receivedAbortSignal = context.abortSignal;
-          return { ok: true, input: _input };
-        },
-      }),
-    ], 'test-conversation', '/tmp', abortController.signal);
+    const url = await bridge.start(
+      [
+        createTool({
+          execute: async (_input, context) => {
+            receivedAbortSignal = context.abortSignal;
+            return { ok: true, input: _input };
+          },
+        }),
+      ],
+      'test-conversation',
+      '/tmp',
+      abortController.signal,
+    );
     const client = new Client({ name: 'kai-test-client', version: '1.0.0' });
     const authToken = bridge.getAuthToken();
     const transport = new StreamableHTTPClientTransport(new URL(url), {
@@ -62,7 +69,9 @@ describe('CodexMcpBridge', () => {
         mimeType: 'application/json',
         uri: 'kai://tools',
       });
-      expect('text' in catalog.contents[0] && catalog.contents[0].text.includes('rally_list_user_story_tasks')).toBe(true);
+      expect('text' in catalog.contents[0] && catalog.contents[0].text.includes('rally_list_user_story_tasks')).toBe(
+        true,
+      );
 
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toContain('rally_list_user_story_tasks');
@@ -105,10 +114,7 @@ describe('CodexMcpBridge', () => {
 
     expect(config).toEqual({
       url: 'http://127.0.0.1:12345/mcp',
-      enabled_tools: [
-        'rally_list_user_story_tasks',
-        'rally_get_feature_details',
-      ],
+      enabled_tools: ['rally_list_user_story_tasks', 'rally_get_feature_details'],
     });
   });
 
@@ -128,11 +134,15 @@ describe('CodexMcpBridge', () => {
       }),
     ]);
 
-    expect(entries.map((entry) => entry.name)).toEqual([
-      'unsafe_tool_name',
-      'plugin__unsafe__second',
-      'x'.repeat(54),
-    ]);
+    const names = entries.map((entry) => entry.name);
+    // First two: sanitized (invalid→_) + deduped by the bridge as before.
+    expect(names[0]).toBe('unsafe_tool_name');
+    expect(names[1]).toBe('plugin__unsafe__second');
+    // Third: a charset-valid but 80-char name is now length-capped WITH a
+    // deterministic hash suffix (not bare-truncated to 54 x's — that would let
+    // two distinct long names sharing a 54-prefix collide). Fits the limit.
+    expect(names[2]).toMatch(/^x+_[0-9a-f]{6}$/);
+    expect(names[2].length).toBe(54);
     expect(entries.every((entry) => /^[a-zA-Z0-9_-]+$/.test(entry.name))).toBe(true);
     expect(entries.every((entry) => entry.name.length <= 54)).toBe(true);
   });
