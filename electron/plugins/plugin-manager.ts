@@ -59,6 +59,17 @@ import { checkPluginCompatibility } from './plugin-compat.js';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
+/**
+ * Whether a newly-computed plugin UI-state snapshot differs from the last one
+ * broadcast (compared by serialized JSON). When it hasn't changed, the emit is
+ * skipped — a plugin re-publishing identical (potentially multi-MB) state, or a
+ * no-op trigger, would otherwise re-broadcast the whole payload to every
+ * window/web/CLI client for nothing. Exported for testing.
+ */
+export function uiStateChanged(lastJson: string, nextJson: string): boolean {
+  return lastJson !== nextJson;
+}
+
 /** A plugin name is used as an on-disk path segment (plugin-settings/<name>/…)
  *  and as an identity key, so it must be a strict slug — no separators, no
  *  traversal, no leading dot. Mirrors the skills-loader name rule. */
@@ -132,6 +143,18 @@ export class PluginManager {
   private sessionDisabled: Set<string> = new Set();
 
   private brandRequiredPluginNamesSet: Set<string>;
+
+  /**
+   * UI-state broadcast coalescing + dedup. broadcastUIState() is called from
+   * many triggers (plugin load, config change, and — frequently — plugin
+   * publishedState updates via onUIStateChanged). Rebuilding + broadcasting the
+   * FULL snapshot on every call is wasteful: the snapshot can be large (a plugin
+   * that publishes big state), and successive calls are often byte-identical or
+   * arrive in bursts. Debounce a burst into one emit, and skip the emit entirely
+   * when the serialized snapshot hasn't changed since the last broadcast.
+   */
+  private uiStateBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastBroadcastUIStateJson = '';
 
   constructor(
     private pluginsDir: string,
@@ -751,6 +774,11 @@ export class PluginManager {
     if (this.catalogRefreshTimer) {
       clearInterval(this.catalogRefreshTimer);
       this.catalogRefreshTimer = null;
+    }
+    // Cancel any pending debounced UI-state broadcast so it can't fire after teardown.
+    if (this.uiStateBroadcastTimer) {
+      clearTimeout(this.uiStateBroadcastTimer);
+      this.uiStateBroadcastTimer = null;
     }
 
     // Unload in reverse of load order: non-required plugins first (reverse alpha), then required plugins in reverse order
@@ -1462,7 +1490,39 @@ export class PluginManager {
   }
 
   private broadcastUIState(): void {
-    broadcastToAllWindows('plugin:ui-state-changed', this.getUIState());
+    // Coalesce bursts (e.g. several plugins publishing state in the same tick, or
+    // a plugin updating state rapidly) into a single emit on the next tick.
+    if (this.uiStateBroadcastTimer) return;
+    this.uiStateBroadcastTimer = setTimeout(() => {
+      this.uiStateBroadcastTimer = null;
+      this.flushUIStateBroadcast();
+    }, 50);
+  }
+
+  /** Build + broadcast the UI-state snapshot once (invoked by the debounce
+   *  timer). Serializes once, and skips the emit when the snapshot is unchanged. */
+  private flushUIStateBroadcast(): void {
+    if (this.uiStateBroadcastTimer) {
+      clearTimeout(this.uiStateBroadcastTimer);
+      this.uiStateBroadcastTimer = null;
+    }
+    const state = this.getUIState();
+    let json: string;
+    try {
+      json = JSON.stringify(state);
+    } catch {
+      // Unserializable snapshot — fall back to broadcasting the object directly
+      // (broadcastToAllWindows guards its own serialization) and skip dedup.
+      broadcastToAllWindows('plugin:ui-state-changed', state);
+      return;
+    }
+    // Dedup: skip re-broadcasting a byte-identical snapshot. A plugin that
+    // re-publishes the same (possibly large) state, or a trigger that didn't
+    // actually change anything, would otherwise re-send the whole payload to
+    // every window/web/CLI client for nothing.
+    if (!uiStateChanged(this.lastBroadcastUIStateJson, json)) return;
+    this.lastBroadcastUIStateJson = json;
+    broadcastToAllWindows('plugin:ui-state-changed', state);
   }
 
   /* ── Actions (renderer → main) ── */
