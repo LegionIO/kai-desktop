@@ -1,9 +1,12 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, writeFileSync, statSync, mkdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const SUPERPOWERS_REPO = 'https://github.com/obra/superpowers.git';
 const SUPERPOWERS_DIR_NAME = 'superpowers';
+/** Cap a single SKILL.md read from the UNTRUSTED cloned repo — a giant file
+ *  shouldn't be read into memory / spliced into a skill prompt. */
+const MAX_SKILL_MD_BYTES = 256 * 1024;
 
 export function parseSkillMdFrontmatter(content: string): { name?: string; description?: string } {
   const match = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
@@ -38,7 +41,16 @@ export function generateSkillJson(sourceDir: string, outputDir: string, skillNam
 
   // Don't overwrite if skill.json already exists (user may have customized)
   if (existsSync(skillJsonPath)) return false;
-  if (!existsSync(skillMdPath)) return false;
+  // SKILL.md must be a REGULAR file — the cloned repo is untrusted, so a symlink
+  // here (e.g. → ~/.ssh/id_rsa) must not be followed and read into a skill prompt.
+  let md;
+  try {
+    md = lstatSync(skillMdPath);
+  } catch {
+    return false;
+  }
+  if (!md.isFile()) return false;
+  if (md.size > MAX_SKILL_MD_BYTES) return false;
 
   const content = readFileSync(skillMdPath, 'utf-8');
   const frontmatter = parseSkillMdFrontmatter(content);
@@ -94,22 +106,26 @@ export function bootstrapSuperpowers(skillsDir: string): void {
   }
 
   for (const entry of entries) {
-    const skillSubDir = join(repoSkillsDir, entry);
     try {
-      if (!statSync(skillSubDir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
+      const skillSubDir = join(repoSkillsDir, entry);
+      // lstat (not stat): a symlinked "skill dir" in the untrusted checkout must
+      // be rejected, not followed out of the repo. Only real directories.
+      if (!lstatSync(skillSubDir).isDirectory()) continue;
 
-    // Create a wrapper directory in the main skills dir that the loader can find
-    const wrapperDir = join(skillsDir, `superpowers-${entry}`);
-    if (!existsSync(wrapperDir)) {
-      mkdirSync(wrapperDir, { recursive: true });
-    }
+      // Create a wrapper directory in the main skills dir that the loader can find
+      const wrapperDir = join(skillsDir, `superpowers-${entry}`);
+      if (!existsSync(wrapperDir)) {
+        mkdirSync(wrapperDir, { recursive: true });
+      }
 
-    // Read SKILL.md from the repo and generate skill.json in the wrapper dir
-    if (generateSkillJson(skillSubDir, wrapperDir, `superpowers-${entry}`)) {
-      generated++;
+      // Read SKILL.md from the repo and generate skill.json in the wrapper dir
+      if (generateSkillJson(skillSubDir, wrapperDir, `superpowers-${entry}`)) {
+        generated++;
+      }
+    } catch (err) {
+      // One malformed/hostile skill must not abort the whole bootstrap (it runs
+      // at startup). Skip it and continue.
+      console.warn(`[Superpowers] Skipping skill "${entry}":`, err);
     }
   }
 
@@ -134,15 +150,15 @@ export function updateSuperpowers(skillsDir: string): void {
     if (!existsSync(repoSkillsDir)) return;
 
     for (const entry of readdirSync(repoSkillsDir)) {
-      const skillSubDir = join(repoSkillsDir, entry);
       try {
-        if (!statSync(skillSubDir).isDirectory()) continue;
-      } catch {
-        continue;
+        const skillSubDir = join(repoSkillsDir, entry);
+        if (!lstatSync(skillSubDir).isDirectory()) continue;
+        const wrapperDir = join(skillsDir, `superpowers-${entry}`);
+        if (!existsSync(wrapperDir)) mkdirSync(wrapperDir, { recursive: true });
+        generateSkillJson(skillSubDir, wrapperDir, `superpowers-${entry}`);
+      } catch (err) {
+        console.warn(`[Superpowers] Skipping skill "${entry}" during update:`, err);
       }
-      const wrapperDir = join(skillsDir, `superpowers-${entry}`);
-      if (!existsSync(wrapperDir)) mkdirSync(wrapperDir, { recursive: true });
-      generateSkillJson(skillSubDir, wrapperDir, `superpowers-${entry}`);
     }
   } catch (err) {
     console.warn('[Superpowers] Failed to update superpowers:', err);

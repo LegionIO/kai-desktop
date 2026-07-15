@@ -6,7 +6,7 @@
  * user-customized skill.json must never be overwritten.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseSkillMdFrontmatter, getSkillMdBody, generateSkillJson } from '../superpowers-bootstrap.js';
@@ -91,6 +91,23 @@ describe('generateSkillJson', () => {
 
   it('returns false and writes nothing when SKILL.md is absent', () => {
     const wrote = generateSkillJson(src, out, 'superpowers-missing');
+    expect(wrote).toBe(false);
+    expect(existsSync(join(out, 'skill.json'))).toBe(false);
+  });
+
+  it('rejects a SKILL.md that is a SYMLINK (untrusted repo must not read outside itself)', () => {
+    // A hostile checkout could symlink SKILL.md → a secret file; lstat must reject it.
+    const secret = join(root, 'secret.txt');
+    writeFileSync(secret, 'super secret contents');
+    symlinkSync(secret, join(src, 'SKILL.md'));
+    const wrote = generateSkillJson(src, out, 'superpowers-evil');
+    expect(wrote).toBe(false);
+    expect(existsSync(join(out, 'skill.json'))).toBe(false);
+  });
+
+  it('rejects an oversized SKILL.md (> 256 KiB) without reading it into a skill', () => {
+    writeFileSync(join(src, 'SKILL.md'), 'x'.repeat(256 * 1024 + 1));
+    const wrote = generateSkillJson(src, out, 'superpowers-huge');
     expect(wrote).toBe(false);
     expect(existsSync(join(out, 'skill.json'))).toBe(false);
   });
