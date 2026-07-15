@@ -219,34 +219,33 @@ describe('PiRuntime', () => {
   });
 
   describe('session id', () => {
-    it('generates a session id, passes it via --session-id, and emits it as enrichment', async () => {
-      spawnState.events = [{ type: 'agent_end' }];
+    it("first turn: no --session, captures pi's emitted session id as an enrichment", async () => {
+      // pi emits {type:'session',id} at stream start; the runtime captures it.
+      spawnState.events = [{ type: 'session', id: 'pi-generated-abc' }, { type: 'agent_end' }];
       const events = await collect(new PiRuntime().stream(makeOptions()));
 
       const enrichment = events.find((e) => e.type === 'enrichment');
-      const piSessionId = (enrichment?.data as { piSessionId?: string })?.piSessionId;
-      expect(piSessionId).toBeTruthy();
+      expect((enrichment?.data as { piSessionId?: string })?.piSessionId).toBe('pi-generated-abc');
 
       const args = spawnState.calls[0].args;
-      const idx = args.indexOf('--session-id');
-      expect(idx).toBeGreaterThanOrEqual(0);
-      expect(args[idx + 1]).toBe(piSessionId);
-      // Must not conflict with these resume flags.
+      // First turn must NOT pass --session (pi would error on an unknown id) or
+      // any other resume flag; it DOES pin the session dir.
+      expect(args).not.toContain('--session');
+      expect(args).not.toContain('--session-id');
       expect(args).not.toContain('--continue');
       expect(args).not.toContain('--resume');
-      expect(args).not.toContain('--session');
       expect(args).not.toContain('--fork');
+      expect(args).toContain('--session-dir');
     });
 
-    it('reuses an existing piSessionId from conversation metadata', async () => {
+    it('reuses an existing piSessionId via --session', async () => {
       spawnState.events = [{ type: 'agent_end' }];
-      const events = await collect(
-        new PiRuntime().stream(makeOptions({ conversationMetadata: { piSessionId: 'prev-session-1' } })),
-      );
-      const enrichment = events.find((e) => e.type === 'enrichment');
-      expect((enrichment?.data as { piSessionId?: string })?.piSessionId).toBe('prev-session-1');
+      await collect(new PiRuntime().stream(makeOptions({ conversationMetadata: { piSessionId: 'prev-session-1' } })));
       const args = spawnState.calls[0].args;
-      expect(args[args.indexOf('--session-id') + 1]).toBe('prev-session-1');
+      const idx = args.indexOf('--session');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe('prev-session-1');
+      expect(args).not.toContain('--session-id');
     });
   });
 
@@ -287,22 +286,25 @@ describe('PiRuntime', () => {
   });
 
   describe('approval → tool scoping', () => {
-    it('full-auto (default) passes no exclusions', async () => {
+    it('full-auto (default) passes no tool restriction', async () => {
       spawnState.events = [{ type: 'agent_end' }];
       await collect(new PiRuntime().stream(makeOptions()));
-      expect(spawnState.calls[0].args).not.toContain('--exclude-tools');
+      const args = spawnState.calls[0].args;
+      expect(args).not.toContain('--tools');
+      expect(args).not.toContain('--no-builtin-tools');
+      expect(args).not.toContain('--exclude-tools'); // pi has no such flag
     });
 
-    it('auto-edit excludes bash; suggest excludes bash,edit,write', async () => {
+    it("maps approval to pi's --tools allowlist (read | read,write,edit)", async () => {
       spawnState.events = [{ type: 'agent_end' }];
       await collect(new PiRuntime().stream(makeOptions({ config: makeConfig({ piSdk: { approval: 'auto-edit' } }) })));
       let args = spawnState.calls[0].args;
-      expect(args[args.indexOf('--exclude-tools') + 1]).toBe('bash');
+      expect(args[args.indexOf('--tools') + 1]).toBe('read,write,edit'); // no bash
 
       spawnState.calls = [];
       await collect(new PiRuntime().stream(makeOptions({ config: makeConfig({ piSdk: { approval: 'suggest' } }) })));
       args = spawnState.calls[0].args;
-      expect(args[args.indexOf('--exclude-tools') + 1]).toBe('bash,edit,write');
+      expect(args[args.indexOf('--tools') + 1]).toBe('read'); // read-only
     });
   });
 

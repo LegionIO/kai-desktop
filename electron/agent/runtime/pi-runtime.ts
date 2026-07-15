@@ -5,7 +5,7 @@
  * pi has no such SDK — its own CLI exposes a headless JSON mode. We therefore
  * spawn the `pi` binary directly, one process per turn:
  *
- *     pi --mode json --session-id <id> [--provider/--model …] [--exclude-tools …]
+ *     pi --mode json [--session <id>] [--session-dir <dir>] [--provider/--model …] [--tools <allow>]
  *
  * pi reads the prompt from piped stdin, then emits a JSONL stream on stdout: a
  * header line followed by one JSON object per session event. Those events are
@@ -17,11 +17,13 @@
  *     leading `-` as a flag, and has no `--` separator.
  *   - API key via the provider-specific env var, NEVER on argv (argv is visible
  *     via `ps`). pi has no generic key env var.
- *   - Session continuity via a Kai-owned id passed as `--session-id` (idempotent
- *     create-or-open in pi); no need to scrape pi's stdout header.
+ *   - Session continuity: the FIRST turn omits --session (pi creates a session
+ *     and emits its id, which we capture + persist); later turns pass
+ *     `--session <id>` to resume. (pi's --session REUSES an existing session — it
+ *     does not create one for an unknown id.)
  *   - pi has no per-tool approval hook in any headless mode, so it runs bash +
  *     file edits unsupervised. The Kai approval mode maps to spawn-time tool
- *     scoping (the only gate available).
+ *     scoping via pi's `--tools` allowlist (read | read,write,edit | all).
  *   - pi only drives models in its own registry at their official endpoints (no
  *     `--base-url`), so Kai's custom-endpoint models are unmappable — we then
  *     let pi use its own configured default and surface a one-line note.
@@ -29,7 +31,6 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
@@ -52,7 +53,7 @@ const PI_CAPABILITIES: RuntimeCapabilities = {
   fallback: false, // pi has no model fallback-chain flag
   multiProvider: true, // pi-ai is multi-provider (mapped where reachable)
   subAgents: false, // no sub-agent delegation
-  sessions: true, // session resume via --session-id
+  sessions: true, // session resume via captured pi session id + --session
   customTools: false, // no MCP bridge possible — Kai custom tools unavailable
   executesUntrustedTools: true, // pi has NO per-tool hook in headless mode — runs bash/edits unsupervised
 };
@@ -153,12 +154,13 @@ export class PiRuntime implements AgentRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // 3. Session id (Kai-owned; idempotent create-or-open in pi)
+    // 3. Session id — pi's `--session <id>` REUSES an existing session (it does
+    // NOT create one for an unknown id; passing a fresh UUID errors "No session
+    // found"). So: on the FIRST turn we pass no --session (pi creates one and
+    // emits its id in the `{type:'session',id}` event, captured below + persisted);
+    // on later turns we pass the captured id to resume.
     // -----------------------------------------------------------------------
-    const piSessionId = (conversationMetadata?.piSessionId as string | undefined) ?? randomUUID();
-
-    // Persist the id on the conversation so the next turn resumes the session.
-    yield { conversationId, type: 'enrichment', data: { piSessionId } };
+    const existingPiSessionId = conversationMetadata?.piSessionId as string | undefined;
 
     // -----------------------------------------------------------------------
     // 4. Build args + env
@@ -180,9 +182,12 @@ export class PiRuntime implements AgentRuntime {
       args.push('--thinking', reasoningEffort);
     }
 
-    // Session: Kai-owned id + a pi session dir under ~/.kai. Do NOT combine with
-    // --continue/--resume/--session/--fork (pi rejects the combination).
-    args.push('--session-id', piSessionId);
+    // Session: reuse an existing pi session id if we captured one on a prior
+    // turn; otherwise let pi create a fresh session (its id is captured from the
+    // session event + persisted below). `--session-dir` pins storage under ~/.kai.
+    if (existingPiSessionId) {
+      args.push('--session', existingPiSessionId);
+    }
     args.push('--session-dir', join(appHome, 'pi-sessions'));
 
     // Env: when the IPC chokepoint pre-built a scrubbed childEnv (confinement
@@ -301,6 +306,14 @@ export class PiRuntime implements AgentRuntime {
           // string) from a hostile/buggy stream would crash translatePiEvent on
           // `event.type`. Skip it.
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          // Capture pi's session id on the FIRST turn so the next turn can resume
+          // it via --session. pi emits {type:'session',id,...} at stream start.
+          if (!existingPiSessionId) {
+            const p = parsed as { type?: unknown; id?: unknown };
+            if (p.type === 'session' && typeof p.id === 'string' && p.id) {
+              yield { conversationId, type: 'enrichment', data: { piSessionId: p.id } };
+            }
+          }
           for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) {
             if (evt.type === 'error') errorYielded = true;
             yield evt;
@@ -433,24 +446,31 @@ function extractLastUserText(messages: unknown[]): string | null {
 // ---------------------------------------------------------------------------
 
 function buildToolScopingArgs(piConfig: Record<string, unknown>): string[] {
-  // Default = full autonomy (matches Codex full-auto; a coding agent must run
-  // bash/tests/git). suggest/auto-edit opt INTO restrictions.
+  // pi has NO --exclude-tools; it only supports an ALLOWLIST via --tools, or
+  // --no-tools / --no-builtin-tools. pi's built-in tools are: read, write, edit,
+  // bash. Map Kai's approval mode to the allowed built-in set. Default full-auto
+  // (a coding agent must run bash/tests/git) → no flag (all tools on).
   const approval = (piConfig.approval as string) ?? 'full-auto';
+  const BUILTINS = ['read', 'write', 'edit', 'bash'];
 
-  // An explicit excludeTools list always wins.
+  // An explicit excludeTools list (Kai config semantics: "deny these") is
+  // translated to pi's allowlist = the built-ins NOT excluded.
   const explicit = piConfig.excludeTools;
   if (Array.isArray(explicit) && explicit.length > 0) {
-    return ['--exclude-tools', explicit.join(',')];
+    const denied = new Set(explicit.map(String));
+    const allowed = BUILTINS.filter((t) => !denied.has(t));
+    // Everything denied → disable built-ins entirely (keep extension tools).
+    return allowed.length === 0 ? ['--no-builtin-tools'] : ['--tools', allowed.join(',')];
   }
 
   switch (approval) {
     case 'suggest':
-      return ['--exclude-tools', 'bash,edit,write']; // read-only
+      return ['--tools', 'read']; // read-only
     case 'auto-edit':
-      return ['--exclude-tools', 'bash']; // file edits allowed, no shell
+      return ['--tools', 'read,write,edit']; // file edits allowed, no shell
     case 'full-auto':
     default:
-      return [];
+      return []; // all built-in tools enabled
   }
 }
 
