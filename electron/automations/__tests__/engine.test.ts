@@ -170,4 +170,57 @@ describe('AutomationEngine', () => {
     expect(r1.matched).toBe(true);
     expect(r2.matched).toBe(true);
   });
+
+  it('does not recurse when a rule action runs a tool that emits its own lifecycle event', async () => {
+    // Reproduces the "Log All Automation Events" feedback loop: a *:* rule whose
+    // tool action runs a tool, and that tool execution emits a PostToolUse
+    // (source:'hook') event. Without the re-entrancy guard this recurses forever
+    // (and, as observed, the logging command's redirect clobbered files). The
+    // guard drops hook-sourced events while an action is in flight, so the tool
+    // runs exactly once per real trigger.
+    const bus = new AutomationEventBus();
+    let executeCount = 0;
+    const loggingTool = {
+      name: 'log_tool',
+      description: '',
+      inputSchema: undefined as never,
+      execute: async () => {
+        executeCount++;
+        // Simulate the tool's own PostToolUse lifecycle event firing mid-execute.
+        bus.emit('hook', 'PostToolUse', { toolName: 'log_tool' });
+        return { ok: true };
+      },
+    };
+    const cfg: AutomationsConfig = {
+      enabled: true,
+      rules: [],
+      log: { maxEntries: 50 },
+      approvalMode: 'auto-allow',
+      surfaceAlertsAsModal: false,
+    };
+    const rule = baseRule({
+      trigger: { source: '*', event: '*' },
+      actions: [{ type: 'tool', toolName: 'log_tool', input: {} } as never],
+    });
+    cfg.rules = [rule];
+    const engine = new AutomationEngine({
+      bus,
+      appHome: '/tmp',
+      getConfig: () => ({}) as never,
+      getAutomationsConfig: () => cfg,
+      getRegisteredTools: () => [loggingTool as never],
+      getWorkspaceTools: () => [],
+      handlePluginAction: vi.fn(async () => 'ok'),
+    });
+    engine.start();
+
+    bus.emit('hook', 'PostToolUse', { toolName: 'some_other_tool' });
+    await flush();
+    await flush();
+
+    // Exactly one execution — the tool's own re-emitted PostToolUse was
+    // suppressed while the action was in flight.
+    expect(executeCount).toBe(1);
+    engine.stop();
+  });
 });

@@ -40,6 +40,18 @@ export class AutomationEngine {
   private lastFireAt = new Map<string, number>();
   private minuteBuckets = new Map<string, number[]>();
   private unsubscribe?: () => void;
+  /**
+   * Number of automation actions currently executing. A rule action can run a
+   * tool/agent, and tool execution emits its OWN lifecycle events (`source:
+   * 'hook'` — PreToolUse/PostToolUse). Without this guard a rule triggering on
+   * `*`/`PostToolUse` whose action runs a tool would catch its own action's
+   * PostToolUse and recurse forever (observed: a "Log All Automation Events"
+   * rule that logged via execute_command, looping + clobbering the redirect
+   * target). While an action is in flight we drop `hook`-sourced events so an
+   * automation-initiated tool call can't re-trigger lifecycle automations.
+   * MAX_EMIT_DEPTH only bounds explicit `emit`-action chains, not this path.
+   */
+  private actionDepth = 0;
 
   constructor(private readonly deps: EngineDeps) {}
 
@@ -98,6 +110,15 @@ export class AutomationEngine {
     if (!cfg.enabled) return;
     if (event.depth > MAX_EMIT_DEPTH) {
       console.warn(`[AutomationEngine] dropping ${event.key}: emit chain depth ${event.depth} > ${MAX_EMIT_DEPTH}`);
+      return;
+    }
+    // Re-entrancy guard: while an automation action is executing, ignore
+    // lifecycle events (`source: 'hook'`) — they are almost always that action's
+    // own tool/agent execution (PreToolUse/PostToolUse) feeding back, which would
+    // recurse without bound. Non-hook events (plugin messages, timers, etc.)
+    // still flow, so an action that legitimately produces a plugin event isn't
+    // silently dropped.
+    if (this.actionDepth > 0 && event.source === 'hook') {
       return;
     }
 
@@ -166,7 +187,12 @@ export class AutomationEngine {
     }
 
     try {
-      return await executeActions(rule, event, this.deps);
+      this.actionDepth++;
+      try {
+        return await executeActions(rule, event, this.deps);
+      } finally {
+        this.actionDepth--;
+      }
     } catch (err) {
       return {
         ...base,
