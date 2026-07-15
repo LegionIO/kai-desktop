@@ -94,18 +94,17 @@ mac:
   # darwin-${process.arch} variant. The bundled esbuild extraResource is
   # host-arch-only and currently unused at runtime.
   x64ArchFiles: "Contents/Resources/{esbuild/bin/esbuild,app.asar.unpacked/**}"
-  # @aws-sdk/xml-builder (a pure-JS transitive dep of @aws-sdk/credential-provider-node,
-  # used for Bedrock auth) can land at a different position in the x64 vs arm64
-  # pnpm dependency tree, so @electron/universal's mergeASARs sees it as a
-  # "unique file not covered by allowList" and fails the build. The package is
-  # byte-identical across arches (no arch-specific content) and IS needed at
-  # runtime, so allow it to appear in a single arch's asar rather than excluding
-  # it. mergeASARs flags the DIRECTORY entry "node_modules/@aws-sdk/xml-builder"
-  # (not a file within), so the glob must match the dir itself AND its contents:
-  # `{,/**}` = the bare dir OR any descendant. (A trailing `/**` alone matches
-  # only descendants and misses the dir entry — which slipped through once by
-  # install-order luck, then failed.)
-  singleArchFiles: "{node_modules,**/node_modules}/@aws-sdk/xml-builder{,/**}"
+  # The AWS SDK's deep transitive tree (@aws-sdk/*, @smithy/*, @aws-crypto/*) is
+  # PURE JS (no arch-specific binaries) but pnpm can place individual packages at
+  # different positions in the x64 vs arm64 dependency tree during the universal
+  # build, so @electron/universal's mergeASARs flags a package DIRECTORY as a
+  # "unique file not covered by allowList" and fails — and it's whack-a-mole
+  # (xml-builder one build, @smithy/core the next). Since every package under
+  # these scopes is byte-identical across arches and needed at runtime (Bedrock),
+  # allow the whole family to appear in a single arch's asar; the universal merge
+  # keeps one copy. `{,/**}` matches the package/scope DIRECTORY entry itself AND
+  # its descendants (a trailing `/**` alone misses the dir entry mergeASARs flags).
+  singleArchFiles: "{node_modules,**/node_modules}/{@aws-sdk,@smithy,@aws-crypto}/**{,/**}"
   hardenedRuntime: true
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
