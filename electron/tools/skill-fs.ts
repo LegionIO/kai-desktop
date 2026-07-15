@@ -39,6 +39,14 @@ export function readContainedFileSync(skillDir: string, absPath: string, maxByte
     // canonical forms on both sides so a symlinked tmpdir ancestor (e.g. macOS
     // /var → /private/var) doesn't cause a false containment failure, while a
     // genuine escape (a file whose realpath leaves the root) is still rejected.
+    //
+    // Residual (accepted): this re-resolves the PATHNAME, not the fd, so a
+    // local attacker who can write inside the skill tree could in principle race
+    // an intermediate-directory symlink between openSync and this check. A full
+    // fix needs fd-anchored traversal (openat per component / F_GETPATH), which
+    // Node doesn't expose portably. The skill root is the user's own
+    // ~/.kai/skills (attacker needs local write access there), so the practical
+    // risk is low; O_NOFOLLOW already pins the leaf inode we actually read.
     let realTarget: string;
     try {
       realTarget = realpathSync(target);
@@ -54,6 +62,9 @@ export function readContainedFileSync(skillDir: string, absPath: string, maxByte
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
+    // A short/premature EOF means the file changed under us or was truncated —
+    // don't hand back a silently-partial manifest/file. Require a full read.
+    if (offset !== st.size) return null;
     return buf.subarray(0, offset).toString('utf-8');
   } catch {
     return null;
