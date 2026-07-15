@@ -225,6 +225,35 @@ describe('agent.confinement schema', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test 1c: agent.piSdk schema — the pi runtime reads agent.piSdk for its
+// approval → --exclude-tools scoping, but the schema field was missing, so a
+// user's saved piSdk was stripped on parse and pi always ran full-auto. Lock
+// that piSdk now survives parse + round-trips through persistence.
+// ---------------------------------------------------------------------------
+
+describe('agent.piSdk schema', () => {
+  it('preserves approval + excludeTools through appConfigSchema.parse', () => {
+    const base = readEffectiveConfig(appHome);
+    const parsed = appConfigSchema.parse({
+      ...base,
+      agent: { ...(base.agent ?? { runtime: 'auto' }), piSdk: { approval: 'suggest', excludeTools: ['bash', 'edit'] } },
+    });
+    expect(parsed.agent?.piSdk).toEqual({ approval: 'suggest', excludeTools: ['bash', 'edit'] });
+  });
+
+  it('round-trips piSdk through desktopConfigPayload write -> read', () => {
+    const base = readEffectiveConfig(appHome);
+    const withPi: AppConfig = {
+      ...base,
+      agent: { ...(base.agent ?? { runtime: 'auto' }), piSdk: { approval: 'auto-edit' } },
+    } as AppConfig;
+    writeDesktopConfig(appHome, withPi);
+    const reread = readEffectiveConfig(appHome);
+    expect(reread.agent?.piSdk).toEqual({ approval: 'auto-edit' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test 2: IPC channels exposed by registerConfigHandlers.
 // ---------------------------------------------------------------------------
 

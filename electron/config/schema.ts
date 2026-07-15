@@ -634,6 +634,18 @@ const codexSdkConfigSchema = z.object({
   approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
 });
 
+const piSdkConfigSchema = z.object({
+  /**
+   * Maps to pi's `--exclude-tools`: suggest = read-only (exclude bash/edit/write),
+   * auto-edit = allow edits but no shell (exclude bash), full-auto = no exclusions.
+   * pi has no per-call approval hook in headless mode, so this spawn-time scoping
+   * is the ONLY tool gate. Default full-auto (a coding agent must run bash/git).
+   */
+  approval: z.enum(['suggest', 'auto-edit', 'full-auto']).optional(),
+  /** Explicit `--exclude-tools` list; when non-empty it overrides `approval`. */
+  excludeTools: z.array(z.string()).optional(),
+});
+
 /**
  * Blast-radius containment for autonomous agent runtimes (#66/#70).
  * Secure-by-default: workspaceOnly + scrubCredentials both default true, so an
@@ -670,6 +682,7 @@ const agentConfigSchema = z.object({
   autoContinueOnMaxTurns: z.boolean().optional(),
   claudeAgentSdk: claudeAgentSdkConfigSchema.optional(),
   codexSdk: codexSdkConfigSchema.optional(),
+  piSdk: piSdkConfigSchema.optional(),
   confinement: confinementConfigSchema.optional(),
 });
 
