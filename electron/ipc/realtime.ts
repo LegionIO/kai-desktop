@@ -171,9 +171,16 @@ export function registerRealtimeHandlers(
     return { ok: true };
   });
 
-  // Fire-and-forget audio sending (use ipcMain.on, not handle)
+  // Fire-and-forget audio sending (use ipcMain.on, not handle). Guard the payload
+  // (renderer is trusted, but a malformed/oversized frame shouldn't throw out of
+  // an event handler with no catch) and never let sendAudio's failure propagate.
   ipcMain.on('realtime:send-audio', (_event, pcmBase64: string) => {
-    activeSession?.sendAudio(pcmBase64);
+    if (typeof pcmBase64 !== 'string' || pcmBase64.length === 0) return;
+    try {
+      activeSession?.sendAudio(pcmBase64);
+    } catch (err) {
+      console.warn('[Realtime IPC] send-audio failed (dropping frame):', err instanceof Error ? err.message : err);
+    }
   });
 
   ipcMain.handle('realtime:get-status', () => {
