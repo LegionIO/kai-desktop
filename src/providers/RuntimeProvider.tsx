@@ -2016,6 +2016,14 @@ export function RuntimeProvider({
           const branch = getActiveBranch(acc.messages, acc.headId);
           const isDuplicate = isDuplicateLastUserMessage(branch, msgText);
           if (!isDuplicate) {
+            // `acc.headId` already points at the live assistant message during
+            // streaming, so an incoming user turn (a follow-up injected mid-turn
+            // for automation back-to-back messages) parents on it and forms a
+            // clean boundary: …assistant1(partial) → user2 → assistant2. The next
+            // delta creates a fresh assistant message (tail is now `user`), so the
+            // new reply can't concatenate onto the superseded one. The main
+            // process also suppresses the superseded run's stale deltas at the
+            // source (see broadcastStreamEvent), which is the primary guard.
             const userMsg: StoredMessage = {
               id: msgId(),
               parentId: acc.headId,

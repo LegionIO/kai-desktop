@@ -193,6 +193,44 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
  * the conversation doesn't look stuck busy. Persistence is best-effort.
  */
 function finalizeTurn(appHome: string, conversationId: string): void {
+  persistAccumulated(appHome, conversationId);
+}
+
+/**
+ * Persist whatever the accumulator holds RIGHT NOW as an assistant turn, without
+ * waiting for `done`, then clear the accumulator. Used when a follow-up message
+ * is injected mid-turn (automation back-to-back messages): the in-progress reply
+ * is preserved as its own turn (text + any tool calls kept intact) rather than
+ * discarded, so the next turn — and the model — can see it. Returns true if an
+ * assistant message was actually written.
+ *
+ * The accumulator is deleted either way, so the superseding run's
+ * `discardPersistenceAccumulator` becomes a no-op and cannot merge this partial
+ * into the fresh turn.
+ *
+ * Returns the persisted assistant message's id (the new conversation head) so
+ * the caller can parent the injected follow-up user turn on it — or null if
+ * there was nothing to persist.
+ */
+export function finalizeInterruptedTurn(appHome: string, conversationId: string): string | null {
+  return persistAccumulatedReturningHead(appHome, conversationId);
+}
+
+/**
+ * Shared persist body for both the normal `done` finalize and the mid-turn
+ * interrupt finalize. Deletes the accumulator, then persists its parts as an
+ * assistant message if there's content; otherwise just clears a lingering
+ * `running` runStatus. Returns whether an assistant message was persisted.
+ */
+function persistAccumulated(appHome: string, conversationId: string): boolean {
+  return persistAccumulatedReturningHead(appHome, conversationId) !== null;
+}
+
+/**
+ * Core persist logic. Returns the new conversation head id (the persisted
+ * assistant message) when content was written, else null.
+ */
+function persistAccumulatedReturningHead(appHome: string, conversationId: string): string | null {
   const acc = accumulators.get(conversationId);
   accumulators.delete(conversationId);
   if (!acc || !acc.sawContent || acc.parts.length === 0) {
@@ -209,19 +247,21 @@ function finalizeTurn(appHome: string, conversationId: string): void {
     } catch {
       // best-effort
     }
-    return;
+    return null;
   }
   try {
     // Parent on the head captured at submit so a mid-run branch change
     // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
     // in options falls back to the current head, so only pass it when known.
     // Reset runStatus to idle: agent:submit set it 'running' for the turn.
-    appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
+    const updated = appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
       runStatus: 'idle',
       ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
     });
+    return updated?.headId ?? null;
   } catch {
     // Persistence is best-effort; a failure must not break the stream.
+    return null;
   }
 }
 

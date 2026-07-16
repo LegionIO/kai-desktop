@@ -17,7 +17,11 @@ import {
 import { readConversation, writeConversation } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
-import { accumulateForPersistence, discardPersistenceAccumulator } from '../agent/stream-persistence.js';
+import {
+  accumulateForPersistence,
+  discardPersistenceAccumulator,
+  finalizeInterruptedTurn,
+} from '../agent/stream-persistence.js';
 import {
   shouldCompact,
   compactConversationPrefix,
@@ -268,6 +272,20 @@ function isServerPersistOwner(conversationId: string, activeToken: string | unde
 }
 
 /**
+ * True if a stream event should be suppressed because it came from a SUPERSEDED
+ * run — a run whose token no longer matches the conversation's active stream
+ * token (a newer run took over, e.g. a mid-turn follow-up injection). Pure so it
+ * can be unit-tested. Only suppresses TOKEN-STAMPED events: an untagged event
+ * (`emittingToken === undefined`, e.g. an automation/external/approval broadcast)
+ * is never suppressed, and while no run is active (`activeToken === undefined`)
+ * nothing is stale.
+ */
+export function isSupersededRunEvent(emittingToken: string | undefined, activeToken: string | undefined): boolean {
+  if (emittingToken === undefined || activeToken === undefined) return false;
+  return emittingToken !== activeToken;
+}
+
+/**
  * @param emittingToken  The stream token of the run that produced this event.
  *   Persistence/accumulation is only applied when it matches BOTH the persist
  *   owner AND the conversation's current active stream — so a superseded run's
@@ -376,6 +394,24 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // We don't have a per-id list here; the window's own resolve path + the
       // tool-result close cover the normal case, and a stale window is harmless
       // (it self-closes on answer). Nothing to do for the bulk case.
+    }
+  }
+
+  // Suppress events from a SUPERSEDED run. When a follow-up is injected mid-turn
+  // (automation back-to-back messages), the prior run is aborted and a new run
+  // takes over the conversation's active stream token. The aborted run can still
+  // emit trailing deltas AND a terminal done/error before it notices the abort.
+  // If broadcast, its deltas concatenate into the new turn's live message and its
+  // stale `done` resets the UI mid-new-turn (stops the spinner + reloads from
+  // disk — the reported "concatenated, then fixed once the final message lands"
+  // bug). Drop ALL of a known-stale run's events: only when the event carries an
+  // emitting token that DOESN'T match the current active token. Events with no
+  // token (external/automation/approval broadcasts) are never suppressed; the new
+  // run emits its own terminal done, so no client hangs.
+  if (event.conversationId && emittingToken !== undefined) {
+    const activeToken = activeStreams.get(event.conversationId)?.token;
+    if (isSupersededRunEvent(emittingToken, activeToken)) {
+      return;
     }
   }
 
@@ -2486,6 +2522,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
+
+    // If a turn is still generating into this conversation, PRESERVE its
+    // in-progress reply as its own (interrupted) turn before we abort + restart.
+    // Without this, the fresh run's discardPersistenceAccumulator (in
+    // streamHandler) would throw the partial away, the model wouldn't see the
+    // work it had already started, and the two runs' deltas would concatenate in
+    // the renderer. finalizeInterruptedTurn writes the partial (text + any tool
+    // calls) and clears the accumulator, so the new user turn parents cleanly on
+    // top of it: …user1 → assistant1(interrupted) → user2 → assistant2.
+    if (activeStreams.has(conversationId)) {
+      finalizeInterruptedTurn(appHome, conversationId);
+    }
 
     const promptWrite = appendConversationMessages(
       appHome,

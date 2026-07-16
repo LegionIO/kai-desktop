@@ -134,7 +134,7 @@ vi.mock('../conversation-store.js', () => ({
 // the resolution before the production module loads.
 // ---------------------------------------------------------------------------
 
-import { registerAgentHandlers, __internal } from '../agent.js';
+import { registerAgentHandlers, __internal, isSupersededRunEvent } from '../agent.js';
 import { pendingToolApprovals } from '../tool-approval.js';
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 
@@ -347,5 +347,26 @@ describe('extractLastUserText (mirror a GUI-driven turn to co-viewing clients)',
   it('returns empty string when there is no user turn', () => {
     expect(extractLastUserText([{ role: 'assistant', content: 'hi' }])).toBe('');
     expect(extractLastUserText([])).toBe('');
+  });
+});
+
+describe("isSupersededRunEvent (mid-turn inject: drop the aborted run's stale events)", () => {
+  it('suppresses a token-stamped event whose token no longer matches the active run', () => {
+    // The prior run (token A) was superseded by a new run (token B); A's trailing
+    // deltas / stale `done` must be dropped so they can\'t concat or reset the UI.
+    expect(isSupersededRunEvent('A', 'B')).toBe(true);
+  });
+
+  it("allows the current run's own events (token matches active)", () => {
+    expect(isSupersededRunEvent('B', 'B')).toBe(false);
+  });
+
+  it('never suppresses an untagged event (automation/external/approval broadcast)', () => {
+    expect(isSupersededRunEvent(undefined, 'B')).toBe(false);
+  });
+
+  it('does not treat events as stale when no run is active', () => {
+    expect(isSupersededRunEvent('A', undefined)).toBe(false);
+    expect(isSupersededRunEvent(undefined, undefined)).toBe(false);
   });
 });

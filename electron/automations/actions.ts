@@ -62,6 +62,22 @@ export function abortAutomationRun(conversationId: string): boolean {
 }
 
 /**
+ * Wait (bounded) until no automation run is in flight for this conversation —
+ * i.e. an aborted run has finished its finally block (flushed its partial reply
+ * + reset runStatus + cleared inFlightAutomationTargets). Used before a busy
+ * mid-turn inject so the injected user turn lands AFTER the prior run's partial
+ * assistant reply, not interleaved with it. Bounded so a wedged run can't hang
+ * the inject forever; on timeout we proceed anyway (injectUserTurnAndRestart's
+ * own abort + fresh token still supersede any straggler).
+ */
+async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isAutomationRunInFlight(conversationId) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/**
  * Run one agent turn on an EXISTING conversation with a plain-text prompt, reusing
  * the automation agent-run machinery (append user turn → stream response → persist
  * → broadcast live). Used by the Alerts feature to RESUME a suspended run after the
@@ -290,6 +306,16 @@ async function runAgentAction(
     // this the old automation stream would run concurrently with the injected
     // one — duplicating tool effects and racing persistence into the same convo.
     abortAutomationRun(resolved.busyInject);
+    // Wait for the aborted automation run to FINISH its own finalize (it flushes
+    // whatever partial reply it had streamed into an assistant turn, then clears
+    // inFlightAutomationTargets in its finally). Without this wait, the injected
+    // user turn could be appended BEFORE the aborted run persists its partial,
+    // producing the wrong order (user1 → user2 → assistant1) or an assistant
+    // reply parented on a stale head. injectUserTurnAndRestart handles the
+    // activeStreams-owned partial itself (finalizeInterruptedTurn); this wait
+    // covers the automation-run-owned partial that lives in runAgentAction's own
+    // accumulator.
+    await waitForAutomationRunToSettle(resolved.busyInject);
     const res = await deps.injectUserTurnAndRestart!(resolved.busyInject, prompt, {
       modelKey: action.modelKey,
       profileKey: action.profileKey,

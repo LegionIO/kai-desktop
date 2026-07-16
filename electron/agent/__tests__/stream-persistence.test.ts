@@ -10,10 +10,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const appendMock = vi.fn();
 vi.mock('../../ipc/conversations.js', () => ({
-  appendConversationMessages: (...args: unknown[]) => appendMock(...args),
+  // Return a minimal record whose headId is the id of the appended assistant
+  // message, so finalizeInterruptedTurn's "return the new head" contract can be
+  // asserted. Real appendConversationMessages sets headId to the last node.
+  appendConversationMessages: (...args: unknown[]) => {
+    appendMock(...args);
+    return { headId: 'persisted-head' };
+  },
+  broadcastUpsert: vi.fn(),
+}));
+vi.mock('../../ipc/conversation-store.js', () => ({
+  readConversation: vi.fn(() => null),
+  writeConversation: vi.fn(),
 }));
 
-import { accumulateForPersistence, discardPersistenceAccumulator } from '../stream-persistence.js';
+import {
+  accumulateForPersistence,
+  discardPersistenceAccumulator,
+  finalizeInterruptedTurn,
+} from '../stream-persistence.js';
 import type { StreamEvent } from '../mastra-agent.js';
 
 const APP_HOME = '/tmp/fake-home';
@@ -163,6 +178,53 @@ describe('stream persistence accumulator', () => {
     discardPersistenceAccumulator('e3');
     // A late/duplicate done now finds nothing → no persist (accumulator was released).
     feed({ conversationId: 'e3', type: 'done' });
+    expect(appendMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('finalizeInterruptedTurn (mid-turn follow-up injection)', () => {
+  beforeEach(() => appendMock.mockReset());
+
+  it('persists the in-progress partial (text + tools) and returns the new head id', () => {
+    feedWithParent({ conversationId: 'i1', type: 'text-delta', text: 'thinking…' }, 'user-1');
+    feed({ conversationId: 'i1', type: 'tool-call', toolCallId: 't1', toolName: 'read_file', args: { path: 'a' } });
+    feed({ conversationId: 'i1', type: 'tool-result', toolCallId: 't1', result: 'contents' });
+
+    const head = finalizeInterruptedTurn(APP_HOME, 'i1');
+
+    expect(head).toBe('persisted-head');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, id, msgs, options] = appendMock.mock.calls[0];
+    expect(id).toBe('i1');
+    // Both the partial text AND the tool call are preserved (not discarded).
+    expect(msgs[0].content).toEqual([
+      { type: 'text', source: 'assistant', text: 'thinking…' },
+      {
+        type: 'tool-call',
+        toolCallId: 't1',
+        toolName: 'read_file',
+        args: { path: 'a' },
+        result: 'contents',
+        isError: undefined,
+        durationMs: undefined,
+      },
+    ]);
+    // Parented on the submit-time head, runStatus reset.
+    expect(options).toEqual({ runStatus: 'idle', parentId: 'user-1' });
+  });
+
+  it('clears the accumulator so a later done cannot double-persist', () => {
+    feed({ conversationId: 'i2', type: 'text-delta', text: 'partial' });
+    finalizeInterruptedTurn(APP_HOME, 'i2');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    // The superseded run's trailing done (or the fresh run's discard) finds nothing.
+    feed({ conversationId: 'i2', type: 'done' });
+    expect(appendMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns null and persists nothing when there is no accumulated content', () => {
+    const head = finalizeInterruptedTurn(APP_HOME, 'i3-never-started');
+    expect(head).toBeNull();
     expect(appendMock).not.toHaveBeenCalled();
   });
 });
