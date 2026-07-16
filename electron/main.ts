@@ -63,6 +63,7 @@ import { MastraRuntime } from './agent/runtime/mastra-runtime.js';
 import { ClaudeAgentRuntime } from './agent/runtime/claude-agent-runtime.js';
 import { CodexRuntime } from './agent/runtime/codex-runtime.js';
 import { PiRuntime } from './agent/runtime/pi-runtime.js';
+import { OpencodeRuntime } from './agent/runtime/opencode-runtime.js';
 import { registerComputerUseHandlers } from './ipc/computer-use.js';
 import { getExistingComputerUseManager } from './computer-use/service.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
@@ -1646,6 +1647,7 @@ if (gotSingleInstanceLock) {
     registerRuntime(new ClaudeAgentRuntime());
     registerRuntime(new CodexRuntime());
     registerRuntime(new PiRuntime());
+    registerRuntime(new OpencodeRuntime());
 
     // Listen for plugin tool changes before plugin activation so early registrations are not missed
     pluginManager.onToolsChanged((pluginTools) => {

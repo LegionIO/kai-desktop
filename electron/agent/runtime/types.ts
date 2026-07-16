@@ -227,7 +227,7 @@ export interface AgentRuntime {
 // ---------------------------------------------------------------------------
 
 /** The set of known runtime identifiers. */
-export type RuntimeId = 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | 'pi';
+export type RuntimeId = 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | 'pi' | 'opencode';
 
 /** Human-readable labels for the settings UI. */
 export const RUNTIME_LABELS: Record<RuntimeId, string> = {
@@ -235,6 +235,7 @@ export const RUNTIME_LABELS: Record<RuntimeId, string> = {
   'claude-agent-sdk': 'Claude Agent SDK',
   'codex-sdk': 'Codex SDK',
   pi: 'pi',
+  opencode: 'OpenCode',
 };
 
 /**

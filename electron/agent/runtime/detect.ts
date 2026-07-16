@@ -21,6 +21,7 @@ import { resolveBinaryPathSync } from '../../utils/shell-env.js';
 let _claudeCliPath: string | false | null = null;
 let _codexCliPath: string | false | null = null;
 let _piCliPath: string | false | null = null;
+let _opencodeCliPath: string | false | null = null;
 
 /**
  * Returns `true` when the `claude` CLI binary is found on PATH.
@@ -76,6 +77,24 @@ export async function resolvePiCliPath(): Promise<string | undefined> {
 }
 
 /**
+ * Returns `true` when the `opencode` CLI binary is found on PATH.
+ * Required for the opencode runtime to function.
+ */
+export async function detectOpencodeCli(): Promise<boolean> {
+  if (typeof _opencodeCliPath === 'string') return true;
+  _opencodeCliPath = resolveCliPath('opencode');
+  return _opencodeCliPath !== false;
+}
+
+/** Absolute path to the `opencode` CLI if found on PATH, else undefined. */
+export async function resolveOpencodeCliPath(): Promise<string | undefined> {
+  if (typeof _opencodeCliPath !== 'string') {
+    _opencodeCliPath = resolveCliPath('opencode');
+  }
+  return _opencodeCliPath || undefined;
+}
+
+/**
  * Resets the cached detection results.  Useful if the user installs a
  * CLI binary while Kai is already running.
  */
@@ -83,6 +102,7 @@ export function resetDetectionCache(): void {
   _claudeCliPath = null;
   _codexCliPath = null;
   _piCliPath = null;
+  _opencodeCliPath = null;
 }
 
 // ---------------------------------------------------------------------------

@@ -165,7 +165,9 @@ export async function getAvailableRuntimes(): Promise<
             ? 'Codex CLI not found on PATH'
             : runtime.id === 'pi'
               ? 'pi CLI not found on PATH'
-              : undefined,
+              : runtime.id === 'opencode'
+                ? 'opencode CLI not found on PATH'
+                : undefined,
     });
   }
 

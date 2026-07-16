@@ -50,7 +50,9 @@ const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   'claude-agent-sdk':
     "Anthropic's Claude Code agent. Production-tested tool execution, native MCP support, session resume. Kai tools (skills, plan mode, ask_user, settings) available via MCP bridge.",
   'codex-sdk': "OpenAI's Codex agent. Thread-based execution with session resume.",
-  pi: 'Fast coding agent (its own bash, read/write/edit, grep). Note: pi cannot use Kai skills, plugins, or custom/MCP tools — only its own built-in tools. It has no per-call approval in headless mode; the Approval setting maps to spawn-time tool exclusions (read-only / no-shell / full). Custom-endpoint models are not supported.',
+  pi: 'Fast coding agent (its own bash, read/write/edit, grep). Kai skills/plugins/custom tools are bridged in via a generated pi extension. No per-call approval in headless mode; the Approval setting maps to spawn-time tool scoping (read-only / no-shell / full). Custom-endpoint models are not supported.',
+  opencode:
+    'OpenCode agent (open-source, provider-agnostic). Headless JSON mode with native MCP + sessions. Kai tools bridged via MCP (coming); runs its own bash/read/write/edit today. Custom-endpoint models are not supported.',
 };
 
 /** Sort order: available before offline, then by priority. */
@@ -58,7 +60,8 @@ const RUNTIME_PRIORITY: Record<string, number> = {
   'claude-agent-sdk': 1,
   'codex-sdk': 2,
   pi: 3,
-  mastra: 4,
+  opencode: 4,
+  mastra: 5,
 };
 
 function sortRuntimes(list: RuntimeInfo[]): RuntimeInfo[] {
@@ -133,6 +136,7 @@ export const RuntimeSettings: FC<SettingsProps & { embedded?: boolean }> = ({ co
             <option value="claude-agent-sdk">Claude Code</option>
             <option value="codex-sdk">Codex</option>
             <option value="pi">Pi</option>
+            <option value="opencode">OpenCode</option>
             <option value="mastra">Mastra</option>
           </select>
         </div>
