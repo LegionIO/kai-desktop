@@ -253,6 +253,15 @@ async function runAgentAction(
     /** For `{type:'existing'}`: if the target is missing/busy, THROW instead of
      *  silently diverting to a new conversation (which would misroute the turn). */
     strictExistingTarget?: boolean;
+    /** Drain-at-end re-run: the follow-up user turn(s) are ALREADY persisted to
+     *  the branch (a mid-turn inject that arrived after the running turn's final
+     *  step boundary, so prepareStep never spliced it). Run a turn on the current
+     *  branch WITHOUT appending a new user prompt. Bounded by the caller to avoid
+     *  loops. */
+    continueOnBranch?: boolean;
+    /** Remaining drain-at-end continuations allowed (loop guard). Defaults to a
+     *  small cap; each stranded-inject continuation decrements it. */
+    continueBudget?: number;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -344,6 +353,8 @@ async function runAgentAction(
   const abortController = new AbortController();
   automationRunAborts.set(conversationId, abortController);
 
+  let turnSucceeded = false;
+  let turnResult: unknown;
   try {
     // Build the model input (optionally including prior history), then write the
     // user prompt turn immediately with runStatus:'running' so the conversation
@@ -354,7 +365,7 @@ async function runAgentAction(
     if (existing) {
       const { tree, headId } = ensureConversationTree(existing);
       parentId = headId;
-      if (action.includeHistory) {
+      if (action.includeHistory || opts?.continueOnBranch) {
         const branch = getConversationBranch(tree, headId);
         const HISTORY_PART_TYPES = new Set(['text', 'image']);
         const history = branch
@@ -368,34 +379,42 @@ async function runAgentAction(
           }))
           .filter((m) => (Array.isArray(m.content) ? m.content.length > 0 : Boolean(m.content)))
           .slice(-40);
-        messages = [...history, { role: 'user', content: prompt }];
+        // continueOnBranch: the follow-up user turn is ALREADY the branch head, so
+        // the branch IS the full input — do not append another prompt turn.
+        messages = opts?.continueOnBranch ? history : [...history, { role: 'user', content: prompt }];
       }
     }
 
-    const promptWrite = appendConversationMessages(
-      deps.appHome,
-      conversationId,
-      [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
-      { skipIfBusy: true, parentId, runStatus: 'running' },
-    );
-    if (!promptWrite) {
-      // Target was genuinely busy (a concurrent run) or deleted mid-flight —
-      // divert to a fresh conversation and write the prompt there.
-      console.warn(
-        `[automations] rule "${rule.name}" target ${conversationId} is busy or was deleted; diverting to a new conversation`,
-      );
-      inFlightAutomationTargets.delete(conversationId);
-      automationRunAborts.delete(conversationId);
-      conversationId = createAutomationConversation(deps.appHome, rule, action, title, false);
-      created = true;
-      inFlightAutomationTargets.add(conversationId);
-      automationRunAborts.set(conversationId, abortController);
-      appendConversationMessages(
+    // continueOnBranch: skip the prompt append (the user turn is already on the
+    // branch). Just flip runStatus to running for the continuation turn.
+    if (opts?.continueOnBranch) {
+      appendConversationMessages(deps.appHome, conversationId, [], { runStatus: 'running' });
+    } else {
+      const promptWrite = appendConversationMessages(
         deps.appHome,
         conversationId,
         [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
-        { parentId: null, runStatus: 'running' },
+        { skipIfBusy: true, parentId, runStatus: 'running' },
       );
+      if (!promptWrite) {
+        // Target was genuinely busy (a concurrent run) or deleted mid-flight —
+        // divert to a fresh conversation and write the prompt there.
+        console.warn(
+          `[automations] rule "${rule.name}" target ${conversationId} is busy or was deleted; diverting to a new conversation`,
+        );
+        inFlightAutomationTargets.delete(conversationId);
+        automationRunAborts.delete(conversationId);
+        conversationId = createAutomationConversation(deps.appHome, rule, action, title, false);
+        created = true;
+        inFlightAutomationTargets.add(conversationId);
+        automationRunAborts.set(conversationId, abortController);
+        appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+          { parentId: null, runStatus: 'running' },
+        );
+      }
     }
     const userTurnHeadId = readConversation(deps.appHome, conversationId)?.headId ?? parentId ?? null;
 
@@ -612,11 +631,48 @@ async function runAgentAction(
         (persistDropped ? `conversation ${conversationId} was removed before the reply could be saved` : null);
       throw new Error(failMsg ?? 'Automation agent run failed');
     }
-    return { text, modelKey, toolCalls, conversationId };
+    // Success — record whether a stranded mid-turn inject remains for this
+    // conversation (an inject that landed after the final step boundary, so
+    // prepareStep never spliced it). Handled AFTER the finally clears in-flight
+    // state, so the continuation sees an idle conversation.
+    turnSucceeded = true;
+    turnResult = { text, modelKey, toolCalls, conversationId };
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);
   }
+
+  // Drain-at-end: a mid-turn inject may have arrived AFTER this turn's final step
+  // boundary (so prepareStep never spliced it). Its user turn is already on the
+  // branch; now that the turn is done + in-flight state cleared, run one more
+  // turn on the current branch to answer it. Bounded to avoid loops.
+  const continueBudget = opts?.continueBudget ?? 3;
+  if (turnSucceeded && continueBudget > 0 && hasInjects(conversationId)) {
+    // Consume the queue so prepareStep on the continuation turn doesn't also
+    // re-splice them (they're already persisted on the branch).
+    drainInjects(conversationId);
+    try {
+      // Force the SAME conversation (not per-invocation/singleton re-resolution)
+      // and continue on its current branch without appending a new prompt.
+      const continueAction = {
+        ...action,
+        conversationTarget: { type: 'existing' as const, conversationId },
+      };
+      await runAgentAction(continueAction, ctx, rule, event, deps, {
+        ...opts,
+        literalPrompt: true, // prompt is unused on a continueOnBranch run
+        strictExistingTarget: true,
+        continueOnBranch: true,
+        continueBudget: continueBudget - 1,
+      });
+    } catch (contErr) {
+      console.warn(
+        `[automations] drain-at-end continuation for ${conversationId} failed:`,
+        contErr instanceof Error ? contErr.message : contErr,
+      );
+    }
+  }
+  return turnResult;
 }
 
 async function runSingleAction(

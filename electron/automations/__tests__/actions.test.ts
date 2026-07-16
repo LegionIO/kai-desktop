@@ -80,7 +80,7 @@ import { AutomationEventBus } from '../event-bus.js';
 import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
 import { appendConversationMessages } from '../../ipc/conversations.js';
 import { writeConversation } from '../../ipc/conversation-store.js';
-import { hasInjects, clearInjects, drainInjects } from '../../agent/inject-queue.js';
+import { hasInjects, clearInjects, drainInjects, enqueueInject } from '../../agent/inject-queue.js';
 
 function rule(actions: AutomationRule['actions']): AutomationRule {
   return {
@@ -442,6 +442,38 @@ describe('agent conversationTarget', () => {
 
     release();
     await first;
+  });
+
+  it('drain-at-end: a stranded inject (queued at turn end) triggers one continuation turn', async () => {
+    // Simulate a mid-turn inject that arrived AFTER the final step boundary:
+    // enqueue during the FIRST run's stream, so it's still queued when the turn
+    // ends. The turn-end drain should fire exactly one continuation turn (a
+    // second streamForPlugin) and drain the queue.
+    clearInjects('convDrain');
+    resetMockStore({
+      convDrain: { id: 'convDrain', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    let calls = 0;
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      calls += 1;
+      if (calls === 1) {
+        // First (main) turn: a follow-up lands after the last step boundary.
+        enqueueInject('convDrain', 'stranded follow-up');
+      }
+      yield { type: 'text-delta', text: `reply ${calls}` } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convDrain' }), evt, deps());
+
+    // Exactly one continuation turn ran (2 total), and the queue was drained.
+    expect(calls).toBe(2);
+    expect(hasInjects('convDrain')).toBe(false);
+    // Restore the shared default streaming impl for any later test.
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
   });
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {
