@@ -147,6 +147,72 @@ export const TextField: FC<{
   );
 };
 
+/**
+ * Multiline sibling of TextField with the SAME local-buffer + focus-guard +
+ * debounce, so typing doesn't fight an async config round-trip (`updateConfig`
+ * awaits IPC then replaces the whole config object — driving a raw
+ * `value={…}` textarea directly resets the caret to the end on every keystroke).
+ * Keeps a local value while focused; syncs from the parent only when NOT focused.
+ */
+export const TextArea: FC<{
+  id?: string;
+  label?: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  rows?: number;
+  mono?: boolean;
+  className?: string;
+}> = ({ id, label, value, onChange, placeholder, rows = 3, mono, className }) => {
+  const [local, setLocal] = useState(value);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedRef.current) setLocal(value);
+  }, [value]);
+
+  const flush = (v: string) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    if (v !== value) onChange(v);
+  };
+
+  const handleChange = (v: string) => {
+    setLocal(v);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => flush(v), 600);
+  };
+
+  const textarea = (
+    <textarea
+      className={
+        className ??
+        `w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 text-[11px] outline-none${mono ? ' font-mono' : ''}`
+      }
+      value={local}
+      rows={rows}
+      onChange={(e) => handleChange(e.target.value)}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        flush(local);
+      }}
+      placeholder={placeholder}
+    />
+  );
+
+  if (!label) return <div data-setting-id={id}>{textarea}</div>;
+  return (
+    <div data-setting-id={id}>
+      <label className="text-[10px] text-muted-foreground block mb-0.5">{label}</label>
+      {textarea}
+    </div>
+  );
+};
+
 export const CollapsibleSection: FC<{ id?: string; title: string; defaultOpen?: boolean; children: ReactNode }> = ({
   id,
   title,

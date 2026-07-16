@@ -13,7 +13,7 @@ import {
 import { app, type AutomationRunRecord, type AutomationSourceCatalogEntry } from '@/lib/ipc-client';
 import { flattenJsonSchema } from '@/lib/schema-paths';
 import { generateId } from '@/lib/utils';
-import { NumberField, settingsSelectClass, TextField, Toggle, type SettingsProps } from './shared';
+import { NumberField, settingsSelectClass, TextArea, TextField, Toggle, type SettingsProps } from './shared';
 
 type ConditionOp =
   | 'equals'
@@ -999,9 +999,9 @@ const ActionEditor: FC<{
           </div>
           <div>
             <label className="mb-0.5 block text-[10px] text-muted-foreground">Prompt</label>
-            <textarea
+            <TextArea
               value={action.prompt}
-              onChange={(e) => onChange({ ...action, prompt: e.target.value })}
+              onChange={(v) => onChange({ ...action, prompt: v })}
               placeholder="Summarize this Teams message and draft a reply: {{payload.body}}"
               rows={3}
               className="w-full rounded-xl border border-border/70 bg-card/80 px-3 py-2 font-mono text-[11px] outline-none"
