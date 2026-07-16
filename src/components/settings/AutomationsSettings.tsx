@@ -361,6 +361,109 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
 
 /* ───────────────────────── Rule editor ───────────────────────── */
 
+/**
+ * Reference panel: the `{{…}}` template variables usable in any action field.
+ * `{{payload.*}}` is per-triggering-event (shape from the event catalog's
+ * payloadSchema); `{{source}}`/`{{event}}`/`{{result[N]...}}` are always
+ * available. Click a chip to copy the `{{…}}` token.
+ */
+const TemplateVariables: FC<{
+  triggerPayloads: Array<{ key: string; source: string; event: string; wildcard: boolean; paths: string[] }>;
+}> = ({ triggerPayloads }) => {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const copy = (token: string) => {
+    void navigator.clipboard?.writeText(token).then(() => {
+      setCopied(token);
+      setTimeout(() => setCopied((c) => (c === token ? null : c)), 1200);
+    });
+  };
+
+  const Chip: FC<{ token: string }> = ({ token }) => (
+    <button
+      type="button"
+      onClick={() => copy(token)}
+      title="Click to copy"
+      className="rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+    >
+      {copied === token ? 'copied!' : token}
+    </button>
+  );
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
+      >
+        {open ? <ChevronDownIcon className="h-3 w-3" /> : <ChevronRightIcon className="h-3 w-3" />}
+        Available variables
+      </button>
+      {open && (
+        <div className="mt-1.5 space-y-2 rounded-lg border border-border/50 bg-card/40 p-2.5">
+          <p className="text-[10px] text-muted-foreground/70">
+            Use these <code className="font-mono">{'{{…}}'}</code> tokens in any action field (prompt, notification,
+            emit payload, …). Click to copy.
+          </p>
+
+          <div>
+            <div className="mb-1 text-[10px] font-medium text-muted-foreground">Always available</div>
+            <div className="flex flex-wrap gap-1">
+              <Chip token="{{source}}" />
+              <Chip token="{{event}}" />
+              <Chip token="{{result[0].text}}" />
+            </div>
+            <p className="mt-0.5 text-[10px] text-muted-foreground/60">
+              <code className="font-mono">{'{{result[N]...}}'}</code> references an earlier action&apos;s output in this
+              rule (0-indexed).
+            </p>
+          </div>
+
+          <div>
+            <div className="mb-1 text-[10px] font-medium text-muted-foreground">
+              Payload fields (per triggering event)
+            </div>
+            {triggerPayloads.length === 0 ? (
+              <p className="text-[10px] text-muted-foreground/60">
+                Pick a trigger source + event to see its payload fields.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {triggerPayloads.map((tp) => (
+                  <div key={tp.key}>
+                    <div className="text-[10px] text-muted-foreground/70">
+                      <span className="font-mono">{tp.key}</span>
+                    </div>
+                    {tp.wildcard ? (
+                      <p className="text-[10px] text-muted-foreground/50">
+                        Wildcard trigger — payload shape varies; use{' '}
+                        <code className="font-mono">{'{{payload.…}}'}</code> against whatever the matched event sends.
+                      </p>
+                    ) : tp.paths.length === 0 ? (
+                      <p className="text-[10px] text-muted-foreground/50">
+                        No declared payload fields. <code className="font-mono">{'{{payload}}'}</code> is the whole
+                        payload.
+                      </p>
+                    ) : (
+                      <div className="flex flex-wrap gap-1">
+                        {tp.paths.map((p) => (
+                          <Chip key={p} token={`{{payload.${p}}}`} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const RuleEditor: FC<{
   rule: Rule;
   catalog: AutomationSourceCatalogEntry[];
@@ -370,6 +473,33 @@ const RuleEditor: FC<{
   const source = catalog.find((c) => c.source === rule.trigger.source);
   const eventDesc = source?.events.find((e) => e.event === rule.trigger.event);
   const payloadPaths = useMemo(() => flattenJsonSchema(eventDesc?.payloadSchema), [eventDesc]);
+
+  // All triggers this rule fires on (canonical + additional). The payload SHAPE
+  // is per-event, so each trigger contributes its own field set — we show them
+  // grouped so the user knows which `{{payload.*}}` variables are available and
+  // for which event (with multiple triggers the payloads may differ).
+  const triggerPayloads = useMemo(() => {
+    const all = [rule.trigger, ...(rule.triggers ?? [])];
+    const seen = new Set<string>();
+    return all
+      .filter((t) => {
+        const k = `${t.source} ${t.event}`;
+        if (seen.has(k) || !t.source || !t.event) return false;
+        seen.add(k);
+        return true;
+      })
+      .map((t) => {
+        const src = catalog.find((c) => c.source === t.source);
+        const ev = src?.events.find((e) => e.event === t.event);
+        return {
+          key: `${t.source}:${t.event}`,
+          source: t.source,
+          event: t.event,
+          wildcard: t.source === '*' || t.event === '*',
+          paths: flattenJsonSchema(ev?.payloadSchema),
+        };
+      });
+  }, [rule.trigger, rule.triggers, catalog]);
 
   const [testPayload, setTestPayload] = useState('{}');
   const [testResult, setTestResult] = useState<AutomationRunRecord | null>(null);
@@ -497,6 +627,9 @@ const RuleEditor: FC<{
           </button>
         </div>
       </div>
+
+      {/* Available template variables — the {{…}} you can use in any action field */}
+      <TemplateVariables triggerPayloads={triggerPayloads} />
 
       {/* Conditions */}
       <div>

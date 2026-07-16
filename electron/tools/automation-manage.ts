@@ -319,7 +319,7 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
             rules: rules.map(summarizeRule),
             catalog,
             availableTools: toolNames,
-            hint: 'Use catalog[].source + catalog[].events[].event for trigger, or "*" for trigger.source/trigger.event to match all sources/all events (then narrow with conditions). Use catalog[].events[].payloadSchema property paths for condition.path. Plugin actions live in catalog[].actions[].targetId (source starting with "plugin."). For agent actions in "conversation" mode, set conversationTarget to {type:"per-invocation"|"singleton"|"existing"}; for "existing", omit conversationId to target this chat.',
+            hint: 'Use catalog[].source + catalog[].events[].event for trigger, or "*" for trigger.source/trigger.event to match all sources/all events (then narrow with conditions). Use catalog[].events[].payloadSchema property paths for condition.path AND for `{{payload.<path>}}` interpolation in action fields. Available `{{ }}` template variables in any action field: `{{payload.<path>}}` (the triggering event payload — shape is per-event, see payloadSchema), `{{source}}` + `{{event}}` (the trigger names), and `{{result[N].text}}` (a prior action\'s output in this rule, 0-indexed). Plugin actions live in catalog[].actions[].targetId (source starting with "plugin."). For agent actions in "conversation" mode, set conversationTarget to {type:"per-invocation"|"singleton"|"existing"}; for "existing", omit conversationId to target this chat.',
           };
         }
 
