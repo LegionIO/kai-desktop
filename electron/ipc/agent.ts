@@ -393,14 +393,18 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         }
       }
       if (dedicated) {
+        console.info(`[APPROVAL-DEBUG] dedicated=true opening window for toolCallId=${event.toolCallId}`);
         openApprovalWindow({
           approvalId: event.toolCallId,
           conversationId: event.conversationId,
           toolName: event.toolName ?? 'tool',
           args: event.args,
         });
+      } else {
+        console.info(`[APPROVAL-DEBUG] dedicated=false (inline card only) toolCallId=${event.toolCallId}`);
       }
     } else if (event.type === 'tool-result' && event.toolCallId) {
+      console.info(`[APPROVAL-DEBUG] tool-result → closeApprovalWindow toolCallId=${event.toolCallId}`);
       closeApprovalWindow(event.toolCallId);
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.

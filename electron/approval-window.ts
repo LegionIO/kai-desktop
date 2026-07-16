@@ -1,7 +1,26 @@
 import { BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
+import { appendFileSync } from 'node:fs';
 import { applyBrandUserAgent } from './utils/user-agent.js';
 import { showMacDockWithPaddedIcon } from './utils/dock-icon.js';
+
+// TEMP debug instrumentation (approval window path). Remove once diagnosed.
+const APPROVAL_DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/approval.log');
+function approvalDebug(msg: string): void {
+  try {
+    appendFileSync(APPROVAL_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    /* best-effort */
+  }
+}
+/** Focused-window title for logs; defensive (BrowserWindow may be a test mock). */
+function focusedWindowTitle(): string {
+  try {
+    return BrowserWindow.getFocusedWindow?.()?.getTitle?.() ?? 'none';
+  } catch {
+    return 'unknown';
+  }
+}
 
 // Same app icon path as electron/main.ts + overlay-window.ts.
 const APP_ICON = join(import.meta.dirname, '../build/icon.png');
@@ -111,8 +130,12 @@ export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindo
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   loadApprovalRoute(win, { approval: '1', approvalId: request.approvalId });
+  approvalDebug(
+    `open approvalId=${request.approvalId} conv=${request.conversationId} tool=${request.toolName} rendererUrl=${process.env.ELECTRON_RENDERER_URL ?? '(file)'} focusedBefore=${focusedWindowTitle()}`,
+  );
 
   win.once('ready-to-show', () => {
+    approvalDebug(`ready-to-show approvalId=${request.approvalId}`);
     // show() (not showInactive) so the user can answer immediately, but we never
     // touch the main window, so it stays where it was (minimized/behind).
     win.show();
@@ -121,6 +144,7 @@ export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindo
   });
 
   win.on('closed', () => {
+    approvalDebug(`closed approvalId=${request.approvalId}`);
     // Identity-guard the delete: only clear the map entry if it still points at
     // THIS window, so a late 'closed' from a replaced window can't evict a newer
     // window registered under the same approvalId.
@@ -136,6 +160,7 @@ export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindo
 /** Close the approval window for an id once it's resolved/aborted. Idempotent. */
 export function closeApprovalWindow(approvalId: string): void {
   const win = approvalWindows.get(approvalId);
+  approvalDebug(`closeApprovalWindow approvalId=${approvalId} found=${Boolean(win && !win.isDestroyed())}`);
   approvalWindows.delete(approvalId);
   if (win && !win.isDestroyed()) win.destroy();
 }

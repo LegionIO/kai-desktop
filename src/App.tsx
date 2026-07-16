@@ -132,6 +132,10 @@ function AppRoot() {
   const isDictationOverlay = search?.get('dictationOverlay') === '1';
   const isApprovalWindow = search?.get('approval') === '1';
   const approvalId = isApprovalWindow ? (search?.get('approvalId') ?? null) : null;
+  if (typeof window !== 'undefined' && isApprovalWindow) {
+    // TEMP debug: is the approval window rendering the standalone shell?
+    console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId}`);
+  }
   const isComputerSetupWindow = isOperatorWindow && search?.get('setup') === '1';
   const operatorSessionId = isOperatorWindow && !isComputerSetupWindow ? search.get('sessionId') : null;
   const operatorConversationId = isComputerSetupWindow ? search?.get('conversationId') : null;
@@ -1639,7 +1643,8 @@ function AppShell() {
 
   // Clicking the OS notification (or a web push) navigates to the Alerts view.
   useEffect(() => {
-    return app.alerts.onNavigate(() => {
+    return app.alerts.onNavigate((payload) => {
+      console.warn(`[ALERTS-NAV] alerts:navigate received alertId=${payload?.alertId ?? '(none)'}`);
       setSidebarSection('alerts');
       setActiveView(ALERTS_VIEW);
     });
