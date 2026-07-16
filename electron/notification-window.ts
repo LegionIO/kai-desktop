@@ -62,6 +62,12 @@ export type ApprovalWindowRequest = {
   args?: unknown;
 };
 
+// The window that was focused just before we opened the pop-out (per id). On
+// close we restore focus to it (only if it's still a live Kai window) instead of
+// letting macOS auto-raise the main window — the user answered in the pop-out and
+// doesn't want the main GUI to jump to the front.
+const notificationPriorFocus = new Map<string, BrowserWindow | null>();
+
 // Deduped by item id — a repeat request for the same id focuses the existing
 // window instead of opening a second one.
 const notificationWindows = new Map<string, BrowserWindow>();
@@ -105,24 +111,31 @@ function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
 }
 
 /**
- * Grow the window to fit its rendered content, clamped to 75% of the display's
- * work area (and never smaller than the current size). Best-effort — any failure
- * leaves the base size. Re-centers horizontally so a wider window stays centered.
+ * Size the window to fit its rendered content, clamped to [minH, 75% of the work
+ * area] (and width to [current, 75% wide]). Measures the CONTENT element's
+ * natural height (the shell renders at intrinsic height, not viewport-stretched),
+ * so the window can SHRINK to remove dead space as well as grow. Best-effort —
+ * any failure leaves the base size. Re-centers horizontally.
  */
 async function autoSizeToContent(win: BrowserWindow, display: Electron.Display): Promise<void> {
   try {
     if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    // #notif-root is the shell's intrinsic-height wrapper. Fall back to body.
     const measured = (await win.webContents.executeJavaScript(
-      `({ w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight })`,
+      `(() => {
+        const el = document.getElementById('notif-root') ?? document.body;
+        const r = el.getBoundingClientRect();
+        return { w: Math.ceil(r.width), h: Math.ceil(r.height) };
+      })()`,
     )) as { w?: number; h?: number };
     const [curW, curH] = win.getContentSize();
     const maxW = Math.floor(display.workArea.width * 0.75);
     const maxH = Math.floor(display.workArea.height * 0.75);
-    const nextW = Math.min(Math.max(curW, Math.ceil(measured.w ?? curW)), maxW);
-    const nextH = Math.min(Math.max(curH, Math.ceil(measured.h ?? curH)), maxH);
+    const MIN_H = 140; // keep a usable minimum even for a tiny card
+    const nextW = Math.min(Math.max(curW, measured.w ?? curW), maxW);
+    const nextH = Math.min(Math.max(MIN_H, measured.h ?? curH), maxH);
     if (nextW === curW && nextH === curH) return;
     win.setContentSize(nextW, nextH);
-    // Re-center horizontally within the work area; keep the top offset.
     const [, y] = win.getPosition();
     const x = Math.round(display.workArea.x + (display.workArea.width - nextW) / 2);
     win.setPosition(x, y);
@@ -139,6 +152,13 @@ async function autoSizeToContent(win: BrowserWindow, display: Electron.Display):
 export function openNotificationWindow(item: NotificationWindowItem): BrowserWindow {
   // Store the payload so the renderer can pull it on mount (notif:get).
   notificationItems.set(item.id, item);
+  // Remember what was focused before we steal focus, to restore it on close
+  // (so answering doesn't leave the main Kai window raised). Only the FIRST open
+  // for an id records it (a re-open shouldn't overwrite with our own window).
+  if (!notificationPriorFocus.has(item.id)) {
+    const prior = BrowserWindow.getFocusedWindow?.() ?? null;
+    notificationPriorFocus.set(item.id, prior && !prior.isDestroyed?.() ? prior : null);
+  }
   const existing = notificationWindows.get(item.id);
   if (existing && !existing.isDestroyed()) {
     // Re-send the payload (renderer may have mounted late) and surface it.
@@ -210,11 +230,41 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     if (notificationWindows.get(item.id) === win) {
       notificationWindows.delete(item.id);
       notificationItems.delete(item.id);
+      // If the window was closed by some path other than closeNotificationWindow
+      // (which already restores), still restore prior focus + clean up.
+      if (notificationPriorFocus.has(item.id)) restorePriorFocus(item.id);
     }
   });
 
   notificationWindows.set(item.id, win);
   return win;
+}
+
+/**
+ * After the pop-out closes, restore focus to whatever was focused before it
+ * opened — rather than letting macOS auto-raise the main Kai window. If the prior
+ * window is gone (or there was none), blur the main window that the OS may have
+ * just raised so it doesn't stay in front. Runs on next tick so it overrides the
+ * OS's post-destroy activation.
+ */
+function restorePriorFocus(id: string): void {
+  const prior = notificationPriorFocus.get(id) ?? null;
+  notificationPriorFocus.delete(id);
+  setTimeout(() => {
+    try {
+      if (prior && !prior.isDestroyed?.()) {
+        // Only restore if it isn't already focused (avoid a redundant raise).
+        if (BrowserWindow.getFocusedWindow?.() !== prior) prior.focus?.();
+        return;
+      }
+      // No valid prior window: if the OS raised some Kai window as a side effect
+      // of the close, blur it so answering the pop-out didn't pull the app front.
+      const nowFocused = BrowserWindow.getFocusedWindow?.() ?? null;
+      if (nowFocused && !nowFocused.isDestroyed?.()) nowFocused.blur?.();
+    } catch {
+      // best-effort
+    }
+  }, 0);
 }
 
 /** Close the notification window for an id once it's resolved/aborted. Idempotent. */
@@ -224,6 +274,7 @@ export function closeNotificationWindow(id: string): void {
   notificationWindows.delete(id);
   notificationItems.delete(id);
   if (win && !win.isDestroyed()) win.destroy();
+  restorePriorFocus(id);
 }
 
 /** Close every notification window (app quit / conversation cancel). */
@@ -231,6 +282,7 @@ export function closeAllNotificationWindows(): void {
   for (const [id, win] of notificationWindows) {
     notificationWindows.delete(id);
     notificationItems.delete(id);
+    notificationPriorFocus.delete(id);
     if (!win.isDestroyed()) win.destroy();
   }
   notificationItems.clear();
