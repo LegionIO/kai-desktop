@@ -11,7 +11,7 @@ import { useAlerts } from './useAlerts';
  * questions), so we hydrate each open alert via alerts:get to render its
  * answer UI. The list reacts live to alerts:changed.
  */
-export const AlertsView: FC = () => {
+export const AlertsView: FC<{ onOpenConversation?: (conversationId: string) => void }> = ({ onOpenConversation }) => {
   const { open } = useAlerts();
   const [alerts, setAlerts] = useState<Alert[]>([]);
 
@@ -54,7 +54,7 @@ export const AlertsView: FC = () => {
         ) : (
           <div className="mx-auto flex max-w-xl flex-col gap-3">
             {alerts.map((a) => (
-              <AlertCard key={a.id} alert={a} />
+              <AlertCard key={a.id} alert={a} onOpenConversation={onOpenConversation} />
             ))}
           </div>
         )}

@@ -1,5 +1,5 @@
 import { useCallback, useState, type FC } from 'react';
-import { BellIcon, InfoIcon, ShieldQuestionIcon, CheckIcon, XIcon } from 'lucide-react';
+import { BellIcon, InfoIcon, ShieldQuestionIcon, CheckIcon, XIcon, MessageSquareIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import type { Alert } from '@/lib/ipc-client';
 import { AlertQuestionPicker } from './AlertQuestionPicker';
@@ -18,7 +18,12 @@ const KIND_META: Record<Alert['kind'], { label: string; icon: FC<{ className?: s
  * Actions call the alerts IPC; on success the parent list drops the alert via
  * the alerts:changed broadcast, so we just show a transient busy state.
  */
-export const AlertCard: FC<{ alert: Alert; onResolved?: () => void }> = ({ alert, onResolved }) => {
+export const AlertCard: FC<{
+  alert: Alert;
+  onResolved?: () => void;
+  /** Deep-link: open the conversation this alert was raised in. */
+  onOpenConversation?: (conversationId: string) => void;
+}> = ({ alert, onResolved, onOpenConversation }) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState('');
@@ -66,6 +71,16 @@ export const AlertCard: FC<{ alert: Alert; onResolved?: () => void }> = ({ alert
           </div>
           <div className="mt-0.5 text-sm font-medium text-foreground">{alert.title}</div>
           {alert.body && <div className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">{alert.body}</div>}
+
+          {onOpenConversation && alert.conversationId && (
+            <button
+              type="button"
+              onClick={() => onOpenConversation(alert.conversationId)}
+              className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-primary/80 transition-colors hover:text-primary"
+            >
+              <MessageSquareIcon className="h-3 w-3" /> View conversation
+            </button>
+          )}
 
           {alert.kind === 'question' && alert.questions && alert.questions.length > 0 && (
             <div className="mt-3">
