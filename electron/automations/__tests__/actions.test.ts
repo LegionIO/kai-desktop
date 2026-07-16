@@ -75,7 +75,7 @@ vi.mock('../../ipc/conversation-store.js', () => ({
 }));
 
 import type { AutomationConversationTarget, AutomationRule } from '../../config/schema.js';
-import { executeActions, interpolateString, type ActionDeps } from '../actions.js';
+import { executeActions, interpolateString, resumeConversationWithMessage, type ActionDeps } from '../actions.js';
 import { AutomationEventBus } from '../event-bus.js';
 import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
 import { appendConversationMessages } from '../../ipc/conversations.js';
@@ -474,6 +474,22 @@ describe('agent conversationTarget', () => {
       yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
       yield { type: 'done', modelKey: 'test' } as never;
     });
+  });
+
+  it('alert resume (forceFreshTurn) runs a real turn on the existing conversation (never enqueues/strands)', async () => {
+    // Regression for the reported bug: an answered alert appended to the thread
+    // but no turn ran. resumeConversationWithMessage must RUN a turn (streamForPlugin)
+    // and never leave the answer merely enqueued.
+    clearInjects('convResume');
+    resetMockStore({
+      convResume: { id: 'convResume', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    await resumeConversationWithMessage('convResume', '[Approved] proceed', deps());
+    // A real turn ran into convResume, and nothing was left enqueued.
+    expect(vi.mocked(streamForPlugin)).toHaveBeenCalled();
+    expect(hasInjects('convResume')).toBe(false);
+    // The answer was appended as a user turn on that conversation.
+    expect(vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convResume')).toBe(true);
   });
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {

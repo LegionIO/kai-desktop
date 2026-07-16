@@ -107,6 +107,7 @@ const appAPI = {
       ipcRenderer.on('notif:request', handler);
       return () => ipcRenderer.removeListener('notif:request', handler);
     },
+    get: (id: string) => ipcRenderer.invoke('notif:get', id),
     close: (id: string) => ipcRenderer.send('notif:close', id),
   },
 

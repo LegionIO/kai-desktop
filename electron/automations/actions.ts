@@ -63,6 +63,19 @@ export function abortAutomationRun(conversationId: string): boolean {
 }
 
 /**
+ * Wait (bounded) until no automation run is in flight for this conversation — its
+ * finally block has flushed the reply + cleared inFlightAutomationTargets. Used
+ * before a forced fresh turn (alert resume) so the answer runs AFTER the prior
+ * run finishes, not racing/stranded against its final step. Proceeds on timeout.
+ */
+async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isAutomationRunInFlight(conversationId) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/**
  * Run one agent turn on an EXISTING conversation with a plain-text prompt, reusing
  * the automation agent-run machinery (append user turn → stream response → persist
  * → broadcast live). Used by the Alerts feature to RESUME a suspended run after the
@@ -111,7 +124,11 @@ export async function resumeConversationWithMessage(
   };
   // Empty ctx: the prompt is a literal, no template substitution wanted.
   const ctx: InterpolationCtx = { payload: null, result: [], source: 'alerts', event: 'answered' };
-  return runAgentAction(action, ctx, rule, event, deps, { literalPrompt: true, strictExistingTarget: true });
+  return runAgentAction(action, ctx, rule, event, deps, {
+    literalPrompt: true,
+    strictExistingTarget: true,
+    forceFreshTurn: true,
+  });
 }
 
 const TEMPLATE_RE = /\{\{\s*([^}]+?)\s*\}\}/g;
@@ -262,6 +279,12 @@ async function runAgentAction(
     /** Remaining drain-at-end continuations allowed (loop guard). Defaults to a
      *  small cap; each stranded-inject continuation decrements it. */
     continueBudget?: number;
+    /** Force a GUARANTEED fresh turn even if the target is busy: an alert answer
+     *  MUST be processed (not cooperatively enqueued, which can strand it if the
+     *  in-flight run is on its final step and never re-splices). When busy, wait
+     *  for the in-flight run to settle, then run a normal turn that appends the
+     *  answer + responds. */
+    forceFreshTurn?: boolean;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -285,7 +308,17 @@ async function runAgentAction(
   }
 
   const canInject = typeof deps.injectUserTurnAndRestart === 'function';
-  const resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+  let resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+
+  // Alert resume (forceFreshTurn): a busy target must NOT cooperatively enqueue
+  // (that can strand the answer if the in-flight run is on its final step). Wait
+  // for the run to settle, then RE-RESOLVE — the conversation is now idle, so the
+  // normal existing-target path below appends the answer + runs a real turn.
+  if (opts?.forceFreshTurn && resolved && 'busyInject' in resolved) {
+    const targetConvId = resolved.busyInject;
+    await waitForAutomationRunToSettle(targetConvId);
+    resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+  }
 
   // Busy target + inject enabled: append this prompt as a mid-turn follow-up and
   // restart the stream (abort+restart with the combined branch), reusing the

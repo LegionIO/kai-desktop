@@ -65,6 +65,11 @@ export type ApprovalWindowRequest = {
 // Deduped by item id — a repeat request for the same id focuses the existing
 // window instead of opening a second one.
 const notificationWindows = new Map<string, BrowserWindow>();
+// The item payload per open window id, so the renderer can PULL it on mount
+// (notif:get) rather than racing the push on ready-to-show (the renderer's React
+// effect may not have subscribed yet when we send — that dropped the payload and
+// left the window spinning forever).
+const notificationItems = new Map<string, NotificationWindowItem>();
 
 function loadNotificationRoute(win: BrowserWindow, query: Record<string, string>): void {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
@@ -105,6 +110,8 @@ function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
  * window is never touched, and focus returns to the prior window on close.
  */
 export function openNotificationWindow(item: NotificationWindowItem): BrowserWindow {
+  // Store the payload so the renderer can pull it on mount (notif:get).
+  notificationItems.set(item.id, item);
   const existing = notificationWindows.get(item.id);
   if (existing && !existing.isDestroyed()) {
     // Re-send the payload (renderer may have mounted late) and surface it.
@@ -171,6 +178,7 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     // window registered under the same id.
     if (notificationWindows.get(item.id) === win) {
       notificationWindows.delete(item.id);
+      notificationItems.delete(item.id);
     }
   });
 
@@ -183,6 +191,7 @@ export function closeNotificationWindow(id: string): void {
   const win = notificationWindows.get(id);
   notifDebug(`closeNotificationWindow id=${id} found=${Boolean(win && !win.isDestroyed())}`);
   notificationWindows.delete(id);
+  notificationItems.delete(id);
   if (win && !win.isDestroyed()) win.destroy();
 }
 
@@ -190,8 +199,10 @@ export function closeNotificationWindow(id: string): void {
 export function closeAllNotificationWindows(): void {
   for (const [id, win] of notificationWindows) {
     notificationWindows.delete(id);
+    notificationItems.delete(id);
     if (!win.isDestroyed()) win.destroy();
   }
+  notificationItems.clear();
 }
 
 export function hasNotificationWindow(id: string): boolean {
@@ -233,6 +244,11 @@ export function registerNotificationWindowIpc(): void {
   ipcMain.on('notif:close', closeHandler);
   // Back-compat channel (ApprovalShell during migration).
   ipcMain.on('approval:close', closeHandler);
+  // Renderer pulls its item on mount — avoids the ready-to-show push racing the
+  // renderer's not-yet-mounted subscription (which left the window spinning).
+  ipcMain.handle('notif:get', (_event, id: unknown) =>
+    typeof id === 'string' ? (notificationItems.get(id) ?? null) : null,
+  );
 }
 /** Back-compat alias. */
 export const registerApprovalWindowIpc = registerNotificationWindowIpc;

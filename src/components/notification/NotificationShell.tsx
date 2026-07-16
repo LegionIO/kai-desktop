@@ -32,10 +32,22 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    return app.notification.onRequest((raw) => {
+    // Subscribe for a push AND pull the item immediately — the main-process push
+    // on ready-to-show can arrive before this effect subscribes (dropped → the
+    // window spins forever), so the pull is the reliable path.
+    const off = app.notification.onRequest((raw) => {
       const it = raw as NotificationItem;
       if (it && it.id === id) setItem(it);
     });
+    let cancelled = false;
+    void app.notification.get(id).then((raw) => {
+      const it = raw as NotificationItem | null;
+      if (!cancelled && it && it.id === id) setItem(it);
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
   }, [id]);
 
   const close = () => app.notification.close(id);

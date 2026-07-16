@@ -18,6 +18,7 @@ beforeEach(() => {
         requestCb = cb;
         return () => {};
       },
+      get: vi.fn().mockResolvedValue(null),
       close: vi.fn(),
     },
     agent: { answerToolQuestion: vi.fn(), approveToolCall: vi.fn(), rejectToolCall: vi.fn() },
