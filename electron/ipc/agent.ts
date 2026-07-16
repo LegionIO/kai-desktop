@@ -22,6 +22,7 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
 } from '../agent/stream-persistence.js';
+import { enqueueInject } from '../agent/inject-queue.js';
 import {
   shouldCompact,
   compactConversationPrefix,
@@ -106,6 +107,7 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   if (activeStreams.get(conversationId)?.token !== token) return;
   activeStreams.delete(conversationId);
   activeStreamModelKeys.delete(conversationId);
+  activeStreamRuntime.delete(conversationId);
   activeObserverSessions.delete(conversationId);
 }
 const activeObserverSessions = new Map<string, string>();
@@ -206,6 +208,17 @@ import { pendingQuestionAnswers, stashQuestionAnswers } from '../tools/ask-user.
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
 
+// Track the runtime driving each active stream, so a mid-turn inject can route:
+// the Mastra runtime supports cooperative step-boundary injection (prepareStep +
+// inject-queue), while the CLI runtimes (codex/claude/pi/opencode) can't be
+// stepped and use the abort+restart fallback.
+const activeStreamRuntime = new Map<string, string>();
+
+/** The runtime id driving the current active stream for a conversation, if any. */
+export function getActiveStreamRuntime(conversationId: string): string | undefined {
+  return activeStreams.has(conversationId) ? activeStreamRuntime.get(conversationId) : undefined;
+}
+
 // Conversations whose current turn was started by a client that does NOT persist
 // the assistant reply itself (the `kai` CLI via agent:submit). For these, the
 // main process accumulates the stream and writes the assistant turn on `done`.
@@ -256,7 +269,7 @@ export type InjectUserTurnFn = (
   conversationId: string,
   userText: string,
   opts?: { modelKey?: string; reasoningEffort?: ReasoningEffort; profileKey?: string; cwd?: string },
-) => Promise<{ ok: boolean; error?: string }>;
+) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
 
 let injectUserTurnAndRestart: InjectUserTurnFn | null = null;
 
@@ -1107,6 +1120,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       conversationId,
       modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey,
     );
+    // Track the runtime so a mid-turn inject can pick cooperative (Mastra) vs
+    // abort+restart (CLI runtimes).
+    activeStreamRuntime.set(conversationId, runtime.id);
     for (const [index, message] of messageList.entries()) {
       const contentPreview =
         typeof message.content === 'string'
@@ -2522,6 +2538,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
+
+    // COOPERATIVE mid-turn injection (Mastra runtime only): if a Mastra turn is
+    // still generating, splice the follow-up into the RUNNING turn at its next
+    // step boundary instead of aborting. Enqueue the message (prepareStep drains
+    // it — see inject-queue.ts + prepare-step-inject.ts), persist + broadcast the
+    // user turn so it renders immediately, and let the live turn continue. The
+    // CLI runtimes can't be stepped, so they fall through to abort+restart below.
+    if (getActiveStreamRuntime(conversationId) === 'mastra') {
+      enqueueInject(conversationId, userText);
+      const write = appendConversationMessages(
+        appHome,
+        conversationId,
+        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+        // Keep runStatus 'running' — the turn is still live; we're extending it.
+        { runStatus: 'running' },
+      );
+      if (!write) {
+        // Conversation vanished between the runtime check and the write — the run
+        // is effectively gone; fall through to the abort+restart path which
+        // re-reads + handles a missing conversation cleanly.
+      } else {
+        broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+        return { ok: true, injectedCooperatively: true };
+      }
+    }
 
     // If a turn is still generating into this conversation, PRESERVE its
     // in-progress reply as its own (interrupted) turn before we abort + restart.

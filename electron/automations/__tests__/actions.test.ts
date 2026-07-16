@@ -80,6 +80,7 @@ import { AutomationEventBus } from '../event-bus.js';
 import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
 import { appendConversationMessages } from '../../ipc/conversations.js';
 import { writeConversation } from '../../ipc/conversation-store.js';
+import { hasInjects, clearInjects, drainInjects } from '../../agent/inject-queue.js';
 
 function rule(actions: AutomationRule['actions']): AutomationRule {
   return {
@@ -402,6 +403,45 @@ describe('agent conversationTarget', () => {
     // Normal path writes the user turn to convA (exactly one append in this path).
     const [, appendedId] = vi.mocked(appendConversationMessages).mock.calls.at(-1) as [string, string, unknown[]];
     expect(appendedId).toBe('convA');
+  });
+
+  it('busy target held by an in-flight AUTOMATION run injects COOPERATIVELY (enqueue, no abort/restart)', async () => {
+    // An in-flight automation run is always Mastra (steppable), so a second
+    // automation targeting it must enqueue for prepareStep to splice mid-turn —
+    // NOT abort+restart. Gate streamForPlugin so the first run stays in-flight
+    // while the second fires.
+    clearInjects('convCoop');
+    resetMockStore({
+      convCoop: { id: 'convCoop', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    vi.mocked(streamForPlugin).mockImplementationOnce(async function* () {
+      yield { type: 'text-delta', text: 'partial…' } as never;
+      await gate; // keep the first run in-flight
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const d = deps({ injectUserTurnAndRestart });
+
+    // First run — do NOT await; it blocks on the gate, staying in-flight.
+    const first = executeActions(agentAction({ type: 'existing', conversationId: 'convCoop' }), evt, d);
+    // Wait until the first run is actually streaming (has written its user turn).
+    await vi.waitFor(() => {
+      const wrote = vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convCoop');
+      if (!wrote) throw new Error('first run not in-flight yet');
+    });
+
+    // Second automation targets the same, still-running conversation.
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convCoop' }), evt, d);
+
+    // Cooperative: enqueued for prepareStep, NOT routed through abort+restart.
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(hasInjects('convCoop')).toBe(true);
+    expect(drainInjects('convCoop').map((q) => q.text)).toContain('do the thing');
+
+    release();
+    await first;
   });
 
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {

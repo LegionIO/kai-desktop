@@ -29,6 +29,7 @@ import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-saniti
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
+import { buildMastraPrepareStep } from './prepare-step-inject.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -1153,6 +1154,9 @@ async function* generateWithSyntheticEvents(
       const generateOptions = {
         maxSteps: maxStepsLimit,
         abortSignal: options?.abortSignal,
+        // Cooperative mid-turn injection (see streamOptions): splice queued
+        // follow-ups at each step boundary. No-op when the queue is empty.
+        prepareStep: buildMastraPrepareStep(conversationId),
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
         ...(memoryOptions ?? {}),
@@ -1388,6 +1392,10 @@ async function* streamWithRealEvents(
         const streamOptions = {
           maxSteps: maxStepsLimit,
           abortSignal: options?.abortSignal,
+          // Cooperative mid-turn injection: drain the conversation's inject queue
+          // at each step boundary and splice queued follow-ups into this turn's
+          // context (no abort). No-op when the queue is empty.
+          prepareStep: buildMastraPrepareStep(conversationId),
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),
           ...(memoryOptions ?? {}),

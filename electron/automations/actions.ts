@@ -4,6 +4,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
+import { enqueueInject, hasInjects, drainInjects } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -37,7 +38,7 @@ export type ActionDeps = {
     conversationId: string,
     userText: string,
     opts?: { modelKey?: string; reasoningEffort?: string; profileKey?: string; cwd?: string },
-  ) => Promise<{ ok: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
 };
 
 type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
@@ -59,22 +60,6 @@ export function abortAutomationRun(conversationId: string): boolean {
   if (!controller) return false;
   controller.abort();
   return true;
-}
-
-/**
- * Wait (bounded) until no automation run is in flight for this conversation —
- * i.e. an aborted run has finished its finally block (flushed its partial reply
- * + reset runStatus + cleared inFlightAutomationTargets). Used before a busy
- * mid-turn inject so the injected user turn lands AFTER the prior run's partial
- * assistant reply, not interleaved with it. Bounded so a wedged run can't hang
- * the inject forever; on timeout we proceed anyway (injectUserTurnAndRestart's
- * own abort + fresh token still supersede any straggler).
- */
-async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 5000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (isAutomationRunInFlight(conversationId) && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
 }
 
 /**
@@ -300,32 +285,43 @@ async function runAgentAction(
   // streamHandler, and its assistant reply is written by the server-persist
   // accumulator. The literal (already-interpolated) prompt is passed as-is.
   if (resolved && 'busyInject' in resolved) {
-    // If the busy target is held by a PRIOR automation run (streamForPlugin,
-    // tracked in automationRunAborts — NOT activeStreams), abort THAT run first.
-    // injectUserTurnAndRestart only aborts the activeStreams entry, so without
-    // this the old automation stream would run concurrently with the injected
-    // one — duplicating tool effects and racing persistence into the same convo.
-    abortAutomationRun(resolved.busyInject);
-    // Wait for the aborted automation run to FINISH its own finalize (it flushes
-    // whatever partial reply it had streamed into an assistant turn, then clears
-    // inFlightAutomationTargets in its finally). Without this wait, the injected
-    // user turn could be appended BEFORE the aborted run persists its partial,
-    // producing the wrong order (user1 → user2 → assistant1) or an assistant
-    // reply parented on a stale head. injectUserTurnAndRestart handles the
-    // activeStreams-owned partial itself (finalizeInterruptedTurn); this wait
-    // covers the automation-run-owned partial that lives in runAgentAction's own
-    // accumulator.
-    await waitForAutomationRunToSettle(resolved.busyInject);
-    const res = await deps.injectUserTurnAndRestart!(resolved.busyInject, prompt, {
+    const targetConvId = resolved.busyInject;
+
+    // An in-flight AUTOMATION run is always the Mastra runtime (streamForPlugin
+    // drives streamAgentResponse directly — never a CLI runtime adapter), so it
+    // supports cooperative step-boundary injection. Enqueue the follow-up + write
+    // the user turn; the running turn's prepareStep hook splices it at its next
+    // step boundary. NO abort — the partial turn continues, the model sees the
+    // new message in the SAME turn.
+    if (isAutomationRunInFlight(targetConvId)) {
+      enqueueInject(targetConvId, prompt);
+      const write = appendConversationMessages(
+        deps.appHome,
+        targetConvId,
+        [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+        { runStatus: 'running' }, // still live — extending the turn
+      );
+      if (!write) {
+        throw new Error(`mid-turn injection into ${targetConvId} failed: conversation missing`);
+      }
+      broadcastAgentStreamEvent({ conversationId: targetConvId, type: 'user-message', text: prompt });
+      return { injectedInto: targetConvId, ok: true };
+    }
+
+    // Otherwise the busy target is held by an activeStreams run (a GUI /
+    // agent:submit turn). injectUserTurnAndRestart routes it: cooperative splice
+    // if that run is Mastra, else abort+restart-with-preserved-partial for a CLI
+    // runtime. It handles the activeStreams-owned partial itself.
+    const res = await deps.injectUserTurnAndRestart!(targetConvId, prompt, {
       modelKey: action.modelKey,
       profileKey: action.profileKey,
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.
     if (!res.ok) {
-      throw new Error(`mid-turn injection into ${resolved.busyInject} failed: ${res.error ?? 'unknown error'}`);
+      throw new Error(`mid-turn injection into ${targetConvId} failed: ${res.error ?? 'unknown error'}`);
     }
-    return { injectedInto: resolved.busyInject, ok: true };
+    return { injectedInto: targetConvId, ok: true };
   }
 
   if (opts?.strictExistingTarget && action.conversationTarget?.type === 'existing' && !resolved) {
