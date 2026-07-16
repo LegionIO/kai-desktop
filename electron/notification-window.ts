@@ -271,10 +271,16 @@ function restorePriorFocus(id: string): void {
 export function closeNotificationWindow(id: string): void {
   const win = notificationWindows.get(id);
   notifDebug(`closeNotificationWindow id=${id} found=${Boolean(win && !win.isDestroyed())}`);
+  // Only manage focus if the POP-OUT WINDOW was actually the focused surface at
+  // close time. When the user answers the INLINE card in the main GUI (which also
+  // closes any pop-out via the dismissal-sync path), the pop-out was NOT focused —
+  // restoring/blurring then would wrongly blur the main window they're using.
+  const popoutWasFocused = Boolean(win && !win.isDestroyed() && win.isFocused?.());
   notificationWindows.delete(id);
   notificationItems.delete(id);
   if (win && !win.isDestroyed()) win.destroy();
-  restorePriorFocus(id);
+  if (popoutWasFocused) restorePriorFocus(id);
+  else notificationPriorFocus.delete(id);
 }
 
 /** Close every notification window (app quit / conversation cancel). */
