@@ -26,7 +26,20 @@ describe('request_review tool', () => {
     const alerts = listAlerts(appHome);
     expect(alerts).toHaveLength(1);
     expect(alerts[0].kind).toBe('fyi');
+    // Default (no awaitAck): FYI is auto-acknowledged — informational, not 'open'
+    // (so it doesn't nag with a badge / sit in the open list).
+    expect(readAlert(appHome, alerts[0].id)?.status).toBe('acknowledged');
     expect(readAlert(appHome, alerts[0].id)?.conversationId).toBe('conv-1');
+  });
+
+  it('fyi with awaitAck:true stays OPEN (needs the user to clear it)', async () => {
+    const tool = createRequestReviewTool(appHome);
+    const res = (await tool.execute(
+      { kind: 'fyi', title: 'Heads up', message: 'please ack', awaitAck: true },
+      ctx,
+    )) as Record<string, unknown>;
+    expect(res.suspend).toBe(false); // still non-blocking for the run
+    expect(readAlert(appHome, res.alertId as string)?.status).toBe('open');
   });
 
   it('question creates a question alert and SUSPENDS', async () => {

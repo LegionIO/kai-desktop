@@ -27,7 +27,7 @@ export interface AlertQuestion {
 }
 
 export type AlertKind = 'question' | 'fyi' | 'approval';
-export type AlertStatus = 'open' | 'answered' | 'dismissed';
+export type AlertStatus = 'open' | 'answered' | 'dismissed' | 'acknowledged';
 
 export interface Alert {
   id: string;
@@ -185,13 +185,17 @@ export interface CreateAlertInput {
   questions?: AlertQuestion[];
   approvalAction?: string;
   ruleId?: string;
+  /** Initial status. Defaults to 'open'. An informational FYI that doesn't need
+   *  an ack is created 'acknowledged' so it's in history but not in the
+   *  open list / badge. */
+  status?: AlertStatus;
 }
 
 export function createAlert(appHome: string, input: CreateAlertInput): Alert {
   const alert: Alert = {
     id: randomUUID(),
     kind: input.kind,
-    status: 'open',
+    status: input.status ?? 'open',
     title: input.title,
     body: input.body,
     conversationId: input.conversationId,

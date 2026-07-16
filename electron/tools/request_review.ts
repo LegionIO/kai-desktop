@@ -54,14 +54,22 @@ export function createRequestReviewTool(appHome: string): ToolDefinition {
         .string()
         .optional()
         .describe('For kind="approval": a short description of the action to approve/deny'),
+      awaitAck: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          'For kind="fyi" only: if true, the FYI stays OPEN in the Alerts tab until the user acknowledges/dismisses it (nags with a badge). Default false — an FYI is informational and auto-acknowledged (shown as a notification + in Alerts history, no action needed). Ignored for question/approval (always awaited).',
+        ),
     }),
     execute: async (input, context) => {
-      const { kind, title, message, questions, approvalAction } = input as {
+      const { kind, title, message, questions, approvalAction, awaitAck } = input as {
         kind: 'fyi' | 'question' | 'approval';
         title: string;
         message: string;
         questions?: AlertQuestion[];
         approvalAction?: string;
+        awaitAck?: boolean;
       };
       const conversationId = context.conversationId;
       if (!conversationId) {
@@ -71,6 +79,10 @@ export function createRequestReviewTool(appHome: string): ToolDefinition {
         return { error: 'kind="question" requires at least one question', isError: true };
       }
 
+      // An FYI that doesn't await an ack is created already-acknowledged: it shows
+      // as a notification + in Alerts history but never sits 'open' (no badge, no
+      // dismissal needed). question/approval are always 'open' (awaited).
+      const fyiAutoAck = kind === 'fyi' && !awaitAck;
       const alert = createAlert(appHome, {
         kind,
         title,
@@ -78,6 +90,7 @@ export function createRequestReviewTool(appHome: string): ToolDefinition {
         conversationId,
         ...(kind === 'question' && questions ? { questions } : {}),
         ...(kind === 'approval' && approvalAction ? { approvalAction } : {}),
+        ...(fyiAutoAck ? { status: 'acknowledged' as const } : {}),
       });
       // Fire the OS notification + UI broadcast (no-op in tests / before the
       // alerts IPC layer has registered its handler).

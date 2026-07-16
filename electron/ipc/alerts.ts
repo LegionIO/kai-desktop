@@ -181,9 +181,16 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
  *  user's answer isn't silently lost and they can retry. */
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
+  // TEMP debug: trace the resume so "answered but no turn ran" can be pinpointed.
+  const conv = readConversation(deps.appHome, alert.conversationId);
+  alertsDebug(
+    `resume START alert=${alert.id} kind=${alert.kind} conv=${alert.conversationId} convRunStatus=${(conv as { runStatus?: string } | null)?.runStatus ?? 'MISSING'} text="${userText.slice(0, 80)}"`,
+  );
   try {
-    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
+    const res = await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
+    alertsDebug(`resume OK alert=${alert.id} result=${JSON.stringify(res)?.slice(0, 200)}`);
   } catch (err) {
+    alertsDebug(`resume THREW alert=${alert.id} err=${err instanceof Error ? err.message : String(err)}`);
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
     if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
     throw err;

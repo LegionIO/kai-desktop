@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Notification } from 'electron';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
@@ -6,6 +8,16 @@ import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
 import { enqueueInject, hasInjects, drainInjects } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
+
+// TEMP debug (alert-resume / runAgentAction path). Remove once diagnosed.
+const ACTIONS_DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/alerts.log');
+function actionsDebug(msg: string): void {
+  try {
+    appendFileSync(ACTIONS_DEBUG_LOG, `[${new Date().toISOString()}] [actions] ${msg}\n`);
+  } catch {
+    /* best-effort */
+  }
+}
 import {
   appendConversationMessages,
   broadcastUpsert,
@@ -309,6 +321,9 @@ async function runAgentAction(
 
   const canInject = typeof deps.injectUserTurnAndRestart === 'function';
   let resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+  actionsDebug(
+    `runAgentAction resolve target=${JSON.stringify(action.conversationTarget)} forceFreshTurn=${!!opts?.forceFreshTurn} canInject=${canInject} → resolved=${JSON.stringify(resolved)}`,
+  );
 
   // Alert resume (forceFreshTurn): a busy target must NOT cooperatively enqueue
   // (that can strand the answer if the in-flight run is on its final step). Wait
@@ -316,8 +331,10 @@ async function runAgentAction(
   // normal existing-target path below appends the answer + runs a real turn.
   if (opts?.forceFreshTurn && resolved && 'busyInject' in resolved) {
     const targetConvId = resolved.busyInject;
+    actionsDebug(`forceFreshTurn: target busy, waiting to settle conv=${targetConvId}`);
     await waitForAutomationRunToSettle(targetConvId);
     resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+    actionsDebug(`forceFreshTurn: after settle re-resolved=${JSON.stringify(resolved)}`);
   }
 
   // Busy target + inject enabled: append this prompt as a mid-turn follow-up and
@@ -423,15 +440,29 @@ async function runAgentAction(
     if (opts?.continueOnBranch) {
       appendConversationMessages(deps.appHome, conversationId, [], { runStatus: 'running' });
     } else {
+      actionsDebug(
+        `append user turn conv=${conversationId} parentId=${parentId ?? 'null'} continueOnBranch=${!!opts?.continueOnBranch} strict=${!!opts?.strictExistingTarget} prompt="${prompt.slice(0, 60)}"`,
+      );
       const promptWrite = appendConversationMessages(
         deps.appHome,
         conversationId,
         [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
-        { skipIfBusy: true, parentId, runStatus: 'running' },
+        // A resume (strictExistingTarget) MUST land in the alert's own
+        // conversation — never skip-if-busy (which would then divert to a NEW
+        // chat, so the answer vanishes from the thread the user is watching).
+        { skipIfBusy: !opts?.strictExistingTarget, parentId, runStatus: 'running' },
+      );
+      actionsDebug(
+        `append result conv=${conversationId} wrote=${Boolean(promptWrite)} newHead=${promptWrite?.headId ?? 'null'}`,
       );
       if (!promptWrite) {
         // Target was genuinely busy (a concurrent run) or deleted mid-flight —
-        // divert to a fresh conversation and write the prompt there.
+        // divert to a fresh conversation and write the prompt there. NEVER divert
+        // a resume (strictExistingTarget): fail loudly instead so the answer isn't
+        // silently moved to a new chat the user won't see.
+        if (opts?.strictExistingTarget) {
+          throw new Error(`resume target ${conversationId} could not be written (missing/busy)`);
+        }
         console.warn(
           `[automations] rule "${rule.name}" target ${conversationId} is busy or was deleted; diverting to a new conversation`,
         );
