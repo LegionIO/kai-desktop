@@ -40,6 +40,15 @@ files:
   # tripping @electron/universal's "unique file not covered by allowList"
   # symmetry check. Nothing require()s it at runtime, so drop it from the package.
   - "!**/node_modules/node-addon-api/**"
+  # Dev-only cruft some packages ship (e.g. strnum's `.vscode/`) can appear in
+  # only ONE arch's dependency tree under pnpm's --frozen-lockfile layout, which
+  # trips @electron/universal's arch-symmetry check — AND it can't be covered by
+  # singleArchFiles because minimatch runs without `dot:true`, so `pkg/**` never
+  # matches a dot-dir like `.vscode`. Strip these dev/editor/CI dirs from every
+  # bundled module (never needed at runtime) so they never reach the check.
+  - "!**/node_modules/**/.vscode/**"
+  - "!**/node_modules/**/.github/**"
+  - "!**/node_modules/**/.idea/**"
 # smartUnpack auto-detects most native binaries, but the Codex CLI lives deep
 # under vendor/<triple>/codex/codex inside an optionalDependency and has been
 # missed — leaving it inside app.asar makes spawn() fail with ENOTDIR. List it
