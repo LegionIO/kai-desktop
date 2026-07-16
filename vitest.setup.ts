@@ -13,6 +13,7 @@
 
 import { vi, beforeEach, afterEach } from 'vitest';
 import type * as Undici from 'undici';
+
 import { setupHttpMock } from './test-utils/http-mock.js';
 import {
   BLOCKED_HOSTS,
@@ -22,6 +23,17 @@ import {
   isBlockedHostname,
   makeFirewallError,
 } from './test-utils/blocked-hosts.js';
+
+// jsdom lacks ResizeObserver; components that observe layout (e.g.
+// NotificationChrome's content-size reporter) need a stub so they don't throw.
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  class ResizeObserverStub {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
+}
 
 // Clear provider base-URL overrides so SDK clients use their canonical defaults
 // during tests. Without this, env vars like ANTHROPIC_BASE_URL set in the

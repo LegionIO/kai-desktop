@@ -100,6 +100,7 @@ type AppAPI = {
     onRequest: (callback: (item: unknown) => void) => () => void;
     get: (id: string) => Promise<unknown>;
     close: (id: string) => void;
+    reportSize: (height: number) => void;
   };
   conversations: {
     list: () => Promise<unknown[]>;

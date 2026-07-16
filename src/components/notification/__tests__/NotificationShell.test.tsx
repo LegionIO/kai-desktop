@@ -20,6 +20,7 @@ beforeEach(() => {
       },
       get: vi.fn().mockResolvedValue(null),
       close: vi.fn(),
+      reportSize: vi.fn(),
     },
     agent: { answerToolQuestion: vi.fn(), approveToolCall: vi.fn(), rejectToolCall: vi.fn() },
     alerts: { answer: vi.fn(), decide: vi.fn(), dismiss: vi.fn() },

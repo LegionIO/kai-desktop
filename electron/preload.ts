@@ -109,6 +109,7 @@ const appAPI = {
     },
     get: (id: string) => ipcRenderer.invoke('notif:get', id),
     close: (id: string) => ipcRenderer.send('notif:close', id),
+    reportSize: (height: number) => ipcRenderer.send('notif:resize', height),
   },
 
   conversations: {

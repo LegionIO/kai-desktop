@@ -639,6 +639,33 @@ const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, resul
   const questions = parseQuestions(args);
   const r = (result && typeof result === 'object' && !Array.isArray(result) ? result : {}) as Record<string, unknown>;
   const suspend = r.suspend === true || r.suspended === true || r.alerted === true;
+  const alertId = typeof r.alertId === 'string' ? r.alertId : null;
+
+  // Track the raised alert's LIVE status so the inline card flips from "awaiting"
+  // to "answered/dismissed" (and shows the selections) once the user answers it
+  // in the pop-out window or the Alerts tab — the tool's own result is frozen at
+  // {suspended} and never learns the outcome.
+  const [alert, setAlert] = useState<AlertLike | null>(null);
+  useEffect(() => {
+    if (!alertId) return;
+    let cancelled = false;
+    const load = () =>
+      void app.alerts.get(alertId).then((al) => {
+        if (!cancelled) setAlert((al as AlertLike | null) ?? null);
+      });
+    load();
+    const off = app.alerts.onChanged((payload) => {
+      const p = payload as { alert?: { id?: string } } | undefined;
+      // Refetch on any change touching this alert (created/resolved/dismissed).
+      if (!p?.alert || p.alert.id === alertId) load();
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [alertId]);
+
+  const alertStatus = alert?.status;
   const label = isAskUserShape
     ? questions.length === 1
       ? 'Asked the user'
@@ -681,13 +708,58 @@ const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, resul
           ))}
         </div>
       )}
-      {suspend && (
+      {/* Live outcome once the raised alert is resolved elsewhere. */}
+      {suspend && alertStatus === 'answered' ? (
+        <ResolvedAlertAnswer alert={alert!} />
+      ) : suspend && alertStatus === 'dismissed' ? (
+        <div className="text-[11px] text-muted-foreground">Dismissed without answering.</div>
+      ) : suspend ? (
         <div className="text-[11px] text-amber-600 dark:text-amber-400">
           Raised as an Alert — awaiting the user. The run will resume when they respond.
         </div>
-      )}
+      ) : null}
     </div>
   );
+};
+
+/** Minimal alert shape the inline card needs (subset of the store's Alert). */
+export type AlertLike = {
+  id: string;
+  kind: 'question' | 'approval' | 'fyi';
+  status: 'open' | 'answered' | 'dismissed';
+  questions?: Array<{ question: string; header: string }>;
+  approvalAction?: string;
+  answer?: Record<string, string> | 'approve' | 'deny';
+  answeredAt?: string;
+};
+
+/** Render the user's recorded answer/decision for a resolved alert. Exported for
+ *  tests. */
+export const ResolvedAlertAnswer: FC<{ alert: AlertLike }> = ({ alert }) => {
+  const ans = alert.answer;
+  if (ans === 'approve' || ans === 'deny') {
+    return (
+      <div className={`text-[11px] font-medium ${ans === 'approve' ? 'text-emerald-500' : 'text-muted-foreground'}`}>
+        {ans === 'approve' ? '✓ Approved' : '✕ Denied'}
+        {alert.approvalAction ? ` — ${alert.approvalAction}` : ''}
+      </div>
+    );
+  }
+  if (ans && typeof ans === 'object') {
+    // answer is keyed by question.header → chosen value; map back to question text.
+    const byHeader = new Map((alert.questions ?? []).map((q) => [q.header, q.question] as const));
+    return (
+      <div className="space-y-1">
+        <div className="text-[11px] font-medium text-emerald-500">✓ Answered</div>
+        {Object.entries(ans).map(([header, choice]) => (
+          <div key={header} className="text-[11px] text-muted-foreground">
+            <span className="text-foreground/80">{byHeader.get(header) ?? header}:</span> {choice}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return <div className="text-[11px] font-medium text-emerald-500">✓ Answered</div>;
 };
 
 /** True if an ask_user result actually carries user answers (vs. a headless
