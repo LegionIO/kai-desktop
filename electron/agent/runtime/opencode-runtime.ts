@@ -114,147 +114,13 @@ export class OpencodeRuntime implements AgentRuntime {
     let bridgeUrl: string | undefined;
     let opencodeConfigDir: string | undefined;
     let opencodeConfigPath: string | undefined;
-    if (customTools.length > 0) {
-      try {
-        bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal);
-        const token = bridge.getAuthToken();
-        opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
-        opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');
-        writeFileSync(opencodeConfigPath, JSON.stringify(buildOpencodeMcpConfig(bridgeUrl, token), null, 2), {
-          mode: 0o600,
-        });
-        promptText = buildOpencodeMcpPrompt(promptText, customTools);
-        console.info(`[opencode-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
-      } catch (err) {
-        console.warn('[opencode-runtime] Failed to start MCP bridge:', err);
-        bridgeUrl = undefined;
-        try {
-          await bridge.stop();
-        } catch {
-          /* ignore */
-        }
-        if (opencodeConfigDir) {
-          try {
-            rmSync(opencodeConfigDir, { recursive: true, force: true });
-          } catch {
-            /* ignore */
-          }
-          opencodeConfigDir = undefined;
-          opencodeConfigPath = undefined;
-        }
-      }
-    }
-
-    // Prompt via stdin (avoid argv @/-/ambiguity + very long prompts).
-    args.push('-');
-
-    if (mapping.unmappableReason) {
-      yield {
-        conversationId,
-        type: 'text-delta',
-        text:
-          `> Note: opencode couldn't be pointed at "${primaryModel?.displayName ?? 'the selected model'}" ` +
-          `(${mapping.unmappableReason}); using opencode's own default model. Configure the provider in ` +
-          `opencode (\`opencode auth login\`) or pick a first-party model.\n\n`,
-      };
-    }
-
-    const baseEnv =
-      options.childEnv ?? scrubSecretEnv(getResolvedProcessEnv(), { preserveAwsChain: mapping.preserveAwsChain });
-    const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
-    // Point opencode at the ephemeral per-run config carrying the Kai MCP bridge.
-    if (opencodeConfigPath) env.OPENCODE_CONFIG = opencodeConfigPath;
-
-    const child = spawn(binPath, args, {
-      cwd: runDir,
-      env,
-      shell: false,
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
-
-    let spawnError: NodeJS.ErrnoException | undefined;
-    let stderrBuf = '';
-    let errorYielded = false;
-    child.on('error', (err) => {
-      spawnError = err as NodeJS.ErrnoException;
-    });
-    child.stdin.on('error', () => {});
-    child.stderr.on('data', (d: Buffer) => {
-      if (stderrBuf.length < 64 * 1024) stderrBuf = (stderrBuf + d.toString('utf8')).slice(0, 64 * 1024);
-    });
-
-    const onAbort = (): void => killProcessGroup(child);
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
-
-    const exited = new Promise<void>((resolve) => {
-      child.on('close', () => resolve());
-    });
-
-    try {
-      // Send the prompt on stdin.
-      child.stdin.write(promptText);
-      child.stdin.end();
-
-      let buf = '';
-      let sessionIdEmitted = false;
-      const MAX_LINE = 4 * 1024 * 1024;
-      for await (const chunk of child.stdout) {
-        if (abortSignal?.aborted) break;
-        buf += (chunk as Buffer).toString('utf8');
-        let nl: number;
-        while ((nl = buf.indexOf('\n')) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line || line.length > MAX_LINE || !line.startsWith('{')) continue;
-          let evt: unknown;
-          try {
-            evt = JSON.parse(line);
-          } catch {
-            continue;
-          }
-          if (!evt || typeof evt !== 'object') continue;
-          // Capture opencode's session id ONCE (first turn) for resume — every
-          // event carries sessionID, so guard against re-emitting the enrichment.
-          if (!existingSessionId && !sessionIdEmitted) {
-            const sid = extractSessionId(evt);
-            if (sid) {
-              sessionIdEmitted = true;
-              yield { conversationId, type: 'enrichment', data: { opencodeSessionId: sid } };
-            }
-          }
-          for (const out of translateOpencodeEvent(conversationId, evt as OpencodeEvent)) {
-            if (out.type === 'error') errorYielded = true;
-            yield out;
-          }
-        }
-        if (buf.length > MAX_LINE) buf = '';
-      }
-
-      await exited;
-      // Surface a spawn/exit failure that produced no error event.
-      if (spawnError && !errorYielded) {
-        yield {
-          conversationId,
-          type: 'error',
-          error:
-            spawnError.code === 'ENOENT'
-              ? 'The opencode CLI could not be launched (ENOENT).'
-              : `opencode failed to start: ${spawnError.message}`,
-        };
-      } else if (!errorYielded && stderrBuf.trim() && child.exitCode && child.exitCode !== 0) {
-        yield {
-          conversationId,
-          type: 'error',
-          error: `opencode exited (${child.exitCode}): ${stderrBuf.trim().slice(0, 500)}`,
-        };
-      }
-    } catch (err) {
-      if (!errorYielded)
-        yield { conversationId, type: 'error', error: err instanceof Error ? err.message : String(err) };
-    } finally {
-      abortSignal?.removeEventListener('abort', onAbort);
-      killProcessGroup(child);
+    let bridgeCleanedUp = false;
+    // Idempotent teardown for the bridge server + ephemeral config dir. Called
+    // from the outer finally (covers the yield-abandonment / spawn-throw paths)
+    // and eagerly on a failed start so a partial start never leaks.
+    const cleanupBridge = async (): Promise<void> => {
+      if (bridgeCleanedUp) return;
+      bridgeCleanedUp = true;
       if (bridgeUrl) {
         try {
           await bridge.stop();
@@ -269,7 +135,149 @@ export class OpencodeRuntime implements AgentRuntime {
           /* ignore */
         }
       }
-      yield { conversationId, type: 'done' };
+    };
+
+    if (customTools.length > 0) {
+      try {
+        bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal);
+        const token = bridge.getAuthToken();
+        opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
+        opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');
+        writeFileSync(opencodeConfigPath, JSON.stringify(buildOpencodeMcpConfig(bridgeUrl, token), null, 2), {
+          mode: 0o600,
+        });
+        promptText = buildOpencodeMcpPrompt(promptText, customTools);
+        console.info(`[opencode-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
+      } catch (err) {
+        console.warn('[opencode-runtime] Failed to start MCP bridge:', err);
+        await cleanupBridge();
+        bridgeUrl = undefined;
+        opencodeConfigDir = undefined;
+        opencodeConfigPath = undefined;
+        // bridgeCleanedUp stays true: nothing remains, so the outer finally no-ops.
+      }
+    }
+
+    // Outer try/finally: guarantees the bridge server + ephemeral config are
+    // torn down on EVERY exit path — including generator abandonment at the
+    // yield below and a synchronous throw from spawn() — not just after the
+    // child-lifecycle try is entered.
+    try {
+      // Prompt via stdin (avoid argv @/-/ambiguity + very long prompts).
+      args.push('-');
+
+      if (mapping.unmappableReason) {
+        yield {
+          conversationId,
+          type: 'text-delta',
+          text:
+            `> Note: opencode couldn't be pointed at "${primaryModel?.displayName ?? 'the selected model'}" ` +
+            `(${mapping.unmappableReason}); using opencode's own default model. Configure the provider in ` +
+            `opencode (\`opencode auth login\`) or pick a first-party model.\n\n`,
+        };
+      }
+
+      const baseEnv =
+        options.childEnv ?? scrubSecretEnv(getResolvedProcessEnv(), { preserveAwsChain: mapping.preserveAwsChain });
+      const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
+      // Point opencode at the ephemeral per-run config carrying the Kai MCP bridge.
+      if (opencodeConfigPath) env.OPENCODE_CONFIG = opencodeConfigPath;
+
+      const child = spawn(binPath, args, {
+        cwd: runDir,
+        env,
+        shell: false,
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }) as ChildProcessWithoutNullStreams;
+
+      let spawnError: NodeJS.ErrnoException | undefined;
+      let stderrBuf = '';
+      let errorYielded = false;
+      child.on('error', (err) => {
+        spawnError = err as NodeJS.ErrnoException;
+      });
+      child.stdin.on('error', () => {});
+      child.stderr.on('data', (d: Buffer) => {
+        if (stderrBuf.length < 64 * 1024) stderrBuf = (stderrBuf + d.toString('utf8')).slice(0, 64 * 1024);
+      });
+
+      const onAbort = (): void => killProcessGroup(child);
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+
+      const exited = new Promise<void>((resolve) => {
+        child.on('close', () => resolve());
+      });
+
+      try {
+        // Send the prompt on stdin.
+        child.stdin.write(promptText);
+        child.stdin.end();
+
+        let buf = '';
+        let sessionIdEmitted = false;
+        const MAX_LINE = 4 * 1024 * 1024;
+        for await (const chunk of child.stdout) {
+          if (abortSignal?.aborted) break;
+          buf += (chunk as Buffer).toString('utf8');
+          let nl: number;
+          while ((nl = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line || line.length > MAX_LINE || !line.startsWith('{')) continue;
+            let evt: unknown;
+            try {
+              evt = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if (!evt || typeof evt !== 'object') continue;
+            // Capture opencode's session id ONCE (first turn) for resume — every
+            // event carries sessionID, so guard against re-emitting the enrichment.
+            if (!existingSessionId && !sessionIdEmitted) {
+              const sid = extractSessionId(evt);
+              if (sid) {
+                sessionIdEmitted = true;
+                yield { conversationId, type: 'enrichment', data: { opencodeSessionId: sid } };
+              }
+            }
+            for (const out of translateOpencodeEvent(conversationId, evt as OpencodeEvent)) {
+              if (out.type === 'error') errorYielded = true;
+              yield out;
+            }
+          }
+          if (buf.length > MAX_LINE) buf = '';
+        }
+
+        await exited;
+        // Surface a spawn/exit failure that produced no error event.
+        if (spawnError && !errorYielded) {
+          yield {
+            conversationId,
+            type: 'error',
+            error:
+              spawnError.code === 'ENOENT'
+                ? 'The opencode CLI could not be launched (ENOENT).'
+                : `opencode failed to start: ${spawnError.message}`,
+          };
+        } else if (!errorYielded && stderrBuf.trim() && child.exitCode && child.exitCode !== 0) {
+          yield {
+            conversationId,
+            type: 'error',
+            error: `opencode exited (${child.exitCode}): ${stderrBuf.trim().slice(0, 500)}`,
+          };
+        }
+      } catch (err) {
+        if (!errorYielded)
+          yield { conversationId, type: 'error', error: err instanceof Error ? err.message : String(err) };
+      } finally {
+        abortSignal?.removeEventListener('abort', onAbort);
+        killProcessGroup(child);
+        yield { conversationId, type: 'done' };
+      }
+    } finally {
+      // Bridge teardown for every exit path (see cleanupBridge / outer try above).
+      await cleanupBridge();
     }
   }
 
