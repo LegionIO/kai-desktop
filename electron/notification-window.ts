@@ -111,36 +111,26 @@ function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
 }
 
 /**
- * Size the window to fit its rendered content, clamped to [minH, 75% of the work
- * area] (and width to [current, 75% wide]). Measures the CONTENT element's
- * natural height (the shell renders at intrinsic height, not viewport-stretched),
- * so the window can SHRINK to remove dead space as well as grow. Best-effort —
- * any failure leaves the base size. Re-centers horizontally.
+ * Apply a renderer-reported content height (from the shell's ResizeObserver on
+ * #notif-root) to the window that reported it, clamped to [MIN_H, 75% of the
+ * work area]. Renderer-driven so we never race the content's layout/measure —
+ * the shell reports its real height exactly when it settles (and again if it
+ * changes, e.g. an ask_user tab switch). Width is left at the base (fixed).
+ * Re-centers horizontally when height changes the position isn't needed, but we
+ * keep the top offset.
  */
-async function autoSizeToContent(win: BrowserWindow, display: Electron.Display): Promise<void> {
+function applyReportedHeight(win: BrowserWindow, height: number): void {
   try {
-    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
-    // #notif-root is the shell's intrinsic-height wrapper. Fall back to body.
-    const measured = (await win.webContents.executeJavaScript(
-      `(() => {
-        const el = document.getElementById('notif-root') ?? document.body;
-        const r = el.getBoundingClientRect();
-        return { w: Math.ceil(r.width), h: Math.ceil(r.height) };
-      })()`,
-    )) as { w?: number; h?: number };
+    if (win.isDestroyed()) return;
+    const display = screen.getDisplayMatching(win.getBounds());
     const [curW, curH] = win.getContentSize();
-    const maxW = Math.floor(display.workArea.width * 0.75);
+    const MIN_H = 120;
     const maxH = Math.floor(display.workArea.height * 0.75);
-    const MIN_H = 140; // keep a usable minimum even for a tiny card
-    const nextW = Math.min(Math.max(curW, measured.w ?? curW), maxW);
-    const nextH = Math.min(Math.max(MIN_H, measured.h ?? curH), maxH);
-    if (nextW === curW && nextH === curH) return;
-    win.setContentSize(nextW, nextH);
-    const [, y] = win.getPosition();
-    const x = Math.round(display.workArea.x + (display.workArea.width - nextW) / 2);
-    win.setPosition(x, y);
+    const nextH = Math.min(Math.max(MIN_H, Math.ceil(height)), maxH);
+    if (nextH === curH) return;
+    win.setContentSize(curW, nextH);
   } catch {
-    // best-effort — leave the base size
+    // best-effort — leave the current size
   }
 }
 
@@ -216,10 +206,9 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     win.show();
     safelySend(win, 'notif:request', item);
     showMacDockWithPaddedIcon(APP_ICON);
-    // Auto-size to fit the rendered content, capped at 75% of the work area. The
-    // item arrives via notif:get on mount, so wait a couple frames for the shell
-    // to render before measuring. Best-effort; failure leaves the base size.
-    setTimeout(() => void autoSizeToContent(win, primary), 250);
+    // Height is set by the renderer via notif:resize (ResizeObserver on
+    // #notif-root) once its content has actually laid out — no measure-on-timer
+    // race.
   });
 
   win.on('closed', () => {
@@ -252,6 +241,16 @@ function restorePriorFocus(id: string): void {
   notificationPriorFocus.delete(id);
   setTimeout(() => {
     try {
+      // If OTHER pop-out windows are still open (e.g. an approval + a question
+      // popped together and the user just answered one), keep the notification
+      // stack on top — focus the most-recent remaining pop-out rather than
+      // restoring the prior (main) window, which would sink the others behind it.
+      const remaining = [...notificationWindows.values()].filter((w) => !w.isDestroyed());
+      if (remaining.length > 0) {
+        const top = remaining[remaining.length - 1];
+        if (BrowserWindow.getFocusedWindow?.() !== top) top.focus?.();
+        return;
+      }
       if (prior && !prior.isDestroyed?.()) {
         // Only restore if it isn't already focused (avoid a redundant raise).
         if (BrowserWindow.getFocusedWindow?.() !== prior) prior.focus?.();
@@ -338,6 +337,13 @@ export function registerNotificationWindowIpc(): void {
   ipcMain.handle('notif:get', (_event, id: unknown) =>
     typeof id === 'string' ? (notificationItems.get(id) ?? null) : null,
   );
+  // Renderer reports its laid-out content height (ResizeObserver on #notif-root);
+  // size the reporting window to it, clamped. Map sender → its BrowserWindow.
+  ipcMain.on('notif:resize', (event, height: unknown) => {
+    if (typeof height !== 'number' || !Number.isFinite(height) || height <= 0) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) applyReportedHeight(win, height);
+  });
 }
 /** Back-compat alias. */
 export const registerApprovalWindowIpc = registerNotificationWindowIpc;

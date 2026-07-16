@@ -329,12 +329,38 @@ async function runAgentAction(
   // (that can strand the answer if the in-flight run is on its final step). Wait
   // for the run to settle, then RE-RESOLVE — the conversation is now idle, so the
   // normal existing-target path below appends the answer + runs a real turn.
-  if (opts?.forceFreshTurn && resolved && 'busyInject' in resolved) {
-    const targetConvId = resolved.busyInject;
-    actionsDebug(`forceFreshTurn: target busy, waiting to settle conv=${targetConvId}`);
-    await waitForAutomationRunToSettle(targetConvId);
-    resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
-    actionsDebug(`forceFreshTurn: after settle re-resolved=${JSON.stringify(resolved)}`);
+  if (opts?.forceFreshTurn && action.conversationTarget?.type === 'existing') {
+    const targetConvId = action.conversationTarget.conversationId;
+    const busyish = resolved && 'busyInject' in resolved;
+    const strandedNull = resolved === null && !!readConversation(deps.appHome, targetConvId);
+    if (busyish || strandedNull) {
+      actionsDebug(
+        `forceFreshTurn: target busy/stranded (${JSON.stringify(resolved)}), waiting to settle conv=${targetConvId}`,
+      );
+      await waitForAutomationRunToSettle(targetConvId);
+      resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+      actionsDebug(`forceFreshTurn: after settle re-resolved=${JSON.stringify(resolved)}`);
+      // Still not a clean target AND no automation run is actually in flight →
+      // the conversation's runStatus is STUCK 'running' (a live turn that
+      // suspended to raise this alert never reset it). A resume answers a
+      // persisted alert, so the raising turn is definitively over — force-clear
+      // the stale status and re-resolve so the answer runs a real turn instead of
+      // being enqueued / diverted.
+      const stillBad = !resolved || 'busyInject' in resolved;
+      if (stillBad && !isAutomationRunInFlight(targetConvId)) {
+        try {
+          const stuck = readConversation(deps.appHome, targetConvId);
+          if (stuck && (stuck.runStatus === 'running' || stuck.runStatus === 'awaiting-approval')) {
+            actionsDebug(`forceFreshTurn: force-clearing stuck runStatus=${stuck.runStatus} conv=${targetConvId}`);
+            writeConversation(deps.appHome, { ...stuck, runStatus: 'idle' });
+            resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
+            actionsDebug(`forceFreshTurn: after force-clear re-resolved=${JSON.stringify(resolved)}`);
+          }
+        } catch (err) {
+          actionsDebug(`forceFreshTurn: force-clear failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
   }
 
   // Busy target + inject enabled: append this prompt as a mid-turn follow-up and

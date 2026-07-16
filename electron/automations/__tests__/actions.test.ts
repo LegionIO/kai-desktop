@@ -492,6 +492,22 @@ describe('agent conversationTarget', () => {
     expect(vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convResume')).toBe(true);
   });
 
+  it('alert resume force-clears a STUCK runStatus:"running" and still runs a real turn', async () => {
+    // The reported bug: a live request_review turn that suspended left the
+    // conversation runStatus:'running' forever; the resume then resolved it as
+    // busy and ENQUEUED the answer (no turn ran, phantom sibling). With no
+    // automation run actually in flight, the resume must force-clear the stale
+    // status and run a real turn.
+    clearInjects('convStuck');
+    resetMockStore({
+      convStuck: { id: 'convStuck', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    await resumeConversationWithMessage('convStuck', '[Approved] proceed', deps());
+    expect(vi.mocked(streamForPlugin)).toHaveBeenCalled();
+    expect(hasInjects('convStuck')).toBe(false);
+    expect(vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convStuck')).toBe(true);
+  });
+
   it('singleton first run creates with automationSingleton=true, second run appends to same id', async () => {
     await executeActions(agentAction({ type: 'singleton' }), evt, deps());
     const created = vi.mocked(writeConversation).mock.calls[0][1] as unknown as {
