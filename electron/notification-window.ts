@@ -105,6 +105,33 @@ function safelySend(win: BrowserWindow, channel: string, data: unknown): void {
 }
 
 /**
+ * Grow the window to fit its rendered content, clamped to 75% of the display's
+ * work area (and never smaller than the current size). Best-effort — any failure
+ * leaves the base size. Re-centers horizontally so a wider window stays centered.
+ */
+async function autoSizeToContent(win: BrowserWindow, display: Electron.Display): Promise<void> {
+  try {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    const measured = (await win.webContents.executeJavaScript(
+      `({ w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight })`,
+    )) as { w?: number; h?: number };
+    const [curW, curH] = win.getContentSize();
+    const maxW = Math.floor(display.workArea.width * 0.75);
+    const maxH = Math.floor(display.workArea.height * 0.75);
+    const nextW = Math.min(Math.max(curW, Math.ceil(measured.w ?? curW)), maxW);
+    const nextH = Math.min(Math.max(curH, Math.ceil(measured.h ?? curH)), maxH);
+    if (nextW === curW && nextH === curH) return;
+    win.setContentSize(nextW, nextH);
+    // Re-center horizontally within the work area; keep the top offset.
+    const [, y] = win.getPosition();
+    const x = Math.round(display.workArea.x + (display.workArea.width - nextW) / 2);
+    win.setPosition(x, y);
+  } catch {
+    // best-effort — leave the base size
+  }
+}
+
+/**
  * Open (or focus) the dedicated notification window for an item. Idempotent per
  * item id. show() (focus-grab) so the user can answer immediately; the main
  * window is never touched, and focus returns to the prior window on close.
@@ -169,6 +196,10 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     win.show();
     safelySend(win, 'notif:request', item);
     showMacDockWithPaddedIcon(APP_ICON);
+    // Auto-size to fit the rendered content, capped at 75% of the work area. The
+    // item arrives via notif:get on mount, so wait a couple frames for the shell
+    // to render before measuring. Best-effort; failure leaves the base size.
+    setTimeout(() => void autoSizeToContent(win, primary), 250);
   });
 
   win.on('closed', () => {

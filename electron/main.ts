@@ -58,6 +58,7 @@ import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
 import { registerStreamingSttHandlers } from './audio/streaming-stt.js';
 import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
+import { resolveAlertSurface } from './config/schema.js';
 import { registerRuntime } from './agent/runtime/index.js';
 import { MastraRuntime } from './agent/runtime/mastra-runtime.js';
 import { ClaudeAgentRuntime } from './agent/runtime/claude-agent-runtime.js';
@@ -1638,8 +1639,7 @@ if (gotSingleInstanceLock) {
     initializeAlerts({
       appHome: APP_HOME,
       getActionDeps: () => automationDeps,
-      surfaceAsModal: () => !!getConfig().automations?.surfaceAlertsAsModal,
-      surfaceAsWindow: () => !!getConfig().automations?.surfaceAlertsAsWindow,
+      alertSurface: () => resolveAlertSurface(getConfig().automations ?? {}),
     });
     registerAlertsHandlers(ipcMain);
 

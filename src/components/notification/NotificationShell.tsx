@@ -63,7 +63,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
   // ── Automation alert → the same card the notifications tab uses ──
   if (item.source === 'alert') {
     return (
-      <div className="h-screen w-screen overflow-y-auto bg-card p-3 text-foreground">
+      <div className="min-h-screen w-screen bg-card p-3 text-foreground">
         <AlertCard alert={item.alert} onResolved={close} />
       </div>
     );
@@ -88,11 +88,11 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       close();
     };
     return (
-      <div className="flex h-screen w-screen flex-col bg-card text-foreground">
+      <div className="flex min-h-screen w-screen flex-col bg-card text-foreground">
         <div className="border-b border-border/70 px-4 py-2.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Question
         </div>
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 p-4">
           <AlertQuestionPicker questions={questions} onSubmit={onSubmit} submitting={submitting} />
         </div>
       </div>

@@ -74,6 +74,7 @@ type AutomationsConfig = {
   rules: Rule[];
   log: { maxEntries: number };
   approvalMode?: AutomationApprovalMode;
+  alertSurface?: 'off' | 'modal' | 'window';
   surfaceAlertsAsModal?: boolean;
   surfaceAlertsAsWindow?: boolean;
 };
@@ -248,43 +249,30 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
       </div>
 
       <div
-        data-setting-id="automations.surfaceAlertsAsModal"
+        data-setting-id="automations.alertSurface"
         className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-card/50 p-3"
       >
         <div>
-          <div className="text-xs font-medium">Pop alerts as a front-most window</div>
+          <div className="text-xs font-medium">Surface a new alert as</div>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            When an automation raises a question or approval Alert, immediately open a focused modal (and bring the app
-            to the front) so you can act on it right away. When off, you only get an OS notification and the Alerts tab
-            badge.
+            When an automation raises a question or approval Alert, how to surface it beyond the OS notification + the
+            Alerts tab badge. In-app modal opens a focused overlay inside Kai; Pop-out window opens a dedicated
+            always-on-top window (the same one tool approvals use) answerable without switching to the main window.
           </p>
         </div>
-        <Toggle
-          id="automations.surfaceAlertsAsModal"
-          label=""
-          checked={!!automations.surfaceAlertsAsModal}
-          onChange={(v) => updateConfig('automations.surfaceAlertsAsModal', v)}
-        />
-      </div>
-
-      <div
-        data-setting-id="automations.surfaceAlertsAsWindow"
-        className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-card/50 p-3"
-      >
-        <div>
-          <div className="text-xs font-medium">Pop alerts out into a dedicated window</div>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            When an automation raises a question or approval Alert, also open it in its own always-on-top window (the
-            same dedicated window tool approvals use) so you can answer it without switching to the main Kai window.
-            Independent of the in-app modal above.
-          </p>
-        </div>
-        <Toggle
-          id="automations.surfaceAlertsAsWindow"
-          label=""
-          checked={!!automations.surfaceAlertsAsWindow}
-          onChange={(v) => updateConfig('automations.surfaceAlertsAsWindow', v)}
-        />
+        <select
+          id="automations.alertSurface"
+          className={settingsSelectClass}
+          value={
+            automations.alertSurface ??
+            (automations.surfaceAlertsAsWindow ? 'window' : automations.surfaceAlertsAsModal ? 'modal' : 'off')
+          }
+          onChange={(e) => updateConfig('automations.alertSurface', e.target.value)}
+        >
+          <option value="off">Notification + tab only</option>
+          <option value="modal">In-app modal</option>
+          <option value="window">Pop-out window</option>
+        </select>
       </div>
 
       {automations.rules.length === 0 && <p className="text-xs text-muted-foreground">No rules configured.</p>}

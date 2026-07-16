@@ -854,19 +854,40 @@ const automationsConfigSchema = z.object({
    */
   approvalMode: z.enum(['auto-allow', 'prompt-user', 'block']).default('prompt-user'),
   /**
-   * When on, a new question/approval Alert (raised by a headless automation run
-   * needing the user) pops a front-most, focused modal for immediate action —
-   * instead of only an OS notification + the Alerts tab badge. Default off.
+   * How a new question/approval Alert (raised by a headless automation run
+   * needing the user) is surfaced beyond the OS notification + Alerts tab badge:
+   *  - 'off'    : notification + tab badge only.
+   *  - 'modal'  : a front-most, focused IN-APP modal for immediate action.
+   *  - 'window' : a dedicated always-on-top OS pop-out window (the same window
+   *    tool approvals use), answerable without switching to the main Kai window.
+   * Mutually exclusive by construction. Default 'off'.
+   */
+  alertSurface: z.enum(['off', 'modal', 'window']).default('off'),
+  /**
+   * @deprecated Legacy booleans, superseded by `alertSurface`. Still read for
+   * one-time migration (surfaceAlertsAsWindow → 'window' wins over
+   * surfaceAlertsAsModal → 'modal'); new writes go to `alertSurface`.
    */
   surfaceAlertsAsModal: z.boolean().default(false),
-  /**
-   * When on, a newly-created question/approval alert ALSO pops out into a
-   * dedicated always-on-top OS window (the same window approvals use), so it's
-   * answerable without switching to the main Kai window. Independent of, and
-   * additive to, `surfaceAlertsAsModal` (the in-app modal). Default off.
-   */
   surfaceAlertsAsWindow: z.boolean().default(false),
 });
+
+/**
+ * Effective alert surface, migrating the legacy booleans: an explicit
+ * `alertSurface` wins; otherwise `surfaceAlertsAsWindow` → 'window' takes
+ * precedence over `surfaceAlertsAsModal` → 'modal'; else 'off'. Single source of
+ * truth so the modal and pop-out window are mutually exclusive.
+ */
+export function resolveAlertSurface(automations: {
+  alertSurface?: 'off' | 'modal' | 'window';
+  surfaceAlertsAsModal?: boolean;
+  surfaceAlertsAsWindow?: boolean;
+}): 'off' | 'modal' | 'window' {
+  if (automations.alertSurface) return automations.alertSurface;
+  if (automations.surfaceAlertsAsWindow) return 'window';
+  if (automations.surfaceAlertsAsModal) return 'modal';
+  return 'off';
+}
 
 export type AutomationCondition = z.infer<typeof automationConditionSchema>;
 export type AutomationAction = z.infer<typeof automationActionSchema>;
@@ -1077,6 +1098,7 @@ export const appConfigSchema = z.object({
     rules: [],
     log: { maxEntries: 200 },
     approvalMode: 'prompt-user',
+    alertSurface: 'off',
     surfaceAlertsAsModal: false,
     surfaceAlertsAsWindow: false,
   }),

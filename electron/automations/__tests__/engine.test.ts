@@ -38,6 +38,7 @@ function makeEngine(rules: AutomationRule[], over: Partial<EngineDeps> = {}) {
     rules,
     log: { maxEntries: 50 },
     approvalMode: 'prompt-user',
+    alertSurface: 'off',
     surfaceAlertsAsModal: false,
     surfaceAlertsAsWindow: false,
   };
@@ -237,6 +238,7 @@ describe('AutomationEngine', () => {
       rules: [],
       log: { maxEntries: 50 },
       approvalMode: 'auto-allow',
+      alertSurface: 'off',
       surfaceAlertsAsModal: false,
       surfaceAlertsAsWindow: false,
     };

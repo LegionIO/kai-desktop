@@ -6,7 +6,11 @@ import type { Alert, AlertsChangedPayload } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import { AlertCard } from './AlertCard';
 
-type AutomationsShape = { surfaceAlertsAsModal?: boolean };
+type AutomationsShape = {
+  alertSurface?: 'off' | 'modal' | 'window';
+  surfaceAlertsAsModal?: boolean;
+  surfaceAlertsAsWindow?: boolean;
+};
 
 /**
  * When `automations.surfaceAlertsAsModal` is on, a newly-created question/
@@ -17,7 +21,12 @@ type AutomationsShape = { surfaceAlertsAsModal?: boolean };
  */
 export const AlertModalHost: FC = () => {
   const { config } = useConfig();
-  const enabled = !!(config as { automations?: AutomationsShape } | null)?.automations?.surfaceAlertsAsModal;
+  const automations = (config as { automations?: AutomationsShape } | null)?.automations;
+  // In-app modal only when the (mutually-exclusive) surface resolves to 'modal'.
+  const surface =
+    automations?.alertSurface ??
+    (automations?.surfaceAlertsAsWindow ? 'window' : automations?.surfaceAlertsAsModal ? 'modal' : 'off');
+  const enabled = surface === 'modal';
   const [alert, setAlert] = useState<Alert | null>(null);
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;

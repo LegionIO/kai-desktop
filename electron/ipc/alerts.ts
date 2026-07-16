@@ -47,10 +47,8 @@ export interface AlertsDeps {
   appHome: string;
   /** Full automation ActionDeps so we can reuse `resumeConversationWithMessage`. */
   getActionDeps: () => ActionDeps;
-  /** Whether the front-most-modal setting is on (config.automations.surfaceAlertsAsModal). */
-  surfaceAsModal: () => boolean;
-  /** Whether the dedicated pop-out window setting is on (surfaceAlertsAsWindow). */
-  surfaceAsWindow: () => boolean;
+  /** Effective alert surface (mutually exclusive): 'off' | 'modal' | 'window'. */
+  alertSurface: () => 'off' | 'modal' | 'window';
 }
 
 let deps: AlertsDeps | null = null;
@@ -143,13 +141,16 @@ export function notifyNewAlert(alert: Alert): void {
     // Notifications can throw on some platforms/permission states — non-fatal.
   }
   broadcastAlertsChanged({ reason: 'created', alert });
-  if (deps?.surfaceAsModal() && alert.kind !== 'fyi') {
-    focusMainWindowForModal();
-  }
-  // Dedicated pop-out window (additive to the in-app modal; own setting).
-  if (deps?.surfaceAsWindow() && alert.kind !== 'fyi') {
-    alertsDebug(`open pop-out window for alert id=${alert.id} kind=${alert.kind}`);
-    openNotificationWindow({ source: 'alert', id: alert.id, alert });
+  // Surface the alert per the single (mutually-exclusive) setting. fyi never
+  // steals focus / pops out — it's non-blocking.
+  const surface = deps?.alertSurface() ?? 'off';
+  if (alert.kind !== 'fyi') {
+    if (surface === 'modal') {
+      focusMainWindowForModal();
+    } else if (surface === 'window') {
+      alertsDebug(`open pop-out window for alert id=${alert.id} kind=${alert.kind}`);
+      openNotificationWindow({ source: 'alert', id: alert.id, alert });
+    }
   }
 }
 
