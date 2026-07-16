@@ -45,6 +45,29 @@ autoUpdater.logger = {
   error: (...a: unknown[]) => logLine('error', a),
 };
 
+/**
+ * Whether to force single-range range requests for a GENERIC update provider,
+ * driven by the `updateForceSingleRange` branding key:
+ *  - 'always' → true
+ *  - 'never'  → false
+ *  - 'auto'   → true when the feed URL host looks like S3 (contains "s3"),
+ *    which covers AWS S3 and most S3-compatible/on-prem stores that lack
+ *    multipart/byteranges support. (Exported for tests.)
+ */
+export function shouldForceSingleRange(
+  url: string | undefined,
+  mode: 'auto' | 'always' | 'never' = __BRAND_UPDATE_FORCE_SINGLE_RANGE,
+): boolean {
+  if (mode === 'always') return true;
+  if (mode === 'never') return false;
+  if (!url) return false;
+  try {
+    return new URL(url).hostname.toLowerCase().includes('s3');
+  } catch {
+    return url.toLowerCase().includes('s3');
+  }
+}
+
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
 /** Upper bound on pre-update hooks (e.g. admin elevation). A hook that never
@@ -88,7 +111,7 @@ if (isUpdateTestMode) {
     autoUpdater.setFeedURL({
       provider: 'generic',
       url: updateUrl,
-      useMultipleRangeRequest: false,
+      useMultipleRangeRequest: shouldForceSingleRange(updateUrl) ? false : undefined,
     } as Parameters<typeof autoUpdater.setFeedURL>[0]);
     console.info(`[auto-update] TEST MODE: faking version ${DEV_TEST_VERSION}, url ${updateUrl}`);
   } else {
@@ -392,6 +415,39 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
+
+  // macOS differential (delta) downloads over a GENERIC provider (on-prem S3,
+  // e.g. kai-platform's s3api-core.optum.com): electron-updater's macOS delta
+  // path requests many byte-ranges in ONE call (multipart/byteranges). Some
+  // S3-compatible stores don't support that and return the whole file as
+  // `200 application/zip`, so electron-updater logs
+  // `Content-Type "multipart/byteranges" is expected, but got "application/zip"`
+  // and falls back to a FULL download every time — even though the block-map diff
+  // computed correctly. Forcing SINGLE-range requests (`useMultipleRangeRequest:
+  // false`) makes each block a plain `bytes=a-b` → `206` GET the server DOES
+  // support, so the delta actually downloads. The `updateForceSingleRange`
+  // branding key controls this: 'always' | 'never' | 'auto' (detect S3 by a
+  // host containing "s3"). GitHub-provider builds are unaffected (multi-range OK).
+  // The dev-test path sets this directly; production relies on the baked
+  // app-update.yml (which can't express it), so re-issue the feed config here.
+  if (app.isPackaged && !isUpdateTestMode) {
+    const configOnDisk = (autoUpdater as unknown as { configOnDisk?: { value?: Promise<Record<string, unknown>> } })
+      .configOnDisk;
+    void configOnDisk?.value
+      ?.then((cfg) => {
+        if (cfg?.provider !== 'generic') return; // GitHub etc. handle multi-range
+        if (shouldForceSingleRange(typeof cfg.url === 'string' ? cfg.url : undefined)) {
+          autoUpdater.setFeedURL({
+            ...cfg,
+            useMultipleRangeRequest: false,
+          } as Parameters<typeof autoUpdater.setFeedURL>[0]);
+          logLine('info', ['generic provider: forcing single-range requests (useMultipleRangeRequest=false)']);
+        }
+      })
+      .catch(() => {
+        /* best-effort: if the baked config can't be read, leave the default */
+      });
+  }
 
   autoUpdater.on('checking-for-update', () => {
     if (!downloaded) broadcast({ state: 'checking' });

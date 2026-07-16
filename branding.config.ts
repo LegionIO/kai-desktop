@@ -76,6 +76,21 @@ export const branding = {
   /** GitHub "owner/repo" used as the auto-updater release source. */
   updateRepo: 'legionio/kai-desktop',
   /**
+   * macOS differential (delta) auto-update range-request strategy for a GENERIC
+   * update provider (on-prem / S3 host). electron-updater's macOS delta path
+   * requests many byte-ranges in ONE call (multipart/byteranges); some
+   * S3-compatible stores (e.g. Optum's) don't support that and return the whole
+   * file, forcing a FULL download every time even though the block-map diff was
+   * computed. This controls forcing SINGLE-range requests (one `bytes=a-b` GET
+   * per block), which those stores DO support:
+   *  - 'auto'   (default): force single-range when the feed URL looks like S3
+   *    (host contains "s3"); otherwise leave electron-updater's default.
+   *  - 'always': always force single-range for a generic provider.
+   *  - 'never' : never force it (use electron-updater's default heuristic).
+   * GitHub-provider builds are unaffected (GitHub supports multi-range).
+   */
+  updateForceSingleRange: 'auto' as 'auto' | 'always' | 'never',
+  /**
    * Optional explicit OTA feed base URL. When set (non-empty), the OTA
    * updater fetches `${otaFeedUrl}/latest-ota.json` instead of deriving
    * a GitHub releases URL from `updateRepo`. Use for on-prem / S3 hosts.

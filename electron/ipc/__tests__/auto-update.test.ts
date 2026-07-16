@@ -29,8 +29,13 @@ vi.mock('electron-updater', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: vi.fn() }));
 
-const { consumePostUpdateMarker, withTimeout, PRE_UPDATE_HOOK_TIMEOUT_MS, resolveDownloadMode } =
-  await import('../auto-update.js');
+const {
+  consumePostUpdateMarker,
+  withTimeout,
+  PRE_UPDATE_HOOK_TIMEOUT_MS,
+  resolveDownloadMode,
+  shouldForceSingleRange,
+} = await import('../auto-update.js');
 
 const MARKER = join(USERDATA, '.update-completed');
 const writeMarker = (obj: unknown) => writeFileSync(MARKER, JSON.stringify(obj));
@@ -154,5 +159,31 @@ describe('resolveDownloadMode — bytes are authoritative over the logger label'
     expect(resolveDownloadMode(12_000_000, undefined, 'differential')).toBe('differential');
     expect(resolveDownloadMode(12_000_000, 0, 'full')).toBe('full');
     expect(resolveDownloadMode(12_000_000, undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe('shouldForceSingleRange — macOS delta over generic/S3 providers', () => {
+  it("forces single-range for S3-looking hosts in 'auto' mode", () => {
+    // The reported bug: kai-platform on Optum's on-prem S3 → multipart/byteranges
+    // unsupported → full download every time. Host contains "s3" → force single.
+    expect(shouldForceSingleRange('https://s3api-core.optum.com/kai/releases/latest', 'auto')).toBe(true);
+    expect(shouldForceSingleRange('https://my-bucket.s3.amazonaws.com/app', 'auto')).toBe(true);
+    expect(shouldForceSingleRange('https://s3.us-east-1.example.com/kai', 'auto')).toBe(true);
+  });
+
+  it("leaves non-S3 hosts alone in 'auto' mode (multi-range assumed OK)", () => {
+    expect(shouldForceSingleRange('https://downloads.example.com/kai', 'auto')).toBe(false);
+    expect(shouldForceSingleRange('https://github.com/owner/repo/releases', 'auto')).toBe(false);
+  });
+
+  it("'always' forces regardless of URL; 'never' never forces", () => {
+    expect(shouldForceSingleRange('https://downloads.example.com/kai', 'always')).toBe(true);
+    expect(shouldForceSingleRange(undefined, 'always')).toBe(true);
+    expect(shouldForceSingleRange('https://s3api-core.optum.com/kai', 'never')).toBe(false);
+  });
+
+  it('handles a missing/malformed URL safely', () => {
+    expect(shouldForceSingleRange(undefined, 'auto')).toBe(false);
+    expect(shouldForceSingleRange('not a url with s3 in it', 'auto')).toBe(true); // substring fallback
   });
 });
