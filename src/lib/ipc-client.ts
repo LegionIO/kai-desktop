@@ -96,6 +96,10 @@ type AppAPI = {
     onRequest: (callback: (request: unknown) => void) => () => void;
     close: (approvalId: string) => void;
   };
+  notification: {
+    onRequest: (callback: (item: unknown) => void) => () => void;
+    close: (id: string) => void;
+  };
   conversations: {
     list: () => Promise<unknown[]>;
     search: (term: string) => Promise<unknown[]>;

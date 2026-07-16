@@ -75,6 +75,7 @@ type AutomationsConfig = {
   log: { maxEntries: number };
   approvalMode?: AutomationApprovalMode;
   surfaceAlertsAsModal?: boolean;
+  surfaceAlertsAsWindow?: boolean;
 };
 
 const APPROVAL_MODES: Array<{ value: AutomationApprovalMode; label: string; hint: string }> = [
@@ -263,6 +264,26 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
           label=""
           checked={!!automations.surfaceAlertsAsModal}
           onChange={(v) => updateConfig('automations.surfaceAlertsAsModal', v)}
+        />
+      </div>
+
+      <div
+        data-setting-id="automations.surfaceAlertsAsWindow"
+        className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-card/50 p-3"
+      >
+        <div>
+          <div className="text-xs font-medium">Pop alerts out into a dedicated window</div>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            When an automation raises a question or approval Alert, also open it in its own always-on-top window (the
+            same dedicated window tool approvals use) so you can answer it without switching to the main Kai window.
+            Independent of the in-app modal above.
+          </p>
+        </div>
+        <Toggle
+          id="automations.surfaceAlertsAsWindow"
+          label=""
+          checked={!!automations.surfaceAlertsAsWindow}
+          onChange={(v) => updateConfig('automations.surfaceAlertsAsWindow', v)}
         />
       </div>
 

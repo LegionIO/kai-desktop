@@ -39,6 +39,7 @@ function makeEngine(rules: AutomationRule[], over: Partial<EngineDeps> = {}) {
     log: { maxEntries: 50 },
     approvalMode: 'prompt-user',
     surfaceAlertsAsModal: false,
+    surfaceAlertsAsWindow: false,
   };
   const handlePluginAction = vi.fn(async () => 'ok');
   const deps: EngineDeps = {
@@ -237,6 +238,7 @@ describe('AutomationEngine', () => {
       log: { maxEntries: 50 },
       approvalMode: 'auto-allow',
       surfaceAlertsAsModal: false,
+      surfaceAlertsAsWindow: false,
     };
     const rule = baseRule({
       trigger: { source: '*', event: '*' },

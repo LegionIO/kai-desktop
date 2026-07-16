@@ -859,6 +859,13 @@ const automationsConfigSchema = z.object({
    * instead of only an OS notification + the Alerts tab badge. Default off.
    */
   surfaceAlertsAsModal: z.boolean().default(false),
+  /**
+   * When on, a newly-created question/approval alert ALSO pops out into a
+   * dedicated always-on-top OS window (the same window approvals use), so it's
+   * answerable without switching to the main Kai window. Independent of, and
+   * additive to, `surfaceAlertsAsModal` (the in-app modal). Default off.
+   */
+  surfaceAlertsAsWindow: z.boolean().default(false),
 });
 
 export type AutomationCondition = z.infer<typeof automationConditionSchema>;
@@ -1071,6 +1078,7 @@ export const appConfigSchema = z.object({
     log: { maxEntries: 200 },
     approvalMode: 'prompt-user',
     surfaceAlertsAsModal: false,
+    surfaceAlertsAsWindow: false,
   }),
   /**
    * UI/renderer preferences. Optional so existing configs keep working; each

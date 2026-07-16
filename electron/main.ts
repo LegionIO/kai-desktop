@@ -1639,6 +1639,7 @@ if (gotSingleInstanceLock) {
       appHome: APP_HOME,
       getActionDeps: () => automationDeps,
       surfaceAsModal: () => !!getConfig().automations?.surfaceAlertsAsModal,
+      surfaceAsWindow: () => !!getConfig().automations?.surfaceAlertsAsWindow,
     });
     registerAlertsHandlers(ipcMain);
 

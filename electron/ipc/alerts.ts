@@ -28,6 +28,7 @@ import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -48,6 +49,8 @@ export interface AlertsDeps {
   getActionDeps: () => ActionDeps;
   /** Whether the front-most-modal setting is on (config.automations.surfaceAlertsAsModal). */
   surfaceAsModal: () => boolean;
+  /** Whether the dedicated pop-out window setting is on (surfaceAlertsAsWindow). */
+  surfaceAsWindow: () => boolean;
 }
 
 let deps: AlertsDeps | null = null;
@@ -62,6 +65,11 @@ export function initializeAlerts(d: AlertsDeps): void {
 
 /** Push an `alerts:changed` event to every window + web client (tab badge / modal host). */
 function broadcastAlertsChanged(payload: { reason: 'created' | 'resolved' | 'dismissed'; alert?: Alert }): void {
+  // Close the dedicated pop-out window once the alert is answered/dismissed (from
+  // any surface: the window, the tab, or the in-app modal) so it can't linger.
+  if ((payload.reason === 'resolved' || payload.reason === 'dismissed') && payload.alert) {
+    closeNotificationWindow(payload.alert.id);
+  }
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('alerts:changed', payload);
   }
@@ -137,6 +145,11 @@ export function notifyNewAlert(alert: Alert): void {
   broadcastAlertsChanged({ reason: 'created', alert });
   if (deps?.surfaceAsModal() && alert.kind !== 'fyi') {
     focusMainWindowForModal();
+  }
+  // Dedicated pop-out window (additive to the in-app modal; own setting).
+  if (deps?.surfaceAsWindow() && alert.kind !== 'fyi') {
+    alertsDebug(`open pop-out window for alert id=${alert.id} kind=${alert.kind}`);
+    openNotificationWindow({ source: 'alert', id: alert.id, alert });
   }
 }
 

@@ -100,6 +100,16 @@ const appAPI = {
     close: (approvalId: string) => ipcRenderer.send('approval:close', approvalId),
   },
 
+  // Dedicated notification pop-out window (approvals · questions · alerts).
+  notification: {
+    onRequest: (callback: (item: unknown) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, data: unknown) => callback(data);
+      ipcRenderer.on('notif:request', handler);
+      return () => ipcRenderer.removeListener('notif:request', handler);
+    },
+    close: (id: string) => ipcRenderer.send('notif:close', id),
+  },
+
   conversations: {
     list: () => ipcRenderer.invoke('conversations:list'),
     search: (term: string) => ipcRenderer.invoke('conversations:search', term),

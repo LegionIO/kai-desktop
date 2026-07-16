@@ -27,6 +27,7 @@ import { DisablePluginModal } from '@/components/plugins/DisablePluginModal';
 import { ComputerUseProvider, useComputerUse } from '@/providers/ComputerUseProvider';
 import { OverlayShell } from '@/components/overlay/OverlayShell';
 import { ApprovalShell } from '@/components/approval/ApprovalShell';
+import { NotificationShell } from '@/components/notification/NotificationShell';
 import { DictationOverlay } from '@/components/dictation/DictationOverlay';
 import { useThemeInjector } from '@/hooks/useThemeInjector';
 import { useAppShots } from '@/hooks/useAppShots';
@@ -132,9 +133,11 @@ function AppRoot() {
   const isDictationOverlay = search?.get('dictationOverlay') === '1';
   const isApprovalWindow = search?.get('approval') === '1';
   const approvalId = isApprovalWindow ? (search?.get('approvalId') ?? null) : null;
-  if (typeof window !== 'undefined' && isApprovalWindow) {
-    // TEMP debug: is the approval window rendering the standalone shell?
-    console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId}`);
+  const isNotifWindow = search?.get('notif') === '1';
+  const notifId = isNotifWindow ? (search?.get('notifId') ?? null) : null;
+  if (typeof window !== 'undefined' && (isApprovalWindow || isNotifWindow)) {
+    // TEMP debug: is the pop-out window rendering the standalone shell?
+    console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId} notifId=${notifId}`);
   }
   const isComputerSetupWindow = isOperatorWindow && search?.get('setup') === '1';
   const operatorSessionId = isOperatorWindow && !isComputerSetupWindow ? search.get('sessionId') : null;
@@ -145,6 +148,12 @@ function AppRoot() {
     return <DictationOverlay />;
   }
 
+  // Unified dedicated pop-out window (approvals · questions · alerts).
+  if (notifId) {
+    return <NotificationShell id={notifId} />;
+  }
+
+  // Back-compat: legacy approval-only route.
   if (approvalId) {
     return <ApprovalShell approvalId={approvalId} />;
   }
