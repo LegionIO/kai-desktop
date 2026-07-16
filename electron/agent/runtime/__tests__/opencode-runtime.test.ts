@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { translateOpencodeEvent } from '../opencode-runtime.js';
+import { translateOpencodeEvent, buildOpencodeMcpConfig, buildOpencodeMcpPrompt } from '../opencode-runtime.js';
+import type { ToolDefinition } from '../../../tools/types.js';
 
 /**
  * translateOpencodeEvent maps opencode's `--format json` stream events to Kai
@@ -73,5 +74,40 @@ describe('translateOpencodeEvent', () => {
   it('emits nothing for step_start and unknown event types', () => {
     expect(translateOpencodeEvent(CID, { type: 'step_start', part: { type: 'step-start' } })).toEqual([]);
     expect(translateOpencodeEvent(CID, { type: 'whatever' })).toEqual([]);
+  });
+});
+
+describe('buildOpencodeMcpConfig', () => {
+  it('emits a remote MCP server block with bearer header', () => {
+    const cfg = buildOpencodeMcpConfig('http://127.0.0.1:5000/mcp', 'tok-123') as {
+      mcp: { kai: { type: string; url: string; enabled: boolean; headers?: Record<string, string> } };
+    };
+    expect(cfg.mcp.kai.type).toBe('remote');
+    expect(cfg.mcp.kai.url).toBe('http://127.0.0.1:5000/mcp');
+    expect(cfg.mcp.kai.enabled).toBe(true);
+    expect(cfg.mcp.kai.headers).toEqual({ Authorization: 'Bearer tok-123' });
+  });
+
+  it('omits the headers block when there is no token', () => {
+    const cfg = buildOpencodeMcpConfig('http://127.0.0.1:5000/mcp', null) as {
+      mcp: { kai: { headers?: unknown } };
+    };
+    expect(cfg.mcp.kai.headers).toBeUndefined();
+  });
+});
+
+describe('buildOpencodeMcpPrompt', () => {
+  const mkTool = (name: string, description: string): ToolDefinition =>
+    ({ name, description, inputSchema: {}, execute: async () => ({}) }) as unknown as ToolDefinition;
+
+  it('returns the prompt unchanged when there are no tools', () => {
+    expect(buildOpencodeMcpPrompt('do the thing', [])).toBe('do the thing');
+  });
+
+  it('lists tools under the kai_ MCP prefix and keeps the user request', () => {
+    const out = buildOpencodeMcpPrompt('what is the weather', [mkTool('get_weather', 'Get weather')]);
+    expect(out).toContain('kai_get_weather: Get weather');
+    expect(out).toContain('User request:');
+    expect(out).toContain('what is the weather');
   });
 });

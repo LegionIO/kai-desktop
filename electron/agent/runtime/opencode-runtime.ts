@@ -21,17 +21,28 @@
  * Sessions: the first turn omits -s (opencode creates a session and emits its id
  * on the created/session event); we capture it and pass `-s <id>` to resume.
  *
- * Tools: opencode has a native MCP client (customTools bridging via the MCP
- * bridge is a follow-up — see TODO); for now it runs with its own built-in tools.
+ * Tools: opencode has a native MCP client, so we bridge Kai's custom tools
+ * (builtin web_search/web_fetch/memory, cli, skill, plugin, mcp — everything
+ * except RUNTIME_BRIDGE_SKIP_TOOLS) via the same Streamable-HTTP MCP server the
+ * Codex runtime uses. We point opencode at an ephemeral, per-run config file
+ * (OPENCODE_CONFIG=<tmp>) whose `mcp.kai` remote block carries the bridge URL +
+ * a per-run bearer token in the Authorization header. opencode keeps its own
+ * built-in tools (bash/read/write/edit/...) alongside the bridged Kai tools.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
 import { detectOpencodeCli, resolveOpencodeCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
 import { getResolvedProcessEnv } from '../../utils/shell-env.js';
 import { scrubSecretEnv } from './confinement.js';
+import { RUNTIME_BRIDGE_SKIP_TOOLS } from './types.js';
+import { CodexMcpBridge, getCodexMcpToolEntries } from './codex-mcp-bridge.js';
+import type { ToolDefinition } from '../../tools/types.js';
 
 const OPENCODE_CAPABILITIES: RuntimeCapabilities = {
   builtInTools: true, // opencode ships bash/read/write/edit/grep/etc.
@@ -43,7 +54,7 @@ const OPENCODE_CAPABILITIES: RuntimeCapabilities = {
   multiProvider: true, // provider/model via models.dev
   subAgents: false,
   sessions: true, // -s <id> / captured session id
-  customTools: false, // TODO: bridge Kai tools via opencode's MCP config
+  customTools: true, // Kai tools bridged via opencode's native MCP client
   executesUntrustedTools: true, // spawns a CLI that runs bash/edits unsupervised
 };
 
@@ -60,7 +71,7 @@ export class OpencodeRuntime implements AgentRuntime {
   }
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
-    const { conversationId, cwd, reasoningEffort, abortSignal, primaryModel, conversationMetadata } = options;
+    const { conversationId, cwd, reasoningEffort, abortSignal, primaryModel, conversationMetadata, tools } = options;
 
     const binPath = await resolveOpencodeCliPath();
     if (!binPath) {
@@ -91,6 +102,49 @@ export class OpencodeRuntime implements AgentRuntime {
     if (existingSessionId) args.push('-s', existingSessionId);
     const runDir = options.confinedCwd || cwd || process.cwd();
     args.push('--dir', runDir);
+
+    // Bridge Kai's custom tools into opencode via its native MCP client. Start a
+    // loopback Streamable-HTTP MCP server (the same one Codex uses) and hand
+    // opencode an ephemeral, per-run config file whose `mcp.kai` remote block
+    // carries the bridge URL + a per-run bearer token. opencode keeps its own
+    // built-in tools alongside these. Non-fatal: a bridge failure just means
+    // opencode runs with its built-ins only.
+    const customTools = tools?.filter((t) => !RUNTIME_BRIDGE_SKIP_TOOLS.has(t.name)) ?? [];
+    const bridge = new CodexMcpBridge();
+    let bridgeUrl: string | undefined;
+    let opencodeConfigDir: string | undefined;
+    let opencodeConfigPath: string | undefined;
+    if (customTools.length > 0) {
+      try {
+        bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal);
+        const token = bridge.getAuthToken();
+        opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
+        opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');
+        writeFileSync(opencodeConfigPath, JSON.stringify(buildOpencodeMcpConfig(bridgeUrl, token), null, 2), {
+          mode: 0o600,
+        });
+        promptText = buildOpencodeMcpPrompt(promptText, customTools);
+        console.info(`[opencode-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
+      } catch (err) {
+        console.warn('[opencode-runtime] Failed to start MCP bridge:', err);
+        bridgeUrl = undefined;
+        try {
+          await bridge.stop();
+        } catch {
+          /* ignore */
+        }
+        if (opencodeConfigDir) {
+          try {
+            rmSync(opencodeConfigDir, { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
+          opencodeConfigDir = undefined;
+          opencodeConfigPath = undefined;
+        }
+      }
+    }
+
     // Prompt via stdin (avoid argv @/-/ambiguity + very long prompts).
     args.push('-');
 
@@ -108,6 +162,8 @@ export class OpencodeRuntime implements AgentRuntime {
     const baseEnv =
       options.childEnv ?? scrubSecretEnv(getResolvedProcessEnv(), { preserveAwsChain: mapping.preserveAwsChain });
     const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
+    // Point opencode at the ephemeral per-run config carrying the Kai MCP bridge.
+    if (opencodeConfigPath) env.OPENCODE_CONFIG = opencodeConfigPath;
 
     const child = spawn(binPath, args, {
       cwd: runDir,
@@ -199,6 +255,20 @@ export class OpencodeRuntime implements AgentRuntime {
     } finally {
       abortSignal?.removeEventListener('abort', onAbort);
       killProcessGroup(child);
+      if (bridgeUrl) {
+        try {
+          await bridge.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (opencodeConfigDir) {
+        try {
+          rmSync(opencodeConfigDir, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
       yield { conversationId, type: 'done' };
     }
   }
@@ -291,6 +361,51 @@ function describeOpencodeError(evt: OpencodeEvent): string {
   const e = evt as { error?: unknown; message?: unknown; part?: { error?: unknown } };
   const msg = e.error ?? e.message ?? e.part?.error;
   return typeof msg === 'string' && msg ? msg : 'opencode reported an error';
+}
+
+// ---------------------------------------------------------------------------
+// MCP bridge config + prompt (opencode native MCP client)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the ephemeral opencode config that registers the Kai MCP bridge as a
+ * remote server. opencode's schema (learned from `opencode mcp add ... --url`):
+ *   { "mcp": { "<name>": { "type": "remote", "url", "headers": { ... } } } }
+ * The bearer token is per-run; only this child (via OPENCODE_CONFIG) sees it.
+ */
+export function buildOpencodeMcpConfig(url: string, token: string | null): Record<string, unknown> {
+  return {
+    $schema: 'https://opencode.ai/config.json',
+    mcp: {
+      kai: {
+        type: 'remote',
+        url,
+        enabled: true,
+        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      },
+    },
+  };
+}
+
+/**
+ * Prepend a short preamble telling opencode the Kai tools are available under
+ * the MCP server prefix. opencode namespaces MCP tools as `kai_<toolName>`.
+ */
+export function buildOpencodeMcpPrompt(prompt: string, tools: ToolDefinition[]): string {
+  if (tools.length === 0) return prompt;
+  const lines = getCodexMcpToolEntries(tools)
+    .map(({ name, tool }) => `- kai_${name}: ${tool.description ?? ''}`.slice(0, 280))
+    .join('\n');
+  return [
+    'Kai has exposed additional plugin, skill, and MCP tools via the "kai" MCP server for this turn.',
+    'Call them by their namespaced names (listed below) when the user asks for that capability.',
+    '',
+    'Available Kai MCP tools:',
+    lines,
+    '',
+    'User request:',
+    prompt,
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------

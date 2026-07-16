@@ -52,7 +52,7 @@ const RUNTIME_DESCRIPTIONS: Record<string, string> = {
   'codex-sdk': "OpenAI's Codex agent. Thread-based execution with session resume.",
   pi: 'Fast coding agent (its own bash, read/write/edit, grep). Kai skills/plugins/custom tools are bridged in via a generated pi extension. No per-call approval in headless mode; the Approval setting maps to spawn-time tool scoping (read-only / no-shell / full). Custom-endpoint models are not supported.',
   opencode:
-    'OpenCode agent (open-source, provider-agnostic). Headless JSON mode with native MCP + sessions. Kai tools bridged via MCP (coming); runs its own bash/read/write/edit today. Custom-endpoint models are not supported.',
+    'OpenCode agent (open-source, provider-agnostic). Headless JSON mode with native MCP + sessions. Kai skills/plugins/custom tools are bridged in via its native MCP client (an ephemeral per-run config); it also keeps its own bash/read/write/edit. Custom-endpoint models are not supported.',
 };
 
 /** Sort order: available before offline, then by priority. */
