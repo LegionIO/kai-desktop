@@ -961,8 +961,17 @@ export const appConfigSchema = z.object({
     composer: z
       .object({
         showModelProfileSelector: z.boolean(),
+        /**
+         * What happens when you send a message while a turn is still generating
+         * (Mastra runtime — the CLI runtimes always abort+restart):
+         *  - 'splice' (default): enqueue silently; the running turn splices it at
+         *    its next step boundary (cooperative mid-turn injection).
+         *  - 'queue-editable': enqueue AND show a queued chip you can cancel or
+         *    edit (cancel + pre-fill the composer) before it's spliced.
+         */
+        midTurnSend: z.enum(['splice', 'queue-editable']).default('splice'),
       })
-      .default({ showModelProfileSelector: true }),
+      .default({ showModelProfileSelector: true, midTurnSend: 'splice' }),
     /**
      * Tool/plan/ask_user approval prompts. When `dedicatedWindow` is on, an
      * approval opens in its own small always-on-top window (so answering it
@@ -1063,6 +1072,11 @@ export const appConfigSchema = z.object({
     approvalMode: 'prompt-user',
     surfaceAlertsAsModal: false,
   }),
+  /**
+   * UI/renderer preferences. Optional so existing configs keep working; each
+   * subsection carries its own defaults. `.passthrough()` preserves any
+   * additional renderer-managed keys not enumerated here.
+   */
   hooks: hooksConfigSchema,
 });
 
