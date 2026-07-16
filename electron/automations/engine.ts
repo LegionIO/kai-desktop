@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AutomationRule, AutomationsConfig } from '../config/schema.js';
+import { getRuleTriggers } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import type { ActionDeps } from './actions.js';
 import { executeActions } from './actions.js';
@@ -124,9 +125,13 @@ export class AutomationEngine {
 
     for (const rule of this.rules) {
       if (!rule.enabled) continue;
-      const sourceMatch = rule.trigger.source === '*' || rule.trigger.source === event.source;
-      const eventMatch = rule.trigger.event === '*' || rule.trigger.event === event.event;
-      if (!sourceMatch || !eventMatch) continue;
+      // Fire if the event matches ANY of the rule's triggers (canonical `trigger`
+      // + optional `triggers[]`, possibly across different sources). `*` wildcards
+      // still match all sources / all events.
+      const matched = getRuleTriggers(rule).some(
+        (t) => (t.source === '*' || t.source === event.source) && (t.event === '*' || t.event === event.event),
+      );
+      if (!matched) continue;
       const record = await this.runRule(rule, event, { skipThrottle: false });
       this.pushLog(record);
     }

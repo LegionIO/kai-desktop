@@ -796,17 +796,46 @@ const automationActionSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
+export const automationTriggerSchema = z.object({ source: z.string(), event: z.string() });
+
 export const automationRuleSchema = z.object({
   id: z.string(),
   name: z.string(),
   enabled: z.boolean().default(true),
-  trigger: z.object({ source: z.string(), event: z.string() }),
+  // The canonical single trigger (kept for back-compat + the common case). A
+  // rule may ALSO declare `triggers[]` to fire on any of several source:event
+  // pairs, possibly across different sources (e.g. teams:message-received AND
+  // outlook:email-received). Matching is the union of `trigger` + `triggers`.
+  trigger: automationTriggerSchema,
+  triggers: z.array(automationTriggerSchema).optional(),
   conditions: z.array(automationConditionSchema).default([]),
   conditionMode: z.enum(['all', 'any']).default('all'),
   actions: z.array(automationActionSchema).min(1),
   debounceMs: z.number().int().nonnegative().default(0),
   rateLimitPerMinute: z.number().int().positive().optional(),
 });
+
+/**
+ * The full set of {source,event} triggers a rule fires on: the canonical
+ * `trigger` plus any `triggers[]`, deduped. Single normalize path for the engine,
+ * validators, and GUI so multi-trigger + legacy single-trigger rules behave the
+ * same everywhere.
+ */
+export function getRuleTriggers(rule: {
+  trigger: { source: string; event: string };
+  triggers?: Array<{ source: string; event: string }>;
+}): Array<{ source: string; event: string }> {
+  const all = [rule.trigger, ...(rule.triggers ?? [])];
+  const seen = new Set<string>();
+  const out: Array<{ source: string; event: string }> = [];
+  for (const t of all) {
+    const key = `${t.source} ${t.event}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
 
 const automationsConfigSchema = z.object({
   enabled: z.boolean().default(true),

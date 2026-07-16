@@ -181,3 +181,80 @@ describe('emit-time schema check', () => {
     spy.mockRestore();
   });
 });
+
+import { getRuleTriggers } from '../../config/schema.js';
+
+describe('getRuleTriggers', () => {
+  it('returns just the canonical trigger for a legacy single-trigger rule', () => {
+    expect(getRuleTriggers({ trigger: { source: 's', event: 'e' } })).toEqual([{ source: 's', event: 'e' }]);
+  });
+
+  it('unions trigger + triggers[] (across sources), deduped', () => {
+    const triggers = getRuleTriggers({
+      trigger: { source: 'plugin.teams', event: 'message-received' },
+      triggers: [
+        { source: 'plugin.teams', event: 'reaction-received' },
+        { source: 'plugin.outlook', event: 'email-received' },
+        { source: 'plugin.teams', event: 'message-received' }, // dup of canonical
+      ],
+    });
+    expect(triggers).toEqual([
+      { source: 'plugin.teams', event: 'message-received' },
+      { source: 'plugin.teams', event: 'reaction-received' },
+      { source: 'plugin.outlook', event: 'email-received' },
+    ]);
+  });
+});
+
+describe('validateRulePaths — multi-trigger', () => {
+  it('accepts a rule whose triggers[] entries are all in the catalog', () => {
+    const w = validateRulePaths(
+      rule({
+        trigger: { source: 'plugin.teams', event: 'message-received' },
+        triggers: [{ source: 'plugin.teams', event: 'message-received' }],
+      }),
+      catalog,
+    );
+    expect(w).toEqual([]);
+  });
+
+  it('warns about an unknown source in triggers[]', () => {
+    const w = validateRulePaths(
+      rule({
+        trigger: { source: 'plugin.teams', event: 'message-received' },
+        triggers: [{ source: 'plugin.ghost', event: 'x' }],
+      }),
+      catalog,
+    );
+    expect(w.some((m) => m.includes('plugin.ghost'))).toBe(true);
+  });
+
+  it('skips condition-path checks when there are multiple DISTINCT triggers (heterogeneous payloads)', () => {
+    // Two distinct triggers → payloads are heterogeneous, so a path valid for
+    // only one trigger's schema must not warn (we can't know which arrives).
+    const catalog2 = [
+      ...catalog,
+      {
+        source: 'plugin.outlook',
+        displayName: 'Outlook',
+        events: [
+          {
+            event: 'email-received',
+            title: 'email',
+            payloadSchema: { type: 'object', properties: { subject: { type: 'string' } } },
+          },
+        ],
+        actions: [],
+      },
+    ];
+    const w = validateRulePaths(
+      rule({
+        trigger: { source: 'plugin.teams', event: 'message-received' },
+        triggers: [{ source: 'plugin.outlook', event: 'email-received' }],
+        conditions: [{ path: 'body', op: 'equals', value: 'x', caseSensitive: false }],
+      }),
+      catalog2,
+    );
+    expect(w).toEqual([]);
+  });
+});

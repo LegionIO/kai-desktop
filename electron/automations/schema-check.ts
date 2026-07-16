@@ -1,4 +1,5 @@
 import type { AutomationRule } from '../config/schema.js';
+import { getRuleTriggers } from '../config/schema.js';
 import type { SourceCatalogEntry } from './types.js';
 
 export function flattenSchemaPaths(schema: Record<string, unknown> | undefined, prefix = ''): string[] {
@@ -49,31 +50,32 @@ function closestPath(target: string, candidates: string[]): string | undefined {
 
 export function validateRulePaths(rule: AutomationRule, catalog: SourceCatalogEntry[]): string[] {
   const warnings: string[] = [];
+  const triggers = getRuleTriggers(rule);
 
-  // Wildcard triggers ("*" source and/or "*" event) match across sources/events,
-  // so there is no single catalog entry (and no single payload schema) to validate
-  // against. The engine honors "*" (engine.ts); accept it and skip path checks —
-  // a wildcard payload is heterogeneous, so condition paths can't be verified.
-  if (rule.trigger.source === '*') return warnings;
-
-  const source = catalog.find((c) => c.source === rule.trigger.source);
-  if (!source) {
-    warnings.push(
-      `Trigger source "${rule.trigger.source}" is not in the event catalog. Available: ${catalog.map((c) => c.source).join(', ') || '(none)'}.`,
-    );
-    return warnings;
+  // Validate that EACH trigger's source/event exists in the catalog (a rule may
+  // fire on several source:event pairs, possibly across sources). "*" wildcards
+  // match everything, so they're accepted without a catalog lookup.
+  let unknownTrigger = false;
+  for (const t of triggers) {
+    if (t.source === '*') continue;
+    const source = catalog.find((c) => c.source === t.source);
+    if (!source) {
+      unknownTrigger = true;
+      warnings.push(
+        `Trigger source "${t.source}" is not in the event catalog. Available: ${catalog.map((c) => c.source).join(', ') || '(none)'}.`,
+      );
+      continue;
+    }
+    if (t.event === '*') continue;
+    if (!source.events.some((e) => e.event === t.event)) {
+      unknownTrigger = true;
+      warnings.push(
+        `Trigger event "${t.event}" is not declared by ${source.displayName}. Available: ${source.events.map((e) => e.event).join(', ') || '(none)'}.`,
+      );
+    }
   }
 
-  if (rule.trigger.event === '*') return warnings;
-
-  const eventDesc = source.events.find((e) => e.event === rule.trigger.event);
-  if (!eventDesc) {
-    warnings.push(
-      `Trigger event "${rule.trigger.event}" is not declared by ${source.displayName}. Available: ${source.events.map((e) => e.event).join(', ') || '(none)'}.`,
-    );
-    return warnings;
-  }
-
+  // Plugin-action targetId validation (independent of the trigger).
   for (const action of rule.actions) {
     if (action.type !== 'plugin-action') continue;
     const target = catalog.find((c) => c.source === `plugin.${action.pluginName}`);
@@ -89,6 +91,17 @@ export function validateRulePaths(rule: AutomationRule, catalog: SourceCatalogEn
     }
   }
 
+  // Condition-path validation needs a single, concrete payload schema. Only run
+  // it for an unambiguous single non-wildcard trigger: with several triggers the
+  // payloads are heterogeneous (a path valid for one may not exist on another),
+  // and a wildcard payload is fully heterogeneous — skip in those cases to avoid
+  // false positives. Also skip if any trigger was unknown (no reliable schema).
+  const single = triggers.length === 1 ? triggers[0] : null;
+  if (unknownTrigger || !single || single.source === '*' || single.event === '*') return warnings;
+  const source = catalog.find((c) => c.source === single.source);
+  const eventDesc = source?.events.find((e) => e.event === single.event);
+  if (!eventDesc) return warnings;
+
   const paths = flattenSchemaPaths(eventDesc.payloadSchema);
   if (paths.length === 0) return warnings;
 
@@ -98,7 +111,7 @@ export function validateRulePaths(rule: AutomationRule, catalog: SourceCatalogEn
     if (!paths.includes(normalized)) {
       const suggestion = closestPath(normalized, paths);
       warnings.push(
-        `Condition path "${cond.path}" is not in the declared payload schema for ${rule.trigger.source}:${rule.trigger.event}.` +
+        `Condition path "${cond.path}" is not in the declared payload schema for ${single.source}:${single.event}.` +
           (suggestion ? ` Did you mean "${suggestion}"?` : ` Known paths: ${paths.join(', ')}.`),
       );
     }

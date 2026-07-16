@@ -92,6 +92,46 @@ describe('AutomationEngine', () => {
     expect(handlePluginAction).not.toHaveBeenCalled();
   });
 
+  it('fires on ANY of several triggers, across different sources', async () => {
+    const rule = baseRule({
+      trigger: { source: 'plugin.teams', event: 'message-received' },
+      triggers: [
+        { source: 'plugin.teams', event: 'reaction-received' },
+        { source: 'plugin.outlook', event: 'email-received' },
+      ],
+    });
+    const { bus, handlePluginAction } = makeEngine([rule]);
+
+    // Canonical trigger.
+    bus.emit('plugin.teams', 'message-received', {});
+    await flush();
+    // A different event under the same source (from triggers[]).
+    bus.emit('plugin.teams', 'reaction-received', {});
+    await flush();
+    // A different SOURCE entirely (from triggers[]).
+    bus.emit('plugin.outlook', 'email-received', {});
+    await flush();
+    expect(handlePluginAction).toHaveBeenCalledTimes(3);
+
+    // An event matching none of the triggers does not fire.
+    bus.emit('plugin.teams', 'unrelated', {});
+    await flush();
+    expect(handlePluginAction).toHaveBeenCalledTimes(3);
+  });
+
+  it('fires a multi-trigger rule exactly once per matching event (no double-fire)', async () => {
+    // Even if the same source:event appears via both trigger and triggers[], the
+    // event fires the rule once.
+    const rule = baseRule({
+      trigger: { source: 'plugin.teams', event: 'msg' },
+      triggers: [{ source: 'plugin.teams', event: 'msg' }],
+    });
+    const { bus, handlePluginAction } = makeEngine([rule]);
+    bus.emit('plugin.teams', 'msg', {});
+    await flush();
+    expect(handlePluginAction).toHaveBeenCalledTimes(1);
+  });
+
   it('skips when conditions fail', async () => {
     const { bus, engine, handlePluginAction } = makeEngine([
       baseRule({ conditions: [{ path: 'x', op: 'equals', value: '1', caseSensitive: false }] }),

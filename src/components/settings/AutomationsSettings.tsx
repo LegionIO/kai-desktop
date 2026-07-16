@@ -51,11 +51,15 @@ type Action =
   | { type: 'emit'; source: string; event: string; payload?: Record<string, unknown> }
   | { type: 'runHookCommand'; command: string; mode: 'observe' | 'block' | 'modify'; matcher?: string };
 
+type Trigger = { source: string; event: string };
 type Rule = {
   id: string;
   name: string;
   enabled: boolean;
-  trigger: { source: string; event: string };
+  trigger: Trigger;
+  /** Additional source:event pairs (possibly cross-source) this rule also fires
+   *  on. The rule matches the union of `trigger` + `triggers`. */
+  triggers?: Trigger[];
   conditions: Condition[];
   conditionMode: 'all' | 'any';
   actions: Action[];
@@ -298,6 +302,7 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
                 />
                 <span className="rounded-full bg-muted/80 px-2 py-0.5 text-[10px] text-muted-foreground">
                   {rule.trigger.source}:{rule.trigger.event}
+                  {rule.triggers && rule.triggers.length > 0 ? ` +${rule.triggers.length}` : ''}
                 </span>
                 {last &&
                   (last.matched && !last.error ? (
@@ -404,6 +409,72 @@ const RuleEditor: FC<{
                 : 'Matches every event from this source.'}
           </span>
         )}
+
+        {/* Additional triggers (cross-source): the rule fires on ANY of these
+            source:event pairs too. */}
+        <div className="mt-2 space-y-1.5">
+          {(rule.triggers ?? []).map((t, i) => {
+            const tSource = catalog.find((c) => c.source === t.source);
+            const setTrigger = (patch: Partial<Trigger>) => {
+              const next = [...(rule.triggers ?? [])];
+              next[i] = { ...next[i], ...patch };
+              onChange({ triggers: next });
+            };
+            return (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-[10px] text-muted-foreground/60">or</span>
+                <select
+                  className={settingsSelectClass}
+                  value={t.source}
+                  onChange={(e) => setTrigger({ source: e.target.value, event: e.target.value === '*' ? '*' : '' })}
+                >
+                  <option value="">— select source —</option>
+                  <option value="*">✳ All sources (*)</option>
+                  {!tSource && t.source && t.source !== '*' && <option value={t.source}>{t.source}</option>}
+                  {catalog.map((c) => (
+                    <option key={c.source} value={c.source}>
+                      {c.displayName}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className={settingsSelectClass}
+                  value={t.event}
+                  onChange={(e) => setTrigger({ event: e.target.value })}
+                >
+                  <option value="">— select event —</option>
+                  <option value="*">✳ All events (*)</option>
+                  {!tSource?.events.find((e) => e.event === t.event) && t.event && t.event !== '*' && (
+                    <option value={t.event}>{t.event}</option>
+                  )}
+                  {(tSource?.events ?? []).map((ev) => (
+                    <option key={ev.event} value={ev.event}>
+                      {ev.title}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="text-[10px] text-muted-foreground/60 hover:text-destructive"
+                  onClick={() => {
+                    const next = (rule.triggers ?? []).filter((_, j) => j !== i);
+                    onChange({ triggers: next.length > 0 ? next : undefined });
+                  }}
+                  aria-label="Remove trigger"
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
+          <button
+            type="button"
+            className="text-[10px] font-medium text-primary/80 hover:text-primary"
+            onClick={() => onChange({ triggers: [...(rule.triggers ?? []), { source: '', event: '' }] })}
+          >
+            + Add trigger (fire on another event too)
+          </button>
+        </div>
       </div>
 
       {/* Conditions */}
