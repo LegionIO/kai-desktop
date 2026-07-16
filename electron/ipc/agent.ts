@@ -2908,6 +2908,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
     }
+    // Sync dismissal: if the user answered the INLINE card, close the dedicated
+    // approval window too. (Approve normally emits a tool-result that also closes
+    // it, but reject/dismiss may not — close here so the surfaces never diverge.)
+    closeApprovalWindow(toolCallId);
     return { ok: true };
   });
 
@@ -2917,6 +2921,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve(false);
       pendingToolApprovals.delete(toolCallId);
     }
+    closeApprovalWindow(toolCallId);
     return { ok: true };
   });
 
@@ -2926,6 +2931,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve('dismiss');
       pendingToolApprovals.delete(toolCallId);
     }
+    closeApprovalWindow(toolCallId);
     return { ok: true };
   });
 
