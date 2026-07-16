@@ -451,6 +451,38 @@ export function usePromptHistory(): PromptHistoryState {
   return useCtx(PromptHistoryContext);
 }
 
+/**
+ * Compose-while-running state for the composer: whether a turn is live, the
+ * configured mid-turn-send mode, and a helper to enqueue a mid-turn follow-up.
+ * `sendMidTurn` returns true if the message was cooperatively injected into the
+ * running turn (the composer should then just clear its input); false means the
+ * caller should fall back to the normal send (supersede / new turn).
+ */
+type MidTurnComposerState = {
+  isRunning: boolean;
+  midTurnSend: 'splice' | 'queue-editable';
+  sendMidTurn: (text: string) => Promise<boolean>;
+  /** Pending (not-yet-spliced) injects for the active conversation — the
+   *  queue-editable chip UI. Empty in 'splice' mode (chips are only shown when
+   *  the setting opts in). */
+  pendingInjects: Array<{ id: string; text: string }>;
+  /** Cancel a queued inject by id. Returns its text (for the "edit" affordance,
+   *  which cancels then pre-fills the composer), or null if already gone. */
+  cancelInject: (id: string) => Promise<string | null>;
+};
+
+const MidTurnComposerContext = createCtx<MidTurnComposerState>({
+  isRunning: false,
+  midTurnSend: 'splice',
+  sendMidTurn: async () => false,
+  pendingInjects: [],
+  cancelInject: async () => null,
+});
+
+export function useMidTurnComposer(): MidTurnComposerState {
+  return useCtx(MidTurnComposerContext);
+}
+
 type CurrentWorkingDirectoryState = {
   currentWorkingDirectory: string | null;
   setCurrentWorkingDirectory: (cwd: string | null) => Promise<void>;
@@ -2758,6 +2790,32 @@ export function RuntimeProvider({
       }
       if (!userContent.some((p) => p.type === 'text' || p.type === 'image')) return;
 
+      // Compose-while-running: if a turn is still generating for this conversation
+      // and cooperative mid-turn injection is enabled, route the send to the
+      // running turn instead of starting a new one. The main process enqueues +
+      // persists + broadcasts the user turn (rendered via the user-message event),
+      // and the running Mastra turn splices it at its next step boundary. Only
+      // text is supported for a mid-turn splice; if there are images/attachments,
+      // fall through to a normal turn (which supersedes). If the main process says
+      // the active run isn't cooperatively injectable (a CLI runtime), also fall
+      // through to the normal supersede path.
+      if (isRunningRef.current) {
+        const onlyText = userContent.length > 0 && userContent.every((p) => p.type === 'text');
+        if (onlyText) {
+          const text = userContent
+            .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+            .map((p) => p.text)
+            .join('\n')
+            .trim();
+          if (text) {
+            const res = await app.agent.injectMidTurn(convId, text);
+            if (res.ok && res.cooperative) return; // spliced into the running turn
+            // Not cooperatively injectable (CLI runtime / race) — fall through to a
+            // normal new turn, which supersedes the running one.
+          }
+        }
+      }
+
       const userMsg: StoredMessage = {
         id: msgId(),
         parentId: headId,
@@ -3088,6 +3146,79 @@ export function RuntimeProvider({
     }),
     [activeBranch, activeConversationId],
   );
+
+  // Compose-while-running: enqueue a typed follow-up into the running turn.
+  // Returns true when it was cooperatively injected (Mastra) so the composer can
+  // just clear; false means fall back to the normal send (supersede / new turn).
+  const [pendingInjects, setPendingInjects] = useState<Array<{ id: string; text: string }>>([]);
+  const midTurnMode: 'splice' | 'queue-editable' =
+    (config as { ui?: { composer?: { midTurnSend?: string } } } | null)?.ui?.composer?.midTurnSend === 'queue-editable'
+      ? 'queue-editable'
+      : 'splice';
+
+  const refreshPendingInjects = useCallback(async () => {
+    const convId = activeIdRef.current;
+    if (!convId || midTurnMode !== 'queue-editable') {
+      setPendingInjects([]);
+      return;
+    }
+    try {
+      const list = await app.agent.listInjects(convId);
+      setPendingInjects(list.map((e) => ({ id: e.id, text: e.text })));
+    } catch {
+      setPendingInjects([]);
+    }
+  }, [midTurnMode]);
+
+  const sendMidTurn = useCallback(
+    async (text: string): Promise<boolean> => {
+      const convId = activeIdRef.current;
+      const trimmed = text.trim();
+      if (!convId || !trimmed || !isRunningRef.current) return false;
+      try {
+        const res = await app.agent.injectMidTurn(convId, trimmed);
+        if (res.ok && res.cooperative) {
+          void refreshPendingInjects();
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    },
+    [refreshPendingInjects],
+  );
+
+  const cancelInject = useCallback(async (id: string): Promise<string | null> => {
+    const convId = activeIdRef.current;
+    if (!convId) return null;
+    try {
+      const res = await app.agent.cancelInject(convId, id);
+      setPendingInjects((prev) => prev.filter((e) => e.id !== id));
+      return res.ok ? (res.text ?? null) : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Injects are consumed by prepareStep as the turn steps; refresh the chip list
+  // when the turn ends (all spliced/drained) and — in queue-editable mode — poll
+  // while running so a chip disappears once its message is spliced mid-turn.
+  useEffect(() => {
+    if (!isRunning) {
+      setPendingInjects([]);
+      return;
+    }
+    void refreshPendingInjects();
+    if (midTurnMode !== 'queue-editable') return;
+    const iv = setInterval(() => void refreshPendingInjects(), 1500);
+    return () => clearInterval(iv);
+  }, [isRunning, midTurnMode, refreshPendingInjects]);
+
+  const midTurnComposerState = useMemo<MidTurnComposerState>(
+    () => ({ isRunning, midTurnSend: midTurnMode, sendMidTurn, pendingInjects, cancelInject }),
+    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject],
+  );
   const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
     () => ({
       currentWorkingDirectory,
@@ -3365,13 +3496,15 @@ export function RuntimeProvider({
           <BranchNavContext.Provider value={branchNav}>
             <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
               <PromptHistoryContext.Provider value={promptHistory}>
-                <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                  <StepTrackingContext.Provider value={stepTrackingState}>
-                    <RuntimeConversationIdContext.Provider value={activeConversationId}>
-                      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
-                    </RuntimeConversationIdContext.Provider>
-                  </StepTrackingContext.Provider>
-                </CurrentWorkingDirectoryContext.Provider>
+                <MidTurnComposerContext.Provider value={midTurnComposerState}>
+                  <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
+                    <StepTrackingContext.Provider value={stepTrackingState}>
+                      <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                        <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+                      </RuntimeConversationIdContext.Provider>
+                    </StepTrackingContext.Provider>
+                  </CurrentWorkingDirectoryContext.Provider>
+                </MidTurnComposerContext.Provider>
               </PromptHistoryContext.Provider>
             </AssistantResponseTimingContext.Provider>
           </BranchNavContext.Provider>

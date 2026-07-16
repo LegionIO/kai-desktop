@@ -69,6 +69,12 @@ type AppAPI = {
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     inFlight: (conversationId: string) => Promise<boolean>;
+    injectMidTurn: (
+      conversationId: string,
+      userText: string,
+    ) => Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }>;
+    listInjects: (conversationId: string) => Promise<Array<{ id: string; text: string; at: number }>>;
+    cancelInject: (conversationId: string, id: string) => Promise<{ ok: boolean; text?: string }>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;

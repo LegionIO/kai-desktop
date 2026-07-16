@@ -22,7 +22,7 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
 } from '../agent/stream-persistence.js';
-import { enqueueInject } from '../agent/inject-queue.js';
+import { enqueueInject, listInjects, removeInject } from '../agent/inject-queue.js';
 import {
   shouldCompact,
   compactConversationPrefix,
@@ -2527,6 +2527,60 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   };
 
   ipcMain.handle('agent:stream', streamHandler);
+
+  // ── Renderer-facing cooperative mid-turn injection ────────────────────────
+  // The GUI composer, when a message is sent while a Mastra turn is still
+  // generating (ui.composer.midTurnSend), calls these instead of starting a new
+  // turn. `inject` enqueues + persists + broadcasts the user turn (prepareStep
+  // splices it at the running turn's next step boundary — see inject-queue.ts).
+  // `list`/`cancel` back the queue-editable chip. These are Mastra-path only;
+  // the renderer only routes here when the active run is the Mastra runtime.
+  ipcMain.handle(
+    'agent:inject-mid-turn',
+    (
+      _event,
+      conversationId: string,
+      userText: string,
+    ): { ok: boolean; cooperative?: boolean; id?: string; error?: string } => {
+      if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
+      const conv = readConversation(appHome, conversationId);
+      if (!conv) return { ok: false, error: 'conversation-not-found' };
+      // Cooperative splice only works on the Mastra runtime (prepareStep). If the
+      // live run is a CLI runtime (or nothing is running), tell the renderer so it
+      // can fall back to a normal turn (abort+restart) instead of stranding the
+      // message in a queue no prepareStep will drain.
+      if (getActiveStreamRuntime(conversationId) !== 'mastra') {
+        return { ok: false, cooperative: false, error: 'active run is not cooperatively injectable' };
+      }
+      const id = enqueueInject(conversationId, userText);
+      const write = appendConversationMessages(
+        appHome,
+        conversationId,
+        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+        { runStatus: 'running' },
+      );
+      if (!write) {
+        if (id) removeInject(conversationId, id);
+        return { ok: false, error: 'conversation-not-found' };
+      }
+      broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+      return { ok: true, cooperative: true, id: id ?? undefined };
+    },
+  );
+
+  ipcMain.handle('agent:list-injects', (_event, conversationId: string) =>
+    listInjects(conversationId).map((e) => ({ id: e.id, text: e.text, at: e.at })),
+  );
+
+  // Cancel a queued (not-yet-spliced) inject by id. Returns the removed text so
+  // the renderer's "edit" affordance can pre-fill the composer with it.
+  ipcMain.handle(
+    'agent:cancel-inject',
+    (_event, conversationId: string, id: string): { ok: boolean; text?: string } => {
+      const text = removeInject(conversationId, id);
+      return { ok: text !== null, text: text ?? undefined };
+    },
+  );
 
   // Shared mid-turn-inject helper (see the exported InjectUserTurnFn doc). This
   // is the same append-user-turn → server-persist → streamHandler sequence the

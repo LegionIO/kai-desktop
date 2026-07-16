@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { enqueueInject, drainInjects, hasInjects, clearInjects } from '../inject-queue.js';
+import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject } from '../inject-queue.js';
 
 describe('inject-queue (cooperative mid-turn injection)', () => {
   beforeEach(() => {
@@ -17,6 +17,31 @@ describe('inject-queue (cooperative mid-turn injection)', () => {
     // Drain removes them.
     expect(hasInjects('c1')).toBe(false);
     expect(drainInjects('c1')).toEqual([]);
+  });
+
+  it('returns a stable id from enqueue and lists pending entries', () => {
+    const id1 = enqueueInject('c1', 'a');
+    const id2 = enqueueInject('c1', 'b');
+    expect(id1).toBeTruthy();
+    expect(id2).toBeTruthy();
+    expect(id1).not.toBe(id2);
+    const listed = listInjects('c1');
+    expect(listed.map((e) => e.id)).toEqual([id1, id2]);
+    expect(listed.map((e) => e.text)).toEqual(['a', 'b']);
+    // listInjects is a snapshot — does not drain.
+    expect(hasInjects('c1')).toBe(true);
+  });
+
+  it('removeInject drops one entry by id and returns its text', () => {
+    const id1 = enqueueInject('c1', 'keep');
+    const id2 = enqueueInject('c1', 'drop')!;
+    expect(removeInject('c1', id2)).toBe('drop');
+    expect(listInjects('c1').map((e) => e.text)).toEqual(['keep']);
+    // Removing an unknown id is a no-op returning null.
+    expect(removeInject('c1', 'nope')).toBeNull();
+    // Removing the last entry clears the queue.
+    removeInject('c1', id1!);
+    expect(hasInjects('c1')).toBe(false);
   });
 
   it('keeps conversations isolated', () => {
@@ -40,9 +65,9 @@ describe('inject-queue (cooperative mid-turn injection)', () => {
     expect(drainInjects('c1')).toEqual([]);
   });
 
-  it('ignores empty conversationId or text', () => {
-    enqueueInject('', 'x');
-    enqueueInject('c1', '');
+  it('ignores empty conversationId or text (returns null)', () => {
+    expect(enqueueInject('', 'x')).toBeNull();
+    expect(enqueueInject('c1', '')).toBeNull();
     expect(hasInjects('c1')).toBe(false);
   });
 

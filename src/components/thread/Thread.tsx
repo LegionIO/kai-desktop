@@ -54,6 +54,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import {
   useBranchNav,
   useCurrentWorkingDirectory,
+  useMidTurnComposer,
   useRuntimeConversationId,
   useStepTracking,
   type TokenUsageData,
@@ -1718,6 +1719,52 @@ const StopButton: FC = () => {
   );
 };
 
+/**
+ * Queued-follow-ups bar (queue-editable mid-turn-send mode): shows pending
+ * injects — messages sent while a reply is still generating, waiting to be woven
+ * into the turn — each with cancel (✕) and edit (✎, cancels + pre-fills the
+ * composer). Hidden entirely in the default 'splice' mode.
+ */
+const QueuedInjectsBar: FC = () => {
+  const { pendingInjects, midTurnSend, cancelInject } = useMidTurnComposer();
+  const composerRuntime = useComposerRuntime();
+  if (midTurnSend !== 'queue-editable' || pendingInjects.length === 0) return null;
+  return (
+    <div className="mb-1.5 flex flex-wrap gap-1.5">
+      {pendingInjects.map((inj) => (
+        <span
+          key={inj.id}
+          className="flex items-center gap-1 rounded-full border border-border/60 bg-muted/60 px-2 py-0.5 text-[10px] text-muted-foreground"
+        >
+          <span className="max-w-[220px] truncate" title={inj.text}>
+            queued: {inj.text}
+          </span>
+          <button
+            type="button"
+            className="hover:text-foreground"
+            title="Edit — cancel and put the text back in the composer"
+            onClick={() => {
+              void cancelInject(inj.id).then((text) => {
+                if (text) composerRuntime.setText(text);
+              });
+            }}
+          >
+            <PencilIcon className="h-2.5 w-2.5" />
+          </button>
+          <button
+            type="button"
+            className="hover:text-destructive"
+            title="Cancel this queued message"
+            onClick={() => void cancelInject(inj.id)}
+          >
+            <XIcon className="h-2.5 w-2.5" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+};
+
 const Composer: FC<{
   mode: ThreadMode;
   onChangeMode: (mode: ThreadMode) => void;
@@ -1752,7 +1799,29 @@ const Composer: FC<{
   const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
+  const { sendMidTurn } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
+
+  // Compose-while-running: send the current composer text into the live turn (the
+  // Send button rendered while running). Cooperatively spliced on Mastra; falls
+  // back to a normal superseding send otherwise.
+  const handleMidTurnSend = useCallback(() => {
+    const t = composerText.trim();
+    if (!t || attachments.length > 0) {
+      // With attachments (or empty) there's nothing to splice — use normal send.
+      composerRuntime.send();
+      return;
+    }
+    composerRuntime.setText('');
+    setComposerText('');
+    void sendMidTurn(t).then((injected) => {
+      if (!injected) {
+        composerRuntime.setText(t);
+        composerRuntime.send();
+        composerRuntime.setText('');
+      }
+    });
+  }, [attachments.length, composerRuntime, composerText, sendMidTurn]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
@@ -2120,6 +2189,7 @@ const Composer: FC<{
               </>
             ) : (
               <>
+                <QueuedInjectsBar />
                 <ComposerInput
                   placeholder={
                     computerUseToggled
@@ -2368,6 +2438,16 @@ const Composer: FC<{
                       </Tooltip>
                     </ThreadPrimitive.If>
                     <ThreadPrimitive.If running>
+                      <Tooltip content="Send now (adds to the running turn)" side="top" sideOffset={8}>
+                        <button
+                          type="button"
+                          onClick={handleMidTurnSend}
+                          disabled={!composerText.trim()}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
+                        >
+                          <SendHorizontalIcon className="h-4 w-4" />
+                        </button>
+                      </Tooltip>
                       <StopButton />
                     </ThreadPrimitive.If>
                   </div>

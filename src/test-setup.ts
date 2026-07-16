@@ -10,6 +10,9 @@ globalThis.window = globalThis.window || ({} as Window & typeof globalThis);
     stream: vi.fn(),
     sendSubAgentMessage: vi.fn(),
     stopSubAgent: vi.fn(),
+    injectMidTurn: vi.fn().mockResolvedValue({ ok: true, cooperative: true, id: 'inj-test' }),
+    listInjects: vi.fn().mockResolvedValue([]),
+    cancelInject: vi.fn().mockResolvedValue({ ok: true }),
   },
   conversations: {
     getActiveId: vi.fn().mockResolvedValue('test-conversation'),

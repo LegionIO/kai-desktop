@@ -3,7 +3,7 @@ import { useComposerRuntime } from '@assistant-ui/react';
 import { RichChatInput } from './RichChatInput';
 import { useAttachments } from '@/providers/AttachmentContext';
 import { useAppShotPasteHandler } from '@/hooks/useAppShots';
-import { usePromptHistory } from '@/providers/RuntimeProvider';
+import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvider';
 import { cn } from '@/lib/utils';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
@@ -15,6 +15,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const { attachments, addAttachments } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
+  const { isRunning, sendMidTurn } = useMidTurnComposer();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   const historyIndexRef = useRef(-1);
   const draftBeforeHistoryRef = useRef('');
@@ -95,11 +96,31 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
 
   const handleSubmit = useCallback(() => {
     if (!text.trim() && attachments.length === 0) return;
+    // Compose-while-running: if a turn is live and this is a plain-text send (no
+    // attachments), try to splice it into the running turn instead of blocking.
+    // sendMidTurn resolves true when it was cooperatively injected (Mastra); on
+    // false (CLI runtime / not running) we fall back to the normal send.
+    if (isRunning && attachments.length === 0 && text.trim()) {
+      const toSend = text;
+      setText('');
+      composerRuntime.setText('');
+      resetHistoryNavigation('');
+      void sendMidTurn(toSend).then((injected) => {
+        if (!injected) {
+          // Not cooperatively injected — restore and use the normal send path
+          // (which supersedes the running turn).
+          composerRuntime.setText(toSend);
+          composerRuntime.send();
+          composerRuntime.setText('');
+        }
+      });
+      return;
+    }
     composerRuntime.send();
     setText('');
     composerRuntime.setText('');
     resetHistoryNavigation('');
-  }, [attachments.length, composerRuntime, resetHistoryNavigation, text]);
+  }, [attachments.length, composerRuntime, isRunning, resetHistoryNavigation, sendMidTurn, text]);
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLElement>) => {

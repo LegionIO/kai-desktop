@@ -17,6 +17,8 @@
  */
 
 export type QueuedInject = {
+  /** Stable per-entry id (for cancel/edit of a specific queued message). */
+  id: string;
   /** The user message text to splice into the running turn. */
   text: string;
   /** Enqueue time (ms epoch) — FIFO ordering + potential future staleness cap. */
@@ -25,13 +27,21 @@ export type QueuedInject = {
 
 const queues = new Map<string, QueuedInject[]>();
 
-/** Append a message to a conversation's pending-inject queue (FIFO). */
-export function enqueueInject(conversationId: string, text: string): void {
-  if (!conversationId || !text) return;
+let injectSeq = 0;
+function nextInjectId(): string {
+  injectSeq += 1;
+  return `inj-${Date.now().toString(36)}-${injectSeq}`;
+}
+
+/** Append a message to a conversation's pending-inject queue (FIFO). Returns the
+ *  new entry's id (for later cancel/edit), or null if nothing was enqueued. */
+export function enqueueInject(conversationId: string, text: string): string | null {
+  if (!conversationId || !text) return null;
+  const entry: QueuedInject = { id: nextInjectId(), text, at: Date.now() };
   const q = queues.get(conversationId);
-  const entry: QueuedInject = { text, at: Date.now() };
   if (q) q.push(entry);
   else queues.set(conversationId, [entry]);
+  return entry.id;
 }
 
 /**
@@ -49,6 +59,25 @@ export function drainInjects(conversationId: string): QueuedInject[] {
 export function hasInjects(conversationId: string): boolean {
   const q = queues.get(conversationId);
   return q !== undefined && q.length > 0;
+}
+
+/** Snapshot the pending injects for a conversation (for the queued-chip UI). */
+export function listInjects(conversationId: string): QueuedInject[] {
+  return [...(queues.get(conversationId) ?? [])];
+}
+
+/**
+ * Remove one queued inject by id (queue-editable cancel/edit). Returns the
+ * removed entry's text, or null if not found (already spliced/drained).
+ */
+export function removeInject(conversationId: string, id: string): string | null {
+  const q = queues.get(conversationId);
+  if (!q) return null;
+  const idx = q.findIndex((e) => e.id === id);
+  if (idx === -1) return null;
+  const [removed] = q.splice(idx, 1);
+  if (q.length === 0) queues.delete(conversationId);
+  return removed.text;
 }
 
 /**

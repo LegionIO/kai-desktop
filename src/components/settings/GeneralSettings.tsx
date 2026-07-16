@@ -9,7 +9,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
     sidebarWidth: number;
     fullWidthContent?: boolean;
     splashBackground?: string;
-    composer?: { showModelProfileSelector?: boolean };
+    composer?: { showModelProfileSelector?: boolean; midTurnSend?: 'splice' | 'queue-editable' };
     approvals?: { dedicatedWindow?: boolean };
   };
   const titleGen =
@@ -187,6 +187,25 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
         <p className="text-[10px] text-muted-foreground -mt-2">
           Display inline model and profile dropdowns in the chat composer toolbar.
         </p>
+        <div className="space-y-1">
+          <label htmlFor="ui.composer.midTurnSend" className="block text-xs font-medium">
+            Sending while a reply is generating
+          </label>
+          <select
+            id="ui.composer.midTurnSend"
+            className={settingsSelectClass}
+            value={ui.composer?.midTurnSend ?? 'splice'}
+            onChange={(e) => updateConfig('ui.composer.midTurnSend', e.target.value)}
+          >
+            <option value="splice">Add to the current reply (splice mid-turn)</option>
+            <option value="queue-editable">Queue with a chip I can cancel or edit</option>
+          </select>
+          <p className="text-[10px] text-muted-foreground">
+            When you send a follow-up while {__BRAND_PRODUCT_NAME} is still replying, it&apos;s woven into the current
+            turn at the next step (on the built-in runtime). &quot;Queue with a chip&quot; also shows a pending chip you
+            can cancel or edit before it&apos;s sent.
+          </p>
+        </div>
         <Toggle
           id="ui.approvals.dedicatedWindow"
           label="Open approval prompts in a dedicated window"

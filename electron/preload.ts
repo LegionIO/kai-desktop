@@ -52,6 +52,21 @@ const appAPI = {
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<boolean>,
+    /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
+     *  running turn (spliced at its next step boundary) instead of a new turn. */
+    injectMidTurn: (conversationId: string, userText: string) =>
+      ipcRenderer.invoke('agent:inject-mid-turn', conversationId, userText) as Promise<{
+        ok: boolean;
+        cooperative?: boolean;
+        id?: string;
+        error?: string;
+      }>,
+    listInjects: (conversationId: string) =>
+      ipcRenderer.invoke('agent:list-injects', conversationId) as Promise<
+        Array<{ id: string; text: string; at: number }>
+      >,
+    cancelInject: (conversationId: string, id: string) =>
+      ipcRenderer.invoke('agent:cancel-inject', conversationId, id) as Promise<{ ok: boolean; text?: string }>,
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
