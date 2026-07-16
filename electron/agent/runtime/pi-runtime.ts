@@ -27,18 +27,21 @@
  *   - pi only drives models in its own registry at their official endpoints (no
  *     `--base-url`), so Kai's custom-endpoint models are unmappable — we then
  *     let pi use its own configured default and surface a one-line note.
- *   - No MCP: Kai skill/plugin/custom tools cannot be bridged.
+ *   - No MCP client, but Kai's custom tools ARE bridged via a generated pi
+ *     EXTENSION (PiToolBridge: loopback HTTP + `-e <ext>`); see pi-tool-bridge.ts.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { join } from 'node:path';
 
 import type { AgentRuntime, RuntimeCapabilities, StreamOptions, StreamEvent } from './types.js';
+import { RUNTIME_BRIDGE_SKIP_TOOLS } from './types.js';
 import { detectPiCli, resolvePiCliPath } from './detect.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { ModelCatalogEntry } from '../model-catalog.js';
 import { getResolvedProcessEnv } from '../../utils/shell-env.js';
 import { scrubSecretEnv } from './confinement.js';
+import { PiToolBridge } from './pi-tool-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Capabilities
@@ -46,7 +49,7 @@ import { scrubSecretEnv } from './confinement.js';
 
 const PI_CAPABILITIES: RuntimeCapabilities = {
   builtInTools: true, // pi has built-in bash, read, write, edit, grep, find, ls
-  mcpSupport: false, // pi has no MCP client
+  mcpSupport: false, // pi has no MCP CLIENT (its README: build an extension instead)
   toolObserver: false, // pi manages its own tool lifecycle
   compaction: false, // pi manages context internally
   memory: false, // no Kai memory layer integration
@@ -54,7 +57,7 @@ const PI_CAPABILITIES: RuntimeCapabilities = {
   multiProvider: true, // pi-ai is multi-provider (mapped where reachable)
   subAgents: false, // no sub-agent delegation
   sessions: true, // session resume via captured pi session id + --session
-  customTools: false, // no MCP bridge possible — Kai custom tools unavailable
+  customTools: true, // Kai tools bridged via a generated pi extension (PiToolBridge)
   executesUntrustedTools: true, // pi has NO per-tool hook in headless mode — runs bash/edits unsupervised
 };
 
@@ -121,8 +124,17 @@ export class PiRuntime implements AgentRuntime {
   }
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
-    const { conversationId, config, cwd, reasoningEffort, abortSignal, appHome, primaryModel, conversationMetadata } =
-      options;
+    const {
+      conversationId,
+      config,
+      cwd,
+      reasoningEffort,
+      abortSignal,
+      appHome,
+      primaryModel,
+      conversationMetadata,
+      tools,
+    } = options;
 
     // -----------------------------------------------------------------------
     // 1. Resolve the pi binary on PATH
@@ -174,8 +186,8 @@ export class PiRuntime implements AgentRuntime {
     const mapping = buildPiModelArgs(primaryModel);
     args.push(...mapping.args);
 
-    // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
-    args.push(...buildToolScopingArgs(piConfig));
+    // (Tool scoping is pushed AFTER the tool bridge is set up below, so a
+    // restrictive --tools allowlist can also include the bridged Kai tool names.)
 
     // Reasoning effort → pi --thinking. Only forward values pi actually accepts.
     if (reasoningEffort && PI_THINKING_LEVELS.has(reasoningEffort)) {
@@ -200,6 +212,38 @@ export class PiRuntime implements AgentRuntime {
     const baseEnv =
       options.childEnv ?? scrubSecretEnv(getResolvedProcessEnv(), { preserveAwsChain: mapping.preserveAwsChain });
     const env: NodeJS.ProcessEnv = { ...baseEnv, ...mapping.env };
+
+    // Bridge Kai's custom tools (skills/plugins/mcp/builtin, minus the runtime
+    // skip-set) into pi via a generated extension + loopback HTTP server. pi has
+    // no MCP client, so unlike codex/claude this uses pi's `-e` extension API.
+    // Started before spawn so the `-e` path + token/url env are set on the child;
+    // stopped in the finally below. The bridge URL/token go via env, never argv.
+    let piBridge: PiToolBridge | null = null;
+    const bridgeableTools = (tools ?? []).filter((t) => !RUNTIME_BRIDGE_SKIP_TOOLS.has(t.name));
+    if (bridgeableTools.length > 0) {
+      try {
+        piBridge = new PiToolBridge();
+        const handle = await piBridge.start(bridgeableTools, conversationId, cwd, abortSignal);
+        if (handle) {
+          args.push('-e', handle.extensionPath);
+          env[handle.urlEnvVar] = handle.url;
+          env[handle.tokenEnvVar] = handle.token;
+        } else {
+          await piBridge.stop();
+          piBridge = null;
+        }
+      } catch (err) {
+        // Non-fatal: pi still runs with its built-in tools if the bridge fails.
+        console.warn('[pi-runtime] tool bridge failed to start:', err instanceof Error ? err.message : err);
+        if (piBridge) await piBridge.stop().catch(() => {});
+        piBridge = null;
+      }
+    }
+
+    // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
+    // Passed the bridged tool names so a restrictive --tools allowlist keeps the
+    // Kai tools enabled (pi's allowlist covers extension tools too).
+    args.push(...buildToolScopingArgs(piConfig, piBridge ? bridgeableTools.map((t) => t.name) : []));
 
     // -----------------------------------------------------------------------
     // 5. Spawn + stream
@@ -374,6 +418,7 @@ export class PiRuntime implements AgentRuntime {
     } finally {
       abortSignal?.removeEventListener('abort', onAbort);
       killProcessGroup(child); // ensure no orphan pi/bash processes survive
+      if (piBridge) await piBridge.stop().catch(() => {});
       yield { conversationId, type: 'done' };
     }
   }
@@ -445,13 +490,21 @@ function extractLastUserText(messages: unknown[]): string | null {
 // Helper: Kai approval mode → pi spawn-time tool scoping
 // ---------------------------------------------------------------------------
 
-function buildToolScopingArgs(piConfig: Record<string, unknown>): string[] {
+function buildToolScopingArgs(piConfig: Record<string, unknown>, bridgedToolNames: string[] = []): string[] {
   // pi has NO --exclude-tools; it only supports an ALLOWLIST via --tools, or
   // --no-tools / --no-builtin-tools. pi's built-in tools are: read, write, edit,
   // bash. Map Kai's approval mode to the allowed built-in set. Default full-auto
   // (a coding agent must run bash/tests/git) → no flag (all tools on).
+  //
+  // IMPORTANT: pi's `--tools` allowlist applies to built-in AND extension tools,
+  // so a restrictive allowlist would ALSO hide the Kai tools bridged via our
+  // extension. When a bridge is active (bridgedToolNames non-empty) and we emit
+  // a `--tools` allowlist, append the bridged names so they stay enabled. The
+  // Kai approval mode is meant to scope pi's own file/shell built-ins, not the
+  // Kai tools (which have their own gating).
   const approval = (piConfig.approval as string) ?? 'full-auto';
   const BUILTINS = ['read', 'write', 'edit', 'bash'];
+  const withBridged = (allowed: string[]): string[] => ['--tools', [...allowed, ...bridgedToolNames].join(',')];
 
   // An explicit excludeTools list (Kai config semantics: "deny these") is
   // translated to pi's allowlist = the built-ins NOT excluded.
@@ -459,17 +512,23 @@ function buildToolScopingArgs(piConfig: Record<string, unknown>): string[] {
   if (Array.isArray(explicit) && explicit.length > 0) {
     const denied = new Set(explicit.map(String));
     const allowed = BUILTINS.filter((t) => !denied.has(t));
-    // Everything denied → disable built-ins entirely (keep extension tools).
-    return allowed.length === 0 ? ['--no-builtin-tools'] : ['--tools', allowed.join(',')];
+    // Everything built-in denied → disable built-ins but keep extension tools;
+    // still allowlist the bridged names so they're callable.
+    if (allowed.length === 0) {
+      return bridgedToolNames.length > 0 ? withBridged([]) : ['--no-builtin-tools'];
+    }
+    return withBridged(allowed);
   }
 
   switch (approval) {
     case 'suggest':
-      return ['--tools', 'read']; // read-only
+      return withBridged(['read']); // read-only (built-ins) + bridged Kai tools
     case 'auto-edit':
-      return ['--tools', 'read,write,edit']; // file edits allowed, no shell
+      return withBridged(['read', 'write', 'edit']); // no shell + bridged Kai tools
     case 'full-auto':
     default:
+      // All built-in tools on. With a bridge, everything is already enabled
+      // (no allowlist), so bridged tools are on too → no flag needed.
       return []; // all built-in tools enabled
   }
 }
