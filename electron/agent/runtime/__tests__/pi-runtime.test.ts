@@ -216,6 +216,26 @@ describe('PiRuntime', () => {
       const result = events.find((e) => e.type === 'tool-result');
       expect(result?.result).toBe('Error: boom');
     });
+
+    it('does not duplicate usage/error when pi emits both message_end and turn_end', async () => {
+      // pi emits BOTH message_end AND turn_end for the same assistant message,
+      // each carrying the same usage + stopReason/errorMessage. We must surface
+      // the error and usage exactly ONCE (turn_end only).
+      const msg = {
+        stopReason: 'error',
+        errorMessage: 'Connection error.',
+        usage: { inputTokens: 10, outputTokens: 0 },
+      };
+      spawnState.events = [
+        { type: 'message_end', message: msg },
+        { type: 'turn_end', message: msg },
+        { type: 'agent_end' },
+      ];
+      const events = await collect(new PiRuntime().stream(makeOptions()));
+      expect(events.filter((e) => e.type === 'error')).toHaveLength(1);
+      expect(events.filter((e) => e.type === 'context-usage')).toHaveLength(1);
+      expect(events.find((e) => e.type === 'error')?.error).toContain('Connection error.');
+    });
   });
 
   describe('session id', () => {

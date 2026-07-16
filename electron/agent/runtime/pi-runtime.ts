@@ -677,8 +677,11 @@ function translatePiEvent(conversationId: string, event: PiEvent): StreamEvent[]
     // surface a turn/message that ended in an error (stopReason:'error' with an
     // errorMessage, e.g. a provider/connection failure) so it isn't a silent
     // empty turn — pi reports these on the assistant message, not an 'error' event.
-    case 'turn_end':
-    case 'message_end': {
+    // pi emits BOTH message_end AND turn_end for the same assistant message,
+    // each carrying the same usage + stopReason/errorMessage. Handle only
+    // turn_end (the turn-level terminal event) so usage + errors aren't
+    // duplicated; message_end is intentionally a no-op here.
+    case 'turn_end': {
       const usage = extractUsage(event.message?.usage);
       if (usage) events.push({ conversationId, type: 'context-usage', data: usage });
       const stopReason = event.message?.stopReason;
@@ -689,9 +692,10 @@ function translatePiEvent(conversationId: string, event: PiEvent): StreamEvent[]
       break;
     }
 
-    // agent_start, turn_start, message_start, agent_end, toolcall_* deltas,
-    // compaction/retry — no direct mapping (text deltas + tool_execution_* are
-    // the source of truth; `done` is emitted on exit; errors handled above).
+    // agent_start, turn_start, message_start, message_end (see turn_end above),
+    // agent_end, toolcall_* deltas, compaction/retry — no direct mapping (text
+    // deltas + tool_execution_* are the source of truth; `done` is emitted on
+    // exit; errors handled above).
     default:
       break;
   }
