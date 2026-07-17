@@ -41,6 +41,11 @@ export type FileDiffResultProps = {
   deleted?: boolean;
   defaultOpen?: boolean;
   className?: string;
+  /** Classes for the inner scroll container that holds the hunks. Defaults to a
+   *  capped both-axis scroller for inline (in-thread) use. The Changes panel
+   *  overrides this so its own wrapper owns vertical scroll and only long lines
+   *  scroll horizontally here (no 24rem cap). */
+  scrollClassName?: string;
   /** When provided, each hunk header shows a revert-hunk button. */
   onRevertHunk?: (hunkIndex: number) => void;
 };
@@ -59,6 +64,7 @@ export const FileDiffResult: FC<FileDiffResultProps> = ({
   deleted,
   defaultOpen = false,
   className,
+  scrollClassName = 'max-h-96 overflow-auto',
   onRevertHunk,
 }) => {
   const [open, setOpen] = useState(defaultOpen);
@@ -113,7 +119,7 @@ export const FileDiffResult: FC<FileDiffResultProps> = ({
       </Collapsible.Trigger>
 
       <Collapsible.Content>
-        <div className="border-t border-border/40 dark:border-white/[0.06] max-h-96 overflow-auto">
+        <div className={cn('border-t border-border/40 dark:border-white/[0.06]', scrollClassName)}>
           {hunks.length === 0 ? (
             <div className="px-3 py-2 text-[11px] text-muted-foreground/60 italic">
               {created ? 'File created (no previous content).' : 'No textual changes.'}

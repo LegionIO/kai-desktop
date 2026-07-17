@@ -290,29 +290,30 @@ export const DiffPanel: FC<DiffPanelProps> = ({ conversationId, className }) => 
                     Revert
                   </button>
                 </div>
-                <ScrollArea.Root className="min-h-0 flex-1">
-                  <ScrollArea.Viewport className="h-full w-full p-2">
-                    <FileDiffResult
-                      path={active.path}
-                      unifiedDiff={active.unifiedDiff}
-                      additions={active.additions}
-                      deletions={active.deletions}
-                      source={active.source}
-                      created={active.created}
-                      deleted={active.deleted}
-                      defaultOpen
-                      onRevertHunk={active.revertable ? handleRevertHunk : undefined}
-                    />
-                    {revertError && (
-                      <div className="mx-2 mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
-                        {revertError}
-                      </div>
-                    )}
-                  </ScrollArea.Viewport>
-                  <ScrollArea.Scrollbar orientation="vertical" className="w-1.5">
-                    <ScrollArea.Thumb className="rounded bg-muted-foreground/30" />
-                  </ScrollArea.Scrollbar>
-                </ScrollArea.Root>
+                {/* Plain scroller (both axes): the diff's minified/long lines
+                    must scroll horizontally, not overflow the panel off-screen.
+                    min-w-0 lets the flex child shrink so the inner overflow-auto
+                    engages instead of the content pushing layout past the edge.
+                    Wrapping it in a vertical-only Radix ScrollArea clipped x. */}
+                <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-2">
+                  <FileDiffResult
+                    path={active.path}
+                    unifiedDiff={active.unifiedDiff}
+                    additions={active.additions}
+                    deletions={active.deletions}
+                    source={active.source}
+                    created={active.created}
+                    deleted={active.deleted}
+                    defaultOpen
+                    scrollClassName="overflow-x-auto"
+                    onRevertHunk={active.revertable ? handleRevertHunk : undefined}
+                  />
+                  {revertError && (
+                    <div className="mx-2 mt-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+                      {revertError}
+                    </div>
+                  )}
+                </div>
               </>
             ) : (
               <div className="flex flex-1 items-center justify-center text-[11px] text-muted-foreground/50">
