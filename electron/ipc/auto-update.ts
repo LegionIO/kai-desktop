@@ -46,6 +46,28 @@ autoUpdater.logger = {
 };
 
 /**
+ * Resolve the `updateForceSingleRange` branding mode WITHOUT assuming the Vite
+ * build-time define exists. kai-platform (and any downstream) builds Kai from
+ * this source with its OWN branding config; if that overlay predates / omits
+ * the `updateForceSingleRange` key, `__BRAND_UPDATE_FORCE_SINGLE_RANGE` is never
+ * defined and a bare reference throws `ReferenceError` at runtime — which is
+ * exactly what silently disabled the delta fix on the Optum S3 feed
+ * (`single-range check [registration] failed ReferenceError: ... is not
+ * defined`). Guarding with `typeof` makes this default to 'auto' regardless.
+ */
+function brandForceSingleRangeMode(): 'auto' | 'always' | 'never' {
+  try {
+    if (typeof __BRAND_UPDATE_FORCE_SINGLE_RANGE !== 'undefined') {
+      const v = __BRAND_UPDATE_FORCE_SINGLE_RANGE;
+      if (v === 'always' || v === 'never' || v === 'auto') return v;
+    }
+  } catch {
+    /* identifier not defined in this build — fall through to the default */
+  }
+  return 'auto';
+}
+
+/**
  * Whether to force single-range range requests for a GENERIC update provider,
  * driven by the `updateForceSingleRange` branding key:
  *  - 'always' → true
@@ -56,7 +78,7 @@ autoUpdater.logger = {
  */
 export function shouldForceSingleRange(
   url: string | undefined,
-  mode: 'auto' | 'always' | 'never' = __BRAND_UPDATE_FORCE_SINGLE_RANGE,
+  mode: 'auto' | 'always' | 'never' = brandForceSingleRangeMode(),
 ): boolean {
   if (mode === 'always') return true;
   if (mode === 'never') return false;

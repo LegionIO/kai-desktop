@@ -188,6 +188,17 @@ describe('shouldForceSingleRange — macOS delta over generic/S3 providers', () 
     expect(shouldForceSingleRange(undefined, 'auto')).toBe(false);
     expect(shouldForceSingleRange('not a url with s3 in it', 'auto')).toBe(true); // substring fallback
   });
+
+  it('does NOT throw when the __BRAND_UPDATE_FORCE_SINGLE_RANGE define is absent (default mode)', () => {
+    // Regression: a bare `= __BRAND_UPDATE_FORCE_SINGLE_RANGE` default param threw
+    // ReferenceError at runtime in downstream builds (kai-platform) whose branding
+    // overlay lacked the key, silently disabling the S3 delta fix. Calling with no
+    // `mode` must fall back to 'auto' (S3-host detection), never throw. This test
+    // file has no Vite define, so the identifier is genuinely undefined here.
+    expect(() => shouldForceSingleRange('https://s3api-core.optum.com/kai')).not.toThrow();
+    expect(shouldForceSingleRange('https://s3api-core.optum.com/kai')).toBe(true);
+    expect(shouldForceSingleRange('https://downloads.example.com/kai')).toBe(false);
+  });
 });
 
 describe('parseUpdateConfigFields — dependency-free app-update.yml scan', () => {
