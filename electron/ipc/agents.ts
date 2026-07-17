@@ -21,7 +21,9 @@ import { listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
 import { DEFAULT_AGENT_ENV_DENYLIST, DEFAULT_AGENT_ARGS_DENYLIST } from '../config/schema.js';
 import { getRegisteredTools } from './agent.js';
-import { resolveModelCatalog } from '../agent/model-catalog.js';
+import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
+import type { ResolvedStreamConfig } from '../agent/model-catalog.js';
+import { readConversation } from './conversation-store.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -307,6 +309,55 @@ function writeTask(appHome: string, task: TaskFile): void {
   atomicWriteFileSync(join(getTasksDir(appHome), `${task.id}.json`), JSON.stringify(task, null, 2));
 }
 
+/**
+ * Resolve the model/profile a Mastra task/review run should use, mirroring a
+ * normal chat turn so agent runs get the SAME profile + fallback chain the work
+ * originated under. Precedence (per product decision):
+ *   1. the agent's own configured profile/model (config.profileKey/modelKey)
+ *   2. the source conversation's selectedProfileKey/selectedModelKey
+ *   3. global default (resolveStreamConfig with no profile)
+ * Exported for tests.
+ */
+export function resolveAgentModelSelection(input: {
+  agentModelKey?: string | null;
+  agentProfileKey?: string | null;
+  sourceProfileKey?: string | null;
+  sourceModelKey?: string | null;
+}): { threadProfileKey: string | null; threadModelKey: string | null } {
+  const { agentModelKey, agentProfileKey, sourceProfileKey, sourceModelKey } = input;
+  if (agentProfileKey) return { threadProfileKey: agentProfileKey, threadModelKey: null };
+  if (agentModelKey) return { threadProfileKey: '__none__', threadModelKey: agentModelKey };
+  if (sourceProfileKey) return { threadProfileKey: sourceProfileKey, threadModelKey: null };
+  if (sourceModelKey) return { threadProfileKey: '__none__', threadModelKey: sourceModelKey };
+  return { threadProfileKey: null, threadModelKey: null }; // global default
+}
+
+/**
+ * Build the resolved stream config (primary + fallback chain) for a task/review
+ * run, inheriting the source conversation's profile. Returns null if no model
+ * resolves (caller falls back to catalog default + single-model path).
+ */
+function resolveAgentStreamConfig(
+  appHome: string,
+  config: unknown,
+  agent: AgentFile | null,
+  task: TaskFile | null,
+): ResolvedStreamConfig | null {
+  const source = task?.sourceConversationId ? readConversation(appHome, task.sourceConversationId) : null;
+  const { threadProfileKey, threadModelKey } = resolveAgentModelSelection({
+    agentModelKey: agent?.config?.modelKey ?? null,
+    agentProfileKey: agent?.config?.profileKey ?? null,
+    sourceProfileKey: source?.selectedProfileKey ?? null,
+    sourceModelKey: source?.selectedModelKey ?? null,
+  });
+  const profileActive = threadProfileKey !== null && threadProfileKey !== '__none__';
+  return resolveStreamConfig(config as Parameters<typeof resolveStreamConfig>[0], {
+    threadProfileKey,
+    threadModelKey,
+    fallbackEnabled: profileActive,
+  });
+}
+
 function broadcastAgentChange(appHome: string): void {
   try {
     const agents = listAllAgents(appHome);
@@ -408,14 +459,19 @@ async function runSingleReviewer(
   broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n`);
 
   try {
-    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const { streamAgentResponse, streamWithFallback } = await import('../agent/mastra-agent.js');
     const config = readEffectiveConfig(appHome);
 
+    // Inherit the source conversation's profile/model (agent config wins) so the
+    // reviewer runs under the same profile + fallback chain as the work.
+    const reviewStreamConfig = resolveAgentStreamConfig(appHome, config, agent, task);
     const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
     const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
-    const modelEntry = defaultKey
-      ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
-      : (catalog.defaultEntry ?? catalog.entries[0]);
+    const modelEntry =
+      reviewStreamConfig?.primaryModel ??
+      (defaultKey
+        ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+        : (catalog.defaultEntry ?? catalog.entries[0]));
 
     if (!modelEntry) {
       broadcast(`\r\n\x1b[1;31m[Error]\x1b[0m No model configured for reviewer.\r\n`);
@@ -516,15 +572,30 @@ async function runSingleReviewer(
       },
     };
 
-    const stream = streamAgentResponse(
-      `review-${task.id}-${reviewerAgentId}`,
-      messages as unknown[],
-      modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
-      reviewConfig as unknown as Parameters<typeof streamAgentResponse>[3],
-      reviewTools as unknown as Parameters<typeof streamAgentResponse>[4],
-      dbPath,
-      { cwd: process.env.HOME ?? '/tmp' },
+    const reviewConvId = `review-${task.id}-${reviewerAgentId}`;
+    const reviewStreamOpts = { cwd: process.env.HOME ?? '/tmp' };
+    const useReviewChain = Boolean(
+      reviewStreamConfig && reviewStreamConfig.fallbackEnabled && reviewStreamConfig.fallbackModels.length > 0,
     );
+    const stream = useReviewChain
+      ? streamWithFallback(
+          reviewConvId,
+          messages as unknown[],
+          reviewStreamConfig as unknown as Parameters<typeof streamWithFallback>[2],
+          reviewConfig as unknown as Parameters<typeof streamWithFallback>[3],
+          reviewTools as unknown as Parameters<typeof streamWithFallback>[4],
+          dbPath,
+          reviewStreamOpts,
+        )
+      : streamAgentResponse(
+          reviewConvId,
+          messages as unknown[],
+          modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+          reviewConfig as unknown as Parameters<typeof streamAgentResponse>[3],
+          reviewTools as unknown as Parameters<typeof streamAgentResponse>[4],
+          dbPath,
+          reviewStreamOpts,
+        );
 
     for await (const event of stream) {
       const ev = event as Record<string, unknown>;
@@ -906,7 +977,7 @@ async function startAgentRunLocked(
     };
 
     // Run the Mastra agent asynchronously
-    const { streamAgentResponse } = await import('../agent/mastra-agent.js');
+    const { streamAgentResponse, streamWithFallback } = await import('../agent/mastra-agent.js');
     // The task may have been DELETED during the dynamic import above (which
     // resets this agent to idle via the onTaskDeleted seam). If so, abort the
     // start instead of streaming against a task that no longer exists.
@@ -965,12 +1036,17 @@ async function startAgentRunLocked(
       let _hasError = false;
       try {
         // Resolve the model using the same catalog resolution as the main chat
-        // This ensures correct provider endpoint, API key, and TLS settings
+        // This ensures correct provider endpoint, API key, and TLS settings.
+        // Inherit the source conversation's profile/model (agent config wins) so
+        // the task runs under the same profile + fallback chain as the work.
+        const taskStreamConfig = resolveAgentStreamConfig(appHome, config, agent, task);
         const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
         const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
-        const modelEntry = defaultKey
-          ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
-          : (catalog.defaultEntry ?? catalog.entries[0]);
+        const modelEntry =
+          taskStreamConfig?.primaryModel ??
+          (defaultKey
+            ? (catalog.byKey.get(defaultKey) ?? catalog.defaultEntry)
+            : (catalog.defaultEntry ?? catalog.entries[0]));
 
         if (!modelEntry) {
           broadcast(
@@ -1161,15 +1237,29 @@ async function startAgentRunLocked(
           },
         };
 
-        const stream = streamAgentResponse(
-          `task-${task.id}`,
-          messages as unknown[],
-          modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
-          taskConfig as unknown as Parameters<typeof streamAgentResponse>[3],
-          tools as unknown as Parameters<typeof streamAgentResponse>[4],
-          dbPath,
-          { cwd: cwd, abortSignal: abortController.signal },
+        const taskStreamOpts = { cwd: cwd, abortSignal: abortController.signal };
+        const useTaskChain = Boolean(
+          taskStreamConfig && taskStreamConfig.fallbackEnabled && taskStreamConfig.fallbackModels.length > 0,
         );
+        const stream = useTaskChain
+          ? streamWithFallback(
+              `task-${task.id}`,
+              messages as unknown[],
+              taskStreamConfig as unknown as Parameters<typeof streamWithFallback>[2],
+              taskConfig as unknown as Parameters<typeof streamWithFallback>[3],
+              tools as unknown as Parameters<typeof streamWithFallback>[4],
+              dbPath,
+              taskStreamOpts,
+            )
+          : streamAgentResponse(
+              `task-${task.id}`,
+              messages as unknown[],
+              modelEntry.modelConfig as unknown as Parameters<typeof streamAgentResponse>[2],
+              taskConfig as unknown as Parameters<typeof streamAgentResponse>[3],
+              tools as unknown as Parameters<typeof streamAgentResponse>[4],
+              dbPath,
+              taskStreamOpts,
+            );
 
         for await (const event of stream) {
           const ev = event as Record<string, unknown>;

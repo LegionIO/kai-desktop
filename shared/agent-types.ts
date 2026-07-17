@@ -9,6 +9,12 @@ export type AgentRole = 'general' | 'engineer' | 'reviewer' | 'researcher';
 export interface AgentRuntimeConfig {
   /** Default working directory for this agent. */
   cwd?: string;
+  /** Model key to run this agent under (Mastra runtime). Takes precedence over
+   *  the source conversation's model/profile. Undefined → inherit source convo. */
+  modelKey?: string;
+  /** Profile key to run this agent under (Mastra runtime). Takes precedence over
+   *  the source conversation's profile. Undefined → inherit source convo. */
+  profileKey?: string;
   /** Maximum seconds a single run can last before timeout. */
   maxSessionSeconds?: number;
   /** Max crashes per day before agent is paused (default 5). */

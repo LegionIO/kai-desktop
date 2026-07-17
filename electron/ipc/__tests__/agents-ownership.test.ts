@@ -8,7 +8,7 @@
  * match + terminalSessionId match.
  */
 import { describe, it, expect } from 'vitest';
-import { isOwningTaskRun } from '../agents.js';
+import { isOwningTaskRun, resolveAgentModelSelection } from '../agents.js';
 import type { TaskFile } from '../../../shared/task-types';
 
 const task = (over: Partial<TaskFile> = {}): TaskFile =>
@@ -49,5 +49,45 @@ describe('isOwningTaskRun', () => {
   it('is false when the task has no assignedAgentId or no terminalSessionId', () => {
     expect(isOwningTaskRun(task({ assignedAgentId: undefined }), 'agent-A', 'mastra-sess-1')).toBe(false);
     expect(isOwningTaskRun(task({ terminalSessionId: undefined }), 'agent-A', 'mastra-sess-1')).toBe(false);
+  });
+});
+
+describe('resolveAgentModelSelection — task/review agents inherit source conversation', () => {
+  const base = { agentModelKey: null, agentProfileKey: null, sourceProfileKey: null, sourceModelKey: null };
+
+  it("1. the agent's own profile wins over everything", () => {
+    expect(
+      resolveAgentModelSelection({
+        ...base,
+        agentProfileKey: 'agent-p',
+        sourceProfileKey: 'src-p',
+        sourceModelKey: 'src-m',
+      }),
+    ).toEqual({ threadProfileKey: 'agent-p', threadModelKey: null });
+  });
+
+  it("the agent's own model wins over the source conversation (no profile)", () => {
+    expect(resolveAgentModelSelection({ ...base, agentModelKey: 'agent-m', sourceProfileKey: 'src-p' })).toEqual({
+      threadProfileKey: '__none__',
+      threadModelKey: 'agent-m',
+    });
+  });
+
+  it('2. inherits the source conversation profile when the agent has none', () => {
+    expect(resolveAgentModelSelection({ ...base, sourceProfileKey: 'src-p', sourceModelKey: 'src-m' })).toEqual({
+      threadProfileKey: 'src-p',
+      threadModelKey: null,
+    });
+  });
+
+  it('inherits the source conversation model when it had no profile', () => {
+    expect(resolveAgentModelSelection({ ...base, sourceModelKey: 'src-m' })).toEqual({
+      threadProfileKey: '__none__',
+      threadModelKey: 'src-m',
+    });
+  });
+
+  it('3. falls to the global default when nothing is available', () => {
+    expect(resolveAgentModelSelection({ ...base })).toEqual({ threadProfileKey: null, threadModelKey: null });
   });
 });
