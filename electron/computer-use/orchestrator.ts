@@ -53,7 +53,7 @@ export function getHarness(config: AppConfig, session: ComputerSession, getConfi
   return new IsolatedBrowserHarness(getConfig);
 }
 
-function getEntryForRole(
+export function getEntryForRole(
   config: AppConfig,
   session: ComputerSession,
   role: 'planner' | 'driver' | 'verifier' | 'recovery',
@@ -71,10 +71,22 @@ function getEntryForRole(
   if (overrideKey) {
     return catalog.byKey.get(overrideKey) ?? null;
   }
+  // No per-role override. If a profile is active, resolve the primary from the
+  // PROFILE (matching how chat/sub-agents/task-agents resolve), so the primary
+  // can't drift from the profile via a stale/absent session.selectedModelKey.
+  // A session-level model pick still wins when set (the UI sets both together).
+  const profileKey = session.selectedProfileKey ?? config.defaultProfileKey ?? null;
+  if (!session.selectedModelKey && profileKey) {
+    const profile = (config.profiles ?? []).find((p) => p.key === profileKey);
+    if (profile?.primaryModelKey) {
+      const fromProfile = catalog.byKey.get(profile.primaryModelKey);
+      if (fromProfile) return fromProfile;
+    }
+  }
   return resolveModelForThread(config, session.selectedModelKey ?? null);
 }
 
-function getModelChainForRole(
+export function getModelChainForRole(
   config: AppConfig,
   session: ComputerSession,
   role: 'planner' | 'driver' | 'verifier' | 'recovery',
@@ -88,8 +100,13 @@ function getModelChainForRole(
     displayName: primaryEntry.displayName,
   };
 
-  // If fallback is not enabled on the session, return only primary
-  if (!session.fallbackEnabled) return [primary];
+  // Fallback is on when the session enabled it OR the session has an explicit
+  // profile selected (a profile implies its fallback chain, matching
+  // chat/sub-agent/task behavior). We DON'T auto-enable from a global
+  // defaultProfileKey — that would change behavior for sessions the user didn't
+  // opt into a profile for.
+  const fallbackOn = session.fallbackEnabled || Boolean(session.selectedProfileKey);
+  if (!fallbackOn) return [primary];
 
   // Build fallback chain: profile fallbacks → global fallback
   const catalog = resolveModelCatalog(config);
