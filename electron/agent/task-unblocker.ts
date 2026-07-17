@@ -6,6 +6,7 @@
  */
 
 import type { TaskFile } from '../../shared/task-types.js';
+import { auxGenerateText } from './generate-fallback.js';
 
 export interface UnblockResult {
   /** Whether the AI believes the blocker can be resolved autonomously. */
@@ -34,18 +35,7 @@ export async function attemptUnblock(task: TaskFile): Promise<UnblockResult> {
     return { resolved: false, requiresHuman: true, reason: 'No block reason found' };
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return { resolved: false, requiresHuman: true, reason: 'No API key for AI assessment' };
-  }
-
   try {
-    const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const { generateText } = await import('ai');
-
-    const anthropic = createAnthropic({ apiKey });
-    const model = anthropic('claude-3-5-haiku-latest');
-
     const prompt = [
       'You are a scrum master AI assessing whether a blocked task can be unblocked automatically.',
       '',
@@ -62,13 +52,11 @@ export async function attemptUnblock(task: TaskFile): Promise<UnblockResult> {
       'REQUIRES_HUMAN: <brief explanation of why a human must intervene>',
     ].join('\n');
 
-    const { text } = await generateText({
-      model,
-      prompt,
-      maxOutputTokens: 200,
-    });
-
-    const raw = (text ?? '').trim();
+    const gen = await auxGenerateText({ prompt, maxOutputTokens: 200 }, { label: 'task-unblock' });
+    if (!gen) {
+      return { resolved: false, requiresHuman: true, reason: 'No model configured for AI assessment' };
+    }
+    const raw = gen.text.trim();
 
     if (raw.startsWith('RESOLVABLE:')) {
       const resolution = raw.replace('RESOLVABLE:', '').trim();
@@ -96,16 +84,7 @@ export async function attemptUnblock(task: TaskFile): Promise<UnblockResult> {
  * even when the review policy would normally skip it.
  */
 export async function assessComplexity(task: TaskFile): Promise<boolean> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return true; // Conservative: require human review if no AI available
-
   try {
-    const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const { generateText } = await import('ai');
-
-    const anthropic = createAnthropic({ apiKey });
-    const model = anthropic('claude-3-5-haiku-latest');
-
     const prompt = [
       'You are assessing whether completed work needs human review.',
       'Answer YES if the task involves any of: security changes, data migrations,',
@@ -120,14 +99,9 @@ export async function assessComplexity(task: TaskFile): Promise<boolean> {
       'Respond with EXACTLY: YES or NO (one word only)',
     ].join('\n');
 
-    const { text } = await generateText({
-      model,
-      prompt,
-      maxOutputTokens: 10,
-    });
-
-    const answer = (text ?? '').trim().toUpperCase();
-    return assessComplexityFromAnswer(answer);
+    const gen = await auxGenerateText({ prompt, maxOutputTokens: 10 }, { label: 'assess-complexity' });
+    if (!gen) return true; // Conservative: require human review if no AI available
+    return assessComplexityFromAnswer(gen.text.trim().toUpperCase());
   } catch (err) {
     console.warn('[task-unblocker] Complexity assessment failed:', err);
     return true; // Conservative fallback

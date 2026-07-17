@@ -2,7 +2,8 @@ import { Agent } from '@mastra/core/agent';
 import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig } from './model-catalog.js';
-import { createLanguageModelFromConfig } from './language-model.js';
+import type { LanguageModel } from 'ai';
+import { runWithModelFallback, auxChainWithPrimary, readAmbientConfig } from './generate-fallback.js';
 import { OBSERVER_SYSTEM_PROMPT } from './prompts.js';
 
 export type ToolObserverConfig = {
@@ -297,8 +298,6 @@ export class ToolObserverManager {
   private readonly pendingLaunchedByParent = new Map<string, Set<string>>();
   private readonly parentWaiters = new Map<string, Array<() => void>>();
   private disposed = false;
-  private observerAgent: Agent | null = null;
-  private observerAgentPromise: Promise<Agent> | null = null;
   private evaluationTimer: ReturnType<typeof setTimeout> | null = null;
   private evaluationInFlight = false;
   private evaluationPending = false;
@@ -566,22 +565,15 @@ export class ToolObserverManager {
     }
   }
 
-  private async getObserverAgent(): Promise<Agent> {
-    if (this.observerAgent) return this.observerAgent;
-    if (!this.observerAgentPromise) {
-      this.observerAgentPromise = (async () => {
-        const model = await createLanguageModelFromConfig(this.modelConfig);
-        const agent = new Agent({
-          id: `tool-observer-${this.conversationId}`,
-          name: 'tool-observer',
-          instructions: OBSERVER_SYSTEM_PROMPT,
-          model: model as AgentConfig['model'],
-        });
-        this.observerAgent = agent;
-        return agent;
-      })();
-    }
-    return this.observerAgentPromise;
+  /** Build an observer Agent bound to a specific model (used per-model in the
+   *  fallback chain). */
+  private buildObserverAgent(model: LanguageModel): Agent {
+    return new Agent({
+      id: `tool-observer-${this.conversationId}`,
+      name: 'tool-observer',
+      instructions: OBSERVER_SYSTEM_PROMPT,
+      model: model as AgentConfig['model'],
+    });
   }
 
   private buildDynamicThreadContext(runningTools: ObservedToolState[]): string {
@@ -867,16 +859,24 @@ export class ToolObserverManager {
     this.evaluationInFlight = true;
     this.evaluationPending = false;
     try {
-      const observer = await this.getObserverAgent();
       const prompt = this.buildPromptPayload(runningTools);
 
-      const result = await observer.generate(prompt, {
-        maxSteps: 1,
-        structuredOutput: {
-          schema: ObserverDecisionSchema,
-          jsonPromptInjection: true,
-        },
-      });
+      // Observer uses structuredOutput (.object), so drive the model-fallback
+      // chain directly rather than the text-only aux wrapper. Primary = the
+      // observer's configured model, then the config fallback chain.
+      const chain = auxChainWithPrimary(this.modelConfig, { config: (await readAmbientConfig()) ?? undefined });
+      const result = await runWithModelFallback(
+        chain,
+        (model) =>
+          this.buildObserverAgent(model).generate(prompt, {
+            maxSteps: 1,
+            structuredOutput: {
+              schema: ObserverDecisionSchema,
+              jsonPromptInjection: true,
+            },
+          }),
+        { label: 'tool-observer' },
+      );
 
       const decision = (result.object as ObserverDecision | undefined) ?? { actions: [] };
       const actions = Array.isArray(decision.actions) ? decision.actions.slice(0, MAX_ACTIONS_PER_TICK) : [];

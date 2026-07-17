@@ -9,7 +9,7 @@
  */
 
 import { resolveModelCatalog, resolveModelForThread, type ModelCatalogEntry } from './model-catalog.js';
-import { createLanguageModelFromConfig } from './language-model.js';
+import { runWithModelFallback, resolveAuxModelChain } from './generate-fallback.js';
 import type { AppConfig } from '../config/schema.js';
 import { generateText } from 'ai';
 import { stripDisplayUnsafeChars } from './display-safe.js';
@@ -32,10 +32,6 @@ export interface TitleGenerationOptions {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /**
  * Resolve the best model for title generation.
@@ -110,30 +106,26 @@ export async function generateTitle(opts: TitleGenerationOptions): Promise<strin
   const modelEntry = resolveTitleModel(config, opts.modelKey ?? null);
   if (!modelEntry) return null;
 
-  try {
-    const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
+  // Title model as primary, then the configured fallback chain (deduped) so a
+  // transient provider blip on the title model falls over instead of skipping.
+  const chain = [modelEntry, ...resolveAuxModelChain(config, { modelKey: opts.modelKey ?? null })].filter(
+    (e, i, arr) => arr.findIndex((x) => x.key === e.key) === i,
+  );
 
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const result = await generateText({
+  try {
+    const result = await runWithModelFallback(
+      chain,
+      (model) =>
+        generateText({
           model,
           system: systemPrompt,
           prompt: input,
           maxOutputTokens: 30,
-        });
-        const rawTitle = typeof result.text === 'string' ? result.text : null;
-        return normalizeGeneratedTitle(rawTitle, maxWords, maxChars);
-      } catch (error) {
-        lastError = error;
-        if (!isRetryableTitleGenerationError(error) || attempt === 2) {
-          throw error;
-        }
-        await sleep(600 * (attempt + 1));
-      }
-    }
-
-    throw lastError;
+        }),
+      { maxRetriesPerModel: 2, label: 'title-gen' },
+    );
+    const rawTitle = typeof result.text === 'string' ? result.text : null;
+    return normalizeGeneratedTitle(rawTitle, maxWords, maxChars);
   } catch (error) {
     if (isRetryableTitleGenerationError(error)) {
       console.warn('[TitleGen] Skipped after retryable provider error.');

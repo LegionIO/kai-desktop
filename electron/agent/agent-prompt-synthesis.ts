@@ -5,8 +5,7 @@
  * by merging the role template with the user's specific requirements.
  */
 
-import { resolveModelForThread } from './model-catalog.js';
-import { createLanguageModelFromConfig } from './language-model.js';
+import { auxAgentGenerate, resolveAuxModelChain } from './generate-fallback.js';
 import type { AppConfig } from '../config/schema.js';
 
 const SYNTHESIS_SYSTEM_PROMPT = `You are an expert at writing system prompts for AI agents. Your task is to synthesize a focused, actionable system prompt for an AI agent.
@@ -37,8 +36,8 @@ export async function synthesizeAgentPrompt(
   config: AppConfig,
 ): Promise<string> {
   try {
-    const modelEntry = resolveModelForThread(config, null);
-    if (!modelEntry) return userDescription;
+    const chain = resolveAuxModelChain(config);
+    if (chain.length === 0) return userDescription;
 
     let input: string;
     if (roleTemplate) {
@@ -48,18 +47,21 @@ export async function synthesizeAgentPrompt(
     }
 
     const { Agent } = await import('@mastra/core/agent');
-    const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
 
-    const agent = new Agent({
-      id: `prompt-synth-${Date.now()}`,
-      name: 'prompt-synthesizer',
-      instructions: SYNTHESIS_SYSTEM_PROMPT,
-      model: model as AgentConfig['model'],
-    });
-
-    const result = await agent.generate(input, { maxSteps: 1 });
-    const synthesized = typeof result.text === 'string' ? result.text.trim() : null;
+    const gen = await auxAgentGenerate(
+      (model) =>
+        new Agent({
+          id: `prompt-synth-${Date.now()}`,
+          name: 'prompt-synthesizer',
+          instructions: SYNTHESIS_SYSTEM_PROMPT,
+          model: model as AgentConfig['model'],
+        }),
+      input,
+      { maxSteps: 1 },
+      { chain, config, label: 'prompt-synthesis' },
+    );
+    const synthesized = gen ? gen.text.trim() : null;
 
     if (synthesized && synthesized.length > 50) {
       return synthesized;

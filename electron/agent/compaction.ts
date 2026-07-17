@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { countSerializedTokens, resolveConversationTokenization, serializeForTokenCounting } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
-import { createLanguageModelFromConfig } from './language-model.js';
+import { auxAgentGenerate } from './generate-fallback.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
 
 export type ChatMessage = {
@@ -231,14 +231,7 @@ export async function compactConversationPrefix(
 
   // Generate summary
   const { Agent } = await import('@mastra/core/agent');
-  const model = await createLanguageModelFromConfig(modelConfig);
   type AgentConfig = ConstructorParameters<typeof Agent>[0];
-  const agent = new Agent({
-    id: `compaction-${Date.now()}`,
-    name: 'compaction-agent',
-    instructions: COMPACTION_SYSTEM_PROMPT,
-    model: model as AgentConfig['model'],
-  });
 
   const prompt = [
     'Summarize the conversation prefix for future continuation.',
@@ -254,8 +247,19 @@ export async function compactConversationPrefix(
   // let the turn proceed (mirrors aiExtractRelevantInfo's try/catch contract).
   let summaryText: string | null = null;
   try {
-    const result = await agent.generate(prompt, { maxSteps: 1 });
-    summaryText = typeof result.text === 'string' ? result.text.trim() || null : null;
+    const gen = await auxAgentGenerate(
+      (model) =>
+        new Agent({
+          id: `compaction-${Date.now()}`,
+          name: 'compaction-agent',
+          instructions: COMPACTION_SYSTEM_PROMPT,
+          model: model as AgentConfig['model'],
+        }),
+      prompt,
+      { maxSteps: 1 },
+      { primaryModelConfig: modelConfig, label: 'compaction' },
+    );
+    summaryText = gen ? gen.text.trim() || null : null;
   } catch (err) {
     console.warn('[compaction] Summarizer generate failed — skipping compaction for this turn:', err);
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
@@ -411,15 +415,7 @@ async function aiExtractRelevantInfo(
 ): Promise<string | null> {
   try {
     const { Agent } = await import('@mastra/core/agent');
-    const model = await createLanguageModelFromConfig(modelConfig);
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
-    const agent = new Agent({
-      id: `tool-compact-${Date.now()}`,
-      name: 'tool-compaction-agent',
-      instructions:
-        'Summarize only the information needed to answer the user request. Keep important IDs, names, and values. Omit boilerplate and repeated metadata. If output is JSON-like, preserve key fields in compact form.',
-      model: model as AgentConfig['model'],
-    });
 
     const prompt = [
       `User request: ${userQuery || '(none provided)'}`,
@@ -429,8 +425,20 @@ async function aiExtractRelevantInfo(
       content,
     ].join('\n');
 
-    const result = await agent.generate(prompt, { maxSteps: 1 });
-    return typeof result.text === 'string' ? result.text.trim() || null : null;
+    const gen = await auxAgentGenerate(
+      (model) =>
+        new Agent({
+          id: `tool-compact-${Date.now()}`,
+          name: 'tool-compaction-agent',
+          instructions:
+            'Summarize only the information needed to answer the user request. Keep important IDs, names, and values. Omit boilerplate and repeated metadata. If output is JSON-like, preserve key fields in compact form.',
+          model: model as AgentConfig['model'],
+        }),
+      prompt,
+      { maxSteps: 1 },
+      { primaryModelConfig: modelConfig, label: 'tool-compaction' },
+    );
+    return gen ? gen.text.trim() || null : null;
   } catch {
     return null;
   }

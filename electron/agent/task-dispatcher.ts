@@ -13,6 +13,7 @@
 
 import type { AgentFile, AgentRole } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
+import { auxGenerateText } from './generate-fallback.js';
 
 const TICK_TIMEOUT_MS = 120_000; // 2 minutes max per tick
 
@@ -227,20 +228,7 @@ export function scoreSimple(task: TaskFile, agent: AgentFile): ScoreResult {
 }
 
 async function scoreAi(task: TaskFile, agent: AgentFile): Promise<ScoreResult> {
-  // Fast path: bail out early if no API key — caller falls back to simple.
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    const fallback = scoreSimple(task, agent);
-    return { score: fallback.score, reason: `[ai-fallback] ${fallback.reason}` };
-  }
-
   try {
-    const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const { generateText } = await import('ai');
-
-    const anthropic = createAnthropic({ apiKey });
-    const model = anthropic('claude-3-5-haiku-latest');
-
     const prompt = [
       'You are a strict matchmaking judge for an AI task orchestrator.',
       'Rate (0.0-1.0) how well this AGENT fits this TASK.',
@@ -257,13 +245,13 @@ async function scoreAi(task: TaskFile, agent: AgentFile): Promise<ScoreResult> {
       `AGENT CAPABILITIES: ${(agent.capabilities ?? []).join(', ') || '(none)'}`,
     ].join('\n');
 
-    const { text } = await generateText({
-      model,
-      prompt,
-      maxOutputTokens: 80,
-    });
+    const gen = await auxGenerateText({ prompt, maxOutputTokens: 80 }, { label: 'task-score' });
+    if (!gen) {
+      const fallback = scoreSimple(task, agent);
+      return { score: fallback.score, reason: `[ai-fallback] ${fallback.reason}` };
+    }
 
-    const raw = (text ?? '').trim();
+    const raw = (gen.text ?? '').trim();
     const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? '';
     // The first line must BE a bare number in [0,1] — not merely contain a digit.
     // Accepting a substring let prose ("1 concern found") or an out-of-range value

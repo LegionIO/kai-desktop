@@ -7,6 +7,7 @@
 
 import type { AgentFile } from '../../shared/agent-types.js';
 import type { TaskFile } from '../../shared/task-types.js';
+import { auxGenerateText } from './generate-fallback.js';
 
 /**
  * Use AI to select the best reviewer agents for a task.
@@ -25,22 +26,7 @@ export async function selectReviewers(
   // Sort a COPY — never mutate the caller-owned array (aliasing bug).
   const byName = () => [...availableReviewers].sort((a, b) => a.name.localeCompare(b.name));
 
-  // Try AI-powered selection
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    // Fallback: pick first N reviewers (sorted by name for stability)
-    return byName()
-      .slice(0, count)
-      .map((a) => a.id);
-  }
-
   try {
-    const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const { generateText } = await import('ai');
-
-    const anthropic = createAnthropic({ apiKey });
-    const model = anthropic('claude-3-5-haiku-latest');
-
     const prompt = [
       'You are selecting code reviewers for a task. Pick the best-fit reviewers.',
       'Return ONLY a JSON array of agent IDs (strings), ordered by best fit.',
@@ -57,13 +43,15 @@ export async function selectReviewers(
       ),
     ].join('\n');
 
-    const { text } = await generateText({
-      model,
-      prompt,
-      maxOutputTokens: 200,
-    });
+    const gen = await auxGenerateText({ prompt, maxOutputTokens: 200 }, { label: 'reviewer-selection' });
+    if (!gen) {
+      // Fallback: pick first N reviewers (sorted by name for stability)
+      return byName()
+        .slice(0, count)
+        .map((a) => a.id);
+    }
 
-    return selectReviewersFromResponse(text ?? '', availableReviewers, count);
+    return selectReviewersFromResponse(gen.text ?? '', availableReviewers, count);
   } catch (err) {
     console.warn('[reviewer-selection] AI selection failed, using fallback:', err);
   }

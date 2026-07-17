@@ -15,7 +15,7 @@
  */
 
 import { estimateToolTokens } from './compaction.js';
-import { createLanguageModelFromConfig } from './language-model.js';
+import { auxAgentGenerate, auxChainWithPrimary } from './generate-fallback.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { RUNTIME_LABELS } from './runtime/types.js';
 import { SWITCH_SUMMARY_PROMPT } from './prompts.js';
@@ -40,15 +40,14 @@ const DEFAULT_TOKEN_THRESHOLD = 4000;
  *
  * @returns The previous runtime ID if a switch occurred, null otherwise.
  */
-export function detectRuntimeSwitch(
-  messages: unknown[],
-  currentRuntimeId: string,
-): string | null {
+export function detectRuntimeSwitch(messages: unknown[], currentRuntimeId: string): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as {
-      role?: string;
-      messageMeta?: Record<string, unknown>;
-    } | undefined;
+    const msg = messages[i] as
+      | {
+          role?: string;
+          messageMeta?: Record<string, unknown>;
+        }
+      | undefined;
 
     if (!msg || msg.role !== 'assistant') continue;
 
@@ -159,18 +158,18 @@ function buildTranscript(messages: unknown[]): string | null {
   for (let i = 0; i < messages.length; i++) {
     if (i === lastUserIdx) continue; // Skip the new prompt
 
-    const msg = messages[i] as {
-      role?: string;
-      content?: unknown;
-    } | undefined;
+    const msg = messages[i] as
+      | {
+          role?: string;
+          content?: unknown;
+        }
+      | undefined;
     if (!msg?.role) continue;
 
     const text = extractTextContent(msg.content);
     if (!text) continue;
 
-    const label = msg.role === 'user' ? 'User'
-      : msg.role === 'assistant' ? 'Assistant'
-      : null;
+    const label = msg.role === 'user' ? 'User' : msg.role === 'assistant' ? 'Assistant' : null;
 
     if (label) {
       lines.push(`${label}: ${text}`);
@@ -214,15 +213,8 @@ async function summarizeTranscript(
 ): Promise<string | null> {
   try {
     const { Agent } = await import('@mastra/core/agent');
-    const model = await createLanguageModelFromConfig(modelConfig);
 
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
-    const agent = new Agent({
-      id: `switch-summary-${Date.now()}`,
-      name: 'switch-summarizer',
-      instructions: SWITCH_SUMMARY_PROMPT,
-      model: model as AgentConfig['model'],
-    });
 
     const prompt = [
       'Summarize the following conversation for seamless continuation by a new assistant.',
@@ -232,12 +224,23 @@ async function summarizeTranscript(
       transcript,
     ].join('\n');
 
-    const result = await agent.generate(prompt, {
-      maxSteps: 1,
-      ...(abortSignal ? { abortSignal } : {}),
-    });
+    const gen = await auxAgentGenerate(
+      (model) =>
+        new Agent({
+          id: `switch-summary-${Date.now()}`,
+          name: 'switch-summarizer',
+          instructions: SWITCH_SUMMARY_PROMPT,
+          model: model as AgentConfig['model'],
+        }),
+      prompt,
+      {
+        maxSteps: 1,
+        ...(abortSignal ? { abortSignal } : {}),
+      },
+      { chain: auxChainWithPrimary(modelConfig), label: 'runtime-switch', abortSignal },
+    );
 
-    const summaryText = typeof result.text === 'string' ? result.text.trim() : null;
+    const summaryText = gen ? gen.text.trim() : null;
     return summaryText || null;
   } catch (err) {
     console.warn('[runtime-switch] Summarization failed:', err);

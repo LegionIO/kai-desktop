@@ -8,6 +8,7 @@
 
 import type { AgentFile } from '../../shared/agent-types.js';
 import type { KaiTaskStatus, TaskFile } from '../../shared/task-types.js';
+import { auxGenerateText } from './generate-fallback.js';
 
 export interface CompletionAnalysisConfig {
   /** When true, exit-code-zero runs go to human_review rather than done. */
@@ -103,16 +104,7 @@ export async function generateCompletionSummary(
   if (strategy === 'simple') return null;
 
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return null;
-
     const tail = terminalOutput.slice(-2000);
-
-    const { createAnthropic } = await import('@ai-sdk/anthropic');
-    const { generateText } = await import('ai');
-
-    const anthropic = createAnthropic({ apiKey });
-    const model = anthropic('claude-3-5-haiku-latest');
 
     const prompt = [
       `Task title: ${task.title}`,
@@ -127,13 +119,10 @@ export async function generateCompletionSummary(
       '--- end ---',
     ].join('\n');
 
-    const { text } = await generateText({
-      model,
-      prompt,
-      maxOutputTokens: 256,
-    });
+    const gen = await auxGenerateText({ prompt, maxOutputTokens: 256 }, { label: 'completion-summary' });
+    if (!gen) return null;
 
-    const cleaned = (text ?? '').trim();
+    const cleaned = (gen.text ?? '').trim();
     return cleaned.length > 0 ? cleaned : null;
   } catch (err) {
     console.warn('[task-completion] Failed to generate completion summary:', err);

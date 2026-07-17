@@ -18,10 +18,8 @@ import { join } from 'node:path';
 import { release } from 'node:os';
 import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron';
 import * as sdk from 'microsoft-cognitiveservices-speech-sdk';
-import { generateText } from 'ai';
 import type { AppConfig } from '../config/schema.js';
-import { createLanguageModelFromConfig } from '../agent/language-model.js';
-import { resolveModelCatalog } from '../agent/model-catalog.js';
+import { auxGenerateText } from '../agent/generate-fallback.js';
 import { runLocalMacMouseCommand } from '../computer-use/permissions.js';
 import { runDictationViaAdapter } from './adapter-bridge.js';
 import { getDictationPlatform } from './dictation-platform.js';
@@ -1948,23 +1946,23 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
   const startedAt = Date.now();
 
   try {
-    const modelEntry = resolveModelCatalog(fullConfig).defaultEntry;
-    if (!modelEntry) return text;
-
-    const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
     const result = await withTimeout(
-      generateText({
-        model,
-        system: FINAL_CLEANUP_PROMPT,
-        prompt: ['Surrounding text: unavailable', 'Dictionary entries: none', '', 'Raw transcript:', raw].join('\n'),
-        temperature: 0,
-        maxRetries: 1,
-        maxOutputTokens: Math.max(128, Math.min(800, Math.ceil(raw.length / 2))),
-        timeout: { totalMs: FINAL_CLEANUP_TIMEOUT_MS },
-      }),
+      auxGenerateText(
+        {
+          system: FINAL_CLEANUP_PROMPT,
+          prompt: ['Surrounding text: unavailable', 'Dictionary entries: none', '', 'Raw transcript:', raw].join('\n'),
+          temperature: 0,
+          maxRetries: 1,
+          maxOutputTokens: Math.max(128, Math.min(800, Math.ceil(raw.length / 2))),
+          timeout: { totalMs: FINAL_CLEANUP_TIMEOUT_MS },
+        },
+        { config: fullConfig, label: 'dictation' },
+      ),
       FINAL_CLEANUP_TIMEOUT_MS + 500,
       'Final transcript cleanup',
     );
+
+    if (!result) return text;
 
     const cleaned = normalizeCleanupResponse(result.text);
     const accepted = isAcceptableCleanupResponse(raw, cleaned);
