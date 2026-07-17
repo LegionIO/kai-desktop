@@ -17,10 +17,10 @@ import {
   sanitizedMessageDisplayText,
 } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
-import { streamAgentResponse, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
+import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
-import type { LLMModelConfig } from '../agent/model-catalog.js';
-import { resolveModelForThread } from '../agent/model-catalog.js';
+import type { LLMModelConfig, ResolvedStreamConfig } from '../agent/model-catalog.js';
+import { resolveModelForThread, resolveStreamConfig } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { getSharedMemory } from '../agent/memory.js';
@@ -41,6 +41,7 @@ const subAgentState = new Map<
     messages: Array<{ role: string; content: unknown }>;
     config: AppConfig;
     modelConfig: LLMModelConfig;
+    streamConfig?: ResolvedStreamConfig;
     tools: ToolDefinition[];
     dbPath: string;
     parentConversationId: string;
@@ -89,7 +90,7 @@ async function resumeSubAgent(
   message: string,
   state: NonNullable<ReturnType<typeof subAgentState.get>>,
 ): Promise<void> {
-  const { messages, config, modelConfig, tools, dbPath, parentConversationId, parentToolCallId } = state;
+  const { messages, config, modelConfig, streamConfig, tools, dbPath, parentConversationId, parentToolCallId } = state;
 
   // Add the resume message, but DON'T broadcast it yet — gate it through
   // UserPromptSubmit first so a DLP block/modify hook can redact/deny before the
@@ -181,111 +182,125 @@ async function resumeSubAgent(
     // suppressing to {pending}, so the card is never left permanently hidden.
     const resolvedArgsByTool = new Map<string, unknown[]>();
 
-    const stream = streamAgentResponse(
-      subAgentConversationId,
-      messages,
-      modelConfig,
-      { ...config, systemPrompt: resumeSystemPrompt },
-      tools,
-      dbPath,
-      {
-        abortSignal: localController.signal,
-        emitEvent: (event) => {
-          broadcastEvent({ ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent);
-        },
-        // Enforce lifecycle hooks on resume, same as the initial sub-agent run.
-        onToolExecutionStart: async (state) => {
-          const rebroadcast = (resolved: unknown): void => {
-            rewrittenArgs.set(state.toolCallId, resolved);
-            // Prefer a suppressed stream id already rendered under {pending}
-            // (stream-first) whose id differs from this exec id — correct it.
-            // Exec-first with a same/not-yet-seen id is handled when the stream
-            // event finds the value by id (no per-tool stash that could leak
-            // onto the next same-named call).
-            const streamQ = suppressedStreamIdsByTool.get(state.toolName);
-            const streamId = streamQ && streamQ.length > 0 ? streamQ.shift() : undefined;
-            if (streamId) {
-              // Stream-first: a card was already rendered under `streamId` as
-              // {pending}. Correct it in place. Alias the extra key only when the
-              // ids differ. Broadcast even when streamId === exec id, since the
-              // renderer will not re-emit that card on its own.
-              if (streamId !== state.toolCallId) rewrittenArgs.set(streamId, resolved);
-              if (enforcingHooks) {
-                broadcastEvent({
-                  type: 'tool-call',
-                  toolCallId: streamId,
-                  toolName: state.toolName,
-                  args: resolved,
-                  subAgentConversationId,
-                  parentConversationId,
-                  parentToolCallId,
-                } as SubAgentEvent);
-              }
-            } else if (enforcingHooks) {
-              // Exec-first: the stream event hasn't arrived yet. Do NOT broadcast
-              // a card under the exec id here — the stream event will render it.
-              // If it uses the SAME id it finds `resolved` via rewrittenArgs by
-              // id; if it uses a DIFFERENT id it claims the parked args below.
-              // Broadcasting now would duplicate the card (renderer upserts by id).
-              const q = resolvedArgsByTool.get(state.toolName) ?? [];
-              q.push(resolved);
-              resolvedArgsByTool.set(state.toolName, q);
+    const resumeStreamOpts = {
+      abortSignal: localController.signal,
+      emitEvent: (event) => {
+        broadcastEvent({ ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent);
+      },
+      // Enforce lifecycle hooks on resume, same as the initial sub-agent run.
+      onToolExecutionStart: async (state) => {
+        const rebroadcast = (resolved: unknown): void => {
+          rewrittenArgs.set(state.toolCallId, resolved);
+          // Prefer a suppressed stream id already rendered under {pending}
+          // (stream-first) whose id differs from this exec id — correct it.
+          // Exec-first with a same/not-yet-seen id is handled when the stream
+          // event finds the value by id (no per-tool stash that could leak
+          // onto the next same-named call).
+          const streamQ = suppressedStreamIdsByTool.get(state.toolName);
+          const streamId = streamQ && streamQ.length > 0 ? streamQ.shift() : undefined;
+          if (streamId) {
+            // Stream-first: a card was already rendered under `streamId` as
+            // {pending}. Correct it in place. Alias the extra key only when the
+            // ids differ. Broadcast even when streamId === exec id, since the
+            // renderer will not re-emit that card on its own.
+            if (streamId !== state.toolCallId) rewrittenArgs.set(streamId, resolved);
+            if (enforcingHooks) {
+              broadcastEvent({
+                type: 'tool-call',
+                toolCallId: streamId,
+                toolName: state.toolName,
+                args: resolved,
+                subAgentConversationId,
+                parentConversationId,
+                parentToolCallId,
+              } as SubAgentEvent);
             }
-          };
-          const preTool = await hookDispatcher.dispatch('PreToolUse', {
-            conversationId: subAgentConversationId,
-            parentConversationId,
-            toolCallId: state.toolCallId,
-            toolName: state.toolName,
-            args: state.args,
-          });
-          if (preTool.denied) {
-            const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+          } else if (enforcingHooks) {
+            // Exec-first: the stream event hasn't arrived yet. Do NOT broadcast
+            // a card under the exec id here — the stream event will render it.
+            // If it uses the SAME id it finds `resolved` via rewrittenArgs by
+            // id; if it uses a DIFFERENT id it claims the parked args below.
+            // Broadcasting now would duplicate the card (renderer upserts by id).
+            const q = resolvedArgsByTool.get(state.toolName) ?? [];
+            q.push(resolved);
+            resolvedArgsByTool.set(state.toolName, q);
+          }
+        };
+        const preTool = await hookDispatcher.dispatch('PreToolUse', {
+          conversationId: subAgentConversationId,
+          parentConversationId,
+          toolCallId: state.toolCallId,
+          toolName: state.toolName,
+          args: state.args,
+        });
+        if (preTool.denied) {
+          const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+          rebroadcast({ redacted: true, reason });
+          return { skip: true as const, result: { isError: true, error: reason } };
+        }
+        const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+        if (nextArgs !== undefined && nextArgs !== state.args) {
+          const canMutateInPlace =
+            state.args &&
+            typeof state.args === 'object' &&
+            !Array.isArray(state.args) &&
+            nextArgs &&
+            typeof nextArgs === 'object' &&
+            !Array.isArray(nextArgs);
+          if (canMutateInPlace) {
+            const target = state.args as Record<string, unknown>;
+            for (const k of Object.keys(target)) delete target[k];
+            Object.assign(target, nextArgs as Record<string, unknown>);
+          } else {
+            // Non-object modify replacement can't be applied to by-reference
+            // args — fail closed rather than run with unsanitized input.
+            const reason =
+              'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed.';
             rebroadcast({ redacted: true, reason });
             return { skip: true as const, result: { isError: true, error: reason } };
           }
-          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
-          if (nextArgs !== undefined && nextArgs !== state.args) {
-            const canMutateInPlace =
-              state.args &&
-              typeof state.args === 'object' &&
-              !Array.isArray(state.args) &&
-              nextArgs &&
-              typeof nextArgs === 'object' &&
-              !Array.isArray(nextArgs);
-            if (canMutateInPlace) {
-              const target = state.args as Record<string, unknown>;
-              for (const k of Object.keys(target)) delete target[k];
-              Object.assign(target, nextArgs as Record<string, unknown>);
-            } else {
-              // Non-object modify replacement can't be applied to by-reference
-              // args — fail closed rather than run with unsanitized input.
-              const reason =
-                'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed.';
-              rebroadcast({ redacted: true, reason });
-              return { skip: true as const, result: { isError: true, error: reason } };
-            }
-          }
-          rebroadcast(state.args);
-        },
-        augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
-          // Use redacted args (if PreToolUse rewrote/denied) so PostToolUse
-          // never sees the raw denied args.
-          const postArgs = rewrittenArgs.get(toolCallId) ?? args;
-          const postTool = await hookDispatcher.dispatch('PostToolUse', {
-            conversationId: subAgentConversationId,
-            parentConversationId,
-            toolCallId,
-            toolName,
-            args: postArgs,
-            result,
-          });
-          if (postTool.denied) return { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
-          const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
-          return nextResult !== undefined ? nextResult : result;
-        },
+        }
+        rebroadcast(state.args);
       },
-    );
+      augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+        // Use redacted args (if PreToolUse rewrote/denied) so PostToolUse
+        // never sees the raw denied args.
+        const postArgs = rewrittenArgs.get(toolCallId) ?? args;
+        const postTool = await hookDispatcher.dispatch('PostToolUse', {
+          conversationId: subAgentConversationId,
+          parentConversationId,
+          toolCallId,
+          toolName,
+          args: postArgs,
+          result,
+        });
+        if (postTool.denied) return { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+        const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+        return nextResult !== undefined ? nextResult : result;
+      },
+    } satisfies Parameters<typeof streamAgentResponse>[6];
+
+    const resumeConfig = { ...config, systemPrompt: resumeSystemPrompt };
+    const stream =
+      streamConfig && streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0
+        ? streamWithFallback(
+            subAgentConversationId,
+            messages,
+            streamConfig,
+            resumeConfig,
+            tools,
+            dbPath,
+            resumeStreamOpts,
+          )
+        : streamAgentResponse(
+            subAgentConversationId,
+            messages,
+            modelConfig,
+            resumeConfig,
+            tools,
+            dbPath,
+            resumeStreamOpts,
+          );
 
     let turnText = '';
     for await (const event of stream) {
@@ -388,6 +403,37 @@ export function getActiveSubAgentIds(): string[] {
   return Array.from(activeSubAgentControllers.keys());
 }
 
+/**
+ * Decide which profile/model a sub-agent runs under, given the tool call's
+ * explicit `profile`/`model` and the parent turn's inherited keys. Precedence:
+ *   1. explicit `profile`      → that profile (may be '__none__' to force none)
+ *   2. explicit `model`        → single model, no profile ('__none__')
+ *   3. inherit parent profile  → parentProfileKey
+ *   4. inherit parent model    → parentModelKey
+ *   5. subAgents.defaultModel / global default (single model)
+ * Returns keys shaped for `resolveStreamConfig` (threadProfileKey '__none__'
+ * skips profiles; threadModelKey pins a single model). Exported for tests.
+ */
+export function resolveSubAgentModelSelection(input: {
+  profile?: string;
+  model?: string;
+  parentProfileKey: string | null;
+  parentModelKey: string | null;
+  defaultModel: string | null;
+}): { threadProfileKey: string | null; threadModelKey: string | null } {
+  const { profile, model, parentProfileKey, parentModelKey, defaultModel } = input;
+  if (profile !== undefined) {
+    return { threadProfileKey: profile, threadModelKey: null };
+  }
+  if (model !== undefined) {
+    return { threadProfileKey: '__none__', threadModelKey: model };
+  }
+  if (parentProfileKey != null && parentProfileKey !== '' && parentProfileKey !== '__none__') {
+    return { threadProfileKey: parentProfileKey, threadModelKey: null };
+  }
+  return { threadProfileKey: '__none__', threadModelKey: parentModelKey ?? defaultModel };
+}
+
 export function createSubAgentTool(
   getConfig: () => AppConfig,
   appHome: string,
@@ -409,14 +455,30 @@ export function createSubAgentTool(
       task: z
         .string()
         .describe('The task/instruction for the sub-agent. Be specific and clear about what you want accomplished.'),
-      model: z.string().optional().describe('Model key to use for the sub-agent (omit to inherit the current model).'),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          'Model key to pin a single model for the sub-agent (no fallback). Omit to inherit the current profile/model.',
+        ),
+      profile: z
+        .string()
+        .optional()
+        .describe(
+          'Profile key to run the sub-agent under (uses that profile\'s primary + fallback chain). Omit to inherit the current turn\'s profile; pass "__none__" to force a single model with no profile.',
+        ),
       context: z
         .string()
         .optional()
         .describe('Additional context from the current conversation that the sub-agent needs.'),
     }),
     execute: async (input: unknown, ctx: ToolExecutionContext): Promise<unknown> => {
-      const { task, model, context } = input as { task: string; model?: string; context?: string };
+      const { task, model, profile, context } = input as {
+        task: string;
+        model?: string;
+        profile?: string;
+        context?: string;
+      };
       const config = getConfig();
       const subAgentConfig = config.tools?.subAgents ?? {
         enabled: true,
@@ -453,8 +515,26 @@ export function createSubAgentTool(
         }
       }
 
-      const modelKey = model ?? subAgentConfig.defaultModel ?? null;
-      const modelEntry = resolveModelForThread(config, modelKey);
+      // Resolve which profile/model the sub-agent runs under (see the helper).
+      const { threadProfileKey, threadModelKey } = resolveSubAgentModelSelection({
+        profile,
+        model,
+        parentProfileKey: ctx.parentProfileKey ?? null,
+        parentModelKey: ctx.parentModelKey ?? null,
+        defaultModel: subAgentConfig.defaultModel ?? null,
+      });
+
+      // Resolve the profile-aware chain. fallbackEnabled whenever a real profile
+      // is active (not the '__none__' sentinel / single-model path).
+      const profileActive = threadProfileKey !== null && threadProfileKey !== '__none__';
+      const streamConfig: ResolvedStreamConfig | null = resolveStreamConfig(config, {
+        threadModelKey,
+        threadProfileKey,
+        fallbackEnabled: profileActive,
+      });
+
+      // Primary model entry (for the single-model path + display/telemetry).
+      const modelEntry = streamConfig?.primaryModel ?? resolveModelForThread(config, threadModelKey);
       if (!modelEntry) {
         return { isError: true, error: 'No model available for sub-agent.' };
       }
@@ -532,6 +612,7 @@ export function createSubAgentTool(
           depth: currentDepth + 1,
           config,
           modelConfig: modelEntry.modelConfig,
+          ...(streamConfig ? { streamConfig } : {}),
           tools: subAgentTools,
           dbPath,
           abortSignal: localController.signal,
@@ -615,6 +696,7 @@ export function createSubAgentTool(
             messages: persistedMessages,
             config,
             modelConfig: modelEntry.modelConfig,
+            ...(streamConfig ? { streamConfig } : {}),
             tools: subAgentTools,
             dbPath,
             parentConversationId: ctx.toolCallId,

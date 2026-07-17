@@ -1066,10 +1066,11 @@ const ActionEditor: FC<{
               <label className="mb-0.5 block text-[10px] text-muted-foreground">Model (optional)</label>
               <select
                 className={settingsSelectClass}
-                value={action.modelKey ?? ''}
+                value={action.profileKey ? '' : (action.modelKey ?? '')}
+                disabled={Boolean(action.profileKey)}
                 onChange={(e) => onChange({ ...action, modelKey: e.target.value || undefined })}
               >
-                <option value="">— default —</option>
+                <option value="">{action.profileKey ? '— set by profile —' : '— default —'}</option>
                 {modelOptions.map((m) => (
                   <option key={m.key} value={m.key}>
                     {m.label}
@@ -1082,7 +1083,12 @@ const ActionEditor: FC<{
               <select
                 className={settingsSelectClass}
                 value={action.profileKey ?? ''}
-                onChange={(e) => onChange({ ...action, profileKey: e.target.value || undefined })}
+                onChange={(e) => {
+                  const profileKey = e.target.value || undefined;
+                  // A profile owns its model + fallback chain — clear any explicit
+                  // model override so the two can't disagree.
+                  onChange({ ...action, profileKey, ...(profileKey ? { modelKey: undefined } : {}) });
+                }}
               >
                 <option value="">— default —</option>
                 {profileOptions.map((p) => (

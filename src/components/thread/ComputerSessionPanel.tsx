@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useState, type FC } from 'react';
-import { CheckCircle2Icon, ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, LoaderIcon, PauseIcon, PlayIcon, ShieldAlertIcon, SquareIcon } from 'lucide-react';
+import {
+  CheckCircle2Icon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ExternalLinkIcon,
+  LoaderIcon,
+  PauseIcon,
+  PlayIcon,
+  ShieldAlertIcon,
+  SquareIcon,
+} from 'lucide-react';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
@@ -33,21 +43,28 @@ function isLikelyHumanTakeover(session: ComputerSession): boolean {
   if (session.humanInControl || session.pauseReason === 'takeover') return true;
   if (session.status !== 'paused') return false;
   const text = `${session.statusMessage ?? ''} ${session.lastError ?? ''} ${session.planSummary ?? ''}`.toLowerCase();
-  return text.includes('human') || text.includes('takeover') || text.includes('manual control') || text.includes('in control');
+  return (
+    text.includes('human') ||
+    text.includes('takeover') ||
+    text.includes('manual control') ||
+    text.includes('in control')
+  );
 }
 
 function isPointerAction(action: Pick<ComputerActionProposal, 'kind'>): boolean {
-  return action.kind === 'movePointer' || action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'drag';
+  return (
+    action.kind === 'movePointer' || action.kind === 'click' || action.kind === 'doubleClick' || action.kind === 'drag'
+  );
 }
 
 function formatMovementPath(path: ComputerActionProposal['movementPath']): string {
   return path === 'teleport'
     ? 'teleport'
     : path === 'horizontal-first'
-    ? 'horizontal first'
-    : path === 'vertical-first'
-      ? 'vertical first'
-      : 'direct';
+      ? 'horizontal first'
+      : path === 'vertical-first'
+        ? 'vertical first'
+        : 'direct';
 }
 
 function formatElapsed(startedAt: string): string {
@@ -74,7 +91,7 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
   } = useComputerUse();
   const { config } = useConfig();
   const showStepLog = (config as Record<string, unknown> | null)?.computerUse
-    ? ((config as Record<string, unknown>).computerUse as { showStepLog?: boolean })?.showStepLog ?? true
+    ? (((config as Record<string, unknown>).computerUse as { showStepLog?: boolean })?.showStepLog ?? true)
     : true;
   const sessionFrames = frameHistory.get(session.id) ?? [];
   const [rejectReasonByApproval, setRejectReasonByApproval] = useState<Record<string, string>>({});
@@ -91,11 +108,13 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
       return;
     }
     let cancelled = false;
-    app.profileCatalog()
+    app
+      .profileCatalog()
       .then((catalog) => {
         if (cancelled) return;
-        const profile = (catalog as { profiles: Array<{ key: string; primaryModelKey: string }> }).profiles
-          .find((p) => p.key === profileKey);
+        const profile = (catalog as { profiles: Array<{ key: string; primaryModelKey: string }> }).profiles.find(
+          (p) => p.key === profileKey,
+        );
         const nextPrimaryModelKey = profile?.primaryModelKey ?? null;
         setProfilePrimaryModelKey(nextPrimaryModelKey);
         if (nextPrimaryModelKey && session.fallbackEnabled && session.selectedModelKey !== nextPrimaryModelKey) {
@@ -111,7 +130,14 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
     return () => {
       cancelled = true;
     };
-  }, [config, session.fallbackEnabled, session.id, session.selectedModelKey, session.selectedProfileKey, updateSessionSettings]);
+  }, [
+    config,
+    session.fallbackEnabled,
+    session.id,
+    session.selectedModelKey,
+    session.selectedProfileKey,
+    updateSessionSettings,
+  ]);
   const pendingApprovals = session.approvals.filter((approval) => approval.status === 'pending');
   const latestFrame = session.latestFrame;
   const canResume = session.status === 'paused' || session.status === 'failed';
@@ -138,16 +164,22 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
   return (
     <div className="space-y-3">
       {/* Header: goal + status + controls */}
-      <div className={`sticky ${stickyTopClassName} z-20 -mx-1 min-w-0 rounded-xl bg-background/90 px-1 py-1 backdrop-blur-sm`}>
+      <div
+        className={`sticky ${stickyTopClassName} z-20 -mx-1 min-w-0 rounded-xl bg-background/90 px-1 py-1 backdrop-blur-sm`}
+      >
         <div className="min-w-0 overflow-hidden pr-32 sm:pr-36">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getBadgeClass(session.status)}`}>
+            <span
+              className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getBadgeClass(session.status)}`}
+            >
               {session.status}
             </span>
             {session.createdAt && (
               <span className="text-[10px] tabular-nums text-muted-foreground">{formatElapsed(session.createdAt)}</span>
             )}
-            <span className="min-w-0 break-words text-[10px] text-muted-foreground [overflow-wrap:anywhere]">{session.target} · {session.approvalMode}</span>
+            <span className="min-w-0 break-words text-[10px] text-muted-foreground [overflow-wrap:anywhere]">
+              {session.target} · {session.approvalMode}
+            </span>
           </div>
           <p
             className="mt-1 min-w-0 overflow-hidden break-words text-sm font-medium leading-snug [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] [overflow-wrap:anywhere]"
@@ -158,29 +190,54 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
         </div>
         <div className="absolute right-0 top-0 z-10 flex shrink-0 items-center gap-1 bg-background/80 pl-2 backdrop-blur-sm">
           {canPause && (
-            <button type="button" onClick={() => { void pauseSession(session.id); }} className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Pause">
+            <button
+              type="button"
+              onClick={() => {
+                void pauseSession(session.id);
+              }}
+              className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50"
+              title="Pause"
+            >
               <PauseIcon className="h-3.5 w-3.5 text-muted-foreground" />
             </button>
           )}
           {canResume && (
             <button
               type="button"
-              onClick={() => { void handleResume(); }}
+              onClick={() => {
+                void handleResume();
+              }}
               disabled={isResuming}
               className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-60"
               title={isResuming ? 'Resuming...' : 'Resume'}
             >
-              {isResuming
-                ? <LoaderIcon className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-                : <PlayIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+              {isResuming ? (
+                <LoaderIcon className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+              ) : (
+                <PlayIcon className="h-3.5 w-3.5 text-muted-foreground" />
+              )}
             </button>
           )}
           {!isTerminal && (
-            <button type="button" onClick={() => { void stopSession(session.id); }} className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-destructive/10" title="Stop">
+            <button
+              type="button"
+              onClick={() => {
+                void stopSession(session.id);
+              }}
+              className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-destructive/10"
+              title="Stop"
+            >
               <SquareIcon className="h-3.5 w-3.5 text-muted-foreground" />
             </button>
           )}
-          <button type="button" onClick={() => { void setSurface(session.id, 'window'); }} className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50" title="Detach to window">
+          <button
+            type="button"
+            onClick={() => {
+              void setSurface(session.id, 'window');
+            }}
+            className="flex h-8 w-8 items-center justify-center rounded-xl border border-border/70 bg-card/70 transition-colors hover:bg-muted/50"
+            title="Detach to window"
+          >
             <ExternalLinkIcon className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
         </div>
@@ -232,11 +289,13 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
             onSelectModel={(key) => {
               void updateSessionSettings(session.id, { modelKey: key });
             }}
-            disabled={session.fallbackEnabled ?? false}
-            filter={(model) => Boolean(
-              (model.computerUseSupport && model.computerUseSupport !== 'none')
-              || model.visionCapable,
-            )}
+            // Lock the model under an active profile (the profile owns its
+            // primary + fallback chain) — same behavior as the chat composer.
+            // Also stays disabled while fallback is on for a chain.
+            disabled={Boolean(session.selectedProfileKey) || (session.fallbackEnabled ?? false)}
+            filter={(model) =>
+              Boolean((model.computerUseSupport && model.computerUseSupport !== 'none') || model.visionCapable)
+            }
             fallbackToUnfilteredWhenEmpty
             dropdownDirection="down"
           />
@@ -269,7 +328,9 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
             </button>
             <button
               type="button"
-              onClick={() => { void openLocalMacosPrivacySettings(); }}
+              onClick={() => {
+                void openLocalMacosPrivacySettings();
+              }}
               className="inline-flex items-center gap-1.5 rounded-xl border border-border/70 bg-card/70 px-2.5 py-1 text-[11px] font-medium text-foreground transition-colors hover:bg-muted/50"
             >
               Open Settings
@@ -304,18 +365,39 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
                       <span className="text-xs font-medium">Approval needed</span>
                     </div>
                     <p className="mt-1 break-words text-xs [overflow-wrap:anywhere]">{approval.prompt}</p>
-                    {approval.rationale && <p className="mt-0.5 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{approval.rationale}</p>}
+                    {approval.rationale && (
+                      <p className="mt-0.5 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+                        {approval.rationale}
+                      </p>
+                    )}
                     {action && (
                       <p className="mt-0.5 text-[11px] text-muted-foreground">
-                        {action.kind}{isPointerAction(action) ? ` · ${formatMovementPath(action.movementPath)}` : ''}
+                        {action.kind}
+                        {isPointerAction(action) ? ` · ${formatMovementPath(action.movementPath)}` : ''}
                       </p>
                     )}
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
-                    <button type="button" onClick={() => { void approveAction(session.id, approval.actionId); }} className="rounded-xl bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void approveAction(session.id, approval.actionId);
+                      }}
+                      className="rounded-xl bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                    >
                       Approve
                     </button>
-                    <button type="button" onClick={() => { void rejectAction(session.id, approval.actionId, rejectReasonByApproval[approval.id] || undefined); }} className="rounded-xl border border-border/70 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted/50">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void rejectAction(
+                          session.id,
+                          approval.actionId,
+                          rejectReasonByApproval[approval.id] || undefined,
+                        );
+                      }}
+                      className="rounded-xl border border-border/70 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted/50"
+                    >
                       Reject
                     </button>
                   </div>
@@ -323,7 +405,9 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
                 <input
                   type="text"
                   value={rejectReasonByApproval[approval.id] ?? ''}
-                  onChange={(event) => setRejectReasonByApproval((current) => ({ ...current, [approval.id]: event.target.value }))}
+                  onChange={(event) =>
+                    setRejectReasonByApproval((current) => ({ ...current, [approval.id]: event.target.value }))
+                  }
                   placeholder="Rejection reason (optional)"
                   className="mt-2 w-full rounded-xl border border-border/60 bg-card/80 px-3 py-1.5 text-xs outline-none placeholder:text-muted-foreground/50"
                 />
@@ -338,7 +422,12 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
         <div className="space-y-2">
           {/* Multi-display: show each display as a separate labeled image */}
           {latestFrame.displayFrames && latestFrame.displayFrames.length > 1 ? (
-            <div className="grid gap-2" style={{ gridTemplateColumns: latestFrame.displayFrames.length <= 2 ? 'repeat(2, 1fr)' : 'repeat(3, 1fr)' }}>
+            <div
+              className="grid gap-2"
+              style={{
+                gridTemplateColumns: latestFrame.displayFrames.length <= 2 ? 'repeat(2, 1fr)' : 'repeat(3, 1fr)',
+              }}
+            >
               {latestFrame.displayFrames.map((df) => (
                 <div key={df.displayIndex} className="overflow-hidden rounded-xl border border-border/60 bg-black/80">
                   <div className="flex items-center gap-1.5 border-b border-border/40 px-2 py-1">
@@ -346,7 +435,11 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
                     <span className="text-[10px] text-muted-foreground/60 truncate">{df.displayName}</span>
                   </div>
                   <div className="relative">
-                    <img src={df.dataUrl} alt={`Display ${df.displayIndex}: ${df.displayName}`} className="block max-h-[280px] w-full object-contain" />
+                    <img
+                      src={df.dataUrl}
+                      alt={`Display ${df.displayIndex}: ${df.displayName}`}
+                      className="block max-h-[280px] w-full object-contain"
+                    />
                   </div>
                 </div>
               ))}
@@ -356,17 +449,27 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
             <div className="overflow-hidden rounded-2xl border border-border/60 bg-black/80">
               <div className="flex justify-center">
                 <div className="relative inline-block">
-                  <img src={latestFrame.dataUrl} alt="Live viewport" className="block max-h-[380px] max-w-full object-contain" />
+                  <img
+                    src={latestFrame.dataUrl}
+                    alt="Live viewport"
+                    className="block max-h-[380px] max-w-full object-contain"
+                  />
                   {session.cursor?.visible && (
                     <>
                       <div
                         className="pointer-events-none absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-primary bg-primary/20 shadow-[0_0_0_6px_rgba(148,163,184,0.12)] transition-[left,top] duration-300 ease-out"
-                        style={{ left: `${(session.cursor.x / Math.max(latestFrame.width, 1)) * 100}%`, top: `${(session.cursor.y / Math.max(latestFrame.height, 1)) * 100}%` }}
+                        style={{
+                          left: `${(session.cursor.x / Math.max(latestFrame.width, 1)) * 100}%`,
+                          top: `${(session.cursor.y / Math.max(latestFrame.height, 1)) * 100}%`,
+                        }}
                       />
                       {cursorClickedRecently && (
                         <div
                           className="pointer-events-none absolute h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border border-primary/70 animate-ping"
-                          style={{ left: `${(session.cursor.x / Math.max(latestFrame.width, 1)) * 100}%`, top: `${(session.cursor.y / Math.max(latestFrame.height, 1)) * 100}%` }}
+                          style={{
+                            left: `${(session.cursor.x / Math.max(latestFrame.width, 1)) * 100}%`,
+                            top: `${(session.cursor.y / Math.max(latestFrame.height, 1)) * 100}%`,
+                          }}
                         />
                       )}
                     </>
@@ -389,8 +492,14 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
       {session.currentSubgoal && (
         <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2.5">
           <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Current subgoal</div>
-          <div className="mt-0.5 break-words text-sm font-medium [overflow-wrap:anywhere]">{session.currentSubgoal}</div>
-          {session.planSummary && <p className="mt-0.5 break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">{session.planSummary}</p>}
+          <div className="mt-0.5 break-words text-sm font-medium [overflow-wrap:anywhere]">
+            {session.currentSubgoal}
+          </div>
+          {session.planSummary && (
+            <p className="mt-0.5 break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+              {session.planSummary}
+            </p>
+          )}
         </div>
       )}
 
@@ -399,8 +508,12 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
         <ComputerStepLog
           session={session}
           frames={sessionFrames}
-          onApprove={(actionId) => { void approveAction(session.id, actionId); }}
-          onReject={(actionId, reason) => { void rejectAction(session.id, actionId, reason); }}
+          onApprove={(actionId) => {
+            void approveAction(session.id, actionId);
+          }}
+          onReject={(actionId, reason) => {
+            void rejectAction(session.id, actionId, reason);
+          }}
         />
       ) : timeline.length > 0 ? (
         <div className="rounded-xl border border-border/60 bg-card/40">
@@ -409,9 +522,11 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
             onClick={() => setTimelineExpanded(!timelineExpanded)}
             className="flex w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-muted/30"
           >
-            {timelineExpanded
-              ? <ChevronDownIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              : <ChevronRightIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+            {timelineExpanded ? (
+              <ChevronDownIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            ) : (
+              <ChevronRightIcon className="h-3.5 w-3.5 text-muted-foreground" />
+            )}
             <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
               Recent actions ({session.actions.length})
             </span>
@@ -420,10 +535,14 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
             <div className="space-y-1.5 border-t border-border/40 px-3 py-2">
               {timeline.map((action) => (
                 <div key={action.id} className="flex items-start gap-2 text-xs">
-                  <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${action.status === 'completed' ? 'bg-green-500/10 text-green-600 dark:text-green-400' : action.status === 'awaiting-approval' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : action.status === 'failed' ? 'bg-destructive/10 text-destructive' : 'bg-muted text-muted-foreground'}`}>
+                  <span
+                    className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${action.status === 'completed' ? 'bg-green-500/10 text-green-600 dark:text-green-400' : action.status === 'awaiting-approval' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : action.status === 'failed' ? 'bg-destructive/10 text-destructive' : 'bg-muted text-muted-foreground'}`}
+                  >
                     {action.kind}
                   </span>
-                  <span className="min-w-0 flex-1 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{action.rationale}</span>
+                  <span className="min-w-0 flex-1 break-words text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+                    {action.rationale}
+                  </span>
                   {action.error && <span className="shrink-0 text-[10px] text-destructive">failed</span>}
                 </div>
               ))}
@@ -445,10 +564,14 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
               {latestCheckpoint.successCriteria.length > 0 && (
                 <div className="mt-1 flex flex-wrap gap-1">
                   {latestCheckpoint.successCriteria.slice(0, 3).map((criterion) => (
-                    <span key={criterion} className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{criterion}</span>
+                    <span key={criterion} className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      {criterion}
+                    </span>
                   ))}
                   {latestCheckpoint.successCriteria.length > 3 && (
-                    <span className="text-[10px] text-muted-foreground">+{latestCheckpoint.successCriteria.length - 3} more</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      +{latestCheckpoint.successCriteria.length - 3} more
+                    </span>
                   )}
                 </div>
               )}
@@ -462,13 +585,27 @@ export const ComputerSessionPanel: FC<PanelProps> = ({ session, stickyTopClassNa
         <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2.5 text-xs text-muted-foreground">
           <div className="text-[10px] font-semibold uppercase tracking-wide">Permissions</div>
           <div className="mt-1 flex flex-wrap gap-2">
-            <span className={session.permissionState.accessibilityTrusted ? 'text-green-600 dark:text-green-400' : 'text-destructive'}>
+            <span
+              className={
+                session.permissionState.accessibilityTrusted ? 'text-green-600 dark:text-green-400' : 'text-destructive'
+              }
+            >
               Accessibility: {session.permissionState.accessibilityTrusted ? 'OK' : 'Missing'}
             </span>
-            <span className={session.permissionState.screenRecordingGranted ? 'text-green-600 dark:text-green-400' : 'text-destructive'}>
+            <span
+              className={
+                session.permissionState.screenRecordingGranted
+                  ? 'text-green-600 dark:text-green-400'
+                  : 'text-destructive'
+              }
+            >
               Screen: {session.permissionState.screenRecordingGranted ? 'OK' : 'Missing'}
             </span>
-            <span className={session.permissionState.automationGranted ? 'text-green-600 dark:text-green-400' : 'text-destructive'}>
+            <span
+              className={
+                session.permissionState.automationGranted ? 'text-green-600 dark:text-green-400' : 'text-destructive'
+              }
+            >
               Automation: {session.permissionState.automationGranted ? 'OK' : 'Missing'}
             </span>
           </div>

@@ -116,6 +116,8 @@ export class MastraRuntime implements AgentRuntime {
       reasoningEffort,
       abortSignal,
       cwd,
+      parentProfileKey: options.parentProfileKey,
+      parentModelKey: options.parentModelKey,
       emitEvent,
       onToolExecutionStart,
       onToolExecutionEnd,

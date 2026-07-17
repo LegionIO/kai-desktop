@@ -2329,6 +2329,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           abortSignal: controller.signal,
           streamConfig: streamConfig ?? undefined,
           primaryModel: modelEntry,
+          // Thread this turn's active profile/model so a sub_agent tool can
+          // inherit the parent's profile + fallback chain (see sub-agent.ts).
+          parentProfileKey: profileKey ?? null,
+          parentModelKey: modelEntry?.key ?? modelKey ?? null,
           modelAuth: resolution.modelAuth,
           conversationMetadata: convMetadata,
           switchContext,

@@ -22,6 +22,13 @@ export type ToolExecutionContext = {
    *  run). Tools that would normally block on user input (e.g. ask_user) use
    *  this to fall back to a persistent Alert instead of failing/hanging. */
   isHeadless?: boolean;
+  /** The active profile key of the PARENT turn running this tool, if any. A
+   *  sub_agent tool inherits it (unless the call overrides) so the sub-agent
+   *  runs under the same profile + fallback chain. */
+  parentProfileKey?: string | null;
+  /** The active model key of the parent turn — the inherit fallback when the
+   *  parent had no profile (single-model turn). */
+  parentModelKey?: string | null;
 };
 
 export type ToolDefinition = {

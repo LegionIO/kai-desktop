@@ -135,12 +135,18 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
       isHeadless: true,
+      // Let a sub_agent spawned inside this automation/plugin run inherit the
+      // profile + fallback chain this run is using.
+      parentProfileKey: options.profileKey ?? null,
+      parentModelKey: options.modelKey ?? streamConfig.primaryModel.key,
     });
   } else {
     stream = streamAgentResponse(conversationId, sanitized, modelConfig, configForStream, pluginTools ?? [], dbPath, {
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
       isHeadless: true,
+      parentProfileKey: options.profileKey ?? null,
+      parentModelKey: options.modelKey ?? streamConfig.primaryModel.key,
     });
   }
 

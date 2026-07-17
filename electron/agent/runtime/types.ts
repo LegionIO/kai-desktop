@@ -88,6 +88,12 @@ export type StreamOptions = {
   abortSignal?: AbortSignal;
   cwd?: string;
 
+  /** The active profile/model key of THIS turn, threaded to tool execution
+   *  context so a sub_agent tool can inherit the parent's profile + fallback
+   *  chain. `parentModelKey` is the inherit fallback when no profile is active. */
+  parentProfileKey?: string | null;
+  parentModelKey?: string | null;
+
   /**
    * Confinement inputs pre-built by the IPC layer (issue #66) for runtimes with
    * `executesUntrustedTools`. `childEnv` is the fail-closed allowlist env

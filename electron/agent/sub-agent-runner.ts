@@ -9,10 +9,10 @@
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { z } from 'zod';
-import { streamAgentResponse, getProviderDefinedToolNames } from './mastra-agent.js';
+import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import { hookDispatcher } from './hooks/dispatcher.js';
-import type { LLMModelConfig } from './model-catalog.js';
+import type { LLMModelConfig, ResolvedStreamConfig } from './model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
 import {
@@ -51,6 +51,11 @@ export type SubAgentRunOptions = {
   depth: number;
   config: AppConfig;
   modelConfig: LLMModelConfig;
+  /** When the sub-agent runs under a profile, the resolved chain (primary +
+   *  fallbacks). Present → the runner uses streamWithFallback (mid-stream
+   *  fallback + errored variants); absent → single-model streamAgentResponse
+   *  with `modelConfig`. */
+  streamConfig?: ResolvedStreamConfig;
   tools: ToolDefinition[];
   dbPath: string;
   abortSignal?: AbortSignal;
@@ -175,6 +180,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     depth,
     config,
     modelConfig,
+    streamConfig,
     tools,
     dbPath,
     abortSignal,
@@ -405,159 +411,174 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         });
       }
 
-      const stream = streamAgentResponse(
-        subAgentConversationId,
-        messages,
-        modelConfig,
-        subAgentConfig,
-        allTools,
-        dbPath,
-        {
-          abortSignal,
-          emitEvent: (event) => {
-            if (event.type === 'tool-progress') {
-              subObserver?.onToolProgress({
-                toolCallId: event.toolCallId,
-                toolName: event.toolName,
-                data: event.data as
-                  | {
-                      stream?: 'stdout' | 'stderr';
-                      output?: string;
-                      delta?: string;
-                      bytesSeen?: number;
-                      truncated?: boolean;
-                      stopped?: boolean;
-                    }
-                  | undefined,
-              });
-            }
-            broadcastSubAgentEvent({
-              ...event,
-              subAgentConversationId,
-              parentConversationId,
-              parentToolCallId,
-            } as SubAgentEvent);
-          },
-          onToolExecutionStart: async (state) => {
-            toolCancels.set(state.toolCallId, state.cancel);
-            // PreToolUse BEFORE the observer so a block/modify hook can deny or
-            // sanitize args before the observer model sees them.
-            const preTool = await hookDispatcher.dispatch('PreToolUse', {
-              conversationId: subAgentConversationId,
-              parentConversationId,
-              toolCallId: state.toolCallId,
-              toolName: state.toolName,
-              args: state.args,
+      const subStreamOpts = {
+        abortSignal,
+        emitEvent: (event) => {
+          if (event.type === 'tool-progress') {
+            subObserver?.onToolProgress({
+              toolCallId: event.toolCallId,
+              toolName: event.toolName,
+              data: event.data as
+                | {
+                    stream?: 'stdout' | 'stderr';
+                    output?: string;
+                    delta?: string;
+                    bytesSeen?: number;
+                    truncated?: boolean;
+                    stopped?: boolean;
+                  }
+                | undefined,
             });
-            // Resolve the stream id the renderer used. If the stream event
-            // already arrived it's queued here; otherwise (exec-first) we get
-            // undefined and stash the resolved args by toolName so the stream
-            // loop applies them when its id shows up.
-            const dequeueStreamId = (): string | undefined => {
-              const q = subSuppressedStreamIdsByTool.get(state.toolName);
-              return q && q.length > 0 ? q.shift() : undefined;
-            };
-            const publishResolved = (resolved: unknown): void => {
-              if (!subEnforcingHooks) return;
-              const streamId = dequeueStreamId();
-              // Record under the exec id (the stream loop checks this by id).
-              subHookRewrittenArgs.set(state.toolCallId, resolved);
-              if (streamId) {
-                // Stream-first: a card was already rendered under `streamId` as
-                // {pending}. Re-broadcast the resolved args to correct it — even
-                // when streamId === exec id, since the renderer will NOT re-emit
-                // that card on its own. Alias the extra key only when the ids
-                // actually differ.
-                if (streamId !== state.toolCallId) subHookRewrittenArgs.set(streamId, resolved);
-                broadcastSubAgentEvent({
-                  type: 'tool-call',
-                  toolCallId: streamId,
-                  toolName: state.toolName,
-                  args: resolved,
-                  subAgentConversationId,
-                  parentConversationId,
-                  parentToolCallId,
-                } as SubAgentEvent);
-              } else {
-                // Exec-first: the stream event hasn't arrived yet. If it later
-                // uses the SAME id, it finds `resolved` via subHookRewrittenArgs
-                // by id. If it uses a DIFFERENT id, that by-id lookup misses and
-                // it would suppress to {pending} forever — so also park the
-                // resolved args by toolName (FIFO) for the stream loop to claim.
-                const q = subResolvedArgsByTool.get(state.toolName) ?? [];
-                q.push(resolved);
-                subResolvedArgsByTool.set(state.toolName, q);
-              }
-            };
-            if (preTool.denied) {
-              const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
-              publishResolved({ redacted: true, reason });
-              return {
-                skip: true as const,
-                result: { isError: true, error: reason },
-              };
-            }
-            const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
-            if (nextArgs !== undefined && nextArgs !== state.args) {
-              const canMutateInPlace =
-                state.args &&
-                typeof state.args === 'object' &&
-                !Array.isArray(state.args) &&
-                nextArgs &&
-                typeof nextArgs === 'object' &&
-                !Array.isArray(nextArgs);
-              if (canMutateInPlace) {
-                const target = state.args as Record<string, unknown>;
-                for (const k of Object.keys(target)) delete target[k];
-                Object.assign(target, nextArgs as Record<string, unknown>);
-              } else {
-                // A modify hook returned a non-object replacement we can't apply
-                // to the by-reference args — fail CLOSED rather than run the tool
-                // with unsanitized input.
-                const reason =
-                  'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed.';
-                publishResolved({ redacted: true, reason });
-                return { skip: true as const, result: { isError: true, error: reason } };
-              }
-            }
-            // Emit resolved args (sanitized or allowed-unchanged) so the
-            // suppressed initial tool-call event is corrected in place.
-            publishResolved(state.args);
-            subObserver?.onToolExecutionStart(state);
-          },
-          onToolExecutionEnd: ({ toolCallId }) => {
-            toolCancels.delete(toolCallId);
-            subObserver?.onToolExecutionEnd(toolCallId);
-          },
-          augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
-            // Use redacted/sanitized args (if PreToolUse rewrote/denied them) so
-            // PostToolUse hooks/observers never see the raw denied args.
-            const postArgs = subHookRewrittenArgs.get(toolCallId) ?? args;
-            const postTool = await hookDispatcher.dispatch('PostToolUse', {
-              conversationId: subAgentConversationId,
-              parentConversationId,
-              toolCallId,
-              toolName,
-              args: postArgs,
-              result,
-            });
-            if (postTool.denied) {
-              result = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
-            } else {
-              const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
-              if (nextResult !== undefined) result = nextResult;
-            }
-            await subObserver?.waitForLinkedLaunchedTools(toolCallId);
-            subObserver?.onToolExecutionResult(toolCallId, toolName, result);
-            const augmentation = subObserver?.getToolAugmentation(toolCallId);
-            if (!augmentation) return result;
-            if (!result || typeof result !== 'object' || Array.isArray(result)) {
-              return { value: result, ...augmentation };
-            }
-            return { ...(result as Record<string, unknown>), ...augmentation };
-          },
+          }
+          broadcastSubAgentEvent({
+            ...event,
+            subAgentConversationId,
+            parentConversationId,
+            parentToolCallId,
+          } as SubAgentEvent);
         },
-      );
+        onToolExecutionStart: async (state) => {
+          toolCancels.set(state.toolCallId, state.cancel);
+          // PreToolUse BEFORE the observer so a block/modify hook can deny or
+          // sanitize args before the observer model sees them.
+          const preTool = await hookDispatcher.dispatch('PreToolUse', {
+            conversationId: subAgentConversationId,
+            parentConversationId,
+            toolCallId: state.toolCallId,
+            toolName: state.toolName,
+            args: state.args,
+          });
+          // Resolve the stream id the renderer used. If the stream event
+          // already arrived it's queued here; otherwise (exec-first) we get
+          // undefined and stash the resolved args by toolName so the stream
+          // loop applies them when its id shows up.
+          const dequeueStreamId = (): string | undefined => {
+            const q = subSuppressedStreamIdsByTool.get(state.toolName);
+            return q && q.length > 0 ? q.shift() : undefined;
+          };
+          const publishResolved = (resolved: unknown): void => {
+            if (!subEnforcingHooks) return;
+            const streamId = dequeueStreamId();
+            // Record under the exec id (the stream loop checks this by id).
+            subHookRewrittenArgs.set(state.toolCallId, resolved);
+            if (streamId) {
+              // Stream-first: a card was already rendered under `streamId` as
+              // {pending}. Re-broadcast the resolved args to correct it — even
+              // when streamId === exec id, since the renderer will NOT re-emit
+              // that card on its own. Alias the extra key only when the ids
+              // actually differ.
+              if (streamId !== state.toolCallId) subHookRewrittenArgs.set(streamId, resolved);
+              broadcastSubAgentEvent({
+                type: 'tool-call',
+                toolCallId: streamId,
+                toolName: state.toolName,
+                args: resolved,
+                subAgentConversationId,
+                parentConversationId,
+                parentToolCallId,
+              } as SubAgentEvent);
+            } else {
+              // Exec-first: the stream event hasn't arrived yet. If it later
+              // uses the SAME id, it finds `resolved` via subHookRewrittenArgs
+              // by id. If it uses a DIFFERENT id, that by-id lookup misses and
+              // it would suppress to {pending} forever — so also park the
+              // resolved args by toolName (FIFO) for the stream loop to claim.
+              const q = subResolvedArgsByTool.get(state.toolName) ?? [];
+              q.push(resolved);
+              subResolvedArgsByTool.set(state.toolName, q);
+            }
+          };
+          if (preTool.denied) {
+            const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
+            publishResolved({ redacted: true, reason });
+            return {
+              skip: true as const,
+              result: { isError: true, error: reason },
+            };
+          }
+          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+          if (nextArgs !== undefined && nextArgs !== state.args) {
+            const canMutateInPlace =
+              state.args &&
+              typeof state.args === 'object' &&
+              !Array.isArray(state.args) &&
+              nextArgs &&
+              typeof nextArgs === 'object' &&
+              !Array.isArray(nextArgs);
+            if (canMutateInPlace) {
+              const target = state.args as Record<string, unknown>;
+              for (const k of Object.keys(target)) delete target[k];
+              Object.assign(target, nextArgs as Record<string, unknown>);
+            } else {
+              // A modify hook returned a non-object replacement we can't apply
+              // to the by-reference args — fail CLOSED rather than run the tool
+              // with unsanitized input.
+              const reason =
+                'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed.';
+              publishResolved({ redacted: true, reason });
+              return { skip: true as const, result: { isError: true, error: reason } };
+            }
+          }
+          // Emit resolved args (sanitized or allowed-unchanged) so the
+          // suppressed initial tool-call event is corrected in place.
+          publishResolved(state.args);
+          subObserver?.onToolExecutionStart(state);
+        },
+        onToolExecutionEnd: ({ toolCallId }) => {
+          toolCancels.delete(toolCallId);
+          subObserver?.onToolExecutionEnd(toolCallId);
+        },
+        augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
+          // Use redacted/sanitized args (if PreToolUse rewrote/denied them) so
+          // PostToolUse hooks/observers never see the raw denied args.
+          const postArgs = subHookRewrittenArgs.get(toolCallId) ?? args;
+          const postTool = await hookDispatcher.dispatch('PostToolUse', {
+            conversationId: subAgentConversationId,
+            parentConversationId,
+            toolCallId,
+            toolName,
+            args: postArgs,
+            result,
+          });
+          if (postTool.denied) {
+            result = { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+          } else {
+            const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
+            if (nextResult !== undefined) result = nextResult;
+          }
+          await subObserver?.waitForLinkedLaunchedTools(toolCallId);
+          subObserver?.onToolExecutionResult(toolCallId, toolName, result);
+          const augmentation = subObserver?.getToolAugmentation(toolCallId);
+          if (!augmentation) return result;
+          if (!result || typeof result !== 'object' || Array.isArray(result)) {
+            return { value: result, ...augmentation };
+          }
+          return { ...(result as Record<string, unknown>), ...augmentation };
+        },
+      } satisfies Parameters<typeof streamAgentResponse>[6];
+
+      // Run under the profile's fallback chain when the caller resolved one;
+      // otherwise the single-model path (backward-compatible).
+      const stream =
+        streamConfig && streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0
+          ? streamWithFallback(
+              subAgentConversationId,
+              messages,
+              streamConfig,
+              subAgentConfig,
+              allTools,
+              dbPath,
+              subStreamOpts,
+            )
+          : streamAgentResponse(
+              subAgentConversationId,
+              messages,
+              modelConfig,
+              subAgentConfig,
+              allTools,
+              dbPath,
+              subStreamOpts,
+            );
 
       for await (const event of stream) {
         if (event.type === 'text-delta' && event.text) {

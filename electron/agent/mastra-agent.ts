@@ -209,7 +209,7 @@ function toMastraTools(
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
-  executionContext?: Pick<ToolExecutionContext, 'cwd' | 'isHeadless'>,
+  executionContext?: Pick<ToolExecutionContext, 'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey'>,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
   // tool named "__proto__"/"constructor" must create a plain entry, not invoke a
@@ -253,6 +253,8 @@ function toMastraTools(
             conversationId,
             cwd: executionContext?.cwd,
             isHeadless: executionContext?.isHeadless,
+            parentProfileKey: executionContext?.parentProfileKey,
+            parentModelKey: executionContext?.parentModelKey,
             abortSignal: mergedAbortSignal,
             onProgress: (progress: ToolProgressEvent) => {
               hooks?.emitEvent?.({
@@ -989,6 +991,10 @@ export async function* streamAgentResponse(
     cwd?: string;
     /** No live user watching this run — see ToolExecutionContext.isHeadless. */
     isHeadless?: boolean;
+    /** Parent turn's profile/model, threaded to tool ctx so a sub_agent tool can
+     *  inherit the parent's profile + fallback chain. */
+    parentProfileKey?: string | null;
+    parentModelKey?: string | null;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
@@ -1046,7 +1052,12 @@ export async function* streamAgentResponse(
       onToolExecutionEnd: options?.onToolExecutionEnd,
       augmentToolResult: options?.augmentToolResult,
     },
-    { cwd: effectiveCwd, isHeadless: options?.isHeadless },
+    {
+      cwd: effectiveCwd,
+      isHeadless: options?.isHeadless,
+      parentProfileKey: options?.parentProfileKey,
+      parentModelKey: options?.parentModelKey,
+    },
   );
   const providerDefinedTools = buildProviderDefinedTools(modelConfig);
 
@@ -1741,6 +1752,8 @@ export async function* streamWithFallback(
     cwd?: string;
     /** No live user watching this run — see ToolExecutionContext.isHeadless. */
     isHeadless?: boolean;
+    parentProfileKey?: string | null;
+    parentModelKey?: string | null;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
