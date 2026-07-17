@@ -593,7 +593,7 @@ describe('agent conversationTarget', () => {
     expect(vi.mocked(streamForPlugin).mock.calls.at(-1)![0].conversationId).toBeTruthy();
   });
 
-  it('includeHistory filters out tool-call/enrichment parts and empty messages', async () => {
+  it('includeHistory keeps tool-call parts (for context) but strips enrichment/other parts', async () => {
     resetMockStore({
       convA: {
         id: 'convA',
@@ -624,8 +624,19 @@ describe('agent conversationTarget', () => {
     });
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, true), evt, deps());
     const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
+    // tool-call parts are preserved so a resumed/automation turn SEES the calls it
+    // made (stripping them made the model think it never asked → "fabricated").
+    // The downstream plugin sanitizer pairs the call with its result; here we only
+    // assert the history filter keeps tool-call + text and drops enrichments.
     expect(call.messages).toEqual([
-      { role: 'assistant', content: [{ type: 'text', text: 'kept' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'kept' },
+          { type: 'tool-call', toolCallId: 't1', toolName: 'x', args: {} },
+        ],
+      },
+      { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't2' }] },
       { role: 'user', content: 'do the thing' },
     ]);
   });

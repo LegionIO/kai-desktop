@@ -29,18 +29,6 @@ import { resumeConversationWithMessage, type ActionDeps } from '../automations/a
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
-import { appendFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-// TEMP debug instrumentation (alert notification/nav path). Remove once diagnosed.
-const ALERTS_DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/alerts.log');
-function alertsDebug(msg: string): void {
-  try {
-    appendFileSync(ALERTS_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch {
-    /* best-effort */
-  }
-}
 
 /** Deps the alerts layer needs: where alerts live + how to resume a conversation. */
 export interface AlertsDeps {
@@ -77,11 +65,6 @@ function broadcastAlertsChanged(payload: { reason: 'created' | 'resolved' | 'dis
 /** Bring the main window front-most + focused (used when surfaceAlertsAsModal is on). */
 function focusMainWindowForModal(): void {
   const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
-  alertsDebug(
-    `focusMainWindowForModal chosen=${win?.getTitle() ?? 'none'} allWindows=[${BrowserWindow.getAllWindows()
-      .map((w) => w.getTitle())
-      .join(', ')}]`,
-  );
   if (!win) return;
   if (win.isMinimized()) win.restore();
   win.show();
@@ -117,27 +100,20 @@ export function raiseAlert(input: CreateAlertInput): Alert {
  *  write the store directly (they live in the tools layer and can't import electron). */
 export function notifyNewAlert(alert: Alert): void {
   const verb = alert.kind === 'fyi' ? 'Flagged for review' : alert.kind === 'approval' ? 'Approval needed' : 'Question';
-  alertsDebug(
-    `notifyNewAlert id=${alert.id} kind=${alert.kind} conv=${alert.conversationId} notifSupported=${Notification.isSupported()}`,
-  );
   try {
     if (Notification.isSupported()) {
       const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
       // Clicking the OS notification should bring the user to the Alerts view.
       n.on('click', () => {
-        alertsDebug(`notification CLICK id=${alert.id} conv=${alert.conversationId}`);
         focusMainWindowForModal();
         for (const win of BrowserWindow.getAllWindows()) {
           win.webContents.send('alerts:navigate', { alertId: alert.id });
         }
         broadcastToWebClients('alerts:navigate', { alertId: alert.id });
       });
-      n.on('show', () => alertsDebug(`notification shown id=${alert.id}`));
-      n.on('failed', (_e, err) => alertsDebug(`notification FAILED id=${alert.id} err=${err}`));
       n.show();
     }
-  } catch (err) {
-    alertsDebug(`notifyNewAlert threw id=${alert.id} err=${err instanceof Error ? err.message : String(err)}`);
+  } catch {
     // Notifications can throw on some platforms/permission states — non-fatal.
   }
   broadcastAlertsChanged({ reason: 'created', alert });
@@ -148,7 +124,6 @@ export function notifyNewAlert(alert: Alert): void {
     if (surface === 'modal') {
       focusMainWindowForModal();
     } else if (surface === 'window') {
-      alertsDebug(`open pop-out window for alert id=${alert.id} kind=${alert.kind}`);
       openNotificationWindow({ source: 'alert', id: alert.id, alert });
     }
   }
@@ -181,16 +156,9 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
  *  user's answer isn't silently lost and they can retry. */
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
-  // TEMP debug: trace the resume so "answered but no turn ran" can be pinpointed.
-  const conv = readConversation(deps.appHome, alert.conversationId);
-  alertsDebug(
-    `resume START alert=${alert.id} kind=${alert.kind} conv=${alert.conversationId} convRunStatus=${(conv as { runStatus?: string } | null)?.runStatus ?? 'MISSING'} text="${userText.slice(0, 80)}"`,
-  );
   try {
-    const res = await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
-    alertsDebug(`resume OK alert=${alert.id} result=${JSON.stringify(res)?.slice(0, 200)}`);
+    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
   } catch (err) {
-    alertsDebug(`resume THREW alert=${alert.id} err=${err instanceof Error ? err.message : String(err)}`);
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
     if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
     throw err;

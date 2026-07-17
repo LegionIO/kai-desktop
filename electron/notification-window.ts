@@ -1,27 +1,8 @@
-import { BrowserWindow, ipcMain, screen } from 'electron';
+import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
-import { appendFileSync } from 'node:fs';
 import { applyBrandUserAgent } from './utils/user-agent.js';
 import { showMacDockWithPaddedIcon } from './utils/dock-icon.js';
 import type { Alert } from './ipc/alert-store.js';
-
-// TEMP debug instrumentation (notification window path). Remove once diagnosed.
-const NOTIF_DEBUG_LOG = join(import.meta.dirname, '../../debug-logs/approval.log');
-function notifDebug(msg: string): void {
-  try {
-    appendFileSync(NOTIF_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch {
-    /* best-effort */
-  }
-}
-/** Focused-window title for logs; defensive (BrowserWindow may be a test mock). */
-function focusedWindowTitle(): string {
-  try {
-    return BrowserWindow.getFocusedWindow?.()?.getTitle?.() ?? 'none';
-  } catch {
-    return 'unknown';
-  }
-}
 
 // Same app icon path as electron/main.ts + overlay-window.ts.
 const APP_ICON = join(import.meta.dirname, '../build/icon.png');
@@ -67,6 +48,12 @@ export type ApprovalWindowRequest = {
 // letting macOS auto-raise the main window — the user answered in the pop-out and
 // doesn't want the main GUI to jump to the front.
 const notificationPriorFocus = new Map<string, BrowserWindow | null>();
+// Whether Kai was the frontmost APP (not just which Kai window) when the pop-out
+// opened. If ANOTHER app (e.g. Chrome) was frontmost, answering + closing the
+// pop-out should hand focus BACK to that app (app.hide on macOS) instead of
+// leaving Kai raised. getFocusedWindow() only sees Kai's own windows, so we use
+// app.isActive() captured at open (before the click/show fully activates Kai).
+const notificationKaiWasFrontmost = new Map<string, boolean>();
 
 // Deduped by item id — a repeat request for the same id focuses the existing
 // window instead of opening a second one.
@@ -148,6 +135,17 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
   if (!notificationPriorFocus.has(item.id)) {
     const prior = BrowserWindow.getFocusedWindow?.() ?? null;
     notificationPriorFocus.set(item.id, prior && !prior.isDestroyed?.() ? prior : null);
+    // Was KAI the frontmost app right now (before show() activates it)? If not,
+    // another app (Chrome, …) was — we'll hand focus back to it on close.
+    let kaiFrontmost = false;
+    try {
+      // app.isActive() is macOS-only (present at runtime, not in the App type).
+      const isActive = (app as unknown as { isActive?: () => boolean }).isActive;
+      kaiFrontmost = typeof isActive === 'function' ? isActive.call(app) : prior !== null;
+    } catch {
+      kaiFrontmost = prior !== null;
+    }
+    notificationKaiWasFrontmost.set(item.id, kaiFrontmost);
   }
   const existing = notificationWindows.get(item.id);
   if (existing && !existing.isDestroyed()) {
@@ -197,13 +195,18 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   loadNotificationRoute(win, { notif: '1', notifId: item.id });
-  notifDebug(
-    `open source=${item.source} id=${item.id} ${item.source === 'tool-approval' ? `tool=${item.toolName} conv=${item.conversationId}` : `kind=${item.alert.kind}`} rendererUrl=${process.env.ELECTRON_RENDERER_URL ?? '(file)'} focusedBefore=${focusedWindowTitle()}`,
-  );
 
   win.once('ready-to-show', () => {
-    notifDebug(`ready-to-show id=${item.id}`);
-    win.show();
+    // FIFO surfacing: if another pop-out is already open + focused, don't steal
+    // focus to this newer one — the user should answer the EARLIEST-raised first.
+    // Show it (visible, on top) but inactive so the first pop-out keeps focus.
+    const others = [...notificationWindows.values()].filter((w) => w !== win && !w.isDestroyed());
+    const anotherFocused = others.some((w) => w.isFocused?.());
+    if (anotherFocused) {
+      win.showInactive();
+    } else {
+      win.show();
+    }
     safelySend(win, 'notif:request', item);
     showMacDockWithPaddedIcon(APP_ICON);
     // Height is set by the renderer via notif:resize (ResizeObserver on
@@ -212,7 +215,6 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
   });
 
   win.on('closed', () => {
-    notifDebug(`closed id=${item.id}`);
     // Identity-guard the delete: only clear the map entry if it still points at
     // THIS window, so a late 'closed' from a replaced window can't evict a newer
     // window registered under the same id.
@@ -238,17 +240,27 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
  */
 function restorePriorFocus(id: string): void {
   const prior = notificationPriorFocus.get(id) ?? null;
+  const kaiWasFrontmost = notificationKaiWasFrontmost.get(id) ?? true;
   notificationPriorFocus.delete(id);
+  notificationKaiWasFrontmost.delete(id);
   setTimeout(() => {
     try {
       // If OTHER pop-out windows are still open (e.g. an approval + a question
       // popped together and the user just answered one), keep the notification
-      // stack on top — focus the most-recent remaining pop-out rather than
-      // restoring the prior (main) window, which would sink the others behind it.
+      // stack on top — focus the EARLIEST remaining pop-out (FIFO) so the user
+      // works through them in the order they were raised, rather than restoring
+      // the prior (main) window, which would sink the others behind it.
       const remaining = [...notificationWindows.values()].filter((w) => !w.isDestroyed());
       if (remaining.length > 0) {
-        const top = remaining[remaining.length - 1];
-        if (BrowserWindow.getFocusedWindow?.() !== top) top.focus?.();
+        const next = remaining[0];
+        if (BrowserWindow.getFocusedWindow?.() !== next) next.focus?.();
+        return;
+      }
+      // Kai was NOT the frontmost app when the pop-out opened (the user was in
+      // another app, e.g. Chrome). Hand focus back to that app instead of leaving
+      // Kai raised — app.hide() (macOS) yields to the previously-active app.
+      if (!kaiWasFrontmost && process.platform === 'darwin') {
+        app?.hide?.();
         return;
       }
       if (prior && !prior.isDestroyed?.()) {
@@ -269,7 +281,6 @@ function restorePriorFocus(id: string): void {
 /** Close the notification window for an id once it's resolved/aborted. Idempotent. */
 export function closeNotificationWindow(id: string): void {
   const win = notificationWindows.get(id);
-  notifDebug(`closeNotificationWindow id=${id} found=${Boolean(win && !win.isDestroyed())}`);
   // Only manage focus if the POP-OUT WINDOW was actually the focused surface at
   // close time. When the user answers the INLINE card in the main GUI (which also
   // closes any pop-out via the dismissal-sync path), the pop-out was NOT focused —
@@ -279,7 +290,10 @@ export function closeNotificationWindow(id: string): void {
   notificationItems.delete(id);
   if (win && !win.isDestroyed()) win.destroy();
   if (popoutWasFocused) restorePriorFocus(id);
-  else notificationPriorFocus.delete(id);
+  else {
+    notificationPriorFocus.delete(id);
+    notificationKaiWasFrontmost.delete(id);
+  }
 }
 
 /** Close every notification window (app quit / conversation cancel). */
@@ -288,6 +302,7 @@ export function closeAllNotificationWindows(): void {
     notificationWindows.delete(id);
     notificationItems.delete(id);
     notificationPriorFocus.delete(id);
+    notificationKaiWasFrontmost.delete(id);
     if (!win.isDestroyed()) win.destroy();
   }
   notificationItems.clear();

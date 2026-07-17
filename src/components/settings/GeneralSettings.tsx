@@ -3,6 +3,14 @@ import { Trash2Icon, LoaderIcon, CheckCircle2Icon, AlertTriangleIcon, HardDriveI
 import { app } from '@/lib/ipc-client';
 import { Toggle, settingsSelectClass, type SettingsProps } from './shared';
 
+/** Mirror of electron/agent/kai-presence.ts normalizeApprovalWindowMode — kept
+ *  inline so the renderer doesn't reach across the main-process boundary. */
+function normalizeApprovalWindowMode(raw: unknown): 'auto' | 'always' | 'never' {
+  if (raw === 'always' || raw === 'never' || raw === 'auto') return raw;
+  if (raw === true) return 'always';
+  return 'auto';
+}
+
 export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const ui = config.ui as {
     theme: string;
@@ -10,7 +18,7 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
     fullWidthContent?: boolean;
     splashBackground?: string;
     composer?: { showModelProfileSelector?: boolean; midTurnSend?: 'splice' | 'queue-editable' };
-    approvals?: { dedicatedWindow?: boolean };
+    approvals?: { dedicatedWindow?: boolean | 'auto' | 'always' | 'never' };
   };
   const titleGen =
     (config.titleGeneration as
@@ -206,16 +214,26 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
             can cancel or edit before it&apos;s sent.
           </p>
         </div>
-        <Toggle
-          id="ui.approvals.dedicatedWindow"
-          label="Open approval prompts in a dedicated window"
-          checked={!!ui.approvals?.dedicatedWindow}
-          onChange={(v) => updateConfig('ui.approvals.dedicatedWindow', v)}
-        />
-        <p className="text-[10px] text-muted-foreground -mt-2">
-          Show tool/plan approval prompts in their own always-on-top window so answering one doesn&apos;t disturb the
-          main Kai window. The inline in-chat prompt still appears too.
-        </p>
+        <div className="space-y-1">
+          <label htmlFor="ui.approvals.dedicatedWindow" className="block text-xs font-medium">
+            Approval &amp; question prompts
+          </label>
+          <select
+            id="ui.approvals.dedicatedWindow"
+            className={settingsSelectClass}
+            value={normalizeApprovalWindowMode(ui.approvals?.dedicatedWindow)}
+            onChange={(e) => updateConfig('ui.approvals.dedicatedWindow', e.target.value)}
+          >
+            <option value="auto">Pop out only when I&apos;m not on {__BRAND_PRODUCT_NAME} (recommended)</option>
+            <option value="always">Always open in a dedicated window</option>
+            <option value="never">Always inline in the chat</option>
+          </select>
+          <p className="text-[10px] text-muted-foreground">
+            Where tool/plan approvals and questions appear. &quot;Only when I&apos;m not on {__BRAND_PRODUCT_NAME}&quot;
+            keeps them inline while the {__BRAND_PRODUCT_NAME} window is focused or the CLI is active, and pops out an
+            always-on-top window (plus a notification) when you&apos;re working elsewhere.
+          </p>
+        </div>
       </fieldset>
 
       <PartitionManager />

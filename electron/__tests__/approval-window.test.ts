@@ -55,6 +55,7 @@ vi.mock('electron', () => {
     setVisibleOnAllWorkspaces() {}
   }
   return {
+    app: { isActive: () => false, hide: vi.fn() },
     BrowserWindow,
     ipcMain: { on: vi.fn() },
     screen: {

@@ -2,6 +2,7 @@ import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
+import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import { normalizeAgentCwd, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
@@ -377,34 +378,33 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     }
   }
 
-  // Dedicated approval window (flag-gated by ui.approvals.dedicatedWindow):
-  // open a small always-on-top window for an approval so answering it doesn't
-  // disturb the main window; close it once the tool resolves or the turn ends.
-  // The inline in-thread card still renders and resolves the same pending entry
-  // (whichever surface the user answers first wins — the resolve is idempotent).
+  // Dedicated approval window (ui.approvals.dedicatedWindow):
+  //   'auto' (default) → presence-aware: pop out ONLY when the user isn't on
+  //     Kai (no GUI focus, no recently-active CLI) — otherwise the inline
+  //     in-thread card / CLI prompt is the surface. 'always'/'never' force it.
+  // Close the window once the tool resolves or the turn ends. The inline card
+  // still renders and resolves the same pending entry (whichever surface the
+  // user answers first wins — resolve is idempotent).
   if (event.conversationId) {
     if (event.type === 'tool-approval-required' && event.toolCallId) {
-      let dedicated = false;
+      let popOut = false;
       if (serverPersistAppHome) {
         try {
-          dedicated = Boolean(readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow);
+          const raw = readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow;
+          popOut = resolveApprovalPopOut(raw);
         } catch {
-          dedicated = false;
+          popOut = false;
         }
       }
-      if (dedicated) {
-        console.info(`[APPROVAL-DEBUG] dedicated=true opening window for toolCallId=${event.toolCallId}`);
+      if (popOut) {
         openApprovalWindow({
           approvalId: event.toolCallId,
           conversationId: event.conversationId,
           toolName: event.toolName ?? 'tool',
           args: event.args,
         });
-      } else {
-        console.info(`[APPROVAL-DEBUG] dedicated=false (inline card only) toolCallId=${event.toolCallId}`);
       }
     } else if (event.type === 'tool-result' && event.toolCallId) {
-      console.info(`[APPROVAL-DEBUG] tool-result → closeApprovalWindow toolCallId=${event.toolCallId}`);
       closeApprovalWindow(event.toolCallId);
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
