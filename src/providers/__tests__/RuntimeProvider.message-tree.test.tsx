@@ -14,7 +14,13 @@ vi.mock('@/lib/ipc-client', () => ({
   app: new Proxy({}, { get: () => () => undefined }),
 }));
 
-import { getActiveBranch, ensureTree, deepestLatestDescendant, isDuplicateLastUserMessage } from '../RuntimeProvider';
+import {
+  getActiveBranch,
+  ensureTree,
+  deepestLatestDescendant,
+  isDuplicateLastUserMessage,
+  locateToolCallInBranch,
+} from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
 
@@ -204,5 +210,94 @@ describe('isDuplicateLastUserMessage — peer user-message dedup (#222)', () => 
       ],
     };
     expect(isDuplicateLastUserMessage(asBranch([withImage]), 'something else [Image]')).toBe(false);
+  });
+});
+
+describe('locateToolCallInBranch — cross-message tool-call lookup (mid-turn splice)', () => {
+  // Messages carrying tool-call content parts. Structural cast like the others.
+  type ToolMsg = {
+    id: string;
+    parentId: string | null;
+    role: 'user' | 'assistant';
+    content: unknown;
+  };
+  const asMsgs = (nodes: ToolMsg[]) => nodes as unknown as Parameters<typeof locateToolCallInBranch>[0];
+
+  it('finds a tool-call in an EARLIER assistant message across a spliced user turn', () => {
+    const msgs = asMsgs([
+      {
+        id: 'a1',
+        parentId: null,
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'github' }],
+      },
+      { id: 'u2', parentId: 'a1', role: 'user', content: [{ type: 'text', text: 'mid-turn note' }] },
+      { id: 'a2', parentId: 'u2', role: 'assistant', content: [{ type: 'text', text: 'continuing' }] },
+    ]);
+    // Head is the NEW assistant after the splice — t1 lives back in a1.
+    expect(locateToolCallInBranch(msgs, 'a2', 't1')).toEqual({ msgIdx: 0, partIdx: 0 });
+  });
+
+  it('returns the part index within a multi-part message', () => {
+    const msgs = asMsgs([
+      {
+        id: 'a1',
+        parentId: null,
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'hi' },
+          { type: 'tool-call', toolCallId: 't1', toolName: 'x' },
+          { type: 'tool-call', toolCallId: 't2', toolName: 'y' },
+        ],
+      },
+      { id: 'u2', parentId: 'a1', role: 'user', content: [{ type: 'text', text: 'note' }] },
+    ]);
+    expect(locateToolCallInBranch(msgs, 'u2', 't2')).toEqual({ msgIdx: 0, partIdx: 2 });
+  });
+
+  it('returns null when the id is absent or empty', () => {
+    const msgs = asMsgs([
+      {
+        id: 'a1',
+        parentId: null,
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'x' }],
+      },
+    ]);
+    expect(locateToolCallInBranch(msgs, 'a1', 'nope')).toBeNull();
+    expect(locateToolCallInBranch(msgs, 'a1', '')).toBeNull();
+  });
+
+  it('prefers the NEWEST message when the same id appears twice on the branch', () => {
+    const msgs = asMsgs([
+      {
+        id: 'a1',
+        parentId: null,
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'x' }],
+      },
+      {
+        id: 'a2',
+        parentId: 'a1',
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'x' }],
+      },
+    ]);
+    expect(locateToolCallInBranch(msgs, 'a2', 't1')).toEqual({ msgIdx: 1, partIdx: 0 });
+  });
+
+  it('ignores messages off the active branch', () => {
+    // b1 is a sibling branch not reachable from head a2.
+    const msgs = asMsgs([
+      { id: 'a1', parentId: null, role: 'assistant', content: [{ type: 'text', text: 'root' }] },
+      {
+        id: 'b1',
+        parentId: 'a1',
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'tX', toolName: 'x' }],
+      },
+      { id: 'a2', parentId: 'a1', role: 'assistant', content: [{ type: 'text', text: 'other branch' }] },
+    ]);
+    expect(locateToolCallInBranch(msgs, 'a2', 'tX')).toBeNull();
   });
 });

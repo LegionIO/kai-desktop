@@ -363,6 +363,40 @@ export function isDuplicateLastUserMessage(branch: StoredMessage[], text: string
 }
 
 /**
+ * Locate an existing `tool-call` content part by id ANYWHERE on the active
+ * branch, searching newest message → oldest. Returns the index of the owning
+ * message in `messages` and the index of the part within that message's
+ * content, or null if not found.
+ *
+ * Needed for mid-turn message splices: when a user sends a follow-up while tools
+ * are still running (cooperative `prepareStep` splice), the branch tail moves to
+ * the new `user` message, so a later `tool-result`/`tool-progress` for a call
+ * that lives in the EARLIER assistant message can't be found by the per-current-
+ * message search. Without this the handlers fabricated a duplicate "done" row in
+ * the new assistant message and left the original stuck on "in progress".
+ */
+export function locateToolCallInBranch(
+  messages: StoredMessage[],
+  headId: string | null,
+  toolCallId: string,
+): { msgIdx: number; partIdx: number } | null {
+  if (!toolCallId) return null;
+  const branch = getActiveBranch(messages, headId);
+  for (let b = branch.length - 1; b >= 0; b--) {
+    const m = branch[b];
+    if (!Array.isArray(m.content)) continue;
+    const partIdx = (m.content as ContentPart[]).findIndex(
+      (p) => p.type === 'tool-call' && p.toolCallId === toolCallId,
+    );
+    if (partIdx >= 0) {
+      const msgIdx = messages.findIndex((mm) => mm.id === m.id);
+      if (msgIdx >= 0) return { msgIdx, partIdx };
+    }
+  }
+  return null;
+}
+
+/**
  * Walk DOWN from `startId` to the deepest descendant, always taking the last
  * (most recent) child, and return that leaf's id. Cycle-guarded the same way as
  * getActiveBranch so a corrupt parentId cycle can't hang the caller.
@@ -761,6 +795,16 @@ function applyToolProgress(
     }
   }
   if (tcIdx < 0) {
+    // Not in the current assistant message. If the call lives in an EARLIER
+    // assistant message on the branch (mid-turn user splice moved the tail),
+    // update it in place there rather than dropping the progress.
+    if (e.toolCallId) {
+      const loc = locateToolCallInBranch(acc.messages, acc.headId, e.toolCallId);
+      if (loc) {
+        applyLiveOutputAt(acc, loc.msgIdx, loc.partIdx, e);
+        return;
+      }
+    }
     // Ignore orphan progress without a resolvable tool call to avoid duplicate cards.
     logRuntimeToolDebug('apply-tool-progress-orphan', {
       toolCallId: e.toolCallId ?? null,
@@ -771,6 +815,24 @@ function applyToolProgress(
   }
 
   const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
+  const liveOutput = mergeLiveOutput(existing, e);
+  content[tcIdx] = { ...existing, liveOutput };
+  logRuntimeToolDebug('apply-tool-progress', {
+    toolCallId: e.toolCallId ?? null,
+    toolName: e.toolName ?? null,
+    matchMode,
+    toolParts: summarizeToolParts(content),
+  });
+  acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+}
+
+/** Merge a progress event's stream output into a tool-call part's liveOutput. */
+function mergeLiveOutput(
+  existing: ContentPart & { type: 'tool-call' },
+  e: {
+    data?: { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean };
+  },
+): NonNullable<(ContentPart & { type: 'tool-call' })['liveOutput']> {
   const liveOutput = {
     stdout: existing.liveOutput?.stdout ?? '',
     stderr: existing.liveOutput?.stderr ?? '',
@@ -784,28 +846,70 @@ function applyToolProgress(
   if (e.data?.stream === 'stderr') liveOutput.stderr = e.data.output ?? liveOutput.stderr;
   liveOutput.truncated = Boolean(liveOutput.truncated || e.data?.truncated);
   liveOutput.stopped = Boolean(liveOutput.stopped || e.data?.stopped);
-  content[tcIdx] = { ...existing, liveOutput };
-  logRuntimeToolDebug('apply-tool-progress', {
-    toolCallId: e.toolCallId ?? null,
-    toolName: e.toolName ?? null,
-    matchMode,
-    toolParts: summarizeToolParts(content),
-  });
-  acc.messages[idx] = { ...msg, content: toStoredContent(content) };
+  return liveOutput;
 }
 
-function applyToolCompaction(
+/** Apply liveOutput to a tool-call at a specific (message, part) location — used
+ *  when a progress event's call lives in an earlier branch message. */
+function applyLiveOutputAt(
   acc: MessageAccumulator,
+  msgIdx: number,
+  partIdx: number,
   e: {
-    toolCallId?: string;
-    toolName?: string;
-    data?: {
-      phase?: 'start' | 'complete' | 'error' | null;
-      originalContent?: string;
-      extractionDurationMs?: number;
-    };
+    data?: { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean };
   },
 ): void {
+  const target = acc.messages[msgIdx];
+  if (!target || !Array.isArray(target.content)) return;
+  const content = [...(target.content as ContentPart[])];
+  const existing = content[partIdx] as ContentPart & { type: 'tool-call' };
+  if (!existing || existing.type !== 'tool-call') return;
+  content[partIdx] = { ...existing, liveOutput: mergeLiveOutput(existing, e) };
+  acc.messages[msgIdx] = { ...target, content: toStoredContent(content) };
+}
+
+type ToolCompactionEvent = {
+  toolCallId?: string;
+  toolName?: string;
+  data?: {
+    phase?: 'start' | 'complete' | 'error' | null;
+    originalContent?: string;
+    extractionDurationMs?: number;
+  };
+};
+
+/** Apply a compaction phase transition to a tool-call part. Pure — returns the
+ *  updated part. Shared by the current-message and cross-branch paths. */
+function applyCompactionToPart(
+  existing: ContentPart & { type: 'tool-call' },
+  e: ToolCompactionEvent,
+): ContentPart & { type: 'tool-call' } {
+  if (e.data?.phase === 'start') {
+    return {
+      ...existing,
+      compactionPhase: 'start',
+      ...(typeof e.data.originalContent === 'string' && e.data.originalContent.length > 0
+        ? { originalResult: existing.originalResult ?? e.data.originalContent }
+        : {}),
+    };
+  }
+  if (e.data?.phase === 'complete') {
+    return {
+      ...existing,
+      compactionPhase: 'complete',
+      ...(typeof e.data.originalContent === 'string' && e.data.originalContent.length > 0
+        ? { originalResult: existing.originalResult ?? e.data.originalContent }
+        : {}),
+      compactionMeta: {
+        wasCompacted: true,
+        extractionDurationMs: e.data.extractionDurationMs ?? existing.compactionMeta?.extractionDurationMs ?? 0,
+      },
+    };
+  }
+  return { ...existing, compactionPhase: null };
+}
+
+function applyToolCompaction(acc: MessageAccumulator, e: ToolCompactionEvent): void {
   const { msg, idx } = getOrCreateAssistantInAcc(acc);
   const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
   let tcIdx = -1;
@@ -826,6 +930,18 @@ function applyToolCompaction(
     }
   }
   if (tcIdx < 0) {
+    // Cross-branch: the call may live in an earlier assistant message (mid-turn
+    // splice). Update it there rather than fabricating a duplicate.
+    if (e.toolCallId) {
+      const loc = locateToolCallInBranch(acc.messages, acc.headId, e.toolCallId);
+      if (loc) {
+        const target = acc.messages[loc.msgIdx];
+        const tContent = [...(target.content as ContentPart[])];
+        tContent[loc.partIdx] = applyCompactionToPart(tContent[loc.partIdx] as ContentPart & { type: 'tool-call' }, e);
+        acc.messages[loc.msgIdx] = { ...target, content: toStoredContent(tContent) };
+        return;
+      }
+    }
     if (!e.toolCallId) return;
     content.push({
       type: 'tool-call',
@@ -840,33 +956,7 @@ function applyToolCompaction(
     matchMode = 'created';
   }
 
-  const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-  if (e.data?.phase === 'start') {
-    content[tcIdx] = {
-      ...existing,
-      compactionPhase: 'start',
-      ...(typeof e.data.originalContent === 'string' && e.data.originalContent.length > 0
-        ? { originalResult: existing.originalResult ?? e.data.originalContent }
-        : {}),
-    };
-  } else if (e.data?.phase === 'complete') {
-    content[tcIdx] = {
-      ...existing,
-      compactionPhase: 'complete',
-      ...(typeof e.data.originalContent === 'string' && e.data.originalContent.length > 0
-        ? { originalResult: existing.originalResult ?? e.data.originalContent }
-        : {}),
-      compactionMeta: {
-        wasCompacted: true,
-        extractionDurationMs: e.data.extractionDurationMs ?? existing.compactionMeta?.extractionDurationMs ?? 0,
-      },
-    };
-  } else {
-    content[tcIdx] = {
-      ...existing,
-      compactionPhase: null,
-    };
-  }
+  content[tcIdx] = applyCompactionToPart(content[tcIdx] as ContentPart & { type: 'tool-call' }, e);
 
   logRuntimeToolDebug('apply-tool-compaction', {
     toolCallId: e.toolCallId ?? null,
@@ -880,22 +970,52 @@ function applyToolCompaction(
   acc.messages[idx] = { ...msg, content: toStoredContent(content) };
 }
 
-function applyToolResult(
-  acc: MessageAccumulator,
-  e: {
-    toolCallId?: string;
-    toolName?: string;
-    result: unknown;
-    startedAt?: string;
-    finishedAt?: string;
-    durationMs?: number;
-    compaction?: {
-      originalContent: string;
-      wasCompacted: boolean;
-      extractionDurationMs: number;
-    };
-  },
-): void {
+type ToolResultEvent = {
+  toolCallId?: string;
+  toolName?: string;
+  result: unknown;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  compaction?: {
+    originalContent: string;
+    wasCompacted: boolean;
+    extractionDurationMs: number;
+  };
+};
+
+/** Stamp a tool-result event onto a tool-call part (result + timing + any
+ *  compaction metadata). Pure — returns the updated part. Shared by the
+ *  current-message path and the cross-branch (mid-turn splice) path. */
+function applyResultToPart(
+  existing: ContentPart & { type: 'tool-call' },
+  e: ToolResultEvent,
+): ContentPart & { type: 'tool-call' } {
+  const finishedAt = e.finishedAt ?? nowIso();
+  const compactionFields: Partial<ContentPart & { type: 'tool-call' }> = e.compaction?.wasCompacted
+    ? {
+        originalResult: e.compaction.originalContent,
+        compactionMeta: {
+          wasCompacted: true,
+          extractionDurationMs: e.compaction.extractionDurationMs,
+        },
+        compactionPhase: 'complete' as const,
+      }
+    : {};
+  return {
+    ...existing,
+    result: e.result,
+    startedAt: e.startedAt ?? existing.startedAt ?? finishedAt,
+    finishedAt,
+    ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
+    ...(!e.compaction?.wasCompacted && existing.compactionPhase === 'start'
+      ? { compactionPhase: existing.compactionMeta?.wasCompacted ? ('complete' as const) : null }
+      : {}),
+    ...compactionFields,
+  };
+}
+
+function applyToolResult(acc: MessageAccumulator, e: ToolResultEvent): void {
   const { msg, idx } = getOrCreateAssistantInAcc(acc);
   const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
   let tcIdx = -1;
@@ -916,6 +1036,28 @@ function applyToolResult(
     }
   }
   if (tcIdx < 0) {
+    // Not in the current assistant message — a mid-turn user splice may have
+    // moved the branch tail past the message that holds this call. Update the
+    // original tool-call in place (in its earlier message) instead of
+    // fabricating a duplicate "done" row here.
+    if (e.toolCallId) {
+      const loc = locateToolCallInBranch(acc.messages, acc.headId, e.toolCallId);
+      if (loc) {
+        const target = acc.messages[loc.msgIdx];
+        const tContent = [...(target.content as ContentPart[])];
+        const tPart = tContent[loc.partIdx] as ContentPart & { type: 'tool-call' };
+        tContent[loc.partIdx] = applyResultToPart(tPart, e);
+        acc.messages[loc.msgIdx] = { ...target, content: toStoredContent(tContent) };
+        logRuntimeToolDebug('apply-tool-result', {
+          toolCallId: e.toolCallId ?? null,
+          toolName: e.toolName ?? null,
+          matchMode: 'cross-branch',
+          hasCompaction: Boolean(e.compaction?.wasCompacted),
+          toolParts: summarizeToolParts(tContent),
+        });
+        return;
+      }
+    }
     if (!e.toolCallId) return;
     content.push({
       type: 'tool-call',
@@ -930,32 +1072,7 @@ function applyToolResult(
     matchMode = 'created';
   }
   if (tcIdx >= 0) {
-    const existing = content[tcIdx] as ContentPart & { type: 'tool-call' };
-    const finishedAt = e.finishedAt ?? nowIso();
-
-    // If compaction metadata was injected by the main process, apply it
-    const compactionFields: Partial<ContentPart & { type: 'tool-call' }> = e.compaction?.wasCompacted
-      ? {
-          originalResult: e.compaction.originalContent,
-          compactionMeta: {
-            wasCompacted: true,
-            extractionDurationMs: e.compaction.extractionDurationMs,
-          },
-          compactionPhase: 'complete' as const,
-        }
-      : {};
-
-    content[tcIdx] = {
-      ...existing,
-      result: e.result,
-      startedAt: e.startedAt ?? existing.startedAt ?? finishedAt,
-      finishedAt,
-      ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
-      ...(!e.compaction?.wasCompacted && existing.compactionPhase === 'start'
-        ? { compactionPhase: existing.compactionMeta?.wasCompacted ? ('complete' as const) : null }
-        : {}),
-      ...compactionFields,
-    };
+    content[tcIdx] = applyResultToPart(content[tcIdx] as ContentPart & { type: 'tool-call' }, e);
   }
   logRuntimeToolDebug('apply-tool-result', {
     toolCallId: e.toolCallId ?? null,
