@@ -35,6 +35,7 @@ const {
   PRE_UPDATE_HOOK_TIMEOUT_MS,
   resolveDownloadMode,
   shouldForceSingleRange,
+  parseUpdateConfigFields,
 } = await import('../auto-update.js');
 
 const MARKER = join(USERDATA, '.update-completed');
@@ -185,5 +186,48 @@ describe('shouldForceSingleRange — macOS delta over generic/S3 providers', () 
   it('handles a missing/malformed URL safely', () => {
     expect(shouldForceSingleRange(undefined, 'auto')).toBe(false);
     expect(shouldForceSingleRange('not a url with s3 in it', 'auto')).toBe(true); // substring fallback
+  });
+});
+
+describe('parseUpdateConfigFields — dependency-free app-update.yml scan', () => {
+  it('parses the real baked generic/S3 config', () => {
+    const yaml = [
+      'provider: generic',
+      'url: https://s3api-core.optum.com/kai/releases/latest',
+      'updaterCacheDirName: kai-updater',
+    ].join('\n');
+    expect(parseUpdateConfigFields(yaml)).toEqual({
+      provider: 'generic',
+      url: 'https://s3api-core.optum.com/kai/releases/latest',
+    });
+  });
+
+  it('parses a github provider config', () => {
+    const yaml = 'provider: github\nowner: LegionIO\nrepo: kai-desktop\n';
+    const out = parseUpdateConfigFields(yaml);
+    expect(out.provider).toBe('github');
+    expect(out.url).toBeUndefined();
+  });
+
+  it('strips surrounding quotes and tolerates CRLF + comments + blank lines', () => {
+    const yaml = '# feed\r\nprovider: "generic"\r\n\r\nurl: \'https://s3.example.com/x\'\r\n';
+    expect(parseUpdateConfigFields(yaml)).toEqual({
+      provider: 'generic',
+      url: 'https://s3.example.com/x',
+    });
+  });
+
+  it('ignores nested (indented) keys and list items', () => {
+    const yaml =
+      'provider: generic\nurl: https://s3api-core.optum.com/kai\nfiles:\n  - url: Kai.zip\n    provider: nested\n';
+    expect(parseUpdateConfigFields(yaml)).toEqual({
+      provider: 'generic',
+      url: 'https://s3api-core.optum.com/kai',
+    });
+  });
+
+  it('returns empty on garbage/empty input', () => {
+    expect(parseUpdateConfigFields('')).toEqual({});
+    expect(parseUpdateConfigFields('just some text\nno colons here')).toEqual({});
   });
 });

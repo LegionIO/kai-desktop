@@ -68,6 +68,54 @@ export function shouldForceSingleRange(
   }
 }
 
+/**
+ * Parse the two fields we care about out of the baked `app-update.yml`
+ * (`provider` + `url`). It's a tiny flat YAML we ship ourselves — a full YAML
+ * parser would pull a transitive dep into the bundled main process (breaks the
+ * release build; see the builder gotcha). A per-line `key: value` scan is
+ * sufficient and dependency-free. Exported for tests.
+ */
+export function parseUpdateConfigFields(yaml: string): { provider?: string; url?: string } {
+  const out: { provider?: string; url?: string } = {};
+  for (const rawLine of yaml.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    // Skip comments, list items, and nested keys (indented) — top-level scalars only.
+    if (!line || line.startsWith('#') || rawLine[0] === ' ' || rawLine[0] === '\t' || rawLine[0] === '-') continue;
+    const m = /^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const key = m[1];
+    // Strip surrounding quotes if present.
+    const val = m[2].replace(/^['"]|['"]$/g, '');
+    if (key === 'provider') out.provider = val;
+    else if (key === 'url') out.url = val;
+  }
+  return out;
+}
+
+/**
+ * Read the baked update config synchronously and, if it's a generic S3-like
+ * provider that needs it, re-issue the feed URL with `useMultipleRangeRequest:
+ * false`. Idempotent + best-effort — safe to call at registration and on every
+ * `update-available`. `reason` is logged so we can see WHEN it applied.
+ */
+function forceSingleRangeIfNeeded(reason: string): void {
+  try {
+    const cfgPath = (app as unknown as { appUpdateConfigPath?: string }).appUpdateConfigPath;
+    if (!cfgPath || !existsSync(cfgPath)) return;
+    const { provider, url } = parseUpdateConfigFields(readFileSync(cfgPath, 'utf-8'));
+    if (provider !== 'generic') return; // GitHub etc. handle multi-range fine
+    if (!shouldForceSingleRange(url)) return;
+    autoUpdater.setFeedURL({
+      provider: 'generic',
+      url,
+      useMultipleRangeRequest: false,
+    } as Parameters<typeof autoUpdater.setFeedURL>[0]);
+    logLine('info', [`generic provider: forcing single-range requests (useMultipleRangeRequest=false) [${reason}]`]);
+  } catch {
+    /* best-effort: if the baked config can't be read, leave the default */
+  }
+}
+
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY_MS = 5_000; // 5 seconds after launch
 /** Upper bound on pre-update hooks (e.g. admin elevation). A hook that never
@@ -426,33 +474,31 @@ export function registerAutoUpdateHandlers(ipcMain: IpcMain, onUpdateDownloaded?
   // computed correctly. Forcing SINGLE-range requests (`useMultipleRangeRequest:
   // false`) makes each block a plain `bytes=a-b` → `206` GET the server DOES
   // support, so the delta actually downloads. The `updateForceSingleRange`
-  // branding key controls this: 'always' | 'never' | 'auto' (detect S3 by a
-  // host containing "s3"). GitHub-provider builds are unaffected (multi-range OK).
-  // The dev-test path sets this directly; production relies on the baked
-  // app-update.yml (which can't express it), so re-issue the feed config here.
+  // branding key controls whether we do this: 'always' | 'never' | 'auto'
+  // (detect S3 by a host containing "s3"). GitHub-provider builds are unaffected.
+  // We apply this SYNCHRONOUSLY at registration — BEFORE the first
+  // `checkForUpdates` runs — so the provider electron-updater builds for the
+  // check (and reuses for the download; `getUpdateInfoAndProvider` only rebuilds
+  // `clientPromise` when it's null) is already single-range. The earlier
+  // fire-and-forget `configOnDisk.value.then(setFeedURL)` was racy: a
+  // `checkForUpdates` that ran before the async config read resolved built the
+  // provider from the UNMODIFIED baked config (multi-range), and the download
+  // captures that provider at check time — so the late override landed on a
+  // client the download never used. Reading the baked `app-update.yml`
+  // synchronously (a tiny flat file we ship ourselves) removes the race.
   if (app.isPackaged && !isUpdateTestMode) {
-    const configOnDisk = (autoUpdater as unknown as { configOnDisk?: { value?: Promise<Record<string, unknown>> } })
-      .configOnDisk;
-    void configOnDisk?.value
-      ?.then((cfg) => {
-        if (cfg?.provider !== 'generic') return; // GitHub etc. handle multi-range
-        if (shouldForceSingleRange(typeof cfg.url === 'string' ? cfg.url : undefined)) {
-          autoUpdater.setFeedURL({
-            ...cfg,
-            useMultipleRangeRequest: false,
-          } as Parameters<typeof autoUpdater.setFeedURL>[0]);
-          logLine('info', ['generic provider: forcing single-range requests (useMultipleRangeRequest=false)']);
-        }
-      })
-      .catch(() => {
-        /* best-effort: if the baked config can't be read, leave the default */
-      });
+    forceSingleRangeIfNeeded('registration');
   }
 
   autoUpdater.on('checking-for-update', () => {
     if (!downloaded) broadcast({ state: 'checking' });
   });
   autoUpdater.on('update-available', (info) => {
+    // Defensive re-assert: the provider the CURRENT download uses was already
+    // captured during the check (built from our single-range clientPromise set
+    // at registration). Re-applying here keeps subsequent checks single-range
+    // too, in case anything reset the feed config in between.
+    if (app.isPackaged && !isUpdateTestMode) forceSingleRangeIfNeeded('update-available');
     pendingVersion = info.version;
     // Best-effort pick of the artifact MacUpdater will actually download
     // (arch-matching .zip). This only feeds the fallback heuristic — the
