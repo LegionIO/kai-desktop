@@ -156,7 +156,9 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
       // If the runtime discarded the partial assistant output before failing
       // over, drop what we've accumulated so we don't persist/replay a partial
       // that the fresh attempt supersedes.
-      const data = event.data as { discardPartialAssistant?: boolean } | undefined;
+      const data = event.data as
+        | { discardPartialAssistant?: boolean; preserveErroredVariant?: boolean; error?: string }
+        | undefined;
       if (data?.discardPartialAssistant) {
         const acc = accumulators.get(conversationId);
         if (acc) {
@@ -164,6 +166,29 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
           acc.toolIndex.clear();
           acc.sawContent = false;
         }
+        break;
+      }
+      if (data?.preserveErroredVariant) {
+        // A transient error hit AFTER content streamed. Commit the partial as its
+        // OWN variant (sibling assistant message), annotated with the error, then
+        // re-seed a fresh accumulator under the SAME parent so the next attempt
+        // persists as a sibling too — the user gets "k / N variants" with the
+        // failed partials selectable.
+        const acc = ensureAcc(conversationId, parentId);
+        const originalParentId = acc.parentId;
+        appendText(acc, `\n\n**Error:** ${data.error ?? event.error ?? 'model error — retrying'}`);
+        // persistAccumulatedReturningHead deletes the accumulator + writes the
+        // sibling with parentId = acc.parentId (the submit head), so this variant
+        // is a sibling of the eventual success rather than its ancestor.
+        persistAccumulatedReturningHead(appHome, conversationId);
+        // Re-seed for the retry, KEEPING the original parent so the next attempt
+        // is a sibling (not chained after this errored one).
+        accumulators.set(conversationId, {
+          parts: [],
+          toolIndex: new Map(),
+          sawContent: false,
+          parentId: originalParentId,
+        });
       }
       break;
     }

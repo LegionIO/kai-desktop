@@ -1770,8 +1770,13 @@ export async function* streamWithFallback(
     let emittedContent = false;
     let lastError: string | null = null;
     let terminalFinishReason: string | null = null;
-    let fallbackReason: 'content-filter' | null = null;
+    let fallbackReason: 'content-filter' | 'transient' | null = null;
     let discardPartialAssistant = false;
+    // When a TRANSIENT error hits AFTER content already streamed, we still fall
+    // back — but the partial+error attempt is preserved as its own variant
+    // (sibling assistant message) rather than discarded, so the user sees
+    // "k / N variants" with the failed partials selectable.
+    let preserveErroredVariant = false;
 
     try {
       console.info(
@@ -1794,10 +1799,31 @@ export async function* streamWithFallback(
           emittedContent = true;
         }
 
-        // If we see an error BEFORE any content and have more fallbacks, capture it
-        if (event.type === 'error' && !emittedContent && attempt < modelChain.length - 1) {
-          lastError = event.error ?? 'Unknown error';
-          continue; // don't yield the error to the UI
+        if (event.type === 'error' && attempt < modelChain.length - 1) {
+          // Never fall back on a USER abort — that's a deliberate cancel, not a
+          // model failure. (The outer catch / abortSignal checks handle the
+          // terminal path.)
+          const userAborted = options?.abortSignal?.aborted === true;
+          if (!userAborted) {
+            if (!emittedContent) {
+              // Error before any content — classic pre-content fallback: capture
+              // and try the next model, don't show the error to the UI.
+              lastError = event.error ?? 'Unknown error';
+              continue;
+            }
+            // Error AFTER content started. Only fall back for TRANSIENT upstream
+            // failures (500 / 529 / network / timeout / rate-limit / provider
+            // cancel). A non-transient error (bad request, auth, content) stays
+            // terminal and is yielded below. The partial+error is preserved as
+            // its own variant so the user can see the failed attempt.
+            const info = classifyError(event.error ?? '');
+            if (info.isTransient) {
+              lastError = event.error ?? 'Unknown error';
+              fallbackReason = 'transient';
+              preserveErroredVariant = true;
+              break; // stop consuming this attempt; fall back below
+            }
+          }
         }
 
         if (event.type === 'done') {
@@ -1817,6 +1843,28 @@ export async function* streamWithFallback(
         }
 
         yield event;
+      }
+
+      // Transient mid-stream fallback: emit the fallback event carrying the
+      // preserve flag so persistence commits the partial+error as a sibling
+      // variant, then retry the next model (a fresh sibling under the same parent).
+      if (fallbackReason === 'transient') {
+        const nextEntry = modelChain[attempt + 1];
+        yield {
+          conversationId,
+          type: 'model-fallback',
+          data: {
+            fromModel: entry.displayName,
+            fromModelKey: entry.key,
+            toModel: nextEntry.displayName,
+            toModelKey: nextEntry.key,
+            error: lastError ?? 'transient error',
+            reason: fallbackReason,
+            preserveErroredVariant,
+            attempt: attempt + 1,
+          },
+        };
+        continue;
       }
 
       if (fallbackReason === 'content-filter') {
@@ -1864,7 +1912,12 @@ export async function* streamWithFallback(
         return;
       }
 
-      if (!emittedContent && attempt < modelChain.length - 1) {
+      const outerInfo = classifyError(outerError);
+      // Fall back on a thrown error when fallbacks remain, IF either no content
+      // was emitted yet, OR the error is transient (mid-stream provider failure).
+      // A non-transient throw after content stays terminal (yielded below).
+      const canFallback = attempt < modelChain.length - 1 && (!emittedContent || outerInfo.isTransient);
+      if (canFallback) {
         const nextEntry = modelChain[attempt + 1];
         yield {
           conversationId,
@@ -1875,13 +1928,16 @@ export async function* streamWithFallback(
             toModel: nextEntry.displayName,
             toModelKey: nextEntry.key,
             error: getErrorMessage(outerError),
+            reason: 'transient',
+            // Preserve the partial as a variant only if content actually streamed.
+            preserveErroredVariant: emittedContent,
             attempt: attempt + 1,
           },
         };
         continue;
       }
 
-      // Last model also failed
+      // Last model also failed (or a non-transient error after content)
       const lastErrorInfo = classifyError(outerError);
       yield {
         conversationId,

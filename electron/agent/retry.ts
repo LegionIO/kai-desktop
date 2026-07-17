@@ -96,6 +96,38 @@ export function classifyError(error: unknown): RetryableErrorInfo {
     return { statusCode, retryAfterMs, isTransient: true, category: 'rate-limit', message };
   }
 
+  // Message-only classification for errors that arrive as a bare string with no
+  // status code (common for mid-stream provider failures surfaced as an `error`
+  // stream event). Without this a string like "internal server error" or
+  // "overloaded" would fall through to `unknown` (non-transient) and defeat
+  // mid-stream fallback. User-initiated aborts are filtered out BEFORE
+  // classifyError is consulted (abortSignal check), so treating a provider-side
+  // "canceled"/stream-abort as transient here is safe.
+  if (lowerMessage.includes('overloaded') || lowerMessage.includes('529') || lowerMessage.includes('capacity')) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'overload', message };
+  }
+  if (
+    lowerMessage.includes('internal server error') ||
+    lowerMessage.includes('service unavailable') ||
+    lowerMessage.includes('bad gateway') ||
+    lowerMessage.includes('gateway timeout') ||
+    /\b(500|502|503|504)\b/.test(lowerMessage) ||
+    lowerMessage.includes('server had an error') ||
+    lowerMessage.includes('server_error')
+  ) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'server-error', message };
+  }
+  if (
+    lowerMessage.includes('canceled') ||
+    lowerMessage.includes('cancelled') ||
+    lowerMessage.includes('stream ended') ||
+    lowerMessage.includes('premature close') ||
+    lowerMessage.includes('connection closed') ||
+    lowerMessage.includes('incomplete chunked')
+  ) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'network', message };
+  }
+
   // Default: not transient
   return { statusCode, retryAfterMs, isTransient: false, category: 'unknown', message };
 }

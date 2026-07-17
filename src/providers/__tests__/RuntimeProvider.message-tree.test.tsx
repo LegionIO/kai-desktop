@@ -20,6 +20,7 @@ import {
   deepestLatestDescendant,
   isDuplicateLastUserMessage,
   locateToolCallInBranch,
+  preserveErroredAssistantVariant,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -299,5 +300,38 @@ describe('locateToolCallInBranch — cross-message tool-call lookup (mid-turn sp
       { id: 'a2', parentId: 'a1', role: 'assistant', content: [{ type: 'text', text: 'other branch' }] },
     ]);
     expect(locateToolCallInBranch(msgs, 'a2', 'tX')).toBeNull();
+  });
+});
+
+describe('preserveErroredAssistantVariant — mid-stream fallback keeps the partial as a sibling', () => {
+  type Msg = { id: string; parentId: string | null; role: 'user' | 'assistant'; content: unknown };
+  const acc = (messages: Msg[], headId: string | null) =>
+    ({ messages, headId }) as unknown as Parameters<typeof preserveErroredAssistantVariant>[0];
+
+  it('annotates the trailing assistant with the error and rewinds head to its parent', () => {
+    const messages: Msg[] = [
+      { id: 'u1', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      { id: 'a1', parentId: 'u1', role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+    ];
+    const a = acc(messages, 'a1');
+    const sealed = preserveErroredAssistantVariant(a, 'internal server error');
+    expect(sealed).toBe(true);
+    // Head rewound to the errored variant's parent → retry becomes a sibling of a1.
+    expect(a.headId).toBe('u1');
+    // The errored assistant still exists, now carrying the error annotation.
+    const errored = a.messages.find((m) => (m as Msg).id === 'a1') as Msg | undefined;
+    const text = (errored?.content as Array<{ type: string; text?: string }>)
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('');
+    expect(text).toContain('partial');
+    expect(text).toContain('internal server error');
+  });
+
+  it('returns false when there is no trailing assistant to seal', () => {
+    const messages: Msg[] = [{ id: 'u1', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] }];
+    const a = acc(messages, 'u1');
+    expect(preserveErroredAssistantVariant(a, 'err')).toBe(false);
+    expect(a.headId).toBe('u1'); // unchanged
   });
 });

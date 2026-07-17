@@ -55,6 +55,21 @@ describe('classifyError', () => {
     expect(classifyError(new Error('something weird')).isTransient).toBe(false);
     expect(classifyError('a string').isTransient).toBe(false);
   });
+
+  it('classifies string-only messages (no status code) that arrive as mid-stream error events', () => {
+    // These commonly surface as a bare string in an `error` stream event with no
+    // status object — must be transient so mid-stream fallback engages.
+    expect(classifyError('Internal Server Error').isTransient).toBe(true);
+    expect(classifyError('Internal Server Error').category).toBe('server-error');
+    expect(classifyError('Overloaded').isTransient).toBe(true);
+    expect(classifyError('Overloaded').category).toBe('overload');
+    expect(classifyError('503 Service Unavailable').isTransient).toBe(true);
+    expect(classifyError('Bad Gateway').isTransient).toBe(true);
+    expect(classifyError('The response was canceled').isTransient).toBe(true);
+    expect(classifyError('premature close').isTransient).toBe(true);
+    // A plain 4xx-style message stays non-transient.
+    expect(classifyError('400 bad request').isTransient).toBe(false);
+  });
 });
 
 describe('calculateDelay', () => {

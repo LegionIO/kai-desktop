@@ -180,6 +180,64 @@ describe('stream persistence accumulator', () => {
     feed({ conversationId: 'e3', type: 'done' });
     expect(appendMock).not.toHaveBeenCalled();
   });
+
+  it('model-fallback with preserveErroredVariant commits the partial as a sibling and re-seeds under the same parent', () => {
+    // Attempt 1 streams partial content, then a transient mid-stream fallback.
+    feedWithParent({ conversationId: 'v1', type: 'text-delta', text: 'partial from model A' }, 'user-node');
+    feedWithParent(
+      {
+        conversationId: 'v1',
+        type: 'model-fallback',
+        error: 'internal server error',
+        data: { preserveErroredVariant: true, error: 'internal server error' },
+      },
+      'user-node',
+    );
+    // The errored partial was committed as its own sibling right away.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, , firstMsgs, firstOpts] = appendMock.mock.calls[0];
+    const firstText = (firstMsgs[0].content as Array<{ type: string; text?: string }>)
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('');
+    expect(firstText).toContain('partial from model A');
+    expect(firstText).toContain('internal server error'); // error annotation preserved
+    expect(firstOpts.parentId).toBe('user-node');
+
+    // Attempt 2 (retry on model B) streams the successful reply + done.
+    feedWithParent({ conversationId: 'v1', type: 'text-delta', text: 'full reply from model B' }, 'user-node');
+    feedWithParent({ conversationId: 'v1', type: 'done' }, 'user-node');
+
+    expect(appendMock).toHaveBeenCalledTimes(2);
+    const [, , secondMsgs, secondOpts] = appendMock.mock.calls[1];
+    const secondText = (secondMsgs[0].content as Array<{ type: string; text?: string }>)
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('');
+    expect(secondText).toContain('full reply from model B');
+    expect(secondText).not.toContain('partial from model A'); // fresh accumulator
+    // Both variants are siblings under the SAME parent.
+    expect(secondOpts.parentId).toBe('user-node');
+  });
+
+  it('model-fallback with discardPartialAssistant drops the partial (no sibling persisted)', () => {
+    feedWithParent({ conversationId: 'v2', type: 'text-delta', text: 'to be discarded' }, 'user-node');
+    feedWithParent(
+      { conversationId: 'v2', type: 'model-fallback', data: { discardPartialAssistant: true } },
+      'user-node',
+    );
+    // Nothing persisted yet (partial dropped, not committed as a sibling).
+    expect(appendMock).not.toHaveBeenCalled();
+    feedWithParent({ conversationId: 'v2', type: 'text-delta', text: 'clean retry' }, 'user-node');
+    feedWithParent({ conversationId: 'v2', type: 'done' }, 'user-node');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, , msgs] = appendMock.mock.calls[0];
+    const text = (msgs[0].content as Array<{ type: string; text?: string }>)
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('');
+    expect(text).toBe('clean retry');
+  });
 });
 
 describe('finalizeInterruptedTurn (mid-turn follow-up injection)', () => {

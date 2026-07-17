@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type FC } from 'react';
-import { CheckIcon, ChevronUpIcon, CpuIcon, DumbbellIcon, MessageCircleIcon, ScrollTextIcon, ShuffleIcon, UserCircleIcon } from 'lucide-react';
+import {
+  CheckIcon,
+  ChevronUpIcon,
+  CpuIcon,
+  DumbbellIcon,
+  MessageCircleIcon,
+  ScrollTextIcon,
+  ShuffleIcon,
+  UserCircleIcon,
+} from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { formatModelDisplayName } from '@/lib/model-display';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -43,7 +52,7 @@ const REASONING_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
 export type ExecutionMode = 'auto' | 'plan-first';
 
 const MODE_ICONS: Record<ExecutionMode, typeof MessageCircleIcon> = {
-  'auto': MessageCircleIcon,
+  auto: MessageCircleIcon,
   'plan-first': ScrollTextIcon,
 };
 
@@ -58,13 +67,25 @@ export const ChatSettingsButton: FC<{
   onSelectProfile?: (key: string | null, primaryModelKey: string | null) => void;
   fallbackEnabled?: boolean;
   onToggleFallback?: (value: boolean) => void;
-}> = ({ reasoningEffort, onChangeReasoningEffort, executionMode, onChangeExecutionMode, selectedModelKey, onSelectModel, selectedProfileKey, onSelectProfile, fallbackEnabled, onToggleFallback }) => {
+}> = ({
+  reasoningEffort,
+  onChangeReasoningEffort,
+  executionMode,
+  onChangeExecutionMode,
+  selectedModelKey,
+  onSelectModel,
+  selectedProfileKey,
+  onSelectProfile,
+  fallbackEnabled,
+  onToggleFallback,
+}) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const { config } = useConfig();
 
   // Determine whether to show model/profile/routing in the popover
-  const showModelProfile = !!(config?.ui as { composer?: { showModelProfileSelector?: boolean } } | undefined)?.composer?.showModelProfileSelector;
+  const showModelProfile = !!(config?.ui as { composer?: { showModelProfileSelector?: boolean } } | undefined)?.composer
+    ?.showModelProfileSelector;
 
   // Load catalogs when the popover sections are enabled
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
@@ -73,19 +94,29 @@ export const ChatSettingsButton: FC<{
   useEffect(() => {
     if (!showModelProfile) return;
     let cancelled = false;
-    app.modelCatalog()
-      .then((data) => { if (!cancelled) setCatalog(data as ModelCatalog); })
+    app
+      .modelCatalog()
+      .then((data) => {
+        if (!cancelled) setCatalog(data as ModelCatalog);
+      })
       .catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [config, showModelProfile]);
 
   useEffect(() => {
     if (!showModelProfile || !onSelectProfile) return;
     let cancelled = false;
-    app.profileCatalog()
-      .then((data) => { if (!cancelled) setProfileCatalog(data as ProfileCatalog); })
+    app
+      .profileCatalog()
+      .then((data) => {
+        if (!cancelled) setProfileCatalog(data as ProfileCatalog);
+      })
       .catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [config, showModelProfile, onSelectProfile]);
 
   // Close on outside click
@@ -118,15 +149,9 @@ export const ChatSettingsButton: FC<{
     }
   }, [hasExecutionMode, onChangeExecutionMode, executionMode, toggleSettings]);
 
-  const mainTooltip = !hasExecutionMode
-    ? 'Chat settings'
-    : executionMode === 'plan-first'
-      ? 'Plan mode'
-      : 'Ask mode';
+  const mainTooltip = !hasExecutionMode ? 'Chat settings' : executionMode === 'plan-first' ? 'Plan mode' : 'Ask mode';
 
-  const ModeIcon = hasExecutionMode
-    ? MODE_ICONS[executionMode ?? 'auto']
-    : MessageCircleIcon;
+  const ModeIcon = hasExecutionMode ? MODE_ICONS[executionMode ?? 'auto'] : MessageCircleIcon;
 
   // Model/profile derived state
   const models = catalog?.models ?? [];
@@ -141,23 +166,23 @@ export const ChatSettingsButton: FC<{
   return (
     <div ref={rootRef} {...containerProps} className="relative flex items-center">
       {/* Joined button group: chevron + mode icon */}
-      <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
-        isNonAutoMode
-          ? 'border-primary/50 bg-primary/10'
-          : 'border-border/50 bg-muted/40'
-      }`}>
+      <div
+        className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+          isNonAutoMode ? 'border-primary/50 bg-primary/10' : 'border-border/50 bg-muted/40'
+        }`}
+      >
         {/* Left segment: chevron — opens settings popover */}
-        <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-          expanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
-        }`}>
+        <div
+          className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+            expanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+          }`}
+        >
           <Tooltip content="Chat settings" side="top" sideOffset={8}>
             <button
               type="button"
               onClick={toggleSettings}
               className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
-                isNonAutoMode
-                  ? 'text-primary hover:bg-primary/15'
-                  : 'text-muted-foreground hover:bg-muted/50'
+                isNonAutoMode ? 'text-primary hover:bg-primary/15' : 'text-muted-foreground hover:bg-muted/50'
               }`}
             >
               <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${settingsOpen ? '' : 'rotate-180'}`} />
@@ -171,9 +196,7 @@ export const ChatSettingsButton: FC<{
             type="button"
             onClick={handleMainClick}
             className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
-              isNonAutoMode
-                ? 'text-primary hover:bg-primary/15'
-                : 'text-muted-foreground hover:bg-muted/50'
+              isNonAutoMode ? 'text-primary hover:bg-primary/15' : 'text-muted-foreground hover:bg-muted/50'
             }`}
           >
             <ModeIcon className="h-4 w-4" />
@@ -183,7 +206,11 @@ export const ChatSettingsButton: FC<{
 
       {/* Settings popover */}
       {settingsOpen && (
-        <div ref={settingsPopover.ref} style={settingsPopover.style} className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+        <div
+          ref={settingsPopover.ref}
+          style={settingsPopover.style}
+          className="absolute bottom-full right-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] max-h-[70vh] overflow-y-auto rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl"
+        >
           {/* Profile section (opt-in) */}
           {hasProfiles && (
             <>
@@ -194,11 +221,11 @@ export const ChatSettingsButton: FC<{
               <div className="max-h-[160px] overflow-y-auto space-y-0.5">
                 <button
                   type="button"
-                  onClick={() => { onSelectProfile!(null, null); }}
+                  onClick={() => {
+                    onSelectProfile!(null, null);
+                  }}
                   className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
-                    !currentProfileKey
-                      ? 'bg-primary/10 text-primary font-medium'
-                      : 'hover:bg-muted/60 text-foreground'
+                    !currentProfileKey ? 'bg-primary/10 text-primary font-medium' : 'hover:bg-muted/60 text-foreground'
                   }`}
                 >
                   {!currentProfileKey && <CheckIcon className="h-3 w-3 shrink-0" />}
@@ -208,7 +235,9 @@ export const ChatSettingsButton: FC<{
                   <button
                     key={profile.key}
                     type="button"
-                    onClick={() => { onSelectProfile!(profile.key, profile.primaryModelKey); }}
+                    onClick={() => {
+                      onSelectProfile!(profile.key, profile.primaryModelKey);
+                    }}
                     className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
                       profile.key === currentProfileKey
                         ? 'bg-primary/10 text-primary font-medium'
@@ -236,36 +265,51 @@ export const ChatSettingsButton: FC<{
                 <CpuIcon className="h-3.5 w-3.5 text-muted-foreground" />
                 <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Model</span>
               </div>
-              <div className="max-h-[200px] overflow-y-auto space-y-0.5">
-                {models.map((model) => {
-                  const label = formatModelDisplayName(model.displayName);
-                  return (
-                    <button
-                      key={model.key}
-                      type="button"
-                      onClick={() => onSelectModel(model.key)}
-                      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
-                        model.key === currentModelKey
-                          ? 'bg-primary/10 text-primary font-medium'
-                          : 'hover:bg-muted/60 text-foreground'
-                      }`}
-                    >
-                      {model.key === currentModelKey && <CheckIcon className="h-3 w-3 shrink-0" />}
-                      <span className="flex-1 min-w-0 truncate text-left">{label}</span>
-                      {model.maxInputTokens && (
-                        <span className="text-[10px] opacity-50">
-                          {Math.round(model.maxInputTokens / 1000)}k
-                        </span>
+              {currentProfileKey ? (
+                // A profile owns its primary model + fallback chain. Don't let the
+                // model be overridden out from under the profile — show the active
+                // (profile-primary) model read-only. Switch to Default to change it.
+                <div className="px-3 pb-1">
+                  <div className="flex items-center gap-2 rounded-xl bg-muted/40 px-3 py-2 text-xs">
+                    <CheckIcon className="h-3 w-3 shrink-0 text-muted-foreground" />
+                    <span className="flex-1 min-w-0 truncate text-left text-foreground">
+                      {formatModelDisplayName(
+                        models.find((m) => m.key === currentModelKey)?.displayName ?? currentModelKey ?? 'Model',
                       )}
-                      {model.computerUseSupport && model.computerUseSupport !== 'none' && (
-                        <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary">
-                          CU
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
+                    </span>
+                  </div>
+                  <p className="px-1 pt-1 text-[10px] text-muted-foreground/60">
+                    Set by the active profile — switch to Default to choose a model.
+                  </p>
+                </div>
+              ) : (
+                <div className="max-h-[200px] overflow-y-auto space-y-0.5">
+                  {models.map((model) => {
+                    const label = formatModelDisplayName(model.displayName);
+                    return (
+                      <button
+                        key={model.key}
+                        type="button"
+                        onClick={() => onSelectModel(model.key)}
+                        className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
+                          model.key === currentModelKey
+                            ? 'bg-primary/10 text-primary font-medium'
+                            : 'hover:bg-muted/60 text-foreground'
+                        }`}
+                      >
+                        {model.key === currentModelKey && <CheckIcon className="h-3 w-3 shrink-0" />}
+                        <span className="flex-1 min-w-0 truncate text-left">{label}</span>
+                        {model.maxInputTokens && (
+                          <span className="text-[10px] opacity-50">{Math.round(model.maxInputTokens / 1000)}k</span>
+                        )}
+                        {model.computerUseSupport && model.computerUseSupport !== 'none' && (
+                          <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary">CU</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <div className="border-t border-border/50 mx-1.5 mt-0.5" />
             </>
           )}
@@ -274,13 +318,17 @@ export const ChatSettingsButton: FC<{
           <div className="flex items-center justify-between px-3 py-2">
             <div className="flex items-center gap-2">
               <DumbbellIcon className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Effort [{REASONING_OPTIONS.find((o) => o.value === reasoningEffort)?.label}]</span>
+              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+                Effort [{REASONING_OPTIONS.find((o) => o.value === reasoningEffort)?.label}]
+              </span>
             </div>
             <div className="relative flex h-6 w-[92px] items-center rounded-full bg-muted-foreground/20">
               {/* Sliding thumb */}
               <span
                 className="absolute h-4 w-4 rounded-full bg-foreground shadow-sm transition-[left] duration-200 ease-out pointer-events-none"
-                style={{ left: `${4 + REASONING_OPTIONS.findIndex((o) => o.value === reasoningEffort) * ((92 - 4 * 2 - 16) / (REASONING_OPTIONS.length - 1))}px` }}
+                style={{
+                  left: `${4 + REASONING_OPTIONS.findIndex((o) => o.value === reasoningEffort) * ((92 - 4 * 2 - 16) / (REASONING_OPTIONS.length - 1))}px`,
+                }}
               />
               {/* Clickable dot positions */}
               {REASONING_OPTIONS.map((option, i) => {
@@ -293,9 +341,11 @@ export const ChatSettingsButton: FC<{
                     className="absolute flex h-6 w-4 items-center justify-center"
                     style={{ left: `${4 + i * ((92 - 4 * 2 - 16) / (REASONING_OPTIONS.length - 1))}px` }}
                   >
-                    <span className={`block h-1.5 w-1.5 rounded-full transition-opacity ${
-                      isActive ? 'opacity-0' : 'bg-muted-foreground/50'
-                    }`} />
+                    <span
+                      className={`block h-1.5 w-1.5 rounded-full transition-opacity ${
+                        isActive ? 'opacity-0' : 'bg-muted-foreground/50'
+                      }`}
+                    />
                   </button>
                 );
               })}
@@ -309,7 +359,9 @@ export const ChatSettingsButton: FC<{
               <div className="flex items-center justify-between px-3 py-2">
                 <div className="flex items-center gap-2">
                   <ShuffleIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Auto-routing</span>
+                  <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+                    Auto-routing
+                  </span>
                 </div>
                 <button
                   type="button"
@@ -318,9 +370,11 @@ export const ChatSettingsButton: FC<{
                     fallbackEnabled ? 'bg-primary' : 'bg-muted-foreground/30'
                   }`}
                 >
-                  <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
-                    fallbackEnabled ? 'translate-x-[21px]' : 'translate-x-[3px]'
-                  }`} />
+                  <span
+                    className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                      fallbackEnabled ? 'translate-x-[21px]' : 'translate-x-[3px]'
+                    }`}
+                  />
                 </button>
               </div>
             </>
@@ -333,7 +387,9 @@ export const ChatSettingsButton: FC<{
               <div className="flex items-center justify-between px-3 py-2">
                 <div className="flex items-center gap-2">
                   <ScrollTextIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Plan Mode</span>
+                  <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+                    Plan Mode
+                  </span>
                 </div>
                 <button
                   type="button"
@@ -342,9 +398,11 @@ export const ChatSettingsButton: FC<{
                     executionMode === 'plan-first' ? 'bg-primary' : 'bg-muted-foreground/30'
                   }`}
                 >
-                  <span className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
-                    executionMode === 'plan-first' ? 'translate-x-[21px]' : 'translate-x-[3px]'
-                  }`} />
+                  <span
+                    className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform ${
+                      executionMode === 'plan-first' ? 'translate-x-[21px]' : 'translate-x-[3px]'
+                    }`}
+                  />
                 </button>
               </div>
             </>

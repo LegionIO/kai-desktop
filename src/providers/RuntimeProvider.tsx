@@ -1172,6 +1172,28 @@ function discardTrailingAssistant(acc: MessageAccumulator): void {
   acc.headId = last.parentId ?? null;
 }
 
+/**
+ * Preserve the trailing (partial) assistant message as its OWN variant after a
+ * transient mid-stream fallback: annotate it with the error, then rewind the
+ * head to that message's PARENT so the retry's first delta creates a fresh
+ * assistant SIBLING under the same parent. The BranchPicker then shows the
+ * failed partial and the successful retry as "k / N variants". Returns true if a
+ * trailing assistant was sealed.
+ */
+export function preserveErroredAssistantVariant(acc: MessageAccumulator, errorText: string): boolean {
+  const branch = getActiveBranch(acc.messages, acc.headId);
+  const last = branch[branch.length - 1];
+  if (last?.role !== 'assistant') return false;
+  const idx = acc.messages.findIndex((m) => m.id === last.id);
+  if (idx < 0) return false;
+  const content = (Array.isArray(last.content) ? [...last.content] : []) as ContentPart[];
+  content.push({ type: 'text', text: `\n\n**Error:** ${errorText}` });
+  acc.messages[idx] = { ...last, content: toStoredContent(content) };
+  // Rewind head to the errored variant's parent so the retry is a sibling.
+  acc.headId = last.parentId ?? null;
+  return true;
+}
+
 // --- Persistence ---
 
 async function persistConversation(
@@ -2507,10 +2529,18 @@ export function RuntimeProvider({
               error: string;
               reason?: string;
               discardPartialAssistant?: boolean;
+              preserveErroredVariant?: boolean;
             }
           | undefined;
         if (fbData?.discardPartialAssistant) {
           discardTrailingAssistant(acc);
+        } else if (fbData?.preserveErroredVariant) {
+          // Seal the partial+error as its own variant; the retry becomes a
+          // sibling. Flush so the growing "k / N variants" shows live.
+          if (preserveErroredAssistantVariant(acc, fbData.error) && isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+          }
         }
         if (fbData && isActiveConv) {
           setFallbackBanner({
