@@ -93,6 +93,24 @@ export function parseUpdateConfigFields(yaml: string): { provider?: string; url?
 }
 
 /**
+ * Path to the baked update config, resolved the way electron-updater does
+ * internally (its ElectronAppAdapter): packaged → `<resourcesPath>/app-update.yml`,
+ * dev → `<appPath>/dev-app-update.yml`. NOTE: `appUpdateConfigPath` lives on
+ * electron-updater's own app adapter, NOT on Electron's global `app` — reading
+ * it off `app` returns undefined (the bug that silently disabled the delta fix
+ * through 0.3.10x: the path was undefined → early return → setFeedURL never ran).
+ * Exported for tests.
+ */
+export function resolveUpdateConfigPath(): string | undefined {
+  try {
+    if (app.isPackaged) return join(process.resourcesPath, 'app-update.yml');
+    return join(app.getAppPath(), 'dev-app-update.yml');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Read the baked update config synchronously and, if it's a generic S3-like
  * provider that needs it, re-issue the feed URL with `useMultipleRangeRequest:
  * false`. Idempotent + best-effort — safe to call at registration and on every
@@ -100,19 +118,25 @@ export function parseUpdateConfigFields(yaml: string): { provider?: string; url?
  */
 function forceSingleRangeIfNeeded(reason: string): void {
   try {
-    const cfgPath = (app as unknown as { appUpdateConfigPath?: string }).appUpdateConfigPath;
-    if (!cfgPath || !existsSync(cfgPath)) return;
+    const cfgPath = resolveUpdateConfigPath();
+    if (!cfgPath || !existsSync(cfgPath)) {
+      logLine('info', [`single-range check [${reason}]: no update config at ${cfgPath ?? '(unresolved)'} — skipping`]);
+      return;
+    }
     const { provider, url } = parseUpdateConfigFields(readFileSync(cfgPath, 'utf-8'));
     if (provider !== 'generic') return; // GitHub etc. handle multi-range fine
-    if (!shouldForceSingleRange(url)) return;
+    if (!shouldForceSingleRange(url)) {
+      logLine('info', [`single-range check [${reason}]: provider=generic url host not S3-like — leaving multi-range`]);
+      return;
+    }
     autoUpdater.setFeedURL({
       provider: 'generic',
       url,
       useMultipleRangeRequest: false,
     } as Parameters<typeof autoUpdater.setFeedURL>[0]);
     logLine('info', [`generic provider: forcing single-range requests (useMultipleRangeRequest=false) [${reason}]`]);
-  } catch {
-    /* best-effort: if the baked config can't be read, leave the default */
+  } catch (err) {
+    logLine('warn', [`single-range check [${reason}] failed`, err]);
   }
 }
 

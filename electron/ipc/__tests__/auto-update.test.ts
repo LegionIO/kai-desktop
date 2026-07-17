@@ -21,7 +21,7 @@ process.env.KAI_USER_DATA = USERDATA;
 const CURRENT_VERSION = '2.5.0';
 
 vi.mock('electron', () => ({
-  app: { getPath: () => USERDATA, getVersion: () => CURRENT_VERSION },
+  app: { getPath: () => USERDATA, getVersion: () => CURRENT_VERSION, isPackaged: false, getAppPath: () => '/app/path' },
   dialog: { showMessageBox: vi.fn() },
 }));
 vi.mock('electron-updater', () => ({
@@ -36,6 +36,7 @@ const {
   resolveDownloadMode,
   shouldForceSingleRange,
   parseUpdateConfigFields,
+  resolveUpdateConfigPath,
 } = await import('../auto-update.js');
 
 const MARKER = join(USERDATA, '.update-completed');
@@ -229,5 +230,14 @@ describe('parseUpdateConfigFields — dependency-free app-update.yml scan', () =
   it('returns empty on garbage/empty input', () => {
     expect(parseUpdateConfigFields('')).toEqual({});
     expect(parseUpdateConfigFields('just some text\nno colons here')).toEqual({});
+  });
+});
+
+describe('resolveUpdateConfigPath — matches electron-updater ElectronAppAdapter', () => {
+  it('uses the app path + dev-app-update.yml when not packaged', () => {
+    // The mock sets isPackaged:false + getAppPath:'/app/path'. The bug being
+    // guarded against was reading app.appUpdateConfigPath (undefined on Electron's
+    // global app) instead of deriving the path ourselves.
+    expect(resolveUpdateConfigPath()).toBe('/app/path/dev-app-update.yml');
   });
 });
