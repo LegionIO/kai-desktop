@@ -143,13 +143,30 @@ describe('resolveStreamConfig', () => {
     expect(resolved.profileKey).toBe('__default__');
   });
 
-  it('an explicit thread model key overrides the profile primary', () => {
+  it('a thread model key overrides the DEFAULT (implicit) profile primary', () => {
     const config = makeConfig({
       profiles: [{ key: 'p1', name: 'P1', primaryModelKey: 'claude', fallbackModelKeys: [] }] as AppConfig['profiles'],
       defaultProfileKey: 'p1',
     });
+    // threadProfileKey is null here (only a global default) → not an EXPLICIT
+    // profile request, so a manual model override still applies.
     const resolved = resolveStreamConfig(config, { ...baseOpts, threadModelKey: 'gpt' })!;
     expect(resolved.primaryModel.key).toBe('gpt');
+  });
+
+  it('an EXPLICIT profile ignores a co-present threadModelKey (profile owns its primary)', () => {
+    // A stale automation rule can carry both profileKey + modelKey. Under an
+    // explicitly-requested profile, the profile primary wins so the hidden model
+    // key can't silently override it.
+    const config = makeConfig({
+      profiles: [{ key: 'p1', name: 'P1', primaryModelKey: 'claude', fallbackModelKeys: [] }] as AppConfig['profiles'],
+    });
+    const resolved = resolveStreamConfig(config, {
+      threadModelKey: 'gpt',
+      threadProfileKey: 'p1',
+      fallbackEnabled: true,
+    })!;
+    expect(resolved.primaryModel.key).toBe('claude');
   });
 
   it('excludes the RESOLVED primary from the fallback list even when the requested key was stale', () => {

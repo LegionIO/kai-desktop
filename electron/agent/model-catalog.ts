@@ -158,8 +158,14 @@ export function resolveStreamConfig(
     };
   }
 
-  // 2. Resolve primary model: manual override → profile's primary model
-  const primaryModelKey = opts.threadModelKey ?? profile.primaryModelKey;
+  // 2. Resolve primary model. A manual model override applies ONLY when no
+  //    explicit profile is active — a profile owns its primary + fallback chain,
+  //    so a stale/hidden threadModelKey (e.g. an old automation rule that stored
+  //    both profileKey and modelKey) must NOT override the profile's primary.
+  //    `explicitProfile` = the caller asked for a specific profile (not the
+  //    synthesized '__default__' and not the '__none__' skip sentinel).
+  const explicitProfile = !skipProfile && !!opts.threadProfileKey && profile.key !== '__default__';
+  const primaryModelKey = explicitProfile ? profile.primaryModelKey : (opts.threadModelKey ?? profile.primaryModelKey);
   const primaryModel = catalog.byKey.get(primaryModelKey) ?? catalog.defaultEntry;
   if (!primaryModel) return null;
 
