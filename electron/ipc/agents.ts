@@ -1658,6 +1658,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
           maxCrashesPerDay: payload.config?.maxCrashesPerDay ?? 5,
           customArgs: payload.config?.customArgs,
           env: payload.config?.env,
+          // Persist the requested route so the agent runs under its own
+          // model/profile instead of silently inheriting source/global routing.
+          ...(payload.config?.modelKey ? { modelKey: payload.config.modelKey } : {}),
+          ...(payload.config?.profileKey ? { profileKey: payload.config.profileKey } : {}),
         },
         stats: {
           tasksCompleted: 0,

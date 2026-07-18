@@ -2455,6 +2455,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           }
           if (event.type === 'model-fallback') {
+            // A mid-stream fallback restarts the response on the next model —
+            // drop the failed partial so post-receive hooks / AssistantMessage
+            // don't get the failed + successful variants concatenated (matching
+            // the renderer + persistence + other collectors).
+            accumulatedResponseText = '';
             const fbData = event.data as { toModelKey?: string } | undefined;
             if (fbData?.toModelKey && streamConfig) {
               const fallbackEntry = streamConfig.fallbackModels.find((m) => m.key === fbData.toModelKey);

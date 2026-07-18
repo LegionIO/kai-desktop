@@ -72,7 +72,14 @@ export function auxChainWithPrimary(
     modelConfig: primary,
   } as ModelCatalogEntry;
   if (!opts?.config) return [primaryEntry];
-  const rest = resolveAuxModelChain(opts.config).filter((e) => e.modelConfig.modelName !== primary.modelName);
+  // Dedupe by FULL provider/endpoint/model identity, not modelName alone — the
+  // same modelName reached through a different provider or endpoint (distinct
+  // credentials + availability) is a valid cross-provider fallback and must be
+  // kept.
+  const identity = (c: ModelCatalogEntry['modelConfig']): string =>
+    `${c.provider}|${(c as { apiEndpoint?: string }).apiEndpoint ?? ''}|${c.modelName}`;
+  const primaryId = identity(primary);
+  const rest = resolveAuxModelChain(opts.config).filter((e) => identity(e.modelConfig) !== primaryId);
   return [primaryEntry, ...rest];
 }
 
