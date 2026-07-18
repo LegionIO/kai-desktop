@@ -44,6 +44,22 @@ describe('runWithModelFallback', () => {
     expect(fn).toHaveBeenCalledTimes(2); // both on model a; never reached b
   });
 
+  it('stops retrying when the abort signal fires during the backoff', async () => {
+    const controller = new AbortController();
+    // Every attempt is transient; abort shortly after the first failure so the
+    // backoff sleep resolves as aborted and no further attempts run.
+    const fn = vi.fn().mockRejectedValue(transient());
+    setTimeout(() => controller.abort(), 10);
+    await expect(
+      runWithModelFallback([entry('a'), entry('b')], fn, {
+        maxRetriesPerModel: 5,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toBeDefined();
+    // Aborted mid-backoff → far fewer than (2 models * 6 attempts) calls.
+    expect(fn.mock.calls.length).toBeLessThan(4);
+  });
+
   it('throws immediately on a non-transient error (no fallback)', async () => {
     const fn = vi.fn().mockRejectedValue(permanent());
     await expect(runWithModelFallback([entry('a'), entry('b')], fn)).rejects.toThrow('bad request');

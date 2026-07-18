@@ -365,8 +365,12 @@ function resolveAgentStreamConfig(
   });
   // Resolved keys for propagating into nested sub-agents' execution context: the
   // effective profile (explicit/source/global default) and the primary model.
+  // '__none__' means an explicit model route with NO profile — keep it null so a
+  // nested sub_agent (which prioritizes parentProfileKey) doesn't switch to the
+  // global default profile. Only fall to the global default when no profile
+  // preference was expressed at all (threadProfileKey === null).
   const effectiveProfileKey =
-    threadProfileKey && threadProfileKey !== '__none__' ? threadProfileKey : (cfg?.defaultProfileKey ?? null);
+    threadProfileKey === '__none__' ? null : (threadProfileKey ?? cfg?.defaultProfileKey ?? null);
   return {
     streamConfig,
     profileKey: effectiveProfileKey,

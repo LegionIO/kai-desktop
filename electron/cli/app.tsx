@@ -579,12 +579,12 @@ export function App({
           // serving the turn in the banner.
           const fb = e.data as { toModel?: string; discardPartialAssistant?: boolean } | undefined;
           if (fb?.toModel) setFallbackModelLabel(fb.toModel);
-          // If the runtime discarded the partial output before failing over,
-          // drop what we've streamed so we don't show a superseded fragment.
-          if (fb?.discardPartialAssistant) {
-            streamingRef.current = '';
-            setTurns((prev) => [...prev]);
-          }
+          // A mid-stream fallback restarts the response on the next model. Always
+          // drop the streamed partial so the failed attempt isn't concatenated
+          // with the retry — regardless of the discardPartialAssistant flag (a
+          // transient fallback sets preserveErroredVariant, not discard).
+          streamingRef.current = '';
+          setTurns((prev) => [...prev]);
           break;
         }
         case 'error':

@@ -13,7 +13,7 @@
 import type { LanguageModel } from 'ai';
 import { generateText } from 'ai';
 import type { AppConfig } from '../config/schema.js';
-import { classifyError } from './retry.js';
+import { classifyError, calculateDelay } from './retry.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import { resolveStreamConfig, type ModelCatalogEntry } from './model-catalog.js';
 
@@ -77,7 +77,7 @@ export function auxChainWithPrimary(
   // credentials + availability) is a valid cross-provider fallback and must be
   // kept.
   const identity = (c: ModelCatalogEntry['modelConfig']): string =>
-    `${c.provider}|${(c as { apiEndpoint?: string }).apiEndpoint ?? ''}|${c.modelName}`;
+    `${c.provider}|${(c as { endpoint?: string }).endpoint ?? ''}|${c.modelName}`;
   const primaryId = identity(primary);
   const rest = resolveAuxModelChain(opts.config).filter((e) => identity(e.modelConfig) !== primaryId);
   return [primaryEntry, ...rest];
@@ -92,6 +92,22 @@ export type AuxFallbackOpts = {
   /** Short label for logs. */
   label?: string;
 };
+
+/** Sleep for `ms`, resolving early to `true` if `signal` aborts (else `false`). */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(false);
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 /**
  * Run `fn(model)` against each entry in `chain`, retrying a transient error on
@@ -132,8 +148,17 @@ export async function runWithModelFallback<T>(
         lastError = error;
         if (opts?.abortSignal?.aborted) throw error;
         const info = classifyError(error);
-        // Retry the SAME model while transient retries remain.
-        if (info.isTransient && attempt < maxRetries) continue;
+        // Retry the SAME model while transient retries remain — after an
+        // (abortable) backoff so a brief 429/503/Retry-After outage can clear
+        // instead of burning all retries instantly.
+        if (info.isTransient && attempt < maxRetries) {
+          const delay = calculateDelay(attempt, info, 500, 8000);
+          if (delay > 0) {
+            const aborted = await abortableSleep(delay, opts?.abortSignal);
+            if (aborted) throw error;
+          }
+          continue;
+        }
         // Transient but out of same-model retries → advance to the next model.
         // Non-transient → do NOT fall back (it'd fail the same way); rethrow.
         if (info.isTransient && i < chain.length - 1) {
@@ -169,7 +194,14 @@ export async function auxGenerateText(
   if (chain.length === 0) return null;
   const result = await runWithModelFallback(
     chain,
-    async (model) => generateText({ ...build, model } as Parameters<typeof generateText>[0]),
+    async (model) =>
+      generateText({
+        ...build,
+        model,
+        // Forward the abort signal into the provider request so an in-flight
+        // call is actually cancelled at the deadline (not just between attempts).
+        ...(opts?.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+      } as Parameters<typeof generateText>[0]),
     opts,
   );
   return { text: typeof result.text === 'string' ? result.text : '' };

@@ -1833,8 +1833,18 @@ export async function* streamWithFallback(
             // cancel). A non-transient error (bad request, auth, content) stays
             // terminal and is yielded below. The partial+error is preserved as
             // its own variant so the user can see the failed attempt.
-            const info = classifyError(event.error ?? '');
-            if (info.isTransient) {
+            // Prefer the event's STRUCTURED status/category (streamAgentResponse
+            // classified the raw error) over re-parsing the message string — a
+            // 503 with a generic message would otherwise look non-transient.
+            const evStatus = (event as { errorStatusCode?: number }).errorStatusCode;
+            const evCategory = (event as { errorCategory?: string }).errorCategory;
+            const transientCategories = new Set(['rate-limit', 'overload', 'server-error', 'timeout', 'network']);
+            const info =
+              evStatus !== undefined
+                ? classifyError({ status: evStatus, message: event.error ?? '' })
+                : classifyError(event.error ?? '');
+            const isTransient = info.isTransient || (evCategory ? transientCategories.has(evCategory) : false);
+            if (isTransient) {
               lastError = event.error ?? 'Unknown error';
               fallbackReason = 'transient';
               preserveErroredVariant = true;
