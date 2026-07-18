@@ -35,6 +35,7 @@ export type PluginPermission =
   | 'network:fetch'
   | 'auth:window'
   | 'http:listen'
+  | 'http:listen:network'
   | 'notifications:send'
   | 'conversations:read'
   | 'conversations:write'
@@ -66,11 +67,17 @@ export type PluginPermission =
  *                            password, TLS key paths (vs. the redacted safe config).
  *   - 'agent:hook'         — full MITM on the agent loop (observe/block/modify
  *                            prompts, tool args + results); ≈ arbitrary tool exec.
+ *   - 'http:listen:network'— bind the plugin's http.listen server to a
+ *                            non-loopback interface (0.0.0.0/::/a LAN address),
+ *                            exposing its unauthenticated, plugin-controlled
+ *                            handler to the local network instead of just this
+ *                            machine.
  */
 export const DANGEROUS_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new Set<PluginPermission>([
   'exec:whitelisted',
   'config:read-secrets',
   'agent:hook',
+  'http:listen:network',
 ]);
 
 export type PluginApprovalRecord = {

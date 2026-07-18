@@ -11,14 +11,20 @@ import { describe, it, expect } from 'vitest';
 import { DANGEROUS_PLUGIN_PERMISSIONS } from '../types.js';
 
 describe('DANGEROUS_PLUGIN_PERMISSIONS', () => {
-  it('contains exactly the code-execution / secret-read capabilities that require consent', () => {
-    expect([...DANGEROUS_PLUGIN_PERMISSIONS].sort()).toEqual(['agent:hook', 'config:read-secrets', 'exec:whitelisted']);
+  it('contains exactly the code-execution / secret-read / network-exposure capabilities that require consent', () => {
+    expect([...DANGEROUS_PLUGIN_PERMISSIONS].sort()).toEqual([
+      'agent:hook',
+      'config:read-secrets',
+      'exec:whitelisted',
+      'http:listen:network',
+    ]);
   });
 
   it('includes each individually (a narrowing that drops one is a consent-gate regression)', () => {
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('exec:whitelisted')).toBe(true); // run binaries
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('config:read-secrets')).toBe(true); // read provider keys/secrets
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('agent:hook')).toBe(true); // MITM the agent loop
+    expect(DANGEROUS_PLUGIN_PERMISSIONS.has('http:listen:network')).toBe(true); // expose local server to LAN
   });
 
   it('does NOT flag a benign permission as dangerous', () => {

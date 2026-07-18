@@ -56,6 +56,11 @@ const PERMISSION_DESCRIPTIONS: Record<
     icon: Bot,
     level: 'high',
   },
+  'http:listen:network': {
+    label: 'Expose its local HTTP server to other devices on your network',
+    icon: Wifi,
+    level: 'high',
+  },
   'fs:scoped-read': { label: 'Read files within declared directories', icon: Eye, level: 'medium' },
   // ── Medium risk ──
   'messages:hook': { label: 'Intercept messages before/after send', icon: MessageSquare, level: 'medium' },

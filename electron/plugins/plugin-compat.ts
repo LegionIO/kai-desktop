@@ -40,6 +40,7 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'network:fetch',
   'auth:window',
   'http:listen',
+  'http:listen:network',
   'notifications:send',
   'conversations:read',
   'conversations:write',

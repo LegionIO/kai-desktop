@@ -76,6 +76,7 @@ const KNOWN_PERMISSIONS = [
   'network:fetch',
   'auth:window',
   'http:listen',
+  'http:listen:network',
   'notifications:send',
   'conversations:read',
   'conversations:write',

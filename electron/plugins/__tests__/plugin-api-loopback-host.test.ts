@@ -2,12 +2,14 @@
  * Tests for the loopback-host guard on a plugin's api.http.listen bind address.
  * A plugin holding the `http:listen` permission may run a LOCAL server, but must
  * not bind to a routable/wildcard interface and expose its unauthenticated
- * handler to the LAN. isLoopbackHost is the pure gate enforcing that.
+ * handler to the LAN — unless it also declares the dangerous
+ * `http:listen:network` permission. isLoopbackHost / isListenHostAllowed are
+ * the pure gates enforcing that.
  */
 import { describe, it, expect } from 'vitest';
 import { __internal } from '../plugin-api.js';
 
-const { isLoopbackHost } = __internal;
+const { isLoopbackHost, isListenHostAllowed } = __internal;
 
 describe('isLoopbackHost — plugin http.listen bind guard', () => {
   it('accepts the canonical loopback hosts', () => {
@@ -47,5 +49,24 @@ describe('isLoopbackHost — plugin http.listen bind guard', () => {
   it('rejects addresses that merely start with 127 but are not 127.0.0.0/8', () => {
     expect(isLoopbackHost('1270.0.0.1')).toBe(false);
     expect(isLoopbackHost('127.0.0.1.evil.com')).toBe(false);
+  });
+});
+
+describe('isListenHostAllowed — permission-gated escape hatch', () => {
+  it('always allows loopback hosts, with or without the network permission', () => {
+    expect(isListenHostAllowed('127.0.0.1', [])).toBe(true);
+    expect(isListenHostAllowed('localhost', ['http:listen'])).toBe(true);
+    expect(isListenHostAllowed('127.0.0.1', ['http:listen', 'http:listen:network'])).toBe(true);
+  });
+
+  it('rejects a wildcard/LAN bind when the plugin lacks http:listen:network', () => {
+    expect(isListenHostAllowed('0.0.0.0', ['http:listen'])).toBe(false);
+    expect(isListenHostAllowed('192.168.1.10', [])).toBe(false);
+  });
+
+  it('allows a wildcard/LAN bind only when the plugin declares http:listen:network', () => {
+    expect(isListenHostAllowed('0.0.0.0', ['http:listen', 'http:listen:network'])).toBe(true);
+    expect(isListenHostAllowed('192.168.1.10', ['http:listen:network'])).toBe(true);
+    expect(isListenHostAllowed('::', ['http:listen:network'])).toBe(true);
   });
 });
