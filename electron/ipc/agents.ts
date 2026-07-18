@@ -350,7 +350,14 @@ function resolveAgentStreamConfig(
     sourceProfileKey: source?.selectedProfileKey ?? null,
     sourceModelKey: source?.selectedModelKey ?? null,
   });
-  const profileActive = threadProfileKey !== null && threadProfileKey !== '__none__';
+  // Fallback is on when a profile is active — explicitly (agent/source) OR via
+  // the global defaultProfileKey that resolveStreamConfig will select. Without
+  // this, a task/reviewer running under the default profile got its primary but
+  // NOT its fallback chain.
+  const cfg = config as { defaultProfileKey?: string | null };
+  const profileActive =
+    (threadProfileKey !== null && threadProfileKey !== '__none__') ||
+    (threadProfileKey === null && !!cfg?.defaultProfileKey);
   return resolveStreamConfig(config as Parameters<typeof resolveStreamConfig>[0], {
     threadProfileKey,
     threadModelKey,

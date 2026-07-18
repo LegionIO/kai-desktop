@@ -603,6 +603,20 @@ async function runAgentAction(
           pendingToolCalls.delete(ev.toolCallId);
         } else if (ev.type === 'error') {
           error = ev.error ?? 'Unknown error';
+        } else if (ev.type === 'model-fallback') {
+          // A mid-stream fallback restarts the response on the next model. The
+          // failed attempt's partial text + tool parts have already accumulated
+          // into the buffers that build the PERSISTED assistant message; drop them
+          // so the persisted/collected result is the SUCCESSFUL retry only, not a
+          // failed-prefix + success concatenation. (The event was already
+          // broadcast above; we only reset the local accumulation, not the wire.)
+          text = '';
+          contentParts.length = 0;
+          toolPartById.clear();
+          toolCalls.length = 0;
+          pendingToolCalls.clear();
+          lastEventWasToolResult = false;
+          error = null;
         }
       }
     } catch (streamErr) {

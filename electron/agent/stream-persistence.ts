@@ -180,7 +180,9 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
         // persistAccumulatedReturningHead deletes the accumulator + writes the
         // sibling with parentId = acc.parentId (the submit head), so this variant
         // is a sibling of the eventual success rather than its ancestor.
-        persistAccumulatedReturningHead(appHome, conversationId);
+        // keepRunning: the retry is still in flight — don't flip the conversation
+        // to 'idle' or a concurrent automation could fork the branch mid-fallback.
+        persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true });
         // Re-seed for the retry, KEEPING the original parent so the next attempt
         // is a sibling (not chained after this errored one).
         accumulators.set(conversationId, {
@@ -255,13 +257,19 @@ function persistAccumulated(appHome: string, conversationId: string): boolean {
  * Core persist logic. Returns the new conversation head id (the persisted
  * assistant message) when content was written, else null.
  */
-function persistAccumulatedReturningHead(appHome: string, conversationId: string): string | null {
+function persistAccumulatedReturningHead(
+  appHome: string,
+  conversationId: string,
+  opts?: { keepRunning?: boolean },
+): string | null {
   const acc = accumulators.get(conversationId);
   accumulators.delete(conversationId);
   if (!acc || !acc.sawContent || acc.parts.length === 0) {
     // Nothing to persist, but agent:submit marked the conversation 'running' for
     // this turn — reset it so it doesn't look stuck busy, and broadcast so
-    // non-active GUI/web clients drop the running indicator too.
+    // non-active GUI/web clients drop the running indicator too. (Unless the
+    // caller says the turn is still running — a mid-stream fallback variant save.)
+    if (opts?.keepRunning) return null;
     try {
       const conv = readConversation(appHome, conversationId);
       if (conv && conv.runStatus === 'running') {
@@ -278,9 +286,11 @@ function persistAccumulatedReturningHead(appHome: string, conversationId: string
     // Parent on the head captured at submit so a mid-run branch change
     // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
     // in options falls back to the current head, so only pass it when known.
-    // Reset runStatus to idle: agent:submit set it 'running' for the turn.
+    // runStatus: keep 'running' when the caller is saving an intermediate
+    // errored variant mid-fallback (the retry is still in flight) — otherwise a
+    // concurrent automation could see 'idle' and fork the branch; else 'idle'.
     const updated = appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
-      runStatus: 'idle',
+      runStatus: opts?.keepRunning ? 'running' : 'idle',
       ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
     });
     return updated?.headId ?? null;

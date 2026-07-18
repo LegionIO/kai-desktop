@@ -2331,7 +2331,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           primaryModel: modelEntry,
           // Thread this turn's active profile/model so a sub_agent tool can
           // inherit the parent's profile + fallback chain (see sub-agent.ts).
-          parentProfileKey: profileKey ?? null,
+          // Fall back to the global defaultProfileKey when the turn has no
+          // explicit profile — the turn ran under that default, so the sub-agent
+          // should inherit it rather than dropping to the single-model path.
+          parentProfileKey: profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
           parentModelKey: modelEntry?.key ?? modelKey ?? null,
           modelAuth: resolution.modelAuth,
           conversationMetadata: convMetadata,

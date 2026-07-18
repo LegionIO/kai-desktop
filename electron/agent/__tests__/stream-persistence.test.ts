@@ -203,6 +203,9 @@ describe('stream persistence accumulator', () => {
     expect(firstText).toContain('partial from model A');
     expect(firstText).toContain('internal server error'); // error annotation preserved
     expect(firstOpts.parentId).toBe('user-node');
+    // The retry is still in flight — the intermediate variant must stay 'running'
+    // so a concurrent automation can't fork the branch mid-fallback.
+    expect(firstOpts.runStatus).toBe('running');
 
     // Attempt 2 (retry on model B) streams the successful reply + done.
     feedWithParent({ conversationId: 'v1', type: 'text-delta', text: 'full reply from model B' }, 'user-node');
@@ -218,6 +221,8 @@ describe('stream persistence accumulator', () => {
     expect(secondText).not.toContain('partial from model A'); // fresh accumulator
     // Both variants are siblings under the SAME parent.
     expect(secondOpts.parentId).toBe('user-node');
+    // The successful final turn resets to idle (retry finished).
+    expect(secondOpts.runStatus).toBe('idle');
   });
 
   it('model-fallback with discardPartialAssistant drops the partial (no sibling persisted)', () => {

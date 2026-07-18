@@ -130,23 +130,27 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
 
   let stream: AsyncGenerator<StreamEvent>;
 
+  // Sub-agents spawned inside this run inherit the profile the run used —
+  // including the global defaultProfileKey when no explicit profile was passed.
+  const parentProfileKey =
+    options.profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null;
+  const parentModelKey = options.modelKey ?? streamConfig.primaryModel.key;
+
   if (streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0) {
     stream = streamWithFallback(conversationId, sanitized, streamConfig, configForStream, pluginTools ?? [], dbPath, {
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
       isHeadless: true,
-      // Let a sub_agent spawned inside this automation/plugin run inherit the
-      // profile + fallback chain this run is using.
-      parentProfileKey: options.profileKey ?? null,
-      parentModelKey: options.modelKey ?? streamConfig.primaryModel.key,
+      parentProfileKey,
+      parentModelKey,
     });
   } else {
     stream = streamAgentResponse(conversationId, sanitized, modelConfig, configForStream, pluginTools ?? [], dbPath, {
       reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
       abortSignal: options.abortSignal,
       isHeadless: true,
-      parentProfileKey: options.profileKey ?? null,
-      parentModelKey: options.modelKey ?? streamConfig.primaryModel.key,
+      parentProfileKey,
+      parentModelKey,
     });
   }
 
@@ -217,6 +221,17 @@ async function collectStreamResult(
       pendingToolCalls.delete(event.toolCallId);
     } else if (event.type === 'error') {
       error = event.error ?? 'Unknown error';
+    } else if (event.type === 'model-fallback') {
+      // A mid-stream fallback restarts the response on the next model. The failed
+      // attempt's partial text + tool-calls have already been emitted into this
+      // buffer; drop them so the collected result is the SUCCESSFUL retry only,
+      // not a failed-prefix + success concatenation. (The renderer separately
+      // preserves the errored attempt as its own variant.)
+      text = '';
+      toolCalls.length = 0;
+      pendingToolCalls.clear();
+      lastEventWasToolResult = false;
+      error = null;
     }
   }
 

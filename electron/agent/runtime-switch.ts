@@ -15,7 +15,7 @@
  */
 
 import { estimateToolTokens } from './compaction.js';
-import { auxAgentGenerate, auxChainWithPrimary } from './generate-fallback.js';
+import { auxAgentGenerate } from './generate-fallback.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { RUNTIME_LABELS } from './runtime/types.js';
 import { SWITCH_SUMMARY_PROMPT } from './prompts.js';
@@ -237,7 +237,7 @@ async function summarizeTranscript(
         maxSteps: 1,
         ...(abortSignal ? { abortSignal } : {}),
       },
-      { chain: auxChainWithPrimary(modelConfig), label: 'runtime-switch', abortSignal },
+      { primaryModelConfig: modelConfig, label: 'runtime-switch', abortSignal },
     );
 
     const summaryText = gen ? gen.text.trim() : null;

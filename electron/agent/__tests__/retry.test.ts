@@ -70,6 +70,15 @@ describe('classifyError', () => {
     // A plain 4xx-style message stays non-transient.
     expect(classifyError('400 bad request').isTransient).toBe(false);
   });
+
+  it('honors an explicit isRetryable marker and "unable to process" gateway text', () => {
+    // Some SDKs/gateways set isRetryable on a statusless error object.
+    expect(classifyError({ isRetryable: true, message: 'weird' }).isTransient).toBe(true);
+    // Gateways often return "unable to process" for a transient dip.
+    expect(classifyError('Unable to process your request').isTransient).toBe(true);
+    // isRetryable:false / absent stays governed by the other rules.
+    expect(classifyError({ isRetryable: false, message: 'nope' }).isTransient).toBe(false);
+  });
 });
 
 describe('calculateDelay', () => {

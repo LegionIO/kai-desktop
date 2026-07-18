@@ -56,6 +56,11 @@ export type SubAgentRunOptions = {
    *  fallback + errored variants); absent → single-model streamAgentResponse
    *  with `modelConfig`. */
   streamConfig?: ResolvedStreamConfig;
+  /** The sub-agent's OWN resolved profile/model keys — threaded to the tool
+   *  execution context so a nested `sub_agent` call inherits this sub-agent's
+   *  profile/model (not the global default). */
+  profileKey?: string | null;
+  modelKey?: string | null;
   tools: ToolDefinition[];
   dbPath: string;
   abortSignal?: AbortSignal;
@@ -181,6 +186,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     config,
     modelConfig,
     streamConfig,
+    profileKey,
+    modelKey,
     tools,
     dbPath,
     abortSignal,
@@ -320,7 +327,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // Provider-native tools execute in-provider and never hit
     // onToolExecutionStart, so their args must not be suppressed (nothing would
     // un-suppress them → stuck {pending}).
-    const subProviderToolNames = getProviderDefinedToolNames(modelConfig);
+    // Recomputed on model-fallback (a cross-provider fallback changes which
+    // tools are provider-defined vs wrapped-local).
+    let subProviderToolNames = getProviderDefinedToolNames(modelConfig);
     const subHookRewrittenArgs = new Map<string, unknown>();
     // Sub-agent runtime has no exec/stream id pairing map. To reconcile a
     // possible id mismatch, the stream loop records suppressed stream ids per
@@ -413,6 +422,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
       const subStreamOpts = {
         abortSignal,
+        // Nested sub_agent inheritance: this sub-agent's own profile/model.
+        parentProfileKey: profileKey ?? null,
+        parentModelKey: modelKey ?? null,
         emitEvent: (event) => {
           if (event.type === 'tool-progress') {
             subObserver?.onToolProgress({
@@ -583,6 +595,22 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       for await (const event of stream) {
         if (event.type === 'text-delta' && event.text) {
           turnText += event.text;
+        } else if (event.type === 'model-fallback') {
+          // A mid-stream fallback restarts the response on the next model. Drop
+          // this turn's accumulated partial text so the persisted assistant
+          // message is the SUCCESSFUL retry only, not a failed-prefix + success
+          // concatenation. Only the LOCAL accumulation is reset — the event is
+          // still enriched, broadcast, and yielded below like any other.
+          turnText = '';
+          // Cross-provider fallback: recompute which tools are provider-defined
+          // for the new model, so enforcing-hook wrapping (below) treats the
+          // fallback provider's native tools correctly (else args stick {pending}).
+          const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
+          const nextEntry = toKey
+            ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
+              (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
+            : undefined;
+          if (nextEntry) subProviderToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
         }
         const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
         // Suppress raw args on tool-call events until PreToolUse resolves; the

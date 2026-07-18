@@ -206,12 +206,12 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
     }
 
     case 'model-fallback': {
-      // If the runtime discarded the partial output before failing over, drop
-      // what we've streamed so a superseded fragment doesn't render. (The banner
-      // model-label update is a side effect the caller handles.) Mirrors app.tsx.
-      const fb = event.data as { discardPartialAssistant?: boolean } | undefined;
-      if (fb?.discardPartialAssistant) return { ...state, streaming: '' };
-      return state;
+      // A mid-stream fallback restarts the response on the next model. Always drop
+      // the in-progress streaming buffer so a superseded failed-attempt fragment
+      // doesn't render or concatenate with the retry — regardless of the runtime's
+      // discardPartialAssistant flag. (The banner model-label update is a side
+      // effect the caller handles.) Mirrors app.tsx.
+      return { ...state, streaming: '' };
     }
 
     default:

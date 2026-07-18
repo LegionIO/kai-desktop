@@ -37,6 +37,12 @@ export function classifyError(error: unknown): RetryableErrorInfo {
   const statusCode = extractStatusCode(error);
   const retryAfterMs = extractRetryAfterMs(error);
 
+  // Explicit provider marker: some SDKs/gateways set `isRetryable: true` on the
+  // error object for a transient failure that carries no recognizable status.
+  if (error && typeof error === 'object' && (error as { isRetryable?: unknown }).isRetryable === true) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'network', message };
+  }
+
   // Auth errors — not transient
   if (statusCode === 401 || statusCode === 403) {
     return { statusCode, retryAfterMs, isTransient: false, category: 'auth', message };
@@ -113,7 +119,8 @@ export function classifyError(error: unknown): RetryableErrorInfo {
     lowerMessage.includes('gateway timeout') ||
     /\b(500|502|503|504)\b/.test(lowerMessage) ||
     lowerMessage.includes('server had an error') ||
-    lowerMessage.includes('server_error')
+    lowerMessage.includes('server_error') ||
+    lowerMessage.includes('unable to process')
   ) {
     return { statusCode, retryAfterMs, isTransient: true, category: 'server-error', message };
   }

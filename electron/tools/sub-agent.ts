@@ -42,6 +42,8 @@ const subAgentState = new Map<
     config: AppConfig;
     modelConfig: LLMModelConfig;
     streamConfig?: ResolvedStreamConfig;
+    profileKey?: string | null;
+    modelKey?: string | null;
     tools: ToolDefinition[];
     dbPath: string;
     parentConversationId: string;
@@ -90,7 +92,18 @@ async function resumeSubAgent(
   message: string,
   state: NonNullable<ReturnType<typeof subAgentState.get>>,
 ): Promise<void> {
-  const { messages, config, modelConfig, streamConfig, tools, dbPath, parentConversationId, parentToolCallId } = state;
+  const {
+    messages,
+    config,
+    modelConfig,
+    streamConfig,
+    profileKey,
+    modelKey,
+    tools,
+    dbPath,
+    parentConversationId,
+    parentToolCallId,
+  } = state;
 
   // Add the resume message, but DON'T broadcast it yet — gate it through
   // UserPromptSubmit first so a DLP block/modify hook can redact/deny before the
@@ -184,6 +197,8 @@ async function resumeSubAgent(
 
     const resumeStreamOpts = {
       abortSignal: localController.signal,
+      parentProfileKey: profileKey ?? null,
+      parentModelKey: modelKey ?? null,
       emitEvent: (event) => {
         broadcastEvent({ ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent);
       },
@@ -613,6 +628,8 @@ export function createSubAgentTool(
           config,
           modelConfig: modelEntry.modelConfig,
           ...(streamConfig ? { streamConfig } : {}),
+          profileKey: threadProfileKey,
+          modelKey: threadModelKey,
           tools: subAgentTools,
           dbPath,
           abortSignal: localController.signal,
@@ -697,6 +714,8 @@ export function createSubAgentTool(
             config,
             modelConfig: modelEntry.modelConfig,
             ...(streamConfig ? { streamConfig } : {}),
+            profileKey: threadProfileKey,
+            modelKey: threadModelKey,
             tools: subAgentTools,
             dbPath,
             parentConversationId: ctx.toolCallId,

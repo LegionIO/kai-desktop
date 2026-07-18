@@ -173,24 +173,28 @@ describe('reduceCliStreamEvent — terminal + misc', () => {
     expect(s.turnSettled).toBe(true);
   });
 
-  it('ignores non-transcript events (model-fallback, unknown) without changing state', () => {
+  it('model-fallback clears the superseded streaming text (leaving other state intact)', () => {
     const start = run([
       { type: 'user-message', text: 'q' },
       { type: 'text-delta', text: 'x' },
     ]);
     const after = reduceCliStreamEvent(start, { type: 'model-fallback', data: { toModel: 'gpt-5.6' } });
-    expect(after).toEqual(start);
+    // Only the in-progress streaming buffer is dropped; the rest of state matches.
+    expect(after.streaming).toBe('');
+    expect({ ...after, streaming: start.streaming }).toEqual(start);
   });
 
-  it('model-fallback with discardPartialAssistant clears the superseded streaming text', () => {
+  it('model-fallback clears the superseded streaming text regardless of the discardPartialAssistant flag', () => {
     const start = run([
       { type: 'user-message', text: 'q' },
       { type: 'text-delta', text: 'superseded partial' },
     ]);
     expect(start.streaming).toBe('superseded partial');
+    // Even WITHOUT discardPartialAssistant (e.g. preserveErroredVariant), the CLI
+    // must not concatenate the failed partial with the retry.
     const after = reduceCliStreamEvent(start, {
       type: 'model-fallback',
-      data: { toModel: 'gpt-5.6', discardPartialAssistant: true },
+      data: { toModel: 'gpt-5.6' },
     });
     expect(after.streaming).toBe('');
   });

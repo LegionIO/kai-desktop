@@ -290,6 +290,13 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
           );
         }
         void client.invoke('agent:reject-tool', e.toolCallId).catch(() => {});
+      } else if (e.type === 'model-fallback') {
+        // A mid-stream fallback restarts the response on the next model. Drop the
+        // failed attempt's accumulated text so the collected `--json` reply is the
+        // SUCCESSFUL retry only, not a failed-prefix + success concatenation.
+        // (Non-JSON output is written straight to stdout and can't be un-printed;
+        // only the accumulation buffer is reset.)
+        if (json) collected = '';
       } else if (e.type === 'error') {
         errored = e.error ?? 'unknown';
         if (!json) process.stderr.write(`\n[error: ${stripControl(errored)}]\n`);
