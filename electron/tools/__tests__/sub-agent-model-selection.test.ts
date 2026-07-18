@@ -49,6 +49,30 @@ describe('resolveSubAgentModelSelection — profile/model precedence', () => {
     });
   });
 
+  it('the Settings default-model override beats implicit parent inheritance', () => {
+    // An explicit subAgents.defaultModel is a user choice → wins over the parent
+    // profile/model that would otherwise be inherited.
+    expect(
+      resolveSubAgentModelSelection({
+        ...base,
+        defaultModel: 'override-m',
+        parentProfileKey: 'parent-profile',
+        parentModelKey: 'parent-m',
+      }),
+    ).toEqual({ threadProfileKey: '__none__', threadModelKey: 'override-m' });
+  });
+
+  it('an explicit call profile/model still beats the default-model override', () => {
+    expect(resolveSubAgentModelSelection({ ...base, profile: 'fast', defaultModel: 'override-m' })).toEqual({
+      threadProfileKey: 'fast',
+      threadModelKey: null,
+    });
+    expect(resolveSubAgentModelSelection({ ...base, model: 'call-m', defaultModel: 'override-m' })).toEqual({
+      threadProfileKey: '__none__',
+      threadModelKey: 'call-m',
+    });
+  });
+
   it('4. inherits the parent model when parent had no profile', () => {
     expect(resolveSubAgentModelSelection({ ...base, parentProfileKey: null, parentModelKey: 'parent-model' })).toEqual({
       threadProfileKey: '__none__',

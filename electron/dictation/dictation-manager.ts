@@ -1946,21 +1946,33 @@ async function maybeCleanupFinalTranscript(text: string): Promise<string> {
   const startedAt = Date.now();
 
   try {
-    const result = await withTimeout(
-      auxGenerateText(
-        {
-          system: FINAL_CLEANUP_PROMPT,
-          prompt: ['Surrounding text: unavailable', 'Dictionary entries: none', '', 'Raw transcript:', raw].join('\n'),
-          temperature: 0,
-          maxRetries: 1,
-          maxOutputTokens: Math.max(128, Math.min(800, Math.ceil(raw.length / 2))),
-          timeout: { totalMs: FINAL_CLEANUP_TIMEOUT_MS },
-        },
-        { config: fullConfig, label: 'dictation' },
-      ),
-      FINAL_CLEANUP_TIMEOUT_MS + 500,
-      'Final transcript cleanup',
-    );
+    // Abort the fallback chain when the overall deadline passes, so retries /
+    // later fallback models don't keep issuing billable requests after
+    // withTimeout has already rejected and raw dictation was returned.
+    const cleanupAbort = new AbortController();
+    const abortTimer = setTimeout(() => cleanupAbort.abort(), FINAL_CLEANUP_TIMEOUT_MS + 500);
+    let result: { text: string } | null;
+    try {
+      result = await withTimeout(
+        auxGenerateText(
+          {
+            system: FINAL_CLEANUP_PROMPT,
+            prompt: ['Surrounding text: unavailable', 'Dictionary entries: none', '', 'Raw transcript:', raw].join(
+              '\n',
+            ),
+            temperature: 0,
+            maxRetries: 1,
+            maxOutputTokens: Math.max(128, Math.min(800, Math.ceil(raw.length / 2))),
+            timeout: { totalMs: FINAL_CLEANUP_TIMEOUT_MS },
+          },
+          { config: fullConfig, label: 'dictation', abortSignal: cleanupAbort.signal },
+        ),
+        FINAL_CLEANUP_TIMEOUT_MS + 500,
+        'Final transcript cleanup',
+      );
+    } finally {
+      clearTimeout(abortTimer);
+    }
 
     if (!result) return text;
 

@@ -100,12 +100,14 @@ export function getModelChainForRole(
     displayName: primaryEntry.displayName,
   };
 
-  // Fallback is on when the session enabled it OR the session has an explicit
-  // profile selected (a profile implies its fallback chain, matching
-  // chat/sub-agent/task behavior). We DON'T auto-enable from a global
-  // defaultProfileKey — that would change behavior for sessions the user didn't
-  // opt into a profile for.
-  const fallbackOn = session.fallbackEnabled || Boolean(session.selectedProfileKey);
+  // Fallback is on when the session enabled it, OR the session has a profile
+  // selected AND fallback wasn't EXPLICITLY turned off. An explicit
+  // `fallbackEnabled: false` (user toggled it off) wins even under a profile, so
+  // the visible FallbackToggle stays authoritative. `undefined` (never set) with
+  // a profile → auto-enable the profile's chain. We DON'T auto-enable from a
+  // global defaultProfileKey — only an explicit per-session profile.
+  const fallbackOn =
+    session.fallbackEnabled === true || (session.fallbackEnabled !== false && Boolean(session.selectedProfileKey));
   if (!fallbackOn) return [primary];
 
   // Build fallback chain: profile fallbacks → global fallback

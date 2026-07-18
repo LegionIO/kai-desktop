@@ -183,7 +183,8 @@ async function resumeSubAgent(
 
     const enforcingHooks = hookDispatcher.hasEnforcingToolHooks();
     // Provider-native tools execute in-provider; never suppress their args.
-    const providerToolNames = getProviderDefinedToolNames(modelConfig);
+    // Recomputed on model-fallback (cross-provider fallback changes the set).
+    let providerToolNames = getProviderDefinedToolNames(modelConfig);
     const rewrittenArgs = new Map<string, unknown>();
     // Stream-first queue: suppressed stream ids awaiting resolution, per tool
     // name. onToolExecutionStart rebroadcasts under the queued stream id (which
@@ -320,6 +321,17 @@ async function resumeSubAgent(
     let turnText = '';
     for await (const event of stream) {
       if (event.type === 'text-delta' && event.text) turnText += event.text;
+      else if (event.type === 'model-fallback') {
+        // Mirror the initial runner: drop the failed partial + refresh the
+        // provider-tool set for the fallback model (enforcing-hook wrapping).
+        turnText = '';
+        const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
+        const nextEntry = toKey
+          ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
+            (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
+          : undefined;
+        if (nextEntry) providerToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
+      }
       const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
       // Suppress raw tool-call args until the hook resolves; publish rewritten
       // args once known (renderer upserts by toolCallId).
@@ -421,11 +433,13 @@ export function getActiveSubAgentIds(): string[] {
 /**
  * Decide which profile/model a sub-agent runs under, given the tool call's
  * explicit `profile`/`model` and the parent turn's inherited keys. Precedence:
- *   1. explicit `profile`      → that profile (may be '__none__' to force none)
- *   2. explicit `model`        → single model, no profile ('__none__')
- *   3. inherit parent profile  → parentProfileKey
- *   4. inherit parent model    → parentModelKey
- *   5. subAgents.defaultModel / global default (single model)
+ *   1. explicit `profile`            → that profile (may be '__none__' to force none)
+ *   2. explicit `model`              → single model, no profile ('__none__')
+ *   3. subAgents.defaultModel override → the Settings "Default Model Override"
+ *      is an explicit user choice, so it beats implicit parent inheritance
+ *   4. inherit parent profile         → parentProfileKey
+ *   5. inherit parent model           → parentModelKey
+ *   6. global default (single model)
  * Returns keys shaped for `resolveStreamConfig` (threadProfileKey '__none__'
  * skips profiles; threadModelKey pins a single model). Exported for tests.
  */
@@ -443,10 +457,14 @@ export function resolveSubAgentModelSelection(input: {
   if (model !== undefined) {
     return { threadProfileKey: '__none__', threadModelKey: model };
   }
+  // Explicit Settings override wins over implicit parent inheritance.
+  if (defaultModel) {
+    return { threadProfileKey: '__none__', threadModelKey: defaultModel };
+  }
   if (parentProfileKey != null && parentProfileKey !== '' && parentProfileKey !== '__none__') {
     return { threadProfileKey: parentProfileKey, threadModelKey: null };
   }
-  return { threadProfileKey: '__none__', threadModelKey: parentModelKey ?? defaultModel };
+  return { threadProfileKey: '__none__', threadModelKey: parentModelKey };
 }
 
 export function createSubAgentTool(
@@ -644,7 +662,13 @@ export function createSubAgentTool(
         });
 
         for await (const event of stream) {
-          if (event.type === 'text-delta' && 'text' in event && event.text) {
+          if (event.type === 'model-fallback') {
+            // Mid-stream fallback restarts the sub-agent response on the next
+            // model — drop the failed partial so the tool result returned to the
+            // parent is the successful retry only, not a failed-prefix + success
+            // concatenation. (The runner resets its own buffer + provider tools.)
+            fullResponse = '';
+          } else if (event.type === 'text-delta' && 'text' in event && event.text) {
             fullResponse += event.text;
             ctx.onProgress?.({
               stream: 'stdout',

@@ -342,7 +342,7 @@ function resolveAgentStreamConfig(
   config: unknown,
   agent: AgentFile | null,
   task: TaskFile | null,
-): ResolvedStreamConfig | null {
+): { streamConfig: ResolvedStreamConfig | null; profileKey: string | null; modelKey: string | null } {
   const source = task?.sourceConversationId ? readConversation(appHome, task.sourceConversationId) : null;
   const { threadProfileKey, threadModelKey } = resolveAgentModelSelection({
     agentModelKey: agent?.config?.modelKey ?? null,
@@ -358,11 +358,20 @@ function resolveAgentStreamConfig(
   const profileActive =
     (threadProfileKey !== null && threadProfileKey !== '__none__') ||
     (threadProfileKey === null && !!cfg?.defaultProfileKey);
-  return resolveStreamConfig(config as Parameters<typeof resolveStreamConfig>[0], {
+  const streamConfig = resolveStreamConfig(config as Parameters<typeof resolveStreamConfig>[0], {
     threadProfileKey,
     threadModelKey,
     fallbackEnabled: profileActive,
   });
+  // Resolved keys for propagating into nested sub-agents' execution context: the
+  // effective profile (explicit/source/global default) and the primary model.
+  const effectiveProfileKey =
+    threadProfileKey && threadProfileKey !== '__none__' ? threadProfileKey : (cfg?.defaultProfileKey ?? null);
+  return {
+    streamConfig,
+    profileKey: effectiveProfileKey,
+    modelKey: streamConfig?.primaryModel.key ?? threadModelKey,
+  };
 }
 
 function broadcastAgentChange(appHome: string): void {
@@ -471,7 +480,11 @@ async function runSingleReviewer(
 
     // Inherit the source conversation's profile/model (agent config wins) so the
     // reviewer runs under the same profile + fallback chain as the work.
-    const reviewStreamConfig = resolveAgentStreamConfig(appHome, config, agent, task);
+    const {
+      streamConfig: reviewStreamConfig,
+      profileKey: reviewProfileKey,
+      modelKey: reviewModelKey,
+    } = resolveAgentStreamConfig(appHome, config, agent, task);
     const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
     const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
     const modelEntry =
@@ -580,7 +593,11 @@ async function runSingleReviewer(
     };
 
     const reviewConvId = `review-${task.id}-${reviewerAgentId}`;
-    const reviewStreamOpts = { cwd: process.env.HOME ?? '/tmp' };
+    const reviewStreamOpts = {
+      cwd: process.env.HOME ?? '/tmp',
+      parentProfileKey: reviewProfileKey,
+      parentModelKey: reviewModelKey,
+    };
     const useReviewChain = Boolean(
       reviewStreamConfig && reviewStreamConfig.fallbackEnabled && reviewStreamConfig.fallbackModels.length > 0,
     );
@@ -1046,7 +1063,11 @@ async function startAgentRunLocked(
         // This ensures correct provider endpoint, API key, and TLS settings.
         // Inherit the source conversation's profile/model (agent config wins) so
         // the task runs under the same profile + fallback chain as the work.
-        const taskStreamConfig = resolveAgentStreamConfig(appHome, config, agent, task);
+        const {
+          streamConfig: taskStreamConfig,
+          profileKey: taskProfileKey,
+          modelKey: taskModelKey,
+        } = resolveAgentStreamConfig(appHome, config, agent, task);
         const catalog = resolveModelCatalog(config as Parameters<typeof resolveModelCatalog>[0]);
         const defaultKey = (config as { models?: { defaultModelKey?: string } })?.models?.defaultModelKey;
         const modelEntry =
@@ -1244,7 +1265,14 @@ async function startAgentRunLocked(
           },
         };
 
-        const taskStreamOpts = { cwd: cwd, abortSignal: abortController.signal };
+        const taskStreamOpts = {
+          cwd: cwd,
+          abortSignal: abortController.signal,
+          // Propagate the task's resolved route so a sub_agent invoked by the
+          // task inherits the profile/model instead of dropping to the default.
+          parentProfileKey: taskProfileKey,
+          parentModelKey: taskModelKey,
+        };
         const useTaskChain = Boolean(
           taskStreamConfig && taskStreamConfig.fallbackEnabled && taskStreamConfig.fallbackModels.length > 0,
         );

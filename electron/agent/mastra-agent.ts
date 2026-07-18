@@ -1803,7 +1803,11 @@ export async function* streamWithFallback(
         configOverride,
         tools,
         dbPath,
-        options,
+        // parentModelKey must reflect the model ACTUALLY handling this attempt,
+        // not the (possibly failed) primary — else a sub_agent spawned by a
+        // fallback model would pin the known-failing primary. Keep the caller's
+        // parentProfileKey (the profile owns the whole chain).
+        { ...options, parentModelKey: entry.key },
       );
 
       for await (const event of innerStream) {

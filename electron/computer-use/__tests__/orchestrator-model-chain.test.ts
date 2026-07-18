@@ -53,7 +53,7 @@ const config = {
 } as unknown as AppConfig;
 
 const session = (over: Partial<ComputerSession> = {}): ComputerSession =>
-  ({ selectedModelKey: null, selectedProfileKey: null, fallbackEnabled: false, ...over }) as ComputerSession;
+  ({ selectedModelKey: null, selectedProfileKey: null, ...over }) as ComputerSession;
 
 describe('computer-use getEntryForRole — primary follows the profile', () => {
   it('uses the profile primary when a profile is active and no session model is set', () => {
@@ -95,5 +95,15 @@ describe('computer-use getModelChainForRole — profile fallback chain', () => {
       'driver',
     );
     expect(chain.map((c) => c.key)).toEqual(['default-m', 'profile-fb1']);
+  });
+
+  it('an explicit fallbackEnabled:false wins over a profile (user toggled it off)', () => {
+    const chain = getModelChainForRole(
+      config,
+      session({ selectedProfileKey: 'fast', fallbackEnabled: false }),
+      'driver',
+    );
+    // Fallback disabled → primary only, even though a profile is selected.
+    expect(chain.map((c) => c.key)).toEqual(['profile-primary']);
   });
 });
