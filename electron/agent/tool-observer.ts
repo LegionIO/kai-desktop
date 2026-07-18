@@ -299,6 +299,8 @@ export class ToolObserverManager {
   private readonly parentWaiters = new Map<string, Array<() => void>>();
   private disposed = false;
   private evaluationTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Aborts the in-flight observer LLM request + its fallback loop on dispose. */
+  private evaluationAbort: AbortController | null = null;
   private evaluationInFlight = false;
   private evaluationPending = false;
   private lastEvaluatedAtMs = 0;
@@ -483,6 +485,10 @@ export class ToolObserverManager {
 
   dispose(): void {
     this.disposed = true;
+    // Abort any in-flight observer LLM request + its fallback loop — the session
+    // is gone, so retrying fallback models would just waste billable requests.
+    this.evaluationAbort?.abort();
+    this.evaluationAbort = null;
     if (this.evaluationTimer) {
       clearTimeout(this.evaluationTimer);
       this.evaluationTimer = null;
@@ -858,24 +864,29 @@ export class ToolObserverManager {
 
     this.evaluationInFlight = true;
     this.evaluationPending = false;
+    const evalAbort = new AbortController();
+    this.evaluationAbort = evalAbort;
     try {
       const prompt = this.buildPromptPayload(runningTools);
 
       // Observer uses structuredOutput (.object), so drive the model-fallback
       // chain directly rather than the text-only aux wrapper. Primary = the
-      // observer's configured model, then the config fallback chain.
+      // observer's configured model, then the config fallback chain. The abort
+      // signal stops the request + fallback loop if the session is disposed
+      // mid-flight (the resulting actions would be discarded anyway).
       const chain = auxChainWithPrimary(this.modelConfig, { config: (await readAmbientConfig()) ?? undefined });
       const result = await runWithModelFallback(
         chain,
         (model) =>
           this.buildObserverAgent(model).generate(prompt, {
             maxSteps: 1,
+            abortSignal: evalAbort.signal,
             structuredOutput: {
               schema: ObserverDecisionSchema,
               jsonPromptInjection: true,
             },
           }),
-        { label: 'tool-observer' },
+        { label: 'tool-observer', abortSignal: evalAbort.signal },
       );
 
       const decision = (result.object as ObserverDecision | undefined) ?? { actions: [] };
@@ -891,6 +902,7 @@ export class ToolObserverManager {
     } catch (error) {
       console.warn('[ToolObserver] Evaluation failed:', error);
     } finally {
+      if (this.evaluationAbort === evalAbort) this.evaluationAbort = null;
       this.lastEvaluatedAtMs = Date.now();
       this.evaluationInFlight = false;
       if (this.evaluationPending && !this.disposed) {

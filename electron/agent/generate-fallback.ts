@@ -72,12 +72,34 @@ export function auxChainWithPrimary(
     modelConfig: primary,
   } as ModelCatalogEntry;
   if (!opts?.config) return [primaryEntry];
-  // Dedupe by FULL provider/endpoint/model identity, not modelName alone — the
-  // same modelName reached through a different provider or endpoint (distinct
-  // credentials + availability) is a valid cross-provider fallback and must be
-  // kept.
-  const identity = (c: ModelCatalogEntry['modelConfig']): string =>
-    `${c.provider}|${(c as { endpoint?: string }).endpoint ?? ''}|${c.modelName}`;
+  // Dedupe only TRULY EQUIVALENT connections. Two entries with the same
+  // provider/endpoint/model can still be distinct availability fallbacks when
+  // they differ by API key, Azure deployment, Bedrock region/profile/role, or
+  // API version — keep those. Key on the full connection tuple.
+  const identity = (c: ModelCatalogEntry['modelConfig']): string => {
+    const x = c as {
+      endpoint?: string;
+      apiKey?: string;
+      apiVersion?: string;
+      deploymentName?: string;
+      region?: string;
+      accessKeyId?: string;
+      awsProfile?: string;
+      roleArn?: string;
+    };
+    return [
+      c.provider,
+      x.endpoint ?? '',
+      c.modelName,
+      x.deploymentName ?? '',
+      x.apiVersion ?? '',
+      x.region ?? '',
+      x.awsProfile ?? '',
+      x.roleArn ?? '',
+      x.accessKeyId ?? '',
+      x.apiKey ?? '',
+    ].join('|');
+  };
   const primaryId = identity(primary);
   const rest = resolveAuxModelChain(opts.config).filter((e) => identity(e.modelConfig) !== primaryId);
   return [primaryEntry, ...rest];

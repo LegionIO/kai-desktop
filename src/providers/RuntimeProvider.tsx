@@ -2049,6 +2049,17 @@ export function RuntimeProvider({
             saAcc.messages.push(userMsg);
             saAcc.headId = userMsg.id;
           }
+        } else if (e.type === 'model-fallback') {
+          // Mirror the main-conversation handling for the sub-agent UI tree so a
+          // mid-stream fallback doesn't append the retry onto the failed partial.
+          const fb = e.data as
+            | { discardPartialAssistant?: boolean; preserveErroredVariant?: boolean; error?: string }
+            | undefined;
+          if (fb?.discardPartialAssistant) {
+            discardTrailingAssistant(saAcc);
+          } else if (fb?.preserveErroredVariant) {
+            preserveErroredAssistantVariant(saAcc, fb.error ?? 'model error — retrying');
+          }
         } else if (e.type === 'text-delta') {
           applyTextDelta(saAcc, e.text ?? '', e.messageMeta);
         } else if (e.type === 'tool-call' && e.toolCallId) {
