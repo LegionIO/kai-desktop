@@ -35,6 +35,9 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
     };
   };
   const subAgents = tools.subAgents;
+  // Bumps whenever ANY file-access rule/toggle changes so path badges re-preview
+  // (a match count / allow-deny result depends on the whole fileAccess config).
+  const fileAccessVersion = JSON.stringify(tools.fileAccess);
 
   return (
     <div className="space-y-6">
@@ -83,6 +86,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           patterns={tools.fileAccess.allowPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.allowPaths', patterns)}
           filePicker
+          configVersion={fileAccessVersion}
         />
         <PatternList
           id="tools.fileAccess.denyPaths"
@@ -90,6 +94,7 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           patterns={tools.fileAccess.denyPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.denyPaths', patterns)}
           filePicker
+          configVersion={fileAccessVersion}
         />
         <p className="text-xs text-muted-foreground">
           Directory paths (e.g. <code>~</code>, <code>~/projects</code>) match themselves and everything inside. Use
@@ -285,8 +290,11 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
 
 type PathPreview = Awaited<ReturnType<typeof app.fileAccess.previewPath>>;
 
-/** Compact match/allow badge shown next to a file-access path entry. */
-const PathBadge: FC<{ entry: string }> = ({ entry }) => {
+/** Compact match/allow badge shown next to a file-access path entry.
+ *  `configVersion` changes whenever the file-access config does, so badges
+ *  re-preview (stale counts/allow-deny) after another rule is added/removed or
+ *  the toggle flips — not only when this entry's own string changes. */
+const PathBadge: FC<{ entry: string; configVersion?: string }> = ({ entry, configVersion }) => {
   const [preview, setPreview] = useState<PathPreview | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -308,7 +316,7 @@ const PathBadge: FC<{ entry: string }> = ({ entry }) => {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [entry]);
+  }, [entry, configVersion]);
 
   if (!preview || preview.error) return null;
   const count = preview.capped ? `${preview.matchCount}+` : `${preview.matchCount}`;
@@ -331,6 +339,14 @@ const PathBadge: FC<{ entry: string }> = ({ entry }) => {
   );
 };
 
+/** Escape glob metacharacters so a LITERAL picked path (whose filename may
+ *  contain *, ?, [, ], {, }, !, (, )) isn't reinterpreted as a pattern by the
+ *  matcher — which could authorize sibling files or stop a dir matching its
+ *  descendants. picomatch treats backslash-escaped metachars as literals. */
+function escapeGlobPath(p: string): string {
+  return p.replace(/[*?[\]{}!()]/g, '\\$&');
+}
+
 const PatternList: FC<{
   id?: string;
   label: string;
@@ -338,10 +354,13 @@ const PatternList: FC<{
   onChange: (patterns: string[]) => void;
   /** File Access lists get a Browse picker, subfolder prompt, and live match preview. */
   filePicker?: boolean;
-}> = ({ id, label, patterns, onChange, filePicker }) => {
+  /** Bumps when the file-access config changes so badges re-preview. */
+  configVersion?: string;
+}> = ({ id, label, patterns, onChange, filePicker, configVersion }) => {
   const [newPattern, setNewPattern] = useState('');
-  // Set briefly while blurring TO the +/Browse button so blur-commit doesn't
-  // double-add (the button's own click handles the add).
+  // Set briefly (on mousedown) while clicking the +/Browse button so blur-commit
+  // doesn't double-add (the button's own click handles the add). A keyboard Tab
+  // does NOT set it, so tabbing away still commits the typed value.
   const skipBlurAddRef = useRef(false);
 
   const addPattern = (value?: string) => {
@@ -362,11 +381,13 @@ const PatternList: FC<{
     if (!filePicker) return;
     const res = await app.dialog.openPath();
     if (res.canceled) return;
-    let path = res.path;
+    // Escape the literal picked path so a filename with glob chars isn't treated
+    // as a pattern; then append the INTENTIONAL /* for folder-only if chosen.
+    let path = escapeGlobPath(res.path);
     // A directory already matches recursively; ask whether to include subfolders.
     if (res.isDirectory) {
       const includeSub = window.confirm(
-        `Include all subfolders of\n${path}\n\nOK = include everything under this folder.\nCancel = only files directly in this folder.`,
+        `Include all subfolders of\n${res.path}\n\nOK = include everything under this folder.\nCancel = only files directly in this folder.`,
       );
       if (!includeSub) path = path.replace(/\/$/, '') + '/*';
     }
@@ -382,7 +403,7 @@ const PatternList: FC<{
             <span className="text-xs font-mono rounded-xl border border-border/70 bg-card/80 px-3 py-1 flex-1 truncate">
               {p}
             </span>
-            {filePicker && <PathBadge entry={p} />}
+            {filePicker && <PathBadge entry={p} configVersion={configVersion} />}
             <button type="button" onClick={() => removePattern(i)} className="p-1 rounded hover:bg-destructive/10">
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
@@ -394,12 +415,14 @@ const PatternList: FC<{
             value={newPattern}
             onChange={setNewPattern}
             onSubmit={() => addPattern()}
-            onBlur={(related) => {
-              // Commit a typed-but-unsubmitted value on blur — unless focus went
-              // to the +/Browse button, which handles the add itself.
-              if (skipBlurAddRef.current) return;
-              const el = related as HTMLElement | null;
-              if (el?.dataset?.patternAction) return;
+            onBlur={() => {
+              // Commit a typed-but-unsubmitted value on blur — unless a mousedown
+              // on the +/Browse button just set the skip flag (that button's own
+              // click does the add). A keyboard Tab doesn't set the flag, so the
+              // value is still committed when the user tabs away.
+              const skip = skipBlurAddRef.current;
+              skipBlurAddRef.current = false; // reset so a stray mousedown can't wedge it
+              if (skip) return;
               addPattern();
             }}
             placeholder={filePicker ? 'Add path (or Browse)…' : 'Add pattern...'}
@@ -436,7 +459,7 @@ const PatternList: FC<{
             <PlusIcon className="h-3 w-3" />
           </button>
         </div>
-        {filePicker && newPattern.trim() && <PathBadge entry={newPattern} />}
+        {filePicker && newPattern.trim() && <PathBadge entry={newPattern} configVersion={configVersion} />}
       </div>
     </div>
   );

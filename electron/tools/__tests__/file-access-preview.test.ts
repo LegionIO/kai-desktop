@@ -63,4 +63,22 @@ describe('previewPathEntry', () => {
   it('is safe on empty/whitespace input', () => {
     expect(previewPathEntry('   ', cfg([root])).matchCount).toBe(0);
   });
+
+  it('reports allowed for a /* glob by evaluating a real matched file (not the base dir)', () => {
+    // allowPaths only contains the /* glob — the base dir itself is NOT an entry,
+    // so allow must be judged on a matched child file.
+    const p = previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
+    expect(p.matchCount).toBeGreaterThan(0);
+    expect(p.allowed).toBe(true);
+  });
+
+  it('does not over-walk a sparse-glob deny entry (bounded, no hang)', () => {
+    // A deny glob whose matches are excluded from the count previously left the
+    // match-count cap at 0 while walking the whole tree. Bounded now; returns
+    // promptly and reports denied via a matched path.
+    const started = Date.now();
+    const p = previewPathEntry(`${root}/**/*.txt`, cfg(['*'], [`${root}/**/*.txt`]));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(p.denied).toBe(true);
+  });
 });

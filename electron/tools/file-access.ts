@@ -184,7 +184,10 @@ export type PathEntryPreview = {
   denied: boolean;
 };
 
-const PREVIEW_WALK_CAP = 2000;
+/** Bound the preview walk so opening Tool Settings can never freeze the main
+ *  thread: stop after this many filesystem entries visited OR this many ms. */
+const PREVIEW_WALK_CAP = 20000;
+const PREVIEW_WALK_MS = 400;
 
 /**
  * Preview a single File Access allow/deny entry for the Settings UI: expand it,
@@ -230,24 +233,32 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
     /* best-effort */
   }
 
-  // Count matching files under root (bounded). A file entry that exists counts
-  // as 1 if it matches; a directory walks its tree.
+  // Count matching files under root, BOUNDED by entries VISITED + a wall-clock
+  // budget (not match count — a sparse glob like **/.env or a deny entry whose
+  // matches are excluded would otherwise walk the whole home tree synchronously
+  // on the main thread and freeze the app when Settings opens). Also capture a
+  // representative MATCHED path so the allow/deny status reflects an actual match
+  // (evaluating only the glob's base dir gives the wrong result for /dir/*).
   let matchCount = 0;
   let capped = false;
+  let visited = 0;
+  const startedAt = Date.now();
+  let sampleMatch: string | null = null;
+  const budgetHit = (): boolean => visited >= PREVIEW_WALK_CAP || Date.now() - startedAt > PREVIEW_WALK_MS;
   const consider = (abs: string): void => {
-    if (matchCount >= PREVIEW_WALK_CAP) {
-      capped = true;
-      return;
-    }
+    visited += 1;
     try {
-      if (matchesEntry(abs, trimmed) && !isPathDenied(abs, config)) matchCount += 1;
+      if (matchesEntry(abs, trimmed)) {
+        if (!isPathDenied(abs, config)) matchCount += 1;
+        if (sampleMatch === null) sampleMatch = abs;
+      }
     } catch {
       /* skip unreadable */
     }
   };
   const walk = (dir: string, depth: number): void => {
-    if (matchCount >= PREVIEW_WALK_CAP || depth > 40) {
-      if (matchCount >= PREVIEW_WALK_CAP) capped = true;
+    if (budgetHit() || depth > 40) {
+      if (budgetHit()) capped = true;
       return;
     }
     let entries: Dirent[];
@@ -257,7 +268,7 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
       return;
     }
     for (const e of entries) {
-      if (matchCount >= PREVIEW_WALK_CAP) {
+      if (budgetHit()) {
         capped = true;
         return;
       }
@@ -276,13 +287,14 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
     /* best-effort */
   }
 
-  // Allow/deny outcome for a representative path (the normalized root itself, or
-  // a matched file). Use the root — isPathAllowed handles dir roots.
+  // Allow/deny outcome: prefer a real matched file (correct for globs like
+  // /dir/* or **/.env); fall back to the root when nothing matched.
+  const repr = sampleMatch ?? root;
   let allowed = false;
   let denied = false;
   try {
-    denied = isPathDenied(root, config);
-    allowed = isPathAllowed(root, config).allowed;
+    denied = isPathDenied(repr, config);
+    allowed = isPathAllowed(repr, config).allowed;
   } catch {
     /* best-effort */
   }
