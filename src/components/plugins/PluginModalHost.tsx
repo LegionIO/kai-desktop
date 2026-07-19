@@ -49,7 +49,7 @@ export const PluginModalHost: FC = () => {
         };
 
         const handleAction = (action: string, data?: unknown) => {
-          sendModalAction(modal.pluginName, modal.id, action, data);
+          return sendModalAction(modal.pluginName, modal.id, action, data);
         };
 
         return (

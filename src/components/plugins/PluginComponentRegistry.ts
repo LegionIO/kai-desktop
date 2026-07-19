@@ -3,7 +3,7 @@ import type { ComponentType } from 'react';
 type PluginComponentProps = {
   pluginName: string;
   props?: Record<string, unknown>;
-  onAction: (action: string, data?: unknown) => void;
+  onAction: (action: string, data?: unknown) => Promise<unknown>;
   onClose?: () => void;
   config?: Record<string, unknown>;
   updateConfig?: (path: string, value: unknown) => Promise<void>;
@@ -17,10 +17,7 @@ export type PluginComponent = ComponentType<PluginComponentProps>;
 // Maps pluginName → { componentName → React Component }
 const registry = new Map<string, Map<string, PluginComponent>>();
 
-export function registerPluginComponents(
-  pluginName: string,
-  components: Record<string, PluginComponent>,
-): void {
+export function registerPluginComponents(pluginName: string, components: Record<string, PluginComponent>): void {
   let pluginMap = registry.get(pluginName);
   if (!pluginMap) {
     pluginMap = new Map();
@@ -31,10 +28,7 @@ export function registerPluginComponents(
   }
 }
 
-export function getPluginComponent(
-  pluginName: string,
-  componentName: string,
-): PluginComponent | null {
+export function getPluginComponent(pluginName: string, componentName: string): PluginComponent | null {
   return registry.get(pluginName)?.get(componentName) ?? null;
 }
 

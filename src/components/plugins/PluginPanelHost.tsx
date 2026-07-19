@@ -113,7 +113,7 @@ export const PluginPanelHost: FC<{
               pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
               pluginState={pluginState}
               onAction={(action: string, data?: unknown) => {
-                sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+                return sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
               }}
               setPluginConfig={async (path: string, value: unknown) => {
                 await setPluginConfig(pluginSection.pluginName, path, value);
@@ -188,7 +188,7 @@ export const PluginPanelHost: FC<{
         pluginConfig={getResolvedPluginConfig(panel.pluginName)}
         pluginState={pluginState}
         onAction={(action, data) => {
-          sendAction(panel.pluginName, `panel:${panel.id}`, action, data);
+          return sendAction(panel.pluginName, `panel:${panel.id}`, action, data);
         }}
         onClose={onClose}
         setPluginConfig={async (path, value) => {
