@@ -6,6 +6,7 @@ import {
   type FC,
   type KeyboardEvent,
   type ClipboardEvent,
+  type FocusEvent,
 } from 'react';
 import { escapeHtml } from '@/lib/utils';
 
@@ -13,6 +14,10 @@ type EditableInputProps = {
   value: string;
   onChange: (value: string) => void;
   onSubmit?: () => void;
+  /** Fired when the field loses focus (e.g. to commit a typed-but-not-submitted
+   *  value). `relatedTarget` is the element focus moved to, so callers can skip
+   *  committing when focus went to an adjacent add/browse button. */
+  onBlur?: (relatedTarget: EventTarget | null) => void;
   className?: string;
   placeholder?: string;
   type?: 'text' | 'password';
@@ -27,6 +32,7 @@ export const EditableInput: FC<EditableInputProps> = ({
   value,
   onChange,
   onSubmit,
+  onBlur,
   className = '',
   placeholder,
   type = 'text',
@@ -36,11 +42,14 @@ export const EditableInput: FC<EditableInputProps> = ({
   const lastValueRef = useRef(value);
   const [isEmpty, setIsEmpty] = useState(!value);
 
-  const toHTML = useCallback((text: string): string => {
-    if (!text) return '';
-    if (type === 'password') return '•'.repeat(text.length);
-    return escapeHtml(text);
-  }, [highlightBrand, type]);
+  const toHTML = useCallback(
+    (text: string): string => {
+      if (!text) return '';
+      if (type === 'password') return '•'.repeat(text.length);
+      return escapeHtml(text);
+    },
+    [highlightBrand, type],
+  );
 
   // --- Cursor save/restore (same as EditableTextarea) ---
   const saveCursorOffset = (): number => {
@@ -90,14 +99,17 @@ export const EditableInput: FC<EditableInputProps> = ({
     return editorRef.current.textContent ?? '';
   };
 
-  const reHighlight = useCallback((text: string) => {
-    const el = editorRef.current;
-    if (!el) return;
-    const cursor = saveCursorOffset();
-    const html = toHTML(text);
-    if (el.innerHTML !== html) el.innerHTML = html;
-    restoreCursorOffset(cursor);
-  }, [toHTML]);
+  const reHighlight = useCallback(
+    (text: string) => {
+      const el = editorRef.current;
+      if (!el) return;
+      const cursor = saveCursorOffset();
+      const html = toHTML(text);
+      if (el.innerHTML !== html) el.innerHTML = html;
+      restoreCursorOffset(cursor);
+    },
+    [toHTML],
+  );
 
   // Sync from prop when not focused
   useEffect(() => {
@@ -141,7 +153,10 @@ export const EditableInput: FC<EditableInputProps> = ({
         range.setStart(el, 0);
         range.collapse(true);
         const sel = window.getSelection();
-        if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
       }
     } else {
       requestAnimationFrame(() => reHighlight(text));
@@ -168,7 +183,14 @@ export const EditableInput: FC<EditableInputProps> = ({
     range.setStart(el, 0);
     range.collapse(true);
     const sel = window.getSelection();
-    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  };
+
+  const handleBlur = (e: FocusEvent<HTMLDivElement>) => {
+    onBlur?.(e.relatedTarget);
   };
 
   return (
@@ -180,6 +202,7 @@ export const EditableInput: FC<EditableInputProps> = ({
       onKeyDown={handleKeyDown}
       onPaste={handlePaste}
       onFocus={handleFocus}
+      onBlur={handleBlur}
       className={`outline-none whitespace-nowrap overflow-hidden app-ce-placeholder ${className}`}
       role="textbox"
       data-placeholder={isEmpty ? placeholder : undefined}

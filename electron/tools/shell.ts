@@ -144,9 +144,15 @@ export function createShellTool(getConfig: () => AppConfig): ToolDefinition {
     description:
       'Execute a shell command on the local machine. Returns stdout/stderr. Use for running programs, scripts, git commands, package managers, etc.',
     inputSchema: z.object({
-      command: z.string().describe('The shell command to execute'),
-      cwd: z.string().optional().describe('Working directory (defaults to home)'),
-      timeout: z.number().optional().describe('Timeout in milliseconds'),
+      command: z
+        .string()
+        .describe(
+          'The shell command to execute. This is the ONLY required argument. Do NOT pass other fields ' +
+            '(no "tail", "background", "args", etc.) — they are rejected. To run in the background or tail ' +
+            'output, put that in the command itself (e.g. append " &", or use "tail -f").',
+        ),
+      cwd: z.string().optional().describe('Optional. Working directory (defaults to home).'),
+      timeout: z.number().optional().describe('Optional. Timeout in MILLISECONDS (a number, not a string).'),
     }),
     execute: async (input, context) =>
       runToolExecution({

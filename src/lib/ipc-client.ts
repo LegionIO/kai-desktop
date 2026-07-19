@@ -322,6 +322,19 @@ type AppAPI = {
     openFile: (options?: { filters?: Array<{ name: string; extensions: string[] }> }) => Promise<unknown>;
     openDirectory: () => Promise<{ canceled: boolean; directoryPath?: string; name?: string }>;
     openDirectoryFiles: () => Promise<{ canceled: boolean; filePaths: string[] }>;
+    openPath: () => Promise<{ canceled: true } | { canceled: false; path: string; isDirectory: boolean; name: string }>;
+  };
+  fileAccess: {
+    previewPath: (entry: string) => Promise<{
+      normalized: string;
+      exists: boolean;
+      isDirectory: boolean;
+      matchCount: number;
+      capped: boolean;
+      allowed: boolean;
+      denied: boolean;
+      error?: string;
+    }>;
   };
   clipboard: {
     writeText: (text: string) => Promise<{ ok: boolean; error?: string }>;

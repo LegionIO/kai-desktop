@@ -495,7 +495,11 @@ export function getBridgeScript(): string {
     dialog: {
       openFile: function() { return Promise.resolve({ canceled: true, files: [] }); },
       openDirectory: function() { return Promise.resolve({ canceled: true }); },
-      openDirectoryFiles: function() { return Promise.resolve({ canceled: true, filePaths: [] }); }
+      openDirectoryFiles: function() { return Promise.resolve({ canceled: true, filePaths: [] }); },
+      openPath: function() { return Promise.resolve({ canceled: true }); }
+    },
+    fileAccess: {
+      previewPath: function(entry) { return invoke('fileAccess:preview-path', entry); }
     },
     clipboard: {
       writeText: function(text) { try { navigator.clipboard.writeText(text); return Promise.resolve({ ok: true }); } catch(e) { return Promise.resolve({ ok: false, error: String(e) }); } }

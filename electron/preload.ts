@@ -498,6 +498,24 @@ const appAPI = {
       ipcRenderer.invoke('dialog:open-file', options),
     openDirectory: () => ipcRenderer.invoke('dialog:open-directory'),
     openDirectoryFiles: () => ipcRenderer.invoke('dialog:open-directory-files'),
+    openPath: () =>
+      ipcRenderer.invoke('dialog:open-path') as Promise<
+        { canceled: true } | { canceled: false; path: string; isDirectory: boolean; name: string }
+      >,
+  },
+
+  fileAccess: {
+    previewPath: (entry: string) =>
+      ipcRenderer.invoke('fileAccess:preview-path', entry) as Promise<{
+        normalized: string;
+        exists: boolean;
+        isDirectory: boolean;
+        matchCount: number;
+        capped: boolean;
+        allowed: boolean;
+        denied: boolean;
+        error?: string;
+      }>,
   },
 
   clipboard: {

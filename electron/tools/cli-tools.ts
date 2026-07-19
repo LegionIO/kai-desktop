@@ -61,9 +61,13 @@ function createCliTool(spec: CliToolSpec, getConfig: () => AppConfig): ToolDefin
     inputSchema: z.object({
       command: z
         .string()
-        .describe(`The full ${spec.binary} command to execute (e.g. "${spec.prefix ?? spec.binary} --help")`),
-      cwd: z.string().optional().describe('Working directory (defaults to home)'),
-      timeout: z.number().optional().describe('Timeout in milliseconds'),
+        .describe(
+          `The full ${spec.binary} command to execute (e.g. "${spec.prefix ?? spec.binary} --help"). ` +
+            `This is the ONLY required argument. Do NOT pass any other fields (no "tail", "background", ` +
+            `"args", etc.) — they are not accepted and will be rejected.`,
+        ),
+      cwd: z.string().optional().describe('Optional. Working directory for the command (defaults to home).'),
+      timeout: z.number().optional().describe('Optional. Timeout in MILLISECONDS (a number, not a string).'),
     }),
     source: 'cli',
     execute: async (input, context) =>

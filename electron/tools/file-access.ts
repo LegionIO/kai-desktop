@@ -1,4 +1,5 @@
-import { realpathSync } from 'node:fs';
+import { realpathSync, existsSync, statSync, readdirSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
@@ -165,4 +166,126 @@ export function filterGrepOutput(output: string, config: AppConfig): string {
     `${matches} match${matches === 1 ? '' : 'es'} across ${files.size} file${files.size === 1 ? '' : 's'}` +
     (truncSummary ? ` ${truncSummary}` : '');
   return [summary, '---', ...kept, ...(truncTrailer ? [truncTrailer] : [])].join('\n');
+}
+
+/** Result of previewing a File Access path entry in Settings. */
+export type PathEntryPreview = {
+  /** The entry after ~/relative/symlink expansion (what the matcher sees). */
+  normalized: string;
+  exists: boolean;
+  isDirectory: boolean;
+  /** Files on disk under `normalized` that this entry matches (capped). */
+  matchCount: number;
+  /** True if the walk hit the cap (so matchCount is a floor, shown as "N+"). */
+  capped: boolean;
+  /** Whether a representative path under the entry would pass the allow rules. */
+  allowed: boolean;
+  /** Whether the entry (or its target) is knocked out by a deny rule. */
+  denied: boolean;
+};
+
+const PREVIEW_WALK_CAP = 2000;
+
+/**
+ * Preview a single File Access allow/deny entry for the Settings UI: expand it,
+ * check existence, count how many on-disk files it matches (bounded walk), and
+ * report the allow/deny outcome. Read-only + best-effort — never throws.
+ */
+export function previewPathEntry(entry: string, config: AppConfig): PathEntryPreview {
+  const trimmed = (entry ?? '').trim();
+  const base: PathEntryPreview = {
+    normalized: '',
+    exists: false,
+    isDirectory: false,
+    matchCount: 0,
+    capped: false,
+    allowed: false,
+    denied: false,
+  };
+  if (!trimmed) return base;
+
+  // Wildcard / everything.
+  if (trimmed === '*') {
+    return { ...base, normalized: '*', allowed: true };
+  }
+
+  // Determine the on-disk root to walk: for a glob, the base dir; else the path.
+  let root: string;
+  try {
+    const scan = picomatch.scan(trimmed);
+    root = scan.isGlob ? (scan.base ? expandConfigPath(scan.base) : homedir()) : expandConfigPath(trimmed);
+  } catch {
+    root = expandConfigPath(trimmed);
+  }
+  const normalized = root;
+
+  let exists = false;
+  let isDirectory = false;
+  try {
+    if (existsSync(root)) {
+      exists = true;
+      isDirectory = statSync(root).isDirectory();
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  // Count matching files under root (bounded). A file entry that exists counts
+  // as 1 if it matches; a directory walks its tree.
+  let matchCount = 0;
+  let capped = false;
+  const consider = (abs: string): void => {
+    if (matchCount >= PREVIEW_WALK_CAP) {
+      capped = true;
+      return;
+    }
+    try {
+      if (matchesEntry(abs, trimmed) && !isPathDenied(abs, config)) matchCount += 1;
+    } catch {
+      /* skip unreadable */
+    }
+  };
+  const walk = (dir: string, depth: number): void => {
+    if (matchCount >= PREVIEW_WALK_CAP || depth > 40) {
+      if (matchCount >= PREVIEW_WALK_CAP) capped = true;
+      return;
+    }
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }) as unknown as Dirent[];
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (matchCount >= PREVIEW_WALK_CAP) {
+        capped = true;
+        return;
+      }
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!e.name.startsWith('.')) walk(full, depth + 1);
+      } else {
+        consider(full);
+      }
+    }
+  };
+  try {
+    if (exists && isDirectory) walk(root, 0);
+    else if (exists) consider(root);
+  } catch {
+    /* best-effort */
+  }
+
+  // Allow/deny outcome for a representative path (the normalized root itself, or
+  // a matched file). Use the root — isPathAllowed handles dir roots.
+  let allowed = false;
+  let denied = false;
+  try {
+    denied = isPathDenied(root, config);
+    allowed = isPathAllowed(root, config).allowed;
+  } catch {
+    /* best-effort */
+  }
+
+  return { normalized, exists, isDirectory, matchCount, capped, allowed, denied };
 }

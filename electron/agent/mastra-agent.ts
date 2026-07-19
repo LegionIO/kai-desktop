@@ -198,9 +198,45 @@ function withTemperatureOmissionHeader(modelConfig: LLMModelConfig): LLMModelCon
 }
 
 function toMastraInputSchema(inputSchema: ToolDefinition['inputSchema']) {
-  const jsonSchema = z.toJSONSchema(inputSchema, { target: 'draft-7' });
+  const jsonSchema = z.toJSONSchema(inputSchema, { target: 'draft-7' }) as JsonStandardSchemaInput & {
+    properties?: Record<string, unknown>;
+    additionalProperties?: unknown;
+  };
+  const standard = toJsonStandardSchema(jsonSchema);
 
-  return toJsonStandardSchema(jsonSchema as JsonStandardSchemaInput);
+  // Enrich the opaque "must NOT have additional properties" issue (empty path,
+  // no property name) with the ACTUAL offending key(s) so the model — and any
+  // logged validationErrors — can see WHICH property was unexpected and the
+  // allowed set. The underlying AJV issue drops params.additionalProperty, so we
+  // recover it by diffing the input against the schema's declared properties.
+  const allowedKeys = new Set(Object.keys(jsonSchema.properties ?? {}));
+  const isClosed = jsonSchema.additionalProperties === false;
+  if (!isClosed || allowedKeys.size === 0) return standard;
+
+  const std = (standard as { ['~standard']?: { validate?: (v: unknown) => unknown } })['~standard'];
+  const originalValidate = std?.validate;
+  if (!std || typeof originalValidate !== 'function') return standard;
+
+  std.validate = (value: unknown) => {
+    const enrich = (result: unknown): unknown => {
+      const issues = (result as { issues?: Array<{ message?: string; path?: unknown[] }> } | undefined)?.issues;
+      if (!issues || !issues.length || !value || typeof value !== 'object') return result;
+      const extraKeys = Object.keys(value as Record<string, unknown>).filter((k) => !allowedKeys.has(k));
+      if (extraKeys.length === 0) return result;
+      let extraIdx = 0;
+      for (const issue of issues) {
+        if (issue.message === 'must NOT have additional properties' && (!issue.path || issue.path.length === 0)) {
+          const key = extraKeys[extraIdx++] ?? extraKeys[extraKeys.length - 1];
+          issue.message = `unexpected property "${key}" — this tool only accepts: ${[...allowedKeys].join(', ')}. Remove "${key}".`;
+          if (!issue.path || issue.path.length === 0) issue.path = [key];
+        }
+      }
+      return result;
+    };
+    const out = originalValidate.call(std, value);
+    return out instanceof Promise ? out.then(enrich) : enrich(out);
+  };
+  return standard;
 }
 
 function toMastraTools(
@@ -2055,6 +2091,7 @@ export const __internal = {
   extractStreamText,
   extractStreamFinishReason,
   isExpectedMastraStructuralEvent,
+  toMastraInputSchema,
   compactToolArgs,
   getStringOption,
   getNumberOption,

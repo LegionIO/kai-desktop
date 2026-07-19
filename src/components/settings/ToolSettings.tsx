@@ -1,6 +1,7 @@
-import { useState, type FC } from 'react';
-import { PlusIcon, XIcon } from 'lucide-react';
+import { useState, useEffect, useRef, type FC } from 'react';
+import { PlusIcon, XIcon, FolderOpenIcon } from 'lucide-react';
 import { EditableInput } from '@/components/EditableInput';
+import { app } from '@/lib/ipc-client';
 import { Toggle, NumberField, SliderField, headTailLabel, settingsSelectClass, type SettingsProps } from './shared';
 
 export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
@@ -81,12 +82,14 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
           label="Allow Paths"
           patterns={tools.fileAccess.allowPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.allowPaths', patterns)}
+          filePicker
         />
         <PatternList
           id="tools.fileAccess.denyPaths"
           label="Deny Paths"
           patterns={tools.fileAccess.denyPaths}
           onChange={(patterns) => updateConfig('tools.fileAccess.denyPaths', patterns)}
+          filePicker
         />
         <p className="text-xs text-muted-foreground">
           Directory paths (e.g. <code>~</code>, <code>~/projects</code>) match themselves and everything inside. Use
@@ -280,23 +283,94 @@ export const ToolSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ conf
   );
 };
 
-const PatternList: FC<{ id?: string; label: string; patterns: string[]; onChange: (patterns: string[]) => void }> = ({
-  id,
-  label,
-  patterns,
-  onChange,
-}) => {
-  const [newPattern, setNewPattern] = useState('');
+type PathPreview = Awaited<ReturnType<typeof app.fileAccess.previewPath>>;
 
-  const addPattern = () => {
-    if (newPattern.trim()) {
-      onChange([...patterns, newPattern.trim()]);
-      setNewPattern('');
+/** Compact match/allow badge shown next to a file-access path entry. */
+const PathBadge: FC<{ entry: string }> = ({ entry }) => {
+  const [preview, setPreview] = useState<PathPreview | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!entry.trim()) {
+      setPreview(null);
+      return;
     }
+    const t = setTimeout(() => {
+      void app.fileAccess
+        .previewPath(entry)
+        .then((p) => {
+          if (!cancelled) setPreview(p);
+        })
+        .catch(() => {
+          if (!cancelled) setPreview(null);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [entry]);
+
+  if (!preview || preview.error) return null;
+  const count = preview.capped ? `${preview.matchCount}+` : `${preview.matchCount}`;
+  return (
+    <span className="shrink-0 text-[10px] text-muted-foreground/80 tabular-nums" title={preview.normalized}>
+      {preview.exists ? (
+        <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+      ) : (
+        <span className="text-amber-600 dark:text-amber-400" title="Path does not exist yet">
+          ✗
+        </span>
+      )}{' '}
+      {count} match{preview.matchCount === 1 ? '' : 'es'}
+      {preview.denied ? (
+        <span className="ml-1 text-red-600 dark:text-red-400">· denied</span>
+      ) : preview.allowed ? (
+        <span className="ml-1 text-emerald-600 dark:text-emerald-400">· allowed</span>
+      ) : null}
+    </span>
+  );
+};
+
+const PatternList: FC<{
+  id?: string;
+  label: string;
+  patterns: string[];
+  onChange: (patterns: string[]) => void;
+  /** File Access lists get a Browse picker, subfolder prompt, and live match preview. */
+  filePicker?: boolean;
+}> = ({ id, label, patterns, onChange, filePicker }) => {
+  const [newPattern, setNewPattern] = useState('');
+  // Set briefly while blurring TO the +/Browse button so blur-commit doesn't
+  // double-add (the button's own click handles the add).
+  const skipBlurAddRef = useRef(false);
+
+  const addPattern = (value?: string) => {
+    const v = (value ?? newPattern).trim();
+    if (!v || patterns.includes(v)) {
+      setNewPattern('');
+      return;
+    }
+    onChange([...patterns, v]);
+    setNewPattern('');
   };
 
   const removePattern = (index: number) => {
     onChange(patterns.filter((_, i) => i !== index));
+  };
+
+  const browse = async () => {
+    if (!filePicker) return;
+    const res = await app.dialog.openPath();
+    if (res.canceled) return;
+    let path = res.path;
+    // A directory already matches recursively; ask whether to include subfolders.
+    if (res.isDirectory) {
+      const includeSub = window.confirm(
+        `Include all subfolders of\n${path}\n\nOK = include everything under this folder.\nCancel = only files directly in this folder.`,
+      );
+      if (!includeSub) path = path.replace(/\/$/, '') + '/*';
+    }
+    addPattern(path);
   };
 
   return (
@@ -305,9 +379,10 @@ const PatternList: FC<{ id?: string; label: string; patterns: string[]; onChange
       <div className="space-y-1">
         {patterns.map((p, i) => (
           <div key={`${p}-${i}`} className="flex items-center gap-1">
-            <span className="text-xs font-mono rounded-xl border border-border/70 bg-card/80 px-3 py-1 flex-1">
+            <span className="text-xs font-mono rounded-xl border border-border/70 bg-card/80 px-3 py-1 flex-1 truncate">
               {p}
             </span>
+            {filePicker && <PathBadge entry={p} />}
             <button type="button" onClick={() => removePattern(i)} className="p-1 rounded hover:bg-destructive/10">
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
@@ -318,13 +393,50 @@ const PatternList: FC<{ id?: string; label: string; patterns: string[]; onChange
             className="flex-1 rounded-xl border border-border/70 bg-card/80 px-3 py-1 text-xs font-mono"
             value={newPattern}
             onChange={setNewPattern}
-            onSubmit={addPattern}
-            placeholder="Add pattern..."
+            onSubmit={() => addPattern()}
+            onBlur={(related) => {
+              // Commit a typed-but-unsubmitted value on blur — unless focus went
+              // to the +/Browse button, which handles the add itself.
+              if (skipBlurAddRef.current) return;
+              const el = related as HTMLElement | null;
+              if (el?.dataset?.patternAction) return;
+              addPattern();
+            }}
+            placeholder={filePicker ? 'Add path (or Browse)…' : 'Add pattern...'}
           />
-          <button type="button" onClick={addPattern} className="p-1 rounded hover:bg-muted">
+          {filePicker && (
+            <button
+              type="button"
+              data-pattern-action="browse"
+              onMouseDown={() => {
+                skipBlurAddRef.current = true;
+              }}
+              onClick={() => {
+                skipBlurAddRef.current = false;
+                void browse();
+              }}
+              className="p-1 rounded hover:bg-muted"
+              title="Browse for a file or folder"
+            >
+              <FolderOpenIcon className="h-3 w-3 text-muted-foreground" />
+            </button>
+          )}
+          <button
+            type="button"
+            data-pattern-action="add"
+            onMouseDown={() => {
+              skipBlurAddRef.current = true;
+            }}
+            onClick={() => {
+              skipBlurAddRef.current = false;
+              addPattern();
+            }}
+            className="p-1 rounded hover:bg-muted"
+          >
             <PlusIcon className="h-3 w-3" />
           </button>
         </div>
+        {filePicker && newPattern.trim() && <PathBadge entry={newPattern} />}
       </div>
     </div>
   );

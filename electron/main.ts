@@ -1785,6 +1785,34 @@ if (gotSingleInstanceLock) {
       return { canceled: false, filePaths: files };
     });
 
+    // Combined file-OR-directory picker (File Access settings "Browse…").
+    ipcMain.handle('dialog:open-path', async () => {
+      const win = BrowserWindow.getFocusedWindow();
+      if (!win) return { canceled: true };
+      const result = await dialog.showOpenDialog(win, {
+        properties: ['openFile', 'openDirectory'],
+      });
+      if (result.canceled || result.filePaths.length === 0) return { canceled: true };
+      const picked = result.filePaths[0];
+      let isDirectory = false;
+      try {
+        isDirectory = statSync(picked).isDirectory();
+      } catch {
+        /* best-effort */
+      }
+      return { canceled: false, path: picked, isDirectory, name: basename(picked) };
+    });
+
+    // File Access settings: preview what a candidate allow/deny entry matches.
+    ipcMain.handle('fileAccess:preview-path', async (_event, entry: unknown) => {
+      try {
+        const { previewPathEntry } = await import('./tools/file-access.js');
+        return previewPathEntry(typeof entry === 'string' ? entry : '', readEffectiveConfig(APP_HOME));
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    });
+
     // List directory contents on the host (used by web UI directory browser)
     ipcMain.handle('fs:list-directory', (_event, dirPath: string) => {
       try {
