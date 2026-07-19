@@ -18,6 +18,13 @@ describe('classifyError', () => {
     expect(classifyError({ status: 422 }).isTransient).toBe(false);
   });
 
+  it('treats 402 as transient (quota/billing) despite being a 4xx', () => {
+    expect(classifyError({ status: 402 }).isTransient).toBe(true);
+    expect(classifyError({ status: 402 }).category).toBe('quota');
+    expect(classifyError(new Error('Payment Required')).category).toBe('unknown');
+    expect(classifyError({ status: 402, message: 'Payment Required' }).isTransient).toBe(true);
+  });
+
   it('treats 401/403 as non-transient auth', () => {
     expect(classifyError({ status: 401 }).category).toBe('auth');
     expect(classifyError({ status: 403 }).category).toBe('auth');

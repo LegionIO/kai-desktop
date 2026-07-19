@@ -9,7 +9,16 @@ export type RetryableErrorInfo = {
   statusCode?: number;
   retryAfterMs?: number;
   isTransient: boolean;
-  category: 'rate-limit' | 'overload' | 'server-error' | 'timeout' | 'network' | 'auth' | 'client-error' | 'unknown';
+  category:
+    | 'rate-limit'
+    | 'overload'
+    | 'server-error'
+    | 'timeout'
+    | 'network'
+    | 'auth'
+    | 'quota'
+    | 'client-error'
+    | 'unknown';
   message: string;
 };
 
@@ -59,7 +68,15 @@ export function classifyError(error: unknown): RetryableErrorInfo {
     return { statusCode, retryAfterMs, isTransient: true, category: 'timeout', message };
   }
 
-  // Client errors (4xx except the retryable 408/429 handled above) — not transient
+  // Payment required (402) — a provider/account billing or quota problem, not a
+  // malformed request. Retrying the same model won't fix it, but falling back to
+  // a different model/profile should, so treat it as transient. Checked before
+  // the generic 4xx branch.
+  if (statusCode === 402) {
+    return { statusCode, retryAfterMs, isTransient: true, category: 'quota', message };
+  }
+
+  // Client errors (4xx except the retryable 402/408/429 handled above) — not transient
   if (statusCode !== undefined && statusCode >= 400 && statusCode < 500) {
     return { statusCode, retryAfterMs, isTransient: false, category: 'client-error', message };
   }

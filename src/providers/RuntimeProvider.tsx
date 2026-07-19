@@ -1106,6 +1106,9 @@ function formatStreamError(raw: string, category?: string, statusCode?: number):
     if (statusCode === 401) return 'Authentication failed — please check your API key or sign in again.';
     return 'Authorization error — please check your credentials and try again.';
   }
+  if (category === 'quota') {
+    return 'Payment required — this provider account is out of credit or quota. Falling back to another model if one is configured.';
+  }
   return raw;
 }
 

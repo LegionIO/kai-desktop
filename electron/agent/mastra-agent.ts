@@ -1865,8 +1865,8 @@ export async function* streamWithFallback(
               continue;
             }
             // Error AFTER content started. Only fall back for TRANSIENT upstream
-            // failures (500 / 529 / network / timeout / rate-limit / provider
-            // cancel). A non-transient error (bad request, auth, content) stays
+            // failures (500 / 529 / network / timeout / rate-limit / 402 quota /
+            // provider cancel). A non-transient error (bad request, auth, content) stays
             // terminal and is yielded below. The partial+error is preserved as
             // its own variant so the user can see the failed attempt.
             // Prefer the event's STRUCTURED status/category (streamAgentResponse
@@ -1874,7 +1874,14 @@ export async function* streamWithFallback(
             // 503 with a generic message would otherwise look non-transient.
             const evStatus = (event as { errorStatusCode?: number }).errorStatusCode;
             const evCategory = (event as { errorCategory?: string }).errorCategory;
-            const transientCategories = new Set(['rate-limit', 'overload', 'server-error', 'timeout', 'network']);
+            const transientCategories = new Set([
+              'rate-limit',
+              'overload',
+              'server-error',
+              'timeout',
+              'network',
+              'quota',
+            ]);
             const info =
               evStatus !== undefined
                 ? classifyError({ status: evStatus, message: event.error ?? '' })
