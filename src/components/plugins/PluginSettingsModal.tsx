@@ -6,6 +6,7 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { usePluginSettingsSections } from './PluginSettingsSections';
 import { getPluginComponentByHint } from './PluginComponentRegistry';
 import { PluginErrorBoundary } from './PluginErrorBoundary';
+import { toPluginFrontendConfig } from '@/lib/plugin-safe-config';
 
 interface PluginSettingsModalProps {
   pluginName: string;
@@ -14,7 +15,7 @@ interface PluginSettingsModalProps {
 }
 
 export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, displayName, onClose }) => {
-  const { config, updateConfig } = useConfig();
+  const { config } = useConfig();
   const {
     setPluginConfig,
     sendAction,
@@ -106,8 +107,7 @@ export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, 
                 <PluginErrorBoundary key={pluginSection.key} pluginName={pluginSection.pluginName}>
                   <Component
                     pluginName={pluginSection.pluginName}
-                    config={config}
-                    updateConfig={updateConfig}
+                    config={toPluginFrontendConfig(config)}
                     pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
                     pluginState={getPluginState(pluginSection.pluginName)}
                     onAction={(action: string, data?: unknown) => {

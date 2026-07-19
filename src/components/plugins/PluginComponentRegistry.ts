@@ -5,8 +5,12 @@ type PluginComponentProps = {
   props?: Record<string, unknown>;
   onAction: (action: string, data?: unknown) => Promise<unknown>;
   onClose?: () => void;
+  // Redacted view of the app config (secrets stripped) — see
+  // src/lib/plugin-safe-config.ts. There is intentionally no `updateConfig`
+  // here: that would let any plugin write arbitrary config paths with no
+  // permission check at all; `setPluginConfig` below is the actual,
+  // permission-gated mechanism for a plugin to persist its own settings.
   config?: Record<string, unknown>;
-  updateConfig?: (path: string, value: unknown) => Promise<void>;
   pluginConfig?: Record<string, unknown>;
   pluginState?: Record<string, unknown>;
   setPluginConfig?: (path: string, value: unknown) => Promise<void>;

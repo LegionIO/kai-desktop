@@ -7,13 +7,14 @@ import { getPluginComponentByHint } from './PluginComponentRegistry';
 import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { usePluginSettingsSections } from './PluginSettingsSections';
 import { getPluginNavigationIcon } from './plugin-icons';
+import { toPluginFrontendConfig } from '@/lib/plugin-safe-config';
 
 export const PluginPanelHost: FC<{
   panel: PluginPanelDescriptor;
   onClose: () => void;
   displayName: string;
 }> = ({ panel, onClose, displayName }) => {
-  const { config, updateConfig } = useConfig();
+  const { config } = useConfig();
   const fullWidth = useFullWidthContent();
   const {
     sendAction,
@@ -108,8 +109,7 @@ export const PluginPanelHost: FC<{
           >
             <SettingsComponent
               pluginName={pluginSection.pluginName}
-              config={config ?? undefined}
-              updateConfig={updateConfig}
+              config={toPluginFrontendConfig(config)}
               pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
               pluginState={pluginState}
               onAction={(action: string, data?: unknown) => {
@@ -183,8 +183,7 @@ export const PluginPanelHost: FC<{
       <Component
         pluginName={panel.pluginName}
         props={panel.props}
-        config={config ?? undefined}
-        updateConfig={updateConfig}
+        config={toPluginFrontendConfig(config)}
         pluginConfig={getResolvedPluginConfig(panel.pluginName)}
         pluginState={pluginState}
         onAction={(action, data) => {

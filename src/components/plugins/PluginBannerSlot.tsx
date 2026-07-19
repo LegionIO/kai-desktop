@@ -4,6 +4,7 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
 import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { useConfig } from '@/providers/ConfigProvider';
+import { toPluginFrontendConfig } from '@/lib/plugin-safe-config';
 
 export const PluginBannerSlot: FC = () => {
   const {
@@ -15,7 +16,7 @@ export const PluginBannerSlot: FC = () => {
     hasRendererScript,
     getPluginRendererStatus,
   } = usePlugins();
-  const { config, updateConfig } = useConfig();
+  const { config } = useConfig();
 
   if (!uiState) return null;
 
@@ -40,8 +41,7 @@ export const PluginBannerSlot: FC = () => {
                   pluginName={banner.pluginName}
                   props={banner.props}
                   onAction={(action, data) => sendBannerAction(banner.pluginName, banner.id, action, data)}
-                  config={config ?? undefined}
-                  updateConfig={updateConfig}
+                  config={toPluginFrontendConfig(config)}
                   pluginConfig={getResolvedPluginConfig(banner.pluginName)}
                   pluginState={getPluginState(banner.pluginName)}
                 />

@@ -4,6 +4,7 @@ import { usePlugins } from '@/providers/PluginProvider';
 import { getPluginComponent } from './PluginComponentRegistry';
 import { PluginErrorBoundary } from './PluginErrorBoundary';
 import { useConfig } from '@/providers/ConfigProvider';
+import { toPluginFrontendConfig } from '@/lib/plugin-safe-config';
 
 export const PluginModalHost: FC = () => {
   const {
@@ -19,7 +20,7 @@ export const PluginModalHost: FC = () => {
     getPluginRendererStatus,
     getPluginRendererError,
   } = usePlugins();
-  const { config, updateConfig } = useConfig();
+  const { config } = useConfig();
 
   // rendererLoadCount changes when a plugin's renderer script finishes loading,
   // which ensures we re-render and pick up newly registered components
@@ -99,8 +100,7 @@ export const PluginModalHost: FC = () => {
                     props={modal.props}
                     onAction={handleAction}
                     onClose={modal.closeable ? handleClose : undefined}
-                    config={config ?? undefined}
-                    updateConfig={updateConfig}
+                    config={toPluginFrontendConfig(config)}
                     pluginConfig={getResolvedPluginConfig(modal.pluginName)}
                     pluginState={getPluginState(modal.pluginName)}
                     setPluginConfig={async (path, value) => {
