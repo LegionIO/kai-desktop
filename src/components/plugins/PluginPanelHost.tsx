@@ -113,7 +113,7 @@ export const PluginPanelHost: FC<{
               pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
               pluginState={pluginState}
               onAction={(action: string, data?: unknown) => {
-                return sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+                return sendAction(pluginSection.pluginName, `settings:${pluginSection.id}`, action, data);
               }}
               setPluginConfig={async (path: string, value: unknown) => {
                 await setPluginConfig(pluginSection.pluginName, path, value);

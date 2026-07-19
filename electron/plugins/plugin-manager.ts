@@ -1550,7 +1550,17 @@ export class PluginManager {
     if (!this.isPluginLive(payload.pluginName)) {
       return { error: 'Plugin is not active' };
     }
-    const handler = this.actionHandlers.get(payload.pluginName)?.get(payload.targetId);
+    const pluginHandlers = this.actionHandlers.get(payload.pluginName);
+    let handler = pluginHandlers?.get(payload.targetId);
+    // Settings-view dispatch now targets `settings:${id}` (the plugin's own
+    // chosen id, matching how panels already worked) instead of the fixed
+    // `settings:SettingsView` literal every plugin used to have to hardcode.
+    // Older plugins built against the previous convention still register at
+    // the literal string, so fall back to it rather than silently breaking
+    // them.
+    if (!handler && payload.targetId !== 'settings:SettingsView' && payload.targetId.startsWith('settings:')) {
+      handler = pluginHandlers?.get('settings:SettingsView');
+    }
     if (!handler) {
       console.warn(`[PluginManager] No action handler for ${payload.pluginName}:${payload.targetId}`);
       return { error: 'No handler registered' };

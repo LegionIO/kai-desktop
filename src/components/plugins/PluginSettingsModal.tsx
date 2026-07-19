@@ -111,7 +111,7 @@ export const PluginSettingsModal: FC<PluginSettingsModalProps> = ({ pluginName, 
                     pluginConfig={getResolvedPluginConfig(pluginSection.pluginName)}
                     pluginState={getPluginState(pluginSection.pluginName)}
                     onAction={(action: string, data?: unknown) => {
-                      return sendAction(pluginSection.pluginName, `settings:${pluginSection.component}`, action, data);
+                      return sendAction(pluginSection.pluginName, `settings:${pluginSection.id}`, action, data);
                     }}
                     setPluginConfig={async (path, value) => {
                       await setPluginConfig(pluginSection.pluginName, path, value);

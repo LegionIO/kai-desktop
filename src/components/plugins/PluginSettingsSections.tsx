@@ -2,6 +2,7 @@ import { usePlugins } from '@/providers/PluginProvider';
 
 export type PluginSettingsSection = {
   key: string;
+  id: string;
   label: string;
   pluginName: string;
   component: string;
@@ -15,6 +16,7 @@ export function usePluginSettingsSections(): PluginSettingsSection[] {
 
   return uiState.settingsSections.map((s) => ({
     key: `plugin:${s.pluginName}:${s.id}`,
+    id: s.id,
     label: s.label,
     pluginName: s.pluginName,
     component: s.component,
