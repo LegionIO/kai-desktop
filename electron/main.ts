@@ -305,7 +305,12 @@ function formatMainProcessError(error: unknown): string {
     return error;
   }
   try {
-    return JSON.stringify(error);
+    // JSON.stringify returns undefined (not a string) for undefined, functions,
+    // and symbols — a Promise.reject() with such a reason would otherwise flow a
+    // non-string downstream into `.match(...)` and throw a secondary error INSIDE
+    // the unhandled-error handler. Coerce to a guaranteed string.
+    const json = JSON.stringify(error);
+    return typeof json === 'string' ? json : String(error);
   } catch {
     return String(error);
   }

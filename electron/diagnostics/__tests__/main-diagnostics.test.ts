@@ -51,6 +51,13 @@ describe('extractPluginName', () => {
   it('returns null for core/app stacks', () => {
     expect(extractPluginName('at Object.foo (file:///app.asar/out/main/index.js:1:1)')).toBeNull();
   });
+  it('does not throw on a non-string (e.g. a JSON.stringify(undefined) result)', () => {
+    // A Promise.reject() with an undefined/function/symbol reason can flow a
+    // non-string into this path; it must return null, not throw inside the
+    // unhandled-error handler (which would spawn a secondary error).
+    expect(extractPluginName(undefined as unknown as string)).toBeNull();
+    expect(extractPluginName(123 as unknown as string)).toBeNull();
+  });
 });
 
 describe('diagnostic counters', () => {
@@ -85,6 +92,13 @@ describe('diagnostic counters', () => {
     expect(getDiagnosticCounters()).toHaveLength(1);
     resetDiagnosticCounters();
     expect(getDiagnosticCounters()).toHaveLength(0);
+  });
+
+  it('records a non-string reason without throwing', () => {
+    expect(() => recordDiagnostic('unhandledRejection', undefined as unknown as string)).not.toThrow();
+    const [c] = getDiagnosticCounters();
+    expect(c.plugin).toBeNull();
+    expect(typeof c.sample).toBe('string');
   });
 });
 

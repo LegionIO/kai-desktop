@@ -54,6 +54,10 @@ export function isDeadPipeError(error: unknown): boolean {
 
 /** Parse `/.kai/plugins/<name>/backend.js` frames out of a stack to attribute the error. */
 export function extractPluginName(formatted: string): string | null {
+  // Defensive: callers should pass a string, but a non-string (e.g. a
+  // JSON.stringify(undefined) result) must not throw here inside the
+  // unhandled-error path and spawn a secondary error.
+  if (typeof formatted !== 'string') return null;
   const m = formatted.match(/[/\\]plugins[/\\]([^/\\]+)[/\\]backend\.js/);
   return m ? m[1] : null;
 }
@@ -63,9 +67,10 @@ export function extractPluginName(formatted: string): string | null {
  * filesystem/console — main.ts owns those side effects. Exposed for testing.
  */
 export function recordDiagnostic(kind: DiagnosticKind, formatted: string): DiagnosticCounter {
-  const plugin = extractPluginName(formatted);
+  const safe = typeof formatted === 'string' ? formatted : String(formatted);
+  const plugin = extractPluginName(safe);
   const key = `${kind}:${plugin ?? 'core'}`;
-  const sample = formatted.split('\n', 1)[0].slice(0, 300);
+  const sample = safe.split('\n', 1)[0].slice(0, 300);
   const existing = counters.get(key);
   if (existing) {
     existing.count += 1;

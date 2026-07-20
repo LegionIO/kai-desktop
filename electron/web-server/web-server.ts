@@ -658,6 +658,12 @@ export function getBridgeScript(): string {
       install: function() { return invoke('auto-update:install'); },
       onStatus: function(cb) { return on('auto-update:status', cb); }
     },
+    diagnostics: {
+      getSummary: function() { return invoke('diagnostics:get-summary'); },
+      tailLog: function(maxBytes) { return invoke('diagnostics:tail-log', maxBytes); },
+      clearLog: function() { return invoke('diagnostics:clear-log'); },
+      resetCounters: function() { return invoke('diagnostics:reset-counters'); }
+    },
     dictation: {
       toggle: function() { return invoke('dictation:toggle'); },
       stop: function() { return invoke('dictation:stop'); },

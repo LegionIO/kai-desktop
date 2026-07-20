@@ -88,6 +88,7 @@ describe('web bridge ↔ preload parity', () => {
     'dictation',
     'appshots',
     'alerts',
+    'diagnostics',
   ] as const;
 
   it.each(fullMirrorNamespaces)('web shim `app.%s` exposes every method preload does', (ns) => {
