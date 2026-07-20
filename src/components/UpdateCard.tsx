@@ -56,6 +56,7 @@ export const UpdateCard: FC = () => {
   // Trigger fade-in animation when card first becomes relevant
   useEffect(() => {
     const showable =
+      status.state === 'available' ||
       status.state === 'downloading' ||
       status.state === 'downloaded' ||
       status.state === 'restarting' ||
@@ -66,14 +67,15 @@ export const UpdateCard: FC = () => {
     }
   }, [status.state, dismissed]);
 
-  // Reset dismissed when a new download starts (e.g. user dismissed but new version appears)
+  // Reset dismissed when a new update is found (e.g. user dismissed but new version appears)
   useEffect(() => {
-    if (status.state === 'downloading' && dismissed) {
+    if ((status.state === 'available' || status.state === 'downloading') && dismissed) {
       setDismissed(false);
     }
   }, [status.state, dismissed]);
 
   const showable =
+    status.state === 'available' ||
     status.state === 'downloading' ||
     status.state === 'downloaded' ||
     status.state === 'restarting' ||
@@ -139,13 +141,17 @@ export const UpdateCard: FC = () => {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <h3 className="text-base font-semibold text-foreground">
-                {status.state === 'downloading'
-                  ? 'Downloading update'
-                  : status.state === 'preparing'
-                    ? 'Preparing update…'
-                    : status.state === 'restarting'
-                      ? 'Restarting…'
-                      : 'Update available'}
+                {status.state === 'available'
+                  ? 'Update found'
+                  : status.state === 'downloading'
+                    ? 'Downloading update'
+                    : status.state === 'preparing'
+                      ? 'Preparing update…'
+                      : status.state === 'restarting'
+                        ? 'Restarting…'
+                        : status.state === 'downloaded'
+                          ? 'Update ready'
+                          : 'Update available'}
               </h3>
               {status.state === 'downloading' && status.mode && (
                 <span
@@ -160,13 +166,15 @@ export const UpdateCard: FC = () => {
               )}
             </div>
             <p className="mt-1 text-sm text-muted-foreground">
-              {status.state === 'downloading'
-                ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? '…'}) is being downloaded.`
-                : status.state === 'preparing'
-                  ? 'Preparing for update, please wait…'
-                  : status.state === 'restarting'
-                    ? `Installing version ${status.version ?? 'new'}, please wait...`
-                    : `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) is now available to install.`}
+              {status.state === 'available'
+                ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) was found. Starting download…`
+                : status.state === 'downloading'
+                  ? `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? '…'}) is being downloaded.`
+                  : status.state === 'preparing'
+                    ? 'Preparing for update, please wait…'
+                    : status.state === 'restarting'
+                      ? `Installing version ${status.version ?? 'new'}, please wait...`
+                      : `A new version of ${__BRAND_PRODUCT_NAME} (${status.version ?? 'new'}) is now available to install.`}
             </p>
           </div>
         </div>

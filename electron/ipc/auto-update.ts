@@ -452,15 +452,19 @@ export function checkForUpdatesInteractive(): void {
     fn();
   };
 
-  const onAvailable = (info: { version: string }) => {
+  // No dialog here on purpose: `dialog.showMessageBox` is an app-modal native
+  // alert, and on macOS showing one stalls the main process's event loop —
+  // including the `download-progress`/network callbacks for the update
+  // electron-updater just started (autoDownload=true kicks it off the moment
+  // `update-available` fires, in the same tick as this listener). A blocking
+  // "Update Available" alert here would visibly delay the download until the
+  // user dismissed it. The persistent listener in registerAutoUpdateHandlers
+  // already broadcasts `{ state: 'available' }` to the renderer, which the
+  // non-blocking corner card (UpdateCard) picks up and live-updates through
+  // downloading → downloaded — so no separate notification is needed.
+  const onAvailable = () => {
     settleOnce(() => {
-      dialog.showMessageBox({
-        type: 'info',
-        title: 'Update Available',
-        message: `${__BRAND_PRODUCT_NAME} ${info.version} is available.`,
-        detail: `The update is downloading in the background. You'll be notified when it's ready to install.`,
-        buttons: ['OK'],
-      });
+      /* handled by the non-blocking status broadcast */
     });
   };
 
