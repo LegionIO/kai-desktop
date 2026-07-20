@@ -88,6 +88,11 @@ export async function generateSwitchContext(
   modelConfig: LLMModelConfig,
   options?: SwitchOptions,
 ): Promise<string | null> {
+  // Transcript construction and model-aware tokenization are synchronous and
+  // can be expensive for long histories. Honor a pre-aborted request before
+  // doing either so cancellation stays immediate even under CPU contention.
+  if (options?.abortSignal?.aborted) return null;
+
   const threshold = options?.tokenThreshold ?? DEFAULT_TOKEN_THRESHOLD;
 
   // Build transcript from all messages except the last user message

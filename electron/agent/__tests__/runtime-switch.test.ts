@@ -117,6 +117,17 @@ describe('generateSwitchContext (under-threshold, no LLM)', () => {
     expect(await generateSwitchContext([], modelConfig)).toBeNull();
   });
 
+  it('honors a pre-aborted signal before processing a short transcript', async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+
+    expect(
+      await generateSwitchContext([user('old'), assistant('answer', 'mastra'), user('new')], modelConfig, {
+        abortSignal: ctrl.signal,
+      }),
+    ).toBeNull();
+  });
+
   it('returns null immediately when the abort signal is already aborted (over threshold)', async () => {
     // A large transcript pushes over the summarize threshold; a pre-aborted
     // signal must short-circuit to null without calling the summarizer.
