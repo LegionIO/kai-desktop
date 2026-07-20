@@ -81,10 +81,12 @@ export function sanitizeMoonshotSchema(schema: unknown): unknown {
     if (conflicting.length > 0) {
       // Rewrite each branch, merging the parent's copy of every conflicting key
       // in. Scalars (default/pattern/maxLength): seed only where the branch
-      // lacks the key. Objects (e.g. `properties`) / arrays (e.g. `required`):
-      // union the parent's members with the branch's so a parent-wide constraint
-      // isn't dropped on a branch that only declared a partial copy — the branch
-      // wins on any key it already sets.
+      // lacks the key. Objects (e.g. `properties`): shallow-union so a
+      // parent-wide constraint isn't dropped on a branch with a partial copy
+      // (branch wins per-key). Arrays: only `required` is a set we can safely
+      // union — `type`/`enum`/tuple `items` are NARROWED by a branch on purpose,
+      // so unioning them back would widen the contract; for those, seed-if-absent.
+      const UNIONABLE_ARRAY_KEYS = new Set(['required']);
       const mergeInto = (branch: Record<string, unknown>, key: string): void => {
         const parentVal = node[key];
         const branchVal = branch[key];
@@ -103,11 +105,12 @@ export function sanitizeMoonshotSchema(schema: unknown): unknown {
           branch[key] = { ...(parentVal as Record<string, unknown>), ...(branchVal as Record<string, unknown>) };
           return;
         }
-        if (Array.isArray(parentVal) && Array.isArray(branchVal)) {
+        if (UNIONABLE_ARRAY_KEYS.has(key) && Array.isArray(parentVal) && Array.isArray(branchVal)) {
           branch[key] = Array.from(new Set([...parentVal, ...branchVal]));
           return;
         }
-        // Scalar (or type mismatch): the branch's own value is authoritative.
+        // Scalar, non-unionable array (type/enum/items), or type mismatch: the
+        // branch's own value is authoritative — it intentionally narrowed the parent.
       };
       const seed = (arr: unknown[]): unknown[] =>
         arr.map((b) => {

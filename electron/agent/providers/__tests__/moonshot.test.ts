@@ -149,6 +149,34 @@ describe('sanitizeMoonshotSchema', () => {
     expect([...(sanitized.anyOf[0].required ?? [])].sort()).toEqual(['a', 'b', 'c']);
     expect([...(sanitized.anyOf[1].required ?? [])].sort()).toEqual(['a', 'b']);
   });
+
+  it('does NOT widen a branch-narrowed array `type` back to the parent set', () => {
+    // Parent allows string|number; a branch deliberately narrows to string only.
+    // Unioning would re-admit number, changing the tool contract — must not happen.
+    const schema = {
+      type: ['string', 'number'],
+      anyOf: [{ type: ['string'] }, { type: 'null' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as {
+      type?: unknown;
+      anyOf: Array<{ type?: unknown }>;
+    };
+    expect(sanitized).not.toHaveProperty('type');
+    // The narrowing branch keeps its own narrowed type (NOT widened to include number).
+    expect(sanitized.anyOf[0].type).toEqual(['string']);
+    // The branch that lacked `type` inherits the parent set (seed-if-absent).
+    expect(sanitized.anyOf[1].type).toEqual('null');
+  });
+
+  it('does NOT union an `enum` — a branch narrows it on purpose', () => {
+    const schema = {
+      enum: ['a', 'b', 'c'],
+      anyOf: [{ enum: ['a'] }, { type: 'null' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as { enum?: unknown; anyOf: Array<{ enum?: unknown }> };
+    expect(sanitized).not.toHaveProperty('enum');
+    expect(sanitized.anyOf[0].enum).toEqual(['a']);
+  });
 });
 
 describe('createMoonshotCompatFetch', () => {

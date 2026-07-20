@@ -27,7 +27,7 @@ import {
 import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
-import { isKaiPresent } from '../agent/kai-presence.js';
+import { isGuiFocused } from '../agent/kai-presence.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
@@ -51,7 +51,14 @@ export function initializeAlerts(d: AlertsDeps): void {
 }
 
 /** Push an `alerts:changed` event to every window + web client (tab badge / modal host). */
-function broadcastAlertsChanged(payload: { reason: 'created' | 'resolved' | 'dismissed'; alert?: Alert }): void {
+function broadcastAlertsChanged(payload: {
+  reason: 'created' | 'resolved' | 'dismissed';
+  alert?: Alert;
+  /** When true, a present user is already looking at Kai — the renderer should
+   *  NOT pop a modal/steal focus (the inline card is the surface). Still updates
+   *  the Alerts tab/badge. */
+  suppressSurface?: boolean;
+}): void {
   // Close the dedicated pop-out window once the alert is answered/dismissed (from
   // any surface: the window, the tab, or the in-app modal) so it can't linger.
   if ((payload.reason === 'resolved' || payload.reason === 'dismissed') && payload.alert) {
@@ -100,15 +107,20 @@ export function raiseAlert(input: CreateAlertInput): Alert {
  *  Exported as the hook `request_review` / the ask_user fallback call after they
  *  write the store directly (they live in the tools layer and can't import electron). */
 export function notifyNewAlert(alert: Alert): void {
-  // Presence-aware surfacing (mirrors the ask_user / tool-approval gate): when
-  // the user is actively on Kai (GUI focused or CLI recently active) they can see
-  // the inline request_review card in the conversation, so DON'T also fire an OS
+  // Presence-aware surfacing: when the user is looking at the Kai GUI they can
+  // see the inline request_review card / Alerts tab, so DON'T also fire an OS
   // notification or steal focus with a modal/pop-out. The alert is still
-  // persisted + broadcast (so it shows inline + in Alerts history). When away,
+  // persisted + broadcast (inline card + Alerts history). When they're away,
   // surface it normally so a headless/automation run isn't missed.
+  //
+  // NB: for ALERTS, presence means the GUI is focused — NOT `isKaiPresent()`.
+  // A connected CLI heartbeats every few seconds (keeping isCliPresent() true)
+  // but the CLI has no live alert UI, so treating CLI liveness as "the alert is
+  // visible" would silently swallow the OS notification/pop-out for a blocking
+  // question/approval and leave the automation waiting invisibly.
   const present = (() => {
     try {
-      return isKaiPresent();
+      return isGuiFocused();
     } catch {
       return false;
     }
@@ -132,8 +144,10 @@ export function notifyNewAlert(alert: Alert): void {
       // Notifications can throw on some platforms/permission states — non-fatal.
     }
   }
-  // Always broadcast so the inline card + Alerts tab/history update live.
-  broadcastAlertsChanged({ reason: 'created', alert });
+  // Always broadcast so the inline card + Alerts tab/history update live. Pass
+  // `suppressSurface` so the renderer's AlertModalHost skips the modal for a
+  // present user (the broadcast alone would otherwise pop it regardless).
+  broadcastAlertsChanged({ reason: 'created', alert, suppressSurface: present });
   // Surface (modal/pop-out) only when AWAY and not an fyi (fyi never steals focus).
   if (!present && alert.kind !== 'fyi') {
     const surface = deps?.alertSurface() ?? 'off';

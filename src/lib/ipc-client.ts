@@ -22,7 +22,14 @@ export type { CliInstallStatus } from '../../electron/ipc/cli-install';
 export type { Alert, AlertIndexEntry, AlertKind, AlertStatus, AlertQuestion } from '../../electron/ipc/alert-store';
 
 /** Payload pushed on `alerts:changed` — the reason + the affected alert. */
-export type AlertsChangedPayload = { reason: 'created' | 'resolved' | 'dismissed'; alert?: Alert };
+export type AlertsChangedPayload = {
+  reason: 'created' | 'resolved' | 'dismissed';
+  alert?: Alert;
+  /** Main process resolved the user as present (GUI focused) — the renderer
+   *  should NOT pop a modal/steal focus for this event (inline card is the
+   *  surface). Absent/false → surface per config. */
+  suppressSurface?: boolean;
+};
 
 export type AutomationSourceCatalogEntry = {
   source: string;

@@ -36,6 +36,10 @@ export const AlertModalHost: FC = () => {
       if (!enabledRef.current) return;
       if (payload.reason !== 'created' || !payload.alert) return;
       if (payload.alert.kind === 'fyi') return; // fyi never steals focus
+      // Present user (GUI focused): the main process already decided NOT to
+      // surface — the inline in-thread card is the surface, so don't overlay a
+      // modal on top of the conversation they're already looking at.
+      if (payload.suppressSurface) return;
       setAlert(payload.alert);
       // The main process already raises + focuses the window (alerts.ts
       // surfaceAsModal path); the renderer just opens the in-app modal.
