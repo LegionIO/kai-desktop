@@ -108,6 +108,19 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: desktopConfigPayload round-trip', () => {
+  it('defaults recent history to the Kai branch and persists an explicit merge mode', () => {
+    const initial = readEffectiveConfig(appHome);
+    expect(initial.memory.recentHistoryMode).toBe('kai-branch');
+
+    initial.memory.recentHistoryMode = 'merge-mastra';
+    initial.memory.lastMessages = 32;
+    writeDesktopConfig(appHome, initial);
+
+    const reread = readEffectiveConfig(appHome);
+    expect(reread.memory.recentHistoryMode).toBe('merge-mastra');
+    expect(reread.memory.lastMessages).toBe(32);
+  });
+
   it('preserves every allowlisted section across write -> read', async () => {
     const initial = readEffectiveConfig(appHome);
     const payload = desktopConfigPayload(initial);

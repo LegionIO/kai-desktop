@@ -100,6 +100,14 @@ const embeddingProviderSchema = z.object({
 
 const memoryConfigSchema = z.object({
   enabled: z.boolean(),
+  /**
+   * Kai always submits the complete active branch. By default that branch is
+   * the sole source of recent conversational history. `merge-mastra` also
+   * recalls Mastra's persisted recent messages and reconciles them against the
+   * Kai branch before inference (useful for mixed GUI/CLI clients and legacy
+   * threads).
+   */
+  recentHistoryMode: z.enum(['kai-branch', 'merge-mastra']).default('kai-branch'),
   workingMemory: z.object({
     enabled: z.boolean(),
     scope: z.enum(['thread', 'resource']),

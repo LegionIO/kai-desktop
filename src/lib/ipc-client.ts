@@ -66,6 +66,7 @@ type AppAPI = {
         maxRetries?: number | null;
         runtimeOverride?: string | null;
       },
+      responseMessageId?: string,
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     inFlight: (conversationId: string) => Promise<boolean>;

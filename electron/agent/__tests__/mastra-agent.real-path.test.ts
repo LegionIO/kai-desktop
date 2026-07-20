@@ -46,28 +46,35 @@ import type { StreamEvent } from '../mastra-agent.js';
 
 const agentState: {
   generateImpl?: (input: unknown, opts: unknown) => Promise<unknown>;
-  streamImpl?: () => unknown;
+  streamImpl?: (input?: unknown, opts?: unknown) => unknown;
   toolsAttached?: unknown;
   lastInstructions?: string;
+  lastInputProcessors?: unknown;
+  lastGenerateOptions?: unknown;
+  streamOptions: unknown[];
   workspaceCommandInput?: unknown;
   agentBuildCount: number;
 } = {
   agentBuildCount: 0,
+  streamOptions: [],
 };
 
 vi.mock('@mastra/core/agent', () => {
   return {
-    Agent: vi.fn(function (cfg: { instructions?: string; tools?: unknown }) {
+    Agent: vi.fn(function (cfg: { instructions?: string; tools?: unknown; inputProcessors?: unknown }) {
       agentState.agentBuildCount += 1;
       agentState.toolsAttached = cfg.tools;
       agentState.lastInstructions = cfg.instructions;
+      agentState.lastInputProcessors = cfg.inputProcessors;
       return {
         generate: vi.fn(async (input: unknown, opts: unknown) => {
+          agentState.lastGenerateOptions = opts;
           if (agentState.generateImpl) return agentState.generateImpl(input, opts);
           return { text: 'Hi.', finishReason: 'stop' };
         }),
-        stream: vi.fn(async () => {
-          if (agentState.streamImpl) return agentState.streamImpl();
+        stream: vi.fn(async (input: unknown, opts: unknown) => {
+          agentState.streamOptions.push(opts);
+          if (agentState.streamImpl) return agentState.streamImpl(input, opts);
           return {
             textStream: (async function* () {
               yield 'Hi.';
@@ -151,7 +158,7 @@ function makeConfig(): AppConfig {
     systemPrompt: 'You are Kai.',
     systemPrompts: { chat: 'You are Kai.' },
     models: { defaultModelKey: 'test', providers: {}, catalog: [] },
-    memory: { enabled: true },
+    memory: { enabled: true, recentHistoryMode: 'kai-branch', lastMessages: 10 },
     tools: {
       executionMode: 'normal',
       shell: { enabled: true, timeout: 30_000, allowPatterns: ['*'], denyPatterns: [] },
@@ -205,6 +212,9 @@ beforeEach(() => {
   agentState.streamImpl = undefined;
   agentState.toolsAttached = undefined;
   agentState.lastInstructions = undefined;
+  agentState.lastInputProcessors = undefined;
+  agentState.lastGenerateOptions = undefined;
+  agentState.streamOptions = [];
   agentState.workspaceCommandInput = undefined;
   agentState.agentBuildCount = 0;
 });
@@ -214,6 +224,35 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('mastra-agent — pure helpers', () => {
+  describe('buildMastraMemoryOptions', () => {
+    it('does not prepend persisted recent messages to a caller-supplied full branch', () => {
+      expect(__internal.buildMastraMemoryOptions('thread-1', { id: 'memory' } as never, makeConfig())).toEqual({
+        memory: {
+          thread: { id: 'thread-1' },
+          resource: 'kai',
+          options: { lastMessages: false },
+        },
+      });
+    });
+
+    it('omits memory options when memory is disabled', () => {
+      expect(__internal.buildMastraMemoryOptions('thread-1', null, makeConfig())).toBeUndefined();
+    });
+
+    it('recalls the configured bounded suffix in deduplicated merge mode', () => {
+      const config = makeConfig();
+      config.memory.recentHistoryMode = 'merge-mastra';
+      config.memory.lastMessages = 24;
+      expect(__internal.buildMastraMemoryOptions('thread-1', { id: 'memory' } as never, config)).toEqual({
+        memory: {
+          thread: { id: 'thread-1' },
+          resource: 'kai',
+          options: { lastMessages: 24 },
+        },
+      });
+    });
+  });
+
   describe('normalizeAgentCwd', () => {
     it('expands "~" to homedir', () => {
       const result = normalizeAgentCwd('~');
@@ -386,6 +425,7 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
         })(),
       });
 
+      const responseMessageId = 'msg-kai-shared-1';
       const events = await collect(
         streamAgentResponse(
           'conv-real-1',
@@ -394,13 +434,42 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
           makeConfig(),
           [],
           '/tmp/test.db',
+          { responseMessageId },
         ),
       );
 
       expect(agentState.agentBuildCount).toBeGreaterThanOrEqual(1);
       expect(agentState.lastInstructions).toContain('Quote every path that contains whitespace.');
       expect(events.some((e) => e.type === 'text-delta' && e.text === 'Hello.')).toBe(true);
+      expect(events.every((e) => e.responseMessageId === responseMessageId)).toBe(true);
+      const streamOptions = agentState.streamOptions[0] as { experimental_generateMessageId?: () => string };
+      expect(streamOptions.experimental_generateMessageId?.()).toBe(responseMessageId);
       expect(events[events.length - 1].type).toBe('done');
+    });
+
+    it('uses the same caller-supplied id for the non-streaming generate path', async () => {
+      const responseMessageId = 'msg-kai-generate-1';
+      const reasoningGatewayModel = {
+        ...makeModelConfig(),
+        provider: 'amazon-bedrock' as const,
+        endpoint: 'https://example.test/ai-gateway-reasoning/',
+      };
+
+      const events = await collect(
+        streamAgentResponse(
+          'conv-generate-id',
+          [{ role: 'user', content: 'Hi.' }],
+          reasoningGatewayModel,
+          makeConfig(),
+          [],
+          '/tmp/generate-id.db',
+          { responseMessageId },
+        ),
+      );
+
+      const generateOptions = agentState.lastGenerateOptions as { experimental_generateMessageId?: () => string };
+      expect(generateOptions.experimental_generateMessageId?.()).toBe(responseMessageId);
+      expect(events.every((event) => event.responseMessageId === responseMessageId)).toBe(true);
     });
 
     it('emits step progress and max-steps-reached for capped streaming tool loops', async () => {
@@ -458,6 +527,26 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
       );
 
       expect(getSharedMemory).toHaveBeenCalled();
+    });
+
+    it('attaches the reconciliation processor only in merge mode', async () => {
+      const config = makeConfig();
+      config.memory.recentHistoryMode = 'merge-mastra';
+
+      await collect(
+        streamAgentResponse(
+          'conv-mem-merge',
+          [{ role: 'user', content: 'Hi.' }],
+          makeModelConfig(),
+          config,
+          [],
+          '/tmp/mem-merge.db',
+        ),
+      );
+
+      expect(agentState.lastInputProcessors).toEqual([
+        expect.objectContaining({ id: 'kai-recent-history-reconciler' }),
+      ]);
     });
   });
 
@@ -563,6 +652,7 @@ describe('streamWithFallback — real path (mocked @mastra/core)', () => {
           makeConfig(),
           [],
           '/tmp/fb.db',
+          { responseMessageId: 'msg-shared-fallback' },
         ),
       );
 
@@ -571,7 +661,57 @@ describe('streamWithFallback — real path (mocked @mastra/core)', () => {
 
       // Fallback should have produced content.
       expect(events.some((e) => e.type === 'text-delta' && e.text === 'Fallback ok.')).toBe(true);
+      expect(events.find((e) => e.type === 'text-delta')?.responseMessageId).toBe('msg-shared-fallback');
       expect(events.some((e) => e.type === 'done')).toBe(true);
+    });
+
+    it('rotates the shared response id when a partial fallback is preserved as a sibling', async () => {
+      let primaryBuildIndex: number | null = null;
+      agentState.streamImpl = () => {
+        if (primaryBuildIndex === null) primaryBuildIndex = agentState.agentBuildCount;
+        if (agentState.agentBuildCount === primaryBuildIndex) {
+          return {
+            fullStream: (async function* () {
+              yield { type: 'text-delta', payload: { text: 'partial' } };
+              const err = new Error('upstream unavailable') as Error & { status?: number; statusCode?: number };
+              err.status = 503;
+              err.statusCode = 503;
+              throw err;
+            })(),
+          };
+        }
+        return {
+          fullStream: (async function* () {
+            yield { type: 'text-delta', payload: { text: 'successful retry' } };
+            yield { type: 'finish', payload: { finishReason: 'stop' } };
+          })(),
+        };
+      };
+
+      const events = await collect(
+        streamWithFallback(
+          'conv-partial-fallback',
+          [{ role: 'user', content: 'Hi.' }],
+          makeStreamConfig(),
+          makeConfig(),
+          [],
+          '/tmp/partial-fallback.db',
+          { responseMessageId: 'msg-primary-partial' },
+        ),
+      );
+
+      const firstText = events.find((event) => event.type === 'text-delta' && event.text === 'partial');
+      const retryText = events.find((event) => event.type === 'text-delta' && event.text === 'successful retry');
+      expect(firstText?.responseMessageId).toBe('msg-primary-partial');
+      expect(retryText?.responseMessageId).toBeTruthy();
+      expect(retryText?.responseMessageId).not.toBe(firstText?.responseMessageId);
+      expect(
+        events.some(
+          (event) =>
+            event.type === 'model-fallback' &&
+            (event.data as { preserveErroredVariant?: boolean } | undefined)?.preserveErroredVariant,
+        ),
+      ).toBe(true);
     });
   });
 });

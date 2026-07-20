@@ -502,6 +502,32 @@ describe('conversations IPC: active-id handling', () => {
 });
 
 describe('appendConversationMessages', () => {
+  it('uses a supplied response id but refuses to duplicate an existing tree id', () => {
+    writeConversationStore(appHome, {
+      conversations: {
+        c1: makeConversation('c1', {
+          messageTree: [
+            { id: 'existing-id', parentId: null, role: 'user', content: 'hi', createdAt: '2026-01-01T00:00:00Z' },
+          ],
+          headId: 'existing-id',
+        }) as never,
+      },
+      activeConversationId: null,
+      settings: {},
+    });
+
+    appendConversationMessages(appHome, 'c1', [
+      { id: 'shared-response-id', role: 'assistant', content: 'first' },
+      { id: 'existing-id', role: 'assistant', content: 'collision' },
+    ]);
+
+    const tree = (readConversationStore(appHome).conversations.c1 as { messageTree: Array<{ id: string }> })
+      .messageTree;
+    expect(tree[1].id).toBe('shared-response-id');
+    expect(tree[2].id).not.toBe('existing-id');
+    expect(new Set(tree.map((message) => message.id)).size).toBe(tree.length);
+  });
+
   it('chains parentId from head, updates counts and timestamps', () => {
     writeConversationStore(appHome, {
       conversations: {

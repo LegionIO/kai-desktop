@@ -37,6 +37,7 @@ const appAPI = {
         maxRetries?: number | null;
         runtimeOverride?: string | null;
       },
+      responseMessageId?: string,
     ) =>
       ipcRenderer.invoke(
         'agent:stream',
@@ -49,6 +50,7 @@ const appAPI = {
         cwd,
         executionMode,
         threadOverrides,
+        responseMessageId,
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<boolean>,

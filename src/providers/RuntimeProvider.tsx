@@ -163,6 +163,9 @@ type MessageAccumulator = {
   messages: StoredMessage[];
   headId: string | null;
   pendingAssistantTiming?: PendingAssistantTiming | null;
+  /** Assistant id preallocated for the current inference response. Mastra uses
+   * the same id for its persisted output row and echoes it on stream events. */
+  pendingAssistantId?: string | null;
   /** Deferred tool approvals keyed by toolName — handles race where
    *  tool-approval-required arrives before the stream-side tool-call event. */
   deferredApprovals?: Map<string, { toolCallId: string; args?: unknown }>;
@@ -616,18 +619,21 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
 
   if (last?.role !== 'assistant') {
     acc.pendingAssistantTiming = null;
+    acc.pendingAssistantId = null;
     return;
   }
 
   const startedAt = getResponseTiming(last)?.startedAt ?? acc.pendingAssistantTiming?.startedAt;
   if (!startedAt) {
     acc.pendingAssistantTiming = null;
+    acc.pendingAssistantId = null;
     return;
   }
 
   const idx = acc.messages.findIndex((m) => m.id === last.id);
   if (idx < 0) {
     acc.pendingAssistantTiming = null;
+    acc.pendingAssistantId = null;
     return;
   }
 
@@ -658,12 +664,14 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
 
   acc.messages[idx] = withResponseTiming(acc.messages[idx], buildResponseTiming(startedAt, finishedAt));
   acc.pendingAssistantTiming = null;
+  acc.pendingAssistantId = null;
 }
 
-function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
+export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
+  const desiredId = acc.pendingAssistantId ?? undefined;
   const branch = getActiveBranch(acc.messages, acc.headId);
   const last = branch[branch.length - 1];
-  if (last?.role === 'assistant') {
+  if (last?.role === 'assistant' && (!desiredId || last.id === desiredId)) {
     const idx = acc.messages.findIndex((m) => m.id === last.id);
     const timed = withPendingAssistantTiming(last, acc);
     if (timed !== last && idx >= 0) {
@@ -673,7 +681,7 @@ function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessag
   }
   // Create new assistant message
   const baseMsg: StoredMessage = {
-    id: msgId(),
+    id: desiredId ?? msgId(),
     parentId: acc.headId,
     role: 'assistant',
     content: [],
@@ -1929,6 +1937,7 @@ export function RuntimeProvider({
       const e = event as {
         conversationId: string;
         type: string;
+        responseMessageId?: string;
         text?: string;
         messageMeta?: Record<string, unknown>;
         toolCallId?: string;
@@ -2028,6 +2037,7 @@ export function RuntimeProvider({
           });
         }
         const saAcc = globalSubAgentAccumulators.get(saId)!;
+        if (e.responseMessageId) saAcc.pendingAssistantId = e.responseMessageId;
 
         if (e.type === 'sub-agent-user-message') {
           // Dedup: skip if the last message in the accumulator is already
@@ -2187,6 +2197,7 @@ export function RuntimeProvider({
       }
 
       const acc = streamAccumulators.get(convId)!;
+      if (e.responseMessageId) acc.pendingAssistantId = e.responseMessageId;
 
       if (e.type === 'user-message') {
         // A user turn submitted into THIS conversation by ANOTHER client (the
@@ -2628,11 +2639,13 @@ export function RuntimeProvider({
             persistTimersRef.current.delete(convId);
           }
           const branch = getActiveBranch(acc.messages, acc.headId);
+          const responseMessageId = msgId();
           persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' });
           streamAccumulators.set(convId, {
             messages: [...acc.messages],
             headId: acc.headId,
             pendingAssistantTiming: createPendingAssistantTiming(),
+            pendingAssistantId: responseMessageId,
           });
           if (isActiveConv) {
             setTree([...acc.messages]);
@@ -2649,6 +2662,7 @@ export function RuntimeProvider({
             currentWorkingDirectoryRef.current ?? undefined,
             cfg.executionMode ?? 'auto',
             cfg.threadOverrides ?? undefined,
+            responseMessageId,
           );
           return;
         }
@@ -2833,10 +2847,12 @@ export function RuntimeProvider({
                 const treeForStream = [...acc.messages];
 
                 const branch = getActiveBranch(treeForStream, headForStream);
+                const responseMessageId = msgId();
                 streamAccumulators.set(convId, {
                   messages: [...treeForStream],
                   headId: headForStream,
                   pendingAssistantTiming: createPendingAssistantTiming(),
+                  pendingAssistantId: responseMessageId,
                 });
                 setIsRunning(true);
                 persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
@@ -2852,6 +2868,7 @@ export function RuntimeProvider({
                   currentWorkingDirectoryRef.current ?? undefined,
                   'plan-first',
                   cfg.threadOverrides ?? undefined,
+                  responseMessageId,
                 );
               }
             }, 100);
@@ -2987,11 +3004,17 @@ export function RuntimeProvider({
       const newTree = [...tree, userMsg];
       const newHead = userMsg.id;
       const pendingAssistantTiming = createPendingAssistantTiming();
+      const responseMessageId = msgId();
       setTree(newTree);
       setHeadId(newHead);
       setIsRunning(true);
 
-      streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
+      streamAccumulators.set(convId, {
+        messages: [...newTree],
+        headId: newHead,
+        pendingAssistantTiming,
+        pendingAssistantId: responseMessageId,
+      });
       const branch = getActiveBranch(newTree, newHead);
 
       await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -3013,6 +3036,7 @@ export function RuntimeProvider({
         cwd ?? undefined,
         executionMode ?? 'auto',
         threadOverrides ?? undefined,
+        responseMessageId,
       );
     },
     [
@@ -3053,10 +3077,12 @@ export function RuntimeProvider({
       setIsRunning(true);
 
       const newTree = [...tree]; // keep all existing messages (old branches preserved)
+      const responseMessageId = msgId();
       streamAccumulators.set(convId, {
         messages: newTree,
         headId: actualParent,
         pendingAssistantTiming: createPendingAssistantTiming(),
+        pendingAssistantId: responseMessageId,
       });
       const branch = getActiveBranch(newTree, actualParent);
       persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
@@ -3073,6 +3099,7 @@ export function RuntimeProvider({
         currentWorkingDirectoryRef.current ?? undefined,
         executionMode ?? 'auto',
         threadOverrides ?? undefined,
+        responseMessageId,
       );
     },
     [
@@ -3146,13 +3173,19 @@ export function RuntimeProvider({
       const newTree = [...tree, editedMsg];
       const newHead = editedMsg.id;
       const pendingAssistantTiming = createPendingAssistantTiming();
+      const responseMessageId = msgId();
 
       lastRetitleCount.delete(convId);
       setTree(newTree);
       setHeadId(newHead);
       setIsRunning(true);
 
-      streamAccumulators.set(convId, { messages: [...newTree], headId: newHead, pendingAssistantTiming });
+      streamAccumulators.set(convId, {
+        messages: [...newTree],
+        headId: newHead,
+        pendingAssistantTiming,
+        pendingAssistantId: responseMessageId,
+      });
       const branch = getActiveBranch(newTree, newHead);
 
       await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -3170,6 +3203,7 @@ export function RuntimeProvider({
         currentWorkingDirectoryRef.current ?? undefined,
         executionMode ?? 'auto',
         threadOverrides ?? undefined,
+        responseMessageId,
       );
     },
     [tree, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides],
@@ -3527,10 +3561,12 @@ export function RuntimeProvider({
         const cfg = streamHandlerRef.current;
         const newHead = cfg.headId;
         const branch = getActiveBranch(updated, newHead);
+        const responseMessageId = msgId();
         streamAccumulators.set(convId, {
           messages: [...updated],
           headId: newHead,
           pendingAssistantTiming: createPendingAssistantTiming(),
+          pendingAssistantId: responseMessageId,
         });
         persistConversation(convId, updated, newHead, { runStatus: 'running' });
         app.agent.stream(
@@ -3543,6 +3579,7 @@ export function RuntimeProvider({
           currentWorkingDirectoryRef.current ?? undefined,
           executionMode ?? 'auto',
           cfg.threadOverrides ?? undefined,
+          responseMessageId,
         );
         return updated;
       });
@@ -3587,6 +3624,7 @@ export function RuntimeProvider({
     };
     const newTree = [...currentTree, continueMsg];
     const newHead = continueMsg.id;
+    const responseMessageId = msgId();
 
     setTree(newTree);
     setHeadId(newHead);
@@ -3598,6 +3636,7 @@ export function RuntimeProvider({
       messages: [...newTree],
       headId: newHead,
       pendingAssistantTiming: createPendingAssistantTiming(),
+      pendingAssistantId: responseMessageId,
     });
     const branch = getActiveBranch(newTree, newHead);
     persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -3611,6 +3650,7 @@ export function RuntimeProvider({
       currentWorkingDirectoryRef.current ?? undefined,
       executionMode ?? 'auto',
       cfg.threadOverrides ?? undefined,
+      responseMessageId,
     );
 
     console.info('[Analytics] step_limit_continue_clicked', { conversationId: convId });

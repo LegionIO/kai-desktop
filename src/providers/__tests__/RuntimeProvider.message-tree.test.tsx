@@ -21,6 +21,7 @@ import {
   isDuplicateLastUserMessage,
   locateToolCallInBranch,
   preserveErroredAssistantVariant,
+  getOrCreateAssistantInAcc,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -62,6 +63,83 @@ describe('getActiveBranch', () => {
     const tree = asTree([n('a', 'a')]);
     const branch = getActiveBranch(tree, 'a');
     expect(branch.map((m) => m.id)).toEqual(['a']);
+  });
+});
+
+describe('shared Kai/Mastra assistant ids', () => {
+  it('uses the preallocated response id for a new assistant message', () => {
+    const acc = {
+      messages: [
+        {
+          id: 'user-1',
+          parentId: null,
+          role: 'user',
+          content: [{ type: 'text', text: 'hello' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-1',
+      pendingAssistantId: 'msg-shared-1',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const { msg } = getOrCreateAssistantInAcc(acc);
+
+    expect(msg.id).toBe('msg-shared-1');
+    expect(msg.parentId).toBe('user-1');
+  });
+
+  it('creates a fresh child when a continuation response has a different shared id', () => {
+    const acc = {
+      messages: [
+        {
+          id: 'assistant-old',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'partial' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'assistant-old',
+      pendingAssistantId: 'assistant-continuation',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const { msg } = getOrCreateAssistantInAcc(acc);
+
+    expect(msg.id).toBe('assistant-continuation');
+    expect(msg.parentId).toBe('assistant-old');
+  });
+
+  it('creates the fallback retry as a sibling with its newly echoed id', () => {
+    const acc = {
+      messages: [
+        {
+          id: 'user-1',
+          parentId: null,
+          role: 'user',
+          content: [{ type: 'text', text: 'hello' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'failed-response',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'partial' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'failed-response',
+      pendingAssistantId: 'failed-response',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    expect(preserveErroredAssistantVariant(acc, 'provider failed')).toBe(true);
+    acc.pendingAssistantId = 'successful-response';
+    const { msg } = getOrCreateAssistantInAcc(acc);
+
+    expect(msg.id).toBe('successful-response');
+    expect(msg.parentId).toBe('user-1');
+    expect(acc.messages.filter((message: { parentId: string | null }) => message.parentId === 'user-1')).toHaveLength(
+      2,
+    );
   });
 });
 

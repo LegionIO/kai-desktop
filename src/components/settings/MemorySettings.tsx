@@ -1,5 +1,14 @@
 import { useState, useRef, useCallback, type FC } from 'react';
-import { Trash2Icon, AlertTriangleIcon, LoaderIcon, CheckCircle2Icon, EyeIcon, EyeOffIcon, WifiIcon, WifiOffIcon } from 'lucide-react';
+import {
+  Trash2Icon,
+  AlertTriangleIcon,
+  LoaderIcon,
+  CheckCircle2Icon,
+  EyeIcon,
+  EyeOffIcon,
+  WifiIcon,
+  WifiOffIcon,
+} from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { Toggle, NumberField, TextField, settingsSelectClass, type SettingsProps } from './shared';
 
@@ -63,7 +72,10 @@ const TestEmbeddingButton: FC = () => {
     setErrorMsg(null);
     setSuccessInfo(null);
 
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
 
     try {
       const result = await app.memory.testEmbedding();
@@ -80,11 +92,14 @@ const TestEmbeddingButton: FC = () => {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     }
 
-    timerRef.current = setTimeout(() => {
-      setState('idle');
-      setErrorMsg(null);
-      setSuccessInfo(null);
-    }, state === 'success' ? 5000 : 10000);
+    timerRef.current = setTimeout(
+      () => {
+        setState('idle');
+        setErrorMsg(null);
+        setSuccessInfo(null);
+      },
+      state === 'success' ? 5000 : 10000,
+    );
   }, [state]);
 
   return (
@@ -132,9 +147,7 @@ const TestEmbeddingButton: FC = () => {
         </p>
       )}
       {state === 'error' && errorMsg && (
-        <p className="text-[10px] text-red-600/80 dark:text-red-400/80 pl-1 break-all">
-          {errorMsg}
-        </p>
+        <p className="text-[10px] text-red-600/80 dark:text-red-400/80 pl-1 break-all">{errorMsg}</p>
       )}
     </div>
   );
@@ -145,6 +158,7 @@ const TestEmbeddingButton: FC = () => {
 export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const memory = config.memory as {
     enabled: boolean;
+    recentHistoryMode?: 'kai-branch' | 'merge-mastra';
     workingMemory: { enabled: boolean; scope: string };
     observationalMemory: { enabled: boolean; scope: string };
     semanticRecall: {
@@ -158,50 +172,113 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
 
   const embeddingProvider = memory.semanticRecall.embeddingProvider;
   const embeddingProviderType: EmbeddingProviderType = embeddingProvider?.type ?? 'azure';
+  const recentHistoryMode = memory.recentHistoryMode ?? 'kai-branch';
 
   return (
     <div className="space-y-6">
       {!hideTitle && <h3 className="text-sm font-semibold">Memory</h3>}
 
-      <Toggle label="Enable Mastra memory" checked={memory.enabled} onChange={(v) => updateConfig('memory.enabled', v)} />
+      <Toggle
+        label="Enable Mastra memory"
+        checked={memory.enabled}
+        onChange={(v) => updateConfig('memory.enabled', v)}
+      />
 
-      <NumberField label="Last messages to keep in context" value={memory.lastMessages} onChange={(v) => updateConfig('memory.lastMessages', v)} min={1} />
+      <div>
+        <label className="text-[10px] text-muted-foreground block mb-0.5">Recent conversation history</label>
+        <select
+          className={settingsSelectClass}
+          value={recentHistoryMode}
+          onChange={(e) => updateConfig('memory.recentHistoryMode', e.target.value)}
+        >
+          <option value="kai-branch">Kai active branch (recommended)</option>
+          <option value="merge-mastra">Merge Mastra history (deduplicated)</option>
+        </select>
+        <p className="text-[10px] text-muted-foreground mt-1">
+          Kai branch mode preserves edits and response variants exactly. Merge mode also recovers recent messages
+          written by other clients, then removes confirmed overlap before inference.
+        </p>
+      </div>
+
+      {recentHistoryMode === 'merge-mastra' && (
+        <NumberField
+          label="Mastra messages to merge"
+          value={memory.lastMessages}
+          onChange={(v) => updateConfig('memory.lastMessages', v)}
+          min={1}
+        />
+      )}
 
       <fieldset className="rounded-lg border p-3 space-y-2">
         <legend className="text-xs font-semibold px-1">Working Memory</legend>
-        <Toggle label="Enabled" checked={memory.workingMemory.enabled} onChange={(v) => updateConfig('memory.workingMemory.enabled', v)} />
+        <Toggle
+          label="Enabled"
+          checked={memory.workingMemory.enabled}
+          onChange={(v) => updateConfig('memory.workingMemory.enabled', v)}
+        />
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
-          <select className={settingsSelectClass} value={memory.workingMemory.scope} onChange={(e) => updateConfig('memory.workingMemory.scope', e.target.value)}>
+          <select
+            className={settingsSelectClass}
+            value={memory.workingMemory.scope}
+            onChange={(e) => updateConfig('memory.workingMemory.scope', e.target.value)}
+          >
             <option value="resource">Resource (cross-chat)</option>
             <option value="thread">Thread (per-chat)</option>
           </select>
         </div>
-        <p className="text-[10px] text-muted-foreground">Working memory stores user preferences and key facts. "Resource" scope shares across all chats.</p>
+        <p className="text-[10px] text-muted-foreground">
+          Working memory stores user preferences and key facts. "Resource" scope shares across all chats.
+        </p>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-2">
         <legend className="text-xs font-semibold px-1">Observational Memory</legend>
-        <Toggle label="Enabled" checked={memory.observationalMemory.enabled} onChange={(v) => updateConfig('memory.observationalMemory.enabled', v)} />
+        <Toggle
+          label="Enabled"
+          checked={memory.observationalMemory.enabled}
+          onChange={(v) => updateConfig('memory.observationalMemory.enabled', v)}
+        />
         <div>
           <label className="text-[10px] text-muted-foreground block mb-0.5">Scope</label>
-          <select className={settingsSelectClass} value={memory.observationalMemory.scope} onChange={(e) => updateConfig('memory.observationalMemory.scope', e.target.value)}>
+          <select
+            className={settingsSelectClass}
+            value={memory.observationalMemory.scope}
+            onChange={(e) => updateConfig('memory.observationalMemory.scope', e.target.value)}
+          >
             <option value="resource">Resource (cross-chat)</option>
             <option value="thread">Thread (per-chat)</option>
           </select>
         </div>
-        <p className="text-[10px] text-muted-foreground">AI-generated observations about patterns and preferences. Best with "resource" scope for cross-chat learning.</p>
+        <p className="text-[10px] text-muted-foreground">
+          AI-generated observations about patterns and preferences. Best with "resource" scope for cross-chat learning.
+        </p>
       </fieldset>
 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Semantic Recall (RAG)</legend>
-        <Toggle label="Enabled" checked={memory.semanticRecall.enabled} onChange={(v) => updateConfig('memory.semanticRecall.enabled', v)} />
-        <NumberField label="Top-K results" value={memory.semanticRecall.topK} onChange={(v) => updateConfig('memory.semanticRecall.topK', v)} min={1} max={20} />
-        <p className="text-[10px] text-muted-foreground">Vector similarity search across chat history. Enables cross-chat reference (&quot;that thing from yesterday&quot;).</p>
+        <Toggle
+          label="Enabled"
+          checked={memory.semanticRecall.enabled}
+          onChange={(v) => updateConfig('memory.semanticRecall.enabled', v)}
+        />
+        <NumberField
+          label="Top-K results"
+          value={memory.semanticRecall.topK}
+          onChange={(v) => updateConfig('memory.semanticRecall.topK', v)}
+          min={1}
+          max={20}
+        />
+        <p className="text-[10px] text-muted-foreground">
+          Vector similarity search across chat history. Enables cross-chat reference (&quot;that thing from
+          yesterday&quot;).
+        </p>
 
         {memory.semanticRecall.enabled && (
           <div className="space-y-3 border-t border-border/50 pt-3">
-            <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Embedding Provider</h4>
+            <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Embedding Provider
+            </h4>
 
             {/* Provider Selector */}
             <div>
@@ -229,7 +306,9 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
             {/* ── OpenAI Configuration ── */}
             {embeddingProviderType === 'openai' && (
               <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">OpenAI Configuration</h4>
+                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  OpenAI Configuration
+                </h4>
                 <PasswordField
                   label="API Key"
                   value={embeddingProvider?.openai?.apiKey ?? ''}
@@ -242,7 +321,9 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
             {/* ── Azure Configuration ── */}
             {embeddingProviderType === 'azure' && (
               <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Azure OpenAI Configuration</h4>
+                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Azure OpenAI Configuration
+                </h4>
                 <p className="text-[10px] text-muted-foreground/60">
                   Configure Azure-specific credentials here, or leave blank to use the global Azure primary provider.
                 </p>
@@ -250,7 +331,9 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
                 <TextField
                   label="Endpoint"
                   value={embeddingProvider?.azure?.endpoint ?? ''}
-                  onChange={(v) => updateConfig('memory.semanticRecall.embeddingProvider.azure.endpoint', v || undefined)}
+                  onChange={(v) =>
+                    updateConfig('memory.semanticRecall.embeddingProvider.azure.endpoint', v || undefined)
+                  }
                   placeholder="https://your-resource.cognitiveservices.azure.com/"
                   mono
                   hint="Your Azure OpenAI resource base URL. Leave blank to use the global Azure primary provider."
@@ -283,7 +366,9 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
             {/* ── Custom Configuration ── */}
             {embeddingProviderType === 'custom' && (
               <div className="space-y-3 rounded-xl border border-border/50 bg-card/40 p-3">
-                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Custom Provider Configuration</h4>
+                <h4 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Custom Provider Configuration
+                </h4>
                 <p className="text-[10px] text-muted-foreground/60">
                   Use any OpenAI-compatible embeddings endpoint (e.g. a proxy, local server, or third-party provider).
                 </p>
@@ -291,7 +376,9 @@ export const MemorySettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ co
                 <TextField
                   label="Base URL"
                   value={embeddingProvider?.custom?.baseUrl ?? ''}
-                  onChange={(v) => updateConfig('memory.semanticRecall.embeddingProvider.custom.baseUrl', v || undefined)}
+                  onChange={(v) =>
+                    updateConfig('memory.semanticRecall.embeddingProvider.custom.baseUrl', v || undefined)
+                  }
                   placeholder="https://api.example.com/v1"
                   mono
                   hint="The base URL of the OpenAI-compatible embeddings API (must support POST /embeddings)."
@@ -337,11 +424,7 @@ const ClearMemorySection: FC = () => {
     setStatus('clearing');
     setResult(null);
     try {
-      const res = await app.memory.clear(
-        clearAll
-          ? { all: true }
-          : { working, observational, semantic },
-      );
+      const res = await app.memory.clear(clearAll ? { all: true } : { working, observational, semantic });
       if (res.error) {
         setResult({ error: res.error });
         setStatus('error');
@@ -364,9 +447,7 @@ const ClearMemorySection: FC = () => {
     <fieldset className="rounded-lg border border-destructive/30 p-3 space-y-3">
       <legend className="text-xs font-semibold px-1 text-destructive">Clear Memory</legend>
 
-      <p className="text-[10px] text-muted-foreground">
-        Permanently delete stored memories. This cannot be undone.
-      </p>
+      <p className="text-[10px] text-muted-foreground">Permanently delete stored memories. This cannot be undone.</p>
 
       <div className="space-y-1.5">
         <label className="flex items-center gap-2">
@@ -375,7 +456,11 @@ const ClearMemorySection: FC = () => {
             checked={clearAll}
             onChange={(e) => {
               setClearAll(e.target.checked);
-              if (e.target.checked) { setWorking(true); setObservational(true); setSemantic(true); }
+              if (e.target.checked) {
+                setWorking(true);
+                setObservational(true);
+                setSemantic(true);
+              }
             }}
             className="rounded"
           />
@@ -385,15 +470,30 @@ const ClearMemorySection: FC = () => {
         {!clearAll && (
           <>
             <label className="flex items-center gap-2">
-              <input type="checkbox" checked={working} onChange={(e) => setWorking(e.target.checked)} className="rounded" />
+              <input
+                type="checkbox"
+                checked={working}
+                onChange={(e) => setWorking(e.target.checked)}
+                className="rounded"
+              />
               <span className="text-xs">Working memory (preferences, facts)</span>
             </label>
             <label className="flex items-center gap-2">
-              <input type="checkbox" checked={observational} onChange={(e) => setObservational(e.target.checked)} className="rounded" />
+              <input
+                type="checkbox"
+                checked={observational}
+                onChange={(e) => setObservational(e.target.checked)}
+                className="rounded"
+              />
               <span className="text-xs">Observational memory (AI observations)</span>
             </label>
             <label className="flex items-center gap-2">
-              <input type="checkbox" checked={semantic} onChange={(e) => setSemantic(e.target.checked)} className="rounded" />
+              <input
+                type="checkbox"
+                checked={semantic}
+                onChange={(e) => setSemantic(e.target.checked)}
+                className="rounded"
+              />
               <span className="text-xs">Semantic recall (vector embeddings)</span>
             </label>
           </>
@@ -427,7 +527,9 @@ const ClearMemorySection: FC = () => {
                       working && 'working memory',
                       observational && 'observational memory',
                       semantic && 'semantic recall vectors',
-                    ].filter(Boolean).join(', ')}.`}
+                    ]
+                      .filter(Boolean)
+                      .join(', ')}.`}
               </p>
             </div>
           </div>
@@ -470,7 +572,11 @@ const ClearMemorySection: FC = () => {
               <li key={item}>{item}</li>
             ))}
           </ul>
-          <button type="button" onClick={reset} className="text-[10px] text-muted-foreground hover:text-foreground transition-colors mt-1">
+          <button
+            type="button"
+            onClick={reset}
+            className="text-[10px] text-muted-foreground hover:text-foreground transition-colors mt-1"
+          >
             Dismiss
           </button>
         </div>
@@ -480,7 +586,11 @@ const ClearMemorySection: FC = () => {
       {status === 'error' && (
         <div className="rounded-md border border-destructive/30 bg-destructive/5 p-2">
           <p className="text-[10px] text-destructive">{result?.error ?? 'Unknown error'}</p>
-          <button type="button" onClick={reset} className="text-[10px] text-muted-foreground hover:text-foreground transition-colors mt-1">
+          <button
+            type="button"
+            onClick={reset}
+            className="text-[10px] text-muted-foreground hover:text-foreground transition-colors mt-1"
+          >
             Dismiss
           </button>
         </div>

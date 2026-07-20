@@ -30,11 +30,16 @@ import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prom
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
 import { buildMastraPrepareStep } from './prepare-step-inject.js';
+import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
 export type StreamEvent = {
   conversationId: string;
+  /** Stable id of the assistant response being produced. For Mastra streams
+   * this is also the id persisted in Mastra memory, allowing Kai and Mastra to
+   * refer to the same logical response across later turns. */
+  responseMessageId?: string;
   type:
     | 'text-delta'
     | 'observer-message'
@@ -624,15 +629,28 @@ export function getProviderDefinedToolNames(modelConfig: LLMModelConfig): Set<st
 function buildMastraMemoryOptions(
   conversationId: string,
   memory: ReturnType<typeof getSharedMemory>,
+  config: AppConfig,
 ): Record<string, unknown> | undefined {
   if (!memory) return undefined;
+
+  const mergeRecentHistory = config.memory.recentHistoryMode === 'merge-mastra';
 
   return {
     memory: {
       thread: { id: conversationId },
       resource: getResourceId(),
+      // Kai always supplies its complete active branch. It is authoritative by
+      // default, preserving edits/regenerations and the reusable prompt prefix.
+      // Merge mode deliberately recalls a bounded Mastra suffix; the configured
+      // Kai reconciler removes confirmed overlap after Mastra inserts it.
+      // Other memory layers keep their shared defaults in either mode.
+      options: { lastMessages: mergeRecentHistory ? config.memory.lastMessages : false },
     },
   };
+}
+
+function createResponseMessageId(): string {
+  return `msg-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 type RawStreamChunk = {
@@ -1161,6 +1179,7 @@ export async function* streamAgentResponse(
      *  inherit the parent's profile + fallback chain. */
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
@@ -1243,6 +1262,9 @@ export async function* streamAgentResponse(
       // which would shadow our wrapped tools and bypass diff tracking + guards.
       tools: allTools as AgentConfig['tools'],
       ...(memory ? { memory } : {}),
+      ...(memory && config.memory.recentHistoryMode === 'merge-mastra'
+        ? { inputProcessors: [createRecentHistoryReconciler()] }
+        : {}),
     });
   };
 
@@ -1259,31 +1281,36 @@ export async function* streamAgentResponse(
     sanitizeMessagesForModel(messages, targetModelId),
     modelConfig,
   );
+  const responseMessageId = options?.responseMessageId ?? createResponseMessageId();
 
-  if (useGenerate) {
-    yield* generateWithSyntheticEvents(
-      buildAgent,
-      conversationId,
-      sanitizedMessages,
-      modelConfig,
-      config,
-      memory,
-      modelSettings,
-      providerOptions,
-      options,
-    );
-  } else {
-    yield* streamWithRealEvents(
-      buildAgent,
-      conversationId,
-      sanitizedMessages,
-      modelConfig,
-      config,
-      memory,
-      modelSettings,
-      providerOptions,
-      options,
-    );
+  const eventStream = useGenerate
+    ? generateWithSyntheticEvents(
+        buildAgent,
+        conversationId,
+        sanitizedMessages,
+        modelConfig,
+        config,
+        memory,
+        modelSettings,
+        providerOptions,
+        responseMessageId,
+        options,
+      )
+    : streamWithRealEvents(
+        buildAgent,
+        conversationId,
+        sanitizedMessages,
+        modelConfig,
+        config,
+        memory,
+        modelSettings,
+        providerOptions,
+        responseMessageId,
+        options,
+      );
+
+  for await (const event of eventStream) {
+    yield { ...event, responseMessageId };
   }
 }
 
@@ -1300,6 +1327,7 @@ async function* generateWithSyntheticEvents(
   memory: ReturnType<typeof getSharedMemory>,
   modelSettings: Record<string, unknown>,
   providerOptions: Record<string, unknown> | undefined,
+  responseMessageId: string,
   options?: {
     abortSignal?: AbortSignal;
     emitEvent?: (event: StreamEvent) => void;
@@ -1326,7 +1354,7 @@ async function* generateWithSyntheticEvents(
       console.info(
         `[Agent:generate] conv=${conversationId} messageCount=${msgArr.length} roles=[${msgArr.map((m) => m.role ?? '?').join(',')}] maxSteps=${config.advanced.maxSteps} temp=${typeof activeModelSettings.temperature === 'number' ? activeModelSettings.temperature : 'default'}`,
       );
-      const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
+      const memoryOptions = buildMastraMemoryOptions(conversationId, memory, config);
 
       const generateOptions = {
         maxSteps: maxStepsLimit,
@@ -1334,6 +1362,7 @@ async function* generateWithSyntheticEvents(
         // Cooperative mid-turn injection (see streamOptions): splice queued
         // follow-ups at each step boundary. No-op when the queue is empty.
         prepareStep: buildMastraPrepareStep(conversationId),
+        experimental_generateMessageId: () => responseMessageId,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
         ...(memoryOptions ?? {}),
@@ -1527,6 +1556,7 @@ async function* streamWithRealEvents(
   memory: ReturnType<typeof getSharedMemory>,
   modelSettings: Record<string, unknown>,
   providerOptions: Record<string, unknown> | undefined,
+  responseMessageId: string,
   options?: {
     abortSignal?: AbortSignal;
   },
@@ -1564,7 +1594,7 @@ async function* streamWithRealEvents(
         console.info(
           `[Agent] Starting stream for ${conversationId}${attempt > 0 ? ` (retry ${attempt})` : ''}${compatibilityRetried ? ' [temp-omitted]' : ''}`,
         );
-        const memoryOptions = buildMastraMemoryOptions(conversationId, memory);
+        const memoryOptions = buildMastraMemoryOptions(conversationId, memory, config);
 
         const streamOptions = {
           maxSteps: maxStepsLimit,
@@ -1573,6 +1603,7 @@ async function* streamWithRealEvents(
           // at each step boundary and splice queued follow-ups into this turn's
           // context (no abort). No-op when the queue is empty.
           prepareStep: buildMastraPrepareStep(conversationId),
+          experimental_generateMessageId: () => responseMessageId,
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),
           ...(memoryOptions ?? {}),
@@ -1920,6 +1951,7 @@ export async function* streamWithFallback(
     isHeadless?: boolean;
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
@@ -1927,6 +1959,7 @@ export async function* streamWithFallback(
     streamConfig.primaryModel,
     ...(streamConfig.fallbackEnabled ? streamConfig.fallbackModels : []),
   ];
+  let responseMessageId = options?.responseMessageId ?? createResponseMessageId();
 
   for (let attempt = 0; attempt < modelChain.length; attempt++) {
     if (options?.abortSignal?.aborted) {
@@ -1973,7 +2006,7 @@ export async function* streamWithFallback(
         // not the (possibly failed) primary — else a sub_agent spawned by a
         // fallback model would pin the known-failing primary. Keep the caller's
         // parentProfileKey (the profile owns the whole chain).
-        { ...options, parentModelKey: entry.key },
+        { ...options, parentModelKey: entry.key, responseMessageId },
       );
 
       for await (const event of innerStream) {
@@ -2064,6 +2097,9 @@ export async function* streamWithFallback(
             attempt: attempt + 1,
           },
         };
+        // The partial response was intentionally preserved as a sibling. The
+        // next model attempt must therefore have its own shared Kai/Mastra id.
+        responseMessageId = createResponseMessageId();
         continue;
       }
 
@@ -2134,6 +2170,9 @@ export async function* streamWithFallback(
             attempt: attempt + 1,
           },
         };
+        if (emittedContent) {
+          responseMessageId = createResponseMessageId();
+        }
         continue;
       }
 
@@ -2246,4 +2285,5 @@ export const __internal = {
   coerceWorkspaceReadLineArguments,
   surfaceWorkspaceCommandStderr,
   mergeAbortSignals,
+  buildMastraMemoryOptions,
 };

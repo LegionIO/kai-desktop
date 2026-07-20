@@ -115,6 +115,7 @@ export class MastraRuntime implements AgentRuntime {
     const streamOpts = {
       reasoningEffort,
       abortSignal,
+      responseMessageId: options.responseMessageId,
       cwd,
       parentProfileKey: options.parentProfileKey,
       parentModelKey: options.parentModelKey,

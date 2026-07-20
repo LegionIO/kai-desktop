@@ -569,7 +569,28 @@ describe('RuntimeProvider - Step Tracking', () => {
         undefined,
         expect.any(String),
         undefined,
+        expect.stringMatching(/^msg-/),
       );
+
+      const responseMessageId = mockStream.mock.calls.at(-1)?.[9] as string;
+      await emitStreamEvent({
+        conversationId: ACTIVE_CONV_ID,
+        type: 'text-delta',
+        text: 'Continuing now.',
+        responseMessageId,
+      });
+      await emitStreamEvent({ conversationId: ACTIVE_CONV_ID, type: 'done', responseMessageId });
+
+      await waitFor(() => {
+        const persisted = mockPut.mock.calls
+          .map((call) => call[0] as { messageTree?: Array<{ id: string; role: string }> })
+          .find((conversation) =>
+            conversation.messageTree?.some(
+              (message) => message.id === responseMessageId && message.role === 'assistant',
+            ),
+          );
+        expect(persisted).toBeDefined();
+      });
     });
 
     it('hides banner and clears stepInfo', async () => {

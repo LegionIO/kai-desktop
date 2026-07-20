@@ -41,18 +41,23 @@ type Accumulator = {
   /** Head captured at submit (the user node this reply answers). Undefined ⇒
    *  fall back to the store's current head. Set on first accumulation. */
   parentId?: string;
+  /** Shared Kai/Mastra response id captured from stream events. */
+  responseMessageId?: string;
 };
 
 const accumulators = new Map<string, Accumulator>();
 
-function ensureAcc(conversationId: string, parentId?: string): Accumulator {
+function ensureAcc(conversationId: string, parentId?: string, responseMessageId?: string): Accumulator {
   let acc = accumulators.get(conversationId);
   if (!acc) {
-    acc = { parts: [], toolIndex: new Map(), sawContent: false, parentId };
+    acc = { parts: [], toolIndex: new Map(), sawContent: false, parentId, responseMessageId };
     accumulators.set(conversationId, acc);
   } else if (acc.parentId === undefined && parentId !== undefined) {
     // First event that knew the parent — record it (later events may omit it).
     acc.parentId = parentId;
+  }
+  if (acc.responseMessageId === undefined && responseMessageId !== undefined) {
+    acc.responseMessageId = responseMessageId;
   }
   return acc;
 }
@@ -78,12 +83,12 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
 
   switch (event.type) {
     case 'text-delta': {
-      if (event.text) appendText(ensureAcc(conversationId, parentId), event.text);
+      if (event.text) appendText(ensureAcc(conversationId, parentId, event.responseMessageId), event.text);
       break;
     }
     case 'tool-call': {
       if (!event.toolCallId) break;
-      const acc = ensureAcc(conversationId, parentId);
+      const acc = ensureAcc(conversationId, parentId, event.responseMessageId);
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx === undefined) {
         acc.parts.push({
@@ -104,7 +109,7 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
     case 'tool-result':
     case 'tool-error': {
       if (!event.toolCallId) break;
-      const acc = ensureAcc(conversationId, parentId);
+      const acc = ensureAcc(conversationId, parentId, event.responseMessageId);
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx !== undefined) {
         const part = acc.parts[idx] as ToolPart;
@@ -174,7 +179,7 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
         // re-seed a fresh accumulator under the SAME parent so the next attempt
         // persists as a sibling too — the user gets "k / N variants" with the
         // failed partials selectable.
-        const acc = ensureAcc(conversationId, parentId);
+        const acc = ensureAcc(conversationId, parentId, event.responseMessageId);
         const originalParentId = acc.parentId;
         appendText(acc, `\n\n**Error:** ${data.error ?? event.error ?? 'model error — retrying'}`);
         // persistAccumulatedReturningHead deletes the accumulator + writes the
@@ -202,7 +207,7 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
       // be released even on an abnormal (done-less) termination by the stream
       // loop's finally → discardPersistenceAccumulator (ipc/agent.ts), so it
       // cannot leak.
-      const acc = ensureAcc(conversationId, parentId);
+      const acc = ensureAcc(conversationId, parentId, event.responseMessageId);
       appendText(acc, `\n\n**Error:** ${event.error ?? 'unknown error'}`);
       break;
     }
@@ -289,10 +294,21 @@ function persistAccumulatedReturningHead(
     // runStatus: keep 'running' when the caller is saving an intermediate
     // errored variant mid-fallback (the retry is still in flight) — otherwise a
     // concurrent automation could see 'idle' and fork the branch; else 'idle'.
-    const updated = appendConversationMessages(appHome, conversationId, [{ role: 'assistant', content: acc.parts }], {
-      runStatus: opts?.keepRunning ? 'running' : 'idle',
-      ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
-    });
+    const updated = appendConversationMessages(
+      appHome,
+      conversationId,
+      [
+        {
+          ...(acc.responseMessageId ? { id: acc.responseMessageId } : {}),
+          role: 'assistant',
+          content: acc.parts,
+        },
+      ],
+      {
+        runStatus: opts?.keepRunning ? 'running' : 'idle',
+        ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
+      },
+    );
     return updated?.headId ?? null;
   } catch {
     // Persistence is best-effort; a failure must not break the stream.

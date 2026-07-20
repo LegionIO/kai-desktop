@@ -81,6 +81,9 @@ export type RuntimeCapabilities = {
 export type StreamOptions = {
   conversationId: string;
   messages: unknown[];
+  /** Preallocated Kai assistant id. Runtimes that persist their own response
+   * messages should use this id and echo it on stream events. */
+  responseMessageId?: string;
   config: AppConfig;
   tools: ToolDefinition[];
   appHome: string;

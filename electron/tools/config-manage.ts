@@ -135,7 +135,7 @@ export function createMemorySettingsTool(appHome: string): ToolDefinition {
     description: [
       'View or update ' +
         __BRAND_PRODUCT_NAME +
-        ' memory settings. Controls working memory, observational memory, semantic recall, embedding provider, and context window.',
+        ' memory settings. Controls recent-history source, working memory, observational memory, semantic recall, embedding provider, and context window.',
       'Use "get" to see current values, "set" to change one.',
       'Embedding provider fields: semanticRecall.embeddingProvider.type (openai|azure|custom), .model, .openai.apiKey, .azure.endpoint, .azure.apiKey, .azure.deploymentName, .azure.apiVersion, .custom.baseUrl, .custom.apiKey.',
     ].join(' '),
@@ -144,6 +144,7 @@ export function createMemorySettingsTool(appHome: string): ToolDefinition {
       field: z
         .enum([
           'enabled',
+          'recentHistoryMode',
           'lastMessages',
           'workingMemory.enabled',
           'workingMemory.scope',

@@ -42,6 +42,7 @@ function getDefaultConfig() {
     },
     memory: {
       enabled: false,
+      recentHistoryMode: 'kai-branch' as const,
       workingMemory: { enabled: true, scope: 'resource' as const },
       observationalMemory: { enabled: true, scope: 'resource' as const },
       semanticRecall: {

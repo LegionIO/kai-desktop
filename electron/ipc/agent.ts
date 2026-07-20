@@ -794,6 +794,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       maxRetries?: number | null;
       runtimeOverride?: string | null;
     },
+    responseMessageId?: string,
   ) => {
     messages = stripDisplayOnlyParts(messages);
     const effectiveCwd = normalizeAgentCwd(cwd);
@@ -2365,6 +2366,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const stream = runtime.stream({
           conversationId,
           messages,
+          responseMessageId,
           config: configWithExecutionMode,
           tools: activeCustomTools,
           appHome,

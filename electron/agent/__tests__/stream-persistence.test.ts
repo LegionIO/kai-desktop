@@ -53,6 +53,20 @@ describe('stream persistence accumulator', () => {
     ]);
   });
 
+  it('persists the shared Kai/Mastra response id when the stream provides it', () => {
+    feed({ conversationId: 'shared-id', type: 'text-delta', text: 'Hello', responseMessageId: 'msg-shared-1' });
+    feed({ conversationId: 'shared-id', type: 'done', responseMessageId: 'msg-shared-1' });
+
+    const [, , msgs] = appendMock.mock.calls[0];
+    expect(msgs).toEqual([
+      {
+        id: 'msg-shared-1',
+        role: 'assistant',
+        content: [{ type: 'text', source: 'assistant', text: 'Hello' }],
+      },
+    ]);
+  });
+
   it('merges a tool-call and its result into one tool part', () => {
     feed({ conversationId: 'c2', type: 'tool-call', toolCallId: 't1', toolName: 'read_file', args: { path: 'a' } });
     feed({ conversationId: 'c2', type: 'tool-result', toolCallId: 't1', result: 'contents', durationMs: 42 });
@@ -183,12 +197,21 @@ describe('stream persistence accumulator', () => {
 
   it('model-fallback with preserveErroredVariant commits the partial as a sibling and re-seeds under the same parent', () => {
     // Attempt 1 streams partial content, then a transient mid-stream fallback.
-    feedWithParent({ conversationId: 'v1', type: 'text-delta', text: 'partial from model A' }, 'user-node');
+    feedWithParent(
+      {
+        conversationId: 'v1',
+        type: 'text-delta',
+        text: 'partial from model A',
+        responseMessageId: 'msg-failed-variant',
+      },
+      'user-node',
+    );
     feedWithParent(
       {
         conversationId: 'v1',
         type: 'model-fallback',
         error: 'internal server error',
+        responseMessageId: 'msg-failed-variant',
         data: { preserveErroredVariant: true, error: 'internal server error' },
       },
       'user-node',
@@ -196,6 +219,7 @@ describe('stream persistence accumulator', () => {
     // The errored partial was committed as its own sibling right away.
     expect(appendMock).toHaveBeenCalledTimes(1);
     const [, , firstMsgs, firstOpts] = appendMock.mock.calls[0];
+    expect(firstMsgs[0].id).toBe('msg-failed-variant');
     const firstText = (firstMsgs[0].content as Array<{ type: string; text?: string }>)
       .filter((p) => p.type === 'text')
       .map((p) => p.text)
@@ -208,11 +232,20 @@ describe('stream persistence accumulator', () => {
     expect(firstOpts.runStatus).toBe('running');
 
     // Attempt 2 (retry on model B) streams the successful reply + done.
-    feedWithParent({ conversationId: 'v1', type: 'text-delta', text: 'full reply from model B' }, 'user-node');
-    feedWithParent({ conversationId: 'v1', type: 'done' }, 'user-node');
+    feedWithParent(
+      {
+        conversationId: 'v1',
+        type: 'text-delta',
+        text: 'full reply from model B',
+        responseMessageId: 'msg-success-variant',
+      },
+      'user-node',
+    );
+    feedWithParent({ conversationId: 'v1', type: 'done', responseMessageId: 'msg-success-variant' }, 'user-node');
 
     expect(appendMock).toHaveBeenCalledTimes(2);
     const [, , secondMsgs, secondOpts] = appendMock.mock.calls[1];
+    expect(secondMsgs[0].id).toBe('msg-success-variant');
     const secondText = (secondMsgs[0].content as Array<{ type: string; text?: string }>)
       .filter((p) => p.type === 'text')
       .map((p) => p.text)

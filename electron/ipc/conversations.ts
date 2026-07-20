@@ -128,7 +128,7 @@ export function getConversationBranch(tree: StoredTreeMessage[], headId: string 
 export function appendConversationMessages(
   appHome: string,
   conversationId: string,
-  messages: Array<{ role: StoredTreeMessage['role']; content: unknown; createdAt?: string }>,
+  messages: Array<{ id?: string; role: StoredTreeMessage['role']; content: unknown; createdAt?: string }>,
   options: { skipIfBusy?: boolean; parentId?: string | null; runStatus?: ConversationRecord['runStatus'] } = {},
 ): ConversationRecord | null {
   const conv = readConversation(appHome, conversationId);
@@ -140,14 +140,17 @@ export function appendConversationMessages(
   const { tree, headId } = ensureConversationTree(conv);
   let parentId = options.parentId !== undefined ? options.parentId : headId;
   const now = new Date().toISOString();
+  const usedIds = new Set(tree.map((message) => message.id));
   const appended: StoredTreeMessage[] = messages.map((m, i) => {
+    const requestedId = typeof m.id === 'string' && m.id.length > 0 && !usedIds.has(m.id) ? m.id : undefined;
     const node: StoredTreeMessage = {
-      id: `auto-msg-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+      id: requestedId ?? `auto-msg-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`,
       role: m.role,
       content: m.content,
       parentId,
       createdAt: m.createdAt ?? now,
     };
+    usedIds.add(node.id);
     parentId = node.id;
     return node;
   });
