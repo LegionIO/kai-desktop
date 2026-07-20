@@ -1874,7 +1874,9 @@ function AppShell() {
             </PluginErrorBoundary>
             <AlertModalHost
               activeConversationId={activeConversationId}
-              chatVisible={activeView === CHAT_VIEW || activeView === activeConversationId}
+              chatViewActive={activeView === CHAT_VIEW || activeView === activeConversationId}
+              threadMode={threadMode}
+              alertsViewActive={activeView === ALERTS_VIEW}
             />
             <PluginErrorBoundary fallback={() => null}>
               <PermissionConsentModal />

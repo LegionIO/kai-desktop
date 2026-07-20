@@ -32,6 +32,12 @@ vi.mock('@/providers/ConfigProvider', () => ({
   useConfig: () => ({ config: { automations: { alertSurface: 'modal' } } }),
 }));
 
+// Sub-agent view state — default: no sub-agent overlaid. Overridable per test.
+let mockSubAgentView: string | null = null;
+vi.mock('@/providers/RuntimeProvider', () => ({
+  useSubAgents: () => ({ activeSubAgentView: mockSubAgentView }),
+}));
+
 import { AlertModalHost } from '../AlertModalHost';
 
 const alert: Alert = {
@@ -53,34 +59,54 @@ function emit(payload: Partial<AlertsChangedPayload>): void {
 describe('AlertModalHost surface suppression', () => {
   beforeEach(() => {
     changedHandler = null;
+    mockSubAgentView = null;
   });
 
   it('shows the modal when the user is NOT present (no suppressSurface)', () => {
-    render(<AlertModalHost activeConversationId="conv-1" chatVisible />);
+    render(<AlertModalHost activeConversationId="conv-1" chatViewActive threadMode="chat" />);
     emit({ suppressSurface: false });
     expect(screen.getByText('Needs your input')).toBeTruthy();
   });
 
-  it('suppresses the modal when present AND viewing the alert’s own conversation', () => {
-    render(<AlertModalHost activeConversationId="conv-1" chatVisible />);
+  it('suppresses the modal when present AND the alert’s transcript is visible', () => {
+    render(<AlertModalHost activeConversationId="conv-1" chatViewActive threadMode="chat" />);
+    emit({ suppressSurface: true });
+    expect(screen.queryByText('Needs your input')).toBeNull();
+  });
+
+  it('suppresses the modal when present on the Alerts view (card shown there)', () => {
+    render(<AlertModalHost activeConversationId="conv-2" chatViewActive={false} alertsViewActive />);
     emit({ suppressSurface: true });
     expect(screen.queryByText('Needs your input')).toBeNull();
   });
 
   it('still shows the modal when present but viewing a DIFFERENT conversation', () => {
-    render(<AlertModalHost activeConversationId="conv-2" chatVisible />);
+    render(<AlertModalHost activeConversationId="conv-2" chatViewActive threadMode="chat" />);
     emit({ suppressSurface: true });
     expect(screen.getByText('Needs your input')).toBeTruthy();
   });
 
   it('still shows the modal when present but on a non-chat view (e.g. Settings)', () => {
-    render(<AlertModalHost activeConversationId="conv-1" chatVisible={false} />);
+    render(<AlertModalHost activeConversationId="conv-1" chatViewActive={false} />);
+    emit({ suppressSurface: true });
+    expect(screen.getByText('Needs your input')).toBeTruthy();
+  });
+
+  it('still shows the modal in Computer mode (transcript hidden despite chat view)', () => {
+    render(<AlertModalHost activeConversationId="conv-1" chatViewActive threadMode="computer" />);
+    emit({ suppressSurface: true });
+    expect(screen.getByText('Needs your input')).toBeTruthy();
+  });
+
+  it('still shows the modal when a sub-agent view is overlaid on the chat', () => {
+    mockSubAgentView = 'sub-1';
+    render(<AlertModalHost activeConversationId="conv-1" chatViewActive threadMode="chat" />);
     emit({ suppressSurface: true });
     expect(screen.getByText('Needs your input')).toBeTruthy();
   });
 
   it('never shows a modal for an fyi', () => {
-    render(<AlertModalHost activeConversationId="conv-2" chatVisible={false} />);
+    render(<AlertModalHost activeConversationId="conv-2" chatViewActive={false} />);
     emit({ suppressSurface: false, alert: { ...alert, kind: 'fyi' } as Alert });
     expect(screen.queryByText('Needs your input')).toBeNull();
   });

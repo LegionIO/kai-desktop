@@ -4,6 +4,8 @@ import { XIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import type { Alert, AlertsChangedPayload } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
+import { useSubAgents } from '@/providers/RuntimeProvider';
+import type { ThreadMode } from '@/components/thread/Thread';
 import { AlertCard } from './AlertCard';
 
 type AutomationsShape = {
@@ -18,14 +20,31 @@ type AutomationsShape = {
  * asks the main process to raise + focus the window so a background automation
  * alert is instantly visible. When the setting is off this renders nothing
  * (the OS notification + Alerts tab badge are the only surfacing).
+ *
+ * Presence suppression: the main process sets `suppressSurface` when the GUI is
+ * focused, but a modal should only be suppressed when the alert is ALREADY
+ * visible inline. That's true in exactly two cases:
+ *   1. The Alerts view is open — AlertsView renders the same actionable card, so
+ *      a modal would duplicate it and steal focus on the dedicated screen.
+ *   2. The alert's originating conversation transcript is actually on screen:
+ *      the chat view is active for that conversation, in 'chat' thread mode
+ *      (NOT the Computer tab, which hides the transcript), and no sub-agent view
+ *      is overlaid.
+ * Any other focused surface (Settings, a different conversation, computer mode,
+ * a sub-agent) does NOT show the inline card, so the modal must still open.
  */
 export const AlertModalHost: FC<{
   /** The conversation currently open in the renderer (null if none). */
   activeConversationId?: string | null;
-  /** True when the chat surface (not Settings/Alerts/a plugin panel) is showing. */
-  chatVisible?: boolean;
-}> = ({ activeConversationId = null, chatVisible = false }) => {
+  /** True when the chat view is the active app view (may still be computer mode). */
+  chatViewActive?: boolean;
+  /** Current thread mode; only 'chat' renders the message transcript inline card. */
+  threadMode?: ThreadMode;
+  /** True when the dedicated Alerts view is the active app view. */
+  alertsViewActive?: boolean;
+}> = ({ activeConversationId = null, chatViewActive = false, threadMode = 'chat', alertsViewActive = false }) => {
   const { config } = useConfig();
+  const { activeSubAgentView } = useSubAgents();
   const automations = (config as { automations?: AutomationsShape } | null)?.automations;
   // In-app modal only when the (mutually-exclusive) surface resolves to 'modal'.
   const surface =
@@ -39,25 +58,31 @@ export const AlertModalHost: FC<{
   // the CURRENT value rather than the value captured at subscription time.
   const activeConvRef = useRef(activeConversationId);
   activeConvRef.current = activeConversationId;
-  const chatVisibleRef = useRef(chatVisible);
-  chatVisibleRef.current = chatVisible;
+  const chatViewActiveRef = useRef(chatViewActive);
+  chatViewActiveRef.current = chatViewActive;
+  const threadModeRef = useRef(threadMode);
+  threadModeRef.current = threadMode;
+  const alertsViewActiveRef = useRef(alertsViewActive);
+  alertsViewActiveRef.current = alertsViewActive;
+  const subAgentRef = useRef(activeSubAgentView);
+  subAgentRef.current = activeSubAgentView;
 
   useEffect(() => {
     const off = app.alerts.onChanged((payload: AlertsChangedPayload) => {
       if (!enabledRef.current) return;
       if (payload.reason !== 'created' || !payload.alert) return;
       if (payload.alert.kind === 'fyi') return; // fyi never steals focus
-      // Presence-based suppression, but ONLY when the alert's inline card is
-      // actually on screen. The main process sets suppressSurface when the GUI
-      // is focused — but focus on Settings, the Alerts tab, or a DIFFERENT
-      // conversation means the originating thread's inline card is NOT visible,
-      // so the modal is the only surface and must still show. Suppress only when
-      // the alert's own conversation is the one currently displayed.
-      const inlineVisible =
-        chatVisibleRef.current &&
+      // Suppress the modal only when the alert is already visible inline (see
+      // the component doc). The main process's suppressSurface is a necessary
+      // precondition (GUI focused) but not sufficient on its own.
+      const onAlertsView = alertsViewActiveRef.current;
+      const transcriptVisible =
+        chatViewActiveRef.current &&
+        threadModeRef.current === 'chat' &&
+        !subAgentRef.current &&
         !!payload.alert.conversationId &&
         activeConvRef.current === payload.alert.conversationId;
-      if (payload.suppressSurface && inlineVisible) return;
+      if (payload.suppressSurface && (onAlertsView || transcriptVisible)) return;
       setAlert(payload.alert);
       // The main process already raises + focuses the window (alerts.ts
       // surfaceAsModal path); the renderer just opens the in-app modal.
