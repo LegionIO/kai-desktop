@@ -322,14 +322,21 @@ const PathBadge: FC<{ entry: string; configVersion?: string }> = ({ entry, confi
   const count = preview.capped ? `${preview.matchCount}+` : `${preview.matchCount}`;
   return (
     <span className="shrink-0 text-[10px] text-muted-foreground/80 tabular-nums" title={preview.normalized}>
-      {preview.exists ? (
-        <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+      {preview.matchesAll ? (
+        // A "*" rule matches everything — a count is meaningless.
+        <span>all files</span>
       ) : (
-        <span className="text-amber-600 dark:text-amber-400" title="Path does not exist yet">
-          ✗
-        </span>
-      )}{' '}
-      {count} match{preview.matchCount === 1 ? '' : 'es'}
+        <>
+          {preview.exists ? (
+            <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+          ) : (
+            <span className="text-amber-600 dark:text-amber-400" title="Path does not exist yet">
+              ✗
+            </span>
+          )}{' '}
+          {count} match{preview.matchCount === 1 ? '' : 'es'}
+        </>
+      )}
       {preview.denied ? (
         <span className="ml-1 text-red-600 dark:text-red-400">· denied</span>
       ) : preview.allowed ? (

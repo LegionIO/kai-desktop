@@ -64,15 +64,34 @@ export function sanitizeMoonshotSchema(schema: unknown): unknown {
     if (Array.isArray(node[key])) node[key] = (node[key] as unknown[]).map(sanitizeMoonshotSchema);
   }
 
-  const branches = [
-    ...(Array.isArray(node.anyOf) ? (node.anyOf as unknown[]) : []),
-    ...(Array.isArray(node.oneOf) ? (node.oneOf as unknown[]) : []),
-  ];
+  // Moonshot/Kimi's validator rejects a schema when a keyword sits on BOTH the
+  // parent node AND inside an anyOf/oneOf branch. Strip the parent copy — but
+  // FIRST propagate it into every branch that lacks the key, so a constraint the
+  // parent applied to ALL branches isn't lost on the branches that didn't repeat
+  // it (e.g. parent maxLength:10 duplicated in only one of two string branches).
+  const anyOf = Array.isArray(node.anyOf) ? (node.anyOf as unknown[]) : null;
+  const oneOf = Array.isArray(node.oneOf) ? (node.oneOf as unknown[]) : null;
+  const branchArrays = [anyOf, oneOf].filter((b): b is unknown[] => b !== null);
+  const branches = branchArrays.flat();
   if (branches.length > 0) {
     const branchKeys = collectBranchKeys(branches);
-    for (const key of Object.keys(node)) {
-      if (key === 'anyOf' || key === 'oneOf' || key === 'allOf') continue;
-      if (branchKeys.has(key)) delete node[key];
+    const conflicting = Object.keys(node).filter(
+      (key) => key !== 'anyOf' && key !== 'oneOf' && key !== 'allOf' && branchKeys.has(key),
+    );
+    if (conflicting.length > 0) {
+      // Rewrite each branch, seeding any missing conflicting key from the parent.
+      const seed = (arr: unknown[]): unknown[] =>
+        arr.map((b) => {
+          if (!b || typeof b !== 'object' || Array.isArray(b)) return b;
+          const branch = { ...(b as Record<string, unknown>) };
+          for (const key of conflicting) {
+            if (!(key in branch)) branch[key] = node[key];
+          }
+          return branch;
+        });
+      if (anyOf) node.anyOf = seed(anyOf);
+      if (oneOf) node.oneOf = seed(oneOf);
+      for (const key of conflicting) delete node[key];
     }
   }
 

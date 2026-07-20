@@ -24,7 +24,7 @@ import { isCommandAllowed, scrubShellEnv } from '../tools/shell.js';
 import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
 import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
 import type { DiffTrackingResultMeta } from '../../shared/diff-types.js';
-import { classifyError, calculateDelay } from './retry.js';
+import { classifyError, calculateDelay, isSameModelRetryable } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
@@ -1496,7 +1496,7 @@ async function* generateWithSyntheticEvents(
       // Classify error for retry decision
       const errorInfo = classifyError(error);
 
-      if (!aborted && errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
+      if (!aborted && isSameModelRetryable(errorInfo) && !emittedAnyOutput && attempt < MAX_RETRIES) {
         const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
         console.warn(
           `[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
@@ -1826,7 +1826,7 @@ async function* streamWithRealEvents(
         const errorInfo = classifyError(error);
 
         // Only retry transient errors when no content has been emitted
-        if (errorInfo.isTransient && !emittedAnyOutput && attempt < MAX_RETRIES) {
+        if (isSameModelRetryable(errorInfo) && !emittedAnyOutput && attempt < MAX_RETRIES) {
           const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
           console.warn(
             `[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,

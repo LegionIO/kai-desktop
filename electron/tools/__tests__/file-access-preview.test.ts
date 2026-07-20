@@ -27,8 +27,8 @@ const cfg = (allow: string[], deny: string[] = []): AppConfig =>
   ({ tools: { fileAccess: { enabled: true, allowPaths: allow, denyPaths: deny } } }) as unknown as AppConfig;
 
 describe('previewPathEntry', () => {
-  it('finds matches under a directory path (approximate/shallow probe, not exact)', () => {
-    const p = previewPathEntry(root, cfg([root]));
+  it('finds matches under a directory path (approximate/shallow probe, not exact)', async () => {
+    const p = await previewPathEntry(root, cfg([root]));
     expect(p.exists).toBe(true);
     expect(p.isDirectory).toBe(true);
     // Shallow probe: an indicator that it matches SOMETHING, not an exact total.
@@ -39,55 +39,57 @@ describe('previewPathEntry', () => {
     expect(p.normalized).toBe(root);
   });
 
-  it('a /* glob still matches direct-child files', () => {
-    const p = previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
+  it('a /* glob still matches direct-child files', async () => {
+    const p = await previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
     expect(p.matchCount).toBeGreaterThan(0); // a.txt / b.txt
   });
 
-  it('reports a non-existent path as not-existing with 0 matches', () => {
-    const p = previewPathEntry(join(root, 'nope'), cfg([root]));
+  it('reports a non-existent path as not-existing with 0 matches', async () => {
+    const p = await previewPathEntry(join(root, 'nope'), cfg([root]));
     expect(p.exists).toBe(false);
     expect(p.matchCount).toBe(0);
   });
 
-  it('reflects a deny rule', () => {
-    const p = previewPathEntry(root, cfg(['*'], [root]));
+  it('reflects a deny rule', async () => {
+    const p = await previewPathEntry(root, cfg(['*'], [root]));
     expect(p.denied).toBe(true);
     // Denied files are excluded from the match count.
     expect(p.matchCount).toBe(0);
   });
 
-  it('handles the "*" wildcard entry — allowed when it is the allow rule', () => {
-    const p = previewPathEntry('*', cfg(['*']));
+  it('handles the "*" wildcard entry — allowed when it is the allow rule', async () => {
+    const p = await previewPathEntry('*', cfg(['*']));
     expect(p.normalized).toBe('*');
     expect(p.allowed).toBe(true);
   });
 
-  it('the "*" wildcard reflects a deny rule (not hardcoded allowed)', () => {
-    const p = previewPathEntry('*', cfg(['*'], ['*']));
+  it('the "*" wildcard reflects a deny rule (not hardcoded allowed)', async () => {
+    const p = await previewPathEntry('*', cfg(['*'], ['*']));
     expect(p.denied).toBe(true);
     expect(p.allowed).toBe(false);
   });
 
-  it('is safe on empty/whitespace input', () => {
-    expect(previewPathEntry('   ', cfg([root])).matchCount).toBe(0);
+  it('is safe on empty/whitespace input', async () => {
+    expect((await previewPathEntry('   ', cfg([root]))).matchCount).toBe(0);
   });
 
-  it('reports allowed for a /* glob by evaluating a real matched file (not the base dir)', () => {
+  it('reports allowed for a /* glob by evaluating a real matched file (not the base dir)', async () => {
     // allowPaths only contains the /* glob — the base dir itself is NOT an entry,
     // so allow must be judged on a matched child file.
-    const p = previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
+    const p = await previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
     expect(p.matchCount).toBeGreaterThan(0);
     expect(p.allowed).toBe(true);
   });
 
-  it('does not over-walk a sparse-glob deny entry (bounded, no hang)', () => {
-    // A deny glob whose matches are excluded from the count previously left the
-    // match-count cap at 0 while walking the whole tree. Bounded now; returns
-    // promptly and reports denied via a matched path.
+  it('does not fan out into synchronous per-child scans (bounded, returns promptly)', async () => {
     const started = Date.now();
-    const p = previewPathEntry(`${root}/**/*.txt`, cfg(['*'], [`${root}/**/*.txt`]));
+    const p = await previewPathEntry(`${root}/**/*.txt`, cfg(['*'], [`${root}/**/*.txt`]));
     expect(Date.now() - started).toBeLessThan(2000);
     expect(p.denied).toBe(true);
+  });
+
+  it('the "*" rule is flagged matchesAll (badge shows "all files", not a count)', async () => {
+    const p = await previewPathEntry('*', cfg(['*']));
+    expect(p.matchesAll).toBe(true);
   });
 });

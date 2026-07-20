@@ -13,7 +13,7 @@
 import type { LanguageModel } from 'ai';
 import { generateText } from 'ai';
 import type { AppConfig } from '../config/schema.js';
-import { classifyError, calculateDelay } from './retry.js';
+import { classifyError, calculateDelay, isSameModelRetryable } from './retry.js';
 import { createLanguageModelFromConfig } from './language-model.js';
 import { resolveStreamConfig, type ModelCatalogEntry } from './model-catalog.js';
 
@@ -170,10 +170,11 @@ export async function runWithModelFallback<T>(
         lastError = error;
         if (opts?.abortSignal?.aborted) throw error;
         const info = classifyError(error);
-        // Retry the SAME model while transient retries remain — after an
-        // (abortable) backoff so a brief 429/503/Retry-After outage can clear
-        // instead of burning all retries instantly.
-        if (info.isTransient && attempt < maxRetries) {
+        // Retry the SAME model while retries remain — after an (abortable)
+        // backoff so a brief 429/503/Retry-After outage can clear instead of
+        // burning all retries instantly. Quota (402) is NOT same-model-retryable
+        // (retrying a depleted account can't help) — it falls straight through.
+        if (isSameModelRetryable(info) && attempt < maxRetries) {
           const delay = calculateDelay(attempt, info, 500, 8000);
           if (delay > 0) {
             const aborted = await abortableSleep(delay, opts?.abortSignal);

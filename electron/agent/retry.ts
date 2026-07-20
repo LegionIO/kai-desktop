@@ -69,9 +69,10 @@ export function classifyError(error: unknown): RetryableErrorInfo {
   }
 
   // Payment required (402) — a provider/account billing or quota problem, not a
-  // malformed request. Retrying the same model won't fix it, but falling back to
-  // a different model/profile should, so treat it as transient. Checked before
-  // the generic 4xx branch.
+  // malformed request. Retrying the SAME model won't fix it (and a Retry-After
+  // could make it sleep for hours), but falling back to a different
+  // model/profile should. Mark transient so fallback engages, but callers must
+  // gate SAME-MODEL retries on isSameModelRetryable() (which excludes quota).
   if (statusCode === 402) {
     return { statusCode, retryAfterMs, isTransient: true, category: 'quota', message };
   }
@@ -156,6 +157,16 @@ export function classifyError(error: unknown): RetryableErrorInfo {
   return { statusCode, retryAfterMs, isTransient: false, category: 'unknown', message };
 }
 
+/**
+ * Whether an error should be retried on the SAME model. Transient errors are,
+ * EXCEPT quota (402): retrying a depleted account can't succeed and — with a
+ * Retry-After header — could sleep for hours. Quota is still `isTransient` so it
+ * remains eligible for model FALLBACK; only same-model retry loops use this.
+ */
+export function isSameModelRetryable(info: RetryableErrorInfo): boolean {
+  return info.isTransient && info.category !== 'quota';
+}
+
 /** Calculate delay for a given attempt using exponential backoff with jitter. */
 export function calculateDelay(
   attempt: number,
@@ -207,8 +218,9 @@ export async function withRetry<T>(fn: () => Promise<T>, options?: RetryOptions)
       lastError = error;
       const errorInfo = classifyError(error);
 
-      // Don't retry non-transient errors
-      if (!errorInfo.isTransient) throw error;
+      // Don't retry non-transient errors, or quota (402) — retrying the same
+      // model can't clear a billing/quota problem (only fallback can).
+      if (!isSameModelRetryable(errorInfo)) throw error;
 
       // Don't retry if we've exhausted attempts
       if (attempt >= maxRetries) throw error;

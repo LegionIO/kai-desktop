@@ -1,4 +1,5 @@
-import { realpathSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { realpathSync, existsSync, statSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -182,19 +183,26 @@ export type PathEntryPreview = {
   allowed: boolean;
   /** Whether the entry (or its target) is knocked out by a deny rule. */
   denied: boolean;
+  /** True for a `*` rule — matches ALL paths, so the badge shows "all files"
+   *  rather than a count. */
+  matchesAll?: boolean;
 };
 
-/** Cap the shallow preview scan (direct children of a directory entry). The
+/** Cap the shallow preview scan (direct children of the entry's root). The
  *  preview is an approximate "does this match anything" indicator, not an exact
- *  count, so a bounded one-level scan is enough and can't freeze the main thread. */
-const PREVIEW_SCAN_CAP = 500;
+ *  count, so a single non-recursive listing is enough and can't fan out into
+ *  hundreds of synchronous per-directory scans. */
+const PREVIEW_SCAN_CAP = 1000;
 
 /**
  * Preview a single File Access allow/deny entry for the Settings UI: expand it,
- * check existence, count how many on-disk files it matches (bounded walk), and
- * report the allow/deny outcome. Read-only + best-effort — never throws.
+ * check existence, probe how many on-disk files it matches, and report the
+ * allow/deny outcome. ASYNC + best-effort — a single non-recursive directory
+ * listing off the event loop, so it can never freeze the main process (no
+ * synchronous per-child fan-out). The count is an approximate indicator, not an
+ * exact total. Never throws.
  */
-export function previewPathEntry(entry: string, config: AppConfig): PathEntryPreview {
+export async function previewPathEntry(entry: string, config: AppConfig): Promise<PathEntryPreview> {
   const trimmed = (entry ?? '').trim();
   const base: PathEntryPreview = {
     normalized: '',
@@ -207,8 +215,9 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
   };
   if (!trimmed) return base;
 
-  // Wildcard / everything — derive its status from the rules (a deny "*" or
-  // disabled file access means it is NOT actually allowed) rather than hardcoding.
+  // Wildcard / everything — matches ALL paths. Derive allowed/denied from the
+  // rules (a deny "*" or disabled access means NOT allowed) and flag matchesAll
+  // so the badge shows "all files" instead of a "0 matches" count.
   if (trimmed === '*') {
     let allowed = false;
     let denied = false;
@@ -218,10 +227,10 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
     } catch {
       /* best-effort */
     }
-    return { ...base, normalized: '*', exists: true, allowed, denied };
+    return { ...base, normalized: '*', exists: true, allowed, denied, matchesAll: true };
   }
 
-  // Determine the on-disk root to walk: for a glob, the base dir; else the path.
+  // On-disk root: for a glob, the base dir; else the path itself.
   let root: string;
   try {
     const scan = picomatch.scan(trimmed);
@@ -242,13 +251,10 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
     /* best-effort */
   }
 
-  // Count matching files as an APPROXIMATE, NON-RECURSIVE probe — the badge only
-  // needs to show whether the entry matches anything, not an exact total. A
-  // shallow one-level scan (hard-capped) can never freeze Electron's main thread
-  // the way a recursive walk of the home tree could. `matchCount` is therefore a
-  // FLOOR (`capped` true when the cap is hit or the entry is a directory with
-  // deeper content). Also capture a representative MATCHED path so the allow/deny
-  // status reflects an actual match (a glob's base dir gives the wrong result).
+  // Approximate match probe: ONE non-recursive listing of the root (dot-entries
+  // included, matching the real dot:true matcher), capped. We don't descend into
+  // child directories — that fan-out could issue hundreds of synchronous scans
+  // on a network mount. `matchCount` is a floor; `capped` marks it inexact.
   let matchCount = 0;
   let capped = false;
   let sampleMatch: string | null = null;
@@ -262,51 +268,37 @@ export function previewPathEntry(entry: string, config: AppConfig): PathEntryPre
       /* skip unreadable */
     }
   };
-  // Scan the direct children of `dir` (dot-entries included, matching the real
-  // dot:true matcher), capped. Descends AT MOST one directory level for a
-  // recursive-style entry so a nested match still registers, without a full walk.
-  const shallowScan = (dir: string): void => {
-    let entries: Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true }) as unknown as Dirent[];
-    } catch {
-      return;
-    }
-    let seen = 0;
-    let sawDir = false;
-    for (const e of entries) {
-      if (seen >= PREVIEW_SCAN_CAP) {
-        capped = true;
-        break;
-      }
-      seen += 1;
-      const full = join(dir, e.name);
-      if (e.isDirectory()) {
-        sawDir = true;
-        // Peek one level in so "matches N files" isn't 0 for a dir-of-dirs, but
-        // don't recurse further — this is an indicator, not an exact count.
-        try {
-          for (const c of readdirSync(full, { withFileTypes: true }).slice(0, 50) as unknown as Dirent[]) {
-            if (!c.isDirectory()) consider(join(full, c.name));
-          }
-        } catch {
-          /* skip */
-        }
-        capped = true; // a directory implies more may exist below our peek depth
-      } else {
-        consider(full);
-      }
-    }
-    if (sawDir) capped = true;
-  };
   try {
-    if (exists && isDirectory) shallowScan(root);
-    else if (exists) consider(root);
+    if (exists && isDirectory) {
+      let entries: Dirent[] = [];
+      try {
+        entries = (await readdir(root, { withFileTypes: true })) as unknown as Dirent[];
+      } catch {
+        entries = [];
+      }
+      if (entries.length > PREVIEW_SCAN_CAP) capped = true;
+      let sawDir = false;
+      for (const e of entries.slice(0, PREVIEW_SCAN_CAP)) {
+        const full = join(root, e.name);
+        if (e.isDirectory()) {
+          sawDir = true;
+          // A dir may match a recursive entry (e.g. plain dir path or **/…);
+          // count the dir itself as a match probe without listing its contents.
+          consider(full);
+        } else {
+          consider(full);
+        }
+      }
+      // A directory implies deeper content our single listing didn't count.
+      if (sawDir || capped) capped = true;
+    } else if (exists) {
+      consider(root);
+    }
   } catch {
     /* best-effort */
   }
 
-  // Allow/deny outcome: prefer a real matched file (correct for globs like
+  // Allow/deny outcome: prefer a real matched path (correct for globs like
   // /dir/* or **/.env); fall back to the root when nothing matched.
   const repr = sampleMatch ?? root;
   let allowed = false;

@@ -516,6 +516,7 @@ const appAPI = {
         capped: boolean;
         allowed: boolean;
         denied: boolean;
+        matchesAll?: boolean;
         error?: string;
       }>,
   },

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyError, calculateDelay } from '../retry';
+import { classifyError, calculateDelay, isSameModelRetryable } from '../retry';
 
 describe('classifyError', () => {
   it('treats 408 as transient (retryable) despite being a 4xx', () => {
@@ -103,5 +103,29 @@ describe('calculateDelay', () => {
       expect(d).toBeGreaterThanOrEqual(0);
       expect(d).toBeLessThanOrEqual(32000);
     }
+  });
+});
+
+describe('isSameModelRetryable — quota (402) is fallback-eligible but NOT same-model-retryable', () => {
+  it('402 quota: transient (so fallback engages) but not same-model-retryable', () => {
+    const info = classifyError({ status: 402 });
+    expect(info.category).toBe('quota');
+    expect(info.isTransient).toBe(true); // still eligible for model FALLBACK
+    expect(isSameModelRetryable(info)).toBe(false); // but never retry the depleted account
+  });
+
+  it('a Retry-After 402 does not become a same-model retry (would sleep for hours)', () => {
+    const info = classifyError({ status: 402, headers: { 'retry-after': '21600' } });
+    expect(isSameModelRetryable(info)).toBe(false);
+  });
+
+  it('ordinary transient errors remain same-model-retryable', () => {
+    expect(isSameModelRetryable(classifyError({ status: 429 }))).toBe(true);
+    expect(isSameModelRetryable(classifyError({ status: 503 }))).toBe(true);
+    expect(isSameModelRetryable(classifyError({ status: 408 }))).toBe(true);
+  });
+
+  it('non-transient errors are not same-model-retryable', () => {
+    expect(isSameModelRetryable(classifyError({ status: 400 }))).toBe(false);
   });
 });

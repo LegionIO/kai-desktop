@@ -95,6 +95,27 @@ describe('sanitizeMoonshotSchema', () => {
     expect(sanitized.properties.list.items).not.toHaveProperty('minLength');
     expect(sanitized.$defs.Thing).not.toHaveProperty('minimum');
   });
+
+  it('seeds a conflicting parent constraint into branches that lack it before stripping', () => {
+    // parent maxLength:10 conflicts (repeated in only ONE of two branches).
+    // Stripping the parent must NOT leave the other branch unconstrained.
+    const schema = {
+      maxLength: 10,
+      anyOf: [
+        { type: 'string', maxLength: 10 },
+        { type: 'string' }, // no maxLength — must inherit it from the parent
+      ],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as {
+      maxLength?: number;
+      anyOf: Array<{ type: string; maxLength?: number }>;
+    };
+    // Parent copy removed (resolves Moonshot's parent/branch conflict) …
+    expect(sanitized).not.toHaveProperty('maxLength');
+    // … but BOTH branches now carry the constraint.
+    expect(sanitized.anyOf[0].maxLength).toBe(10);
+    expect(sanitized.anyOf[1].maxLength).toBe(10);
+  });
 });
 
 describe('createMoonshotCompatFetch', () => {
