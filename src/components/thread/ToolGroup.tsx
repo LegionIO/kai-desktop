@@ -2187,6 +2187,45 @@ function parseReadContent(raw: string): { lines: string[]; startLine: number } {
   return { lines: allLines, startLine: 1 };
 }
 
+function formatReadErrorMessage(message: string): string {
+  if (message.includes('EISDIR')) return 'Path is a directory';
+  if (message.includes('ENOENT')) return 'File not found';
+  if (message.includes('EACCES') || message.includes('EPERM')) return 'Permission denied';
+  return message;
+}
+
+/** Extract the readable error from every result shape used by Kai runtimes. */
+function extractReadResultError(result: unknown, isError: boolean): string | null {
+  if (typeof result === 'string') {
+    return isError && result.trim() ? formatReadErrorMessage(result.trim()) : null;
+  }
+
+  if (Array.isArray(result)) {
+    if (!isError) return null;
+    const text = (result as Array<Record<string, unknown>>)
+      .filter((block) => block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text as string)
+      .join('\n')
+      .trim();
+    return text ? formatReadErrorMessage(text) : 'Read failed';
+  }
+
+  if (result && typeof result === 'object') {
+    const record = result as Record<string, unknown>;
+    const message =
+      typeof record.error === 'string'
+        ? record.error
+        : typeof record.message === 'string' && isError
+          ? record.message
+          : typeof record.stderr === 'string' && isError
+            ? record.stderr
+            : null;
+    if (message?.trim()) return formatReadErrorMessage(message.trim());
+  }
+
+  return isError ? 'Read failed' : null;
+}
+
 const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: boolean }> = ({
   part,
   isRunning,
@@ -2205,20 +2244,9 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
 
   // Result can be a shaped {content,path} object, a plain string (Claude Code Read tool),
   // an observer-wrapped { value: string }, or an array of content blocks [{ type:'text', text }].
-  // It can also be an error object: { isError: true, error: "EISDIR: ..." }
-  const resultError = useMemo(() => {
-    if (part.result && typeof part.result === 'object' && !Array.isArray(part.result)) {
-      const r = part.result as Record<string, unknown>;
-      if (r.isError && typeof r.error === 'string') {
-        // Extract a human-readable label from common error codes
-        if (r.error.includes('EISDIR')) return 'Path is a directory';
-        if (r.error.includes('ENOENT')) return 'File not found';
-        if (r.error.includes('EACCES') || r.error.includes('EPERM')) return 'Permission denied';
-        return r.error.split('\n')[0]; // first line of error message
-      }
-    }
-    return null;
-  }, [part.result]);
+  // Validation failures use { error: true, message: "..." }, while runtime
+  // failures may use { isError: true, error: "..." } or errored text blocks.
+  const resultError = useMemo(() => extractReadResultError(part.result, isError), [part.result, isError]);
 
   const resultValue = useMemo(() => {
     if (typeof part.result === 'string') return part.result;
@@ -2312,7 +2340,9 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             </button>
           </div>
         )}
-        {!isRunning && resultError && <div className="px-3 py-2 text-destructive/70 italic">{resultError}</div>}
+        {!isRunning && resultError && (
+          <div className="px-3 py-2 text-destructive/70 italic whitespace-pre-wrap break-words">{resultError}</div>
+        )}
         {!isRunning && !resultError && lines.length === 0 && (
           <div className="px-3 py-2 text-muted-foreground/40 italic">Empty file</div>
         )}
@@ -3883,7 +3913,5 @@ function formatLiveOutput(output?: {
   return chunks.join('\n\n') || '[no output yet]';
 }
 
-/** Exposed for unit tests: the wrapper-unwrap sanitizer + shell-result shape
- *  detection that together decide whether a bash tool renders stdout or the
- *  "No output" fallback. */
-export const __internal = { detectShResult, sanitizeResultForDisplay };
+/** Test-only exposure for result-shape normalization helpers. */
+export const __internal = { detectShResult, sanitizeResultForDisplay, extractReadResultError };

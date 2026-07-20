@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { __internal } from '../ToolGroup';
 
-const { sanitizeResultForDisplay, detectShResult } = __internal;
+const { sanitizeResultForDisplay, detectShResult, extractReadResultError } = __internal;
 
 describe('sanitizeResultForDisplay — unwrap { value } past internal metadata', () => {
   it('unwraps { value } when it is the only visible key', () => {
@@ -46,5 +46,24 @@ describe('detectShResult after sanitize — the full "No output" path', () => {
   it('a plain { stdout } sh result still detects', () => {
     const sh = detectShResult({ stdout: 'ok', stderr: '', exitCode: 0 });
     expect(sh?.stdout).toBe('ok');
+  });
+});
+
+describe('extractReadResultError', () => {
+  it('surfaces Mastra validation messages instead of treating them as empty content', () => {
+    const message =
+      'Tool input validation failed for mastra_workspace_read_file.\n- offset: expected number, received string';
+
+    expect(extractReadResultError({ error: true, message, validationErrors: {} }, true)).toBe(message);
+  });
+
+  it('keeps friendly labels for common filesystem errors', () => {
+    expect(extractReadResultError({ isError: true, error: 'ENOENT: no such file or directory' }, true)).toBe(
+      'File not found',
+    );
+  });
+
+  it('does not turn a successful empty result into an error', () => {
+    expect(extractReadResultError('', false)).toBeNull();
   });
 });

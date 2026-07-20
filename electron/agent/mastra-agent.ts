@@ -742,11 +742,56 @@ function normalizeWorkspaceToolInput(toolName: string, input: unknown, cwd: stri
     normalized.path = cwd;
   }
 
+  if (toolName === WORKSPACE_TOOLS.FILESYSTEM.READ_FILE) {
+    if (normalized.offset !== undefined) normalized.offset = coerceFiniteNumberString(normalized.offset);
+    if (normalized.limit !== undefined) normalized.limit = coerceFiniteNumberString(normalized.limit);
+  }
+
   if (toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND && typeof normalized.cwd === 'string') {
     normalized.cwd = normalizeWorkspacePath(cwd, normalized.cwd);
   }
 
   return normalized;
+}
+
+function coerceFiniteNumberString(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : value;
+}
+
+/**
+ * Models occasionally serialize optional numeric Read arguments as JSON
+ * strings (for example `{"offset":"230","limit":"50"}`). Mastra validates
+ * a tool call before invoking its execute function, so execute-time input
+ * normalization never gets a chance to repair those values. Patch the generated
+ * Read schema at the validation boundary while continuing to expose `number` to
+ * the model and rejecting nonnumeric strings normally.
+ */
+function coerceWorkspaceReadLineArguments(tools: Record<string, unknown>): void {
+  const tool = tools[WORKSPACE_TOOLS.FILESYSTEM.READ_FILE];
+  if (!tool || typeof tool !== 'object') return;
+
+  const candidate = tool as { inputSchema?: unknown };
+  if (!candidate.inputSchema || typeof candidate.inputSchema !== 'object') return;
+
+  const schema = candidate.inputSchema as {
+    extend?: (shape: Record<string, unknown>) => unknown;
+  };
+  if (typeof schema.extend !== 'function') return;
+
+  candidate.inputSchema = schema.extend({
+    offset: z
+      .preprocess(coerceFiniteNumberString, z.number())
+      .optional()
+      .describe('Line number to start reading from (1-indexed). If omitted, starts from line 1.'),
+    limit: z
+      .preprocess(coerceFiniteNumberString, z.number())
+      .optional()
+      .describe('Maximum number of lines to read. If omitted, reads to the end of the file.'),
+  });
 }
 
 const WORKSPACE_FILE_MUTATING_TOOLS: Set<string> = new Set([
@@ -1026,6 +1071,7 @@ async function createWorkspaceForAgent(
   await workspace.init();
 
   const tools = await createWorkspaceTools(workspace);
+  coerceWorkspaceReadLineArguments(tools as Record<string, unknown>);
   applyWorkspaceToolGuards(tools as Record<string, unknown>, cwd, getConfig, conversationId, hooks);
 
   // If in plan-first mode, remove mutating workspace tools
@@ -2193,6 +2239,8 @@ export const __internal = {
   normalizeOpenAIWebSearchFilters,
   normalizeProviderToolType,
   normalizeWorkspacePath,
+  normalizeWorkspaceToolInput,
+  coerceWorkspaceReadLineArguments,
   surfaceWorkspaceCommandStderr,
   mergeAbortSignals,
 };

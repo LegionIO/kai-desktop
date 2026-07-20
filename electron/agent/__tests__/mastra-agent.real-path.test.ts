@@ -35,6 +35,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { z } from 'zod';
 import type { AppConfig } from '../../config/schema.js';
 import type { ToolDefinition } from '../../tools/types.js';
 import type { StreamEvent } from '../mastra-agent.js';
@@ -273,6 +274,60 @@ describe('mastra-agent — pure helpers', () => {
       expect(sub).not.toContain('~');
       expect(sub.endsWith('/x/y')).toBe(true);
       expect(sub.startsWith('/work/base')).toBe(false); // resolved under home, not base
+    });
+  });
+
+  describe('workspace Read schema normalization', () => {
+    it('coerces finite numeric strings before Mastra validation', async () => {
+      const readTool = {
+        inputSchema: z.object({
+          path: z.string(),
+          offset: z.number().optional(),
+          limit: z.number().optional(),
+        }),
+      };
+      __internal.coerceWorkspaceReadLineArguments({ mastra_workspace_read_file: readTool });
+
+      const result = await readTool.inputSchema['~standard'].validate({
+        path: '~/src/file.ts',
+        offset: '230',
+        limit: '50',
+      });
+
+      expect(result).toEqual({ value: { path: '~/src/file.ts', offset: 230, limit: 50 } });
+      expect(z.toJSONSchema(readTool.inputSchema)).toMatchObject({
+        properties: {
+          offset: { type: 'number' },
+          limit: { type: 'number' },
+        },
+      });
+    });
+
+    it('still rejects nonnumeric strings', async () => {
+      const readTool = {
+        inputSchema: z.object({
+          path: z.string(),
+          offset: z.number().optional(),
+          limit: z.number().optional(),
+        }),
+      };
+      __internal.coerceWorkspaceReadLineArguments({ mastra_workspace_read_file: readTool });
+
+      const result = await readTool.inputSchema['~standard'].validate({ path: 'file.ts', offset: 'later' });
+
+      expect(result).toMatchObject({
+        issues: [expect.objectContaining({ path: ['offset'], code: 'invalid_type' })],
+      });
+    });
+
+    it('also normalizes direct workspace-tool invocations that bypass schema parsing', () => {
+      expect(
+        __internal.normalizeWorkspaceToolInput(
+          'mastra_workspace_read_file',
+          { path: '~/src/file.ts', offset: '230', limit: '50' },
+          '/workspace',
+        ),
+      ).toMatchObject({ offset: 230, limit: 50 });
     });
   });
 
