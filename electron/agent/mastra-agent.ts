@@ -163,7 +163,10 @@ function shouldRetryWithoutTemperature(
   return (
     /unsupported parameter:\s*'temperature'/.test(message) ||
     message.includes('temperature is not supported') ||
-    /only (?:the )?default \(1\) value is supported/.test(message)
+    /only (?:the )?default \(1\) value is supported/.test(message) ||
+    // e.g. Moonshot/Kimi: "invalid temperature: only 1 is allowed for this model"
+    /invalid temperature/.test(message) ||
+    /only \d+(\.\d+)? is allowed/.test(message)
   );
 }
 

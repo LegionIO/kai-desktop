@@ -5,6 +5,7 @@ import { defaultProvider } from '@aws-sdk/credential-provider-node';
 import type { LanguageModel } from 'ai';
 import type { LLMModelConfig } from './model-catalog.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
+import { isMoonshotModel, createMoonshotCompatFetch } from './providers/moonshot.js';
 
 function stripTrailingSlashes(value: string): string {
   let end = value.length;
@@ -196,11 +197,11 @@ function createResponsesApiPatchingFetch(): typeof fetch {
   };
 }
 
-function createTemperatureOmissionFetch(): typeof fetch {
+function withTemperatureOmissionSupport(inner: typeof fetch): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(withBrandUserAgent(init?.headers));
     if (headers.get('x-skynet-omit-temperature') !== '1') {
-      return fetch(input, {
+      return inner(input, {
         ...init,
         headers,
       });
@@ -209,7 +210,7 @@ function createTemperatureOmissionFetch(): typeof fetch {
     headers.delete('x-skynet-omit-temperature');
 
     if (typeof init?.body !== 'string') {
-      return fetch(input, {
+      return inner(input, {
         ...init,
         headers,
       });
@@ -220,13 +221,13 @@ function createTemperatureOmissionFetch(): typeof fetch {
       if (parsed && typeof parsed === 'object' && 'temperature' in parsed) {
         delete parsed.temperature;
       }
-      return fetch(input, {
+      return inner(input, {
         ...init,
         headers,
         body: JSON.stringify(parsed),
       });
     } catch {
-      return fetch(input, {
+      return inner(input, {
         ...init,
         headers,
       });
@@ -301,7 +302,7 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
       ...(endpoint ? { baseURL: endpoint } : {}),
       ...(modelConfig.apiKey ? { apiKey: modelConfig.apiKey } : {}),
       headers: withBrandUserAgent(modelConfig.extraHeaders ?? {}),
-      fetch: createTemperatureOmissionFetch(),
+      fetch: withTemperatureOmissionSupport(fetch),
     });
     return anthropic(modelConfig.modelName);
   }
@@ -316,7 +317,10 @@ export async function createLanguageModelFromConfig(modelConfig: LLMModelConfig)
   // wrapper for Azure endpoints. Non-Azure OpenAI-compatible endpoints that
   // read api-version from a header still get it via `headers` below.
   const isAzure = /\.openai\.azure\.com/i.test(normalizedBaseUrl ?? '');
-  const baseFetch = createResponsesApiPatchingFetch();
+  let baseFetch = withTemperatureOmissionSupport(createResponsesApiPatchingFetch());
+  if (isMoonshotModel(modelConfig)) {
+    baseFetch = createMoonshotCompatFetch(baseFetch);
+  }
   const openai = createOpenAI({
     ...(normalizedBaseUrl ? { baseURL: normalizedBaseUrl } : {}),
     apiKey: modelConfig.apiKey || 'dummy',

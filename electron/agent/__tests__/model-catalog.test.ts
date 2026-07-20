@@ -204,6 +204,24 @@ describe('resolveStreamConfig', () => {
     expect(resolved.primaryModel.modelConfig.temperature).toBe(0.1);
   });
 
+  it("a manual model pick against an implicit default profile uses GLOBAL params, not the default profile's", () => {
+    // Regression: picking a bare model from the model dropdown (threadModelKey
+    // set, threadProfileKey null) must not silently inherit the configured
+    // default profile's temperature/systemPrompt/etc. just because a default
+    // profile happens to be set — only its primary-model fallback applies.
+    const config = makeConfig({
+      advanced: { temperature: 1, maxSteps: 25, maxRetries: 2, useResponsesApi: false },
+      profiles: [
+        { key: 'p1', name: 'P1', primaryModelKey: 'claude', fallbackModelKeys: [], temperature: 0.3, maxSteps: 10 },
+      ] as AppConfig['profiles'],
+      defaultProfileKey: 'p1',
+    });
+    const resolved = resolveStreamConfig(config, { ...baseOpts, threadModelKey: 'gpt' })!;
+    expect(resolved.primaryModel.key).toBe('gpt');
+    expect(resolved.temperature).toBe(1); // global, not the p1 profile's 0.3
+    expect(resolved.maxSteps).toBe(25); // global, not the p1 profile's 10
+  });
+
   it('systemPrompt precedence: thread override → profile → global', () => {
     const config = makeConfig({
       systemPrompt: 'GLOBAL',

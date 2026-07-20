@@ -186,17 +186,32 @@ export function resolveStreamConfig(
       return true;
     });
 
-  // 4. Merge parameters: thread overrides → profile overrides → global
+  // 4. Merge parameters: thread overrides → profile overrides → global.
+  // The profile's own overrides only apply when the profile is genuinely in
+  // play — explicitly requested, or implicitly supplying the primary model
+  // (no manual threadModelKey). A manual model pick against an implicit
+  // default profile means the caller chose a bare model, not that profile's
+  // bundle — its temperature/system prompt/etc. must not silently attach to
+  // an unrelated model selection just because a default profile happens to
+  // be configured.
+  const applyProfileParams = explicitProfile || !opts.threadModelKey;
   const threadOvr = opts.threadOverrides;
-  const temperature = threadOvr?.temperature ?? profile.temperature ?? config.advanced.temperature;
-  const maxSteps = threadOvr?.maxSteps ?? profile.maxSteps ?? config.advanced.maxSteps;
-  const maxRetries = threadOvr?.maxRetries ?? profile.maxRetries ?? config.advanced.maxRetries;
-  const profileUseResponsesApi = profile.useResponsesApi;
+  const temperature =
+    threadOvr?.temperature ?? (applyProfileParams ? profile.temperature : undefined) ?? config.advanced.temperature;
+  const maxSteps =
+    threadOvr?.maxSteps ?? (applyProfileParams ? profile.maxSteps : undefined) ?? config.advanced.maxSteps;
+  const maxRetries =
+    threadOvr?.maxRetries ?? (applyProfileParams ? profile.maxRetries : undefined) ?? config.advanced.maxRetries;
+  const profileUseResponsesApi = applyProfileParams ? profile.useResponsesApi : undefined;
   const useResponsesApi =
     profileUseResponsesApi ?? primaryModel.modelConfig.useResponsesApi ?? config.advanced.useResponsesApi;
   const globalSystemPrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
-  const systemPrompt = threadOvr?.systemPromptOverride?.trim() || profile.systemPrompt?.trim() || globalSystemPrompt;
-  const reasoningEffort = opts.reasoningEffort ?? (profile.reasoningEffort as ReasoningEffort | undefined);
+  const systemPrompt =
+    threadOvr?.systemPromptOverride?.trim() ||
+    (applyProfileParams ? profile.systemPrompt?.trim() : undefined) ||
+    globalSystemPrompt;
+  const reasoningEffort =
+    opts.reasoningEffort ?? (applyProfileParams ? (profile.reasoningEffort as ReasoningEffort | undefined) : undefined);
 
   // 5. Apply merged parameters to model configs (cloned so we don't mutate catalog)
   // For useResponsesApi, precedence is: profile explicit > model/provider default > global default.
