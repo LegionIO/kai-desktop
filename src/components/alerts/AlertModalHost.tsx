@@ -19,7 +19,12 @@ type AutomationsShape = {
  * alert is instantly visible. When the setting is off this renders nothing
  * (the OS notification + Alerts tab badge are the only surfacing).
  */
-export const AlertModalHost: FC = () => {
+export const AlertModalHost: FC<{
+  /** The conversation currently open in the renderer (null if none). */
+  activeConversationId?: string | null;
+  /** True when the chat surface (not Settings/Alerts/a plugin panel) is showing. */
+  chatVisible?: boolean;
+}> = ({ activeConversationId = null, chatVisible = false }) => {
   const { config } = useConfig();
   const automations = (config as { automations?: AutomationsShape } | null)?.automations;
   // In-app modal only when the (mutually-exclusive) surface resolves to 'modal'.
@@ -30,16 +35,29 @@ export const AlertModalHost: FC = () => {
   const [alert, setAlert] = useState<Alert | null>(null);
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
+  // Keep the live view state in refs so the (mount-once) onChanged handler reads
+  // the CURRENT value rather than the value captured at subscription time.
+  const activeConvRef = useRef(activeConversationId);
+  activeConvRef.current = activeConversationId;
+  const chatVisibleRef = useRef(chatVisible);
+  chatVisibleRef.current = chatVisible;
 
   useEffect(() => {
     const off = app.alerts.onChanged((payload: AlertsChangedPayload) => {
       if (!enabledRef.current) return;
       if (payload.reason !== 'created' || !payload.alert) return;
       if (payload.alert.kind === 'fyi') return; // fyi never steals focus
-      // Present user (GUI focused): the main process already decided NOT to
-      // surface — the inline in-thread card is the surface, so don't overlay a
-      // modal on top of the conversation they're already looking at.
-      if (payload.suppressSurface) return;
+      // Presence-based suppression, but ONLY when the alert's inline card is
+      // actually on screen. The main process sets suppressSurface when the GUI
+      // is focused — but focus on Settings, the Alerts tab, or a DIFFERENT
+      // conversation means the originating thread's inline card is NOT visible,
+      // so the modal is the only surface and must still show. Suppress only when
+      // the alert's own conversation is the one currently displayed.
+      const inlineVisible =
+        chatVisibleRef.current &&
+        !!payload.alert.conversationId &&
+        activeConvRef.current === payload.alert.conversationId;
+      if (payload.suppressSurface && inlineVisible) return;
       setAlert(payload.alert);
       // The main process already raises + focuses the window (alerts.ts
       // surfaceAsModal path); the renderer just opens the in-app modal.

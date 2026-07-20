@@ -1872,7 +1872,10 @@ function AppShell() {
             <PluginErrorBoundary fallback={() => null}>
               <PluginToastHost />
             </PluginErrorBoundary>
-            <AlertModalHost />
+            <AlertModalHost
+              activeConversationId={activeConversationId}
+              chatVisible={activeView === CHAT_VIEW || activeView === activeConversationId}
+            />
             <PluginErrorBoundary fallback={() => null}>
               <PermissionConsentModal />
             </PluginErrorBoundary>
