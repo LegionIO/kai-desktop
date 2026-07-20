@@ -32,6 +32,7 @@ import type {
   PluginConsentRequest,
   PluginInferenceProvider,
   PluginCliToolContribution,
+  PluginActionHandler,
 } from './types.js';
 import { DANGEROUS_PLUGIN_PERMISSIONS } from './types.js';
 import { createPluginAPI, cleanupPluginAPI } from './plugin-api.js';
@@ -128,8 +129,7 @@ export class PluginManager {
   private pluginAPIs: Map<string, PluginAPI> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private cliToolChangeCallback: (() => void) | null = null;
-  private actionHandlers: Map<string, Map<string, (action: string, data?: unknown) => void | Promise<void>>> =
-    new Map();
+  private actionHandlers: Map<string, Map<string, PluginActionHandler>> = new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
@@ -1527,11 +1527,7 @@ export class PluginManager {
 
   /* ── Actions (renderer → main) ── */
 
-  registerActionHandler(
-    pluginName: string,
-    targetId: string,
-    handler: (action: string, data?: unknown) => void | Promise<void>,
-  ): void {
+  registerActionHandler(pluginName: string, targetId: string, handler: PluginActionHandler): void {
     // Refuse late registrations from a disabled/unloaded plugin's stale async
     // code — otherwise it could repopulate actionHandlers after unloadPlugin()
     // cleared them and keep executing backend logic via the IPC action endpoints.

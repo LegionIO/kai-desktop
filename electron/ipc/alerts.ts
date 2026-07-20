@@ -27,6 +27,7 @@ import {
 import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
+import { isKaiPresent } from '../agent/kai-presence.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
@@ -99,28 +100,43 @@ export function raiseAlert(input: CreateAlertInput): Alert {
  *  Exported as the hook `request_review` / the ask_user fallback call after they
  *  write the store directly (they live in the tools layer and can't import electron). */
 export function notifyNewAlert(alert: Alert): void {
-  const verb = alert.kind === 'fyi' ? 'Flagged for review' : alert.kind === 'approval' ? 'Approval needed' : 'Question';
-  try {
-    if (Notification.isSupported()) {
-      const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
-      // Clicking the OS notification should bring the user to the Alerts view.
-      n.on('click', () => {
-        focusMainWindowForModal();
-        for (const win of BrowserWindow.getAllWindows()) {
-          win.webContents.send('alerts:navigate', { alertId: alert.id });
-        }
-        broadcastToWebClients('alerts:navigate', { alertId: alert.id });
-      });
-      n.show();
+  // Presence-aware surfacing (mirrors the ask_user / tool-approval gate): when
+  // the user is actively on Kai (GUI focused or CLI recently active) they can see
+  // the inline request_review card in the conversation, so DON'T also fire an OS
+  // notification or steal focus with a modal/pop-out. The alert is still
+  // persisted + broadcast (so it shows inline + in Alerts history). When away,
+  // surface it normally so a headless/automation run isn't missed.
+  const present = (() => {
+    try {
+      return isKaiPresent();
+    } catch {
+      return false;
     }
-  } catch {
-    // Notifications can throw on some platforms/permission states — non-fatal.
+  })();
+
+  const verb = alert.kind === 'fyi' ? 'Flagged for review' : alert.kind === 'approval' ? 'Approval needed' : 'Question';
+  if (!present) {
+    try {
+      if (Notification.isSupported()) {
+        const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
+        n.on('click', () => {
+          focusMainWindowForModal();
+          for (const win of BrowserWindow.getAllWindows()) {
+            win.webContents.send('alerts:navigate', { alertId: alert.id });
+          }
+          broadcastToWebClients('alerts:navigate', { alertId: alert.id });
+        });
+        n.show();
+      }
+    } catch {
+      // Notifications can throw on some platforms/permission states — non-fatal.
+    }
   }
+  // Always broadcast so the inline card + Alerts tab/history update live.
   broadcastAlertsChanged({ reason: 'created', alert });
-  // Surface the alert per the single (mutually-exclusive) setting. fyi never
-  // steals focus / pops out — it's non-blocking.
-  const surface = deps?.alertSurface() ?? 'off';
-  if (alert.kind !== 'fyi') {
+  // Surface (modal/pop-out) only when AWAY and not an fyi (fyi never steals focus).
+  if (!present && alert.kind !== 'fyi') {
+    const surface = deps?.alertSurface() ?? 'off';
     if (surface === 'modal') {
       focusMainWindowForModal();
     } else if (surface === 'window') {

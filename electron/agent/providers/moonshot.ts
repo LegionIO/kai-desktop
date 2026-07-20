@@ -79,14 +79,41 @@ export function sanitizeMoonshotSchema(schema: unknown): unknown {
       (key) => key !== 'anyOf' && key !== 'oneOf' && key !== 'allOf' && branchKeys.has(key),
     );
     if (conflicting.length > 0) {
-      // Rewrite each branch, seeding any missing conflicting key from the parent.
+      // Rewrite each branch, merging the parent's copy of every conflicting key
+      // in. Scalars (default/pattern/maxLength): seed only where the branch
+      // lacks the key. Objects (e.g. `properties`) / arrays (e.g. `required`):
+      // union the parent's members with the branch's so a parent-wide constraint
+      // isn't dropped on a branch that only declared a partial copy — the branch
+      // wins on any key it already sets.
+      const mergeInto = (branch: Record<string, unknown>, key: string): void => {
+        const parentVal = node[key];
+        const branchVal = branch[key];
+        if (!(key in branch)) {
+          branch[key] = parentVal;
+          return;
+        }
+        if (
+          parentVal &&
+          typeof parentVal === 'object' &&
+          !Array.isArray(parentVal) &&
+          branchVal &&
+          typeof branchVal === 'object' &&
+          !Array.isArray(branchVal)
+        ) {
+          branch[key] = { ...(parentVal as Record<string, unknown>), ...(branchVal as Record<string, unknown>) };
+          return;
+        }
+        if (Array.isArray(parentVal) && Array.isArray(branchVal)) {
+          branch[key] = Array.from(new Set([...parentVal, ...branchVal]));
+          return;
+        }
+        // Scalar (or type mismatch): the branch's own value is authoritative.
+      };
       const seed = (arr: unknown[]): unknown[] =>
         arr.map((b) => {
           if (!b || typeof b !== 'object' || Array.isArray(b)) return b;
           const branch = { ...(b as Record<string, unknown>) };
-          for (const key of conflicting) {
-            if (!(key in branch)) branch[key] = node[key];
-          }
+          for (const key of conflicting) mergeInto(branch, key);
           return branch;
         });
       if (anyOf) node.anyOf = seed(anyOf);

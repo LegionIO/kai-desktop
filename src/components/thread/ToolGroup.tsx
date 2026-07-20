@@ -638,7 +638,11 @@ const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, resul
   const approvalAction = typeof a.approvalAction === 'string' ? a.approvalAction : '';
   const questions = parseQuestions(args);
   const r = (result && typeof result === 'object' && !Array.isArray(result) ? result : {}) as Record<string, unknown>;
-  const suspend = r.suspend === true || r.suspended === true || r.alerted === true;
+  // An fyi is non-blocking — it never "awaits the user / resumes". Only a
+  // question/approval (or an explicit suspend flag) shows the awaiting affordance.
+  // Don't key off `alerted` alone, which is true for every request_review kind.
+  const alerted = r.alerted === true;
+  const suspend = (r.suspend === true || r.suspended === true) && kind !== 'fyi';
   const alertId = typeof r.alertId === 'string' ? r.alertId : null;
 
   // Track the raised alert's LIVE status so the inline card flips from "awaiting"
@@ -716,6 +720,13 @@ const ReviewRequestView: FC<{ args: unknown; result: unknown }> = ({ args, resul
       ) : suspend ? (
         <div className="text-[11px] text-amber-600 dark:text-amber-400">
           Raised as an Alert — awaiting the user. The run will resume when they respond.
+        </div>
+      ) : kind === 'fyi' && alerted ? (
+        // fyi is informational + non-blocking — no "awaiting/resume".
+        <div className="text-[11px] text-muted-foreground">
+          {alertStatus === 'open'
+            ? 'Flagged for you — awaiting acknowledgement in the Alerts tab.'
+            : 'Flagged for you.'}
         </div>
       ) : null}
     </div>
@@ -2305,8 +2316,9 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
             {rawPath}
           </div>
         )}
-        {/* Preview lines */}
-        {!isRunning && previewLines.length > 0 && (
+        {/* Preview lines — suppressed on error so the error string isn't parsed
+            and shown as if it were file content (the error block renders below). */}
+        {!isRunning && !resultError && previewLines.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full border-collapse table-fixed">
               <tbody>
@@ -2323,7 +2335,7 @@ const ReadInlineView: FC<{ part: ToolCallPart; isRunning: boolean; isError: bool
           </div>
         )}
         {/* Click to expand */}
-        {hasMore && !isRunning && (
+        {hasMore && !isRunning && !resultError && (
           <div className="border-t border-border/50 dark:border-white/10 px-3 py-1.5 flex items-center justify-between">
             <span className="text-muted-foreground/40 text-[10px] tabular-nums">
               {lines.length - PREVIEW_LINES > 0

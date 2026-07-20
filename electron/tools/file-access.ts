@@ -192,7 +192,7 @@ export type PathEntryPreview = {
  *  preview is an approximate "does this match anything" indicator, not an exact
  *  count, so a single non-recursive listing is enough and can't fan out into
  *  hundreds of synchronous per-directory scans. */
-const PREVIEW_SCAN_CAP = 1000;
+const PREVIEW_SCAN_CAP = 250;
 
 /**
  * Preview a single File Access allow/deny entry for the Settings UI: expand it,

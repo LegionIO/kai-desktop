@@ -40,3 +40,25 @@ describe('AlertCard deep-link to conversation', () => {
     expect(screen.queryByText('View conversation')).toBeNull();
   });
 });
+
+describe('AlertCard readOnly (history) rendering', () => {
+  it('suppresses the fyi Dismiss action and shows the resolution status', () => {
+    const acked = { ...baseAlert, status: 'acknowledged' } as unknown as Alert;
+    render(<AlertCard alert={acked} readOnly />);
+    expect(screen.queryByText('Dismiss')).toBeNull();
+    expect(screen.getByText('Acknowledged')).toBeTruthy();
+  });
+
+  it('suppresses Approve/Deny for a resolved approval alert', () => {
+    const approval = { ...baseAlert, kind: 'approval', status: 'answered' } as unknown as Alert;
+    render(<AlertCard alert={approval} readOnly />);
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(screen.queryByText('Deny')).toBeNull();
+    expect(screen.getByText('Answered')).toBeTruthy();
+  });
+
+  it('still renders the Dismiss action when not readOnly', () => {
+    render(<AlertCard alert={baseAlert} />);
+    expect(screen.getByText('Dismiss')).toBeTruthy();
+  });
+});

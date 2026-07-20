@@ -58,6 +58,7 @@ import type {
   CookiePromotionConfig,
   SessionCookieInfo,
   AutomationEvent,
+  PluginActionHandler,
 } from './types.js';
 import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandboxed-exec.js';
 import { isExternallyOpenableUrl } from '../utils/safe-external-url.js';
@@ -261,7 +262,7 @@ type PluginAPICallbacks = {
   onUIStateChanged: () => void;
   onToolsChanged: () => void;
   onCliToolsChanged?: () => void;
-  registerActionHandler: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
+  registerActionHandler: (targetId: string, handler: PluginActionHandler) => void;
 };
 
 function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
@@ -1447,7 +1448,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       },
     },
 
-    onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => {
+    onAction: (targetId: string, handler: PluginActionHandler) => {
       callbacks.registerActionHandler(targetId, handler);
     },
 

@@ -18,12 +18,20 @@ const KIND_META: Record<Alert['kind'], { label: string; icon: FC<{ className?: s
  * Actions call the alerts IPC; on success the parent list drops the alert via
  * the alerts:changed broadcast, so we just show a transient busy state.
  */
+const STATUS_LABEL: Partial<Record<Alert['status'], string>> = {
+  answered: 'Answered',
+  acknowledged: 'Acknowledged',
+  dismissed: 'Dismissed',
+};
+
 export const AlertCard: FC<{
   alert: Alert;
   onResolved?: () => void;
   /** Deep-link: open the conversation this alert was raised in. */
   onOpenConversation?: (conversationId: string) => void;
-}> = ({ alert, onResolved, onOpenConversation }) => {
+  /** History rendering: suppress live action controls, show a resolution badge. */
+  readOnly?: boolean;
+}> = ({ alert, onResolved, onOpenConversation, readOnly = false }) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState('');
@@ -82,13 +90,13 @@ export const AlertCard: FC<{
             </button>
           )}
 
-          {alert.kind === 'question' && alert.questions && alert.questions.length > 0 && (
+          {alert.kind === 'question' && alert.questions && alert.questions.length > 0 && !readOnly && (
             <div className="mt-3">
               <AlertQuestionPicker questions={alert.questions} onSubmit={answer} submitting={busy} />
             </div>
           )}
 
-          {alert.kind === 'approval' && (
+          {alert.kind === 'approval' && !readOnly && (
             <div className="mt-3 flex flex-col gap-2">
               {alert.approvalAction && <span className="text-xs text-muted-foreground">{alert.approvalAction}</span>}
               <textarea
@@ -119,7 +127,7 @@ export const AlertCard: FC<{
             </div>
           )}
 
-          {alert.kind === 'fyi' && (
+          {alert.kind === 'fyi' && !readOnly && (
             <div className="mt-3 flex justify-end">
               <button
                 type="button"
@@ -132,7 +140,7 @@ export const AlertCard: FC<{
             </div>
           )}
 
-          {alert.kind !== 'fyi' && (
+          {alert.kind !== 'fyi' && !readOnly && (
             <button
               type="button"
               disabled={busy}
@@ -141,6 +149,10 @@ export const AlertCard: FC<{
             >
               Dismiss without answering
             </button>
+          )}
+
+          {readOnly && STATUS_LABEL[alert.status] && (
+            <div className="mt-2 text-[11px] font-medium text-muted-foreground/70">{STATUS_LABEL[alert.status]}</div>
           )}
 
           {error && <div className="mt-2 text-xs text-rose-500">{error}</div>}

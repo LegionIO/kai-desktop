@@ -373,6 +373,10 @@ const PatternList: FC<{
   };
 
   const removePattern = (index: number) => {
+    // The remove button's onMouseDown set skipBlurAddRef to suppress the input's
+    // blur-commit; clear it here now that we've folded the draft in ourselves, so
+    // a subsequent blur can't be silently swallowed by a stale flag.
+    skipBlurAddRef.current = false;
     // Fold any pending typed-but-uncommitted draft into the SAME update so a
     // remove-click that races the blur-commit can't drop the draft (both would
     // otherwise write from the stale `patterns` array, and remove would win).

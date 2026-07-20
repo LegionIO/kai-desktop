@@ -116,6 +116,39 @@ describe('sanitizeMoonshotSchema', () => {
     expect(sanitized.anyOf[0].maxLength).toBe(10);
     expect(sanitized.anyOf[1].maxLength).toBe(10);
   });
+
+  it('deep-merges an object-valued parent keyword into a branch that only declared part of it', () => {
+    // parent `properties` conflicts with a branch's own partial `properties`.
+    // The branch's own keys win; the parent's extra keys must NOT be lost.
+    const schema = {
+      type: 'object',
+      properties: { a: { type: 'string' }, b: { type: 'number' } },
+      anyOf: [{ type: 'object', properties: { a: { type: 'boolean' } } }, { type: 'null' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as {
+      properties?: unknown;
+      anyOf: Array<{ properties?: Record<string, { type: string }> }>;
+    };
+    expect(sanitized).not.toHaveProperty('properties');
+    // Branch keeps its own `a` (boolean), inherits parent's `b`.
+    expect(sanitized.anyOf[0].properties?.a.type).toBe('boolean');
+    expect(sanitized.anyOf[0].properties?.b.type).toBe('number');
+  });
+
+  it('unions an array-valued parent keyword (e.g. required) into branches', () => {
+    const schema = {
+      type: 'object',
+      required: ['a', 'b'],
+      anyOf: [{ type: 'object', required: ['b', 'c'] }, { type: 'object' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as {
+      required?: unknown;
+      anyOf: Array<{ required?: string[] }>;
+    };
+    expect(sanitized).not.toHaveProperty('required');
+    expect([...(sanitized.anyOf[0].required ?? [])].sort()).toEqual(['a', 'b', 'c']);
+    expect([...(sanitized.anyOf[1].required ?? [])].sort()).toEqual(['a', 'b']);
+  });
 });
 
 describe('createMoonshotCompatFetch', () => {

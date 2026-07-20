@@ -67,12 +67,21 @@ export const UpdateCard: FC = () => {
     }
   }, [status.state, dismissed]);
 
-  // Reset dismissed when a new update is found (e.g. user dismissed but new version appears)
+  // Reset dismissed only when a genuinely NEW version appears — not on every
+  // 'available'/'downloading' tick. 'available' is sticky (re-emitted on each
+  // poll for the same version), so keying off state alone would un-dismiss the
+  // card the user just closed for the same update. Track the version we last
+  // reset for and only clear the dismissal when it actually changes.
+  const lastResetVersion = useRef<string | null>(null);
   useEffect(() => {
-    if ((status.state === 'available' || status.state === 'downloading') && dismissed) {
-      setDismissed(false);
-    }
-  }, [status.state, dismissed]);
+    if (status.state !== 'available' && status.state !== 'downloading') return;
+    const version = status.version ?? null;
+    if (version === lastResetVersion.current) return; // same update we've already accounted for
+    // A version we haven't seen before: record it, and clear any prior dismissal
+    // (that dismissal was for the previous version).
+    lastResetVersion.current = version;
+    if (dismissed) setDismissed(false);
+  }, [status.state, status.version, dismissed]);
 
   const showable =
     status.state === 'available' ||

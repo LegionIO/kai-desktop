@@ -145,6 +145,16 @@ export type ToolDetectionResult = {
   error?: string;
 };
 
+/**
+ * Result an `onAction` handler may return. A plugin can return nothing (fire-
+ * and-forget), or a small structured ack the renderer/automation can read back
+ * — e.g. `{ ok: true, message: 'Saved' }`. The full value is passed through by
+ * `PluginManager.handleAction` unchanged.
+ */
+export type PluginActionResult = void | { ok?: boolean; message?: string; data?: unknown; [key: string]: unknown };
+
+export type PluginActionHandler = (action: string, data?: unknown) => PluginActionResult | Promise<PluginActionResult>;
+
 export type AuditEntry = {
   timestamp: string;
   pluginName: string;
@@ -677,7 +687,7 @@ export type PluginAPI = {
     registerCliTool: (tool: PluginCliToolContribution) => void;
   };
 
-  onAction: (targetId: string, handler: (action: string, data?: unknown) => void | Promise<void>) => void;
+  onAction: (targetId: string, handler: PluginActionHandler) => void;
 
   fetch: typeof globalThis.fetch;
 
