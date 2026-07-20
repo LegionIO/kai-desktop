@@ -17,6 +17,7 @@ import { MediaGenerationSettings } from './MediaGenerationSettings';
 import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
 import { AutomationsSettings } from './AutomationsSettings';
+import { DiagnosticsSettings } from './DiagnosticsSettings';
 import { searchSettings, breadcrumb, type SettingsSearchEntry } from './search-index';
 import type { SettingsProps } from './shared';
 
@@ -30,7 +31,8 @@ export type SettingsSection =
   | 'voice'
   | 'computer-use'
   | 'media-generation'
-  | 'web-server';
+  | 'web-server'
+  | 'diagnostics';
 
 const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'models', label: 'Models' },
@@ -43,6 +45,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'computer-use', label: 'Autopilot' },
   { key: 'media-generation', label: 'Media Generation' },
   { key: 'web-server', label: 'Web UI' },
+  { key: 'diagnostics', label: 'Diagnostics' },
 ];
 
 type FocusTarget = { tab?: string; anchorId?: string; fallbackId?: string; nonce: number };
@@ -251,6 +254,7 @@ export const SettingsPanel: FC<{ onClose: () => void; onOpenConversation?: (id: 
         )}
         {activeSection === 'computer-use' && <ComputerUseSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'web-server' && <WebServerSettings config={config} updateConfig={updateConfig} />}
+        {activeSection === 'diagnostics' && <DiagnosticsSettings config={config} updateConfig={updateConfig} />}
         {activeSection === 'general' && (
           <ApplicationSettings
             config={config}

@@ -15,6 +15,14 @@ import {
 } from 'electron';
 import { basename, join, sep } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
+import {
+  appendBoundedLog,
+  enterErrorHandler,
+  exitErrorHandler,
+  isDeadPipeError,
+  isInErrorHandler,
+  recordDiagnostic,
+} from './diagnostics/main-diagnostics.js';
 import { homedir } from 'os';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
@@ -70,6 +78,7 @@ import { getExistingComputerUseManager } from './computer-use/service.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
+import { registerDiagnosticsHandlers } from './ipc/diagnostics.js';
 import { registerTaskHandlers } from './ipc/tasks.js';
 import {
   registerAgentHandlers as registerAgentEntityHandlers,
@@ -303,15 +312,57 @@ function formatMainProcessError(error: unknown): string {
 }
 
 function recordMainProcessUnhandledError(kind: MainProcessUnhandledKind, error: unknown): void {
-  const formatted = formatMainProcessError(error);
-  console.error(`[${__BRAND_PRODUCT_NAME}] Unhandled main-process ${kind}:`, error);
+  // Re-entrancy guard: if we're already inside this handler, a nested throw
+  // (typically another EPIPE from the console write below) must NOT recurse —
+  // that is exactly the self-feeding loop that once produced a 218 MB log and
+  // pinned the event loop. Record to the counter and bail without touching
+  // stdio again.
+  if (isInErrorHandler()) {
+    try {
+      recordDiagnostic(kind, formatMainProcessError(error));
+    } catch {
+      /* noop */
+    }
+    return;
+  }
+  enterErrorHandler();
   try {
-    mkdirSync(join(APP_HOME, 'logs'), { recursive: true });
-    appendFileSync(MAIN_PROCESS_LOG, `[${new Date().toISOString()}] [${kind}] ${formatted}\n\n`, 'utf-8');
-  } catch {
-    /* best-effort logging only */
+    const formatted = formatMainProcessError(error);
+    recordDiagnostic(kind, formatted);
+
+    // Never re-log a dead-pipe write to the console — the write would throw
+    // another EPIPE. File logging still captures it (append is fd-based, not
+    // tied to the dead stdio stream).
+    if (!isDeadPipeError(error)) {
+      try {
+        console.error(`[${__BRAND_PRODUCT_NAME}] Unhandled main-process ${kind}:`, error);
+      } catch {
+        /* console itself can throw on a dead pipe — swallow */
+      }
+    }
+
+    appendBoundedLog(MAIN_PROCESS_LOG, `[${new Date().toISOString()}] [${kind}] ${formatted}\n\n`);
+  } finally {
+    exitErrorHandler();
   }
 }
+
+// A dead stdout/stderr pipe (parent shell exits, launcher detaches) makes any
+// write throw an async 'error' that would otherwise surface as an
+// uncaughtException. Swallow those at the stream level so they never even reach
+// the handler above — belt to its re-entrancy suspenders.
+function swallowStdioError(error: NodeJS.ErrnoException): void {
+  if (isDeadPipeError(error)) return;
+  // A non-EPIPE stdio error is unusual; record it but do not re-log to the
+  // stream that just failed.
+  try {
+    recordDiagnostic('uncaughtException', formatMainProcessError(error));
+  } catch {
+    /* noop */
+  }
+}
+process.stdout.on('error', swallowStdioError);
+process.stderr.on('error', swallowStdioError);
 
 process.on('uncaughtException', (error) => {
   recordMainProcessUnhandledError('uncaughtException', error);
@@ -1244,6 +1295,7 @@ if (gotSingleInstanceLock) {
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerPartitionHandlers(ipcMain);
+    registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);

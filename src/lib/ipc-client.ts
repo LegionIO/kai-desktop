@@ -359,6 +359,25 @@ type AppAPI = {
     list: () => Promise<Array<{ name: string; sizeBytes: number }>>;
     delete: (names: string[]) => Promise<{ success?: boolean; deleted?: string[]; error?: string }>;
   };
+  diagnostics: {
+    getSummary: () => Promise<{
+      logPath: string;
+      logSizeBytes: number;
+      sinceBoot: string;
+      totalErrors: number;
+      counters: Array<{
+        key: string;
+        kind: 'uncaughtException' | 'unhandledRejection';
+        plugin: string | null;
+        count: number;
+        lastTs: string;
+        sample: string;
+      }>;
+    }>;
+    tailLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
+    clearLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
+    resetCounters: () => Promise<{ success: boolean }>;
+  };
   plans: {
     readFile: (filename: string) => Promise<{ content?: string; error?: string }>;
   };

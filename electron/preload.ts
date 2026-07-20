@@ -886,6 +886,32 @@ const appAPI = {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
   },
 
+  diagnostics: {
+    getSummary: () =>
+      ipcRenderer.invoke('diagnostics:get-summary') as Promise<{
+        logPath: string;
+        logSizeBytes: number;
+        sinceBoot: string;
+        totalErrors: number;
+        counters: Array<{
+          key: string;
+          kind: 'uncaughtException' | 'unhandledRejection';
+          plugin: string | null;
+          count: number;
+          lastTs: string;
+          sample: string;
+        }>;
+      }>,
+    tailLog: (maxBytes?: number) =>
+      ipcRenderer.invoke('diagnostics:tail-log', maxBytes) as Promise<{
+        text: string;
+        sizeBytes: number;
+        truncated: boolean;
+      }>,
+    clearLog: () => ipcRenderer.invoke('diagnostics:clear-log') as Promise<{ success: boolean; logSizeBytes: number }>,
+    resetCounters: () => ipcRenderer.invoke('diagnostics:reset-counters') as Promise<{ success: boolean }>,
+  },
+
   appShots: {
     capture: () => ipcRenderer.invoke('app-shots:capture') as Promise<AppShotPayload>,
     suspendHotkey: () => ipcRenderer.invoke('app-shots:suspend-hotkey'),

@@ -24,6 +24,7 @@ export const SECTION_LABELS: Record<SettingsSection, string> = {
   'computer-use': 'Autopilot',
   'media-generation': 'Media Generation',
   'web-server': 'Web UI',
+  diagnostics: 'Diagnostics',
 };
 
 export const TAB_LABELS: Record<string, string> = {
@@ -705,6 +706,23 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     section: 'web-server',
     keywords: ['login', 'credential'],
     fallbackId: 'webServer.enabled',
+  },
+  {
+    id: 'diagnostics-log-tail',
+    label: 'Diagnostics & main-process log',
+    section: 'diagnostics',
+    keywords: [
+      'logs',
+      'errors',
+      'epipe',
+      'unresponsive',
+      'freeze',
+      'hang',
+      'crash',
+      'plugin health',
+      'unhandled',
+      'log size',
+    ],
   },
 ];
 
