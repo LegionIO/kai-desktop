@@ -15,33 +15,33 @@ export function isMoonshotModel(modelConfig: Pick<LLMModelConfig, 'provider' | '
   return /^kimi(-|$)/i.test(modelConfig.modelName ?? '');
 }
 
-/** Schema keywords that stay on a node even alongside `anyOf`/`oneOf`. */
-const SCHEMA_STRUCTURAL_KEYWORDS = new Set([
-  'anyOf',
-  'oneOf',
-  'allOf',
-  'type',
-  'description',
-  'title',
-  'default',
-  '$ref',
-  'definitions',
-  '$defs',
-]);
+/** Top-level keys across a set of anyOf/oneOf branch schemas. */
+function collectBranchKeys(branches: unknown[]): Set<string> {
+  const keys = new Set<string>();
+  for (const branch of branches) {
+    if (branch && typeof branch === 'object' && !Array.isArray(branch)) {
+      for (const k of Object.keys(branch as Record<string, unknown>)) keys.add(k);
+    }
+  }
+  return keys;
+}
 
 /**
- * Moonshot's tool-schema validator rejects a schema where a constraint
- * keyword (e.g. `pattern`) is declared BOTH on a parent object and inside one
- * of its `anyOf`/`oneOf` branches:
+ * Moonshot's tool-schema validator rejects a schema where ANY keyword —
+ * `pattern`, `default`, whatever the generator produced — is declared BOTH
+ * on a parent object and inside one of its `anyOf`/`oneOf` branches:
  *
  *   "conflicting keywords found in anyOf with parent: keywords (pattern) are
  *    defined on the parent schema and inside anyOf; remove them from the
  *    parent or from anyOf branches"
  *
  * Kai's zod -> JSON Schema generator can legitimately produce this shape for
- * a union field. Strip the parent-level duplicates (keeping the more
- * specific branch-level constraints) so the same tool definitions still
- * render normally for every other provider but validate for Moonshot.
+ * an optional/nullable/union field (e.g. `.optional().default(false)`
+ * duplicates `default` on both the parent and each branch). Rather than
+ * enumerating specific keyword names — which just turns into whack-a-mole as
+ * new ones surface — strip any parent key that's also a key on at least one
+ * branch, keeping the (equally valid) branch-level copy. Keys unique to the
+ * parent are left untouched.
  */
 export function sanitizeMoonshotSchema(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(sanitizeMoonshotSchema);
@@ -64,11 +64,15 @@ export function sanitizeMoonshotSchema(schema: unknown): unknown {
     if (Array.isArray(node[key])) node[key] = (node[key] as unknown[]).map(sanitizeMoonshotSchema);
   }
 
-  // A sibling constraint keyword next to anyOf/oneOf is what Moonshot's
-  // validator flags as conflicting — drop it from this (parent) node.
-  if (Array.isArray(node.anyOf) || Array.isArray(node.oneOf)) {
+  const branches = [
+    ...(Array.isArray(node.anyOf) ? (node.anyOf as unknown[]) : []),
+    ...(Array.isArray(node.oneOf) ? (node.oneOf as unknown[]) : []),
+  ];
+  if (branches.length > 0) {
+    const branchKeys = collectBranchKeys(branches);
     for (const key of Object.keys(node)) {
-      if (!SCHEMA_STRUCTURAL_KEYWORDS.has(key)) delete node[key];
+      if (key === 'anyOf' || key === 'oneOf' || key === 'allOf') continue;
+      if (branchKeys.has(key)) delete node[key];
     }
   }
 

@@ -52,6 +52,29 @@ describe('sanitizeMoonshotSchema', () => {
     expect(sanitizeMoonshotSchema(schema)).toEqual(schema);
   });
 
+  it('strips a "default" duplicated on the parent alongside anyOf (regression)', () => {
+    // Real-world case: `.optional().default(false)` on a boolean produces a
+    // `default` on both the parent and each anyOf branch.
+    const schema = {
+      default: false,
+      anyOf: [{ type: 'boolean', default: false }, { type: 'null' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as typeof schema;
+    expect(sanitized).not.toHaveProperty('default');
+    expect((sanitized.anyOf[0] as { default?: boolean }).default).toBe(false);
+  });
+
+  it('keeps a parent-only keyword that no branch also declares', () => {
+    // `description` isn't duplicated in any branch here, so it must survive —
+    // this isn't a fixed allowlist, only actual duplicates get stripped.
+    const schema = {
+      description: 'whether to show line numbers',
+      anyOf: [{ type: 'boolean' }, { type: 'null' }],
+    };
+    const sanitized = sanitizeMoonshotSchema(schema) as typeof schema;
+    expect(sanitized.description).toBe('whether to show line numbers');
+  });
+
   it('recurses into nested properties, items, and definitions', () => {
     const schema = {
       type: 'object',
