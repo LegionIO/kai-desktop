@@ -765,6 +765,62 @@ function attachDiffMeta(result: unknown, meta: DiffTrackingResultMeta): unknown 
   return { value: result, _diffTracking: meta };
 }
 
+type WorkspaceCommandOutput = {
+  stdout: string;
+  stderr: string;
+  success?: boolean;
+};
+
+function captureWorkspaceCommandEvent(output: WorkspaceCommandOutput, event: unknown): void {
+  if (!event || typeof event !== 'object') return;
+  const typedEvent = event as { type?: unknown; data?: unknown };
+  const data = typedEvent.data && typeof typedEvent.data === 'object' ? typedEvent.data : undefined;
+  const typedData = data as { output?: unknown; success?: unknown } | undefined;
+  if (typedEvent.type === 'data-sandbox-stdout' && typeof typedData?.output === 'string') {
+    output.stdout += typedData.output;
+  } else if (typedEvent.type === 'data-sandbox-stderr' && typeof typedData?.output === 'string') {
+    output.stderr += typedData.output;
+  } else if (typedEvent.type === 'data-sandbox-exit' && typeof typedData?.success === 'boolean') {
+    output.success = typedData.success;
+  }
+}
+
+function withWorkspaceCommandOutputCapture(
+  context: Record<string, unknown>,
+  output: WorkspaceCommandOutput,
+): Record<string, unknown> {
+  const upstreamWriter =
+    context.writer && typeof context.writer === 'object'
+      ? (context.writer as { custom?: (event: unknown) => unknown })
+      : undefined;
+  const writer = Object.create(upstreamWriter ?? null) as { custom: (event: unknown) => Promise<unknown> };
+  writer.custom = async (event: unknown) => {
+    captureWorkspaceCommandEvent(output, event);
+    if (typeof upstreamWriter?.custom === 'function') {
+      return upstreamWriter.custom.call(upstreamWriter, event);
+    }
+    return undefined;
+  };
+  return { ...context, writer };
+}
+
+function surfaceWorkspaceCommandStderr(result: unknown, output: WorkspaceCommandOutput): unknown {
+  const stderr = output.stderr.trimEnd();
+  // Mastra already includes stderr when it considers a command failed. Its
+  // lossy branch is a successful final exit (commonly a pipeline ending in
+  // `head`) where it returns only stdout and silently drops stderr.
+  if (!stderr || output.success === false) return result;
+  if (typeof result === 'string') {
+    if (result.trim() === '(no output)') return `stderr:\n${stderr}`;
+    return `${result}\n\nstderr:\n${stderr}`;
+  }
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const record = result as Record<string, unknown>;
+    if (record.stderr === undefined) return { ...record, stderr };
+  }
+  return result;
+}
+
 function applyWorkspaceToolGuards(
   tools: Record<string, unknown>,
   cwd: string,
@@ -789,10 +845,22 @@ function applyWorkspaceToolGuards(
       const localAbort = new AbortController();
       const existingSignal = (context as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
       const mergedSignal = mergeAbortSignals(existingSignal, localAbort.signal);
-      const execContext =
+      const baseExecContext =
         context && typeof context === 'object'
           ? { ...(context as Record<string, unknown>), abortSignal: mergedSignal }
           : { abortSignal: mergedSignal };
+      const commandOutput: WorkspaceCommandOutput = { stdout: '', stderr: '' };
+      const execContext =
+        toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND
+          ? withWorkspaceCommandOutputCapture(baseExecContext, commandOutput)
+          : baseExecContext;
+
+      const executeOriginal = async (args: unknown): Promise<unknown> => {
+        const result = await originalExecute(args, execContext);
+        return toolName === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND
+          ? surfaceWorkspaceCommandStderr(result, commandOutput)
+          : result;
+      };
 
       const runGuarded = async (args: unknown): Promise<unknown> => {
         if (WORKSPACE_PATH_TOOLS.has(toolName) && typeof (args as { path?: unknown })?.path === 'string') {
@@ -822,7 +890,7 @@ function applyWorkspaceToolGuards(
           const absPath = (args as { path: string }).path;
           const handle = trackFileWrite(conversationId, absPath, { toolName, toolCallId }, getConfig());
           try {
-            const result = await originalExecute(args, execContext);
+            const result = await executeOriginal(args);
             const ev = handle.finish();
             return attachDiffMeta(result, { diffs: ev ? [ev] : [] });
           } catch (err) {
@@ -847,11 +915,10 @@ function applyWorkspaceToolGuards(
             getConfig(),
           );
           try {
-            const result = await originalExecute(args, execContext);
-            const r = result as { stdout?: unknown; stderr?: unknown } | undefined;
+            const result = await executeOriginal(args);
             const events = await snap.finish({
-              stdout: typeof r?.stdout === 'string' ? r.stdout : '',
-              stderr: typeof r?.stderr === 'string' ? r.stderr : '',
+              stdout: commandOutput.stdout,
+              stderr: commandOutput.stderr,
             });
             return attachDiffMeta(result, { diffs: events, snapshotSkipped: snap.snapshotSkipped });
           } catch (err) {
@@ -866,7 +933,7 @@ function applyWorkspaceToolGuards(
           }
         }
 
-        const result = await originalExecute(args, execContext);
+        const result = await executeOriginal(args);
         if (toolName === WORKSPACE_TOOLS.FILESYSTEM.GREP && typeof result === 'string') {
           return filterGrepOutput(result, getConfig());
         }
@@ -986,8 +1053,15 @@ type MastraWorkspaceTool = {
 export async function createWorkspaceToolDefinitions(
   cwd: string,
   getConfig: () => AppConfig,
+  options?: { executionMode?: string; conversationId?: string },
 ): Promise<ToolDefinition[]> {
-  const { tools } = await createWorkspaceForAgent(normalizeAgentCwd(cwd), getConfig);
+  const { tools } = await createWorkspaceForAgent(
+    normalizeAgentCwd(cwd),
+    getConfig,
+    options?.executionMode,
+    undefined,
+    options?.conversationId,
+  );
   const isExecuteCommand = (name: string) => name === WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND;
 
   return Object.entries(tools as Record<string, MastraWorkspaceTool>)
@@ -999,15 +1073,22 @@ export async function createWorkspaceToolDefinitions(
       source: 'builtin' as const,
       execute: async (input, ctx) => {
         const config = getConfig();
-        let effectiveInput = input;
+        const invocationCwd = normalizeAgentCwd(ctx.cwd ?? cwd);
+        let effectiveInput = normalizeWorkspaceToolInput(name, input, invocationCwd);
         if (isExecuteCommand(name)) {
-          const raw = (input ?? {}) as { command?: unknown; timeout?: unknown };
+          const raw = (effectiveInput ?? {}) as { command?: unknown; timeout?: unknown; cwd?: unknown };
           const check = isCommandAllowed(typeof raw.command === 'string' ? raw.command : '', config);
           if (!check.allowed) throw new Error(`${name}: ${check.reason}`);
-          if (raw.timeout == null) {
+          effectiveInput = {
+            ...raw,
+            // Definitions are initialized at startup for automation use, but
+            // observer calls carry the active run cwd in their execution
+            // context. Always make that default explicit so the startup/home
+            // workspace cannot accidentally win.
+            ...(raw.cwd == null ? { cwd: invocationCwd } : {}),
             // Mastra execute_command takes `timeout` in seconds; Kai's shell config is in ms.
-            effectiveInput = { ...raw, timeout: Math.ceil(config.tools.shell.timeout / 1000) };
-          }
+            ...(raw.timeout == null ? { timeout: Math.ceil(config.tools.shell.timeout / 1000) } : {}),
+          };
         }
         return tool.execute!(effectiveInput, { toolCallId: ctx.toolCallId, abortSignal: ctx.abortSignal });
       },
@@ -2046,6 +2127,8 @@ function buildAgentInstructions(config: AppConfig, executionMode?: string): stri
     '- The runtime may emit mid-tool progress updates to the user.',
     '- A tool run may be cancelled if output indicates failure, risk, or mismatch with intent.',
     '- Do not claim that mid-tool progress updates are impossible in this environment.',
+    '- For shell commands, prefer the tool working directory and relative paths. Quote every path that contains whitespace.',
+    '- Treat stderr as diagnostic output even when the final exit code is zero, and avoid pipelines that mask an earlier command failure.',
   ];
 
   if (executionMode === 'plan-first') {
@@ -2110,5 +2193,6 @@ export const __internal = {
   normalizeOpenAIWebSearchFilters,
   normalizeProviderToolType,
   normalizeWorkspacePath,
+  surfaceWorkspaceCommandStderr,
   mergeAbortSignals,
 };

@@ -4,7 +4,12 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
 import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
-import { normalizeAgentCwd, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
+import {
+  createWorkspaceToolDefinitions,
+  normalizeAgentCwd,
+  getProviderDefinedToolNames,
+  WORKSPACE_MUTATING_TOOLS,
+} from '../agent/mastra-agent.js';
 import type { StreamEvent, ReasoningEffort } from '../agent/mastra-agent.js';
 import { generateTitle } from '../agent/title-generation.js';
 import type { AppConfig, ExecutionMode } from '../config/schema.js';
@@ -553,6 +558,19 @@ function toolsForExecutionMode(tools: ToolDefinition[], executionMode: Execution
   }
 
   return tools;
+}
+
+function observerToolsForExecutionMode(
+  customTools: ToolDefinition[],
+  workspaceTools: ToolDefinition[],
+  executionMode: ExecutionMode,
+): ToolDefinition[] {
+  const activeCustomTools = toolsForExecutionMode(customTools, executionMode);
+  const activeWorkspaceTools =
+    executionMode === 'plan-first'
+      ? workspaceTools.filter((tool) => !WORKSPACE_MUTATING_TOOLS.has(tool.name))
+      : workspaceTools;
+  return [...activeCustomTools, ...activeWorkspaceTools];
 }
 
 /**
@@ -1641,7 +1659,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       };
 
-      const activeTools = toolsForExecutionMode(registeredTools, effectiveExecutionMode);
+      const activeCustomTools = toolsForExecutionMode(registeredTools, effectiveExecutionMode);
+      let observerWorkspaceToolsPromise: Promise<ToolDefinition[]> | undefined;
+      const getObserverWorkspaceTools = (): Promise<ToolDefinition[]> => {
+        observerWorkspaceToolsPromise ??= createWorkspaceToolDefinitions(effectiveCwd, () => config, {
+          executionMode: effectiveExecutionMode,
+          conversationId,
+        });
+        return observerWorkspaceToolsPromise;
+      };
 
       const launchObserverToolCall = async (toolName: string, args: unknown): Promise<LaunchToolCallResult> => {
         if (!observer) {
@@ -1657,7 +1683,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           return { ok: false, details: 'Thread run is already cancelled.' };
         }
 
-        const tool = findToolByName(activeTools, toolName);
+        // Workspace tools deliberately live outside `registeredTools` because
+        // Mastra builds a guarded workspace per main-agent run. Build the
+        // observer adapter lazily from this run's cwd/config/conversation so it
+        // gets the same guards and diff tracking without slowing turns where
+        // the observer launches only a custom tool (or nothing at all).
+        let tool = findToolByName(activeCustomTools, toolName);
+        if (!tool && runtime.id === 'mastra') {
+          try {
+            const workspaceTools = await getObserverWorkspaceTools();
+            tool = findToolByName(observerToolsForExecutionMode([], workspaceTools, effectiveExecutionMode), toolName);
+          } catch (error) {
+            return {
+              ok: false,
+              details: `Workspace tool initialization failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            };
+          }
+        }
         if (!tool) {
           return { ok: false, details: `Tool "${toolName}" is not registered.` };
         }
@@ -2322,7 +2366,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           conversationId,
           messages,
           config: configWithExecutionMode,
-          tools: activeTools,
+          tools: activeCustomTools,
           appHome,
           cwd: effectiveCwd,
           reasoningEffort,
@@ -3109,4 +3153,4 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 }
 
 /** Exposed for unit tests only. */
-export const __internal = { extractLastUserText };
+export const __internal = { extractLastUserText, observerToolsForExecutionMode };

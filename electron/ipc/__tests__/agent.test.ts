@@ -11,8 +11,10 @@
  * shape but do not exercise any agent.ts code path.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { createIpcHarness } from '../../../test-utils/ipc-harness.js';
+import type { ToolDefinition } from '../../tools/types.js';
 
 // ---------------------------------------------------------------------------
 // Mocks for the heavy production graph that `electron/ipc/agent.ts` pulls in.
@@ -54,8 +56,15 @@ vi.mock('../../agent/model-catalog.js', () => ({
 }));
 
 vi.mock('../../agent/mastra-agent.js', () => ({
+  createWorkspaceToolDefinitions: vi.fn(async () => []),
   normalizeAgentCwd: vi.fn((cwd: string | undefined) => cwd ?? '/tmp'),
   streamAgentResponse: vi.fn(),
+  WORKSPACE_MUTATING_TOOLS: new Set([
+    'mastra_workspace_write_file',
+    'mastra_workspace_edit_file',
+    'mastra_workspace_delete',
+    'mastra_workspace_execute_command',
+  ]),
 }));
 
 vi.mock('../../agent/title-generation.js', () => ({
@@ -352,6 +361,39 @@ describe('extractLastUserText (mirror a GUI-driven turn to co-viewing clients)',
   it('returns empty string when there is no user turn', () => {
     expect(extractLastUserText([{ role: 'assistant', content: 'hi' }])).toBe('');
     expect(extractLastUserText([])).toBe('');
+  });
+});
+
+describe('observer workspace tool registry', () => {
+  const tool = (name: string): ToolDefinition => ({
+    name,
+    description: name,
+    inputSchema: z.any(),
+    execute: vi.fn(async () => ({ ok: true })),
+  });
+
+  it('includes workspace tools that are intentionally outside the main registry', () => {
+    const active = __internal.observerToolsForExecutionMode(
+      [tool('web_search')],
+      [tool('mastra_workspace_execute_command'), tool('mastra_workspace_list_files')],
+      'auto',
+    );
+
+    expect(active.map((entry) => entry.name)).toEqual([
+      'web_search',
+      'mastra_workspace_execute_command',
+      'mastra_workspace_list_files',
+    ]);
+  });
+
+  it('keeps read-only workspace tools but removes shell execution in plan mode', () => {
+    const active = __internal.observerToolsForExecutionMode(
+      [tool('web_search'), tool('github')],
+      [tool('mastra_workspace_execute_command'), tool('mastra_workspace_list_files')],
+      'plan-first',
+    );
+
+    expect(active.map((entry) => entry.name)).toEqual(['web_search', 'mastra_workspace_list_files']);
   });
 });
 

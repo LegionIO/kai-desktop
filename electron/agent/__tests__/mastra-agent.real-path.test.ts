@@ -48,6 +48,7 @@ const agentState: {
   streamImpl?: () => unknown;
   toolsAttached?: unknown;
   lastInstructions?: string;
+  workspaceCommandInput?: unknown;
   agentBuildCount: number;
 } = {
   agentBuildCount: 0,
@@ -102,6 +103,23 @@ vi.mock('@mastra/core/workspace', async () => {
     createWorkspaceTools: vi.fn(async () => ({
       'workspace.read_file': { description: 'read', execute: vi.fn() },
       'workspace.list_files': { description: 'list', execute: vi.fn() },
+      mastra_workspace_execute_command: {
+        description: 'execute command',
+        execute: vi.fn(async (input: unknown, context: unknown) => {
+          agentState.workspaceCommandInput = input;
+          const writer = (context as { writer?: { custom?: (event: unknown) => Promise<unknown> } } | undefined)
+            ?.writer;
+          await writer?.custom?.({
+            type: 'data-sandbox-stderr',
+            data: { output: 'find: /Volumes/Workspace: No such file or directory\n' },
+          });
+          await writer?.custom?.({
+            type: 'data-sandbox-exit',
+            data: { exitCode: 0, success: true },
+          });
+          return '(no output)';
+        }),
+      },
     })),
   };
 });
@@ -118,7 +136,8 @@ vi.mock('../language-model.js', () => ({
   shouldUseOpenAIResponsesApi: vi.fn(() => false),
 }));
 
-const { streamAgentResponse, streamWithFallback, normalizeAgentCwd, __internal } = await import('../mastra-agent.js');
+const { streamAgentResponse, streamWithFallback, normalizeAgentCwd, createWorkspaceToolDefinitions, __internal } =
+  await import('../mastra-agent.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,7 +151,10 @@ function makeConfig(): AppConfig {
     systemPrompts: { chat: 'You are Kai.' },
     models: { defaultModelKey: 'test', providers: {}, catalog: [] },
     memory: { enabled: true },
-    tools: { executionMode: 'normal' },
+    tools: {
+      executionMode: 'normal',
+      shell: { enabled: true, timeout: 30_000, allowPatterns: ['*'], denyPatterns: [] },
+    },
   } as unknown as AppConfig;
 }
 
@@ -182,6 +204,7 @@ beforeEach(() => {
   agentState.streamImpl = undefined;
   agentState.toolsAttached = undefined;
   agentState.lastInstructions = undefined;
+  agentState.workspaceCommandInput = undefined;
   agentState.agentBuildCount = 0;
 });
 
@@ -252,6 +275,47 @@ describe('mastra-agent — pure helpers', () => {
       expect(sub.startsWith('/work/base')).toBe(false); // resolved under home, not base
     });
   });
+
+  describe('workspace command output', () => {
+    it('surfaces stderr from a successful pipeline instead of reporting no output', () => {
+      expect(
+        __internal.surfaceWorkspaceCommandStderr('(no output)', {
+          stdout: '',
+          stderr: 'find: /Volumes/Workspace: No such file or directory\n',
+          success: true,
+        }),
+      ).toBe('stderr:\nfind: /Volumes/Workspace: No such file or directory');
+    });
+
+    it('keeps failed-command results unchanged because Mastra already includes stderr', () => {
+      expect(
+        __internal.surfaceWorkspaceCommandStderr('error\nExit code: 1', {
+          stdout: '',
+          stderr: 'error\n',
+          success: false,
+        }),
+      ).toBe('error\nExit code: 1');
+    });
+
+    it('uses the active execution cwd and captures Mastra writer stderr', async () => {
+      const definitions = await createWorkspaceToolDefinitions('/Users/test', makeConfig);
+      const executeCommand = definitions.find((tool) => tool.name === 'mastra_workspace_execute_command');
+      expect(executeCommand).toBeDefined();
+
+      const result = await executeCommand!.execute(
+        { command: 'find . -type d | head -n 1', timeout: 30 },
+        {
+          toolCallId: 'tc-observer-cwd',
+          cwd: '/Volumes/Workspace NVME/git/kai-plugin-plex',
+        },
+      );
+
+      expect(agentState.workspaceCommandInput).toMatchObject({
+        cwd: '/Volumes/Workspace NVME/git/kai-plugin-plex',
+      });
+      expect(result).toBe('stderr:\nfind: /Volumes/Workspace: No such file or directory');
+    });
+  });
 });
 
 describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
@@ -279,6 +343,7 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
       );
 
       expect(agentState.agentBuildCount).toBeGreaterThanOrEqual(1);
+      expect(agentState.lastInstructions).toContain('Quote every path that contains whitespace.');
       expect(events.some((e) => e.type === 'text-delta' && e.text === 'Hello.')).toBe(true);
       expect(events[events.length - 1].type).toBe('done');
     });
