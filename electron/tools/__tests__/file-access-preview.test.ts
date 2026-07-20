@@ -27,18 +27,21 @@ const cfg = (allow: string[], deny: string[] = []): AppConfig =>
   ({ tools: { fileAccess: { enabled: true, allowPaths: allow, denyPaths: deny } } }) as unknown as AppConfig;
 
 describe('previewPathEntry', () => {
-  it('counts all files recursively for a plain directory path (subfolders included)', () => {
+  it('finds matches under a directory path (approximate/shallow probe, not exact)', () => {
     const p = previewPathEntry(root, cfg([root]));
     expect(p.exists).toBe(true);
     expect(p.isDirectory).toBe(true);
-    expect(p.matchCount).toBe(3); // a.txt, b.txt, sub/c.txt
+    // Shallow probe: an indicator that it matches SOMETHING, not an exact total.
+    expect(p.matchCount).toBeGreaterThan(0);
+    // A directory implies deeper content beyond the shallow scan → marked capped.
+    expect(p.capped).toBe(true);
     expect(p.allowed).toBe(true);
     expect(p.normalized).toBe(root);
   });
 
-  it('counts only direct children for a /* glob (folder-only)', () => {
+  it('a /* glob still matches direct-child files', () => {
     const p = previewPathEntry(`${root}/*`, cfg([`${root}/*`]));
-    expect(p.matchCount).toBe(2); // a.txt, b.txt — NOT sub/c.txt
+    expect(p.matchCount).toBeGreaterThan(0); // a.txt / b.txt
   });
 
   it('reports a non-existent path as not-existing with 0 matches', () => {
@@ -54,10 +57,16 @@ describe('previewPathEntry', () => {
     expect(p.matchCount).toBe(0);
   });
 
-  it('handles the "*" wildcard entry', () => {
+  it('handles the "*" wildcard entry — allowed when it is the allow rule', () => {
     const p = previewPathEntry('*', cfg(['*']));
     expect(p.normalized).toBe('*');
     expect(p.allowed).toBe(true);
+  });
+
+  it('the "*" wildcard reflects a deny rule (not hardcoded allowed)', () => {
+    const p = previewPathEntry('*', cfg(['*'], ['*']));
+    expect(p.denied).toBe(true);
+    expect(p.allowed).toBe(false);
   });
 
   it('is safe on empty/whitespace input', () => {

@@ -339,14 +339,6 @@ const PathBadge: FC<{ entry: string; configVersion?: string }> = ({ entry, confi
   );
 };
 
-/** Escape glob metacharacters so a LITERAL picked path (whose filename may
- *  contain *, ?, [, ], {, }, !, (, )) isn't reinterpreted as a pattern by the
- *  matcher — which could authorize sibling files or stop a dir matching its
- *  descendants. picomatch treats backslash-escaped metachars as literals. */
-function escapeGlobPath(p: string): string {
-  return p.replace(/[*?[\]{}!()]/g, '\\$&');
-}
-
 const PatternList: FC<{
   id?: string;
   label: string;
@@ -374,20 +366,31 @@ const PatternList: FC<{
   };
 
   const removePattern = (index: number) => {
-    onChange(patterns.filter((_, i) => i !== index));
+    // Fold any pending typed-but-uncommitted draft into the SAME update so a
+    // remove-click that races the blur-commit can't drop the draft (both would
+    // otherwise write from the stale `patterns` array, and remove would win).
+    const draft = newPattern.trim();
+    const next = patterns.filter((_, i) => i !== index);
+    if (draft && !next.includes(draft)) {
+      next.push(draft);
+      setNewPattern('');
+    }
+    onChange(next);
   };
 
   const browse = async () => {
     if (!filePicker) return;
     const res = await app.dialog.openPath();
     if (res.canceled) return;
-    // Escape the literal picked path so a filename with glob chars isn't treated
-    // as a pattern; then append the INTENTIONAL /* for folder-only if chosen.
-    let path = escapeGlobPath(res.path);
+    // Store the picked path AS-IS. A plain literal path is matched literally by
+    // the non-glob branch of the matcher; escaping metacharacters would flip it
+    // to a literal-with-backslashes that never matches. (A filename literally
+    // containing a glob char is a rare inherent ambiguity we accept.)
+    let path = res.path;
     // A directory already matches recursively; ask whether to include subfolders.
     if (res.isDirectory) {
       const includeSub = window.confirm(
-        `Include all subfolders of\n${res.path}\n\nOK = include everything under this folder.\nCancel = only files directly in this folder.`,
+        `Include all subfolders of\n${path}\n\nOK = include everything under this folder.\nCancel = only files directly in this folder.`,
       );
       if (!includeSub) path = path.replace(/\/$/, '') + '/*';
     }
@@ -404,7 +407,16 @@ const PatternList: FC<{
               {p}
             </span>
             {filePicker && <PathBadge entry={p} configVersion={configVersion} />}
-            <button type="button" onClick={() => removePattern(i)} className="p-1 rounded hover:bg-destructive/10">
+            <button
+              type="button"
+              onMouseDown={() => {
+                // Suppress the input's blur-commit — removePattern folds any
+                // pending draft into its single update so nothing is lost.
+                skipBlurAddRef.current = true;
+              }}
+              onClick={() => removePattern(i)}
+              className="p-1 rounded hover:bg-destructive/10"
+            >
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           </div>
