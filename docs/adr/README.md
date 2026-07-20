@@ -12,6 +12,9 @@ way it does — not just _what_ it does.
 | ---- | ------------------------------------------------------------------------------------------------------ | -------- | ---------- |
 | 0001 | [Electron Fuses Policy](./0001-electron-fuses-policy.md)                                               | Accepted | 2026-05-19 |
 | 0002 | [Thread / Conversation / Chat Naming Convention](./0002-thread-conversation-chat-naming-convention.md) | Accepted | 2026-05-26 |
+| 0004 | [Appshots Persisted Capture Artifacts](./0004-appshots-persisted-capture-artifacts.md)                 | Accepted | 2026-07-11 |
+| 0005 | [Platform Capability Seam](./0005-platform-capability-seam.md)                                         | Accepted | 2026-07-11 |
+| 0006 | [Plugin Backend Process Isolation](./0006-plugin-backend-process-isolation.md)                         | Proposed | 2026-07-20 |
 
 ## Adding a new ADR
 
