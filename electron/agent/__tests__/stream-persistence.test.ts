@@ -9,18 +9,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const appendMock = vi.fn();
+const readMock = vi.fn((_appHome?: string, _conversationId?: string) => null as { headId?: string | null } | null);
 vi.mock('../../ipc/conversations.js', () => ({
   // Return a minimal record whose headId is the id of the appended assistant
   // message, so finalizeInterruptedTurn's "return the new head" contract can be
   // asserted. Real appendConversationMessages sets headId to the last node.
   appendConversationMessages: (...args: unknown[]) => {
-    appendMock(...args);
-    return { headId: 'persisted-head' };
+    const customResult = appendMock(...args);
+    return customResult ?? { headId: 'persisted-head' };
   },
   broadcastUpsert: vi.fn(),
 }));
 vi.mock('../../ipc/conversation-store.js', () => ({
-  readConversation: vi.fn(() => null),
+  readConversation: (appHome: string, conversationId: string) => readMock(appHome, conversationId),
   writeConversation: vi.fn(),
 }));
 
@@ -28,6 +29,7 @@ import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
+  persistCooperativeInjectedUserTurn,
 } from '../stream-persistence.js';
 import type { StreamEvent } from '../mastra-agent.js';
 
@@ -322,5 +324,71 @@ describe('finalizeInterruptedTurn (mid-turn follow-up injection)', () => {
     const head = finalizeInterruptedTurn(APP_HOME, 'i3-never-started');
     expect(head).toBeNull();
     expect(appendMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('persistCooperativeInjectedUserTurn (CLI/server-persisted cooperative inject)', () => {
+  beforeEach(() => {
+    appendMock.mockReset();
+    readMock.mockReset();
+    readMock.mockReturnValue({ headId: 'original-user' });
+  });
+
+  it('persists partial assistant first, then parents injected user on that partial', () => {
+    // A CLI-owned turn is accumulating under the original user prompt.
+    feedWithParent({ conversationId: 'ci1', type: 'text-delta', text: 'partial work' }, 'original-user');
+
+    appendMock
+      // finalizeInterruptedTurn writes the partial assistant and returns its id.
+      .mockReturnValueOnce({ headId: 'partial-assistant' })
+      // injected-user append succeeded (the helper supplies its own stable id).
+      .mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci1', 'my follow up');
+
+    expect(result?.messageId).toMatch(/^inject-msg-/);
+    expect(result?.parentId).toBe('partial-assistant');
+    expect(typeof result?.createdAt).toBe('string');
+    expect(appendMock).toHaveBeenCalledTimes(2);
+
+    const [, , partialMsgs, partialOpts] = appendMock.mock.calls[0];
+    expect(partialMsgs).toEqual([
+      { role: 'assistant', content: [{ type: 'text', source: 'assistant', text: 'partial work' }] },
+    ]);
+    expect(partialOpts).toEqual({ runStatus: 'idle', parentId: 'original-user' });
+
+    const [, , injectedMsgs, injectedOpts] = appendMock.mock.calls[1];
+    expect(injectedMsgs).toHaveLength(1);
+    expect(injectedMsgs[0]).toMatchObject({
+      id: result?.messageId,
+      role: 'user',
+      content: [{ type: 'text', text: 'my follow up' }],
+      createdAt: result?.createdAt,
+    });
+    expect(injectedOpts).toEqual({ runStatus: 'running', parentId: 'partial-assistant' });
+
+    // The running turn continues after prepareStep consumed the inject. A fresh
+    // accumulator is seeded with the injected USER as its parent, so final done
+    // appends the continuation assistant after the user — not as a sibling.
+    feedWithParent({ conversationId: 'ci1', type: 'text-delta', text: 'addressed follow up' }, result!.messageId);
+    feedWithParent({ conversationId: 'ci1', type: 'done' }, result!.messageId);
+    expect(appendMock).toHaveBeenCalledTimes(3);
+    const [, , continuationMsgs, continuationOpts] = appendMock.mock.calls[2];
+    expect(continuationMsgs).toEqual([
+      { role: 'assistant', content: [{ type: 'text', source: 'assistant', text: 'addressed follow up' }] },
+    ]);
+    expect(continuationOpts).toEqual({ runStatus: 'idle', parentId: result!.messageId });
+  });
+
+  it('uses the current store head when no partial assistant was accumulated', () => {
+    appendMock.mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci2', 'late follow up');
+
+    expect(result?.messageId).toMatch(/^inject-msg-/);
+    expect(result?.parentId).toBe('original-user');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    const [, , , options] = appendMock.mock.calls[0];
+    expect(options).toEqual({ runStatus: 'running' });
   });
 });

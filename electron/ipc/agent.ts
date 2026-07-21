@@ -27,6 +27,7 @@ import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
+  persistCooperativeInjectedUserTurn,
 } from '../agent/stream-persistence.js';
 import { enqueueInject, listInjects, removeInject } from '../agent/inject-queue.js';
 import {
@@ -2615,17 +2616,62 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { ok: false, cooperative: false, error: 'active run is not cooperatively injectable' };
       }
       const id = enqueueInject(conversationId, userText);
-      const write = appendConversationMessages(
-        appHome,
-        conversationId,
-        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        { runStatus: 'running' },
-      );
-      if (!write) {
-        if (id) removeInject(conversationId, id);
-        return { ok: false, error: 'conversation-not-found' };
+      const activeToken = activeStreams.get(conversationId)?.token;
+      const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+
+      // A CLI/server-persisted run has an assistant accumulator parented on the
+      // ORIGINAL user prompt. Split that accumulator at the injection boundary
+      // before appending the new user turn; otherwise the final assistant and the
+      // inject become siblings under the original prompt and the inject vanishes
+      // from the authoritative active branch at `done` (even though the model saw
+      // it through prepareStep).
+      let persistedMessageId: string;
+      let persistedParentId: string | null;
+      let persistedCreatedAt: string | undefined;
+      if (serverOwnsPersistence) {
+        const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, userText);
+        if (!persisted) {
+          if (id) removeInject(conversationId, id);
+          return { ok: false, error: 'conversation-not-found' };
+        }
+        persistedMessageId = persisted.messageId;
+        persistedParentId = persisted.parentId;
+        persistedCreatedAt = persisted.createdAt;
+      } else {
+        const write = appendConversationMessages(
+          appHome,
+          conversationId,
+          [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          { runStatus: 'running' },
+        );
+        if (!write) {
+          if (id) removeInject(conversationId, id);
+          return { ok: false, error: 'conversation-not-found' };
+        }
+        persistedMessageId = write.headId ?? '';
+        const persistedNode = (
+          (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+        ).find((message) => message.id === persistedMessageId);
+        persistedParentId = persistedNode?.parentId ?? null;
+        persistedCreatedAt = persistedNode?.createdAt;
       }
-      broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+
+      if (serverOwnsPersistence) {
+        // The continuation assistant must parent on the injected user turn, not
+        // the original submit head. The next streamed event re-seeds a fresh
+        // persistence accumulator with this parent.
+        serverPersistParents.set(conversationId, persistedMessageId);
+      }
+      broadcastStreamEvent({
+        conversationId,
+        type: 'user-message',
+        text: userText,
+        data: {
+          messageId: persistedMessageId,
+          parentId: persistedParentId,
+          createdAt: persistedCreatedAt,
+        },
+      });
       return { ok: true, cooperative: true, id: id ?? undefined };
     },
   );
@@ -2662,20 +2708,45 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // user turn so it renders immediately, and let the live turn continue. The
     // CLI runtimes can't be stepped, so they fall through to abort+restart below.
     if (getActiveStreamRuntime(conversationId) === 'mastra') {
-      enqueueInject(conversationId, userText);
-      const write = appendConversationMessages(
-        appHome,
-        conversationId,
-        [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        // Keep runStatus 'running' — the turn is still live; we're extending it.
-        { runStatus: 'running' },
-      );
-      if (!write) {
+      const injectId = enqueueInject(conversationId, userText);
+      const activeToken = activeStreams.get(conversationId)?.token;
+      const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+      let persistedMeta: { messageId: string; parentId: string | null; createdAt?: string } | null = null;
+      if (serverOwnsPersistence) {
+        persistedMeta = persistCooperativeInjectedUserTurn(appHome, conversationId, userText);
+      } else {
+        const write = appendConversationMessages(
+          appHome,
+          conversationId,
+          [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          // Keep runStatus 'running' — the turn is still live; we're extending it.
+          { runStatus: 'running' },
+        );
+        if (write?.headId) {
+          const messageId = write.headId;
+          const node = (
+            (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+          ).find((message) => message.id === messageId);
+          persistedMeta = {
+            messageId,
+            parentId: node?.parentId ?? null,
+            createdAt: node?.createdAt,
+          };
+        }
+      }
+      if (!persistedMeta) {
+        if (injectId) removeInject(conversationId, injectId);
         // Conversation vanished between the runtime check and the write — the run
         // is effectively gone; fall through to the abort+restart path which
         // re-reads + handles a missing conversation cleanly.
       } else {
-        broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+        if (serverOwnsPersistence) serverPersistParents.set(conversationId, persistedMeta.messageId);
+        broadcastStreamEvent({
+          conversationId,
+          type: 'user-message',
+          text: userText,
+          data: persistedMeta,
+        });
         return { ok: true, injectedCooperatively: true };
       }
     }

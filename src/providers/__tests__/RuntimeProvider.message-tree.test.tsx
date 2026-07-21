@@ -22,6 +22,7 @@ import {
   locateToolCallInBranch,
   preserveErroredAssistantVariant,
   getOrCreateAssistantInAcc,
+  resolveLiveInjectedParentId,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -29,6 +30,28 @@ type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
 function n(id: string, parentId: string | null, role: 'user' | 'assistant' = 'user'): Node {
   return { id, parentId, role };
 }
+
+describe('resolveLiveInjectedParentId', () => {
+  it('uses the authoritative persisted parent when that node is already live', () => {
+    const messages = [n('user-1', null), n('assistant-persisted', 'user-1', 'assistant')];
+    expect(resolveLiveInjectedParentId(messages as never[], 'assistant-live', 'assistant-persisted')).toBe(
+      'assistant-persisted',
+    );
+  });
+
+  it('falls back to the live head when the persisted parent is not in the accumulator', () => {
+    const messages = [n('user-1', null), n('assistant-live', 'user-1', 'assistant')];
+    expect(resolveLiveInjectedParentId(messages as never[], 'assistant-live', 'assistant-persisted')).toBe(
+      'assistant-live',
+    );
+    // This keeps the full branch connected rather than producing only the new
+    // injected user node under a dangling persisted-parent id.
+  });
+
+  it('preserves an explicit null persisted parent', () => {
+    expect(resolveLiveInjectedParentId([], 'assistant-live', null)).toBeNull();
+  });
+});
 
 // getActiveBranch/ensureTree operate structurally on {id,parentId,role}; cast
 // the minimal shape to the StoredMessage[] the functions expect.

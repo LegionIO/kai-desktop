@@ -322,6 +322,24 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 }
 
 /**
+ * Choose the parent used for a server-persisted injected user message in the
+ * LIVE renderer accumulator. Main may just have persisted the partial assistant
+ * under an authoritative id that this accumulator does not contain yet. Using
+ * that missing id would make the injected node's parent edge dangling, so
+ * getActiveBranch would return only the new node and the prior chat would appear
+ * to vanish until the authoritative reload. Prefer the persisted parent only
+ * when it exists locally; otherwise retain the current live head for display.
+ */
+export function resolveLiveInjectedParentId(
+  messages: StoredMessage[],
+  currentHeadId: string | null,
+  persistedParentId: string | null,
+): string | null {
+  if (persistedParentId === null) return null;
+  return messages.some((message) => message.id === persistedParentId) ? persistedParentId : currentHeadId;
+}
+
+/**
  * True when the last turn in `branch` is already a user message equivalent to
  * `text`. Used to dedup a broadcast `user-message` (from the `kai` CLI, a second
  * GUI window, OR this window's OWN turn echoed back by the backend) against the
@@ -2220,12 +2238,34 @@ export function RuntimeProvider({
             // new reply can't concatenate onto the superseded one. The main
             // process also suppresses the superseded run's stale deltas at the
             // source (see broadcastStreamEvent), which is the primary guard.
+            const persisted = e.data as { messageId?: unknown; parentId?: unknown; createdAt?: unknown } | undefined;
+            const messageId = typeof persisted?.messageId === 'string' ? persisted.messageId : msgId();
+            const candidateParentId =
+              persisted?.parentId === null || typeof persisted?.parentId === 'string' ? persisted.parentId : acc.headId;
+            // The main process may just have persisted the partial assistant under
+            // its authoritative response id while this live accumulator still has
+            // a locally-shaped equivalent. Parenting the injected user on an id
+            // absent from acc.messages makes getActiveBranch stop at that dangling
+            // edge — all prior messages appear to vanish until the done reload.
+            // Use the authoritative parent when it is already present; otherwise
+            // retain the current live head for display. The user message itself
+            // still uses the authoritative persisted id, and the done reload fixes
+            // its exact parent from disk.
+            const persistedParentId = resolveLiveInjectedParentId(acc.messages, acc.headId, candidateParentId);
+            const persistedCreatedAt =
+              typeof persisted?.createdAt === 'string' && Number.isFinite(Date.parse(persisted.createdAt))
+                ? new Date(persisted.createdAt)
+                : new Date();
             const userMsg: StoredMessage = {
-              id: msgId(),
-              parentId: acc.headId,
+              // Prefer the authoritative persisted id/parent broadcast by main.
+              // Fabricating a renderer-only id made this live node disappear when
+              // the server-persisted tree reloaded at done, even though the model
+              // had consumed the injected text.
+              id: messageId,
+              parentId: persistedParentId,
               role: 'user',
               content: toStoredContent([{ type: 'text', text: msgText }]),
-              createdAt: new Date(),
+              createdAt: persistedCreatedAt,
             };
             acc.messages.push(userMsg);
             acc.headId = userMsg.id;

@@ -248,6 +248,56 @@ export function finalizeInterruptedTurn(appHome: string, conversationId: string)
   return persistAccumulatedReturningHead(appHome, conversationId);
 }
 
+export type PersistedInjectedUserTurn = {
+  /** Stable id of the user node appended to the authoritative conversation tree. */
+  messageId: string;
+  /** The node the injected user turn was parented on (usually the partial assistant). */
+  parentId: string | null;
+  createdAt?: string;
+};
+
+/**
+ * Persist the branch boundary for a cooperative mid-turn inject on a
+ * server-persisted (CLI/headless-owned) run:
+ *
+ *   original user → partial assistant → injected user → continuation assistant
+ *
+ * Without this split, the running persistence accumulator remains parented on
+ * the ORIGINAL user. The injected user is appended as one child of that node,
+ * then `done` appends the accumulated assistant as another child and makes it
+ * the head — turning the injected message into an inactive sibling. The model
+ * still saw the inject via prepareStep, but the GUI loses it when it reloads the
+ * authoritative branch. Finalize the partial first, append the injected user on
+ * top of it, and return that user's id so the caller can rebind subsequent
+ * assistant persistence to the new head.
+ */
+export function persistCooperativeInjectedUserTurn(
+  appHome: string,
+  conversationId: string,
+  userText: string,
+): PersistedInjectedUserTurn | null {
+  if (!conversationId || !userText) return null;
+  const partialAssistantHead = finalizeInterruptedTurn(appHome, conversationId);
+  const current = readConversation(appHome, conversationId);
+  if (!current) return null;
+  const parentId = partialAssistantHead ?? current.headId ?? null;
+  const messageId = `inject-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const createdAt = new Date().toISOString();
+  const updated = appendConversationMessages(
+    appHome,
+    conversationId,
+    [{ id: messageId, role: 'user', content: [{ type: 'text', text: userText }], createdAt }],
+    {
+      runStatus: 'running',
+      // Pin to the partial assistant we just persisted. If there was no partial,
+      // omit parentId so appendConversationMessages uses the store's current head.
+      ...(partialAssistantHead !== null ? { parentId: partialAssistantHead } : {}),
+    },
+  );
+  if (!updated?.headId) return null;
+  return { messageId, parentId, createdAt };
+}
+
 /**
  * Shared persist body for both the normal `done` finalize and the mid-turn
  * interrupt finalize. Deletes the accumulator, then persists its parts as an
