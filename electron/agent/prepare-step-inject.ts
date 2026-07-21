@@ -16,7 +16,7 @@
  * is appended as a plain `{ role:'user', content:text }`, which Mastra maps.
  */
 
-import { drainInjects } from './inject-queue.js';
+import { drainInjects, type QueuedInject } from './inject-queue.js';
 
 type ModelMessageLike = { role: string; content: unknown };
 
@@ -29,6 +29,17 @@ type PrepareStepArgs = {
 type PrepareStepResult = {
   messages?: ModelMessageLike[];
 };
+
+/** Main-process persistence hook for cooperative injects. Set by ipc/agent.ts.
+ * Invoked at the ACTUAL prepareStep consumption boundary — after the prior
+ * tool-step results have arrived — so rotating the persistence accumulator here
+ * cannot strand an unresolved tool call. */
+type InjectConsumedHandler = (conversationId: string, entries: QueuedInject[]) => void;
+let injectConsumedHandler: InjectConsumedHandler | null = null;
+
+export function setInjectConsumedHandler(handler: InjectConsumedHandler | null): void {
+  injectConsumedHandler = handler;
+}
 
 /**
  * Build the prepareStep function for a conversation's Mastra turn. Returns
@@ -47,6 +58,13 @@ export function buildMastraPrepareStep(
     const queued = drainInjects(conversationId);
     if (queued.length === 0) return {};
     const appended: ModelMessageLike[] = [...messages, ...queued.map((q) => ({ role: 'user', content: q.text }))];
+    if (injectConsumedHandler) {
+      try {
+        injectConsumedHandler(conversationId, queued);
+      } catch {
+        // Persistence/display bookkeeping only — never break model stepping.
+      }
+    }
     if (onInjected) {
       try {
         onInjected(queued.map((q) => q.text));

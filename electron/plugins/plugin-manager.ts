@@ -53,7 +53,7 @@ import { buildPluginRendererBundle } from './renderer-build.js';
 import { MarketplaceService, UnverifiedPluginError } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry, InstallResult } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
-import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
+import { arePermissionSetsEqual, hashPluginDirectory, hashPluginFile, readPluginManifest } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
 import { PluginProcessHost } from './process/plugin-process-host.js';
 import { selectPluginHostRuntime } from './process/runtime-selection.js';
@@ -697,11 +697,17 @@ export class PluginManager {
 
       const runtimeSelection = selectPluginHostRuntime(manifest, dir, backendPath);
       console.info(`[PluginManager] ${manifest.name}: ${runtimeSelection.runtime} (${runtimeSelection.reason})`);
+      // `instance.fileHash` is the hash of the WHOLE plugin directory (approval /
+      // trust). The isolated runtime performs a byte-level TOCTOU check against
+      // backend.js specifically, so pass its own SHA-256 — comparing backend
+      // bytes to the directory hash makes every normal multi-file plugin fail
+      // with "backend changed after integrity verification" (exposed by SEA).
+      const backendHash = hashPluginFile(backendPath);
       const processHost = new PluginProcessHost({
         manifest,
         pluginDir: dir,
         backendPath,
-        fileHash: instance.fileHash,
+        backendHash,
         api,
         utilityEntryPath: join(import.meta.dirname, 'plugin-host.js'),
         syncWorkerPath: join(import.meta.dirname, 'plugin-sync-worker.js'),

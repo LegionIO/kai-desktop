@@ -233,7 +233,9 @@ type PluginProcessHostOptions = {
   manifest: PluginManifest;
   pluginDir: string;
   backendPath: string;
-  fileHash: string;
+  /** SHA-256 of backend.js bytes for runtime TOCTOU verification (NOT the
+   *  whole-plugin directory hash used for approval/trust). */
+  backendHash: string;
   api: PluginAPI;
   utilityEntryPath: string;
   syncWorkerPath: string;
@@ -1406,7 +1408,7 @@ export class PluginProcessHost {
       manifest: this.options.manifest,
       pluginDir: this.options.pluginDir,
       backendPath: this.options.backendPath,
-      fileHash: this.options.fileHash,
+      fileHash: this.options.backendHash,
       apiVersion: this.options.api.host.apiVersion(),
       capabilities: this.options.api.host.capabilities(),
       initialConfig,

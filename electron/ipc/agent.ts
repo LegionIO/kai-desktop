@@ -30,6 +30,7 @@ import {
   persistCooperativeInjectedUserTurn,
 } from '../agent/stream-persistence.js';
 import { enqueueInject, listInjects, removeInject } from '../agent/inject-queue.js';
+import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
   shouldCompact,
   compactConversationPrefix,
@@ -765,6 +766,26 @@ export function updateCliTools(cliTools: ToolDefinition[]): void {
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
   hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
   serverPersistAppHome = appHome;
+  // Persist cooperative injects for server-owned (CLI/headless) turns at the
+  // ACTUAL prepareStep consumption boundary — after the prior tool step's results
+  // have arrived. Splitting at enqueue time can clear the persistence tool index
+  // between tool-call and tool-result, permanently losing the later result.
+  setInjectConsumedHandler((conversationId, entries) => {
+    const activeToken = activeStreams.get(conversationId)?.token;
+    if (!isServerPersistOwner(conversationId, activeToken)) return;
+    let lastMessageId: string | null = null;
+    for (const entry of entries) {
+      const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+      if (persisted) lastMessageId = persisted.messageId;
+    }
+    if (lastMessageId) {
+      // Continuation output from this same turn now persists after the last
+      // injected user node, producing:
+      // original user → partial assistant → injected user → continuation.
+      serverPersistParents.set(conversationId, lastMessageId);
+    }
+  });
+
   // The dedicated approval window (flag-gated) posts answers through the
   // existing agent:approve/reject/answer handlers, then asks to close itself.
   registerApprovalWindowIpc();
@@ -2616,52 +2637,36 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { ok: false, cooperative: false, error: 'active run is not cooperatively injectable' };
       }
       const id = enqueueInject(conversationId, userText);
+      if (!id) return { ok: false, error: 'failed-to-enqueue' };
       const activeToken = activeStreams.get(conversationId)?.token;
       const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
 
-      // A CLI/server-persisted run has an assistant accumulator parented on the
-      // ORIGINAL user prompt. Split that accumulator at the injection boundary
-      // before appending the new user turn; otherwise the final assistant and the
-      // inject become siblings under the original prompt and the inject vanishes
-      // from the authoritative active branch at `done` (even though the model saw
-      // it through prepareStep).
-      let persistedMessageId: string;
-      let persistedParentId: string | null;
-      let persistedCreatedAt: string | undefined;
-      if (serverOwnsPersistence) {
-        const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, userText);
-        if (!persisted) {
-          if (id) removeInject(conversationId, id);
-          return { ok: false, error: 'conversation-not-found' };
-        }
-        persistedMessageId = persisted.messageId;
-        persistedParentId = persisted.parentId;
-        persistedCreatedAt = persisted.createdAt;
-      } else {
+      // For a server-owned turn, display immediately with the stable queue id but
+      // DO NOT persist/split yet. prepareStep consumes this entry only after the
+      // prior step's tool results have arrived; the consumption hook above then
+      // persists the partial assistant + user boundary without losing tool state.
+      let persistedMessageId = id;
+      let persistedParentId = conv.headId ?? null;
+      let persistedCreatedAt: string | undefined = new Date().toISOString();
+      if (!serverOwnsPersistence) {
         const write = appendConversationMessages(
           appHome,
           conversationId,
-          [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          [{ id, role: 'user', content: [{ type: 'text', text: userText }], createdAt: persistedCreatedAt }],
           { runStatus: 'running' },
         );
         if (!write) {
-          if (id) removeInject(conversationId, id);
+          removeInject(conversationId, id);
           return { ok: false, error: 'conversation-not-found' };
         }
-        persistedMessageId = write.headId ?? '';
+        persistedMessageId = write.headId ?? id;
         const persistedNode = (
           (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
         ).find((message) => message.id === persistedMessageId);
         persistedParentId = persistedNode?.parentId ?? null;
-        persistedCreatedAt = persistedNode?.createdAt;
+        persistedCreatedAt = persistedNode?.createdAt ?? persistedCreatedAt;
       }
 
-      if (serverOwnsPersistence) {
-        // The continuation assistant must parent on the injected user turn, not
-        // the original submit head. The next streamed event re-seeds a fresh
-        // persistence accumulator with this parent.
-        serverPersistParents.set(conversationId, persistedMessageId);
-      }
       broadcastStreamEvent({
         conversationId,
         type: 'user-message',
@@ -2709,16 +2714,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // CLI runtimes can't be stepped, so they fall through to abort+restart below.
     if (getActiveStreamRuntime(conversationId) === 'mastra') {
       const injectId = enqueueInject(conversationId, userText);
+      if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
       const activeToken = activeStreams.get(conversationId)?.token;
       const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
-      let persistedMeta: { messageId: string; parentId: string | null; createdAt?: string } | null = null;
-      if (serverOwnsPersistence) {
-        persistedMeta = persistCooperativeInjectedUserTurn(appHome, conversationId, userText);
-      } else {
+      let persistedMeta: { messageId: string; parentId: string | null; createdAt?: string } | null = {
+        messageId: injectId,
+        parentId: existingConv.headId ?? null,
+        createdAt: new Date().toISOString(),
+      };
+      if (!serverOwnsPersistence) {
         const write = appendConversationMessages(
           appHome,
           conversationId,
-          [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          [
+            {
+              id: injectId,
+              role: 'user',
+              content: [{ type: 'text', text: userText }],
+              createdAt: persistedMeta.createdAt,
+            },
+          ],
           // Keep runStatus 'running' — the turn is still live; we're extending it.
           { runStatus: 'running' },
         );
@@ -2730,17 +2745,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           persistedMeta = {
             messageId,
             parentId: node?.parentId ?? null,
-            createdAt: node?.createdAt,
+            createdAt: node?.createdAt ?? persistedMeta.createdAt,
           };
+        } else {
+          persistedMeta = null;
         }
       }
       if (!persistedMeta) {
-        if (injectId) removeInject(conversationId, injectId);
+        removeInject(conversationId, injectId);
         // Conversation vanished between the runtime check and the write — the run
         // is effectively gone; fall through to the abort+restart path which
         // re-reads + handles a missing conversation cleanly.
       } else {
-        if (serverOwnsPersistence) serverPersistParents.set(conversationId, persistedMeta.messageId);
         broadcastStreamEvent({
           conversationId,
           type: 'user-message',

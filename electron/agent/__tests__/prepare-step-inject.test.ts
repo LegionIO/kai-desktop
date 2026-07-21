@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildMastraPrepareStep } from '../prepare-step-inject.js';
+import { buildMastraPrepareStep, setInjectConsumedHandler } from '../prepare-step-inject.js';
 import { enqueueInject, clearInjects, hasInjects } from '../inject-queue.js';
 
 describe('buildMastraPrepareStep (cooperative mid-turn splice)', () => {
-  beforeEach(() => clearInjects('c1'));
+  beforeEach(() => {
+    clearInjects('c1');
+    setInjectConsumedHandler(null);
+  });
 
   it('returns {} (no override) when nothing is queued', () => {
     const prepareStep = buildMastraPrepareStep('c1');
@@ -48,5 +51,17 @@ describe('buildMastraPrepareStep (cooperative mid-turn splice)', () => {
     });
     expect(() => prepareStep({ messages: [] })).not.toThrow();
     expect(seen).toEqual([['a', 'b']]);
+  });
+
+  it('notifies the global consumed handler with stable queue ids at the step boundary', () => {
+    const id = enqueueInject('c1', 'follow-up');
+    const seen: Array<{ conversationId: string; id: string; text: string }> = [];
+    setInjectConsumedHandler((conversationId, entries) => {
+      seen.push(...entries.map((entry) => ({ conversationId, id: entry.id, text: entry.text })));
+    });
+
+    buildMastraPrepareStep('c1')({ messages: [] });
+
+    expect(seen).toEqual([{ conversationId: 'c1', id, text: 'follow-up' }]);
   });
 });

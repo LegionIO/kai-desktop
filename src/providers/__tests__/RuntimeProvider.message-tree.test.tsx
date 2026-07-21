@@ -48,8 +48,19 @@ describe('resolveLiveInjectedParentId', () => {
     // injected user node under a dangling persisted-parent id.
   });
 
-  it('preserves an explicit null persisted parent', () => {
-    expect(resolveLiveInjectedParentId([], 'assistant-live', null)).toBeNull();
+  it('always keeps the live head for renderer-owned streams, even when the stale persisted parent exists', () => {
+    const messages = [
+      n('user-1', null),
+      n('assistant-old-disk-head', 'user-1', 'assistant'),
+      n('assistant-live', 'assistant-old-disk-head', 'assistant'),
+    ];
+    expect(resolveLiveInjectedParentId(messages as never[], 'assistant-live', 'assistant-old-disk-head', false)).toBe(
+      'assistant-live',
+    );
+  });
+
+  it('preserves an explicit null persisted parent for main-owned streams', () => {
+    expect(resolveLiveInjectedParentId([], 'assistant-live', null, true)).toBeNull();
   });
 });
 

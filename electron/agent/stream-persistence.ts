@@ -275,13 +275,14 @@ export function persistCooperativeInjectedUserTurn(
   appHome: string,
   conversationId: string,
   userText: string,
+  requestedMessageId?: string,
 ): PersistedInjectedUserTurn | null {
   if (!conversationId || !userText) return null;
   const partialAssistantHead = finalizeInterruptedTurn(appHome, conversationId);
   const current = readConversation(appHome, conversationId);
   if (!current) return null;
   const parentId = partialAssistantHead ?? current.headId ?? null;
-  const messageId = `inject-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const messageId = requestedMessageId || `inject-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const createdAt = new Date().toISOString();
   const updated = appendConversationMessages(
     appHome,

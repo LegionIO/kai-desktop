@@ -15,7 +15,9 @@ function shouldHashPluginFile(relativePath: string): boolean {
 }
 
 function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
-  const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) => a.name.localeCompare(b.name));
+  const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) =>
+    a.name.localeCompare(b.name),
+  );
   const files: string[] = [];
 
   for (const entry of entries) {
@@ -38,6 +40,10 @@ function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
   return files;
 }
 
+export function hashPluginFile(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
 export function hashPluginDirectory(dir: string): string {
   const hash = createHash('sha256');
   const files = collectPluginFiles(dir);
@@ -55,7 +61,7 @@ export function hashPluginDirectory(dir: string): string {
 
 export function readPluginManifest(pluginDir: string, fallbackName?: string): PluginManifest {
   const raw = JSON.parse(readFileSync(join(pluginDir, 'plugin.json'), 'utf-8')) as Record<string, unknown>;
-  const name = typeof raw.name === 'string' ? raw.name : fallbackName ?? '';
+  const name = typeof raw.name === 'string' ? raw.name : (fallbackName ?? '');
 
   return {
     name,
@@ -63,15 +69,17 @@ export function readPluginManifest(pluginDir: string, fallbackName?: string): Pl
     version: typeof raw.version === 'string' ? raw.version : '0.0.0',
     description: typeof raw.description === 'string' ? raw.description : '',
     author: typeof raw.author === 'string' ? raw.author : undefined,
-    icon: raw.icon && typeof raw.icon === 'object' && !Array.isArray(raw.icon)
-      ? raw.icon as { lucide: string } | { svg: string }
-      : undefined,
+    icon:
+      raw.icon && typeof raw.icon === 'object' && !Array.isArray(raw.icon)
+        ? (raw.icon as { lucide: string } | { svg: string })
+        : undefined,
     permissions: Array.isArray(raw.permissions)
       ? raw.permissions.filter((value): value is PluginPermission => typeof value === 'string')
       : [],
-    configSchema: raw.configSchema && typeof raw.configSchema === 'object'
-      ? raw.configSchema as Record<string, unknown>
-      : undefined,
+    configSchema:
+      raw.configSchema && typeof raw.configSchema === 'object'
+        ? (raw.configSchema as Record<string, unknown>)
+        : undefined,
     execScope: parseExecScope(raw.execScope),
     engines: parseEngines(raw.engines),
     capabilities: Array.isArray(raw.capabilities)
@@ -113,7 +121,16 @@ function parseEngines(raw: unknown): { kai?: string } | undefined {
 }
 
 const VALID_ALLOWED_BINARIES = new Set<string>([
-  'claude', 'codex', 'node', 'npm', 'pip', 'pip3', 'python', 'python3', 'git', 'bash',
+  'claude',
+  'codex',
+  'node',
+  'npm',
+  'pip',
+  'pip3',
+  'python',
+  'python3',
+  'git',
+  'bash',
 ]);
 
 function parseExecScope(raw: unknown): ExecScopeDeclaration | undefined {

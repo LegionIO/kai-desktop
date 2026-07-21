@@ -28,7 +28,7 @@ describe('PluginProcessHost callback streams', () => {
       manifest,
       pluginDir: '/tmp/plugin',
       backendPath: '/tmp/plugin/backend.js',
-      fileHash: '0'.repeat(64),
+      backendHash: '0'.repeat(64),
       api: {} as PluginAPI,
       utilityEntryPath: '/tmp/plugin-host.js',
       syncWorkerPath: '/tmp/plugin-sync-worker.js',

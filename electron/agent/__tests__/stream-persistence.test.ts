@@ -344,9 +344,9 @@ describe('persistCooperativeInjectedUserTurn (CLI/server-persisted cooperative i
       // injected-user append succeeded (the helper supplies its own stable id).
       .mockReturnValueOnce({ headId: 'stored-injected-head' });
 
-    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci1', 'my follow up');
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci1', 'my follow up', 'inj-stable');
 
-    expect(result?.messageId).toMatch(/^inject-msg-/);
+    expect(result?.messageId).toBe('inj-stable');
     expect(result?.parentId).toBe('partial-assistant');
     expect(typeof result?.createdAt).toBe('string');
     expect(appendMock).toHaveBeenCalledTimes(2);

@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   hashPluginDirectory,
+  hashPluginFile,
   getPluginIntegrity,
   arePermissionSetsEqual,
   readPluginManifest,
@@ -32,6 +33,18 @@ beforeEach(() => {
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('hashPluginFile', () => {
+  it('hashes exactly the backend bytes, independently of directory metadata', () => {
+    write('backend.js', 'export function activate() {}');
+    write('plugin.json', '{"name":"p"}');
+    const backendHash = hashPluginFile(join(dir, 'backend.js'));
+    expect(backendHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(backendHash).not.toBe(hashPluginDirectory(dir));
+    write('plugin.json', '{"name":"p","version":"2"}');
+    expect(hashPluginFile(join(dir, 'backend.js'))).toBe(backendHash);
+  });
 });
 
 describe('hashPluginDirectory', () => {

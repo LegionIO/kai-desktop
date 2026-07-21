@@ -334,7 +334,12 @@ export function resolveLiveInjectedParentId(
   messages: StoredMessage[],
   currentHeadId: string | null,
   persistedParentId: string | null,
+  mainOwnsPersistence = true,
 ): string | null {
+  // Renderer-owned streams persist with a debounce, so disk may lag the live
+  // assistant even when the persisted parent exists locally. The live head is
+  // authoritative for display in that mode.
+  if (!mainOwnsPersistence) return currentHeadId;
   if (persistedParentId === null) return null;
   return messages.some((message) => message.id === persistedParentId) ? persistedParentId : currentHeadId;
 }
@@ -2251,7 +2256,19 @@ export function RuntimeProvider({
             // retain the current live head for display. The user message itself
             // still uses the authoritative persisted id, and the done reload fixes
             // its exact parent from disk.
-            const persistedParentId = resolveLiveInjectedParentId(acc.messages, acc.headId, candidateParentId);
+            const mainOwnsPersistence = e.automation || e.serverPersisted || automationStreams.has(convId);
+            // Renderer-owned streams persist with a 300ms debounce, so main may
+            // have appended this injected user to an older disk head that still
+            // exists locally. Always retain the CURRENT live head there; trusting
+            // the stale persisted parent would orphan the live partial assistant.
+            // Main-owned streams can use the authoritative parent, with the
+            // dangling-edge fallback handled by the helper.
+            const persistedParentId = resolveLiveInjectedParentId(
+              acc.messages,
+              acc.headId,
+              candidateParentId,
+              mainOwnsPersistence,
+            );
             const persistedCreatedAt =
               typeof persisted?.createdAt === 'string' && Number.isFinite(Date.parse(persisted.createdAt))
                 ? new Date(persisted.createdAt)
