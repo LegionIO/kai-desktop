@@ -29,7 +29,7 @@ import {
   finalizeInterruptedTurn,
   persistCooperativeInjectedUserTurn,
 } from '../agent/stream-persistence.js';
-import { enqueueInject, listInjects, removeInject } from '../agent/inject-queue.js';
+import { drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
   shouldCompact,
@@ -855,7 +855,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // If agent:submit flagged this turn for server-side persistence, bind that
     // ownership to THIS run's token (so a later superseding run doesn't inherit
     // or clobber it). Consume the one-shot pending marker.
+    let serverPersistedRun = false;
     if (pendingServerPersist.delete(conversationId)) {
+      serverPersistedRun = true;
       serverPersistTokens.set(conversationId, streamToken);
       // Bind the submit-time parent head to this run (consume the one-shot).
       serverPersistParents.set(conversationId, pendingServerPersistParent.get(conversationId) ?? null);
@@ -2588,9 +2590,50 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         observer?.dispose();
         // Token-guarded so a replacement run that already took over this
         // conversation keeps its own stream + model-key state.
-        if (activeStreams.get(conversationId)?.token === streamToken) {
+        const stillOwnsRun = activeStreams.get(conversationId)?.token === streamToken;
+        if (stillOwnsRun) {
           activeStreams.delete(conversationId);
           activeStreamModelKeys.delete(conversationId);
+        }
+
+        // Drain-at-end safety net for a cooperative inject that arrived AFTER the
+        // final prepareStep boundary. It was accepted + optimistically broadcast,
+        // but the consumption hook never ran, so persist it now rather than leave
+        // it queued to leak into an unrelated future turn. On normal completion,
+        // immediately continue once on the resulting branch so the user still gets
+        // an answer. On explicit abort/stop, preserve the user message but respect
+        // the stop (no automatic restart). A superseding run owns its own queue,
+        // so only the still-current token may drain.
+        if (stillOwnsRun && serverPersistedRun && hasInjects(conversationId)) {
+          const stranded = drainInjects(conversationId);
+          let lastInjectedHead: string | null = null;
+          for (const entry of stranded) {
+            const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+            if (persisted) lastInjectedHead = persisted.messageId;
+          }
+          if (lastInjectedHead && !controller.signal.aborted) {
+            const updated = readConversation(appHome, conversationId);
+            if (updated) {
+              const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
+              const continuationBranch = getConversationBranch(continuationTree, continuationHead);
+              pendingServerPersist.add(conversationId);
+              pendingServerPersistParent.set(conversationId, lastInjectedHead);
+              queueMicrotask(() => {
+                void streamHandler(
+                  null,
+                  conversationId,
+                  continuationBranch,
+                  modelKey,
+                  reasoningEffort,
+                  profileKey,
+                  fallbackEnabled,
+                  effectiveCwd ?? undefined,
+                  effectiveExecutionMode,
+                  threadOverrides,
+                );
+              });
+            }
+          }
         }
         if (activeObserverSessions.get(conversationId) === observerSessionId) {
           activeObserverSessions.delete(conversationId);
@@ -2646,7 +2689,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // prior step's tool results have arrived; the consumption hook above then
       // persists the partial assistant + user boundary without losing tool state.
       let persistedMessageId = id;
-      let persistedParentId = conv.headId ?? null;
+      let persistedParentId: string | null | undefined = serverOwnsPersistence ? undefined : (conv.headId ?? null);
       let persistedCreatedAt: string | undefined = new Date().toISOString();
       if (!serverOwnsPersistence) {
         const write = appendConversationMessages(
@@ -2717,9 +2760,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
       const activeToken = activeStreams.get(conversationId)?.token;
       const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
-      let persistedMeta: { messageId: string; parentId: string | null; createdAt?: string } | null = {
+      let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
         messageId: injectId,
-        parentId: existingConv.headId ?? null,
+        // For deferred server-owned persistence, omit the stale disk parent so a
+        // co-viewing renderer keeps its current live assistant head.
+        ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
         createdAt: new Date().toISOString(),
       };
       if (!serverOwnsPersistence) {

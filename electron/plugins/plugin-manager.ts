@@ -703,6 +703,15 @@ export class PluginManager {
       // bytes to the directory hash makes every normal multi-file plugin fail
       // with "backend changed after integrity verification" (exposed by SEA).
       const backendHash = hashPluginFile(backendPath);
+      // Bind that byte hash to the directory snapshot that was actually approved.
+      // If any plugin file changed between the initial approval hash and this
+      // backend read, abort instead of blessing the changed bytes with a fresh
+      // backend hash. The child independently checks backend.js again against
+      // backendHash, closing the remaining manager→runtime TOCTOU window.
+      const verifiedDirectoryHash = hashPluginDirectory(dir);
+      if (verifiedDirectoryHash !== instance.fileHash) {
+        throw new Error(`Plugin "${manifest.name}" changed after integrity verification`);
+      }
       const processHost = new PluginProcessHost({
         manifest,
         pluginDir: dir,
