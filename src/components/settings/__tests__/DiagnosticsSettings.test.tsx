@@ -33,6 +33,9 @@ const summary = {
       cumulativeCpuSeconds: 4.2,
       privateMemoryBytes: 64 * 1024 * 1024,
       residentSetBytes: 70 * 1024 * 1024,
+      memorySource: 'private' as const,
+      syncWorkerRunning: false,
+      zodCodecLoaded: false,
     },
   ],
 };
@@ -92,6 +95,7 @@ describe('DiagnosticsSettings plugin process controls', () => {
     expect(await screen.findByText('12.5%')).toBeTruthy();
     expect(screen.getByText('4.2s total')).toBeTruthy();
     expect(screen.getByText('64.0 MB')).toBeTruthy();
+    expect(screen.getByText('private footprint')).toBeTruthy();
     expect(screen.getByText('RSS 70.0 MB')).toBeTruthy();
     expect(screen.getByText('4242')).toBeTruthy();
     expect(screen.getByRole('button', { name: /pause/i })).toBeTruthy();

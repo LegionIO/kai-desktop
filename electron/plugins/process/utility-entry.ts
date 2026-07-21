@@ -1,8 +1,8 @@
 import { pathToFileURL } from 'node:url';
 import type { PluginManifest, PluginModule } from '../types.js';
-import { createUtilityPluginAPI } from './utility-api.js';
+import { createUtilityConfigMirror, createUtilityPluginAPI } from './utility-api.js';
 import { UtilityTransport, type SyncBridgeInit } from './utility-transport.js';
-import { serializeWireError } from './wire.js';
+import { installZodWireCodec, isZodWireCodecLoaded, serializeWireError } from './wire.js';
 
 type InitMessage = {
   type: 'init';
@@ -12,6 +12,8 @@ type InitMessage = {
   fileHash: string;
   apiVersion: string;
   capabilities: string[];
+  initialConfig: Record<string, unknown>;
+  initialPluginData: Record<string, unknown>;
   syncBridge: SyncBridgeInit;
 };
 
@@ -58,16 +60,36 @@ const init = await waitForInit();
 process.title = `Kai Plugin: ${init.manifest.name}`;
 
 const transport = new UtilityTransport(parentPort);
+transport.configureSyncBridge(init.syncBridge);
+const configMirror = createUtilityConfigMirror(init.initialConfig, init.initialPluginData);
 let pluginModule: PluginModule | null = null;
 
+function reportResourceUsage(): void {
+  try {
+    parentPort.postMessage({
+      type: 'resource-usage',
+      syncWorkerRunning: transport.hasSyncWorker,
+      zodCodecLoaded: isZodWireCodecLoaded(),
+    });
+  } catch {
+    // Metrics are best-effort and must never affect plugin functionality.
+  }
+}
+
+transport.setSyncWorkerStateChangeHandler(reportResourceUsage);
+
 try {
-  await transport.startSyncBridge(init.syncBridge);
+  if (init.manifest.permissions.includes('tools:register')) {
+    const { zodWireCodec } = await import('./zod-wire-codec.js');
+    installZodWireCodec(zodWireCodec);
+  }
   const api = createUtilityPluginAPI({
     manifest: init.manifest,
     pluginDir: init.pluginDir,
     apiVersion: init.apiVersion,
     capabilities: init.capabilities,
     transport,
+    configMirror,
   });
 
   transport.setControlHandler(async (command, args) => {
@@ -76,7 +98,13 @@ try {
       return null;
     }
     if (command === 'config-changed') {
+      configMirror.config = structuredClone((args[0] as Record<string, unknown>) ?? {});
+      configMirror.pluginData = structuredClone((args[1] as Record<string, unknown>) ?? {});
       pluginModule?.onConfigChanged?.(args[0] as never);
+      return null;
+    }
+    if (command === 'plugin-config-changed') {
+      configMirror.pluginData = structuredClone((args[0] as Record<string, unknown>) ?? {});
       return null;
     }
     throw new Error(`Unknown plugin process command: ${command}`);
@@ -89,6 +117,7 @@ try {
   }
   await pluginModule.activate(api);
   await transport.flush();
+  reportResourceUsage();
   parentPort.postMessage({ type: 'activated' });
 } catch (error) {
   parentPort.postMessage({ type: 'activation-error', error: serializeWireError(error) });

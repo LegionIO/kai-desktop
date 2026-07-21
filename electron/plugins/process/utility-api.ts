@@ -1,5 +1,5 @@
 import { net } from 'electron';
-import { toJSONSchema, type ZodType } from 'zod';
+import type { ZodType } from 'zod';
 import type {
   AllowedBinary,
   PluginAPI,
@@ -10,6 +10,7 @@ import type {
 } from '../types.js';
 import type { ToolDefinition } from '../../tools/types.js';
 import type { UtilityTransport } from './utility-transport.js';
+import { zodSchemaToJsonSchema } from './wire.js';
 import { isAmbiguousPluginCallError } from './utility-transport.js';
 
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
@@ -33,6 +34,18 @@ function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
   }
 }
 
+export type UtilityConfigMirror = {
+  config: Record<string, unknown>;
+  pluginData: Record<string, unknown>;
+};
+
+export function createUtilityConfigMirror(
+  config: Record<string, unknown> = {},
+  pluginData: Record<string, unknown> = {},
+): UtilityConfigMirror {
+  return { config: cloneRecord(config), pluginData: cloneRecord(pluginData) };
+}
+
 function toolForWire(tool: ToolDefinition): Record<string, unknown> {
   let inputSchema: unknown = tool.inputSchema;
   const originalExecute = tool.execute;
@@ -44,7 +57,7 @@ function toolForWire(tool: ToolDefinition): Record<string, unknown> {
   ) {
     const pluginSchema = inputSchema as ZodType;
     try {
-      inputSchema = toJSONSchema(pluginSchema, { io: 'input', unrepresentable: 'any' });
+      inputSchema = zodSchemaToJsonSchema(pluginSchema);
     } catch (error) {
       throw new Error(`Could not serialize input schema for plugin tool "${tool.name}"`, { cause: error });
     }
@@ -78,8 +91,10 @@ export function createUtilityPluginAPI(options: {
   apiVersion: string;
   capabilities: string[];
   transport: UtilityTransport;
+  configMirror?: UtilityConfigMirror;
 }): PluginAPI {
   const { manifest, pluginDir, apiVersion, capabilities, transport } = options;
+  const configMirror = options.configMirror ?? createUtilityConfigMirror();
   let state: Record<string, unknown> = {};
 
   const checkPermission = (permission: PluginManifest['permissions'][number]): void => {
@@ -113,23 +128,29 @@ export function createUtilityPluginAPI(options: {
     config: {
       get: () => {
         checkPermission('config:read');
-        return sync('config.get');
+        return cloneRecord(configMirror.config) as ReturnType<PluginAPI['config']['get']>;
       },
       set: (path, value) => {
         checkPermission('config:write');
-        sync('config.set', [path, value]);
+        const next = cloneRecord(configMirror.config);
+        applyNestedWrite(next, path, value);
+        configMirror.config = next;
+        transport.orderedCall('config.set', [path, value]);
       },
       getPluginData: () => {
         checkPermission('config:read');
-        return sync('config.getPluginData');
+        return cloneRecord(configMirror.pluginData);
       },
       setPluginData: (path, value) => {
         checkPermission('config:write');
-        sync('config.setPluginData', [path, value]);
+        const next = cloneRecord(configMirror.pluginData);
+        applyNestedWrite(next, path, value);
+        configMirror.pluginData = next;
+        transport.orderedCall('config.setPluginData', [path, value]);
       },
       onChanged: (callback) => {
         checkPermission('config:read');
-        return sync('config.onChanged', [callback]);
+        return transport.registerDisposable('config.onChanged', [callback]);
       },
     },
 
@@ -138,146 +159,146 @@ export function createUtilityPluginAPI(options: {
       replace: (next) => {
         checkPermission('state:publish');
         state = cloneRecord(next);
-        sync('state.replace', [state]);
+        transport.orderedCall('state.replace', [state]);
       },
       set: (path, value) => {
         checkPermission('state:publish');
         const next = cloneRecord(state);
         applyNestedWrite(next, path, value);
         state = next;
-        sync('state.set', [path, value]);
+        transport.orderedCall('state.set', [path, value]);
       },
       emitEvent: (eventName, data) => {
         checkAnyPermission(['state:publish', 'events:publish']);
-        sync('state.emitEvent', [eventName, data]);
+        transport.orderedCall('state.emitEvent', [eventName, data]);
       },
     },
 
     events: {
       declare: (declaration) => {
         checkPermission('events:publish');
-        sync('events.declare', [declaration]);
+        transport.orderedCall('events.declare', [declaration]);
       },
       emit: (event, payload) => {
         checkAnyPermission(['events:publish', 'state:publish']);
-        sync('events.emit', [event, payload]);
+        transport.orderedCall('events.emit', [event, payload]);
       },
       on: (key, handler) => {
         checkPermission('events:subscribe');
-        return sync('events.on', [key, handler]);
+        return transport.registerDisposable('events.on', [key, handler]);
       },
     },
 
     tools: {
       register: (tools) => {
         checkPermission('tools:register');
-        sync('tools.register', [tools.map(toolForWire)]);
+        transport.orderedCall('tools.register', [tools.map(toolForWire)]);
       },
       unregister: (toolNames) => {
         checkPermission('tools:register');
-        sync('tools.unregister', [toolNames]);
+        transport.orderedCall('tools.unregister', [toolNames]);
       },
     },
 
     messages: {
       registerPreSendHook: (hook) => {
         checkPermission('messages:hook');
-        sync('messages.registerPreSendHook', [hook]);
+        transport.orderedCall('messages.registerPreSendHook', [hook]);
       },
       registerPostReceiveHook: (hook) => {
         checkPermission('messages:hook');
-        sync('messages.registerPostReceiveHook', [hook]);
+        transport.orderedCall('messages.registerPostReceiveHook', [hook]);
       },
     },
 
     lifecycle: {
       registerPreUpdateHook: (hook) => {
         checkPermission('lifecycle:hook');
-        sync('lifecycle.registerPreUpdateHook', [hook]);
+        transport.orderedCall('lifecycle.registerPreUpdateHook', [hook]);
       },
       registerPostUpdateHook: (hook) => {
         checkPermission('lifecycle:hook');
-        sync('lifecycle.registerPostUpdateHook', [hook]);
+        transport.orderedCall('lifecycle.registerPostUpdateHook', [hook]);
       },
     },
 
     hooks: {
       register: (event, handler, registrationOptions) => {
         checkPermission('agent:hook');
-        return sync('hooks.register', [event, handler, registrationOptions]);
+        return transport.registerDisposable('hooks.register', [event, handler, registrationOptions]);
       },
     },
 
     ui: {
       showBanner: (descriptor) => {
         checkPermission('ui:banner');
-        sync('ui.showBanner', [descriptor]);
+        transport.orderedCall('ui.showBanner', [descriptor]);
       },
       hideBanner: (id) => {
         checkPermission('ui:banner');
-        sync('ui.hideBanner', [id]);
+        transport.orderedCall('ui.hideBanner', [id]);
       },
       showModal: (descriptor) => {
         checkPermission('ui:modal');
-        sync('ui.showModal', [descriptor]);
+        transport.orderedCall('ui.showModal', [descriptor]);
       },
       hideModal: (id) => {
         checkPermission('ui:modal');
-        sync('ui.hideModal', [id]);
+        transport.orderedCall('ui.hideModal', [id]);
       },
       updateModal: (id, updates) => {
         checkPermission('ui:modal');
-        sync('ui.updateModal', [id, updates]);
+        transport.orderedCall('ui.updateModal', [id, updates]);
       },
       registerSettingsView: (descriptor) => {
         checkPermission('ui:settings');
-        sync('ui.registerSettingsView', [descriptor]);
+        transport.orderedCall('ui.registerSettingsView', [descriptor]);
       },
       registerPanelView: (descriptor) => {
         checkPermission('ui:panel');
-        sync('ui.registerPanelView', [descriptor]);
+        transport.orderedCall('ui.registerPanelView', [descriptor]);
       },
       registerNavigationItem: (descriptor) => {
         checkPermission('ui:navigation');
-        sync('ui.registerNavigationItem', [descriptor]);
+        transport.orderedCall('ui.registerNavigationItem', [descriptor]);
       },
       registerCommand: (descriptor) => {
         checkPermission('ui:navigation');
-        sync('ui.registerCommand', [descriptor]);
+        transport.orderedCall('ui.registerCommand', [descriptor]);
       },
       showConversationDecoration: (descriptor) => {
         checkPermission('ui:navigation');
-        sync('ui.showConversationDecoration', [descriptor]);
+        transport.orderedCall('ui.showConversationDecoration', [descriptor]);
       },
       hideConversationDecoration: (id) => {
         checkPermission('ui:navigation');
-        sync('ui.hideConversationDecoration', [id]);
+        transport.orderedCall('ui.hideConversationDecoration', [id]);
       },
       showThreadDecoration: (descriptor) => {
         checkPermission('ui:navigation');
-        sync('ui.showThreadDecoration', [descriptor]);
+        transport.orderedCall('ui.showThreadDecoration', [descriptor]);
       },
       hideThreadDecoration: (id) => {
         checkPermission('ui:navigation');
-        sync('ui.hideThreadDecoration', [id]);
+        transport.orderedCall('ui.hideThreadDecoration', [id]);
       },
     },
 
     notifications: {
       show: (descriptor) => {
         checkPermission('notifications:send');
-        sync('notifications.show', [descriptor]);
+        transport.orderedCall('notifications.show', [descriptor]);
       },
       dismiss: (id) => {
         checkPermission('notifications:send');
-        sync('notifications.dismiss', [id]);
+        transport.orderedCall('notifications.dismiss', [id]);
       },
     },
 
     navigation: {
       open: (target) => {
         checkPermission('navigation:open');
-        sync('navigation.open', [target]);
+        transport.orderedCall('navigation.open', [target]);
       },
     },
 
@@ -292,11 +313,11 @@ export function createUtilityPluginAPI(options: {
       },
       upsert: (conversation) => {
         checkPermission('conversations:write');
-        sync('conversations.upsert', [conversation]);
+        transport.orderedCall('conversations.upsert', [conversation]);
       },
       setActive: (conversationId) => {
         checkPermission('conversations:write');
-        sync('conversations.setActive', [conversationId]);
+        transport.orderedCall('conversations.setActive', [conversationId]);
       },
       getActiveId: () => {
         checkPermission('conversations:read');
@@ -308,7 +329,7 @@ export function createUtilityPluginAPI(options: {
       },
       markUnread: (conversationId, unread) => {
         checkPermission('conversations:write');
-        sync('conversations.markUnread', [conversationId, unread]);
+        transport.orderedCall('conversations.markUnread', [conversationId, unread]);
       },
     },
 
@@ -350,7 +371,7 @@ export function createUtilityPluginAPI(options: {
     browser: {
       open: (browserOptions) => {
         checkPermission('browser:window');
-        sync('browser.open', [browserOptions]);
+        transport.orderedCall('browser.open', [browserOptions]);
       },
     },
 
@@ -430,16 +451,16 @@ export function createUtilityPluginAPI(options: {
         // Do NOT release the callback ids here — the host's provider object may
         // still be captured by an in-flight agent turn. The host releases them
         // via `release-callback` when that object is collected.
-        sync('agent.unregisterInferenceProvider');
+        transport.orderedCall('agent.unregisterInferenceProvider');
       },
       registerCliTool: (tool) => {
         checkPermission('agent:register-cli-tool');
-        sync('agent.registerCliTool', [tool]);
+        transport.orderedCall('agent.registerCliTool', [tool]);
       },
     },
 
     onAction: (targetId, handler) => {
-      sync('onAction', [targetId, handler]);
+      transport.orderedCall('onAction', [targetId, handler]);
     },
 
     fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {

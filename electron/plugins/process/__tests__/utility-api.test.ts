@@ -5,7 +5,10 @@ import type { UtilityTransport } from '../utility-transport.js';
 
 vi.mock('electron', () => ({ net: { fetch: vi.fn() } }));
 
-const { createUtilityPluginAPI } = await import('../utility-api.js');
+const { createUtilityConfigMirror, createUtilityPluginAPI } = await import('../utility-api.js');
+const { installZodWireCodec } = await import('../wire.js');
+const { zodWireCodec } = await import('../zod-wire-codec.js');
+installZodWireCodec(zodWireCodec);
 
 const allPermissions: PluginManifest['permissions'] = [
   'config:read',
@@ -58,6 +61,13 @@ function setup() {
       if (method === 'agent.generate') return { text: 'ok', modelKey: 'test', toolCalls: [] };
       return undefined;
     }),
+    orderedCall: vi.fn((method: string, args: unknown[] = []) => {
+      calls.push({ method, args });
+    }),
+    registerDisposable: vi.fn((method: string, args: unknown[]) => {
+      calls.push({ method, args });
+      return vi.fn();
+    }),
     streamCall: vi.fn(async function* () {
       yield { type: 'text-delta', text: 'streamed', conversationId: 'c1' };
     }),
@@ -83,6 +93,7 @@ function setup() {
     apiVersion: '1.2.3',
     capabilities: ['events:publish'],
     transport,
+    configMirror: createUtilityConfigMirror({ ui: { theme: 'dark' } }, { enabled: true }),
   });
   return { api, calls, functions, transport };
 }
@@ -91,7 +102,7 @@ describe('utility-process plugin API compatibility proxy', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('keeps legacy synchronous getters and safe-storage calls synchronous', () => {
-    const { api } = setup();
+    const { api, transport } = setup();
     expect(api.host.apiVersion()).toBe('1.2.3');
     expect(api.host.hasCapability('events:publish')).toBe(true);
     expect(api.config.get()).toEqual({ ui: { theme: 'dark' } });
@@ -99,6 +110,8 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(api.safeStorage.isEncryptionAvailable()).toBe(true);
     expect(api.safeStorage.encryptString('secret')).toBe('cipher:secret');
     expect(api.safeStorage.decryptString('cipher:secret')).toBe('secret');
+    expect(transport.syncCall).not.toHaveBeenCalledWith('config.get', expect.anything());
+    expect(transport.syncCall).not.toHaveBeenCalledWith('config.getPluginData', expect.anything());
   });
 
   it('maintains plugin-owned state locally while mirroring writes to the host', () => {
@@ -109,6 +122,20 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(calls.filter((call) => call.method.startsWith('state.'))).toEqual([
       { method: 'state.replace', args: [{ nested: { count: 1 } }] },
       { method: 'state.set', args: ['nested.count', 2] },
+    ]);
+  });
+
+  it('keeps config reads synchronous and read-after-write consistent without the worker', () => {
+    const { api, calls, transport } = setup();
+    api.config.set('ui.theme', 'light');
+    api.config.setPluginData('nested.count', 8);
+
+    expect(api.config.get()).toEqual({ ui: { theme: 'light' } });
+    expect(api.config.getPluginData()).toEqual({ enabled: true, nested: { count: 8 } });
+    expect(transport.syncCall).not.toHaveBeenCalled();
+    expect(calls.filter((call) => call.method.startsWith('config.'))).toEqual([
+      { method: 'config.set', args: ['ui.theme', 'light'] },
+      { method: 'config.setPluginData', args: ['nested.count', 8] },
     ]);
   });
 

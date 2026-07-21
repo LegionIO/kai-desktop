@@ -7,7 +7,11 @@ import {
   resetDiagnosticCounters,
   type DiagnosticCounter,
 } from '../diagnostics/main-diagnostics.js';
-import { getPluginProcessMetrics, type PluginProcessMetric } from '../plugins/process/plugin-process-host.js';
+import {
+  getPluginProcessMetrics,
+  refreshPluginProcessPrivateMemory,
+  type PluginProcessMetric,
+} from '../plugins/process/plugin-process-host.js';
 
 export interface DiagnosticsSummary {
   logPath: string;
@@ -32,6 +36,7 @@ function logSize(logPath: string): number {
 
 export function registerDiagnosticsHandlers(ipcMain: IpcMain, mainProcessLogPath: string): void {
   ipcMain.handle('diagnostics:get-summary', async (): Promise<DiagnosticsSummary> => {
+    await refreshPluginProcessPrivateMemory();
     const counters = getDiagnosticCounters();
     return {
       logPath: mainProcessLogPath,

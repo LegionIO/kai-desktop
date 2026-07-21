@@ -11,6 +11,42 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('electron', () => ({}));
 
+const mockWorkerState = vi.hoisted(() => ({
+  created: 0,
+  calls: [] as Array<Record<string, unknown>>,
+}));
+
+vi.mock('node:worker_threads', () => ({
+  Worker: class MockWorker {
+    constructor(_path: string, options: { workerData: { readyShared: SharedArrayBuffer } }) {
+      mockWorkerState.created += 1;
+      const ready = new Int32Array(options.workerData.readyShared);
+      Atomics.store(ready, 0, 1);
+      Atomics.notify(ready, 0);
+    }
+
+    on(): this {
+      return this;
+    }
+
+    postMessage(message: Record<string, unknown>): void {
+      if (message.type !== 'call') return;
+      mockWorkerState.calls.push(JSON.parse(String(message.payload)) as Record<string, unknown>);
+      const shared = message.shared as SharedArrayBuffer;
+      const response = new TextEncoder().encode(JSON.stringify({ ok: true, value: 'sync-result' }));
+      new Uint8Array(shared, 8, response.length).set(response);
+      const header = new Int32Array(shared, 0, 2);
+      Atomics.store(header, 1, response.length);
+      Atomics.store(header, 0, 1);
+      Atomics.notify(header, 0);
+    }
+
+    terminate(): Promise<number> {
+      return Promise.resolve(0);
+    }
+  },
+}));
+
 const { UtilityTransport } = await import('../utility-transport.js');
 const { PluginCallTimeoutError, PluginCallAmbiguousError, isAmbiguousPluginCallError } =
   await import('../utility-transport.js');
@@ -38,6 +74,47 @@ function makePort() {
 }
 
 describe('UtilityTransport callback release', () => {
+  it('starts the sync worker only for the first value-returning synchronous call', async () => {
+    mockWorkerState.created = 0;
+    mockWorkerState.calls = [];
+    const { port, posted, emit } = makePort();
+    const transport = new UtilityTransport(port as never);
+    transport.configureSyncBridge({ host: '127.0.0.1', port: 1234, token: 'test', workerPath: '/worker.js' });
+
+    transport.orderedCall('state.set', ['ready', true]);
+    expect(transport.hasSyncWorker).toBe(false);
+    expect(mockWorkerState.created).toBe(0);
+
+    const ordered = posted.find((message) => message.type === 'invoke' && message.order === 1);
+    emit({ type: 'invoke-result', id: ordered?.id, ok: true, value: null });
+    await Promise.resolve();
+
+    expect(transport.syncCall('safeStorage.encryptString', ['secret'])).toBe('sync-result');
+    expect(transport.hasSyncWorker).toBe(true);
+    expect(mockWorkerState.created).toBe(1);
+    expect(mockWorkerState.calls[0]).toMatchObject({ method: 'safeStorage.encryptString', afterOrder: 1 });
+    await transport.close();
+  });
+
+  it('flush waits for ordered void calls before posting its async barrier', async () => {
+    const { port, posted, emit } = makePort();
+    const transport = new UtilityTransport(port as never);
+    transport.orderedCall('config.set', ['ui.theme', 'light']);
+
+    const flushing = transport.flush();
+    expect(posted.filter((message) => message.type === 'invoke')).toHaveLength(1);
+
+    const ordered = posted[0];
+    emit({ type: 'invoke-result', id: ordered.id, ok: true, value: null });
+    await vi.waitFor(() => {
+      expect(posted.some((message) => message.type === 'invoke' && message.method === '__ping')).toBe(true);
+    });
+    const barrier = posted.find((message) => message.type === 'invoke' && message.method === '__ping');
+    expect(barrier).toMatchObject({ afterOrder: 1 });
+    emit({ type: 'invoke-result', id: barrier?.id, ok: true, value: null });
+    await flushing;
+  });
+
   it('drops a released callback so it can no longer be invoked', async () => {
     const { port, posted, emit } = makePort();
     const transport = new UtilityTransport(port as never);

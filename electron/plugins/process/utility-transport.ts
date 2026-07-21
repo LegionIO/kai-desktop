@@ -4,6 +4,7 @@ import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from
 
 const SYNC_BUFFER_BYTES = 16 * 1024 * 1024;
 const SYNC_CALL_TIMEOUT_MS = 120_000;
+const SYNC_BRIDGE_START_TIMEOUT_MS = 10_000;
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -134,8 +135,13 @@ export function isAmbiguousPluginCallError(error: unknown): boolean {
 
 export class UtilityTransport {
   private worker: Worker | null = null;
-  private syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
+  private syncBridge: SyncBridgeInit | null = null;
+  private syncShared: SharedArrayBuffer | null = null;
   private sequence = 0;
+  private orderedSequence = 0;
+  private orderedPending = new Map<number, Promise<void>>();
+  private orderedFailure: unknown = null;
+  private disposableSequence = 0;
   private functionSequence = 0;
   private abortSequence = 0;
   private pending = new Map<number, Deferred<unknown>>();
@@ -169,6 +175,7 @@ export class UtilityTransport {
   private remoteAbortControllers = new Map<string, AbortController>();
   private activeCallbackStreams = new Map<number, AsyncIterator<unknown>>();
   private controlHandler: ControlHandler | null = null;
+  private syncWorkerStateChangeHandler: (() => void) | null = null;
   private closed = false;
 
   constructor(private parentPort: ParentPort) {
@@ -177,23 +184,72 @@ export class UtilityTransport {
     });
   }
 
-  async startSyncBridge(init: SyncBridgeInit): Promise<void> {
-    const ready = deferred<void>();
-    const worker = new Worker(init.workerPath, {
-      workerData: { host: init.host, port: init.port, token: init.token },
+  /** Store bridge credentials without allocating a Worker/V8 isolate. */
+  configureSyncBridge(init: SyncBridgeInit): void {
+    this.syncBridge = init;
+  }
+
+  get hasSyncWorker(): boolean {
+    return this.worker !== null;
+  }
+
+  setSyncWorkerStateChangeHandler(handler: () => void): void {
+    this.syncWorkerStateChangeHandler = handler;
+  }
+
+  private ensureSyncWorker(): Worker {
+    if (this.closed) throw new Error('Plugin process transport is closed');
+    if (this.worker) return this.worker;
+    if (!this.syncBridge) throw new Error('Plugin synchronous bridge is not configured');
+
+    // EventEmitter callbacks cannot run while this thread is blocked in
+    // Atomics.wait, so the worker signals connection readiness directly through
+    // this tiny startup buffer. The large response buffer is also allocated only
+    // when a plugin first needs a genuinely synchronous host result.
+    const readyShared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const readyState = new Int32Array(readyShared);
+    const worker = new Worker(this.syncBridge.workerPath, {
+      workerData: {
+        host: this.syncBridge.host,
+        port: this.syncBridge.port,
+        token: this.syncBridge.token,
+        readyShared,
+      },
     });
     this.worker = worker;
-    worker.on('message', (message: { type?: string; error?: string }) => {
-      if (message?.type === 'ready') ready.resolve();
-      else if (message?.type === 'error' || message?.type === 'closed') {
-        ready.reject(new Error(message.error ?? 'Plugin synchronous broker closed'));
+
+    const retire = (): void => {
+      if (this.worker !== worker) return;
+      this.worker = null;
+      try {
+        this.syncWorkerStateChangeHandler?.();
+      } catch {
+        // Diagnostics reporting is best-effort during worker teardown.
       }
+    };
+    worker.on('message', (message: { type?: string }) => {
+      if (message?.type === 'error' || message?.type === 'closed') retire();
     });
-    worker.on('error', (error) => ready.reject(error));
-    worker.on('exit', (code) => {
-      if (!this.closed && code !== 0) ready.reject(new Error(`Plugin sync worker exited with code ${code}`));
-    });
-    await ready.promise;
+    worker.on('error', retire);
+    worker.on('exit', retire);
+
+    const waitResult = Atomics.wait(readyState, 0, 0, SYNC_BRIDGE_START_TIMEOUT_MS);
+    if (waitResult === 'timed-out' || Atomics.load(readyState, 0) !== 1) {
+      retire();
+      void worker.terminate();
+      throw new PluginCallAmbiguousError(
+        waitResult === 'timed-out'
+          ? `Plugin synchronous broker did not start within ${SYNC_BRIDGE_START_TIMEOUT_MS}ms`
+          : 'Plugin synchronous broker failed to connect',
+      );
+    }
+    this.syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
+    try {
+      this.syncWorkerStateChangeHandler?.();
+    } catch {
+      // Diagnostics reporting must not make a compatibility call fail.
+    }
+    return worker;
   }
 
   setControlHandler(handler: ControlHandler): void {
@@ -330,19 +386,26 @@ export class UtilityTransport {
   }
 
   syncCall(method: string, args: unknown[]): unknown {
-    if (this.closed || !this.worker) throw new Error('Plugin process transport is closed');
+    const worker = this.ensureSyncWorker();
+    const syncShared = this.syncShared;
+    if (!syncShared) throw new Error('Plugin synchronous response buffer is unavailable');
     const id = ++this.sequence;
-    const request = JSON.stringify({ id, method, args: this.encode(args, id) });
-    const header = new Int32Array(this.syncShared, 0, 2);
+    const request = JSON.stringify({
+      id,
+      method,
+      args: this.encode(args, id),
+      afterOrder: this.orderedSequence,
+    });
+    const header = new Int32Array(syncShared, 0, 2);
     Atomics.store(header, 0, 0);
     Atomics.store(header, 1, 0);
-    this.worker.postMessage({ type: 'call', id, payload: request, shared: this.syncShared });
+    worker.postMessage({ type: 'call', id, payload: request, shared: syncShared });
     const waitResult = Atomics.wait(header, 0, 0, SYNC_CALL_TIMEOUT_MS);
     if (waitResult === 'timed-out') {
       // A late response must never wake a later call that reused the same
       // shared buffer. Retire this buffer and let the worker discard the old
       // request ID before any subsequent call is posted.
-      this.worker.postMessage({ type: 'cancel', id });
+      worker.postMessage({ type: 'cancel', id });
       this.syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
       // Do NOT settle the request here: a timeout is ambiguous — the host may
       // still process the queued broker request and adopt these ids. Their
@@ -357,7 +420,7 @@ export class UtilityTransport {
     // there's no adopted payload here, so treat it like a timeout: do NOT settle;
     // defer reclamation to the drain-barrier reconcile.
     const size = Atomics.load(header, 1);
-    const text = new TextDecoder().decode(new Uint8Array(this.syncShared, 8, size));
+    const text = new TextDecoder().decode(new Uint8Array(syncShared, 8, size));
     if (Atomics.load(header, 0) === 2) {
       throw new PluginCallAmbiguousError(text || `Plugin API call "${method}" failed`);
     }
@@ -379,8 +442,60 @@ export class UtilityTransport {
     const id = ++this.sequence;
     const item = deferred<unknown>();
     this.pending.set(id, item);
-    this.parentPort.postMessage({ type: 'invoke', id, method, args: this.encode(args, id) });
+    this.parentPort.postMessage({
+      type: 'invoke',
+      id,
+      method,
+      args: this.encode(args, id),
+      afterOrder: this.orderedSequence,
+    });
     return item.promise;
+  }
+
+  /**
+   * Preserve a void PluginAPI call's synchronous call shape while executing it
+   * on the existing Electron IPC channel. Calls are numbered and the host runs
+   * them strictly in order; every later sync/async request carries a barrier so
+   * it cannot overtake these side effects on the separate broker channel.
+   */
+  orderedCall(method: string, args: unknown[] = []): void {
+    if (this.closed) throw new Error('Plugin process transport is closed');
+    if (this.orderedFailure) throw this.orderedFailure;
+    const id = ++this.sequence;
+    const order = ++this.orderedSequence;
+    const item = deferred<unknown>();
+    this.pending.set(id, item);
+    this.parentPort.postMessage({ type: 'invoke', id, order, method, args: this.encode(args, id) });
+    const tracked = item.promise.then(
+      () => undefined,
+      (error) => {
+        this.orderedFailure ??= error;
+      },
+    );
+    this.orderedPending.set(order, tracked);
+    void tracked.finally(() => this.orderedPending.delete(order));
+  }
+
+  registerDisposable(method: 'config.onChanged' | 'events.on' | 'hooks.register', args: unknown[]): () => void {
+    const registrationId = `d${++this.disposableSequence}`;
+    let active = true;
+    this.orderedCall('__registerDisposable', [registrationId, method, args]);
+    return () => {
+      if (!active) return;
+      active = false;
+      this.orderedCall('__disposeDisposable', [registrationId]);
+    };
+  }
+
+  private async flushOrderedCalls(): Promise<void> {
+    while (this.orderedPending.size > 0) {
+      await Promise.all([...this.orderedPending.values()]);
+    }
+    if (this.orderedFailure) {
+      const error = this.orderedFailure;
+      this.orderedFailure = null;
+      throw error;
+    }
   }
 
   notify(method: string, args: unknown[]): void {
@@ -397,11 +512,18 @@ export class UtilityTransport {
       this.streams.delete(requestId);
     });
     this.streams.set(id, stream);
-    this.parentPort.postMessage({ type: 'stream-invoke', id, method, args: this.encode(args) });
+    this.parentPort.postMessage({
+      type: 'stream-invoke',
+      id,
+      method,
+      args: this.encode(args),
+      afterOrder: this.orderedSequence,
+    });
     return stream;
   }
 
   async flush(): Promise<void> {
+    await this.flushOrderedCalls();
     await this.asyncCall('__ping', []);
   }
 
@@ -422,6 +544,7 @@ export class UtilityTransport {
     try {
       const args = this.decode(message.args, abortIds) as unknown[];
       const value = await fn(...args);
+      await this.flushOrderedCalls();
       this.parentPort.postMessage({ type: 'callback-result', id, ok: true, value: this.encode(value) });
     } catch (error) {
       this.parentPort.postMessage({ type: 'callback-result', id, ok: false, error: serializeWireError(error) });
@@ -454,8 +577,10 @@ export class UtilityTransport {
       for (;;) {
         const next = await iterator.next();
         if (next.done) break;
+        await this.flushOrderedCalls();
         this.parentPort.postMessage({ type: 'callback-stream-event', id, value: this.encode(next.value) });
       }
+      await this.flushOrderedCalls();
       this.parentPort.postMessage({ type: 'callback-stream-end', id });
     } catch (error) {
       this.parentPort.postMessage({ type: 'callback-stream-error', id, error: serializeWireError(error) });
@@ -580,6 +705,7 @@ export class UtilityTransport {
         try {
           const args = this.decode(message.args, abortIds) as unknown[];
           const value = await this.controlHandler(String(message.command ?? ''), args);
+          await this.flushOrderedCalls();
           this.parentPort.postMessage({ type: 'control-result', id, ok: true, value: this.encode(value) });
         } catch (error) {
           this.parentPort.postMessage({ type: 'control-result', id, ok: false, error: serializeWireError(error) });
@@ -607,5 +733,6 @@ export class UtilityTransport {
     this.remoteAbortControllers.clear();
     await this.worker?.terminate();
     this.worker = null;
+    this.syncShared = null;
   }
 }

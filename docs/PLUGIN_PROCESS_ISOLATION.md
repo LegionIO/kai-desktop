@@ -15,15 +15,17 @@ renderer ── existing plugin action IPC ──> Electron main
              │                                 │                         │
       utility: plugin A                 utility: plugin B         utility: plugin C
        backend.js + API                  backend.js + API          backend.js + API
-       sync RPC worker                   sync RPC worker           sync RPC worker
+       sync worker on demand             sync worker on demand     sync worker on demand
 ```
 
 The renderer contract is unchanged. Only the backend-to-main boundary moved.
 
 ## What remains compatible
 
-Plugins do not need to be rewritten. The following retain their existing call
-shapes:
+Plugins do not need to be rewritten. Config reads use a local mirror, and
+void-returning writes/registrations use an ordered IPC queue; only APIs that
+must synchronously return a host value start the compatibility worker. The
+following retain their existing call shapes:
 
 - synchronous config, state, conversations, environment, and safe-storage APIs;
 - tool registration/execution, progress, and cancellation;
@@ -43,7 +45,8 @@ those exports are intentionally unavailable in a utility process.
 
 Open **Settings → Advanced → Diagnostics** to inspect the “Plugin process
 resources” table. It refreshes every five seconds and reports each plugin's
-PID, CPU percentage, private/working-set memory, state, and crash count.
+PID, CPU percentage, physical/private footprint, RSS/working-set memory, state,
+and crash count.
 
 Each row also has operational controls:
 
@@ -54,8 +57,25 @@ Each row also has operational controls:
 - **Enable** starts a fresh isolated backend for a disabled plugin.
 
 Electron reports CPU over its sampling window. The first sample for a new
-process can be zero. On platforms where Electron does not expose private bytes,
-Kai shows working-set memory instead.
+process can be zero. On macOS, Kai obtains all live plugin physical footprints
+with one bounded OS query while Diagnostics is open because Electron utility
+metrics expose only working set there. On platforms where private bytes are
+unavailable, Kai labels and shows working-set memory instead.
+
+## Memory overhead
+
+Isolation still has an unavoidable Electron utility-process baseline, but
+optional compatibility machinery is demand-driven:
+
+- the worker thread and 16 MiB response buffer are created only by a true
+  value-returning synchronous host call;
+- app/plugin config reads and read-after-write behavior use local mirrors;
+- void calls are sent over ordered IPC without changing the public API shape;
+- the Zod transport bundle is loaded only for plugins with `tools:register`.
+
+This keeps lightweight config/UI plugins isolated without charging them for
+tool-schema code or a second V8 isolate. Diagnostics continues to attribute the
+remaining baseline to each plugin rather than hiding it in the main process.
 
 An unexpectedly exited process remains visible as `crashed` until the plugin is
 disabled, re-enabled, uninstalled, or the app exits. The plugin error view also
@@ -81,7 +101,7 @@ shows the failure while other plugins continue running.
 The production build has two additional main outputs:
 
 - `out/main/plugin-host.js` — utility-process entry point;
-- `out/main/plugin-sync-worker.js` — worker-thread synchronous bridge.
+- `out/main/plugin-sync-worker.js` — demand-started worker-thread synchronous bridge.
 
 `package.json` carries `pluginProcessProtocolVersion`. Bump it whenever the
 host/utility wire contract becomes incompatible; the release classifier then

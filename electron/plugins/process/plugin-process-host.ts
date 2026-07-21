@@ -5,6 +5,14 @@ import type { Readable } from 'node:stream';
 import type { PluginAPI, PluginInferenceProvider, PluginManifest } from '../types.js';
 import { recordDiagnosticForPlugin, type DiagnosticKind } from '../../diagnostics/main-diagnostics.js';
 import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from './wire.js';
+import { installZodWireCodec } from './wire.js';
+import { zodWireCodec } from './zod-wire-codec.js';
+import { sampleMacOSPrivateMemory } from './macos-private-memory.js';
+
+// The main process already uses Zod for config/tool validation. Install its
+// codec eagerly here; utility processes load the same code only for plugins
+// that can actually register schema-bearing tools.
+installZodWireCodec(zodWireCodec);
 
 const BROKER_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 const BROKER_MAX_CALLS_PER_SECOND = 1_000;
@@ -133,20 +141,53 @@ type ProcessRecord = {
   crashCount: number;
   lastExitCode: number | null;
   lastError: string | null;
+  privateMemoryBytes: number;
+  syncWorkerRunning: boolean;
+  zodCodecLoaded: boolean;
 };
 
 export type PluginProcessMetric = ProcessRecord & {
   canPause: boolean;
   cpuPercent: number;
   cumulativeCpuSeconds: number | null;
-  privateMemoryBytes: number;
   residentSetBytes: number;
+  memorySource: 'private' | 'working-set';
 };
 
 const processRecords = new Map<string, ProcessRecord>();
 const processRecordOwners = new Map<string, symbol>();
 /** Session-lifetime crash totals survive disable/enable process replacement. */
 const processCrashCounts = new Map<string, number>();
+const PRIVATE_MEMORY_SAMPLE_TTL_MS = 4_000;
+let privateMemorySampleStartedAt = 0;
+let privateMemorySampleInFlight: Promise<void> | null = null;
+
+/**
+ * Refresh macOS physical footprints on demand. Diagnostics is the consumer, so
+ * this does no work while that panel is closed and coalesces concurrent polls.
+ */
+export async function refreshPluginProcessPrivateMemory(force = false): Promise<void> {
+  if (process.platform !== 'darwin') return;
+  if (privateMemorySampleInFlight) return privateMemorySampleInFlight;
+  if (!force && Date.now() - privateMemorySampleStartedAt < PRIVATE_MEMORY_SAMPLE_TTL_MS) return;
+
+  const pids = [...processRecords.values()].map((record) => record.pid).filter((pid): pid is number => pid !== null);
+  privateMemorySampleStartedAt = Date.now();
+  privateMemorySampleInFlight = sampleMacOSPrivateMemory(pids)
+    .then((sample) => {
+      for (const [pluginName, record] of processRecords) {
+        if (record.pid === null) continue;
+        const privateMemoryBytes = sample.get(record.pid);
+        if (privateMemoryBytes !== undefined) {
+          processRecords.set(pluginName, { ...record, privateMemoryBytes });
+        }
+      }
+    })
+    .finally(() => {
+      privateMemorySampleInFlight = null;
+    });
+  return privateMemorySampleInFlight;
+}
 
 /** Returns live, OS-attributed resource usage for every loaded plugin backend. */
 export function getPluginProcessMetrics(): PluginProcessMetric[] {
@@ -165,8 +206,11 @@ export function getPluginProcessMetrics(): PluginProcessMetric[] {
         canPause: process.platform !== 'win32',
         cpuPercent: metric?.cpu.percentCPUUsage ?? 0,
         cumulativeCpuSeconds: metric?.cpu.cumulativeCPUUsage ?? null,
-        privateMemoryBytes: (metric?.memory.privateBytes ?? metric?.memory.workingSetSize ?? 0) * 1024,
+        privateMemoryBytes: record.privateMemoryBytes || (metric?.memory.privateBytes ?? 0) * 1024,
         residentSetBytes: (metric?.memory.workingSetSize ?? 0) * 1024,
+        memorySource: (record.privateMemoryBytes > 0 || (metric?.memory.privateBytes ?? 0) > 0
+          ? 'private'
+          : 'working-set') as PluginProcessMetric['memorySource'],
       };
     })
     .sort((a, b) => a.pluginName.localeCompare(b.pluginName));
@@ -187,6 +231,7 @@ type BrokerRequest = {
   id: number;
   method: string;
   args?: unknown;
+  afterOrder?: number;
 };
 
 export class PluginProcessHost {
@@ -285,9 +330,16 @@ export class PluginProcessHost {
   private childMessagesInWindow = 0;
   private childMessageOverload = false;
   private inboundInvocations = 0;
+  private orderedInvokeTail: Promise<void> = Promise.resolve();
+  private orderedReceived = 0;
+  private orderedCompleted = 0;
+  private orderedWaiters: Array<{ order: number; resolve: () => void }> = [];
+  private remoteDisposables = new Map<string, () => void>();
   private readonly recordOwner = Symbol('plugin-process-record-owner');
   private hasPausedConfig = false;
   private pausedConfig: unknown;
+  private hasPausedPluginData = false;
+  private pausedPluginData: unknown;
 
   constructor(private options: PluginProcessHostOptions) {
     processRecordOwners.set(options.manifest.name, this.recordOwner);
@@ -300,6 +352,9 @@ export class PluginProcessHost {
       crashCount: processCrashCounts.get(options.manifest.name) ?? 0,
       lastExitCode: null,
       lastError: null,
+      privateMemoryBytes: 0,
+      syncWorkerRunning: false,
+      zodCodecLoaded: false,
     });
   }
 
@@ -583,6 +638,39 @@ export class PluginProcessHost {
     return { owner, fn: fn as (...args: unknown[]) => unknown };
   }
 
+  private async awaitOrdered(order: number): Promise<void> {
+    if (!Number.isFinite(order) || order <= this.orderedCompleted) return;
+    if (this.disposed) throw new Error('Plugin process is not running');
+    await new Promise<void>((resolve) => this.orderedWaiters.push({ order, resolve }));
+  }
+
+  private finishOrdered(order: number): void {
+    this.orderedCompleted = Math.max(this.orderedCompleted, order);
+    const ready = this.orderedWaiters.filter((waiter) => waiter.order <= this.orderedCompleted);
+    this.orderedWaiters = this.orderedWaiters.filter((waiter) => waiter.order > this.orderedCompleted);
+    for (const waiter of ready) waiter.resolve();
+  }
+
+  private enqueueOrderedInvoke(message: Record<string, unknown>): void {
+    const order = Number(message.order);
+    if (!Number.isInteger(order) || order !== this.orderedReceived + 1) {
+      this.terminateForProtocolOverload(`Plugin sent an invalid ordered API sequence (${String(message.order)})`);
+      return;
+    }
+    this.orderedReceived = order;
+    if (this.orderedReceived - this.orderedCompleted > CHILD_MAX_INFLIGHT_INVOCATIONS) {
+      this.terminateForProtocolOverload('Plugin exceeded the ordered host API queue limit');
+      return;
+    }
+    const run = this.orderedInvokeTail.then(() => this.handleAsyncInvoke(message, false));
+    this.orderedInvokeTail = run
+      .catch(() => {
+        // handleAsyncInvoke reports the error to the utility; keep the queue live
+        // so teardown and later barriers cannot deadlock behind a failed call.
+      })
+      .then(() => this.finishOrdered(order));
+  }
+
   private async dispatch(method: string, args: unknown[], adoptSink?: string[]): Promise<unknown> {
     if (method === '__ping') return null;
     if (method === '__mainCallback') {
@@ -591,6 +679,30 @@ export class PluginProcessHost {
       if (!callback) throw new Error(`Unknown main-process plugin callback: ${callbackId}`);
       const callbackArgs = Array.isArray(args[1]) ? (args[1] as unknown[]) : [];
       return callback(...callbackArgs);
+    }
+
+    if (method === '__registerDisposable') {
+      const registrationId = String(args[0] ?? '');
+      const targetMethod = String(args[1] ?? '');
+      const targetArgs = Array.isArray(args[2]) ? (args[2] as unknown[]) : [];
+      if (!registrationId || !['config.onChanged', 'events.on', 'hooks.register'].includes(targetMethod)) {
+        throw new Error('Invalid disposable plugin registration');
+      }
+      const disposable = await this.dispatch(targetMethod, targetArgs, adoptSink);
+      if (typeof disposable !== 'function') {
+        throw new Error(`Plugin API method ${targetMethod} did not return a disposer`);
+      }
+      this.remoteDisposables.get(registrationId)?.();
+      this.remoteDisposables.set(registrationId, disposable as () => void);
+      return null;
+    }
+
+    if (method === '__disposeDisposable') {
+      const registrationId = String(args[0] ?? '');
+      const disposable = this.remoteDisposables.get(registrationId);
+      this.remoteDisposables.delete(registrationId);
+      disposable?.();
+      return null;
     }
 
     if (method === 'agent.registerInferenceProvider') {
@@ -685,7 +797,7 @@ export class PluginProcessHost {
     }
   }
 
-  private async handleAsyncInvoke(message: Record<string, unknown>): Promise<void> {
+  private async handleAsyncInvoke(message: Record<string, unknown>, enforceBarrier = true): Promise<void> {
     const id = Number(message.id);
     if (this.inboundInvocations >= CHILD_MAX_INFLIGHT_INVOCATIONS) {
       this.child?.postMessage({
@@ -699,6 +811,7 @@ export class PluginProcessHost {
     this.inboundInvocations += 1;
     const abortIds: string[] = [];
     try {
+      if (enforceBarrier) await this.awaitOrdered(Number(message.afterOrder ?? 0));
       const args = this.decode(message.args, abortIds) as unknown[];
       const value = await this.dispatch(String(message.method ?? ''), args);
       this.child?.postMessage({ type: 'invoke-result', id, ok: true, value: this.encode(value) });
@@ -723,6 +836,7 @@ export class PluginProcessHost {
     this.inboundInvocations += 1;
     const abortIds: string[] = [];
     try {
+      await this.awaitOrdered(Number(message.afterOrder ?? 0));
       const args = this.decode(message.args, abortIds) as unknown[];
       const iterable = (await this.dispatch(String(message.method ?? ''), args)) as AsyncIterable<unknown>;
       if (!iterable || typeof iterable[Symbol.asyncIterator] !== 'function') {
@@ -805,7 +919,8 @@ export class PluginProcessHost {
         this.activation.reject(deserializeWireError(message.error));
         return;
       case 'invoke':
-        await this.handleAsyncInvoke(message);
+        if (message.order !== undefined) this.enqueueOrderedInvoke(message);
+        else await this.handleAsyncInvoke(message);
         return;
       case 'stream-invoke':
         await this.handleStreamInvoke(message);
@@ -861,6 +976,13 @@ export class PluginProcessHost {
         console.error(`[Plugin:${this.options.manifest.name}] ${error}`);
         return;
       }
+      case 'resource-usage': {
+        this.updateRecord({
+          syncWorkerRunning: message.syncWorkerRunning === true,
+          zodCodecLoaded: message.zodCodecLoaded === true,
+        });
+        return;
+      }
       default:
         return;
     }
@@ -879,6 +1001,7 @@ export class PluginProcessHost {
     // handlers can't corrupt each other's routing.
     const adopted: string[] = [];
     try {
+      await this.awaitOrdered(Number(request.afterOrder ?? 0));
       const args = this.decode(request.args, abortIds, adopted) as unknown[];
       const value = await this.dispatch(request.method, args, adopted);
       this.writeBrokerResponse(socket, {
@@ -1051,6 +1174,9 @@ export class PluginProcessHost {
       crashCount,
       lastExitCode: code,
       lastError: this.expectedExit ? (record?.lastError ?? null) : error,
+      privateMemoryBytes: 0,
+      syncWorkerRunning: false,
+      zodCodecLoaded: false,
     });
     this.releaseRuntimeResources(new Error(error));
     this.exit.resolve(code);
@@ -1066,6 +1192,9 @@ export class PluginProcessHost {
 
   async activate(): Promise<void> {
     await this.startBroker();
+    const canReadConfig = this.options.manifest.permissions.includes('config:read');
+    const initialConfig = canReadConfig ? this.options.api.config.get() : {};
+    const initialPluginData = canReadConfig ? this.options.api.config.getPluginData() : {};
     const child = utilityProcess.fork(this.options.utilityEntryPath, [], {
       // Match the main process's historical cwd semantics. Plugin assets should
       // continue to use api.pluginDir; silently changing process.cwd() to the
@@ -1104,6 +1233,8 @@ export class PluginProcessHost {
           fileHash: this.options.fileHash,
           apiVersion: this.options.api.host.apiVersion(),
           capabilities: this.options.api.host.capabilities(),
+          initialConfig,
+          initialPluginData,
           syncBridge: {
             host: '127.0.0.1',
             port: this.brokerPort,
@@ -1135,8 +1266,22 @@ export class PluginProcessHost {
       this.pausedConfig = config;
       return;
     }
-    void this.invokeControl('config-changed', [config]).catch((error) => {
+    const pluginData = this.options.manifest.permissions.includes('config:read')
+      ? this.options.api.config.getPluginData()
+      : {};
+    void this.invokeControl('config-changed', [config, pluginData]).catch((error) => {
       console.error(`[PluginManager] Error in plugin "${this.options.manifest.name}" onConfigChanged:`, error);
+    });
+  }
+
+  notifyPluginConfigChanged(pluginData: unknown): void {
+    if (this.status === 'paused') {
+      this.hasPausedPluginData = true;
+      this.pausedPluginData = pluginData;
+      return;
+    }
+    void this.invokeControl('plugin-config-changed', [pluginData]).catch((error) => {
+      console.error(`[PluginManager] Error updating plugin "${this.options.manifest.name}" config mirror:`, error);
     });
   }
 
@@ -1191,6 +1336,12 @@ export class PluginProcessHost {
       this.hasPausedConfig = false;
       this.pausedConfig = undefined;
       this.notifyConfigChanged(config);
+    }
+    if (this.hasPausedPluginData) {
+      const pluginData = this.pausedPluginData;
+      this.hasPausedPluginData = false;
+      this.pausedPluginData = undefined;
+      this.notifyPluginConfigChanged(pluginData);
     }
   }
 
@@ -1278,9 +1429,22 @@ export class PluginProcessHost {
       if (!controller.signal.aborted) controller.abort(error);
     }
     this.remoteAbortControllers.clear();
+    for (const disposable of this.remoteDisposables.values()) {
+      try {
+        disposable();
+      } catch {
+        // Plugin teardown is already in progress; remaining manager cleanup is
+        // authoritative.
+      }
+    }
+    this.remoteDisposables.clear();
+    for (const waiter of this.orderedWaiters) waiter.resolve();
+    this.orderedWaiters = [];
     this.mainFunctions.clear();
     this.hasPausedConfig = false;
     this.pausedConfig = undefined;
+    this.hasPausedPluginData = false;
+    this.pausedPluginData = undefined;
     this.child = null;
   }
 

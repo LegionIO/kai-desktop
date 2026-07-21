@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from '../wire.js';
+import { decodeWire, deserializeWireError, encodeWire, installZodWireCodec, serializeWireError } from '../wire.js';
+import { zodWireCodec } from '../zod-wire-codec.js';
+
+installZodWireCodec(zodWireCodec);
 
 describe('plugin process wire encoding', () => {
   it('round-trips supported non-JSON values explicitly', () => {

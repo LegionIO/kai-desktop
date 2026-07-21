@@ -35,13 +35,15 @@ purpose-built transports.
 Each plugin gets:
 
 - one Electron utility process named `Kai Plugin: <plugin-name>`;
-- one worker thread inside that utility process for synchronous RPC; and
+- an on-demand worker thread inside that utility process for synchronous RPC;
 - one authenticated loopback broker connection to the main process.
 
-The worker thread is deliberately inside the plugin's utility process. It can
-continue servicing the broker while the plugin's JavaScript thread waits with
-`Atomics.wait`, and all of its CPU/memory remains attributed to the same plugin
-OS process.
+The worker thread is created only when a plugin makes a synchronous API call
+that must return a host value. It is deliberately inside the plugin's utility
+process: it can continue servicing the broker while the plugin's JavaScript
+thread waits with `Atomics.wait`, and all of its CPU/memory remains attributed
+to the same plugin OS process. Registration-only plugins never pay for its V8
+isolate or 16 MiB shared response buffer.
 
 ### Synchronous compatibility channel
 
@@ -50,6 +52,13 @@ utility thread encodes a request, hands it and a `SharedArrayBuffer` to its
 worker, and waits. The worker performs asynchronous loopback I/O to the main
 broker, writes the response into shared memory, and wakes the utility thread.
 The main event loop never blocks on the plugin.
+
+Frequently used config reads are served from a utility-local mirror. Config,
+state, registration, and other void-returning calls retain their synchronous
+call shape but use a numbered IPC queue. Later async, stream, and true sync
+calls carry an ordering barrier, so they cannot overtake those side effects.
+This preserves existing plugin behavior while avoiding the worker for plugins
+such as LLM Gateway that only read/write config and register UI/actions.
 
 The broker is:
 
@@ -71,7 +80,9 @@ Electron's utility-process message port carries:
 
 Functions are represented by opaque callback IDs, never source serialization.
 Zod tool schemas cross as JSON Schema and are reconstructed on the receiving
-side. Other supported non-JSON values use explicit tagged wire forms.
+side. The bundled Zod codec is loaded as a separate dynamic chunk only for
+plugins declaring `tools:register`; plugins without schemas do not load it.
+Other supported non-JSON values use explicit tagged wire forms.
 
 ### Main-side broker responsibilities
 
@@ -105,12 +116,17 @@ If a utility process crashes or exits unexpectedly, the manager:
 
 ### Resource diagnostics
 
-`app.getAppMetrics()` is joined to the process registry by PID. The Kai
-Diagnostics GUI refreshes every five seconds and shows, per plugin:
+`app.getAppMetrics()` is joined to the process registry by PID. On macOS,
+Electron omits private bytes for utility processes and utility-process globals
+do not expose `process.getProcessMemoryInfo()`, so Diagnostics issues one
+bounded `/usr/bin/footprint` query for all live plugin PIDs while the panel is
+being polled. The Kai Diagnostics GUI refreshes every five seconds and shows,
+per plugin:
 
 - PID;
 - CPU percentage;
-- private memory when supplied by Electron, otherwise working-set memory;
+- physical/private footprint as the primary memory value, with RSS/working set
+  shown separately;
 - process state;
 - crash count and last error.
 
@@ -157,8 +173,9 @@ the OS could not provide per-plugin accounting.
 
 ### Negative
 
-- Each enabled plugin now carries an Electron utility-process baseline and one
-  worker thread, increasing total application memory.
+- Each enabled plugin still carries an Electron utility-process baseline.
+  Plugins that require true synchronous host results additionally carry a
+  worker thread and shared response buffer.
 - Cross-boundary calls cost more than in-process function calls.
 - A plugin can still consume broker work by calling host APIs; message size and
   per-second/concurrency limits bound that path but do not make plugins a
@@ -170,6 +187,9 @@ the OS could not provide per-plugin accounting.
 
 - Published state remains locally readable in the utility process, while writes
   are mirrored synchronously, avoiding a host round-trip for `state.get()`.
+- App and plugin config mirrors preserve synchronous reads and read-after-write
+  behavior without starting the compatibility worker.
+- The sync worker and Zod transport chunk are both demand-driven.
 - Output pipes are rate-limited and backpressured per plugin.
 - Activation/deactivation, synchronous RPC, and availability polling have
   bounded timeouts.
@@ -182,7 +202,8 @@ the OS could not provide per-plugin accounting.
 - `pnpm verify:plugin-process` launches real Electron utility processes and
   verifies activation, config/event callbacks, tools and progress, hooks,
   actions, safe storage, agent streams, inference-provider streams, metrics,
-  pause/resume, forced termination, graceful teardown, and crash containment.
+  pause/resume, forced termination, graceful teardown, crash containment, and a
+  workerless LLM-Gateway-shaped activation path.
 - The normal `type-check`, `lint`, `test`, and `build` gates remain required.
 
 ## References

@@ -390,6 +390,9 @@ type AppAPI = {
         cumulativeCpuSeconds: number | null;
         privateMemoryBytes: number;
         residentSetBytes: number;
+        memorySource: 'private' | 'working-set';
+        syncWorkerRunning: boolean;
+        zodCodecLoaded: boolean;
       }>;
     }>;
     tailLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;

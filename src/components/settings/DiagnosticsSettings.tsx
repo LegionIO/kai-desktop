@@ -249,12 +249,14 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
                         {process ? (
                           <>
                             <div>{formatBytes(process.privateMemoryBytes || process.residentSetBytes)}</div>
-                            {process.residentSetBytes > 0 &&
-                              process.residentSetBytes !== process.privateMemoryBytes && (
-                                <div className="text-[10px] text-muted-foreground">
-                                  RSS {formatBytes(process.residentSetBytes)}
-                                </div>
-                              )}
+                            <div className="text-[10px] text-muted-foreground">
+                              {process.memorySource === 'private' ? 'private footprint' : 'working set'}
+                            </div>
+                            {process.privateMemoryBytes > 0 && process.residentSetBytes > 0 && (
+                              <div className="text-[10px] text-muted-foreground">
+                                RSS {formatBytes(process.residentSetBytes)}
+                              </div>
+                            )}
                           </>
                         ) : (
                           '—'

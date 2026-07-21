@@ -5,7 +5,11 @@
  */
 import { app } from 'electron';
 import { resolve } from 'node:path';
-import { PluginProcessHost, getPluginProcessMetrics } from '../out/plugin-process-smoke-host.mjs';
+import {
+  PluginProcessHost,
+  getPluginProcessMetrics,
+  refreshPluginProcessPrivateMemory,
+} from '../out/plugin-process-smoke-host.mjs';
 
 console.info('Starting plugin utility-process smoke verification…');
 
@@ -104,7 +108,19 @@ async function run() {
       },
     },
     ui: {
+      showBanner: () => {},
+      hideBanner: () => {},
+      showModal: () => {},
+      hideModal: () => {},
+      updateModal: () => {},
+      registerSettingsView: () => {},
       registerPanelView: () => {},
+      registerNavigationItem: () => {},
+      registerCommand: () => {},
+      showConversationDecoration: () => {},
+      hideConversationDecoration: () => {},
+      showThreadDecoration: () => {},
+      hideThreadDecoration: () => {},
     },
     safeStorage: {
       isEncryptionAvailable: () => true,
@@ -279,8 +295,51 @@ async function run() {
     host.notifyConfigChanged({});
     await waitFor(() => captured.state.moduleConfigChanged === true);
 
+    await refreshPluginProcessPrivateMemory(true);
     const metric = getPluginProcessMetrics().find((entry) => entry.pluginName === manifest.name);
     assert(metric?.pid && metric.status === 'running', 'plugin process metrics were not attributed to the plugin');
+    assert(metric.privateMemoryBytes > 0, 'plugin private/physical footprint was not reported by the utility');
+    assert(metric.memorySource === 'private', 'plugin footprint did not take priority over RSS');
+    assert(metric.syncWorkerRunning === true, 'a true synchronous API did not start the bridge worker');
+    assert(metric.zodCodecLoaded === true, 'schema-capable plugin did not load the Zod transport chunk');
+
+    const workerlessManifest = {
+      name: 'process-workerless-smoke',
+      displayName: 'Process Workerless Smoke',
+      version: '1.0.0',
+      description: 'Mirrored config and registration-only fixture',
+      permissions: ['config:read', 'config:write', 'state:publish', 'events:publish', 'ui:settings', 'ui:modal'],
+    };
+    const workerlessHost = new PluginProcessHost({
+      manifest: workerlessManifest,
+      pluginDir: resolve('electron/plugins/process/__fixtures__'),
+      backendPath: resolve('electron/plugins/process/__fixtures__/workerless-plugin.js'),
+      fileHash: 'workerless-smoke',
+      api,
+      utilityEntryPath: resolve('out/main/plugin-host.js'),
+      syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
+      onUnexpectedExit: ({ code, error }) => {
+        throw new Error(`Workerless plugin exited unexpectedly (${code}): ${error ?? ''}`);
+      },
+    });
+    await workerlessHost.activate();
+    assert(captured.state.workerlessActivated === true, 'workerless ordered state write was not flushed');
+    assert(captured.actions.has('workerless'), 'workerless action registration was not flushed');
+    const workerlessAction = await captured.actions.get('workerless')('read');
+    assert(workerlessAction.data.theme === 'light', 'mirrored config did not preserve read-after-write');
+    assert(workerlessAction.data.count === 8, 'mirrored plugin config did not preserve read-after-write');
+    await refreshPluginProcessPrivateMemory(true);
+    const workerlessMetric = getPluginProcessMetrics().find(
+      (entry) => entry.pluginName === workerlessManifest.name,
+    );
+    assert(workerlessMetric?.privateMemoryBytes > 0, 'workerless utility did not report its footprint');
+    assert(workerlessMetric.syncWorkerRunning === false, 'mirrored/registration APIs eagerly started the sync worker');
+    assert(workerlessMetric.zodCodecLoaded === false, 'plugin without tools loaded the Zod transport chunk');
+    console.info(
+      `Workerless footprint ${(workerlessMetric.privateMemoryBytes / 1024 / 1024).toFixed(1)} MB; ` +
+        `full fixture ${(metric.privateMemoryBytes / 1024 / 1024).toFixed(1)} MB`,
+    );
+    await workerlessHost.deactivate();
 
     host.pause();
     assert(

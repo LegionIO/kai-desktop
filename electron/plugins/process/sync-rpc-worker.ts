@@ -11,6 +11,7 @@ type WorkerInit = {
   host: string;
   port: number;
   token: string;
+  readyShared: SharedArrayBuffer;
 };
 
 type SyncCallMessage = {
@@ -26,10 +27,19 @@ type SyncCancelMessage = {
 };
 
 const init = workerData as WorkerInit;
+const readyState = new Int32Array(init.readyShared);
 const encoder = new TextEncoder();
 const pending = new Map<number, SharedArrayBuffer>();
 let buffered = '';
 let socket: Socket | null = null;
+let startupSettled = false;
+
+function settleStartup(state: 1 | 2): void {
+  if (startupSettled) return;
+  startupSettled = true;
+  Atomics.store(readyState, 0, state);
+  Atomics.notify(readyState, 0);
+}
 
 function finish(shared: SharedArrayBuffer, state: 1 | 2, payload: string): void {
   const header = new Int32Array(shared, 0, 2);
@@ -65,6 +75,7 @@ function consumeFrames(chunk: Buffer): void {
     try {
       const response = JSON.parse(line) as { id?: unknown; type?: unknown };
       if (response.type === 'ready') {
+        settleStartup(1);
         parentPort?.postMessage({ type: 'ready' });
         continue;
       }
@@ -74,6 +85,7 @@ function consumeFrames(chunk: Buffer): void {
       pending.delete(response.id);
       finish(shared, 1, line);
     } catch (error) {
+      settleStartup(2);
       failPending(`Invalid response from plugin broker: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -87,10 +99,12 @@ function connect(): void {
   });
   socket.on('data', consumeFrames);
   socket.on('error', (error) => {
+    settleStartup(2);
     failPending(`Plugin broker connection failed: ${error.message}`);
     parentPort?.postMessage({ type: 'error', error: error.message });
   });
   socket.on('close', () => {
+    settleStartup(2);
     failPending('Plugin broker connection closed');
     parentPort?.postMessage({ type: 'closed' });
   });

@@ -1270,6 +1270,10 @@ export class PluginManager {
     atomicWriteFileSync(settingsPath, JSON.stringify(validated, null, 2));
     this.broadcastUIState();
 
+    // Keep the isolated utility's synchronous config.getPluginData() mirror
+    // canonical for writes originating from either the plugin or the renderer.
+    this.pluginProcesses.get(pluginName)?.notifyPluginConfigChanged(validated);
+
     // Fire the plugin's own config-change listeners so api.config.onChanged
     // callbacks are triggered when plugin settings change (not just app config).
     // Plugins receive the redacted PluginSafeConfig unless they declared

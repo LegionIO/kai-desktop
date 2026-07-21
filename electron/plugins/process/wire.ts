@@ -4,10 +4,38 @@
  * values natively, but the synchronous compatibility channel is framed JSON,
  * so both transports intentionally use one representation.
  */
-import { fromJSONSchema, toJSONSchema } from 'zod';
-
 const MARKER = '__kaiPluginWire';
 const INTERNAL_MARKER = Symbol('kaiPluginWireMarker');
+
+export type ZodWireCodec = {
+  toJSONSchema: (schema: unknown) => unknown;
+  fromJSONSchema: (schema: unknown) => unknown;
+};
+
+let zodWireCodec: ZodWireCodec | null = null;
+
+/** Install the optional schema codec before transporting a Zod value. */
+export function installZodWireCodec(codec: ZodWireCodec): void {
+  zodWireCodec = codec;
+}
+
+export function isZodWireCodecLoaded(): boolean {
+  return zodWireCodec !== null;
+}
+
+export function zodSchemaToJsonSchema(schema: unknown): unknown {
+  if (!zodWireCodec) {
+    throw new Error('Zod schema transport is unavailable because the optional codec was not loaded');
+  }
+  return zodWireCodec.toJSONSchema(schema);
+}
+
+function jsonSchemaToZod(schema: unknown): unknown {
+  if (!zodWireCodec) {
+    throw new Error('Zod schema transport is unavailable because the optional codec was not loaded');
+  }
+  return zodWireCodec.fromJSONSchema(schema);
+}
 
 type Marker = {
   [MARKER]: string;
@@ -101,13 +129,7 @@ export function encodeWire(value: unknown, options: WireEncodeOptions = {}): unk
     if (typeof (current as { safeParse?: unknown }).safeParse === 'function') {
       try {
         return marker('zod-schema', {
-          schema: visit(
-            toJSONSchema(current as Parameters<typeof toJSONSchema>[0], {
-              io: 'input',
-              unrepresentable: 'any',
-            }),
-            depth + 1,
-          ),
+          schema: visit(zodSchemaToJsonSchema(current), depth + 1),
         });
       } catch (error) {
         throw new Error('Plugin IPC could not convert a Zod schema to JSON Schema', { cause: error });
@@ -177,7 +199,7 @@ export function decodeWire(value: unknown, options: WireDecodeOptions = {}): unk
         case 'regexp':
           return new RegExp(String(candidate.source), String(candidate.flags ?? ''));
         case 'zod-schema':
-          return fromJSONSchema(visit(candidate.schema, depth + 1) as Parameters<typeof fromJSONSchema>[0]);
+          return jsonSchemaToZod(visit(candidate.schema, depth + 1));
         case 'bytes':
           return Buffer.from(String(candidate.value ?? ''), 'base64');
         case 'error': {
