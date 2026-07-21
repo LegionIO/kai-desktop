@@ -84,4 +84,28 @@ describe('UtilityTransport callback release', () => {
     expect(() => transport.releaseFunction('nope')).not.toThrow();
     expect(() => transport.releaseFunction('')).not.toThrow();
   });
+
+  it('rolls back callback ids registered before an encode failure (no leak)', () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    const fn = vi.fn(() => 'live');
+
+    // First, a clean encode to learn which id the next callback would get, then
+    // confirm THAT id is invokable — establishing the id→fn mapping works.
+    const ok = transport.encode({ cb: fn }) as { cb: { id: string } };
+    const liveId = ok.cb.id;
+    emit({ type: 'callback', id: 1, callbackId: liveId, args: [] });
+
+    // Now an encode that registers a NEW callback then throws on a later symbol.
+    const doomed = vi.fn();
+    expect(() => transport.encode({ cb: doomed, bad: Symbol('x') })).toThrow();
+
+    // The doomed callback's id was rolled back: driving a callback for the id
+    // that WOULD have been next (liveId's successor) finds nothing.
+    const rolledBackId = `u${Number(liveId.slice(1)) + 1}`;
+    emit({ type: 'callback', id: 2, callbackId: rolledBackId, args: [] });
+    const reply = posted.find((m) => m.type === 'callback-result' && m.id === 2);
+    expect(reply?.ok).toBe(false); // unknown callback → not retained
+    expect(doomed).not.toHaveBeenCalled();
+  });
 });

@@ -227,4 +227,38 @@ describe('utility-process plugin API compatibility proxy', () => {
     // …and the just-registered (now-orphaned) ids must be cleaned up, so no leak.
     expect([...functions.keys()].sort()).toEqual(idsBefore.sort());
   });
+
+  it('keeps BOTH id sets alive when provider replacement TIMES OUT (ambiguous)', async () => {
+    const { PluginCallTimeoutError } = await import('../utility-transport.js');
+    const { api, calls, functions, transport } = setup();
+    const makeProvider = () => ({
+      name: 'Fixture',
+      isAvailable: () => true,
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'p' };
+      },
+    });
+
+    api.agent.registerInferenceProvider(makeProvider());
+    const first = calls.find((c) => c.method === 'agent.registerInferenceProvider')!.args[0] as {
+      isAvailableId: string;
+      streamId: string;
+    };
+
+    // Next handoff TIMES OUT — the host may still adopt the queued request, so
+    // neither the new ids NOR the old ids may be freed (freeing either could
+    // strand a live provider on an unknown callback).
+    (transport.syncCall as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((method: string) => {
+      if (method === 'agent.registerInferenceProvider') throw new PluginCallTimeoutError('timed out');
+      return undefined;
+    });
+
+    expect(() => api.agent.registerInferenceProvider(makeProvider())).toThrow('timed out');
+
+    // Old ids preserved (host might still be using the prior provider).
+    expect(functions.has(first.isAvailableId)).toBe(true);
+    expect(functions.has(first.streamId)).toBe(true);
+    // New ids preserved too (host might have adopted the new provider). 4 total.
+    expect(functions.size).toBe(4);
+  });
 });

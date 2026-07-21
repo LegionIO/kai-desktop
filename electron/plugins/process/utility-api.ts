@@ -10,6 +10,7 @@ import type {
 } from '../types.js';
 import type { ToolDefinition } from '../../tools/types.js';
 import type { UtilityTransport } from './utility-transport.js';
+import { PluginCallTimeoutError } from './utility-transport.js';
 
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.').filter(Boolean);
@@ -415,6 +416,19 @@ export function createUtilityPluginAPI(options: {
             },
           ]);
         } catch (error) {
+          // A TIMEOUT is ambiguous — the host may or may not have processed the
+          // queued request. Freeing EITHER id set risks stranding the host on an
+          // unknown callback (the new provider if it was adopted, or the old one
+          // if it wasn't). So on timeout we keep BOTH sets alive: adopt the new
+          // ids as current and deliberately do NOT release the previous ones.
+          // That's at worst a small bounded leak (one provider's 2 callbacks) —
+          // strictly safer than breaking a live provider. A CONFIRMED rejection,
+          // by contrast, means the host will never use the new ids, so free them
+          // and leave the prior provider intact.
+          if (error instanceof PluginCallTimeoutError) {
+            inferenceCallbackIds = [isAvailableId, streamId];
+            throw error;
+          }
           transport.releaseFunction(isAvailableId);
           transport.releaseFunction(streamId);
           throw error;

@@ -94,6 +94,20 @@ export type SyncBridgeInit = {
 
 type ControlHandler = (command: string, args: unknown[]) => Promise<unknown> | unknown;
 
+/**
+ * Thrown by syncCall when the host doesn't respond within the timeout. Distinct
+ * from a confirmed host rejection: a timeout is AMBIGUOUS — the queued request
+ * may still be processed by the host later — so callers must NOT treat it as
+ * "the host rejected this" (e.g. freeing callback ids the host may still adopt).
+ */
+export class PluginCallTimeoutError extends Error {
+  readonly isTimeout = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'PluginCallTimeoutError';
+  }
+}
+
 export class UtilityTransport {
   private worker: Worker | null = null;
   private syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
@@ -177,13 +191,26 @@ export class UtilityTransport {
   }
 
   encode(value: unknown): unknown {
-    return encodeWire(value, {
-      registerFunction: (fn) => ({
-        id: this.registerFunction(fn),
-        async: fn.constructor.name === 'AsyncFunction',
-      }),
-      registerAbortSignal: (signal) => this.registerAbortSignal(signal),
-    });
+    // Track ids registered during THIS encode so we can roll them back if
+    // encodeWire throws partway (e.g. a callback appears before a later cyclic
+    // value that aborts serialization). Without rollback, the id sits in
+    // `functions` with no host stub ever created for it — so it's never
+    // GC-released, and since ids are unique per occurrence, every retry leaks a
+    // fresh one.
+    const registeredHere: string[] = [];
+    try {
+      return encodeWire(value, {
+        registerFunction: (fn) => {
+          const id = this.registerFunction(fn);
+          registeredHere.push(id);
+          return { id, async: fn.constructor.name === 'AsyncFunction' };
+        },
+        registerAbortSignal: (signal) => this.registerAbortSignal(signal),
+      });
+    } catch (error) {
+      for (const id of registeredHere) this.releaseFunction(id);
+      throw error;
+    }
   }
 
   decode(value: unknown, abortIds?: string[]): unknown {
@@ -221,7 +248,7 @@ export class UtilityTransport {
       // request ID before any subsequent call is posted.
       this.worker.postMessage({ type: 'cancel', id });
       this.syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
-      throw new Error(`Plugin API call "${method}" timed out after ${SYNC_CALL_TIMEOUT_MS}ms`);
+      throw new PluginCallTimeoutError(`Plugin API call "${method}" timed out after ${SYNC_CALL_TIMEOUT_MS}ms`);
     }
     const size = Atomics.load(header, 1);
     const text = new TextDecoder().decode(new Uint8Array(this.syncShared, 8, size));
