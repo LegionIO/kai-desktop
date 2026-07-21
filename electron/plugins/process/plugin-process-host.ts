@@ -217,16 +217,30 @@ export class PluginProcessHost {
       return;
     }
     this.utilityCallbackRefs.delete(id);
-    // Only worth (and only safe) telling a live child; a dead/disposed child has
-    // already dropped its whole function table.
-    if (this.child && !this.disposed) {
-      try {
-        this.child.postMessage({ type: 'release-callback', callbackId: id });
-      } catch {
-        /* child may be tearing down — the release is moot then */
-      }
-    }
+    this.postReleaseCallback(id);
   });
+  // Inference-provider callbacks (isAvailableId/streamId) travel to us as raw
+  // ids the utility won't release — only we know when no in-flight turn still
+  // holds the provider. We tie their release to GC of the provider OBJECT we
+  // build (which the agent framework keeps alive across an in-flight turn).
+  // `streamId` is held only by the provider → released on that GC.
+  // `isAvailableId` is ALSO held by the poll loop → released only once the
+  // provider is collected AND the poll has stopped using it (whichever is last).
+  private inferenceProviderFinalizer = new FinalizationRegistry<{ isAvailableId: string; streamId: string }>(
+    ({ isAvailableId, streamId }) => {
+      this.postReleaseCallback(streamId);
+      // Release isAvailableId only if the poll isn't still pointing at it.
+      if (this.inferenceAvailabilityCallbackId !== isAvailableId) {
+        this.postReleaseCallback(isAvailableId);
+      } else {
+        this.pendingIdleInferenceCallbackId = isAvailableId;
+      }
+    },
+  );
+  // Set when the provider object was collected while the poll still held
+  // isAvailableId; released by releaseIdleInferencePollCallback once the poll
+  // stops (unregister/dispose/replace).
+  private pendingIdleInferenceCallbackId: string | null = null;
   private activation = deferred<void>();
   private exit = deferred<number>();
   private expectedExit = false;
@@ -361,6 +375,35 @@ export class PluginProcessHost {
     this.utilityCallbackFinalizer.register(stub, id, stub);
   }
 
+  /** Tell the utility it may drop a callback id. Safe + worthwhile only for a
+   *  live child (a dead/disposed child already dropped its whole table). */
+  private postReleaseCallback(id: string): void {
+    if (this.child && !this.disposed) {
+      try {
+        this.child.postMessage({ type: 'release-callback', callbackId: id });
+      } catch {
+        /* child may be tearing down — the release is moot then */
+      }
+    }
+  }
+
+  /** Arm GC-release for an inference provider's raw-id callbacks, keyed to the
+   *  provider object's lifetime (see the finalizer field). A fresh registration
+   *  supersedes any earlier one: the prior provider object, once no in-flight
+   *  turn holds it, is collected and releases its own ids independently. */
+  private trackInferenceProviderCallbacks(provider: object, isAvailableId: string, streamId: string): void {
+    this.inferenceProviderFinalizer.register(provider, { isAvailableId, streamId });
+  }
+
+  /** Release the isAvailableId that a collected provider left pinned by the poll
+   *  loop, now that the poll has stopped using it (unregister/dispose). */
+  private releaseIdleInferencePollCallback(): void {
+    if (this.pendingIdleInferenceCallbackId) {
+      this.postReleaseCallback(this.pendingIdleInferenceCallbackId);
+      this.pendingIdleInferenceCallbackId = null;
+    }
+  }
+
   private releaseMainFunctions(functionIds: string[]): void {
     for (const id of functionIds) this.mainFunctions.delete(id);
   }
@@ -453,11 +496,13 @@ export class PluginProcessHost {
       if (typeof descriptor.isAvailableId !== 'string' || typeof descriptor.streamId !== 'string') {
         throw new Error('Inference provider callbacks were not registered');
       }
+      const isAvailableId = descriptor.isAvailableId;
+      const streamId = descriptor.streamId;
       this.inferenceAvailable = descriptor.available === true;
-      this.inferenceAvailabilityCallbackId = descriptor.isAvailableId;
+      this.inferenceAvailabilityCallbackId = isAvailableId;
       const readAvailability = () => this.status === 'running' && this.inferenceAvailable;
       const openStream = (streamOptions: Parameters<PluginInferenceProvider['stream']>[0]) =>
-        this.invokeChildStream(descriptor.streamId as string, [streamOptions]);
+        this.invokeChildStream(streamId, [streamOptions]);
       const provider: PluginInferenceProvider = {
         name: descriptor.name,
         isAvailable: readAvailability,
@@ -467,6 +512,15 @@ export class PluginProcessHost {
           }
         },
       };
+      // The utility no longer releases these raw-id callbacks itself (only the
+      // host knows when no in-flight turn still references the provider). Tie
+      // their release to GC of THIS provider object — which transitively holds
+      // both ids via its stream/isAvailable closures, and which the agent
+      // framework keeps alive for the duration of any in-flight turn that
+      // captured it. `streamId` is held only by the provider, so it releases on
+      // that GC. `isAvailableId` is ALSO held by the poll loop, so it releases
+      // only once BOTH the provider is collected and the poll has moved off it.
+      this.trackInferenceProviderCallbacks(provider, isAvailableId, streamId);
       this.options.api.agent.registerInferenceProvider(provider);
       this.startInferenceAvailabilityPolling();
       return null;
@@ -474,6 +528,7 @@ export class PluginProcessHost {
 
     if (method === 'agent.unregisterInferenceProvider') {
       this.stopInferenceAvailabilityPolling();
+      this.releaseIdleInferencePollCallback();
       this.options.api.agent.unregisterInferenceProvider();
       return null;
     }

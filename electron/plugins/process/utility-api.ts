@@ -100,24 +100,6 @@ export function createUtilityPluginAPI(options: {
   const asyncCall = <T>(method: string, args: unknown[] = []): Promise<T> =>
     transport.asyncCall(method, args) as Promise<T>;
 
-  // Ids of the currently-registered inference-provider callbacks. Unlike wire-
-  // passed callbacks (GC-released on the host side), these travel as raw ids and
-  // .bind() makes a fresh function each call — so the host never releases them.
-  // Release them ourselves when the provider is replaced or unregistered.
-  let inferenceCallbackIds: string[] = [];
-  // Ids from handoffs that TIMED OUT: we can't tell whether the host adopted
-  // them, so we keep them alive but must still remember them — otherwise they'd
-  // fall out of all bookkeeping and leak permanently. A later CONFIRMED success
-  // (register/unregister) proves the host settled on some other set, so every
-  // ambiguous set accumulated until then can finally be released.
-  let ambiguousInferenceCallbackIds: string[] = [];
-  const releaseInferenceCallbacks = (): void => {
-    for (const id of inferenceCallbackIds) transport.releaseFunction(id);
-    for (const id of ambiguousInferenceCallbackIds) transport.releaseFunction(id);
-    inferenceCallbackIds = [];
-    ambiguousInferenceCallbackIds = [];
-  };
-
   const api: PluginAPI = {
     pluginName: manifest.name,
     pluginDir,
@@ -403,15 +385,13 @@ export function createUtilityPluginAPI(options: {
         if (!provider || typeof provider.isAvailable !== 'function' || typeof provider.stream !== 'function') {
           throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
         }
-        const previousIds = inferenceCallbackIds;
         const isAvailableId = transport.registerFunction(provider.isAvailable.bind(provider));
         const streamId = transport.registerFunction(
           provider.stream.bind(provider) as unknown as (...args: unknown[]) => unknown,
         );
-        // Evaluate availability BEFORE the handoff attempt. If isAvailable()
-        // itself makes a plugin call that times out, that happens while the host
-        // is still unambiguously using previousIds — so it must NOT be treated as
-        // an ambiguous handoff. Clean up the just-registered orphans and rethrow.
+        // Evaluate availability BEFORE the handoff. If isAvailable() makes a
+        // plugin call that fails/times out, the host never received these ids —
+        // free the orphans and rethrow (any prior provider stays intact).
         let available: boolean;
         try {
           available = Boolean(provider.isAvailable());
@@ -420,41 +400,33 @@ export function createUtilityPluginAPI(options: {
           transport.releaseFunction(streamId);
           throw error;
         }
-        // Now the actual host handoff. Only a timeout HERE is ambiguous (the
-        // request may or may not have been processed).
-        let handoffStarted = false;
         try {
-          handoffStarted = true;
           sync('agent.registerInferenceProvider', [{ name: provider.name, available, isAvailableId, streamId }]);
         } catch (error) {
-          if (handoffStarted && error instanceof PluginCallTimeoutError) {
-            // Ambiguous: the host may have adopted the new ids OR still be using
-            // the old ones. Keep BOTH sets alive, and remember BOTH in the
-            // ambiguous bucket so a later confirmed op can reclaim them (they
-            // travel as raw ids the host never GC-releases). Adopt the new set
-            // as "current" so a subsequent successful call reconciles cleanly.
-            ambiguousInferenceCallbackIds.push(...previousIds);
-            inferenceCallbackIds = [isAvailableId, streamId];
-            throw error;
+          // On a TIMEOUT the host MAY have adopted these ids (and built a provider
+          // around them, possibly captured by an in-flight agent turn) — freeing
+          // here could break a delayed stream() call. So DON'T: the host owns
+          // their lifetime and GC-releases them when its provider object is
+          // collected. On a CONFIRMED rejection the host never took them → free.
+          if (!(error instanceof PluginCallTimeoutError)) {
+            transport.releaseFunction(isAvailableId);
+            transport.releaseFunction(streamId);
           }
-          // Confirmed rejection (or a pre-handoff failure): the host will never
-          // use the new ids. Free them; leave the prior provider intact.
-          transport.releaseFunction(isAvailableId);
-          transport.releaseFunction(streamId);
           throw error;
         }
-        // Confirmed success: the host settled on the new ids. Release the prior
-        // set AND any ambiguous ids accumulated from earlier timeouts — they're
-        // now provably unused.
-        inferenceCallbackIds = [isAvailableId, streamId];
-        for (const id of previousIds) transport.releaseFunction(id);
-        for (const id of ambiguousInferenceCallbackIds) transport.releaseFunction(id);
-        ambiguousInferenceCallbackIds = [];
+        // Success: the host now owns these callbacks and is SOLELY responsible
+        // for releasing them (via `release-callback`) once its provider object —
+        // including any in-flight agent turn that captured it — is GC'd. The
+        // utility deliberately does NOT release inference-provider ids on
+        // re-register/unregister: only the host knows when no in-flight user
+        // remains, so utility-side release would race a delayed stream() call.
       },
       unregisterInferenceProvider: () => {
         checkPermission('agent:inference-provider');
+        // Do NOT release the callback ids here — the host's provider object may
+        // still be captured by an in-flight agent turn. The host releases them
+        // via `release-callback` when that object is collected.
         sync('agent.unregisterInferenceProvider');
-        releaseInferenceCallbacks();
       },
       registerCliTool: (tool) => {
         checkPermission('agent:register-cli-tool');

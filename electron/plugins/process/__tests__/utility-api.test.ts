@@ -159,7 +159,7 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(events).toEqual([{ type: 'text-delta', text: 'streamed', conversationId: 'c1' }]);
   });
 
-  it('releases prior inference-provider callback ids on re-register and unregister', () => {
+  it('does NOT release inference-provider ids on re-register/unregister (host owns their lifetime)', () => {
     const { api, calls, functions } = setup();
     const makeProvider = () => ({
       name: 'Fixture',
@@ -177,26 +177,22 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(functions.has(first.isAvailableId)).toBe(true);
     expect(functions.has(first.streamId)).toBe(true);
 
-    // Re-registering must release the FIRST registration's ids only AFTER the
-    // new registration succeeds (they'd otherwise leak — .bind() makes fresh
-    // functions each call, so there's never any id reuse to rely on).
+    // Re-registering must NOT release the prior ids: an in-flight agent turn may
+    // still hold the old provider object, and only the host (via GC of that
+    // object → `release-callback`) can safely retire them. So both sets persist
+    // here — the utility never frees inference-provider callbacks itself.
     api.agent.registerInferenceProvider(makeProvider());
-    expect(functions.has(first.isAvailableId)).toBe(false);
-    expect(functions.has(first.streamId)).toBe(false);
+    expect(functions.has(first.isAvailableId)).toBe(true);
+    expect(functions.has(first.streamId)).toBe(true);
+    expect(functions.size).toBe(4);
 
-    const second = calls.filter((c) => c.method === 'agent.registerInferenceProvider')[1].args[0] as {
-      isAvailableId: string;
-      streamId: string;
-    };
-    expect(functions.has(second.isAvailableId)).toBe(true);
-
-    // Unregister releases the live registration's ids too.
+    // Unregister likewise does not release — the host does when its provider is
+    // collected.
     api.agent.unregisterInferenceProvider();
-    expect(functions.has(second.isAvailableId)).toBe(false);
-    expect(functions.has(second.streamId)).toBe(false);
+    expect(functions.size).toBe(4);
   });
 
-  it('keeps the prior provider intact and cleans up new ids when replacement fails', () => {
+  it('frees the just-registered ids only on a CONFIRMED handoff rejection', () => {
     const { api, calls, functions, transport } = setup();
     const makeProvider = () => ({
       name: 'Fixture',
@@ -212,23 +208,22 @@ describe('utility-process plugin API compatibility proxy', () => {
       streamId: string;
     };
 
-    // Make the NEXT host handoff fail.
+    // A CONFIRMED rejection (not a timeout): the host never took the new ids.
     (transport.syncCall as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((method: string) => {
-      if (method === 'agent.registerInferenceProvider') throw new Error('handoff failed');
+      if (method === 'agent.registerInferenceProvider') throw new Error('handoff rejected');
       return undefined;
     });
 
     const idsBefore = [...functions.keys()];
-    expect(() => api.agent.registerInferenceProvider(makeProvider())).toThrow('handoff failed');
+    expect(() => api.agent.registerInferenceProvider(makeProvider())).toThrow('handoff rejected');
 
-    // Prior provider's ids must survive (host still points to them)…
+    // Prior provider's ids survive; the orphaned new ids are freed → no leak.
     expect(functions.has(first.isAvailableId)).toBe(true);
     expect(functions.has(first.streamId)).toBe(true);
-    // …and the just-registered (now-orphaned) ids must be cleaned up, so no leak.
     expect([...functions.keys()].sort()).toEqual(idsBefore.sort());
   });
 
-  it('keeps BOTH id sets alive when provider replacement TIMES OUT (ambiguous)', async () => {
+  it('keeps the new ids alive on a handoff TIMEOUT (host may have adopted them)', async () => {
     const { PluginCallTimeoutError } = await import('../utility-transport.js');
     const { api, calls, functions, transport } = setup();
     const makeProvider = () => ({
@@ -245,29 +240,19 @@ describe('utility-process plugin API compatibility proxy', () => {
       streamId: string;
     };
 
-    // Next handoff TIMES OUT — the host may still adopt the queued request, so
-    // neither the new ids NOR the old ids may be freed (freeing either could
-    // strand a live provider on an unknown callback).
+    // On a TIMEOUT the host MAY have adopted the new ids (and built a provider a
+    // turn could capture), so the utility must NOT free them — the host releases
+    // them via `release-callback` when its provider object is collected. Both
+    // sets therefore persist on the utility side.
     (transport.syncCall as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((method: string) => {
       if (method === 'agent.registerInferenceProvider') throw new PluginCallTimeoutError('timed out');
       return undefined;
     });
 
     expect(() => api.agent.registerInferenceProvider(makeProvider())).toThrow('timed out');
-
-    // Old ids preserved (host might still be using the prior provider).
     expect(functions.has(first.isAvailableId)).toBe(true);
     expect(functions.has(first.streamId)).toBe(true);
-    // New ids preserved too (host might have adopted the new provider). 4 total.
-    expect(functions.size).toBe(4);
-
-    // A later SUCCESSFUL registration proves the host settled elsewhere, so the
-    // ambiguous prior set is finally reclaimed (no permanent leak) — leaving only
-    // the newest 2 callbacks.
-    api.agent.registerInferenceProvider(makeProvider());
-    expect(functions.has(first.isAvailableId)).toBe(false);
-    expect(functions.has(first.streamId)).toBe(false);
-    expect(functions.size).toBe(2);
+    expect(functions.size).toBe(4); // both sets kept; host owns release
   });
 
   it('does NOT treat an isAvailable() timeout (pre-handoff) as ambiguous', async () => {
