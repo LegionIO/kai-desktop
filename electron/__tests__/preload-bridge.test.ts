@@ -105,7 +105,7 @@ describe('preload bridge contract', () => {
     { ns: 'workspaces', methods: ['create', 'rename', 'delete', 'setActive'] },
     { ns: 'memory', methods: ['clear', 'testEmbedding'] },
     { ns: 'mcp', methods: ['testConnection'] },
-    { ns: 'plugins', methods: [] },
+    { ns: 'plugins', methods: ['pause', 'resume', 'kill', 'disable', 'enable'] },
     { ns: 'dialog', methods: [] },
   ];
 
@@ -148,6 +148,17 @@ describe('preload bridge contract', () => {
 
     unsubscribe();
     expect(removeListenerMock).toHaveBeenCalledWith('config:changed', expect.any(Function));
+  });
+
+  it.each([
+    ['pause', 'plugin:pause'],
+    ['resume', 'plugin:resume'],
+    ['kill', 'plugin:kill'],
+  ] as const)('plugins.%s routes through the matching control channel', async (method, channel) => {
+    invokeMock.mockClear();
+    const pluginsNs = exposedAPI?.plugins as Record<string, (pluginName: string) => Promise<unknown>>;
+    await pluginsNs[method]('fixture-plugin');
+    expect(invokeMock).toHaveBeenCalledWith(channel, 'fixture-plugin');
   });
 });
 

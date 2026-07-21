@@ -1,11 +1,9 @@
 import { Notification, BrowserWindow } from 'electron';
 import { readdirSync, readFileSync, existsSync, statSync, mkdirSync, unlinkSync } from 'fs';
 import { join, resolve, sep } from 'path';
-import { pathToFileURL } from 'url';
 import type {
   PluginManifest,
   PluginInstance,
-  PluginModule,
   PluginUIState,
   PluginRendererScript,
   PluginRendererStyle,
@@ -57,6 +55,7 @@ import type { MarketplaceCatalogEntry, InstallResult } from './marketplace-servi
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
+import { PluginProcessHost } from './process/plugin-process-host.js';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -127,6 +126,8 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
 export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
+  /** One independently-accounted Electron utility process per live plugin. */
+  private pluginProcesses: Map<string, PluginProcessHost> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private cliToolChangeCallback: (() => void) | null = null;
   private actionHandlers: Map<string, Map<string, PluginActionHandler>> = new Map();
@@ -604,10 +605,6 @@ export class PluginManager {
         return;
       }
 
-      const moduleUrl = `${pathToFileURL(backendPath).href}?v=${instance.fileHash}`;
-      const mod = (await import(moduleUrl)) as PluginModule;
-      instance.module = mod;
-
       const api = createPluginAPI(instance, {
         appHome: this.appHome,
         isLive: () => this.isCurrentInstance(instance),
@@ -697,9 +694,18 @@ export class PluginManager {
       }
       instance.agentHookUnsubscribers = [];
 
-      if (typeof mod.activate === 'function') {
-        await mod.activate(api);
-      }
+      const processHost = new PluginProcessHost({
+        manifest,
+        pluginDir: dir,
+        backendPath,
+        fileHash: instance.fileHash,
+        api,
+        utilityEntryPath: join(import.meta.dirname, 'plugin-host.js'),
+        syncWorkerPath: join(import.meta.dirname, 'plugin-sync-worker.js'),
+        onUnexpectedExit: (details) => this.handleUnexpectedPluginExit(instance, details),
+      });
+      this.pluginProcesses.set(manifest.name, processHost);
+      await processHost.activate();
 
       // Check for frontend entry point at frontend.js
       const frontendPath = join(dir, 'frontend.js');
@@ -761,10 +767,86 @@ export class PluginManager {
           cleanupErr,
         );
       }
+      const processHost = this.pluginProcesses.get(manifest.name);
+      if (processHost) {
+        await processHost.stop(true);
+        this.pluginProcesses.delete(manifest.name);
+      }
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.error(`[PluginManager] Failed to load plugin "${manifest.name}":`, err);
     }
+  }
+
+  /**
+   * A crash, fatal V8 error, or explicit process.exit() is contained to the
+   * owning plugin. Remove every main-side proxy it registered, keep the
+   * instance as an error row for the UI, and leave the other plugin processes
+   * untouched.
+   */
+  private async handleUnexpectedPluginExit(
+    instance: PluginInstance,
+    details: { code: number; error?: string },
+  ): Promise<void> {
+    if (!this.isCurrentInstance(instance) || instance.tearingDown) return;
+    const pluginName = instance.manifest.name;
+    instance.state = 'error';
+    instance.error = details.error ?? `Plugin process exited unexpectedly (code ${details.code})`;
+    instance.registeredTools = [];
+    instance.preSendHooks = [];
+    instance.postReceiveHooks = [];
+    instance.preUpdateHooks = [];
+    instance.postUpdateHooks = [];
+    instance.configChangeListeners = [];
+    instance.inferenceProvider = null;
+    instance.contributedCliTools = [];
+    instance.declaredEvents = [];
+    instance.declaredActions = [];
+    instance.uiBanners = [];
+    instance.uiModals = [];
+    instance.uiSettingsSections = [];
+    instance.uiPanels = [];
+    instance.uiNavigationItems = [];
+    instance.uiCommands = [];
+    instance.conversationDecorations = [];
+    instance.threadDecorations = [];
+    instance.notifications = [];
+    instance.publishedState = {};
+    for (const off of instance.eventUnsubscribers.splice(0)) {
+      try {
+        off();
+      } catch {}
+    }
+    for (const off of instance.agentHookUnsubscribers.splice(0)) {
+      try {
+        off();
+      } catch {}
+    }
+    eventBus.unregisterSource(`plugin.${pluginName}`);
+    this.actionHandlers.delete(pluginName);
+    for (const [key, timer] of this.notificationTimers.entries()) {
+      if (!key.startsWith(`${pluginName}:`)) continue;
+      clearTimeout(timer);
+      this.notificationTimers.delete(key);
+    }
+    for (const [key, notification] of this.nativeNotifications.entries()) {
+      if (!key.startsWith(`${pluginName}:`)) continue;
+      try {
+        notification.close();
+      } catch {
+        // Best-effort cleanup for a process that is already failing.
+      }
+      this.nativeNotifications.delete(key);
+    }
+    try {
+      const api = this.pluginAPIs.get(pluginName);
+      if (api) await cleanupPluginAPI(api);
+    } catch (error) {
+      console.error(`[PluginManager] Error cleaning up crashed plugin "${pluginName}":`, error);
+    }
+    this.broadcastUIState();
+    this.notifyToolsChanged();
+    this.notifyCliToolsChanged();
   }
 
   /* ── Unloading ── */
@@ -794,9 +876,7 @@ export class PluginManager {
     for (const [name, instance] of sorted) {
       instance.tearingDown = true;
       try {
-        if (instance.module?.deactivate) {
-          await instance.module.deactivate();
-        }
+        await this.pluginProcesses.get(name)?.deactivate();
       } catch (err) {
         console.error(`[PluginManager] Error deactivating plugin "${name}":`, err);
       }
@@ -809,6 +889,7 @@ export class PluginManager {
         console.error(`[PluginManager] Error cleaning up plugin API for "${name}":`, err);
       }
       instance.tearingDown = false;
+      this.pluginProcesses.delete(name);
     }
 
     for (const timer of this.notificationTimers.values()) {
@@ -817,6 +898,7 @@ export class PluginManager {
 
     this.plugins.clear();
     this.pluginAPIs.clear();
+    this.pluginProcesses.clear();
     this.actionHandlers.clear();
     this.notificationTimers.clear();
     this.notifyToolsChanged();
@@ -828,12 +910,11 @@ export class PluginManager {
 
     instance.tearingDown = true;
     try {
-      if (instance.module?.deactivate) {
-        await instance.module.deactivate();
-      }
+      await this.pluginProcesses.get(pluginName)?.deactivate();
     } catch (err) {
       console.error(`[PluginManager] Error deactivating plugin "${pluginName}":`, err);
     }
+    this.pluginProcesses.delete(pluginName);
     // Always run API cleanup (e.g. close HTTP servers) even if deactivate() threw,
     // so a partially-activated/errored plugin can't leak resources.
     try {
@@ -1070,6 +1151,36 @@ export class PluginManager {
     return this.plugins.get(pluginName) ?? null;
   }
 
+  async pausePlugin(pluginName: string): Promise<void> {
+    await this.withInstallLock(pluginName, async () => {
+      const instance = this.plugins.get(pluginName);
+      const host = this.pluginProcesses.get(pluginName);
+      if (!instance || instance.state !== 'active' || !host) {
+        throw new Error(`Plugin "${pluginName}" is not active`);
+      }
+      host.pause();
+    });
+  }
+
+  async resumePlugin(pluginName: string): Promise<void> {
+    await this.withInstallLock(pluginName, async () => {
+      const instance = this.plugins.get(pluginName);
+      const host = this.pluginProcesses.get(pluginName);
+      if (!instance || instance.state !== 'active' || !host) {
+        throw new Error(`Plugin "${pluginName}" is not active`);
+      }
+      host.resume();
+    });
+  }
+
+  async killPlugin(pluginName: string): Promise<void> {
+    await this.withInstallLock(pluginName, async () => {
+      const host = this.pluginProcesses.get(pluginName);
+      if (!host) throw new Error(`Plugin "${pluginName}" has no running process`);
+      await host.kill();
+    });
+  }
+
   private pluginSettingsPath(pluginName: string): string {
     // Defense-in-depth: discovery already rejects non-slug names, but this path
     // is derived from a name that also flows in via IPC — refuse anything that
@@ -1199,7 +1310,7 @@ export class PluginManager {
       const payload = viewFor(instance);
 
       try {
-        instance.module?.onConfigChanged?.(payload);
+        this.pluginProcesses.get(name)?.notifyConfigChanged(payload);
       } catch (err) {
         console.error(`[PluginManager] Error in plugin "${name}" onConfigChanged:`, err);
       }

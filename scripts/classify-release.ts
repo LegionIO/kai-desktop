@@ -8,6 +8,7 @@
  * - Electron version has NOT changed
  * - Native dependencies have NOT changed (better-sqlite3, tiktoken, node-pty, libsql)
  * - Node engines requirement has NOT changed
+ * - The plugin utility-process shell protocol has NOT changed
  *
  * Usage:  node --import tsx scripts/classify-release.ts [--base-tag <tag>]
  *
@@ -133,6 +134,17 @@ export function comparePackages(currentPkg: Record<string, unknown>, prevPkg: Re
   const prevEngines = (prevPkg.engines as Record<string, unknown>)?.node as string | undefined;
   if (currentEngines !== prevEngines) {
     reasons.push(`Node engines changed: ${prevEngines} → ${currentEngines}`);
+  }
+
+  // The utility entrypoint and synchronous worker live in the signed app.asar;
+  // OTA overlays replace only preload/renderer. A protocol bump therefore
+  // requires a full shell update even though the implementation is pure JS.
+  const currentPluginProtocol = currentPkg.pluginProcessProtocolVersion as number | undefined;
+  const prevPluginProtocol = prevPkg.pluginProcessProtocolVersion as number | undefined;
+  if (currentPluginProtocol !== prevPluginProtocol) {
+    reasons.push(
+      `Plugin process protocol changed: ${prevPluginProtocol ?? '(none)'} → ${currentPluginProtocol ?? '(none)'}`,
+    );
   }
 
   const otaEligible = reasons.length === 0;

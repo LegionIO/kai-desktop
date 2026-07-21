@@ -383,6 +383,9 @@ const appAPI = {
     disable: (pluginName: string, opts?: { persist?: boolean }) =>
       ipcRenderer.invoke('plugin:disable', pluginName, opts) as Promise<{ success: boolean }>,
     enable: (pluginName: string) => ipcRenderer.invoke('plugin:enable', pluginName) as Promise<{ success: boolean }>,
+    pause: (pluginName: string) => ipcRenderer.invoke('plugin:pause', pluginName) as Promise<{ success: boolean }>,
+    resume: (pluginName: string) => ipcRenderer.invoke('plugin:resume', pluginName) as Promise<{ success: boolean }>,
+    kill: (pluginName: string) => ipcRenderer.invoke('plugin:kill', pluginName) as Promise<{ success: boolean }>,
     marketplaceRefresh: () =>
       ipcRenderer.invoke('plugin:marketplace-refresh') as Promise<
         Array<{
@@ -900,6 +903,21 @@ const appAPI = {
           count: number;
           lastTs: string;
           sample: string;
+        }>;
+        pluginProcesses: Array<{
+          pluginName: string;
+          displayName: string;
+          pid: number | null;
+          status: 'starting' | 'running' | 'paused' | 'stopping' | 'crashed';
+          canPause: boolean;
+          startedAt: string;
+          crashCount: number;
+          lastExitCode: number | null;
+          lastError: string | null;
+          cpuPercent: number;
+          cumulativeCpuSeconds: number | null;
+          privateMemoryBytes: number;
+          residentSetBytes: number;
         }>;
       }>,
     tailLog: (maxBytes?: number) =>

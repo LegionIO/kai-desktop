@@ -101,6 +101,21 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return { success: true };
   });
 
+  ipcMain.handle('plugin:pause', async (_event, pluginName: string) => {
+    await pluginManager.pausePlugin(pluginName);
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:resume', async (_event, pluginName: string) => {
+    await pluginManager.resumePlugin(pluginName);
+    return { success: true };
+  });
+
+  ipcMain.handle('plugin:kill', async (_event, pluginName: string) => {
+    await pluginManager.killPlugin(pluginName);
+    return { success: true };
+  });
+
   ipcMain.handle('plugin:marketplace-refresh', async () => {
     const catalog = await pluginManager.refreshMarketplace();
     return catalog;

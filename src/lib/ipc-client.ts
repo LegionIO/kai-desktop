@@ -279,6 +279,9 @@ type AppAPI = {
     marketplaceUninstall: (pluginName: string) => Promise<{ success: boolean }>;
     disable: (pluginName: string, opts?: { persist?: boolean }) => Promise<{ success: boolean }>;
     enable: (pluginName: string) => Promise<{ success: boolean }>;
+    pause: (pluginName: string) => Promise<{ success: boolean }>;
+    resume: (pluginName: string) => Promise<{ success: boolean }>;
+    kill: (pluginName: string) => Promise<{ success: boolean }>;
     marketplaceRefresh: () => Promise<
       Array<{
         name: string;
@@ -372,6 +375,21 @@ type AppAPI = {
         count: number;
         lastTs: string;
         sample: string;
+      }>;
+      pluginProcesses: Array<{
+        pluginName: string;
+        displayName: string;
+        pid: number | null;
+        status: 'starting' | 'running' | 'paused' | 'stopping' | 'crashed';
+        canPause: boolean;
+        startedAt: string;
+        crashCount: number;
+        lastExitCode: number | null;
+        lastError: string | null;
+        cpuPercent: number;
+        cumulativeCpuSeconds: number | null;
+        privateMemoryBytes: number;
+        residentSetBytes: number;
       }>;
     }>;
     tailLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;

@@ -2,6 +2,7 @@
   "name": "kai",
   "productName": "Kai",
   "version": "1.0.195",
+  "pluginProcessProtocolVersion": 1,
   "description": "Kai - Local AI Assistant",
   "main": "./out/main/index.js",
   "bin": {
@@ -40,6 +41,7 @@
     "test:fixtures:verify": "tsx scripts/verify-fixtures.ts",
     "compare:fixture-shapes": "tsx scripts/compare-fixture-shapes.ts",
     "verify:fuses": "tsx scripts/verify-fuses.ts",
+    "verify:plugin-process": "pnpm build && esbuild electron/plugins/process/plugin-process-host.ts --bundle --platform=node --format=esm --packages=external --external:electron --outfile=out/plugin-process-smoke-host.mjs && electron scripts/verify-plugin-process.mjs",
     "check:lockfile-registry": "node scripts/check-lockfile-registry.mjs",
     "assert:update-verification": "tsx scripts/assert-update-verification.ts",
     "test:ipc-seam:linux": "playwright test --config playwright.config.ts",

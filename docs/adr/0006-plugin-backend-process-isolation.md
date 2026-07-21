@@ -1,176 +1,196 @@
-# ADR 0006: Plugin Backend Process Isolation (Research)
+# ADR 0006: Plugin Backend Process Isolation
 
-- **Status**: Proposed — research only, no decision to build yet
+- **Status**: Accepted and implemented
 - **Date**: 2026-07-20
-- **Deciders**: maintainers (pending)
+- **Deciders**: maintainers
 
 ## Context
 
-Plugin **backends** run **in the Electron main process**. Each plugin's
-`backend.js` is loaded by dynamic `import()` (`PluginManager.loadPlugin`) and
-its `activate(api)` runs with a live in-process API object. Every plugin's
-timers, WebSockets, caches, tool bodies, and agent hooks execute inside the one
-main process.
+Plugin backends previously ran inside Electron's main process. Each plugin's
+`backend.js`, `activate(api)`, timers, WebSockets, caches, tool bodies, hooks,
+and inference providers therefore shared one event loop and one OS process.
 
-Two consequences motivated this research:
+That design had two unacceptable properties:
 
-1. **No per-plugin resource attribution.** The OS accounts CPU/memory per
-   _process_. Because all 8 installed plugins share the main process, neither the
-   OS nor the new Diagnostics panel (which currently counts only unhandled
-   errors per plugin) can say "plugin X is using 40% CPU / 300 MB." A runaway
-   plugin (e.g. a tight poll loop, a leaking cache) is invisible as _resource_
-   usage and can only be inferred from error counts or symptoms.
-2. **No fault/CPU isolation.** A plugin that spins, leaks, or blocks the event
-   loop degrades the whole app — the same class of problem as the EPIPE
-   self-loop we just fixed, but sourced from third-party code we don't control.
+1. The OS could not attribute CPU or memory to a specific plugin.
+2. A plugin crash, infinite loop, or memory leak could degrade or terminate the
+   main application and every other plugin.
 
-True per-plugin CPU/memory requires the plugin backend to run in its **own OS
-process** (Electron `utilityProcess`, or `child_process`/`worker_threads`), so
-the OS can attribute resources and a crash/spin is contained. This ADR records
-what that would actually take. **There is no `utilityProcess` precedent anywhere
-in the codebase** — this would be greenfield.
+Moving a backend across a process boundary is not a simple `fork()`. The public
+plugin API intentionally contains synchronous methods (`config.get`,
+`state.set`, `safeStorage.encryptString`, conversation access), callback
+registrations (tools, hooks, events, actions, auth helpers), `AbortSignal`s, and
+async generators. Requiring every plugin to become async would be a breaking
+API-major migration and would force rewrites of existing plugins.
 
-## The core obstacle
+## Decision
 
-The plugin API is **not** a serializable message channel today. It is a live
-in-process object (`createPluginAPI` in `electron/plugins/plugin-api.ts`)
-holding closures over the shared mutable `PluginInstance` and ~30
-`PluginAPICallbacks` wired in `PluginManager.loadPlugin`. A plugin backend
-touches roughly **12-15 distinct main-process subsystems synchronously**, ~10
-of them via crossings that cannot be serialized as-is: callbacks the main
-process invokes, async generators, live handles, or shared mutable state. Each
-would need a dedicated async IPC shim/proxy.
+Run every enabled plugin backend in its own Electron `utilityProcess`. Keep a
+thin, permission-enforcing broker in the main process for Electron-only state
+and live handles. Preserve the existing plugin API call shapes through two
+purpose-built transports.
 
-### Tier 1 — Callbacks/closures the main process invokes (hardest; not serializable)
+### Process topology
 
-Symbols in `plugin-api.ts` (`createPluginAPI`) unless noted; invocation sites in
-`electron/ipc/agent.ts` and `electron/plugins/plugin-manager.ts`.
+Each plugin gets:
 
-| API                                                                                                             | Why it's hard                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tools.register` → `tool.execute` (invoked by the agent tool loop in `ipc/agent.ts`)                            | Tool body is a plugin closure run in-process on the agent's hot path, receiving a live `ToolExecutionContext` (`electron/tools/types.ts`) with an `onProgress` callback **and** an `AbortSignal`. Isolation ⇒ every tool call becomes an async round-trip and `onProgress`/`abortSignal` must be proxied _back_ into the child. The single most coupled path. |
-| `agent.registerInferenceProvider` (consumed via `getInferenceProvider` in the model path)                       | Provider exposes sync `isAvailable()` and an **async-generator `stream()`**. Streaming a generator across a process boundary is a hard IPC problem.                                                                                                                                                                                                           |
-| `hooks.register` (PostToolUse etc.; invoked by `hookDispatcher` mid-loop)                                       | Handler runs mid-agent-loop; returns a live unsubscribe fn.                                                                                                                                                                                                                                                                                                   |
-| `messages.registerPreSendHook` / `registerPostReceiveHook` (awaited by `runPreSendHooks`/`runPostReceiveHooks`) | Closures on the turn hot path; can rewrite/abort the turn.                                                                                                                                                                                                                                                                                                    |
-| `lifecycle.registerPreUpdateHook` / `registerPostUpdateHook`                                                    | Closures on shared arrays.                                                                                                                                                                                                                                                                                                                                    |
-| `events.on(key, handler)` (via `subscribeBus` → `eventBus`)                                                     | Subscribes to in-process `eventBus`; returns live unsubscribe.                                                                                                                                                                                                                                                                                                |
-| `config.onChanged(cb)` (invoked by the manager's config-change path)                                            | Main invokes plugin cb synchronously on config change.                                                                                                                                                                                                                                                                                                        |
-| `onAction` + `events.declare({actions})` (dispatched by `handleAction`)                                         | The renderer→backend RPC entrypoint; handler runs in main.                                                                                                                                                                                                                                                                                                    |
-| `auth.openAuthWindow`                                                                                           | Accepts `onReady(helpers)` and returns helper closures (`executeJavaScript`, `onDidNavigate`, …) that drive `webContents` directly. `cookiePromotion` may itself be a function (`resolveCookiePromotion`) invoked per-cookie in a `session.cookies.on('changed')` listener.                                                                                   |
-| `http.listen(port, handler)`                                                                                    | `handler` runs per HTTP request with live `req`/`res` streams; returns a live `http.Server`.                                                                                                                                                                                                                                                                  |
+- one Electron utility process named `Kai Plugin: <plugin-name>`;
+- one worker thread inside that utility process for synchronous RPC; and
+- one authenticated loopback broker connection to the main process.
 
-### Tier 2 — Direct Electron main-only APIs (need async IPC shims)
+The worker thread is deliberately inside the plugin's utility process. It can
+continue servicing the broker while the plugin's JavaScript thread waits with
+`Atomics.wait`, and all of its CPU/memory remains attributed to the same plugin
+OS process.
 
-Imports and calls **7 Electron singletons**: `app, shell, BrowserWindow,
-safeStorage, session, net, Notification`, plus Node `http.createServer`.
+### Synchronous compatibility channel
 
-- `auth.openAuthWindow` — `new BrowserWindow`, `session.fromPartition`, `webRequest.onBeforeSendHeaders`. Deeply main-only.
-- `safeStorage.encryptString/decryptString` — **synchronous** today; plugins call them as blocking functions.
-- `browser.open`, `session.clearCookies`.
-- `fetch` — routes through `net.fetch`, returns a **streaming Response**.
-- `shell.openExternal`; `notifications.show/dismiss` → `showPluginNotification` (`new Notification` + `webContents.send`).
-- `agent.generate/stream` — pulls the full live tool registry (`getRegisteredTools`); `stream` is an async generator with an `abortSignal`.
+Legacy synchronous API methods retain their synchronous return values. The
+utility thread encodes a request, hands it and a `SharedArrayBuffer` to its
+worker, and waits. The worker performs asynchronous loopback I/O to the main
+broker, writes the response into shared memory, and wakes the utility thread.
+The main event loop never blocks on the plugin.
 
-### Tier 3 — Shared mutable state (needs a state-sync protocol)
+The broker is:
 
-The **`PluginInstance` object itself** is mutated by nearly every `ui.*`,
-`state.*`, tool/event registration (`uiBanners`, `uiModals`, `uiPanels`,
-`registeredTools`, `publishedState`, hook arrays, …). `broadcastUIState` ships
-serialized snapshots to the renderer. If the backend moved out, these mutations
-would happen in the child and need shipping back. `state.get/replace/set` +
-`emitEvent` read/write `instance.publishedState`.
+- bound only to `127.0.0.1` on an ephemeral port;
+- authenticated with a per-process 256-bit random token;
+- framed and size-bounded; and
+- rate-limited per plugin to contain API-call floods.
 
-### Tier 4 — Already serializable (easy, but sync + touch main stores)
+### Asynchronous and bidirectional channel
 
-`config.get/set/getPluginData`, `conversations.*` (hits the conversation store
-directly), `exec.run/which`, `detect.*`, `env.*`, `log.*`, `host.capabilities`.
-Results already serialize; only the sync call-shape and store access need an
-async shim.
+Electron's utility-process message port carries:
 
-### Renderer relationship (already solved)
+- async API calls and results;
+- tools, message hooks, lifecycle hooks, agent hooks, events, and actions;
+- tool-progress callbacks in the reverse direction;
+- auth-window helper callbacks and HTTP request handlers;
+- cancellation in both directions via proxied `AbortSignal`s; and
+- `agent.stream` and inference-provider streams as chunk/end/error sequences.
 
-Renderer↔backend is **already a serialized IPC boundary**, not shared memory:
-`frontend.js` is compiled to a browser ESM bundle served over
-`plugin-renderer://` and reaches the backend only via `plugin:action` /
-`plugin:modal-action` / `plugin:banner-action` IPC (`electron/ipc/plugins.ts`) →
-`handleAction`. So the renderer side is _not_ the problem — the
-backend↔main-process coupling is the unsolved part.
+Functions are represented by opaque callback IDs, never source serialization.
+Zod tool schemas cross as JSON Schema and are reconstructed on the receiving
+side. Other supported non-JSON values use explicit tagged wire forms.
 
-## Options considered
+### Main-side broker responsibilities
 
-### Option A — Process-level metrics only (no isolation)
+`createPluginAPI` remains the single permission and behavior implementation.
+The main-side process host calls that real API, so isolation does not duplicate
+or bypass permission checks. Main-only objects stay in main:
 
-Add `app.getAppMetrics()` + `process.memoryUsage()`/`getCPUUsage()` to the
-Diagnostics panel: live CPU%/memory for **main / each renderer / GPU / network**
-processes. **Cost: low** (a few IPC calls, no arch change). **Attribution:
-per-process only** — shows if Kai _overall_ is heavy, never per-plugin. Does not
-solve the stated goal but is a cheap, honest baseline.
+- `BrowserWindow`, sessions, notifications, shell, and `safeStorage`;
+- HTTP servers;
+- conversation/config stores and published UI state; and
+- the agent tool registry and generator implementation.
 
-### Option B — Plugin-API activity accounting (approximate, in-process)
+The streaming `net.fetch` implementation runs directly through Electron's
+`net` module in the utility process, with the same HTTP(S)-only permission
+gate, so a `Response` body remains streamable rather than being fully buffered
+through IPC.
 
-Instrument `createPluginAPI` to time every `api.*` call, timer tick, and `fetch`
-per plugin; attribute wall-time and call counts. **Cost: medium.**
-**Attribution: approximate _activity_, not true CPU** — but it would catch the
-common "runaway timer/poll" case (which is what we actually hit). Adds overhead
-to every plugin API call and cannot see CPU a plugin burns in pure computation
-that never calls the API.
+### Lifecycle and fault containment
 
-### Option C — Full backend process isolation (true per-plugin CPU/mem)
+Activation, config-change forwarding, deactivation, hot enable/disable, update
+rollback, and uninstall all target the owning process host. Deactivation has a
+bounded graceful window followed by `UtilityProcess.kill()`.
 
-Move each backend to a `utilityProcess`, replace the live API object with an
-async message-port RPC, and build proxies for every Tier 1-2 crossing. **Cost:
-very high**, and it changes plugin-visible semantics:
+If a utility process crashes or exits unexpectedly, the manager:
 
-- Every currently-synchronous API (`safeStorage.encryptString`, `state.set`,
-  `config.get`) becomes **async** → breaking change to the plugin API contract,
-  or a sync-over-async shim (not possible without `Atomics.wait`/SharedArrayBuffer
-  gymnastics).
-- Tool `execute`, agent hooks, and inference-provider `stream()` need
-  bidirectional streaming proxies (args in, `onProgress`/chunks/`abortSignal`
-  back). This is the bulk of the work and the highest-risk part.
-- `auth.openAuthWindow` and `http.listen` return live handles that can't cross a
-  process line — they'd need a full request/response and window-control proxy
-  protocol, or those capabilities stay main-side.
-- The existing capability/confinement system (`plugin-api.ts`,
-  `sandboxed-exec.ts`, `plugin-integrity.ts`) sandboxes _external binary spawns_,
-  **not** the plugin's own JS — so isolation is additive, not a refactor of
-  something existing.
+- marks only that plugin as errored;
+- rejects its pending calls and streams;
+- removes its tools, hooks, actions, subscriptions, and inference provider;
+- closes main-side resources such as its HTTP server; and
+- leaves the main application and all other plugin processes running.
 
-A realistic middle path within Option C: run the backend in a child process but
-keep a **thin main-side broker** that holds all the live handles
-(BrowserWindow, http.Server, safeStorage) and exposes them to the child over
-RPC. Tools/hooks/inference-provider that must run synchronously on the agent
-hot path arguably _stay_ in main (or the agent loop itself awaits the child).
-This bounds the blast radius but still async-ifies the API contract.
+### Resource diagnostics
 
-## Recommendation (for maintainer decision)
+`app.getAppMetrics()` is joined to the process registry by PID. The Kai
+Diagnostics GUI refreshes every five seconds and shows, per plugin:
 
-- **Adopt Option A now** — cheap, useful, no risk; gives real process-level
-  CPU/mem in the Diagnostics panel and an honest baseline.
-- **Consider Option B next** — it targets the failure mode we actually saw
-  (runaway plugin activity) at medium cost and no contract break.
-- **Defer Option C** — the payoff (true per-plugin CPU/mem, fault isolation) is
-  real, but it is a multi-week effort that breaks the plugin API's synchronous
-  contract and requires streaming proxies for the agent hot path. It should be
-  its own epic with a migration plan for the plugin API version, not folded into
-  diagnostics work.
+- PID;
+- CPU percentage;
+- private memory when supplied by Electron, otherwise working-set memory;
+- process state;
+- crash count and last error.
+
+The same table exposes pause, resume, kill, disable, and enable controls.
+Pause/resume uses `SIGSTOP`/`SIGCONT` on supported POSIX platforms, so a
+CPU-bound backend is suspended by the OS rather than asked to cooperate. Kill
+targets only the selected utility process. Disable/enable goes through the
+normal plugin lifecycle and persistence rules.
+
+These are OS process metrics, not estimated API activity.
+
+## Considered alternatives
+
+### Main-process metrics only
+
+Rejected because it cannot attribute resource use to a plugin and provides no
+fault or event-loop isolation.
+
+### In-process API activity accounting
+
+Rejected as the primary solution because it misses pure computation, native
+work, and memory leaks. It also does not protect the main event loop.
+
+### Async-only plugin API
+
+Rejected because it would break every synchronous plugin caller and require a
+plugin API major version. The worker-backed compatibility bridge preserves the
+current contract instead.
+
+### One shared plugin child process
+
+Rejected because one runaway plugin would still affect every other plugin and
+the OS could not provide per-plugin accounting.
 
 ## Consequences
 
-- If we ship only A/B, "per-plugin CPU/memory" remains _approximate_; we should
-  say so in the UI rather than imply true accounting.
-- If C is ever adopted, it forces a plugin-API major version (sync→async) and a
-  migration for all 8 in-tree plugins; the renderer boundary is unaffected.
-- The Diagnostics per-plugin **error** table (already shipped) is complementary
-  to all three and remains the fastest way to attribute a _crash storm_.
+### Positive
+
+- CPU, memory, crashes, and fatal V8 failures are attributable per plugin.
+- CPU loops and ordinary memory leaks cannot block the main event loop or other
+  plugin event loops.
+- Existing plugins continue using the same public API without rewrites.
+- Permission enforcement and Electron-only resources remain centralized.
+
+### Negative
+
+- Each enabled plugin now carries an Electron utility-process baseline and one
+  worker thread, increasing total application memory.
+- Cross-boundary calls cost more than in-process function calls.
+- A plugin can still consume broker work by calling host APIs; message size and
+  per-second/concurrency limits bound that path but do not make plugins a
+  security sandbox. A process flooding the host IPC channel is terminated.
+- Undocumented direct access to main-only Electron exports from `backend.js` is
+  no longer possible. The documented `PluginAPI` is preserved.
+
+### Mitigations
+
+- Published state remains locally readable in the utility process, while writes
+  are mirrored synchronously, avoiding a host round-trip for `state.get()`.
+- Output pipes are rate-limited and backpressured per plugin.
+- Activation/deactivation, synchronous RPC, and availability polling have
+  bounded timeouts.
+- The Diagnostics GUI makes process overhead and regressions visible.
+
+## Verification
+
+- Unit tests cover wire encoding, callback references, Zod schemas, synchronous
+  compatibility, state mirroring, tools, generators, and inference providers.
+- `pnpm verify:plugin-process` launches real Electron utility processes and
+  verifies activation, config/event callbacks, tools and progress, hooks,
+  actions, safe storage, agent streams, inference-provider streams, metrics,
+  pause/resume, forced termination, graceful teardown, and crash containment.
+- The normal `type-check`, `lint`, `test`, and `build` gates remain required.
 
 ## References
 
-- Coupling inventory: `electron/plugins/plugin-api.ts` (`createPluginAPI`),
-  `electron/plugins/plugin-manager.ts` (`loadPlugin` callback wiring,
-  `getAllPluginTools`, `runPreSendHooks`/`runPostReceiveHooks`, `handleAction`),
-  `electron/ipc/agent.ts` (plugin tool `execute` invocation), and
-  `electron/ipc/plugins.ts` (renderer→backend `plugin:action` RPC).
-- Related: ADR 0005 (platform capability seam) for the capability-gating model;
-  the shipped Diagnostics section (error attribution) in
-  `electron/diagnostics/` + `src/components/settings/DiagnosticsSettings.tsx`.
+- Runtime host: `electron/plugins/process/plugin-process-host.ts`
+- Utility runtime: `electron/plugins/process/utility-entry.ts`
+- Compatibility API: `electron/plugins/process/utility-api.ts`
+- Synchronous bridge: `electron/plugins/process/sync-rpc-worker.ts`
+- Wire protocol: `electron/plugins/process/wire.ts`
+- Lifecycle integration: `electron/plugins/plugin-manager.ts`
+- Resource UI: `src/components/settings/DiagnosticsSettings.tsx`

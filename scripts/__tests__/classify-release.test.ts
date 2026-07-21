@@ -14,6 +14,7 @@ import { comparePackages } from '../classify-release.js';
 type Pkg = Record<string, unknown>;
 const pkg = (over: Pkg = {}): Pkg => ({
   version: '1.2.0',
+  pluginProcessProtocolVersion: 1,
   dependencies: { 'better-sqlite3': '11.0.0', tiktoken: '1.0.0', '@lydell/node-pty': '1.0.0' },
   devDependencies: { electron: '32.0.0', esbuild: '0.23.0' },
   engines: { node: '>=22' },
@@ -71,6 +72,14 @@ describe('comparePackages — full update required (NOT OTA) when ABI changes', 
     const r = comparePackages(cur, prev);
     expect(r.otaEligible).toBe(false);
     expect(r.reasons.some((x) => /Node engines changed/.test(x))).toBe(true);
+  });
+
+  it('plugin utility-process protocol change → not eligible', () => {
+    const prev = pkg({ version: '1.1.0', pluginProcessProtocolVersion: undefined });
+    const cur = pkg({ version: '1.2.0', pluginProcessProtocolVersion: 1 });
+    const r = comparePackages(cur, prev);
+    expect(r.otaEligible).toBe(false);
+    expect(r.reasons.some((x) => /Plugin process protocol changed/.test(x))).toBe(true);
   });
 
   it('a native dep newly added (absent → present) → not eligible', () => {

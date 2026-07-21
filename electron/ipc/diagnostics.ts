@@ -7,6 +7,7 @@ import {
   resetDiagnosticCounters,
   type DiagnosticCounter,
 } from '../diagnostics/main-diagnostics.js';
+import { getPluginProcessMetrics, type PluginProcessMetric } from '../plugins/process/plugin-process-host.js';
 
 export interface DiagnosticsSummary {
   logPath: string;
@@ -14,6 +15,8 @@ export interface DiagnosticsSummary {
   sinceBoot: string;
   totalErrors: number;
   counters: DiagnosticCounter[];
+  /** One OS process per plugin, sampled through Electron's app metrics. */
+  pluginProcesses: PluginProcessMetric[];
 }
 
 /** Max bytes returned by diagnostics:tail-log (keeps the IPC payload bounded). */
@@ -36,6 +39,7 @@ export function registerDiagnosticsHandlers(ipcMain: IpcMain, mainProcessLogPath
       sinceBoot: getDiagnosticsBootTs(),
       totalErrors: counters.reduce((sum, c) => sum + c.count, 0),
       counters,
+      pluginProcesses: getPluginProcessMetrics(),
     };
   });
 

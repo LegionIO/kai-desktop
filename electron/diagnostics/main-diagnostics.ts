@@ -69,6 +69,16 @@ export function extractPluginName(formatted: string): string | null {
 export function recordDiagnostic(kind: DiagnosticKind, formatted: string): DiagnosticCounter {
   const safe = typeof formatted === 'string' ? formatted : String(formatted);
   const plugin = extractPluginName(safe);
+  return recordDiagnosticForPlugin(kind, plugin, safe);
+}
+
+/** Record an error whose plugin identity came from an isolated process host. */
+export function recordDiagnosticForPlugin(
+  kind: DiagnosticKind,
+  plugin: string | null,
+  formatted: string,
+): DiagnosticCounter {
+  const safe = typeof formatted === 'string' ? formatted : String(formatted);
   const key = `${kind}:${plugin ?? 'core'}`;
   const sample = safe.split('\n', 1)[0].slice(0, 300);
   const existing = counters.get(key);

@@ -103,6 +103,8 @@ export default defineConfig({
         input: {
           index: resolve(__dirname, 'electron/main.ts'),
           cli: resolve(__dirname, 'electron/cli/main.ts'),
+          'plugin-host': resolve(__dirname, 'electron/plugins/process/utility-entry.ts'),
+          'plugin-sync-worker': resolve(__dirname, 'electron/plugins/process/sync-rpc-worker.ts'),
         },
         output: {
           // Suppress Node's own deprecation warnings (e.g. the `punycode`

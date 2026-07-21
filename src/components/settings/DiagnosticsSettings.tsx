@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useState, type FC } from 'react';
-import { AlertTriangleIcon, RefreshCwIcon, Trash2Icon, ActivityIcon } from 'lucide-react';
+import {
+  ActivityIcon,
+  AlertTriangleIcon,
+  PauseIcon,
+  PlayIcon,
+  PowerIcon,
+  PowerOffIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+  XCircleIcon,
+} from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import type { SettingsProps } from './shared';
 import { CollapsibleSection } from './shared';
 
 type Summary = Awaited<ReturnType<typeof app.diagnostics.getSummary>>;
+type PluginList = Awaited<ReturnType<typeof app.plugins.list>>;
 
 /** Warn once the main-process log crosses this size — the same cap the writer rotates at. */
 const LOG_WARN_BYTES = 25 * 1024 * 1024;
@@ -24,20 +35,24 @@ function formatTs(iso: string): string {
 }
 
 /**
- * Diagnostics — surfaces main-process health so an error storm (the class of
+ * Diagnostics — surfaces process health so an error storm (the class of
  * bug that once pinned the event loop via an EPIPE self-loop and grew the log
  * to hundreds of MB) is visible and attributable to the offending plugin,
  * rather than only discoverable by manually inspecting ~/.kai/logs.
  */
 export const DiagnosticsSettings: FC<SettingsProps> = () => {
   const [summary, setSummary] = useState<Summary | null>(null);
+  const [plugins, setPlugins] = useState<PluginList>([]);
   const [tail, setTail] = useState<{ text: string; sizeBytes: number; truncated: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pluginControlBusy, setPluginControlBusy] = useState<string | null>(null);
+  const [pluginControlError, setPluginControlError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const s = await app.diagnostics.getSummary();
+      const [s, pluginList] = await Promise.all([app.diagnostics.getSummary(), app.plugins.list()]);
       setSummary(s);
+      setPlugins(pluginList);
     } catch {
       /* ignore — desktop-only surface */
     }
@@ -78,8 +93,30 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
     }
   }, [refresh]);
 
+  const controlPlugin = useCallback(
+    async (pluginName: string, action: 'pause' | 'resume' | 'kill' | 'disable' | 'enable') => {
+      setPluginControlBusy(`${pluginName}:${action}`);
+      setPluginControlError(null);
+      try {
+        if (action === 'pause') await app.plugins.pause(pluginName);
+        else if (action === 'resume') await app.plugins.resume(pluginName);
+        else if (action === 'kill') await app.plugins.kill(pluginName);
+        else if (action === 'disable') await app.plugins.disable(pluginName, { persist: true });
+        else await app.plugins.enable(pluginName);
+        await refresh();
+      } catch (error) {
+        setPluginControlError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setPluginControlBusy(null);
+      }
+    },
+    [refresh],
+  );
+
   const logOversized = (summary?.logSizeBytes ?? 0) > LOG_WARN_BYTES;
   const hasErrors = (summary?.totalErrors ?? 0) > 0;
+  const processByPlugin = new Map((summary?.pluginProcesses ?? []).map((process) => [process.pluginName, process]));
+  const pluginRows = plugins.map((plugin) => ({ plugin, process: processByPlugin.get(plugin.name) }));
 
   return (
     <div className="space-y-6">
@@ -89,8 +126,8 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
           Diagnostics
         </h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Main-process health. Unhandled errors are counted here and attributed to the originating plugin, so a runaway
-          plugin or error storm is visible instead of silently pinning the app.
+          Each plugin backend runs in its own utility process. CPU, memory, crashes, and unhandled errors are attributed
+          to the owning plugin instead of being hidden inside the main app process.
         </p>
       </div>
 
@@ -152,6 +189,151 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
             Clear log
           </button>
         </div>
+      </div>
+
+      {/* True per-plugin process resource attribution */}
+      <div>
+        <h4 className="text-xs font-semibold text-muted-foreground">Plugin process resources</h4>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Pause uses OS process suspension and stops plugin CPU work. Kill terminates only that plugin; disable also
+          tears down its registrations and persists the disabled state.
+        </p>
+        {pluginControlError && (
+          <div className="mt-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {pluginControlError}
+          </div>
+        )}
+        {summary && pluginRows.length > 0 ? (
+          <div className="mt-2 overflow-x-auto rounded-xl border border-border/70">
+            <table className="min-w-[760px] w-full text-xs">
+              <thead className="bg-muted/40 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Plugin</th>
+                  <th className="px-3 py-2 text-right font-medium">PID</th>
+                  <th className="px-3 py-2 text-right font-medium">CPU</th>
+                  <th className="px-3 py-2 text-right font-medium">Memory</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-3 py-2 text-right font-medium">Controls</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pluginRows.map(({ plugin, process }) => {
+                  const rowBusy = pluginControlBusy?.startsWith(`${plugin.name}:`) ?? false;
+                  const canTerminate =
+                    process?.status === 'starting' || process?.status === 'running' || process?.status === 'paused';
+                  return (
+                    <tr key={plugin.name} className="border-t border-border/50 align-top">
+                      <td className="px-3 py-2">
+                        <span className="font-medium">{plugin.displayName}</span>
+                        <div className="text-[11px] text-muted-foreground">{plugin.name}</div>
+                        {process?.lastError && process.status === 'crashed' && (
+                          <div className="mt-0.5 line-clamp-2 text-destructive">{process.lastError}</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{process?.pid ?? '—'}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {process ? (
+                          <>
+                            <div>{process.cpuPercent.toFixed(1)}%</div>
+                            {process.cumulativeCpuSeconds !== null && (
+                              <div className="text-[10px] text-muted-foreground">
+                                {process.cumulativeCpuSeconds.toFixed(1)}s total
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {process ? (
+                          <>
+                            <div>{formatBytes(process.privateMemoryBytes || process.residentSetBytes)}</div>
+                            {process.residentSetBytes > 0 &&
+                              process.residentSetBytes !== process.privateMemoryBytes && (
+                                <div className="text-[10px] text-muted-foreground">
+                                  RSS {formatBytes(process.residentSetBytes)}
+                                </div>
+                              )}
+                          </>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={process?.status === 'crashed' ? 'text-destructive' : 'text-muted-foreground'}>
+                          {process?.status ?? plugin.state}
+                          {process && process.crashCount > 0
+                            ? ` (${process.crashCount} crash${process.crashCount === 1 ? '' : 'es'})`
+                            : ''}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          {process?.status === 'running' && (
+                            <button
+                              type="button"
+                              disabled={rowBusy || !process.canPause}
+                              title={
+                                process.canPause ? 'Pause plugin process' : 'Pause is unavailable on this platform'
+                              }
+                              onClick={() => void controlPlugin(plugin.name, 'pause')}
+                              className="inline-flex items-center gap-1 rounded border border-border/70 px-2 py-1 hover:bg-accent disabled:opacity-40"
+                            >
+                              <PauseIcon className="h-3 w-3" /> Pause
+                            </button>
+                          )}
+                          {process?.status === 'paused' && (
+                            <button
+                              type="button"
+                              disabled={rowBusy}
+                              onClick={() => void controlPlugin(plugin.name, 'resume')}
+                              className="inline-flex items-center gap-1 rounded border border-border/70 px-2 py-1 hover:bg-accent disabled:opacity-40"
+                            >
+                              <PlayIcon className="h-3 w-3" /> Resume
+                            </button>
+                          )}
+                          {canTerminate && (
+                            <button
+                              type="button"
+                              disabled={rowBusy}
+                              onClick={() => void controlPlugin(plugin.name, 'kill')}
+                              className="inline-flex items-center gap-1 rounded border border-destructive/50 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                            >
+                              <XCircleIcon className="h-3 w-3" /> Kill
+                            </button>
+                          )}
+                          {plugin.state === 'disabled' ? (
+                            <button
+                              type="button"
+                              disabled={rowBusy}
+                              onClick={() => void controlPlugin(plugin.name, 'enable')}
+                              className="inline-flex items-center gap-1 rounded border border-border/70 px-2 py-1 hover:bg-accent disabled:opacity-40"
+                            >
+                              <PowerIcon className="h-3 w-3" /> Enable
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={rowBusy || plugin.brandRequired}
+                              title={plugin.brandRequired ? 'Required plugins cannot be disabled' : 'Disable plugin'}
+                              onClick={() => void controlPlugin(plugin.name, 'disable')}
+                              className="inline-flex items-center gap-1 rounded border border-border/70 px-2 py-1 hover:bg-accent disabled:opacity-40"
+                            >
+                              <PowerOffIcon className="h-3 w-3" /> Disable
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="mt-2 text-xs text-muted-foreground">No plugin backend processes are currently running.</p>
+        )}
       </div>
 
       {/* Per-plugin / per-kind error table */}

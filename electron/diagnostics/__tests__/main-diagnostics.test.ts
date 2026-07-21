@@ -15,6 +15,7 @@ import {
   isDeadPipeError,
   extractPluginName,
   recordDiagnostic,
+  recordDiagnosticForPlugin,
   getDiagnosticCounters,
   resetDiagnosticCounters,
   appendBoundedLog,
@@ -85,6 +86,13 @@ describe('diagnostic counters', () => {
     expect(counters[0].count).toBe(2); // sorted first
     expect(counters[0].plugin).toBe('cron');
     expect(counters.find((c) => c.plugin === null)?.kind).toBe('uncaughtException');
+  });
+
+  it('accepts explicit attribution from an isolated plugin process', () => {
+    recordDiagnosticForPlugin('uncaughtException', 'utility-plugin', 'Error: isolated crash');
+    expect(getDiagnosticCounters()).toEqual([
+      expect.objectContaining({ plugin: 'utility-plugin', kind: 'uncaughtException', count: 1 }),
+    ]);
   });
 
   it('reset clears the map', () => {

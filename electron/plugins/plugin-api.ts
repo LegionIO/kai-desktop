@@ -123,6 +123,12 @@ function isListenHostAllowed(host: string, permissions: readonly string[]): bool
 // By default NO promotion happens — plugins must explicitly opt in.
 
 const DEFAULT_TTL_DAYS = 7;
+const PERSISTENT_PLUGIN_CALLBACK = Symbol.for('kai.plugin.persistent-callback');
+
+function persistentPluginCallback<T extends (...args: never[]) => unknown>(callback: T): T {
+  Object.defineProperty(callback, PERSISTENT_PLUGIN_CALLBACK, { value: true });
+  return callback;
+}
 
 interface SessionPromotionState {
   config: CookiePromotionConfig | undefined;
@@ -166,7 +172,10 @@ function domainMatchesPattern(cookieDomain: string, pattern: string): boolean {
  * Resolves whether a cookie should be promoted and with what TTL.
  * Returns TTL in seconds, or false if the cookie should not be promoted.
  */
-function resolveCookiePromotion(config: CookiePromotionConfig | undefined, cookie: Electron.Cookie): number | false {
+async function resolveCookiePromotion(
+  config: CookiePromotionConfig | undefined,
+  cookie: Electron.Cookie,
+): Promise<number | false> {
   // No config or explicitly false = no promotion
   if (!config) return false;
 
@@ -179,7 +188,10 @@ function resolveCookiePromotion(config: CookiePromotionConfig | undefined, cooki
       secure: cookie.secure ?? false,
       httpOnly: cookie.httpOnly ?? false,
     };
-    const result = config(info);
+    // Isolated plugin callbacks are asynchronous IPC proxies. Awaiting also
+    // preserves the existing synchronous callback contract for in-process test
+    // doubles and older callers because Promise.resolve semantics are implicit.
+    const result = await config(info);
     if (!result || !result.promote) return false;
     const ttlDays = result.ttlDays ?? DEFAULT_TTL_DAYS;
     return ttlDays * 24 * 60 * 60;
@@ -213,14 +225,20 @@ function configureSessionCookiePromotion(ses: Electron.Session, config?: CookieP
   const state: SessionPromotionState = { config };
   sessionPromotionState.set(ses, state);
 
-  ses.cookies.on('changed', (_event, cookie, _cause, removed) => {
+  ses.cookies.on('changed', async (_event, cookie, _cause, removed) => {
     // Only promote cookies that were just set (not removed) and lack an expiry
     if (removed || cookie.expirationDate) return;
 
     const currentState = sessionPromotionState.get(ses);
     if (!currentState) return;
 
-    const ttlSeconds = resolveCookiePromotion(currentState.config, cookie);
+    let ttlSeconds: number | false;
+    try {
+      ttlSeconds = await resolveCookiePromotion(currentState.config, cookie);
+    } catch (error) {
+      console.warn('[PluginAPI] Session-cookie promotion callback failed:', error);
+      return;
+    }
     if (ttlSeconds === false) return;
 
     const expirationDate = Math.floor(Date.now() / 1000) + ttlSeconds;
@@ -1165,20 +1183,35 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           // Provide helpers to the caller for auto-login / webContents interaction
           if (onReady) {
             const helpers = {
-              executeJavaScript: (code: string) => authWin.webContents.executeJavaScript(code),
-              getURL: () => authWin.webContents.getURL(),
-              onDidNavigate: (cb: (url: string) => void) => {
+              executeJavaScript: persistentPluginCallback(async (code: string) =>
+                authWin.webContents.executeJavaScript(code),
+              ),
+              getURL: persistentPluginCallback(() => authWin.webContents.getURL()),
+              onDidNavigate: persistentPluginCallback((cb: (url: string) => void) => {
                 authWin.webContents.on('did-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
                 authWin.webContents.on('will-redirect', (_event: Electron.Event, navUrl: string) => cb(navUrl));
                 authWin.webContents.on('will-navigate', (_event: Electron.Event, navUrl: string) => cb(navUrl));
-              },
-              show: () => revealWindow(),
-              hide: () => {
+              }),
+              show: persistentPluginCallback(() => revealWindow()),
+              hide: persistentPluginCallback(() => {
                 if (!authWin.isDestroyed()) authWin.hide();
-              },
-              close: () => settle({ success: false, error: 'Closed by plugin' }),
+              }),
+              close: persistentPluginCallback(() => settle({ success: false, error: 'Closed by plugin' })),
             };
-            onReady(helpers);
+            try {
+              const readyResult = onReady(helpers) as unknown;
+              // Utility-process callbacks return a Promise even though the
+              // legacy public type is void. Observe it so callback failures
+              // reject the auth operation instead of becoming an unhandled
+              // rejection in the main process.
+              if (readyResult && typeof (readyResult as PromiseLike<unknown>).then === 'function') {
+                void Promise.resolve(readyResult).catch((error) => {
+                  settle({ success: false, error: error instanceof Error ? error.message : String(error) });
+                });
+              }
+            } catch (error) {
+              settle({ success: false, error: error instanceof Error ? error.message : String(error) });
+            }
           }
 
           debugAuth(
