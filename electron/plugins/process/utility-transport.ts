@@ -369,6 +369,25 @@ export class UtilityTransport {
         this.releaseFunction(String(message.callbackId ?? ''));
         return;
       }
+      case 'reconcile-callbacks': {
+        // Authoritative sweep from the host: `heldIds` are every callback id the
+        // host still references; `upToSeq` is the highest id-sequence the host has
+        // observed. Any id we registered AT OR BEFORE that watermark that the host
+        // does NOT hold is provably orphaned — e.g. a handoff that timed out and
+        // was never adopted, so no host finalizer will ever release it. Drop those.
+        // Ids created AFTER the watermark are left alone (the host may not have
+        // seen them yet). This is the only reclaim path for the timeout-not-
+        // adopted case; every other release is host-GC-driven per id.
+        const held = new Set(Array.isArray(message.heldIds) ? (message.heldIds as unknown[]).map(String) : []);
+        const upToSeq = Number(message.upToSeq ?? 0);
+        for (const id of [...this.functions.keys()]) {
+          const seq = Number(id.slice(1)); // ids are `u<seq>`
+          if (Number.isFinite(seq) && seq <= upToSeq && !held.has(id)) {
+            this.releaseFunction(id);
+          }
+        }
+        return;
+      }
       case 'callback-stream':
         await this.invokeFunctionStream(message);
         return;

@@ -108,4 +108,30 @@ describe('UtilityTransport callback release', () => {
     expect(reply?.ok).toBe(false); // unknown callback → not retained
     expect(doomed).not.toHaveBeenCalled();
   });
+
+  it('reconcile-callbacks sweeps orphaned pre-watermark ids the host does not hold', async () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    const held = vi.fn(() => 'held');
+    const orphan = vi.fn(() => 'orphan');
+    const heldId = transport.registerFunction(held); // u1
+    const orphanId = transport.registerFunction(orphan); // u2
+    const future = transport.registerFunction(() => 0); // u3 (created after watermark)
+
+    // Host reconciles: it holds heldId, watermark = 2 (has seen u1 & u2). orphanId
+    // (u2, ≤ watermark, not held) → swept. future (u3, > watermark) → kept.
+    emit({ type: 'reconcile-callbacks', heldIds: [heldId], upToSeq: 2 });
+
+    emit({ type: 'callback', id: 1, callbackId: heldId, args: [] });
+    emit({ type: 'callback', id: 2, callbackId: orphanId, args: [] });
+    emit({ type: 'callback', id: 3, callbackId: future, args: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const reply = (n: number) => posted.find((m) => m.type === 'callback-result' && m.id === n);
+    expect(reply(1)?.ok).toBe(true); // held — kept
+    expect(reply(2)?.ok).toBe(false); // orphan — swept
+    expect(reply(3)?.ok).toBe(true); // post-watermark — kept (host may not have seen it)
+    expect(orphan).not.toHaveBeenCalled();
+  });
 });

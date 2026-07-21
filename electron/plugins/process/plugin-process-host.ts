@@ -14,6 +14,10 @@ const ACTIVATION_TIMEOUT_MS = 60_000;
 const DEACTIVATION_TIMEOUT_MS = 10_000;
 const AVAILABILITY_POLL_MS = 5_000;
 const AVAILABILITY_TIMEOUT_MS = 2_000;
+// Periodic callback reconciliation. Reclaims utility-side callbacks that no host
+// GC will ever release — specifically a handoff that timed out and was never
+// adopted. Infrequent: it's a slow-leak backstop, not a hot path.
+const CALLBACK_RECONCILE_MS = 30_000;
 const OUTPUT_BYTES_PER_SECOND = 64 * 1024;
 const PERSISTENT_PLUGIN_CALLBACK = Symbol.for('kai.plugin.persistent-callback');
 
@@ -228,6 +232,9 @@ export class PluginProcessHost {
   // provider is collected AND the poll has stopped using it (whichever is last).
   private inferenceProviderFinalizer = new FinalizationRegistry<{ isAvailableId: string; streamId: string }>(
     ({ isAvailableId, streamId }) => {
+      // Only the CURRENT registration's streamId is still held by the host; a
+      // superseded provider's streamId is safe to release on its own GC.
+      if (this.currentInferenceStreamId === streamId) this.currentInferenceStreamId = null;
       this.postReleaseCallback(streamId);
       // Release isAvailableId only if the poll isn't still pointing at it.
       if (this.inferenceAvailabilityCallbackId !== isAvailableId) {
@@ -241,6 +248,15 @@ export class PluginProcessHost {
   // isAvailableId; released by releaseIdleInferencePollCallback once the poll
   // stops (unregister/dispose/replace).
   private pendingIdleInferenceCallbackId: string | null = null;
+  // The current inference provider's streamId (isAvailableId is tracked
+  // separately via inferenceAvailabilityCallbackId). Held so reconciliation
+  // reports it as still-in-use.
+  private currentInferenceStreamId: string | null = null;
+  // Highest utility callback-id sequence the host has ever OBSERVED. Sent as the
+  // reconcile watermark so the utility only sweeps ids the host has demonstrably
+  // seen (and doesn't hold) — never ids created after the host's snapshot.
+  private maxSeenUtilitySeq = 0;
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   private activation = deferred<void>();
   private exit = deferred<number>();
   private expectedExit = false;
@@ -371,8 +387,54 @@ export class PluginProcessHost {
    *  last stub for this id is collected. Keyed by the stub object identity so
    *  each distinct stub is counted (and unregistered) independently. */
   private trackUtilityCallbackStub(id: string, stub: object): void {
+    this.observeUtilitySeq(id);
     this.utilityCallbackRefs.set(id, (this.utilityCallbackRefs.get(id) ?? 0) + 1);
     this.utilityCallbackFinalizer.register(stub, id, stub);
+  }
+
+  /** Record the highest utility callback-id sequence we've observed, for the
+   *  reconcile watermark. Ids are `u<seq>`. */
+  private observeUtilitySeq(id: string): void {
+    const seq = Number(id.slice(1));
+    if (Number.isFinite(seq) && seq > this.maxSeenUtilitySeq) this.maxSeenUtilitySeq = seq;
+  }
+
+  /** Every utility callback id the host currently references: live wire-callback
+   *  stubs (refcount > 0) plus the active inference-provider ids. The reconcile
+   *  sweep treats any other id at/below the watermark as orphaned. */
+  private heldUtilityCallbackIds(): string[] {
+    const held = new Set<string>(this.utilityCallbackRefs.keys());
+    if (this.inferenceAvailabilityCallbackId) held.add(this.inferenceAvailabilityCallbackId);
+    if (this.pendingIdleInferenceCallbackId) held.add(this.pendingIdleInferenceCallbackId);
+    if (this.currentInferenceStreamId) held.add(this.currentInferenceStreamId);
+    return [...held];
+  }
+
+  /** Sweep utility-side callbacks that no host reference exists for. Reclaims the
+   *  one case host-GC can't: a handoff that timed out and was never adopted, so
+   *  no finalizer will ever fire for its ids. Safe because it only sweeps ids the
+   *  host has SEEN (≤ watermark) and does not hold. */
+  private reconcileUtilityCallbacks(): void {
+    if (!this.child || this.disposed) return;
+    try {
+      this.child.postMessage({
+        type: 'reconcile-callbacks',
+        heldIds: this.heldUtilityCallbackIds(),
+        upToSeq: this.maxSeenUtilitySeq,
+      });
+    } catch {
+      /* child tearing down */
+    }
+  }
+
+  private startCallbackReconciliation(): void {
+    if (this.reconcileTimer) return;
+    this.reconcileTimer = setInterval(() => this.reconcileUtilityCallbacks(), CALLBACK_RECONCILE_MS);
+  }
+
+  private stopCallbackReconciliation(): void {
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    this.reconcileTimer = null;
   }
 
   /** Tell the utility it may drop a callback id. Safe + worthwhile only for a
@@ -498,8 +560,11 @@ export class PluginProcessHost {
       }
       const isAvailableId = descriptor.isAvailableId;
       const streamId = descriptor.streamId;
+      this.observeUtilitySeq(isAvailableId);
+      this.observeUtilitySeq(streamId);
       this.inferenceAvailable = descriptor.available === true;
       this.inferenceAvailabilityCallbackId = isAvailableId;
+      this.currentInferenceStreamId = streamId;
       const readAvailability = () => this.status === 'running' && this.inferenceAvailable;
       const openStream = (streamOptions: Parameters<PluginInferenceProvider['stream']>[0]) =>
         this.invokeChildStream(streamId, [streamOptions]);
@@ -529,6 +594,7 @@ export class PluginProcessHost {
     if (method === 'agent.unregisterInferenceProvider') {
       this.stopInferenceAvailabilityPolling();
       this.releaseIdleInferencePollCallback();
+      this.currentInferenceStreamId = null;
       this.options.api.agent.unregisterInferenceProvider();
       return null;
     }
@@ -682,6 +748,7 @@ export class PluginProcessHost {
     switch (message?.type) {
       case 'activated':
         this.activation.resolve();
+        this.startCallbackReconciliation();
         return;
       case 'activation-error':
         this.activation.reject(deserializeWireError(message.error));
@@ -1106,6 +1173,7 @@ export class PluginProcessHost {
     if (this.runtimeReleased) return;
     this.runtimeReleased = true;
     this.stopInferenceAvailabilityPolling();
+    this.stopCallbackReconciliation();
     this.rejectPending(error);
     this.cancelOutboundStreams();
     this.brokerSocket?.destroy();
