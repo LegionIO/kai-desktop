@@ -1,4 +1,3 @@
-import { net } from 'electron';
 import type { ZodType } from 'zod';
 import type {
   AllowedBinary,
@@ -92,9 +91,11 @@ export function createUtilityPluginAPI(options: {
   capabilities: string[];
   transport: UtilityTransport;
   configMirror?: UtilityConfigMirror;
+  fetchImpl?: typeof globalThis.fetch;
 }): PluginAPI {
   const { manifest, pluginDir, apiVersion, capabilities, transport } = options;
   const configMirror = options.configMirror ?? createUtilityConfigMirror();
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   let state: Record<string, unknown> = {};
 
   const checkPermission = (permission: PluginManifest['permissions'][number]): void => {
@@ -475,7 +476,11 @@ export function createUtilityPluginAPI(options: {
       if (protocol !== 'http:' && protocol !== 'https:') {
         throw new TypeError(`Plugin "${manifest.name}" fetch is restricted to http(s); refusing "${protocol}" URL.`);
       }
-      return net.fetch(...(args as Parameters<typeof net.fetch>)) as ReturnType<typeof globalThis.fetch>;
+      // Forward the same canonical URL that was validated. A Request is safe to
+      // retain because its URL is immutable and its remaining semantics (body,
+      // headers, signal) must be preserved by the selected runtime adapter.
+      const input = args[0] instanceof Request ? args[0] : url;
+      return fetchImpl(input, args[1]);
     }) as typeof globalThis.fetch,
 
     exec: {

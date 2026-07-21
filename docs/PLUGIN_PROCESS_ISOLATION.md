@@ -1,7 +1,9 @@
 # Plugin Process Isolation
 
-Every enabled plugin backend runs in a separate Electron utility process. This
-document is the operational companion to
+Every enabled plugin backend runs in a separate OS process. Lightweight,
+compatible plugins use a signed Node SEA host; plugins that need native or
+heavier compatibility features use an Electron utility process. This document
+is the operational companion to
 [ADR 0006](./adr/0006-plugin-backend-process-isolation.md).
 
 ## Runtime map
@@ -13,7 +15,7 @@ renderer ── existing plugin action IPC ──> Electron main
                                                │
              ┌─────────────────────────────────┼─────────────────────────┐
              │                                 │                         │
-      utility: plugin A                 utility: plugin B         utility: plugin C
+       Node SEA: plugin A                Node SEA: plugin B       Electron utility: C
        backend.js + API                  backend.js + API          backend.js + API
        sync worker on demand             sync worker on demand     sync worker on demand
 ```
@@ -37,16 +39,19 @@ following retain their existing call shapes:
 - inference providers and their async-generator streams; and
 - plugin activation, config changes, and deactivation.
 
-The compatibility promise applies to the documented `PluginAPI`. A backend
-that imported main-only Electron objects directly was bypassing that contract;
-those exports are intentionally unavailable in a utility process.
+The compatibility promise applies to the documented `PluginAPI`. A bounded
+preflight routes native addons and direct Electron imports to the Electron
+compatibility host before activation. It never starts a plugin in SEA and then
+retries in Electron, so activation side effects cannot run twice.
 
 ## Diagnostics
 
 Open **Settings → Advanced → Diagnostics** to inspect the “Plugin process
 resources” table. It refreshes every five seconds and reports each plugin's
-PID, CPU percentage, physical/private footprint, RSS/working-set memory, state,
-and crash count.
+PID, CPU percentage, cumulative CPU time, physical/private footprint,
+RSS/working-set memory, state, crash count, and selected runtime. The runtime is
+shown as **Node SEA** or **Electron compatibility host**, with the routing reason
+available as hover text.
 
 Each row also has operational controls:
 
@@ -64,8 +69,9 @@ unavailable, Kai labels and shows working-set memory instead.
 
 ## Memory overhead
 
-Isolation still has an unavoidable Electron utility-process baseline, but
-optional compatibility machinery is demand-driven:
+Isolation has an unavoidable per-process Node/V8 baseline, but compatible light
+plugins avoid Electron/Chromium initialization by using the shared signed SEA
+executable. Optional compatibility machinery is demand-driven in both hosts:
 
 - the worker thread and 16 MiB response buffer are created only by a true
   value-returning synchronous host call;
@@ -74,8 +80,17 @@ optional compatibility machinery is demand-driven:
 - the Zod transport bundle is loaded only for plugins with `tools:register`.
 
 This keeps lightweight config/UI plugins isolated without charging them for
-tool-schema code or a second V8 isolate. Diagnostics continues to attribute the
-remaining baseline to each plugin rather than hiding it in the main process.
+Electron, tool-schema code, or a second V8 isolate. Plugins declaring APIs that
+load enough compatibility machinery to make Electron cheaper are routed to the
+utility host based on measured private footprint. The routing set currently
+includes tools, safe storage, conversations, system environment, and inference
+providers. Diagnostics continues to attribute the selected runtime's full
+baseline to each plugin rather than hiding it in the main process.
+
+`network:fetch` remains available in SEA. Upload and response bodies are
+streamed through the bounded broker to main's existing Electron fetch
+implementation, preserving proxy/session behavior and cancellation without
+whole-body buffering.
 
 An unexpectedly exited process remains visible as `crashed` until the plugin is
 disabled, re-enabled, uninstalled, or the app exits. The plugin error view also
@@ -84,35 +99,43 @@ shows the failure while other plugins continue running.
 ## Lifecycle
 
 - **Enable/load:** integrity and permission checks run before a process starts.
-- **Activate:** the utility imports `backend.js` and calls the unchanged
+- **Activate:** the selected host imports `backend.js` and calls the unchanged
   `activate(api)` export.
 - **Config change:** both module `onConfigChanged` and registered listeners are
-  forwarded to the utility.
+  forwarded to the selected host.
 - **Disable/update/uninstall:** `deactivate()` gets a bounded graceful window;
-  Kai then terminates the utility and cleans all main-side registrations.
+  Kai then terminates the process and cleans all main-side registrations.
 - **Crash/hang:** pending work rejects, registrations are removed, and only the
-  owning process is terminated. A CPU-bound utility can be killed from main
+  owning process is terminated. A CPU-bound plugin can be killed from main
   even when its JavaScript event loop is blocked.
 - **IPC flood:** per-plugin rate and concurrency limits terminate a backend
   that overwhelms the host channel, containing pressure on the main event loop.
 
 ## Development and verification
 
-The production build has two additional main outputs:
+The production build has two additional main outputs and one generated host:
 
 - `out/main/plugin-host.js` — utility-process entry point;
-- `out/main/plugin-sync-worker.js` — demand-started worker-thread synchronous bridge.
+- `out/main/plugin-sync-worker.js` — demand-started worker-thread synchronous bridge;
+- `resources/plugin-host/<platform>-<arch>/kai-plugin-host` — signed Node SEA
+  executable (`.exe` on Windows), generated from pinned Node inputs.
 
 `package.json` carries `pluginProcessProtocolVersion`. Bump it whenever the
-host/utility wire contract becomes incompatible; the release classifier then
+host/runtime wire contract becomes incompatible; the release classifier then
 requires a full signed-app update because OTA overlays cannot replace these
-app.asar entrypoints.
+app.asar entrypoints or the SEA executable. The generated SEA manifest carries
+the same protocol value.
 
 Run the focused real-Electron verification after changing this subsystem:
 
 ```bash
 pnpm verify:plugin-process
 ```
+
+The smoke can also target a generated SEA host by setting
+`KAI_PLUGIN_SEA_HOST`. That path additionally verifies mutual control-channel
+authentication, brokered streaming fetch and abort, and an unchanged external
+plugin backend.
 
 Also run the standard repository gates:
 

@@ -136,9 +136,9 @@ export function comparePackages(currentPkg: Record<string, unknown>, prevPkg: Re
     reasons.push(`Node engines changed: ${prevEngines} → ${currentEngines}`);
   }
 
-  // The utility entrypoint and synchronous worker live in the signed app.asar;
-  // OTA overlays replace only preload/renderer. A protocol bump therefore
-  // requires a full shell update even though the implementation is pure JS.
+  // The utility entrypoints live in signed app.asar and the same protocol is
+  // embedded in the signed Node SEA host. OTA overlays replace only
+  // preload/renderer, so a protocol bump requires a full shell update.
   const currentPluginProtocol = currentPkg.pluginProcessProtocolVersion as number | undefined;
   const prevPluginProtocol = prevPkg.pluginProcessProtocolVersion as number | undefined;
   if (currentPluginProtocol !== prevPluginProtocol) {

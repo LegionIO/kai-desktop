@@ -43,12 +43,14 @@ type Marker = {
 };
 
 export type WireEncodeOptions = {
-  registerFunction?: (fn: (...args: unknown[]) => unknown) => string | { id: string; async?: boolean };
+  registerFunction?: (
+    fn: (...args: unknown[]) => unknown,
+  ) => string | { id: string; async?: boolean; stream?: boolean };
   registerAbortSignal?: (signal: AbortSignal) => string;
 };
 
 export type WireDecodeOptions = {
-  callFunction?: (id: string, args: unknown[], isAsync: boolean) => unknown;
+  callFunction?: (id: string, args: unknown[], isAsync: boolean, isStream: boolean) => unknown;
   /** Called with each function stub the decoder creates, paired with its wire
    *  id. Lets the caller track the stub's lifetime (e.g. a FinalizationRegistry
    *  that releases the remote callback once every stub for the id is collected). */
@@ -71,8 +73,8 @@ function assignOwn(target: Record<string, unknown>, key: string, value: unknown)
   });
 }
 
-export function createFunctionRef(id: string, isAsync = false): unknown {
-  return marker('function', { id, async: isAsync });
+export function createFunctionRef(id: string, isAsync = false, isStream = false): unknown {
+  return marker('function', { id, async: isAsync, stream: isStream });
 }
 
 export function encodeWire(value: unknown, options: WireEncodeOptions = {}): unknown {
@@ -91,7 +93,7 @@ export function encodeWire(value: unknown, options: WireEncodeOptions = {}): unk
       const registration = options.registerFunction(current as (...args: unknown[]) => unknown);
       return typeof registration === 'string'
         ? createFunctionRef(registration)
-        : createFunctionRef(registration.id, registration.async === true);
+        : createFunctionRef(registration.id, registration.async === true, registration.stream === true);
     }
     if (typeof current === 'symbol') throw new Error('Plugin IPC cannot encode symbol values');
     if (typeof current !== 'object') return current;
@@ -239,7 +241,8 @@ export function decodeWire(value: unknown, options: WireDecodeOptions = {}): unk
             throw new Error('Plugin IPC received a function without a callback transport');
           }
           const fnId = candidate.id;
-          const stub = (...args: unknown[]) => options.callFunction!(fnId, args, candidate.async === true);
+          const stub = (...args: unknown[]) =>
+            options.callFunction!(fnId, args, candidate.async === true, candidate.stream === true);
           options.onFunctionStub?.(fnId, stub);
           return stub;
         }

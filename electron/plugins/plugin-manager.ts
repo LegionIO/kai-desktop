@@ -56,6 +56,7 @@ import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
 import { arePermissionSetsEqual, hashPluginDirectory, readPluginManifest } from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
 import { PluginProcessHost } from './process/plugin-process-host.js';
+import { selectPluginHostRuntime } from './process/runtime-selection.js';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -126,7 +127,7 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
 export class PluginManager {
   private plugins: Map<string, PluginInstance> = new Map();
   private pluginAPIs: Map<string, PluginAPI> = new Map();
-  /** One independently-accounted Electron utility process per live plugin. */
+  /** One independently-accounted SEA or Electron utility process per live plugin. */
   private pluginProcesses: Map<string, PluginProcessHost> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private cliToolChangeCallback: (() => void) | null = null;
@@ -694,6 +695,8 @@ export class PluginManager {
       }
       instance.agentHookUnsubscribers = [];
 
+      const runtimeSelection = selectPluginHostRuntime(manifest, dir, backendPath);
+      console.info(`[PluginManager] ${manifest.name}: ${runtimeSelection.runtime} (${runtimeSelection.reason})`);
       const processHost = new PluginProcessHost({
         manifest,
         pluginDir: dir,
@@ -702,6 +705,9 @@ export class PluginManager {
         api,
         utilityEntryPath: join(import.meta.dirname, 'plugin-host.js'),
         syncWorkerPath: join(import.meta.dirname, 'plugin-sync-worker.js'),
+        runtime: runtimeSelection.runtime,
+        seaHostPath: runtimeSelection.seaHostPath,
+        runtimeReason: runtimeSelection.reason,
         onUnexpectedExit: (details) => this.handleUnexpectedPluginExit(instance, details),
       });
       this.pluginProcesses.set(manifest.name, processHost);

@@ -921,6 +921,8 @@ const appAPI = {
           memorySource: 'private' | 'working-set';
           syncWorkerRunning: boolean;
           zodCodecLoaded: boolean;
+          runtime: 'node-sea' | 'electron-utility';
+          runtimeReason: string;
         }>;
       }>,
     tailLog: (maxBytes?: number) =>

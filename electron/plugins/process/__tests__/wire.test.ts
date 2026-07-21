@@ -47,7 +47,7 @@ describe('plugin process wire encoding', () => {
     const decoded = decodeWire(encoded, { callFunction: callRemote }) as { fn: (value: number) => number };
 
     expect(decoded.fn(21)).toBe(42);
-    expect(callRemote).toHaveBeenCalledWith('callback-1', [21], false);
+    expect(callRemote).toHaveBeenCalledWith('callback-1', [21], false, false);
     expect(original).toHaveBeenCalledWith(21);
   });
 
@@ -80,7 +80,21 @@ describe('plugin process wire encoding', () => {
     const decoded = decodeWire(encoded, { callFunction: callRemote }) as (value: number) => Promise<number>;
 
     await expect(decoded(41)).resolves.toBe(42);
-    expect(callRemote).toHaveBeenCalledWith('async-1', [41], true);
+    expect(callRemote).toHaveBeenCalledWith('async-1', [41], true, false);
+  });
+
+  it('marks async-generator callbacks for streamed invocation', () => {
+    const encoded = encodeWire(async function* () {}, {
+      registerFunction: () => ({ id: 'stream-1', stream: true }),
+    });
+    const stream = (async function* () {
+      yield 'chunk';
+    })();
+    const callRemote = vi.fn(() => stream);
+    const decoded = decodeWire(encoded, { callFunction: callRemote }) as () => AsyncGenerator<string>;
+
+    expect(decoded()).toBe(stream);
+    expect(callRemote).toHaveBeenCalledWith('stream-1', [], false, true);
   });
 
   it('reconstructs Zod schemas used in tool and inference-provider descriptors', () => {

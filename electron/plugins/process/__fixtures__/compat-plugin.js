@@ -100,6 +100,48 @@ export async function activate(pluginApi) {
   });
 
   api.onAction('fixture', async (_action, data) => {
+    let fetchResult = null;
+    if (data === 'fetch-test') {
+      const requestChunks = ['streamed-', 'upload'];
+      const requestBody = new ReadableStream({
+        pull(controller) {
+          const next = requestChunks.shift();
+          if (next === undefined) controller.close();
+          else controller.enqueue(new TextEncoder().encode(next));
+        },
+      });
+      const response = await api.fetch('https://plugin-fetch.test/stream', {
+        method: 'POST',
+        headers: { 'x-plugin-fetch': 'fixture' },
+        body: requestBody,
+        duplex: 'half',
+      });
+      const responseChunks = [];
+      const reader = response.body.getReader();
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        responseChunks.push(new TextDecoder().decode(next.value));
+      }
+      fetchResult = {
+        status: response.status,
+        url: response.url,
+        redirected: response.redirected,
+        header: response.headers.get('x-main-fetch'),
+        chunks: responseChunks,
+      };
+    }
+    if (data === 'fetch-abort-test') {
+      const controller = new AbortController();
+      const pending = api.fetch('https://plugin-fetch.test/abort', { signal: controller.signal });
+      setTimeout(() => controller.abort('fixture-fetch-abort'), 10);
+      try {
+        await pending;
+        fetchResult = { aborted: false };
+      } catch (error) {
+        fetchResult = { aborted: true, reason: String(error) };
+      }
+    }
     const generateOptions = { messages: [{ role: 'user', content: String(data ?? '') }] };
     if (data === 'abort-test') {
       const controller = new AbortController();
@@ -131,6 +173,7 @@ export async function activate(pluginApi) {
         streamed,
         decrypted: api.safeStorage.decryptString(cipher),
         auth,
+        fetchResult,
         state: api.state.get(),
       },
     };

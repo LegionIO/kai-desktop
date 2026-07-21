@@ -41,10 +41,15 @@ describe('after-pack.cjs linux branch — restores exec bit on shipped launcher 
       writeFileSync(join(bin, f), '#!/bin/sh\n', { mode: 0o644 });
       chmodSync(join(bin, f), 0o644); // ensure the umask didn't widen it
     }
+    const pluginHost = join(outDir, 'resources', 'plugin-host', 'linux-x64', 'kai-plugin-host');
+    mkdirSync(join(pluginHost, '..'), { recursive: true });
+    writeFileSync(pluginHost, '#!/bin/sh\n', { mode: 0o644 });
+    chmodSync(pluginHost, 0o644);
     await afterPack(ctx('linux', outDir));
     expect(mode(join(bin, 'kai'))).toBe(0o755);
     expect(mode(join(bin, 'LocalLinuxHelper.sh'))).toBe(0o755);
     expect(mode(join(bin, 'atspi_helper.py'))).toBe(0o755);
+    expect(mode(pluginHost)).toBe(0o755);
   });
 
   it('does not throw when a helper is missing (only chmods what exists)', async () => {
@@ -78,9 +83,22 @@ describe('after-pack.cjs darwin branch — exec bit + early bail', () => {
     writeFileSync(join(outDir, 'Kai.app', 'Contents', 'Info.plist'), '<plist/>', { mode: 0o644 });
     writeFileSync(join(resBin, 'kai'), '#!/bin/sh\n', { mode: 0o644 });
     chmodSync(join(resBin, 'kai'), 0o644);
+    const pluginHost = join(
+      outDir,
+      'Kai.app',
+      'Contents',
+      'Resources',
+      'plugin-host',
+      'darwin-arm64',
+      'kai-plugin-host',
+    );
+    mkdirSync(join(pluginHost, '..'), { recursive: true });
+    writeFileSync(pluginHost, '#!/bin/sh\n', { mode: 0o644 });
+    chmodSync(pluginHost, 0o644);
     // No Frameworks/ dir → the hook bails before the helper-plist loop (still chmods the shim).
     await afterPack(ctx('darwin', outDir));
     expect(mode(join(resBin, 'kai'))).toBe(0o755);
+    expect(mode(pluginHost)).toBe(0o755);
   });
 
   it('bails cleanly when the main app Info.plist is absent (any host)', async () => {

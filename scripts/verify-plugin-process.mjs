@@ -4,17 +4,33 @@
  * command so this test exercises the same source used by the app.
  */
 import { app } from 'electron';
-import { resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { dirname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import {
   PluginProcessHost,
   getPluginProcessMetrics,
   refreshPluginProcessPrivateMemory,
 } from '../out/plugin-process-smoke-host.mjs';
 
-console.info('Starting plugin utility-process smoke verification…');
+const seaHostPath = process.env.KAI_PLUGIN_SEA_HOST ? resolve(process.env.KAI_PLUGIN_SEA_HOST) : null;
+const pluginProcessProtocolVersion = JSON.parse(
+  readFileSync(resolve('package.json'), 'utf8'),
+).pluginProcessProtocolVersion;
+const runtimeOptions = seaHostPath
+  ? { runtime: 'node-sea', seaHostPath, runtimeReason: 'real-process SEA smoke' }
+  : { runtime: 'electron-utility', runtimeReason: 'real-process Electron smoke' };
+
+console.info(`Starting plugin ${seaHostPath ? 'Node SEA' : 'Electron utility-process'} smoke verification…`);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function hashFile(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
 function setNested(target, path, value) {
@@ -36,8 +52,78 @@ function waitFor(predicate, timeoutMs = 2_000) {
   });
 }
 
+async function verifySeaRejectsUnauthenticatedControlPeer() {
+  if (!seaHostPath) return;
+  console.info('Verifying SEA control-channel server authentication…');
+  let helloReceived = false;
+  const server = createServer((socket) => {
+    socket.setEncoding('utf8');
+    let buffered = '';
+    socket.on('data', (chunk) => {
+      buffered += chunk;
+      const newline = buffered.indexOf('\n');
+      if (newline < 0) return;
+      const hello = JSON.parse(buffered.slice(0, newline));
+      helloReceived = hello.type === 'hello' && hello.channel === 'control';
+      socket.end(`${JSON.stringify({ type: 'ready', tokenProof: '0'.repeat(64) })}\n`);
+    });
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  const address = server.address();
+  assert(address && typeof address === 'object', 'could not bind fake SEA control server');
+  const backendPath = resolve('electron/plugins/process/__fixtures__/workerless-plugin.js');
+  const child = spawn(seaHostPath, [], { stdio: ['pipe', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => (stderr += chunk));
+  child.stdin.end(
+    `${JSON.stringify({
+      type: 'init',
+      protocolVersion: pluginProcessProtocolVersion,
+      manifest: {
+        name: 'sea-auth-smoke',
+        displayName: 'SEA auth smoke',
+        version: '1.0.0',
+        description: 'Rejects a fake control server',
+        permissions: [],
+      },
+      pluginDir: resolve('electron/plugins/process/__fixtures__'),
+      backendPath,
+      fileHash: hashFile(backendPath),
+      apiVersion: '1.0.0',
+      capabilities: [],
+      initialConfig: {},
+      initialPluginData: {},
+      syncBridge: { host: '127.0.0.1', port: address.port, token: 'a'.repeat(64) },
+    })}\n`,
+  );
+  const exitCode = await new Promise((resolveExit, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('Timed out waiting for SEA authentication rejection'));
+    }, 5_000);
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      resolveExit(code);
+    });
+  }).finally(
+    () =>
+      new Promise((resolveClose) => {
+        server.close(resolveClose);
+      }),
+  );
+  assert(helloReceived, 'SEA host did not initiate its authenticated control handshake');
+  assert(exitCode !== 0, 'SEA host trusted a control server without a valid HMAC proof');
+  assert(/proof failed|authentication failed/i.test(stderr), 'SEA host did not report control authentication failure');
+}
+
 async function run() {
   console.info('Electron ready; starting fixture plugin process…');
+  await verifySeaRejectsUnauthenticatedControlPeer();
 
   const captured = {
     state: {},
@@ -55,6 +141,8 @@ async function run() {
     httpClosed: false,
     authNavigate: null,
     authVisibility: [],
+    fetchRequests: [],
+    fetchAbortObserved: false,
   };
 
   const api = {
@@ -160,7 +248,9 @@ async function run() {
       generate: async (options) => {
         if (options.abortSignal) {
           if (!options.abortSignal.aborted) {
-            await new Promise((resolveAbort) => options.abortSignal.addEventListener('abort', resolveAbort, { once: true }));
+            await new Promise((resolveAbort) =>
+              options.abortSignal.addEventListener('abort', resolveAbort, { once: true }),
+            );
           }
           return { text: String(options.abortSignal.reason), modelKey: 'fixture', toolCalls: [] };
         }
@@ -177,6 +267,52 @@ async function run() {
         captured.provider = null;
       },
       registerCliTool: () => {},
+    },
+    fetch: async (input, init = {}) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === 'https://plugin-fetch.test/abort') {
+        return new Promise((_resolve, reject) => {
+          const abort = () => {
+            captured.fetchAbortObserved = true;
+            reject(init.signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          };
+          if (init.signal?.aborted) abort();
+          else init.signal?.addEventListener('abort', abort, { once: true });
+        });
+      }
+      assert(url === 'https://plugin-fetch.test/stream', `unexpected brokered fetch URL: ${url}`);
+      const requestChunks = [];
+      if (init.body) {
+        const reader = init.body.getReader();
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          requestChunks.push(new TextDecoder().decode(next.value));
+        }
+      }
+      captured.fetchRequests.push({
+        url,
+        method: init.method,
+        header: new Headers(init.headers).get('x-plugin-fetch'),
+        chunks: requestChunks,
+      });
+      const responseChunks = ['streamed-', 'download'];
+      const response = new Response(
+        new ReadableStream({
+          pull(controller) {
+            const next = responseChunks.shift();
+            if (next === undefined) controller.close();
+            else controller.enqueue(new TextEncoder().encode(next));
+          },
+        }),
+        { status: 206, headers: { 'x-main-fetch': 'fixture' } },
+      );
+      Object.defineProperties(response, {
+        url: { value: 'https://plugin-fetch.test/final' },
+        redirected: { value: true },
+        type: { value: 'basic' },
+      });
+      return response;
     },
     onAction: (targetId, handler) => captured.actions.set(targetId, handler),
   };
@@ -202,14 +338,16 @@ async function run() {
       'browser:window',
       'http:listen',
       'auth:window',
+      'network:fetch',
     ],
   };
 
   const host = new PluginProcessHost({
+    ...runtimeOptions,
     manifest,
     pluginDir: resolve('electron/plugins/process/__fixtures__'),
     backendPath: resolve('electron/plugins/process/__fixtures__/compat-plugin.js'),
-    fileHash: 'smoke',
+    fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/compat-plugin.js')),
     api,
     utilityEntryPath: resolve('out/main/plugin-host.js'),
     syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -232,7 +370,13 @@ async function run() {
       httpOnly: true,
     });
     assert(cookieDecision.promote === true && cookieDecision.ttlDays === 2, 'cookie callback proxy failed');
-    const httpResult = await captured.httpHandler({ method: 'POST', url: '/callback', headers: {}, query: {}, body: 'ok' });
+    const httpResult = await captured.httpHandler({
+      method: 'POST',
+      url: '/callback',
+      headers: {},
+      query: {},
+      body: 'ok',
+    });
     assert(httpResult.status === 201 && httpResult.body === 'POST:/callback:ok', 'HTTP handler proxy failed');
 
     await captured.configListeners[0]({});
@@ -271,6 +415,23 @@ async function run() {
     assert(authAction.data.state.authUrl === 'https://example.test/current', 'synchronous auth helper proxy failed');
     assert(authAction.data.state.authNavigate === 'https://example.test/callback', 'nested auth callback proxy failed');
     assert(captured.authVisibility.join(',') === 'hide,show', 'auth helper controls did not reach main');
+    if (seaHostPath) {
+      const fetchAction = await captured.actions.get('fixture')('run', 'fetch-test');
+      assert(captured.fetchRequests.length === 1, 'SEA fetch did not reach the mocked main-process broker');
+      assert(captured.fetchRequests[0].method === 'POST', 'SEA fetch method was not preserved');
+      assert(captured.fetchRequests[0].header === 'fixture', 'SEA fetch request headers were not preserved');
+      assert(captured.fetchRequests[0].chunks.join('') === 'streamed-upload', 'SEA fetch upload did not stream');
+      assert(fetchAction.data.fetchResult.status === 206, 'SEA fetch response status was not preserved');
+      assert(fetchAction.data.fetchResult.url === 'https://plugin-fetch.test/final', 'SEA fetch URL was not preserved');
+      assert(fetchAction.data.fetchResult.redirected === true, 'SEA fetch redirect metadata was not preserved');
+      assert(fetchAction.data.fetchResult.header === 'fixture', 'SEA fetch response headers were not preserved');
+      assert(fetchAction.data.fetchResult.chunks.join('') === 'streamed-download', 'SEA fetch response did not stream');
+
+      const fetchAbortAction = await captured.actions.get('fixture')('run', 'fetch-abort-test');
+      assert(captured.fetchAbortObserved, 'SEA fetch abort did not reach the mocked main-process broker');
+      assert(fetchAbortAction.data.fetchResult.aborted === true, 'SEA fetch abort did not reject in the plugin');
+      assert(fetchAbortAction.data.fetchResult.reason === 'fixture-fetch-abort', 'SEA fetch abort reason was lost');
+    }
     assert(host.mainFunctions.size === persistentMainFunctions, 'ephemeral callback references leaked in main');
     assert(host.remoteAbortControllers.size === 0, 'completed abort-signal proxies leaked in main');
 
@@ -288,7 +449,8 @@ async function run() {
           execute: async ({ value }) => value + 1,
         },
       ],
-    })) providerEvents.push(event);
+    }))
+      providerEvents.push(event);
     assert(providerEvents.map((event) => event.type).join(',') === 'text-delta,done', 'provider stream proxy failed');
     assert(providerEvents[0].data.toolValue === 42, 'async callback Promise semantics were not preserved');
 
@@ -311,10 +473,11 @@ async function run() {
       permissions: ['config:read', 'config:write', 'state:publish', 'events:publish', 'ui:settings', 'ui:modal'],
     };
     const workerlessHost = new PluginProcessHost({
+      ...runtimeOptions,
       manifest: workerlessManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/workerless-plugin.js'),
-      fileHash: 'workerless-smoke',
+      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/workerless-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -329,9 +492,7 @@ async function run() {
     assert(workerlessAction.data.theme === 'light', 'mirrored config did not preserve read-after-write');
     assert(workerlessAction.data.count === 8, 'mirrored plugin config did not preserve read-after-write');
     await refreshPluginProcessPrivateMemory(true);
-    const workerlessMetric = getPluginProcessMetrics().find(
-      (entry) => entry.pluginName === workerlessManifest.name,
-    );
+    const workerlessMetric = getPluginProcessMetrics().find((entry) => entry.pluginName === workerlessManifest.name);
     assert(workerlessMetric?.privateMemoryBytes > 0, 'workerless utility did not report its footprint');
     assert(workerlessMetric.syncWorkerRunning === false, 'mirrored/registration APIs eagerly started the sync worker');
     assert(workerlessMetric.zodCodecLoaded === false, 'plugin without tools loaded the Zod transport chunk');
@@ -341,6 +502,35 @@ async function run() {
     );
     await workerlessHost.deactivate();
 
+    if (process.env.KAI_PLUGIN_SMOKE_BACKEND && process.env.KAI_PLUGIN_SMOKE_MANIFEST) {
+      console.info('Verifying an unchanged external plugin backend…');
+      const externalBackend = resolve(process.env.KAI_PLUGIN_SMOKE_BACKEND);
+      const externalManifest = JSON.parse(readFileSync(resolve(process.env.KAI_PLUGIN_SMOKE_MANIFEST), 'utf8'));
+      const externalHost = new PluginProcessHost({
+        ...runtimeOptions,
+        manifest: externalManifest,
+        pluginDir: dirname(externalBackend),
+        backendPath: externalBackend,
+        fileHash: hashFile(externalBackend),
+        api,
+        utilityEntryPath: resolve('out/main/plugin-host.js'),
+        syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
+        onUnexpectedExit: ({ code, error }) => {
+          throw new Error(`External plugin exited unexpectedly (${code}): ${error ?? ''}`);
+        },
+      });
+      await externalHost.activate();
+      await refreshPluginProcessPrivateMemory(true);
+      const externalMetric = getPluginProcessMetrics().find((entry) => entry.pluginName === externalManifest.name);
+      assert(externalMetric?.runtime === runtimeOptions.runtime, 'external plugin used the wrong runtime');
+      console.info(
+        `External plugin ${externalManifest.name} footprint ` +
+          `${(externalMetric.privateMemoryBytes / 1024 / 1024).toFixed(1)} MB`,
+      );
+      await externalHost.deactivate();
+    }
+
+    console.info('Verifying pause/resume/deactivate controls…');
     host.pause();
     assert(
       getPluginProcessMetrics().find((entry) => entry.pluginName === manifest.name)?.status === 'paused',
@@ -367,12 +557,14 @@ async function run() {
     );
 
     let crashDetails = null;
+    console.info('Verifying crash isolation…');
     const crashManifest = { ...manifest, name: 'process-crash-smoke', displayName: 'Process Crash Smoke' };
     const crashHost = new PluginProcessHost({
+      ...runtimeOptions,
       manifest: crashManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/crash-plugin.js'),
-      fileHash: 'crash-smoke',
+      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -391,12 +583,14 @@ async function run() {
     await crashHost.stop(true);
 
     let floodContained = false;
+    console.info('Verifying protocol-flood containment…');
     const floodManifest = { ...manifest, name: 'process-flood-smoke', displayName: 'Process Flood Smoke' };
     const floodHost = new PluginProcessHost({
+      ...runtimeOptions,
       manifest: floodManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/flood-plugin.js'),
-      fileHash: 'flood-smoke',
+      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/flood-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -405,20 +599,24 @@ async function run() {
       },
     });
     await floodHost.activate();
-    await captured.actions.get('flood')('run').catch(() => {});
+    await captured.actions
+      .get('flood')('run')
+      .catch(() => {});
     await waitFor(() => floodContained, 5_000);
     const floodMetric = getPluginProcessMetrics().find((entry) => entry.pluginName === floodManifest.name);
     assert(floodMetric?.status === 'crashed', 'IPC flood did not remain isolated to its plugin process');
-    assert(floodMetric.lastError?.includes('IPC messages per second'), 'IPC flood reason was not retained');
+    assert(floodMetric.lastError?.includes('exceeded'), 'IPC flood reason was not retained');
     await floodHost.stop(true);
 
     let killed = false;
+    console.info('Verifying explicit kill containment…');
     const killManifest = { ...manifest, name: 'process-kill-smoke', displayName: 'Process Kill Smoke' };
     const killHost = new PluginProcessHost({
+      ...runtimeOptions,
       manifest: killManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/crash-plugin.js'),
-      fileHash: 'kill-smoke',
+      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),

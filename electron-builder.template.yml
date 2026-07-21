@@ -80,6 +80,15 @@ extraResources:
   # asarUnpack'd and there's no runtime esbuild on the render path.
   - from: resources/mermaid-runtime.js
     to: mermaid-runtime.js
+  # One signed Node SEA executable is reused by every compatible plugin. Each
+  # plugin still receives a distinct OS process; architecture-specific hosts
+  # let universal macOS builds select the native executable at runtime.
+  - from: resources/plugin-host
+    to: plugin-host
+    filter:
+      - "manifest.json"
+      - "**/kai-plugin-host"
+      - "**/kai-plugin-host.exe"
 {{esbuildExtraResources}}
 icon: build/icon
 # Electron Fuses — locked-down per ADR 0001 (docs/adr/0001-electron-fuses-policy.md).

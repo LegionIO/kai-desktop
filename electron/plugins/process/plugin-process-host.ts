@@ -1,6 +1,7 @@
 import { app, utilityProcess, type UtilityProcess } from 'electron';
 import { createServer, type Server, type Socket } from 'node:net';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { PluginAPI, PluginInferenceProvider, PluginManifest } from '../types.js';
 import { recordDiagnosticForPlugin, type DiagnosticKind } from '../../diagnostics/main-diagnostics.js';
@@ -8,6 +9,9 @@ import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from
 import { installZodWireCodec } from './wire.js';
 import { zodWireCodec } from './zod-wire-codec.js';
 import { sampleMacOSPrivateMemory } from './macos-private-memory.js';
+import type { BrokerFetchMetadata, BrokerFetchRequest } from './broker-fetch.js';
+import { PLUGIN_PROCESS_PROTOCOL_VERSION, type PluginRuntimeInit } from './plugin-runtime.js';
+import { sampleProcessResources, type ProcessResourceSample } from './process-resource-sampler.js';
 
 // The main process already uses Zod for config/tool validation. Install its
 // codec eagerly here; utility processes load the same code only for plugins
@@ -131,6 +135,7 @@ class RemoteAsyncIterable implements AsyncGenerator<unknown> {
 }
 
 export type PluginProcessStatus = 'starting' | 'running' | 'paused' | 'stopping' | 'crashed';
+export type PluginHostRuntime = 'node-sea' | 'electron-utility';
 
 type ProcessRecord = {
   pluginName: string;
@@ -144,6 +149,8 @@ type ProcessRecord = {
   privateMemoryBytes: number;
   syncWorkerRunning: boolean;
   zodCodecLoaded: boolean;
+  runtime: PluginHostRuntime;
+  runtimeReason: string;
 };
 
 export type PluginProcessMetric = ProcessRecord & {
@@ -161,23 +168,28 @@ const processCrashCounts = new Map<string, number>();
 const PRIVATE_MEMORY_SAMPLE_TTL_MS = 4_000;
 let privateMemorySampleStartedAt = 0;
 let privateMemorySampleInFlight: Promise<void> | null = null;
+let processResourceSamples = new Map<number, ProcessResourceSample>();
 
 /**
- * Refresh macOS physical footprints on demand. Diagnostics is the consumer, so
- * this does no work while that panel is closed and coalesces concurrent polls.
+ * Refresh OS CPU/RSS/private-memory samples on demand. Diagnostics is the
+ * consumer, so this does no work while that panel is closed and coalesces
+ * concurrent polls.
  */
 export async function refreshPluginProcessPrivateMemory(force = false): Promise<void> {
-  if (process.platform !== 'darwin') return;
   if (privateMemorySampleInFlight) return privateMemorySampleInFlight;
   if (!force && Date.now() - privateMemorySampleStartedAt < PRIVATE_MEMORY_SAMPLE_TTL_MS) return;
 
   const pids = [...processRecords.values()].map((record) => record.pid).filter((pid): pid is number => pid !== null);
   privateMemorySampleStartedAt = Date.now();
-  privateMemorySampleInFlight = sampleMacOSPrivateMemory(pids)
-    .then((sample) => {
+  privateMemorySampleInFlight = Promise.all([
+    sampleProcessResources(pids),
+    process.platform === 'darwin' ? sampleMacOSPrivateMemory(pids) : Promise.resolve(new Map<number, number>()),
+  ])
+    .then(([resources, privateMemory]) => {
+      processResourceSamples = resources;
       for (const [pluginName, record] of processRecords) {
         if (record.pid === null) continue;
-        const privateMemoryBytes = sample.get(record.pid);
+        const privateMemoryBytes = privateMemory.get(record.pid) ?? resources.get(record.pid)?.privateMemoryBytes;
         if (privateMemoryBytes !== undefined) {
           processRecords.set(pluginName, { ...record, privateMemoryBytes });
         }
@@ -201,16 +213,17 @@ export function getPluginProcessMetrics(): PluginProcessMetric[] {
   return [...processRecords.values()]
     .map((record) => {
       const metric = record.pid === null ? undefined : byPid.get(record.pid);
+      const sampled = record.pid === null ? undefined : processResourceSamples.get(record.pid);
+      const privateMemoryBytes =
+        record.privateMemoryBytes || sampled?.privateMemoryBytes || (metric?.memory.privateBytes ?? 0) * 1024;
       return {
         ...record,
         canPause: process.platform !== 'win32',
-        cpuPercent: metric?.cpu.percentCPUUsage ?? 0,
-        cumulativeCpuSeconds: metric?.cpu.cumulativeCPUUsage ?? null,
-        privateMemoryBytes: record.privateMemoryBytes || (metric?.memory.privateBytes ?? 0) * 1024,
-        residentSetBytes: (metric?.memory.workingSetSize ?? 0) * 1024,
-        memorySource: (record.privateMemoryBytes > 0 || (metric?.memory.privateBytes ?? 0) > 0
-          ? 'private'
-          : 'working-set') as PluginProcessMetric['memorySource'],
+        cpuPercent: sampled?.cpuPercent ?? metric?.cpu.percentCPUUsage ?? 0,
+        cumulativeCpuSeconds: sampled?.cumulativeCpuSeconds ?? metric?.cpu.cumulativeCPUUsage ?? null,
+        privateMemoryBytes,
+        residentSetBytes: sampled?.residentSetBytes ?? (metric?.memory.workingSetSize ?? 0) * 1024,
+        memorySource: (privateMemoryBytes > 0 ? 'private' : 'working-set') as PluginProcessMetric['memorySource'],
       };
     })
     .sort((a, b) => a.pluginName.localeCompare(b.pluginName));
@@ -224,6 +237,9 @@ type PluginProcessHostOptions = {
   api: PluginAPI;
   utilityEntryPath: string;
   syncWorkerPath: string;
+  runtime?: PluginHostRuntime;
+  seaHostPath?: string;
+  runtimeReason?: string;
   onUnexpectedExit: (details: { code: number; error?: string }) => void | Promise<void>;
 };
 
@@ -235,9 +251,10 @@ type BrokerRequest = {
 };
 
 export class PluginProcessHost {
-  private child: UtilityProcess | null = null;
+  private child: UtilityProcess | ChildProcess | null = null;
   private server: Server | null = null;
   private brokerSocket: Socket | null = null;
+  private controlSocket: Socket | null = null;
   // In-flight broker (sync-call) requests + waiters that resolve when the count
   // hits zero. Used by the reconcile drain barrier: a sync handoff whose reply
   // the utility abandoned on timeout may still be processing here and about to
@@ -340,8 +357,13 @@ export class PluginProcessHost {
   private pausedConfig: unknown;
   private hasPausedPluginData = false;
   private pausedPluginData: unknown;
+  private readonly runtime: PluginHostRuntime;
 
   constructor(private options: PluginProcessHostOptions) {
+    this.runtime = options.runtime ?? 'electron-utility';
+    if (this.runtime === 'node-sea' && !options.seaHostPath) {
+      throw new Error('Node SEA plugin runtime selected without a host executable');
+    }
     processRecordOwners.set(options.manifest.name, this.recordOwner);
     processRecords.set(options.manifest.name, {
       pluginName: options.manifest.name,
@@ -355,6 +377,9 @@ export class PluginProcessHost {
       privateMemoryBytes: 0,
       syncWorkerRunning: false,
       zodCodecLoaded: false,
+      runtime: this.runtime,
+      runtimeReason:
+        options.runtimeReason ?? (this.runtime === 'node-sea' ? 'compatible plugin' : 'compatibility fallback'),
     });
   }
 
@@ -377,6 +402,27 @@ export class PluginProcessHost {
     if (current) processRecords.set(this.options.manifest.name, { ...current, ...updates });
   }
 
+  private postToChild(message: unknown): void {
+    if (!this.child || this.disposed) throw new Error('Plugin process is not running');
+    if (this.runtime === 'node-sea') {
+      if (!this.controlSocket || this.controlSocket.destroyed) {
+        throw new Error('Plugin SEA control channel is not connected');
+      }
+      this.writeBrokerResponse(this.controlSocket, message as Record<string, unknown>);
+      return;
+    }
+    (this.child as UtilityProcess).postMessage(message);
+  }
+
+  private tryPostToChild(message: unknown): boolean {
+    try {
+      this.postToChild(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private registerMainFunction(fn: (...args: unknown[]) => unknown): { id: string; newlyRegistered: boolean } {
     const existing = this.mainFunctionIds.get(fn);
     if (existing) {
@@ -395,7 +441,7 @@ export class PluginProcessHost {
     const hostRef = new WeakRef(this);
     const listener = () => {
       const host = hostRef.deref();
-      host?.child?.postMessage({ type: 'abort', abortId: id, reason: host.encode(signal.reason) });
+      host?.tryPostToChild({ type: 'abort', abortId: id, reason: host.encode(signal.reason) });
     };
     if (!signal.aborted) {
       signal.addEventListener('abort', listener, { once: true });
@@ -416,6 +462,7 @@ export class PluginProcessHost {
         return {
           id: registration.id,
           async: fn.constructor.name === 'AsyncFunction',
+          stream: fn.constructor.name === 'AsyncGeneratorFunction',
         };
       },
       registerAbortSignal: (signal) => this.registerAbortSignal(signal),
@@ -424,7 +471,8 @@ export class PluginProcessHost {
 
   private decode(value: unknown, abortIds?: string[], adoptSink?: string[]): unknown {
     return decodeWire(value, {
-      callFunction: (id, args) => {
+      callFunction: (id, args, _isAsync, isStream) => {
+        if (isStream) return this.invokeChildStream(id, args);
         const result = this.invokeChildCallback(id, args);
         // Some plugin API callbacks are intentionally fire-and-forget in the
         // host (event/config listeners), while tools and hooks await the same
@@ -476,7 +524,7 @@ export class PluginProcessHost {
     }
     if (!this.child || this.disposed) return;
     try {
-      this.child.postMessage({ type: 'callback-adopted', ids });
+      this.postToChild({ type: 'callback-adopted', ids });
     } catch {
       /* child tearing down */
     }
@@ -506,7 +554,7 @@ export class PluginProcessHost {
     try {
       await this.awaitDrainBarrier();
       if (!this.child || this.disposed) return;
-      this.child.postMessage({ type: 'reconcile-callbacks', heldIds: this.heldUtilityCallbackIds() });
+      this.postToChild({ type: 'reconcile-callbacks', heldIds: this.heldUtilityCallbackIds() });
     } catch {
       /* child tearing down, or barrier abandoned on dispose */
     }
@@ -521,7 +569,7 @@ export class PluginProcessHost {
     const token = ++this.drainBarrierToken;
     await new Promise<void>((resolve) => {
       this.pendingDrainResolve = resolve;
-      this.child?.postMessage({ type: 'drain-ping', token });
+      if (!this.tryPostToChild({ type: 'drain-ping', token })) resolve();
     });
   }
 
@@ -543,7 +591,7 @@ export class PluginProcessHost {
   private postReleaseCallback(id: string): void {
     if (this.child && !this.disposed) {
       try {
-        this.child.postMessage({ type: 'release-callback', callbackId: id });
+        this.postToChild({ type: 'release-callback', callbackId: id });
       } catch {
         /* child may be tearing down — the release is moot then */
       }
@@ -583,7 +631,13 @@ export class PluginProcessHost {
     if (this.status === 'paused') return Promise.reject(new Error('Plugin process is paused'));
     const request = this.nextRequest();
     const functionIds: string[] = [];
-    this.child.postMessage({ type: 'callback', id: request.id, callbackId, args: this.encode(args, functionIds) });
+    try {
+      this.postToChild({ type: 'callback', id: request.id, callbackId, args: this.encode(args, functionIds) });
+    } catch (error) {
+      this.pending.delete(request.id);
+      this.releaseMainFunctions(functionIds);
+      return Promise.reject(error);
+    }
     // When a timeout is given, cancel (reject + REMOVE from `pending`) the
     // underlying request on expiry — not just the caller's promise. Otherwise a
     // child that never replies leaves the pending entry forever, and a periodic
@@ -608,20 +662,31 @@ export class PluginProcessHost {
     const stream = new RemoteAsyncIterable(
       id,
       (requestId) => {
-        this.child?.postMessage({ type: 'stream-cancel', id: requestId, direction: 'to-utility' });
+        this.tryPostToChild({ type: 'stream-cancel', id: requestId, direction: 'to-utility' });
         this.inboundStreams.delete(requestId);
       },
       () => this.releaseMainFunctions(functionIds),
     );
     this.inboundStreams.set(id, stream);
-    this.child.postMessage({ type: 'callback-stream', id, callbackId, args: this.encode(args, functionIds) });
+    try {
+      this.postToChild({ type: 'callback-stream', id, callbackId, args: this.encode(args, functionIds) });
+    } catch (error) {
+      this.inboundStreams.delete(id);
+      this.releaseMainFunctions(functionIds);
+      throw error;
+    }
     return stream;
   }
 
   private invokeControl(command: string, args: unknown[] = []): Promise<unknown> {
     if (!this.child || this.disposed) return Promise.reject(new Error('Plugin process is not running'));
     const request = this.nextRequest();
-    this.child.postMessage({ type: 'control', id: request.id, command, args: this.encode(args) });
+    try {
+      this.postToChild({ type: 'control', id: request.id, command, args: this.encode(args) });
+    } catch (error) {
+      this.pending.delete(request.id);
+      request.deferred.reject(error);
+    }
     return request.deferred.promise;
   }
 
@@ -671,7 +736,96 @@ export class PluginProcessHost {
       .then(() => this.finishOrdered(order));
   }
 
+  private async *streamPluginFetch(descriptor: BrokerFetchRequest): AsyncGenerator<BrokerFetchMetadata | Uint8Array> {
+    if (!descriptor || typeof descriptor.url !== 'string' || typeof descriptor.method !== 'string') {
+      throw new TypeError('Plugin fetch broker received an invalid request');
+    }
+    const scheme = new URL(descriptor.url).protocol;
+    if (scheme !== 'http:' && scheme !== 'https:') {
+      throw new TypeError(`Plugin fetch is restricted to http(s); refusing "${scheme}" URL.`);
+    }
+
+    const controller = new AbortController();
+    const sourceSignal = descriptor.signal;
+    const forwardAbort = (): void => controller.abort(sourceSignal.reason);
+    if (sourceSignal?.aborted) forwardAbort();
+    else sourceSignal?.addEventListener('abort', forwardAbort, { once: true });
+
+    let bodyIterator: AsyncIterator<Uint8Array> | null = null;
+    let responseReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    try {
+      let body: ReadableStream<Uint8Array> | undefined;
+      if (typeof descriptor.body === 'function') {
+        const iterable = descriptor.body();
+        bodyIterator = iterable[Symbol.asyncIterator]();
+        body = new ReadableStream<Uint8Array>({
+          async pull(streamController) {
+            try {
+              const next = await bodyIterator!.next();
+              if (next.done) streamController.close();
+              else streamController.enqueue(next.value);
+            } catch (error) {
+              streamController.error(error);
+            }
+          },
+          async cancel() {
+            await bodyIterator?.return?.();
+          },
+        });
+      }
+
+      const requestInit = {
+        method: descriptor.method,
+        headers: descriptor.headers,
+        cache: descriptor.cache,
+        credentials: descriptor.credentials,
+        integrity: descriptor.integrity,
+        keepalive: descriptor.keepalive,
+        mode: descriptor.mode,
+        redirect: descriptor.redirect,
+        referrer: descriptor.referrer,
+        referrerPolicy: descriptor.referrerPolicy,
+        signal: controller.signal,
+        ...(body ? { body, duplex: 'half' as const } : {}),
+      } as RequestInit & { duplex?: 'half' };
+      const response = await this.options.api.fetch(descriptor.url, requestInit);
+      const metadata: BrokerFetchMetadata = {
+        kind: 'metadata',
+        status: response.status,
+        statusText: response.statusText,
+        headers: [...response.headers.entries()],
+        url: response.url,
+        redirected: response.redirected,
+        responseType: response.type,
+        hasBody: response.body !== null,
+      };
+      yield metadata;
+      if (!response.body) return;
+
+      responseReader = response.body.getReader();
+      for (;;) {
+        const next = await responseReader.read();
+        if (next.done) return;
+        yield next.value;
+      }
+    } finally {
+      sourceSignal?.removeEventListener('abort', forwardAbort);
+      if (!controller.signal.aborted) controller.abort(new DOMException('Plugin fetch stream closed', 'AbortError'));
+      try {
+        await responseReader?.cancel();
+      } catch {
+        // The response may already be complete or failed.
+      }
+      try {
+        await bodyIterator?.return?.();
+      } catch {
+        // Request-body cancellation is best-effort during teardown.
+      }
+    }
+  }
+
   private async dispatch(method: string, args: unknown[], adoptSink?: string[]): Promise<unknown> {
+    if (method === '__fetch') return this.streamPluginFetch(args[0] as BrokerFetchRequest);
     if (method === '__ping') return null;
     if (method === '__mainCallback') {
       const callbackId = String(args[0] ?? '');
@@ -679,6 +833,18 @@ export class PluginProcessHost {
       if (!callback) throw new Error(`Unknown main-process plugin callback: ${callbackId}`);
       const callbackArgs = Array.isArray(args[1]) ? (args[1] as unknown[]) : [];
       return callback(...callbackArgs);
+    }
+
+    if (method === '__mainCallbackStream') {
+      const callbackId = String(args[0] ?? '');
+      const callback = this.mainFunctions.get(callbackId);
+      if (!callback) throw new Error(`Unknown main-process plugin callback: ${callbackId}`);
+      const callbackArgs = Array.isArray(args[1]) ? (args[1] as unknown[]) : [];
+      const iterable = callback(...callbackArgs) as AsyncIterable<unknown>;
+      if (!iterable || typeof iterable[Symbol.asyncIterator] !== 'function') {
+        throw new Error(`Main-process plugin callback ${callbackId} did not return an async iterable`);
+      }
+      return iterable;
     }
 
     if (method === '__registerDisposable') {
@@ -800,7 +966,7 @@ export class PluginProcessHost {
   private async handleAsyncInvoke(message: Record<string, unknown>, enforceBarrier = true): Promise<void> {
     const id = Number(message.id);
     if (this.inboundInvocations >= CHILD_MAX_INFLIGHT_INVOCATIONS) {
-      this.child?.postMessage({
+      this.tryPostToChild({
         type: 'invoke-result',
         id,
         ok: false,
@@ -814,9 +980,9 @@ export class PluginProcessHost {
       if (enforceBarrier) await this.awaitOrdered(Number(message.afterOrder ?? 0));
       const args = this.decode(message.args, abortIds) as unknown[];
       const value = await this.dispatch(String(message.method ?? ''), args);
-      this.child?.postMessage({ type: 'invoke-result', id, ok: true, value: this.encode(value) });
+      this.tryPostToChild({ type: 'invoke-result', id, ok: true, value: this.encode(value) });
     } catch (error) {
-      this.child?.postMessage({ type: 'invoke-result', id, ok: false, error: serializeWireError(error) });
+      this.tryPostToChild({ type: 'invoke-result', id, ok: false, error: serializeWireError(error) });
     } finally {
       this.releaseRemoteAbortControllers(abortIds);
       this.inboundInvocations -= 1;
@@ -826,7 +992,7 @@ export class PluginProcessHost {
   private async handleStreamInvoke(message: Record<string, unknown>): Promise<void> {
     const id = Number(message.id);
     if (this.inboundInvocations >= CHILD_MAX_INFLIGHT_INVOCATIONS) {
-      this.child?.postMessage({
+      this.tryPostToChild({
         type: 'stream-error',
         id,
         error: serializeWireError(new Error('Plugin exceeded the concurrent host stream limit')),
@@ -847,11 +1013,11 @@ export class PluginProcessHost {
       for (;;) {
         const next = await iterator.next();
         if (next.done) break;
-        this.child?.postMessage({ type: 'stream-event', id, value: this.encode(next.value) });
+        if (!this.tryPostToChild({ type: 'stream-event', id, value: this.encode(next.value) })) break;
       }
-      this.child?.postMessage({ type: 'stream-end', id });
+      this.tryPostToChild({ type: 'stream-end', id });
     } catch (error) {
-      this.child?.postMessage({ type: 'stream-error', id, error: serializeWireError(error) });
+      this.tryPostToChild({ type: 'stream-error', id, error: serializeWireError(error) });
     } finally {
       this.outboundStreams.delete(id);
       this.releaseRemoteAbortControllers(abortIds);
@@ -1044,6 +1210,7 @@ export class PluginProcessHost {
 
   private attachBrokerSocket(socket: Socket): void {
     let authenticated = false;
+    let channel: 'sync' | 'control' = 'sync';
     let buffer = '';
     let windowStartedAt = Date.now();
     let callsInWindow = 0;
@@ -1074,8 +1241,36 @@ export class PluginProcessHost {
             return;
           }
           authenticated = true;
-          this.brokerSocket = socket;
-          this.writeBrokerResponse(socket, { type: 'ready' });
+          if (parsed.channel === 'control') {
+            const challenge = typeof parsed.challenge === 'string' ? parsed.challenge : '';
+            const pid = Number(parsed.pid);
+            if (
+              this.runtime !== 'node-sea' ||
+              this.controlSocket ||
+              parsed.protocolVersion !== PLUGIN_PROCESS_PROTOCOL_VERSION ||
+              parsed.pluginName !== this.options.manifest.name ||
+              pid !== this.child?.pid ||
+              !/^[a-f0-9]{64}$/.test(challenge)
+            ) {
+              socket.destroy(new Error('Plugin control channel identity validation failed'));
+              return;
+            }
+            channel = 'control';
+            this.controlSocket = socket;
+            const tokenProof = createHmac('sha256', this.brokerToken)
+              .update(`server:${challenge}:${pid}:${this.options.manifest.name}`)
+              .digest('hex');
+            this.writeBrokerResponse(socket, { type: 'ready', tokenProof });
+          } else {
+            this.brokerSocket = socket;
+            this.writeBrokerResponse(socket, { type: 'ready' });
+          }
+          continue;
+        }
+
+        if (channel === 'control') {
+          if (!this.acceptChildMessage()) continue;
+          void this.handleMessage(parsed);
           continue;
         }
 
@@ -1102,6 +1297,15 @@ export class PluginProcessHost {
     });
     socket.on('close', () => {
       if (this.brokerSocket === socket) this.brokerSocket = null;
+      if (this.controlSocket === socket) {
+        this.controlSocket = null;
+        if (!this.disposed && ['starting', 'running', 'paused'].includes(this.status)) {
+          if (!processRecords.get(this.options.manifest.name)?.lastError) {
+            this.updateRecord({ lastError: 'Plugin SEA control channel closed unexpectedly' });
+          }
+          this.child?.kill();
+        }
+      }
     });
     socket.on('error', () => {
       // Exit handling reports the owning utility process failure if needed.
@@ -1159,10 +1363,12 @@ export class PluginProcessHost {
     });
   }
 
-  private handleExit(code: number): void {
+  private handleExit(code: number, signal?: NodeJS.Signals | null): void {
     const ownsRecord = processRecordOwners.get(this.options.manifest.name) === this.recordOwner;
     const record = ownsRecord ? processRecords.get(this.options.manifest.name) : undefined;
-    const error = record?.lastError ?? `Plugin utility process exited with code ${code}`;
+    if (record?.pid !== null && record?.pid !== undefined) processResourceSamples.delete(record.pid);
+    const runtimeLabel = this.runtime === 'node-sea' ? 'Node SEA host' : 'Electron utility process';
+    const error = record?.lastError ?? `Plugin ${runtimeLabel} exited with code ${code}${signal ? ` (${signal})` : ''}`;
     const priorCrashCount = record?.crashCount ?? processCrashCounts.get(this.options.manifest.name) ?? 0;
     const crashCount = this.expectedExit ? priorCrashCount : priorCrashCount + 1;
     if (!this.expectedExit) processCrashCounts.set(this.options.manifest.name, crashCount);
@@ -1190,28 +1396,41 @@ export class PluginProcessHost {
     }
   }
 
-  async activate(): Promise<void> {
-    await this.startBroker();
-    const canReadConfig = this.options.manifest.permissions.includes('config:read');
-    const initialConfig = canReadConfig ? this.options.api.config.get() : {};
-    const initialPluginData = canReadConfig ? this.options.api.config.getPluginData() : {};
+  private createRuntimeInit(
+    initialConfig: Record<string, unknown>,
+    initialPluginData: Record<string, unknown>,
+  ): PluginRuntimeInit {
+    return {
+      type: 'init',
+      protocolVersion: PLUGIN_PROCESS_PROTOCOL_VERSION,
+      manifest: this.options.manifest,
+      pluginDir: this.options.pluginDir,
+      backendPath: this.options.backendPath,
+      fileHash: this.options.fileHash,
+      apiVersion: this.options.api.host.apiVersion(),
+      capabilities: this.options.api.host.capabilities(),
+      initialConfig,
+      initialPluginData,
+      syncBridge: {
+        host: '127.0.0.1',
+        port: this.brokerPort,
+        token: this.brokerToken,
+        workerPath: this.options.syncWorkerPath,
+      },
+    };
+  }
+
+  private launchUtility(init: PluginRuntimeInit): UtilityProcess {
     const child = utilityProcess.fork(this.options.utilityEntryPath, [], {
       // Match the main process's historical cwd semantics. Plugin assets should
-      // continue to use api.pluginDir; silently changing process.cwd() to the
-      // plugin folder would break existing relative-path behavior.
+      // continue to use api.pluginDir.
       cwd: process.cwd(),
       env: { ...process.env },
       execArgv: [],
       stdio: 'pipe',
       serviceName: `Kai Plugin: ${this.options.manifest.name}`,
-      // Plugins may bundle native addons. Loading them in the dedicated Plugin
-      // helper preserves the capability they had in the main process while
-      // keeping any native crash inside this utility process.
       allowLoadingUnsignedLibraries: process.platform === 'darwin',
     });
-    this.child = child;
-    this.pipeOutput(child.stdout, 'info');
-    this.pipeOutput(child.stderr, 'error');
     child.on('message', (message) => {
       if (!this.acceptChildMessage()) return;
       void this.handleMessage(message as Record<string, unknown>);
@@ -1220,31 +1439,63 @@ export class PluginProcessHost {
       this.updateRecord({ lastError: `${type}${location ? ` at ${location}` : ''}` });
     });
     child.once('exit', (code) => this.handleExit(code));
+    child.once('spawn', () => child.postMessage(init));
+    return child;
+  }
+
+  private launchSea(init: PluginRuntimeInit): ChildProcessWithoutNullStreams {
+    const executable = this.options.seaHostPath!;
+    const env = { ...process.env };
+    delete env.NODE_OPTIONS;
+    delete env.NODE_REPL_EXTERNAL_MODULE;
+    delete env.ELECTRON_RUN_AS_NODE;
+    const child = spawn(executable, [], {
+      cwd: process.cwd(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      // The SEA itself also uses execArgvExtension:none. Removing interpreter
+      // extension variables avoids even parsing them in development builds.
+      env,
+    });
+    child.stdin.on('error', (error) => {
+      if (!this.disposed) this.updateRecord({ lastError: `Plugin SEA initialization pipe failed: ${error.message}` });
+    });
+    child.on('error', (error) => this.updateRecord({ lastError: error.message }));
+    child.once('exit', (code, signal) => this.handleExit(code ?? 1, signal));
+    child.once('spawn', () => child.stdin.end(`${JSON.stringify(init)}\n`));
+    return child;
+  }
+
+  async activate(): Promise<void> {
+    await this.startBroker();
+    const canReadConfig = this.options.manifest.permissions.includes('config:read');
+    const initialConfig = canReadConfig ? this.options.api.config.get() : {};
+    const initialPluginData = canReadConfig ? this.options.api.config.getPluginData() : {};
+    const init = this.createRuntimeInit(initialConfig, initialPluginData);
+    const child = this.runtime === 'node-sea' ? this.launchSea(init) : this.launchUtility(init);
+    this.child = child;
+    this.pipeOutput(child.stdout, 'info');
+    this.pipeOutput(child.stderr, 'error');
 
     await new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => {
+      const onSpawn = (): void => {
         const pid = child.pid ?? null;
+        if (pid !== null) processResourceSamples.delete(pid);
         this.updateRecord({ pid, status: 'starting', startedAt: new Date().toISOString() });
-        child.postMessage({
-          type: 'init',
-          manifest: this.options.manifest,
-          pluginDir: this.options.pluginDir,
-          backendPath: this.options.backendPath,
-          fileHash: this.options.fileHash,
-          apiVersion: this.options.api.host.apiVersion(),
-          capabilities: this.options.api.host.capabilities(),
-          initialConfig,
-          initialPluginData,
-          syncBridge: {
-            host: '127.0.0.1',
-            port: this.brokerPort,
-            token: this.brokerToken,
-            workerPath: this.options.syncWorkerPath,
-          },
-        });
         resolve();
-      });
-      child.once('exit', (code) => reject(new Error(`Plugin process exited before spawn completed (${code})`)));
+      };
+      if (this.runtime === 'node-sea') {
+        const seaChild = child as ChildProcess;
+        seaChild.once('spawn', onSpawn);
+        seaChild.once('error', reject);
+        seaChild.once('exit', (code) => reject(new Error(`Plugin process exited before spawn completed (${code})`)));
+      } else {
+        const utilityChild = child as UtilityProcess;
+        utilityChild.once('spawn', onSpawn);
+        utilityChild.once('exit', (code) =>
+          reject(new Error(`Plugin process exited before spawn completed (${code})`)),
+        );
+      }
     });
 
     try {
@@ -1360,7 +1611,7 @@ export class PluginProcessHost {
     await this.unexpectedExitCleanup;
   }
 
-  private async terminateChild(child: UtilityProcess): Promise<void> {
+  private async terminateChild(child: UtilityProcess | ChildProcess): Promise<void> {
     const pid = child.pid;
     if (pid === undefined) return;
     const label = `Plugin "${this.options.manifest.name}" process exit`;
@@ -1421,6 +1672,9 @@ export class PluginProcessHost {
     this.cancelOutboundStreams();
     this.brokerSocket?.destroy();
     this.brokerSocket = null;
+    const controlSocket = this.controlSocket;
+    this.controlSocket = null;
+    controlSocket?.destroy();
     this.server?.close();
     this.server = null;
     for (const timer of this.outputTimers) clearInterval(timer);

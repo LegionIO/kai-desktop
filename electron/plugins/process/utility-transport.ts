@@ -1,5 +1,5 @@
 import { Worker } from 'node:worker_threads';
-import type { ParentPort } from 'electron';
+import type { PluginMessagePort } from './message-port.js';
 import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from './wire.js';
 
 const SYNC_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -90,7 +90,10 @@ export type SyncBridgeInit = {
   host: string;
   port: number;
   token: string;
-  workerPath: string;
+  workerPath?: string;
+  /** Bundled SEA hosts cannot address app.asar. They embed the same worker and
+   * start it from source only when a synchronous compatibility call occurs. */
+  workerSource?: string;
 };
 
 type ControlHandler = (command: string, args: unknown[]) => Promise<unknown> | unknown;
@@ -178,7 +181,7 @@ export class UtilityTransport {
   private syncWorkerStateChangeHandler: (() => void) | null = null;
   private closed = false;
 
-  constructor(private parentPort: ParentPort) {
+  constructor(private parentPort: PluginMessagePort) {
     parentPort.on('message', (event) => {
       void this.handleMessage(event.data as Record<string, unknown>);
     });
@@ -208,7 +211,10 @@ export class UtilityTransport {
     // when a plugin first needs a genuinely synchronous host result.
     const readyShared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
     const readyState = new Int32Array(readyShared);
-    const worker = new Worker(this.syncBridge.workerPath, {
+    const workerEntry = this.syncBridge.workerSource ?? this.syncBridge.workerPath;
+    if (!workerEntry) throw new Error('Plugin synchronous bridge worker is unavailable');
+    const worker = new Worker(workerEntry, {
+      eval: this.syncBridge.workerSource !== undefined,
       workerData: {
         host: this.syncBridge.host,
         port: this.syncBridge.port,
@@ -343,7 +349,11 @@ export class UtilityTransport {
         registerFunction: (fn) => {
           const id = this.registerFunction(fn);
           registeredHere.push(id);
-          return { id, async: fn.constructor.name === 'AsyncFunction' };
+          return {
+            id,
+            async: fn.constructor.name === 'AsyncFunction',
+            stream: fn.constructor.name === 'AsyncGeneratorFunction',
+          };
         },
         registerAbortSignal: (signal) => this.registerAbortSignal(signal),
       });
@@ -367,8 +377,10 @@ export class UtilityTransport {
 
   decode(value: unknown, abortIds?: string[]): unknown {
     return decodeWire(value, {
-      callFunction: (id, args, isAsync) =>
-        isAsync ? this.asyncCall('__mainCallback', [id, args]) : this.syncCall('__mainCallback', [id, args]),
+      callFunction: (id, args, isAsync, isStream) => {
+        if (isStream) return this.streamCall('__mainCallbackStream', [id, args]);
+        return isAsync ? this.asyncCall('__mainCallback', [id, args]) : this.syncCall('__mainCallback', [id, args]);
+      },
       resolveAbortSignal: (id, aborted, reason) => {
         const controller = new AbortController();
         if (aborted) controller.abort(reason);

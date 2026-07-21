@@ -4,6 +4,21 @@ const { join } = require('node:path');
 
 const PLIST_BUDDY = '/usr/libexec/PlistBuddy';
 
+function chmodPluginHosts(resourcesDir) {
+  const root = join(resourcesDir, 'plugin-host');
+  if (!existsSync(root)) return;
+  const stack = [root];
+  const { chmodSync, statSync } = require('node:fs');
+  while (stack.length > 0) {
+    const directory = stack.pop();
+    for (const entry of readdirSync(directory)) {
+      const path = join(directory, entry);
+      if (statSync(path).isDirectory()) stack.push(path);
+      else if (entry === 'kai-plugin-host') chmodSync(path, 0o755);
+    }
+  }
+}
+
 function plistBuddy(plistPath, command, allowFailure = false) {
   try {
     return execFileSync(PLIST_BUDDY, ['-c', command, plistPath], {
@@ -44,6 +59,7 @@ module.exports = async function afterPack(context) {
       const p = join(resourcesBin, helper);
       if (existsSync(p)) chmodSync(p, 0o755);
     }
+    chmodPluginHosts(join(context.appOutDir, 'resources'));
     return;
   }
   if (context.electronPlatformName !== 'darwin') return;
@@ -61,6 +77,7 @@ module.exports = async function afterPack(context) {
     const shim = join(appPath, 'Contents', 'Resources', 'bin', 'kai');
     if (existsSync(shim)) chmodSync(shim, 0o755);
   }
+  chmodPluginHosts(join(appPath, 'Contents', 'Resources'));
 
   const localNetworkUsageDescription = plistBuddy(
     appInfoPlist,

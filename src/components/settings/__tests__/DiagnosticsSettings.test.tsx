@@ -36,6 +36,8 @@ const summary = {
       memorySource: 'private' as const,
       syncWorkerRunning: false,
       zodCodecLoaded: false,
+      runtime: 'node-sea' as const,
+      runtimeReason: 'pure JavaScript plugin passed SEA compatibility preflight',
     },
   ],
 };
@@ -98,6 +100,7 @@ describe('DiagnosticsSettings plugin process controls', () => {
     expect(screen.getByText('private footprint')).toBeTruthy();
     expect(screen.getByText('RSS 70.0 MB')).toBeTruthy();
     expect(screen.getByText('4242')).toBeTruthy();
+    expect(screen.getByText('Node SEA')).toBeTruthy();
     expect(screen.getByRole('button', { name: /pause/i })).toBeTruthy();
     expect(screen.getByRole('button', { name: /kill/i })).toBeTruthy();
     expect(screen.getByRole('button', { name: /disable/i })).toBeTruthy();
@@ -125,5 +128,21 @@ describe('DiagnosticsSettings plugin process controls', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /resume/i }));
     await waitFor(() => expect(mocks.resume).toHaveBeenCalledWith('calendar'));
+  });
+
+  it('identifies the Electron fallback runtime', async () => {
+    mocks.getSummary.mockResolvedValue({
+      ...summary,
+      pluginProcesses: [
+        {
+          ...summary.pluginProcesses[0],
+          runtime: 'electron-utility' as const,
+          runtimeReason: 'native addon detected',
+        },
+      ],
+    });
+    render(<DiagnosticsSettings config={{}} updateConfig={vi.fn()} />);
+
+    expect(await screen.findByText('Electron compatibility host')).toBeTruthy();
   });
 });

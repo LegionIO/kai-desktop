@@ -126,8 +126,8 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
           Diagnostics
         </h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Each plugin backend runs in its own utility process. CPU, memory, crashes, and unhandled errors are attributed
-          to the owning plugin instead of being hidden inside the main app process.
+          Each plugin backend runs in its own isolated process. CPU, memory, crashes, and unhandled errors are
+          attributed to the owning plugin instead of being hidden inside the main app process.
         </p>
       </div>
 
@@ -226,6 +226,11 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
                       <td className="px-3 py-2">
                         <span className="font-medium">{plugin.displayName}</span>
                         <div className="text-[11px] text-muted-foreground">{plugin.name}</div>
+                        {process && (
+                          <div className="text-[10px] text-muted-foreground" title={process.runtimeReason}>
+                            {process.runtime === 'node-sea' ? 'Node SEA' : 'Electron compatibility host'}
+                          </div>
+                        )}
                         {process?.lastError && process.status === 'crashed' && (
                           <div className="mt-0.5 line-clamp-2 text-destructive">{process.lastError}</div>
                         )}

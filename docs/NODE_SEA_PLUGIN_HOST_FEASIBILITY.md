@@ -1,191 +1,160 @@
-# Node SEA Plugin Host Feasibility
+# Node SEA Plugin Host
 
 ## Status
 
-Feasibility proof only. This experiment is deliberately separate from the
-production Electron utility-process host and does not alter plugin loading.
+Accepted and implemented in production. The original feasibility experiment is
+still available in `scripts/verify-sea-plugin-host.mjs`, but normal plugin
+loading now selects between the lighter Node SEA host and the Electron utility
+compatibility host before activation.
 
-Run it with Node 25.5 or newer:
+Every plugin still receives its own OS process. The SEA work changes the
+runtime baseline; it does not combine plugins or weaken fault/resource
+isolation.
 
-```bash
-node scripts/verify-sea-plugin-host.mjs
-```
+## Why a second runtime exists
 
-If the active Node was built without SEA support (Homebrew may expose the flag
-while compiling the feature out), point the proof at a pinned official binary:
+An Electron utility process preserves the entire Electron/Node environment but
+charges even a small config-only plugin for that runtime. A signed Node Single
+Executable Application (SEA) provides Node and the same Kai compatibility
+runtime without Chromium/Electron initialization.
 
-```bash
-KAI_SEA_NODE_BINARY=/absolute/path/to/official-node/bin/node \
-  node scripts/verify-sea-plugin-host.mjs
-```
+The host executable is shared on disk and in file-backed code pages, while
+each launch has a distinct PID, heap, event loop, control channel, and lifecycle.
+Plugins continue exporting the existing `activate(api)`, optional
+`deactivate()`, and optional `onConfigChanged()` functions; no plugin rewrite is
+required.
 
-For Node 20-24, also provide `postject`:
+## Runtime selection
 
-```bash
-KAI_SEA_NODE_BINARY=/absolute/path/to/node \
-KAI_SEA_POSTJECT=/absolute/path/to/postject \
-  node scripts/verify-sea-plugin-host.mjs
-```
+Selection is conservative and occurs before any plugin code runs. Kai uses SEA
+when all of the following are true:
 
-An existing plugin backend can be included in the smoke run without copying or
-modifying it:
+- the signed host for the current platform/architecture exists and is
+  executable;
+- the backend is inside the scanned plugin tree;
+- the bounded scan finds no `.node` addon, native package metadata, or direct
+  `electron` dependency; and
+- the plugin does not request a permission class measured locally as cheaper in
+  the Electron host.
 
-```bash
-KAI_SEA_SMOKE_PLUGIN=/absolute/path/to/plugin/dist/backend.js \
-KAI_SEA_NODE_BINARY=/absolute/path/to/node \
-KAI_SEA_POSTJECT=/absolute/path/to/postject \
-  node scripts/verify-sea-plugin-host.mjs
-```
+The currently measured Electron-favored permission classes are
+`tools:register`, `safe-storage`, conversation reads/writes, `system:env`, and
+`agent:inference-provider`. These APIs often load the Zod codec or synchronous
+compatibility worker, at which point Electron's shared framework pages make its
+private footprint competitive or lower. This is a routing optimization, not a
+capability restriction: those plugins remain isolated in their own Electron
+utility process.
 
-Node 24 uses the same SEA format but requires the older preparation-blob plus
-`postject` build sequence. Production should use a pinned official or
-Kai-built Node binary rather than whichever Node happens to run the build.
+Native addons and direct Electron consumers also use the utility host. A scan
+error or configured size/file limit is treated the same way. Kai never retries
+activation in the other runtime after plugin code has started, because doing so
+could duplicate registrations or other side effects.
 
-## What the proof establishes
+For development diagnostics only, `KAI_PLUGIN_HOST_RUNTIME=sea` and
+`KAI_PLUGIN_HOST_RUNTIME=electron` force a runtime. `KAI_PLUGIN_SEA_HOST` can
+point at an explicit executable.
 
-The verification script creates a temporary, ad-hoc-signed SEA executable and
-launches two copies. It verifies that the host can:
+## Shared compatibility runtime
 
-- ignore `NODE_OPTIONS` (`execArgvExtension: "none"`) and refuse generic Node
-  CLI arguments;
-- accept initialization through a private stdin pipe;
-- authenticate to a loopback broker with a per-process random token;
-- hash an external plugin backend before loading it;
-- load an external ESM plugin containing top-level `await` without rewriting
-  the plugin;
-- publish API operations and invoke an asynchronous plugin callback;
-- survive a sibling plugin host being force-killed; and
-- deactivate and exit cleanly.
+`electron/plugins/process/plugin-runtime.ts` is Electron-free and runs in both
+hosts. It preserves:
 
-Node SEA entrypoints cannot directly import filesystem ESM. The proof embeds a
-small CommonJS loader as a SEA asset, writes it into a mode-0700 temporary
-directory, loads it as an ordinary filesystem module, and immediately removes
-the extraction directory. Dynamic imports initiated by that ordinary module
-use Node's normal ESM loader. This preserves top-level-await support.
+- config/state mirrors and ordered writes;
+- true synchronous calls through the demand-started worker bridge;
+- callbacks, hooks, actions, tools, progress events, and inference providers;
+- async generators and bidirectional `AbortSignal` propagation;
+- Zod schemas through the lazy external codec; and
+- activation, config change, graceful deactivation, crash, and kill behavior.
 
-## Local measurements
+The SEA runtime cannot import Electron's `net` module. Its `fetch` adapter
+therefore streams request and response bodies through the bounded control
+protocol to the existing permission-enforcing main-process `PluginAPI.fetch`.
+This retains Electron session/proxy/certificate behavior, status and redirect
+metadata, headers, streaming, and cancellation without buffering whole bodies.
 
-The proof was exercised on macOS arm64 with a self-contained Node 24.14 binary
-and `postject` 1.0.0-alpha.6:
+## Process and channel hardening
 
-| Item                              | Measurement              |
-| --------------------------------- | ------------------------ |
-| SEA executable                    | 118,229,824 bytes        |
-| Fixture host physical footprint A | 13.4 MB                  |
-| Fixture host physical footprint B | 13.1 MB                  |
-| Fixture host RSS                  | approximately 47 MB each |
-| Stripped SEA executable           | 109,807,760 bytes        |
-| Stripped fixture physical memory  | 13.1 MB                  |
-| Stripped fixture RSS              | approximately 39 MB each |
+The production host:
 
-The existing LLM Gateway `dist/backend.js` also activated, registered its
-settings/actions, deactivated, and exited without source changes. It was given
-unconfigured plugin data so the proof did not perform authentication or
-network traffic.
+- is built from checksum-pinned official Node 24.14.0 archives;
+- uses `execArgvExtension: "none"`, a fixed heap ceiling, no CLI arguments, and
+  a sanitized environment;
+- accepts its one initialization frame through inherited stdin;
+- binds no public listener and connects only to the main process's IPv4
+  loopback endpoint;
+- authenticates both peers with a per-launch 256-bit token and HMAC challenge;
+- re-hashes `backend.js` immediately before import;
+- uses bounded frames, call/message rate limits, concurrency limits, and output
+  backpressure; and
+- extracts embedded runtime assets into a private mode-0700 temporary directory
+  that is removed on exit.
 
-The executable is a one-time application-size cost, not a per-plugin disk
-cost. Every plugin launches the same signed file, and the OS can share its
-read-only code pages. Node 24 and universal arm64/x64 packaging will have
-different binary sizes and must be measured in the release build.
+This boundary provides fault and resource isolation, not a hostile-code
+sandbox. A granted plugin can still exercise the capabilities represented by
+its permissions.
 
-The Node 24 binary reported native module ABI 137 and N-API 10. Electron
-41.2's embedded Node 24.14 reports module ABI 145 and N-API 10. This confirms
-that classic Electron-targeted `.node` addons need the utility-process
-fallback, while N-API addons remain candidates after explicit testing.
+## Measured footprint
 
-The SEA configuration used `execArgvExtension: "none"`; the verification
-launched both the CLI-refusal probe and plugin hosts with a deliberately
-invalid `NODE_OPTIONS=--require=...` value. Node 24 ignored it and completed
-the proof, so the intended production hardening is empirically supported.
+Local macOS arm64 measurements using the production protocol and OS physical
+footprint sampler were:
 
-## Proposed production topology
+| Fixture                               |           Node SEA | Electron utility |
+| ------------------------------------- | -----------------: | ---------------: |
+| Lightweight mirrored-config plugin    |      about 16.1 MB |    about 18.0 MB |
+| Unchanged LLM Gateway backend         | about 17.2-17.5 MB |    about 18.3 MB |
+| Full tools/sync compatibility fixture |     about 32-37 MB |      about 27 MB |
+
+The last row is why selection includes permission-based cost routing rather
+than assuming SEA is always smaller. Values vary with OS/runtime versions and
+plugin behavior; the Diagnostics GUI is the source of truth for a running app.
+The stripped arm64 host is roughly 110 MB on disk, paid once per architecture
+in the application rather than once per plugin.
+
+## Build and packaging
+
+`pnpm build` generates the current platform/architecture host. Release builds
+use `scripts/build-plugin-sea-host.mjs`; macOS builds explicitly generate both
+`darwin-arm64` and `darwin-x64` so a universal app can select the native host.
+The generated manifest records the Node version, input archive checksum,
+pre-application-signing host hash/size, architecture, and plugin protocol
+version. Final application signing intentionally changes the nested executable
+hash and size.
+
+Hosts are copied to:
 
 ```text
-Electron main
-  │
-  ├── permission-enforcing PluginAPI broker
-  │        │
-  │        ├── signed Node SEA host: pure-JS/N-API plugin A
-  │        ├── signed Node SEA host: pure-JS/N-API plugin B
-  │        └── Electron utility process: Electron-ABI native plugin C
-  │
-  └── PID-based diagnostics and pause/resume/kill controls
+Contents/Resources/plugin-host/<platform>-<arch>/kai-plugin-host
 ```
 
-One SEA executable is reused for every compatible plugin, but every launch is
-a distinct OS process. Fault and resource isolation therefore remain
-per-plugin.
+(`kai-plugin-host.exe` on Windows). The after-pack hook restores executable
+bits before application signing. The host is then covered by the normal
+application code-signing/notarization pipeline.
 
-## Production work still required
+The SEA and its embedded protocol cannot be replaced by Kai's preload/renderer
+OTA overlay. `package.json#pluginProcessProtocolVersion` is the release
+sentinel; changing it makes the release classifier require a full signed-app
+update. The SEA build reads the same value into its generated manifest, and a
+test keeps the shared runtime constant in sync.
 
-1. **Reuse the production protocol.** Replace the proof's intentionally small
-   JSON API with the existing bounded wire codec, callback/stream transport,
-   abort propagation, and permission-enforcing main broker.
-2. **Move `electron.net`.** A Node host cannot import Electron's `net` module.
-   To preserve proxy, certificate, and streaming behavior, perform fetches in
-   Electron main and stream request/response bodies over the broker.
-3. **Pin the runtime.** Download/build Node by version and SHA-256 in release
-   CI. Do not rely on Homebrew, nvm, or the build machine's `PATH`.
-4. **Build each architecture.** Produce arm64/x64 hosts in the corresponding
-   packaging jobs, merge them for a universal macOS app if required, then sign
-   the final binary with Kai's identity and include it in notarization.
-5. **Harden parent authentication.** The random broker token prevents a host
-   from joining an existing Kai process, but a standalone caller can still
-   launch the fixed host and provide its own initialization. Consider signing
-   the initialization payload with an installation key or requiring an
-   inherited endpoint that is never addressable by path/port.
-6. **Close the hash/load race.** Production should open and verify the plugin
-   file once, then load from that verified descriptor or an immutable private
-   copy. The current utility host has the same path-based race.
-7. **Native compatibility routing.** N-API addons should be tested by version;
-   addons built specifically for Electron's module ABI must continue using the
-   utility-process host. Detect this before activation so fallback cannot
-   duplicate side effects.
-8. **OTA protocol/versioning.** The SEA binary and embedded host cannot be
-   replaced by an app.asar-only update. Changes to its protocol must require a
-   full signed application update, like the current plugin process entrypoints.
-9. **Resource limits.** Apply a per-host V8 heap limit and retain broker rate,
-   message-size, and in-flight limits. Native allocations still require
-   monitoring and kill thresholds.
+## Verification
 
-## Packaging observations
+The real-process smoke uses the production executable and unchanged plugin
+backends. It covers mutual authentication (including invalid-proof rejection),
+integrity validation, config/state ordering, callbacks, tools, streams, aborts,
+streamed fetch upload/download, metrics, pause/resume/kill, crash and IPC-flood
+containment, deactivation, lazy worker/Zod loading, and LLM Gateway activation
+without network egress.
 
-- Stripping symbols mainly reduces disk size. The runtime memory reduction
-  comes from avoiding Chromium/Electron utility-process initialization.
-- In this sample, stripping before injection reduced the signed arm64 SEA by
-  about 8.4 MB and gzip size by about 2.6 MB. It reduced RSS because fewer
-  file-backed pages were mapped but did not materially change physical
-  footprint. The stripped input must be re-signed before macOS will execute it,
-  and the final injected host must receive Kai's production signature.
-- Node 25.5+ can create the executable directly with `--build-sea`; Node 24
-  needs `--experimental-sea-config` followed by `postject`.
-- `useCodeCache` must remain disabled because Node documents that dynamic
-  `import()` is unavailable when SEA code cache is enabled.
-- `execArgvExtension: "none"` is load-bearing: it ignores `NODE_OPTIONS` and
-  prevents CLI extension of Node/V8 flags.
-- Some package-manager Node executables dynamically link a separately installed
-  `libnode`. Release builds must verify that the chosen runtime is actually
-  redistributable and self-contained.
-- The locally installed Homebrew Node 26 advertised `--build-sea` but reported
-  that SEA was compiled out. The NVM Node 22 binary completed the legacy flow.
-  This confirms that runtime capability must be tested, not inferred from
-  `node --help`.
-- The enterprise npm virtual registry accepted the existing `~/.npmrc` token
-  for installing `postject` and `node-bin-darwin-arm64@24.14.0`. That package's
-  binary was signed by the Node.js Foundation and had SHA-256
-  `20a18709f0154d668f1bd6f6ea8c2a7ae001447b4b2c339732f22e57a8767a55`.
-  The generic Node distribution mirror requires its own username/token
-  permission; the npm token alone did not authorize a known cached artifact
-  during this proof. Release CI should prefer a checksum-pinned official
-  archive mirrored in the generic repository, or explicitly approve and lock
-  the platform npm package as release input. The npm virtual exposed the arm64
-  package but not the corresponding x64 package during this run, so universal
-  packaging still depends on making the x64 archive available through the
-  generic mirror.
+Standard gates remain:
 
-## Expected integration strategy
+```bash
+pnpm type-check
+pnpm lint
+pnpm test
+pnpm build
+pnpm verify:plugin-process
+```
 
-Keep the existing utility-process implementation as a compatibility fallback.
-Select the SEA host only after a preflight classifies the plugin as pure JS or
-compatible N-API. This permits incremental rollout without changing plugin
-source or sacrificing functionality.
+To run the same smoke through a built SEA host, first bundle the smoke host as
+done by `verify:plugin-process`, then set `KAI_PLUGIN_SEA_HOST` to the generated
+executable before launching `scripts/verify-plugin-process.mjs` with Electron.

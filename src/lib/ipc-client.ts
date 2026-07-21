@@ -393,6 +393,8 @@ type AppAPI = {
         memorySource: 'private' | 'working-set';
         syncWorkerRunning: boolean;
         zodCodecLoaded: boolean;
+        runtime: 'node-sea' | 'electron-utility';
+        runtimeReason: string;
       }>;
     }>;
     tailLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
