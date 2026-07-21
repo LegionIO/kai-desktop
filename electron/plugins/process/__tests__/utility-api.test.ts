@@ -289,4 +289,27 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(functions.has(first.streamId)).toBe(true);
     expect(functions.size).toBe(2); // only the original pair remains — no leak
   });
+
+  it('preserves inference ids on an AMBIGUOUS worker failure during handoff', async () => {
+    const { PluginCallAmbiguousError } = await import('../utility-transport.js');
+    const { api, functions, transport } = setup();
+    const provider = {
+      name: 'Fixture',
+      isAvailable: () => true,
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'p' };
+      },
+    };
+    // The handoff fails with a worker-level ambiguous error (e.g. broker
+    // disconnect before the response) AFTER the host may have accepted it. The
+    // ids must be preserved — not freed as if rejected — or the host could invoke
+    // a released callback. (These ids bypass per-request bookkeeping.)
+    (transport.syncCall as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((method: string) => {
+      if (method === 'agent.registerInferenceProvider') throw new PluginCallAmbiguousError('broker disconnected');
+      return undefined;
+    });
+    expect(() => api.agent.registerInferenceProvider(provider)).toThrow('broker disconnected');
+    // Both ids kept alive (host may hold them); reclaim deferred to reconcile.
+    expect(functions.size).toBe(2);
+  });
 });

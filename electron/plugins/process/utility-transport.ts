@@ -102,10 +102,34 @@ type ControlHandler = (command: string, args: unknown[]) => Promise<unknown> | u
  */
 export class PluginCallTimeoutError extends Error {
   readonly isTimeout = true;
+  readonly isAmbiguous = true;
   constructor(message: string) {
     super(message);
     this.name = 'PluginCallTimeoutError';
   }
+}
+
+/**
+ * Thrown by syncCall on a WORKER-level failure (broker disconnected, response
+ * exceeded the shared buffer, socket closed before delivery). Like a timeout,
+ * this is AMBIGUOUS: the host may already have processed the request and be
+ * holding callbacks, but no adopted payload reached us — so callers must not
+ * free callback ids on this error either.
+ */
+export class PluginCallAmbiguousError extends Error {
+  readonly isAmbiguous = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'PluginCallAmbiguousError';
+  }
+}
+
+/** True for any error where the host's disposition of a call is UNKNOWN — the
+ *  host may hold callbacks it introduced, so their ids must be preserved (never
+ *  freed as if rejected). Reclamation for genuinely-orphaned ids is deferred to
+ *  the drain-barrier reconcile. */
+export function isAmbiguousPluginCallError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { isAmbiguous?: boolean }).isAmbiguous === true;
 }
 
 export class UtilityTransport {
@@ -335,7 +359,7 @@ export class UtilityTransport {
     const size = Atomics.load(header, 1);
     const text = new TextDecoder().decode(new Uint8Array(this.syncShared, 8, size));
     if (Atomics.load(header, 0) === 2) {
-      throw new Error(text || `Plugin API call "${method}" failed`);
+      throw new PluginCallAmbiguousError(text || `Plugin API call "${method}" failed`);
     }
     // A definite host reply (state 1). It carries any callback ids the host
     // ADOPTED while handling it (on this same broker channel, avoiding a

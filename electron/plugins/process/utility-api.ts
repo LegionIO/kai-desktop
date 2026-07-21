@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import type { ToolDefinition } from '../../tools/types.js';
 import type { UtilityTransport } from './utility-transport.js';
-import { PluginCallTimeoutError } from './utility-transport.js';
+import { isAmbiguousPluginCallError } from './utility-transport.js';
 
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.').filter(Boolean);
@@ -403,12 +403,16 @@ export function createUtilityPluginAPI(options: {
         try {
           sync('agent.registerInferenceProvider', [{ name: provider.name, available, isAvailableId, streamId }]);
         } catch (error) {
-          // On a TIMEOUT the host MAY have adopted these ids (and built a provider
-          // around them, possibly captured by an in-flight agent turn) — freeing
-          // here could break a delayed stream() call. So DON'T: the host owns
-          // their lifetime and GC-releases them when its provider object is
-          // collected. On a CONFIRMED rejection the host never took them → free.
-          if (!(error instanceof PluginCallTimeoutError)) {
+          // On any AMBIGUOUS failure (timeout, or a worker-level broker error
+          // like a disconnect/oversized-response) the host MAY have accepted the
+          // registration and built a provider around these ids — freeing them
+          // could break a delayed stream()/isAvailable() call. So DON'T: the host
+          // owns their lifetime and GC-releases them when its provider object is
+          // collected (a truly-orphaned pair is reclaimed by the drain-barrier
+          // reconcile). Only on a CONFIRMED rejection did the host never take
+          // them → free them here. These ids bypass per-request bookkeeping (they
+          // travel as raw strings), so this is their only utility-side guard.
+          if (!isAmbiguousPluginCallError(error)) {
             transport.releaseFunction(isAvailableId);
             transport.releaseFunction(streamId);
           }

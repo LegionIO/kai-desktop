@@ -12,6 +12,8 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('electron', () => ({}));
 
 const { UtilityTransport } = await import('../utility-transport.js');
+const { PluginCallTimeoutError, PluginCallAmbiguousError, isAmbiguousPluginCallError } =
+  await import('../utility-transport.js');
 
 type Listener = (event: { data: Record<string, unknown> }) => void;
 
@@ -207,6 +209,14 @@ describe('UtilityTransport callback release', () => {
     const reply = posted.find((m) => m.type === 'callback-result' && m.id === 7);
     expect(reply?.ok).toBe(true); // still invokable — host owns it
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('isAmbiguousPluginCallError classifies timeout + worker failures, not generic errors', () => {
+    expect(isAmbiguousPluginCallError(new PluginCallTimeoutError('t'))).toBe(true);
+    expect(isAmbiguousPluginCallError(new PluginCallAmbiguousError('a'))).toBe(true);
+    expect(isAmbiguousPluginCallError(new Error('rejected'))).toBe(false);
+    expect(isAmbiguousPluginCallError(null)).toBe(false);
+    expect(isAmbiguousPluginCallError('nope')).toBe(false);
   });
 });
 
