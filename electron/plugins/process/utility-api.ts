@@ -105,9 +105,17 @@ export function createUtilityPluginAPI(options: {
   // .bind() makes a fresh function each call — so the host never releases them.
   // Release them ourselves when the provider is replaced or unregistered.
   let inferenceCallbackIds: string[] = [];
+  // Ids from handoffs that TIMED OUT: we can't tell whether the host adopted
+  // them, so we keep them alive but must still remember them — otherwise they'd
+  // fall out of all bookkeeping and leak permanently. A later CONFIRMED success
+  // (register/unregister) proves the host settled on some other set, so every
+  // ambiguous set accumulated until then can finally be released.
+  let ambiguousInferenceCallbackIds: string[] = [];
   const releaseInferenceCallbacks = (): void => {
     for (const id of inferenceCallbackIds) transport.releaseFunction(id);
+    for (const id of ambiguousInferenceCallbackIds) transport.releaseFunction(id);
     inferenceCallbackIds = [];
+    ambiguousInferenceCallbackIds = [];
   };
 
   const api: PluginAPI = {
@@ -395,46 +403,53 @@ export function createUtilityPluginAPI(options: {
         if (!provider || typeof provider.isAvailable !== 'function' || typeof provider.stream !== 'function') {
           throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
         }
-        // Register the NEW callbacks and hand off to the host FIRST, releasing
-        // the previous registration's ids only after that succeeds. If anything
-        // here throws (provider.isAvailable(), the sync handoff), we release the
-        // just-registered ids and keep the prior provider intact — otherwise a
-        // failed replacement would strand the host on freed ids ("Unknown
-        // plugin callback") while leaking the new ones.
         const previousIds = inferenceCallbackIds;
         const isAvailableId = transport.registerFunction(provider.isAvailable.bind(provider));
         const streamId = transport.registerFunction(
           provider.stream.bind(provider) as unknown as (...args: unknown[]) => unknown,
         );
+        // Evaluate availability BEFORE the handoff attempt. If isAvailable()
+        // itself makes a plugin call that times out, that happens while the host
+        // is still unambiguously using previousIds — so it must NOT be treated as
+        // an ambiguous handoff. Clean up the just-registered orphans and rethrow.
+        let available: boolean;
         try {
-          sync('agent.registerInferenceProvider', [
-            {
-              name: provider.name,
-              available: Boolean(provider.isAvailable()),
-              isAvailableId,
-              streamId,
-            },
-          ]);
+          available = Boolean(provider.isAvailable());
         } catch (error) {
-          // A TIMEOUT is ambiguous — the host may or may not have processed the
-          // queued request. Freeing EITHER id set risks stranding the host on an
-          // unknown callback (the new provider if it was adopted, or the old one
-          // if it wasn't). So on timeout we keep BOTH sets alive: adopt the new
-          // ids as current and deliberately do NOT release the previous ones.
-          // That's at worst a small bounded leak (one provider's 2 callbacks) —
-          // strictly safer than breaking a live provider. A CONFIRMED rejection,
-          // by contrast, means the host will never use the new ids, so free them
-          // and leave the prior provider intact.
-          if (error instanceof PluginCallTimeoutError) {
-            inferenceCallbackIds = [isAvailableId, streamId];
-            throw error;
-          }
           transport.releaseFunction(isAvailableId);
           transport.releaseFunction(streamId);
           throw error;
         }
+        // Now the actual host handoff. Only a timeout HERE is ambiguous (the
+        // request may or may not have been processed).
+        let handoffStarted = false;
+        try {
+          handoffStarted = true;
+          sync('agent.registerInferenceProvider', [{ name: provider.name, available, isAvailableId, streamId }]);
+        } catch (error) {
+          if (handoffStarted && error instanceof PluginCallTimeoutError) {
+            // Ambiguous: the host may have adopted the new ids OR still be using
+            // the old ones. Keep BOTH sets alive, and remember BOTH in the
+            // ambiguous bucket so a later confirmed op can reclaim them (they
+            // travel as raw ids the host never GC-releases). Adopt the new set
+            // as "current" so a subsequent successful call reconciles cleanly.
+            ambiguousInferenceCallbackIds.push(...previousIds);
+            inferenceCallbackIds = [isAvailableId, streamId];
+            throw error;
+          }
+          // Confirmed rejection (or a pre-handoff failure): the host will never
+          // use the new ids. Free them; leave the prior provider intact.
+          transport.releaseFunction(isAvailableId);
+          transport.releaseFunction(streamId);
+          throw error;
+        }
+        // Confirmed success: the host settled on the new ids. Release the prior
+        // set AND any ambiguous ids accumulated from earlier timeouts — they're
+        // now provably unused.
         inferenceCallbackIds = [isAvailableId, streamId];
         for (const id of previousIds) transport.releaseFunction(id);
+        for (const id of ambiguousInferenceCallbackIds) transport.releaseFunction(id);
+        ambiguousInferenceCallbackIds = [];
       },
       unregisterInferenceProvider: () => {
         checkPermission('agent:inference-provider');

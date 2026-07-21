@@ -260,5 +260,48 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(functions.has(first.streamId)).toBe(true);
     // New ids preserved too (host might have adopted the new provider). 4 total.
     expect(functions.size).toBe(4);
+
+    // A later SUCCESSFUL registration proves the host settled elsewhere, so the
+    // ambiguous prior set is finally reclaimed (no permanent leak) — leaving only
+    // the newest 2 callbacks.
+    api.agent.registerInferenceProvider(makeProvider());
+    expect(functions.has(first.isAvailableId)).toBe(false);
+    expect(functions.has(first.streamId)).toBe(false);
+    expect(functions.size).toBe(2);
+  });
+
+  it('does NOT treat an isAvailable() timeout (pre-handoff) as ambiguous', async () => {
+    const { PluginCallTimeoutError } = await import('../utility-transport.js');
+    const { api, calls, functions } = setup();
+    const good = {
+      name: 'Fixture',
+      isAvailable: () => true,
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'p' };
+      },
+    };
+    api.agent.registerInferenceProvider(good);
+    const first = calls.find((c) => c.method === 'agent.registerInferenceProvider')!.args[0] as {
+      isAvailableId: string;
+      streamId: string;
+    };
+
+    // A replacement whose isAvailable() itself times out — this happens BEFORE
+    // the host handoff, so the host is unambiguously still using the old ids.
+    const doomed = {
+      name: 'Doomed',
+      isAvailable: () => {
+        throw new PluginCallTimeoutError('inner call timed out');
+      },
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'd' };
+      },
+    };
+    expect(() => api.agent.registerInferenceProvider(doomed)).toThrow('inner call timed out');
+
+    // Old provider intact; the doomed provider's just-registered orphans freed.
+    expect(functions.has(first.isAvailableId)).toBe(true);
+    expect(functions.has(first.streamId)).toBe(true);
+    expect(functions.size).toBe(2); // only the original pair remains — no leak
   });
 });
