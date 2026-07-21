@@ -73,11 +73,24 @@ async function downloadPinnedArchive(target) {
 
   const configured = process.env.KAI_SEA_NODE_MIRROR?.replace(/\/$/, '');
   const mirrors = configured ? [configured] : ['https://nodejs.org/dist', 'https://npmmirror.com/mirrors/node'];
+  const mirrorUser = process.env.KAI_SEA_NODE_MIRROR_USER;
+  const mirrorToken = process.env.KAI_SEA_NODE_MIRROR_TOKEN;
+  if ((mirrorUser && !mirrorToken) || (!mirrorUser && mirrorToken)) {
+    throw new Error('KAI_SEA_NODE_MIRROR_USER and KAI_SEA_NODE_MIRROR_TOKEN must be set together');
+  }
+  const authHeaders =
+    mirrorUser && mirrorToken
+      ? { Authorization: `Basic ${Buffer.from(`${mirrorUser}:${mirrorToken}`).toString('base64')}` }
+      : undefined;
   let lastError;
   for (const mirror of mirrors) {
     const url = `${mirror}/v${NODE_VERSION}/${descriptor.name}`;
     try {
-      const response = await fetch(url, { redirect: 'follow' });
+      // Keep credentials out of the URL (failure logs print it). Corporate/on-
+      // prem builds pass the JFrog OIDC subject + access-token via env and we
+      // authenticate with a Basic header. Every response is still verified
+      // against the pinned upstream SHA-256 below.
+      const response = await fetch(url, { redirect: 'follow', headers: authHeaders });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       writeFileSync(archivePath, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
       const actual = sha256(archivePath);

@@ -110,8 +110,12 @@ mac:
   # Tell @electron/universal to copy these as-is instead of failing the
   # same-SHA mach-o check; the runtime loader of each package picks the right
   # darwin-${process.arch} variant. The bundled esbuild extraResource is
-  # host-arch-only and currently unused at runtime.
-  x64ArchFiles: "Contents/Resources/{esbuild/bin/esbuild,app.asar.unpacked/**}"
+  # host-arch-only and currently unused at runtime. The plugin-host resource also
+  # intentionally contains BOTH darwin-arm64 and darwin-x64 SEA executables in
+  # each temp build; plugin-runtime.ts selects the matching process.arch at
+  # runtime. Cover the whole resource so @electron/universal keeps one identical
+  # copy instead of rejecting the duplicate cross-arch files.
+  x64ArchFiles: "Contents/Resources/{esbuild/bin/esbuild,app.asar.unpacked/**,plugin-host/**}"
   # The AWS SDK's deep transitive tree is PURE JS (no arch-specific binaries) but
   # @electron/universal's mergeASARs can flag a package DIRECTORY as a "unique
   # file not covered by allowList" because pnpm places packages at slightly
