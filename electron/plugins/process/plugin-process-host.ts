@@ -335,12 +335,25 @@ export class PluginProcessHost {
     return { id, deferred: item };
   }
 
-  private invokeChildCallback(callbackId: string, args: unknown[]): Promise<unknown> {
+  private invokeChildCallback(callbackId: string, args: unknown[], timeoutMs?: number): Promise<unknown> {
     if (!this.child || this.disposed) return Promise.reject(new Error('Plugin process is not running'));
     if (this.status === 'paused') return Promise.reject(new Error('Plugin process is paused'));
     const request = this.nextRequest();
     const functionIds: string[] = [];
     this.child.postMessage({ type: 'callback', id: request.id, callbackId, args: this.encode(args, functionIds) });
+    // When a timeout is given, cancel (reject + REMOVE from `pending`) the
+    // underlying request on expiry — not just the caller's promise. Otherwise a
+    // child that never replies leaves the pending entry forever, and a periodic
+    // caller (e.g. the availability poll) accretes a new orphan every interval.
+    if (timeoutMs !== undefined) {
+      const timer = setTimeout(() => {
+        this.cancelPending(request.id, new Error(`Plugin callback timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      return request.deferred.promise.finally(() => {
+        clearTimeout(timer);
+        this.releaseMainFunctions(functionIds);
+      });
+    }
     return request.deferred.promise.finally(() => this.releaseMainFunctions(functionIds));
   }
 
@@ -437,11 +450,10 @@ export class PluginProcessHost {
     this.inferenceAvailabilityTimer = setInterval(() => {
       if (this.inferenceAvailabilityPollPending || !this.inferenceAvailabilityCallbackId) return;
       this.inferenceAvailabilityPollPending = true;
-      void withTimeout(
-        this.invokeChildCallback(this.inferenceAvailabilityCallbackId, []),
-        AVAILABILITY_TIMEOUT_MS,
-        'Plugin inference-provider availability check',
-      )
+      // Pass the timeout into invokeChildCallback so a hung/never-settling
+      // isAvailable rejects AND removes its pending entry (see the method) —
+      // wrapping with withTimeout alone would leak a pending request per poll.
+      void this.invokeChildCallback(this.inferenceAvailabilityCallbackId, [], AVAILABILITY_TIMEOUT_MS)
         .then((available) => {
           this.inferenceAvailable = available === true;
         })
@@ -562,6 +574,16 @@ export class PluginProcessHost {
     this.pending.delete(id);
     if (message.ok === true) item.resolve(this.decode(message.value));
     else item.reject(deserializeWireError(message.error));
+  }
+
+  /** Reject + remove a still-pending request (e.g. it timed out). Idempotent: a
+   *  later reply for the same id lands in settlePending as a no-op. Prevents the
+   *  pending map from growing without bound when the child never replies. */
+  private cancelPending(id: number, error: Error): void {
+    const item = this.pending.get(id);
+    if (!item) return;
+    this.pending.delete(id);
+    item.reject(error);
   }
 
   private async handleMessage(message: Record<string, unknown>): Promise<void> {
