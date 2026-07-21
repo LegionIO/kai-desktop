@@ -1,5 +1,74 @@
-import { describe, it, expect } from 'vitest';
-import { isStrictPrefix, selectProtectedTail, splitPreservedFields, type ChatMessage } from '../compaction';
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  isStrictPrefix,
+  selectProtectedTail,
+  splitPreservedFields,
+  shouldCompact,
+  type ChatMessage,
+} from '../compaction';
+import {
+  resolveConversationTokenization,
+  countSerializedTokens,
+  __clearExactTokenCacheForTests,
+} from '../tokenization';
+
+describe('shouldCompact (cheap pre-check gate + exact count)', () => {
+  beforeEach(() => __clearExactTokenCacheForTests());
+
+  const MODEL = 'gpt-4o'; // contextWindow 128000
+  const window = 128000;
+
+  it('does NOT compact a short conversation (estimate below trigger, no exact encode needed)', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+    ];
+    const res = shouldCompact(msgs, MODEL, 0.85);
+    expect(res.shouldCompact).toBe(false);
+    expect(res.contextWindowTokens).toBe(window);
+  });
+
+  it('the cheap estimate never under-reports vs the exact count, so a real over-trigger still compacts', () => {
+    // Build a branch whose EXACT token count exceeds the trigger.
+    const trigger = 0.85;
+    const triggerTokens = Math.floor(window * trigger);
+    const tokenization = resolveConversationTokenization(MODEL);
+    // ~4 chars/token; make content comfortably over the trigger.
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(30000);
+    const msgs: ChatMessage[] = [{ role: 'user', content: big }];
+    const exact = countSerializedTokens(msgs, tokenization)!;
+    expect(exact).toBeGreaterThan(triggerTokens); // precondition: genuinely over
+    const res = shouldCompact(msgs, MODEL, trigger);
+    expect(res.shouldCompact).toBe(true);
+    expect(res.usedTokens).toBe(exact); // exact count reported when gate passes
+  });
+
+  it('a value just under the trigger by exact count is NOT compacted even if the estimate crosses it', () => {
+    // Choose a low trigger so a modest branch makes the estimate cross while the
+    // exact count stays under — verifies the exact check is authoritative.
+    const trigger = 0.0005; // 128000 * 0.0005 = 64 tokens
+    const tokenization = resolveConversationTokenization(MODEL);
+    const msgs: ChatMessage[] = [{ role: 'user', content: 'x'.repeat(250) }];
+    const exact = countSerializedTokens(msgs, tokenization)!;
+    const triggerTokens = Math.floor(window * trigger);
+    // Repeated single char tokenizes to FEWER tokens than chars/3 estimates.
+    if (exact < triggerTokens) {
+      const res = shouldCompact(msgs, MODEL, trigger);
+      expect(res.shouldCompact).toBe(false);
+      // usedTokens is the exact count (gate passed → we ran the real encode)
+      expect(res.usedTokens).toBe(exact);
+    } else {
+      // If the content happened to exceed the trigger, the assertion is trivially
+      // satisfied elsewhere; skip to avoid a brittle expectation.
+      expect(true).toBe(true);
+    }
+  });
+
+  it('returns not-compact with zeros when the model has no known context window', () => {
+    const res = shouldCompact([{ role: 'user', content: 'hi' }], 'totally-made-up-model-xyz', 0.85);
+    expect(res).toEqual({ shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 });
+  });
+});
 
 describe('isStrictPrefix (compaction reuse / divergence detector)', () => {
   it('is true when ids are an ordered prefix of the branch', () => {

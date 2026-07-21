@@ -1,5 +1,10 @@
 import { randomUUID } from 'crypto';
-import { countSerializedTokens, resolveConversationTokenization, serializeForTokenCounting } from './tokenization.js';
+import {
+  countBranchTokensCached,
+  estimateSerializedTokens,
+  resolveConversationTokenization,
+  serializeForTokenCounting,
+} from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { auxAgentGenerate } from './generate-fallback.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
@@ -137,8 +142,26 @@ export function shouldCompact(
   if (!tokenization.encoding || !tokenization.contextWindowTokens) {
     return { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 };
   }
-  const usedTokens = countSerializedTokens(messages, tokenization) ?? 0;
   const triggerTokens = Math.floor(tokenization.contextWindowTokens * triggerPercent);
+
+  // Cheap pre-check: an over-biased estimate from serialized length (no WASM).
+  // Because the estimate is >= the true token count, if even it is below the
+  // trigger the exact count must be too — skip tiktoken entirely. This is the
+  // common case every turn on a normal-length chat and keeps the expensive
+  // encode off the hot send path. Only when the estimate reaches the trigger do
+  // we pay for the exact count (memoized per branch).
+  const estimatedTokens = estimateSerializedTokens(messages);
+  if (estimatedTokens < triggerTokens) {
+    return {
+      shouldCompact: false,
+      // Report the estimate for context-usage telemetry; it's an upper bound.
+      usedTokens: estimatedTokens,
+      contextWindowTokens: tokenization.contextWindowTokens,
+    };
+  }
+
+  const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
+  const usedTokens = countBranchTokensCached(messages, tokenization, lastMessageId) ?? 0;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
