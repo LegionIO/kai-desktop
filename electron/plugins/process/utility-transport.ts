@@ -117,6 +117,21 @@ export class UtilityTransport {
   private pending = new Map<number, Deferred<unknown>>();
   private streams = new Map<number, RemoteAsyncIterable>();
   private functions = new Map<string, (...args: unknown[]) => unknown>();
+  // Ownership tracking for utility→host callbacks. A registered id is only
+  // safe to reclaim once we KNOW the host's disposition for it — never inferred
+  // from ordering (callbacks travel over two unordered channels: the TCP sync
+  // broker and Electron IPC). Two host signals resolve it:
+  //   • `callback-adopted {id}` — the host decoded it into a live reference and
+  //     now owns its lifetime (it will send `release-callback` when GC'd). We
+  //     drop the id from `unadopted` and NEVER reclaim it ourselves.
+  //   • the carrying request settling (reply/confirmed-timeout) — if the id is
+  //     still unadopted then, the host never took it (dropped/rejected message),
+  //     so we release it. `requestCallbacks` maps a carrying-request id to the
+  //     ids it introduced; released or adopted ids are pruned from it.
+  // Ids the host adopts asynchronously (before the carrying request settles) are
+  // removed from `unadopted` by the adopt ack, so request-settle won't free them.
+  private unadopted = new Set<string>();
+  private requestCallbacks = new Map<number, string[]>();
   private remoteAbortControllers = new Map<string, AbortController>();
   private activeCallbackStreams = new Map<number, AsyncIterator<unknown>>();
   private controlHandler: ControlHandler | null = null;
@@ -162,15 +177,35 @@ export class UtilityTransport {
     // release unambiguous: it targets exactly the occurrence that was collected.
     const id = `u${++this.functionSequence}`;
     this.functions.set(id, fn);
+    this.unadopted.add(id);
     return id;
   }
 
-  /** Drop a callback the host will no longer invoke (it released the stub for
-   *  this specific occurrence, or a caller like the inference provider replaced/
-   *  unregistered it). Idempotent; a stray release for an unknown id no-ops. */
+  /** Drop a callback + all its ownership bookkeeping. Idempotent. */
   releaseFunction(id: string): void {
     if (!id) return;
     this.functions.delete(id);
+    this.unadopted.delete(id);
+  }
+
+  /** Host confirmed it decoded this id into a live reference — it now owns the
+   *  id's lifetime (releasing via `release-callback` on GC). Remove it from the
+   *  unadopted set so request-settle reclamation won't touch it. */
+  private markAdopted(id: string): void {
+    this.unadopted.delete(id);
+  }
+
+  /** A carrying request settled (reply received, or a confirmed cancel/timeout
+   *  the host will never process). Any callback ids it introduced that the host
+   *  never adopted are provably orphaned — release them. Per-request scoped, so
+   *  it's immune to cross-channel ordering. */
+  private settleRequest(requestId: number): void {
+    const ids = this.requestCallbacks.get(requestId);
+    if (!ids) return;
+    this.requestCallbacks.delete(requestId);
+    for (const id of ids) {
+      if (this.unadopted.has(id)) this.releaseFunction(id);
+    }
   }
 
   private registerAbortSignal(signal: AbortSignal): string {
@@ -190,16 +225,14 @@ export class UtilityTransport {
     return id;
   }
 
-  encode(value: unknown): unknown {
-    // Track ids registered during THIS encode so we can roll them back if
-    // encodeWire throws partway (e.g. a callback appears before a later cyclic
-    // value that aborts serialization). Without rollback, the id sits in
-    // `functions` with no host stub ever created for it — so it's never
-    // GC-released, and since ids are unique per occurrence, every retry leaks a
-    // fresh one.
+  encode(value: unknown, requestId?: number): unknown {
+    // Track ids registered during THIS encode so we can (a) roll them back if
+    // encodeWire throws partway (e.g. a callback before a later cyclic value),
+    // and (b) associate them with the carrying request so that, if that request
+    // settles without the host adopting them, we can reclaim the orphans.
     const registeredHere: string[] = [];
     try {
-      return encodeWire(value, {
+      const encoded = encodeWire(value, {
         registerFunction: (fn) => {
           const id = this.registerFunction(fn);
           registeredHere.push(id);
@@ -207,6 +240,12 @@ export class UtilityTransport {
         },
         registerAbortSignal: (signal) => this.registerAbortSignal(signal),
       });
+      if (requestId !== undefined && registeredHere.length > 0) {
+        const existing = this.requestCallbacks.get(requestId);
+        if (existing) existing.push(...registeredHere);
+        else this.requestCallbacks.set(requestId, registeredHere);
+      }
+      return encoded;
     } catch (error) {
       for (const id of registeredHere) this.releaseFunction(id);
       throw error;
@@ -236,7 +275,7 @@ export class UtilityTransport {
   syncCall(method: string, args: unknown[]): unknown {
     if (this.closed || !this.worker) throw new Error('Plugin process transport is closed');
     const id = ++this.sequence;
-    const request = JSON.stringify({ id, method, args: this.encode(args) });
+    const request = JSON.stringify({ id, method, args: this.encode(args, id) });
     const header = new Int32Array(this.syncShared, 0, 2);
     Atomics.store(header, 0, 0);
     Atomics.store(header, 1, 0);
@@ -248,12 +287,29 @@ export class UtilityTransport {
       // request ID before any subsequent call is posted.
       this.worker.postMessage({ type: 'cancel', id });
       this.syncShared = new SharedArrayBuffer(SYNC_BUFFER_BYTES + 8);
+      // Do NOT settle the request here: a timeout is ambiguous — the host may
+      // still process the queued broker request and adopt these ids. Their
+      // disposition resolves later via an adopt-ack (host took them) or the
+      // drain-barrier reconcile (host confirms it never did). Settling now would
+      // free ids the host is about to use.
       throw new PluginCallTimeoutError(`Plugin API call "${method}" timed out after ${SYNC_CALL_TIMEOUT_MS}ms`);
     }
+    // A definite reply arrived (ok or error): the host processed the request.
+    // The response carries any callback ids the host ADOPTED while handling it
+    // (on this same broker channel, avoiding a cross-channel race). Mark those
+    // adopted FIRST, then settle — so settle only reclaims ids the host truly
+    // never took.
     const size = Atomics.load(header, 1);
     const text = new TextDecoder().decode(new Uint8Array(this.syncShared, 8, size));
-    if (Atomics.load(header, 0) === 2) throw new Error(text || `Plugin API call "${method}" failed`);
-    const response = JSON.parse(text) as { ok: boolean; value?: unknown; error?: unknown };
+    let response: { ok: boolean; value?: unknown; error?: unknown; adopted?: unknown } | null = null;
+    if (Atomics.load(header, 0) !== 2) {
+      response = JSON.parse(text) as { ok: boolean; value?: unknown; error?: unknown; adopted?: unknown };
+      if (Array.isArray(response.adopted)) {
+        for (const adoptedId of response.adopted) this.markAdopted(String(adoptedId));
+      }
+    }
+    this.settleRequest(id);
+    if (response === null) throw new Error(text || `Plugin API call "${method}" failed`);
     if (!response.ok) throw deserializeWireError(response.error);
     return this.decode(response.value);
   }
@@ -263,7 +319,7 @@ export class UtilityTransport {
     const id = ++this.sequence;
     const item = deferred<unknown>();
     this.pending.set(id, item);
-    this.parentPort.postMessage({ type: 'invoke', id, method, args: this.encode(args) });
+    this.parentPort.postMessage({ type: 'invoke', id, method, args: this.encode(args, id) });
     return item.promise;
   }
 
@@ -352,9 +408,13 @@ export class UtilityTransport {
   private async handleMessage(message: Record<string, unknown>): Promise<void> {
     switch (message?.type) {
       case 'invoke-result': {
-        const item = this.pending.get(Number(message.id));
+        const requestId = Number(message.id);
+        const item = this.pending.get(requestId);
         if (!item) return;
-        this.pending.delete(Number(message.id));
+        this.pending.delete(requestId);
+        // The host processed this request; reclaim any callback ids it carried
+        // that were never adopted.
+        this.settleRequest(requestId);
         if (message.ok === true) item.resolve(this.decode(message.value));
         else item.reject(deserializeWireError(message.error));
         return;
@@ -362,6 +422,15 @@ export class UtilityTransport {
       case 'callback':
         await this.invokeFunction(message);
         return;
+      case 'callback-adopted': {
+        // The host decoded these ids into live references and now owns their
+        // lifetime (it will `release-callback` on GC). Remove them from the
+        // unadopted set so request-settle / reconcile never reclaims them out
+        // from under the host.
+        const ids = Array.isArray(message.ids) ? (message.ids as unknown[]) : [];
+        for (const id of ids) this.markAdopted(String(id));
+        return;
+      }
       case 'release-callback': {
         // The host GC'd every stub referencing this callback id — it will never
         // invoke it again, so drop our strong reference and let the closure (and
@@ -369,22 +438,28 @@ export class UtilityTransport {
         this.releaseFunction(String(message.callbackId ?? ''));
         return;
       }
+      case 'drain-ping': {
+        // The host is establishing a two-channel drain barrier before a reconcile
+        // sweep. Echo the token back over the SAME channel it arrived on so the
+        // host learns this channel is drained up to this point. This is what makes
+        // the subsequent reconcile safe against cross-channel reordering — an
+        // id whose (broker or IPC) delivery is still in flight cannot have been
+        // passed before a barrier both channels have acknowledged.
+        this.parentPort.postMessage({ type: 'drain-pong', token: message.token });
+        return;
+      }
       case 'reconcile-callbacks': {
-        // Authoritative sweep from the host: `heldIds` are every callback id the
-        // host still references; `upToSeq` is the highest id-sequence the host has
-        // observed. Any id we registered AT OR BEFORE that watermark that the host
-        // does NOT hold is provably orphaned — e.g. a handoff that timed out and
-        // was never adopted, so no host finalizer will ever release it. Drop those.
-        // Ids created AFTER the watermark are left alone (the host may not have
-        // seen them yet). This is the only reclaim path for the timeout-not-
-        // adopted case; every other release is host-GC-driven per id.
+        // Post-barrier authoritative sweep. `heldIds` are every callback id the
+        // host still references. Because the host only sends this AFTER both
+        // channels have echoed its drain barrier, every id we sent before the
+        // barrier has been fully processed by the host — so any UNADOPTED id not
+        // in heldIds is provably orphaned (e.g. a sync handoff that timed out and
+        // the host never adopted). Reclaim those. Adopted ids and ids the host
+        // holds are untouched; in-flight (post-barrier) ids are still unadopted
+        // but the host will re-sweep on the next barrier, so nothing leaks.
         const held = new Set(Array.isArray(message.heldIds) ? (message.heldIds as unknown[]).map(String) : []);
-        const upToSeq = Number(message.upToSeq ?? 0);
-        for (const id of [...this.functions.keys()]) {
-          const seq = Number(id.slice(1)); // ids are `u<seq>`
-          if (Number.isFinite(seq) && seq <= upToSeq && !held.has(id)) {
-            this.releaseFunction(id);
-          }
+        for (const id of [...this.unadopted]) {
+          if (!held.has(id)) this.releaseFunction(id);
         }
         return;
       }

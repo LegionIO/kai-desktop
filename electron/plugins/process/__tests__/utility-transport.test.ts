@@ -109,29 +109,91 @@ describe('UtilityTransport callback release', () => {
     expect(doomed).not.toHaveBeenCalled();
   });
 
-  it('reconcile-callbacks sweeps orphaned pre-watermark ids the host does not hold', async () => {
+  it('drain-ping is echoed as drain-pong over the same channel', () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    void transport;
+    emit({ type: 'drain-ping', token: 42 });
+    const pong = posted.find((m) => m.type === 'drain-pong');
+    expect(pong?.token).toBe(42);
+  });
+
+  it('reconcile-callbacks sweeps unadopted ids the host does not hold, keeps held + adopted', async () => {
     const { port, emit, posted } = makePort();
     const transport = new UtilityTransport(port as never);
     const held = vi.fn(() => 'held');
+    const adopted = vi.fn(() => 'adopted');
     const orphan = vi.fn(() => 'orphan');
-    const heldId = transport.registerFunction(held); // u1
-    const orphanId = transport.registerFunction(orphan); // u2
-    const future = transport.registerFunction(() => 0); // u3 (created after watermark)
+    const heldId = transport.registerFunction(held);
+    const adoptedId = transport.registerFunction(adopted);
+    const orphanId = transport.registerFunction(orphan);
 
-    // Host reconciles: it holds heldId, watermark = 2 (has seen u1 & u2). orphanId
-    // (u2, ≤ watermark, not held) → swept. future (u3, > watermark) → kept.
-    emit({ type: 'reconcile-callbacks', heldIds: [heldId], upToSeq: 2 });
+    // Host adopted adoptedId (took ownership); reconcile lists only heldId as held.
+    emit({ type: 'callback-adopted', ids: [adoptedId] });
+    // Post-barrier sweep: unadopted ids NOT in heldIds are orphaned.
+    emit({ type: 'reconcile-callbacks', heldIds: [heldId] });
 
     emit({ type: 'callback', id: 1, callbackId: heldId, args: [] });
-    emit({ type: 'callback', id: 2, callbackId: orphanId, args: [] });
-    emit({ type: 'callback', id: 3, callbackId: future, args: [] });
+    emit({ type: 'callback', id: 2, callbackId: adoptedId, args: [] });
+    emit({ type: 'callback', id: 3, callbackId: orphanId, args: [] });
     await Promise.resolve();
     await Promise.resolve();
 
     const reply = (n: number) => posted.find((m) => m.type === 'callback-result' && m.id === n);
-    expect(reply(1)?.ok).toBe(true); // held — kept
-    expect(reply(2)?.ok).toBe(false); // orphan — swept
-    expect(reply(3)?.ok).toBe(true); // post-watermark — kept (host may not have seen it)
+    expect(reply(1)?.ok).toBe(true); // held → kept
+    expect(reply(2)?.ok).toBe(true); // adopted (host owns) → kept
+    expect(reply(3)?.ok).toBe(false); // unadopted + not held → swept
     expect(orphan).not.toHaveBeenCalled();
   });
+
+  it('a settled request reclaims its unadopted callback ids (host never took them)', async () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    const cb = vi.fn();
+    const p = transport.asyncCall('m', [cb]);
+    const invoke = posted.find((m) => m.type === 'invoke') as { id: number; args: unknown } | undefined;
+    expect(invoke).toBeTruthy();
+    const cbId = findCallbackId(invoke!.args);
+    expect(cbId).toMatch(/^u\d+$/);
+    // Host replies WITHOUT adopting the callback → on settle it's reclaimed.
+    emit({ type: 'invoke-result', id: invoke!.id, ok: true, value: null });
+    await p;
+    emit({ type: 'callback', id: 99, callbackId: cbId, args: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    const reply = posted.find((m) => m.type === 'callback-result' && m.id === 99);
+    expect(reply?.ok).toBe(false);
+    expect(cb).not.toHaveBeenCalled();
+  });
+
+  it('a settled request does NOT reclaim an adopted callback id', async () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    const cb = vi.fn(() => 'ok');
+    const p = transport.asyncCall('m', [cb]);
+    const invoke = posted.find((m) => m.type === 'invoke') as { id: number; args: unknown } | undefined;
+    const cbId = findCallbackId(invoke!.args);
+    expect(cbId).toMatch(/^u\d+$/);
+    // Host adopts the callback (IPC), THEN replies — settle must not reclaim it.
+    emit({ type: 'callback-adopted', ids: [cbId] });
+    emit({ type: 'invoke-result', id: invoke!.id, ok: true, value: null });
+    await p;
+    emit({ type: 'callback', id: 7, callbackId: cbId, args: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    const reply = posted.find((m) => m.type === 'callback-result' && m.id === 7);
+    expect(reply?.ok).toBe(true); // still invokable — host owns it
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
 });
+
+/** Recursively find the first wire function-marker id (`u<seq>`) in an encoded value. */
+function findCallbackId(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    if (typeof v === 'string' && /^u\d+$/.test(v)) return v;
+    const nested = findCallbackId(v);
+    if (nested) return nested;
+  }
+  return '';
+}

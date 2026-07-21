@@ -193,6 +193,16 @@ export class PluginProcessHost {
   private child: UtilityProcess | null = null;
   private server: Server | null = null;
   private brokerSocket: Socket | null = null;
+  // In-flight broker (sync-call) requests + waiters that resolve when the count
+  // hits zero. Used by the reconcile drain barrier: a sync handoff whose reply
+  // the utility abandoned on timeout may still be processing here and about to
+  // adopt callbacks, so the sweep waits for these to finish first.
+  private inFlightBrokerRequests = 0;
+  private brokerDrainWaiters: Array<() => void> = [];
+  // While a broker request is being handled, adopted callback ids are collected
+  // here and returned IN the broker response (same channel), instead of over IPC
+  // — so the utility learns adoption before its sync call unblocks.
+  private brokerAdoptionSink: string[] | null = null;
   private brokerToken = randomBytes(32).toString('hex');
   private brokerPort = 0;
   private sequence = 0;
@@ -232,11 +242,15 @@ export class PluginProcessHost {
   // provider is collected AND the poll has stopped using it (whichever is last).
   private inferenceProviderFinalizer = new FinalizationRegistry<{ isAvailableId: string; streamId: string }>(
     ({ isAvailableId, streamId }) => {
-      // Only the CURRENT registration's streamId is still held by the host; a
-      // superseded provider's streamId is safe to release on its own GC.
-      if (this.currentInferenceStreamId === streamId) this.currentInferenceStreamId = null;
+      // This provider object is gone (no in-flight turn holds it). Its streamId
+      // is held ONLY by this provider, so release it and drop it from the live
+      // set — every superseded provider tracks + releases its OWN streamId, so a
+      // replaced-but-still-in-flight old provider keeps its stream alive until
+      // its own finalizer runs (fixes the "only current streamId" regression).
+      this.liveInferenceStreamIds.delete(streamId);
       this.postReleaseCallback(streamId);
-      // Release isAvailableId only if the poll isn't still pointing at it.
+      // isAvailableId is ALSO pinned by the availability poll. Release it only if
+      // the poll has already moved off it; otherwise defer to when the poll stops.
       if (this.inferenceAvailabilityCallbackId !== isAvailableId) {
         this.postReleaseCallback(isAvailableId);
       } else {
@@ -248,15 +262,18 @@ export class PluginProcessHost {
   // isAvailableId; released by releaseIdleInferencePollCallback once the poll
   // stops (unregister/dispose/replace).
   private pendingIdleInferenceCallbackId: string | null = null;
-  // The current inference provider's streamId (isAvailableId is tracked
-  // separately via inferenceAvailabilityCallbackId). Held so reconciliation
-  // reports it as still-in-use.
-  private currentInferenceStreamId: string | null = null;
-  // Highest utility callback-id sequence the host has ever OBSERVED. Sent as the
-  // reconcile watermark so the utility only sweeps ids the host has demonstrably
-  // seen (and doesn't hold) — never ids created after the host's snapshot.
-  private maxSeenUtilitySeq = 0;
+  // Every live inference provider's streamId — the CURRENT one plus any
+  // superseded provider still captured by an in-flight turn. Each is removed by
+  // its own provider finalizer. Reported as held so reconcile never sweeps a
+  // stream a delayed turn may still call.
+  private liveInferenceStreamIds = new Set<string>();
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+  // Drain-barrier bookkeeping for the reconcile sweep. Each barrier gets a token
+  // echoed by the utility over IPC; we also wait until our broker inbound queue
+  // is drained past the point the barrier was issued, so an adopt-ack for a
+  // slow broker (sync-call) request can't still be in flight when we sweep.
+  private drainBarrierToken = 0;
+  private pendingDrainResolve: (() => void) | null = null;
   private activation = deferred<void>();
   private exit = deferred<number>();
   private expectedExit = false;
@@ -384,57 +401,89 @@ export class PluginProcessHost {
 
   /** Register a freshly-decoded utility-callback stub for GC tracking: bump the
    *  per-id live-stub count and arm the finalizer so we post a release once the
-   *  last stub for this id is collected. Keyed by the stub object identity so
-   *  each distinct stub is counted (and unregistered) independently. */
+   *  last stub for this id is collected. Also ACK adoption to the utility — this
+   *  is the authoritative "the host took ownership of this id" signal, so the
+   *  utility won't reclaim it on request-settle or reconcile. */
   private trackUtilityCallbackStub(id: string, stub: object): void {
-    this.observeUtilitySeq(id);
     this.utilityCallbackRefs.set(id, (this.utilityCallbackRefs.get(id) ?? 0) + 1);
     this.utilityCallbackFinalizer.register(stub, id, stub);
+    this.postCallbackAdopted([id]);
   }
 
-  /** Record the highest utility callback-id sequence we've observed, for the
-   *  reconcile watermark. Ids are `u<seq>`. */
-  private observeUtilitySeq(id: string): void {
-    const seq = Number(id.slice(1));
-    if (Number.isFinite(seq) && seq > this.maxSeenUtilitySeq) this.maxSeenUtilitySeq = seq;
-  }
-
-  /** Every utility callback id the host currently references: live wire-callback
-   *  stubs (refcount > 0) plus the active inference-provider ids. The reconcile
-   *  sweep treats any other id at/below the watermark as orphaned. */
-  private heldUtilityCallbackIds(): string[] {
-    const held = new Set<string>(this.utilityCallbackRefs.keys());
-    if (this.inferenceAvailabilityCallbackId) held.add(this.inferenceAvailabilityCallbackId);
-    if (this.pendingIdleInferenceCallbackId) held.add(this.pendingIdleInferenceCallbackId);
-    if (this.currentInferenceStreamId) held.add(this.currentInferenceStreamId);
-    return [...held];
-  }
-
-  /** Sweep utility-side callbacks that no host reference exists for. Reclaims the
-   *  one case host-GC can't: a handoff that timed out and was never adopted, so
-   *  no finalizer will ever fire for its ids. Safe because it only sweeps ids the
-   *  host has SEEN (≤ watermark) and does not hold. */
-  private reconcileUtilityCallbacks(): void {
+  /** Tell the utility the host decoded these ids into live references and now
+   *  owns their lifetime. During a broker (sync-call) request, ids are routed
+   *  into the response on the SAME (broker) channel — otherwise a race exists
+   *  where the sync reply unblocks the utility before an IPC adopt-ack arrives,
+   *  and the utility would reclaim an id the host actually adopted. Outside a
+   *  broker request, send over IPC (same channel as the async reply). */
+  private postCallbackAdopted(ids: string[]): void {
+    if (ids.length === 0) return;
+    if (this.brokerAdoptionSink) {
+      this.brokerAdoptionSink.push(...ids);
+      return;
+    }
     if (!this.child || this.disposed) return;
     try {
-      this.child.postMessage({
-        type: 'reconcile-callbacks',
-        heldIds: this.heldUtilityCallbackIds(),
-        upToSeq: this.maxSeenUtilitySeq,
-      });
+      this.child.postMessage({ type: 'callback-adopted', ids });
     } catch {
       /* child tearing down */
     }
   }
 
+  /** Every utility callback id the host currently references: live wire-callback
+   *  stubs (refcount > 0) plus the active inference-provider ids (poll id, any
+   *  deferred idle poll id, and EVERY live provider streamId). The reconcile
+   *  sweep treats any UNADOPTED id not in this set as orphaned. */
+  private heldUtilityCallbackIds(): string[] {
+    const held = new Set<string>(this.utilityCallbackRefs.keys());
+    if (this.inferenceAvailabilityCallbackId) held.add(this.inferenceAvailabilityCallbackId);
+    if (this.pendingIdleInferenceCallbackId) held.add(this.pendingIdleInferenceCallbackId);
+    for (const id of this.liveInferenceStreamIds) held.add(id);
+    return [...held];
+  }
+
+  /** Reclaim utility-side callbacks the host never adopted — the sole case
+   *  host-GC can't cover: a sync handoff that timed out and the host never
+   *  processed/adopted. Driven by an explicit two-channel DRAIN BARRIER instead
+   *  of a sequence watermark: we (a) drain our broker inbound queue and (b) wait
+   *  for the utility to echo an IPC barrier token, so any adopt-ack that was
+   *  coming (over either channel) has definitely arrived before we ask the
+   *  utility to sweep its still-unadopted, not-held ids. */
+  private async reconcileUtilityCallbacks(): Promise<void> {
+    if (!this.child || this.disposed) return;
+    try {
+      await this.awaitDrainBarrier();
+      if (!this.child || this.disposed) return;
+      this.child.postMessage({ type: 'reconcile-callbacks', heldIds: this.heldUtilityCallbackIds() });
+    } catch {
+      /* child tearing down, or barrier abandoned on dispose */
+    }
+  }
+
+  /** Establish a two-channel drain barrier: flush the broker inbound queue, then
+   *  ping the utility over IPC and await its pong. Resolves once BOTH channels
+   *  are known-drained past this point. */
+  private async awaitDrainBarrier(): Promise<void> {
+    await this.drainBrokerInbound();
+    if (!this.child || this.disposed) return;
+    const token = ++this.drainBarrierToken;
+    await new Promise<void>((resolve) => {
+      this.pendingDrainResolve = resolve;
+      this.child?.postMessage({ type: 'drain-ping', token });
+    });
+  }
+
   private startCallbackReconciliation(): void {
     if (this.reconcileTimer) return;
-    this.reconcileTimer = setInterval(() => this.reconcileUtilityCallbacks(), CALLBACK_RECONCILE_MS);
+    this.reconcileTimer = setInterval(() => void this.reconcileUtilityCallbacks(), CALLBACK_RECONCILE_MS);
   }
 
   private stopCallbackReconciliation(): void {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
+    // Abandon any in-flight barrier so its awaiter can't hang.
+    this.pendingDrainResolve?.();
+    this.pendingDrainResolve = null;
   }
 
   /** Tell the utility it may drop a callback id. Safe + worthwhile only for a
@@ -560,11 +609,13 @@ export class PluginProcessHost {
       }
       const isAvailableId = descriptor.isAvailableId;
       const streamId = descriptor.streamId;
-      this.observeUtilitySeq(isAvailableId);
-      this.observeUtilitySeq(streamId);
+      // Adopt both ids: the host now owns their lifetime (GC-driven release via
+      // the provider-object finalizer + poll teardown), so the utility must not
+      // reclaim them on request-settle/reconcile.
+      this.postCallbackAdopted([isAvailableId, streamId]);
       this.inferenceAvailable = descriptor.available === true;
       this.inferenceAvailabilityCallbackId = isAvailableId;
-      this.currentInferenceStreamId = streamId;
+      this.liveInferenceStreamIds.add(streamId);
       const readAvailability = () => this.status === 'running' && this.inferenceAvailable;
       const openStream = (streamOptions: Parameters<PluginInferenceProvider['stream']>[0]) =>
         this.invokeChildStream(streamId, [streamOptions]);
@@ -594,7 +645,9 @@ export class PluginProcessHost {
     if (method === 'agent.unregisterInferenceProvider') {
       this.stopInferenceAvailabilityPolling();
       this.releaseIdleInferencePollCallback();
-      this.currentInferenceStreamId = null;
+      // Do NOT drop the streamId here: an in-flight turn may still hold the
+      // provider object and call stream(). Its id stays in liveInferenceStreamIds
+      // until that object's finalizer runs.
       this.options.api.agent.unregisterInferenceProvider();
       return null;
     }
@@ -763,6 +816,14 @@ export class PluginProcessHost {
       case 'control-result':
         this.settlePending(message);
         return;
+      case 'drain-pong':
+        // The utility echoed our drain barrier over IPC — the IPC channel is now
+        // drained past this point. Resolve the awaiting reconcile.
+        if (Number(message.token) === this.drainBarrierToken) {
+          this.pendingDrainResolve?.();
+          this.pendingDrainResolve = null;
+        }
+        return;
       case 'callback-stream-event': {
         const stream = this.inboundStreams.get(Number(message.id));
         if (stream) stream.push(this.decode(message.value));
@@ -812,16 +873,49 @@ export class PluginProcessHost {
   }
 
   private async handleBrokerRequest(socket: Socket, request: BrokerRequest): Promise<void> {
+    this.inFlightBrokerRequests += 1;
     const abortIds: string[] = [];
+    // Collect ids adopted while handling THIS request so they ride back on the
+    // broker response (see postCallbackAdopted). Nested handlers can't overlap
+    // on one socket read loop, but guard by save/restore regardless.
+    const previousSink = this.brokerAdoptionSink;
+    const adopted: string[] = [];
+    this.brokerAdoptionSink = adopted;
     try {
       const args = this.decode(request.args, abortIds) as unknown[];
       const value = await this.dispatch(request.method, args);
-      this.writeBrokerResponse(socket, { id: request.id, ok: true, value: this.encode(value) });
+      this.brokerAdoptionSink = previousSink;
+      this.writeBrokerResponse(socket, {
+        id: request.id,
+        ok: true,
+        value: this.encode(value),
+        adopted: adopted.length ? adopted : undefined,
+      });
     } catch (error) {
-      this.writeBrokerResponse(socket, { id: request.id, ok: false, error: serializeWireError(error) });
+      this.brokerAdoptionSink = previousSink;
+      this.writeBrokerResponse(socket, {
+        id: request.id,
+        ok: false,
+        error: serializeWireError(error),
+        adopted: adopted.length ? adopted : undefined,
+      });
     } finally {
+      this.brokerAdoptionSink = previousSink;
       this.releaseRemoteAbortControllers(abortIds);
+      this.inFlightBrokerRequests -= 1;
+      if (this.inFlightBrokerRequests === 0) {
+        const waiters = this.brokerDrainWaiters;
+        this.brokerDrainWaiters = [];
+        for (const resolve of waiters) resolve();
+      }
     }
+  }
+
+  /** Resolve once no broker (sync-call) request is mid-flight — so any adopt-ack
+   *  a still-processing timed-out handoff is about to emit has been sent. */
+  private drainBrokerInbound(): Promise<void> {
+    if (this.inFlightBrokerRequests === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => this.brokerDrainWaiters.push(resolve));
   }
 
   private authenticateToken(candidate: unknown): boolean {
@@ -1174,6 +1268,10 @@ export class PluginProcessHost {
     this.runtimeReleased = true;
     this.stopInferenceAvailabilityPolling();
     this.stopCallbackReconciliation();
+    // Release any barrier awaiting broker drain so it can't hang past teardown.
+    const drainWaiters = this.brokerDrainWaiters;
+    this.brokerDrainWaiters = [];
+    for (const resolve of drainWaiters) resolve();
     this.rejectPending(error);
     this.cancelOutboundStreams();
     this.brokerSocket?.destroy();
