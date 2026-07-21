@@ -394,21 +394,33 @@ export function createUtilityPluginAPI(options: {
         if (!provider || typeof provider.isAvailable !== 'function' || typeof provider.stream !== 'function') {
           throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
         }
-        // Replacing a provider: drop the previous registration's callback ids.
-        releaseInferenceCallbacks();
+        // Register the NEW callbacks and hand off to the host FIRST, releasing
+        // the previous registration's ids only after that succeeds. If anything
+        // here throws (provider.isAvailable(), the sync handoff), we release the
+        // just-registered ids and keep the prior provider intact — otherwise a
+        // failed replacement would strand the host on freed ids ("Unknown
+        // plugin callback") while leaking the new ones.
+        const previousIds = inferenceCallbackIds;
         const isAvailableId = transport.registerFunction(provider.isAvailable.bind(provider));
         const streamId = transport.registerFunction(
           provider.stream.bind(provider) as unknown as (...args: unknown[]) => unknown,
         );
+        try {
+          sync('agent.registerInferenceProvider', [
+            {
+              name: provider.name,
+              available: Boolean(provider.isAvailable()),
+              isAvailableId,
+              streamId,
+            },
+          ]);
+        } catch (error) {
+          transport.releaseFunction(isAvailableId);
+          transport.releaseFunction(streamId);
+          throw error;
+        }
         inferenceCallbackIds = [isAvailableId, streamId];
-        sync('agent.registerInferenceProvider', [
-          {
-            name: provider.name,
-            available: Boolean(provider.isAvailable()),
-            isAvailableId,
-            streamId,
-          },
-        ]);
+        for (const id of previousIds) transport.releaseFunction(id);
       },
       unregisterInferenceProvider: () => {
         checkPermission('agent:inference-provider');

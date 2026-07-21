@@ -103,7 +103,6 @@ export class UtilityTransport {
   private pending = new Map<number, Deferred<unknown>>();
   private streams = new Map<number, RemoteAsyncIterable>();
   private functions = new Map<string, (...args: unknown[]) => unknown>();
-  private functionIds = new WeakMap<(...args: unknown[]) => unknown, string>();
   private remoteAbortControllers = new Map<string, AbortController>();
   private activeCallbackStreams = new Map<number, AsyncIterator<unknown>>();
   private controlHandler: ControlHandler | null = null;
@@ -139,24 +138,25 @@ export class UtilityTransport {
   }
 
   registerFunction(fn: (...args: unknown[]) => unknown): string {
-    const existing = this.functionIds.get(fn);
-    if (existing) return existing;
+    // Deliberately NOT deduped by fn identity. If the same function object is
+    // sent across the wire in separate messages, each occurrence gets its own
+    // fresh id. Deduping to a shared id created a use-after-free race: after the
+    // host GC'd the FIRST occurrence's stub it would queue a release for that
+    // id, but a concurrent re-send of the same fn would hand the host a NEW stub
+    // bound to the SAME (deduped) id — then the stale release would delete a
+    // callback the host is actively using. Unique-per-occurrence ids make a
+    // release unambiguous: it targets exactly the occurrence that was collected.
     const id = `u${++this.functionSequence}`;
-    this.functionIds.set(fn, id);
     this.functions.set(id, fn);
     return id;
   }
 
-  /** Drop a callback the host will no longer invoke (it released all its stubs,
-   *  or a caller like the inference provider explicitly replaced/unregistered
-   *  it). Clears both the id→fn strong map and the fn→id dedup entry so the
-   *  closure can be GC'd. Idempotent; a stray release for an unknown id no-ops. */
+  /** Drop a callback the host will no longer invoke (it released the stub for
+   *  this specific occurrence, or a caller like the inference provider replaced/
+   *  unregistered it). Idempotent; a stray release for an unknown id no-ops. */
   releaseFunction(id: string): void {
     if (!id) return;
-    const fn = this.functions.get(id);
-    if (!fn) return;
     this.functions.delete(id);
-    this.functionIds.delete(fn);
   }
 
   private registerAbortSignal(signal: AbortSignal): string {

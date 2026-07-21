@@ -177,8 +177,9 @@ describe('utility-process plugin API compatibility proxy', () => {
     expect(functions.has(first.isAvailableId)).toBe(true);
     expect(functions.has(first.streamId)).toBe(true);
 
-    // Re-registering must release the FIRST registration's ids (they'd otherwise
-    // leak — .bind() makes fresh functions so registerFunction never dedups).
+    // Re-registering must release the FIRST registration's ids only AFTER the
+    // new registration succeeds (they'd otherwise leak — .bind() makes fresh
+    // functions each call, so there's never any id reuse to rely on).
     api.agent.registerInferenceProvider(makeProvider());
     expect(functions.has(first.isAvailableId)).toBe(false);
     expect(functions.has(first.streamId)).toBe(false);
@@ -193,5 +194,37 @@ describe('utility-process plugin API compatibility proxy', () => {
     api.agent.unregisterInferenceProvider();
     expect(functions.has(second.isAvailableId)).toBe(false);
     expect(functions.has(second.streamId)).toBe(false);
+  });
+
+  it('keeps the prior provider intact and cleans up new ids when replacement fails', () => {
+    const { api, calls, functions, transport } = setup();
+    const makeProvider = () => ({
+      name: 'Fixture',
+      isAvailable: () => true,
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'p' };
+      },
+    });
+
+    api.agent.registerInferenceProvider(makeProvider());
+    const first = calls.find((c) => c.method === 'agent.registerInferenceProvider')!.args[0] as {
+      isAvailableId: string;
+      streamId: string;
+    };
+
+    // Make the NEXT host handoff fail.
+    (transport.syncCall as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((method: string) => {
+      if (method === 'agent.registerInferenceProvider') throw new Error('handoff failed');
+      return undefined;
+    });
+
+    const idsBefore = [...functions.keys()];
+    expect(() => api.agent.registerInferenceProvider(makeProvider())).toThrow('handoff failed');
+
+    // Prior provider's ids must survive (host still points to them)…
+    expect(functions.has(first.isAvailableId)).toBe(true);
+    expect(functions.has(first.streamId)).toBe(true);
+    // …and the just-registered (now-orphaned) ids must be cleaned up, so no leak.
+    expect([...functions.keys()].sort()).toEqual(idsBefore.sort());
   });
 });

@@ -200,13 +200,15 @@ export class PluginProcessHost {
   private mainFunctions = new Map<string, (...args: unknown[]) => unknown>();
   private mainFunctionIds = new WeakMap<(...args: unknown[]) => unknown, string>();
   private remoteAbortControllers = new Map<string, AbortController>();
-  // Utility-side callback bookkeeping. Each utility function id is decoded into
-  // one or more host-side stubs (the utility dedups fn→id, but each wire
-  // occurrence yields a fresh stub here). We refcount live stubs per id and, via
-  // a FinalizationRegistry, tell the utility to release the callback once EVERY
-  // stub for that id has been garbage-collected — so a long-running plugin that
-  // churns registrations can't retain callbacks (+ captured data) forever, and
-  // we never release an id the host still holds a stub for (no use-after-free).
+  // Utility-side callback bookkeeping. The utility assigns a fresh id per wire
+  // occurrence (no fn-identity dedup), so an id normally maps to exactly ONE
+  // host stub. We still refcount defensively — should the same id ever decode
+  // into multiple stubs, we post the release only once EVERY stub for it has
+  // been garbage-collected. This lets a long-running plugin that churns
+  // registrations reclaim callbacks (+ captured data), and — because release is
+  // tied to GC of the host's own stubs — we never release an id the host still
+  // references (no use-after-free), and a stale release can't hit a live id
+  // (ids aren't reused).
   private utilityCallbackRefs = new Map<string, number>();
   private utilityCallbackFinalizer = new FinalizationRegistry<string>((id) => {
     const remaining = (this.utilityCallbackRefs.get(id) ?? 0) - 1;

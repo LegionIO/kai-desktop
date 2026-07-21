@@ -63,15 +63,19 @@ describe('UtilityTransport callback release', () => {
     expect(failReply?.ok).toBe(false);
   });
 
-  it('re-registers a fresh id after release (dedup entry also cleared)', () => {
+  it('assigns a fresh id per registration (no fn-identity dedup)', () => {
     const { port } = makePort();
     const transport = new UtilityTransport(port as never);
     const fn = () => 1;
+    // Same fn object registered twice → two distinct ids. Unique-per-occurrence
+    // ids are what make releases race-free (a release targets one occurrence).
     const id1 = transport.registerFunction(fn);
-    transport.releaseFunction(id1);
-    // Same fn object, but the fn→id dedup entry was cleared, so it re-registers.
     const id2 = transport.registerFunction(fn);
     expect(id2).not.toBe(id1);
+    // Releasing one leaves the other invokable.
+    transport.releaseFunction(id1);
+    const id3 = transport.registerFunction(fn);
+    expect(id3).not.toBe(id2);
   });
 
   it('release of an unknown id is a no-op', () => {
