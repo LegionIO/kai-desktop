@@ -130,7 +130,10 @@ describe('UtilityTransport callback release', () => {
 
     // Host adopted adoptedId (took ownership); reconcile lists only heldId as held.
     emit({ type: 'callback-adopted', ids: [adoptedId] });
-    // Post-barrier sweep: unadopted ids NOT in heldIds are orphaned.
+    // Establish the drain barrier FIRST (snapshots the creation watermark at the
+    // current sequence), then the post-barrier sweep drops unadopted, not-held
+    // ids created at/before the watermark.
+    emit({ type: 'drain-ping', token: 1 });
     emit({ type: 'reconcile-callbacks', heldIds: [heldId] });
 
     emit({ type: 'callback', id: 1, callbackId: heldId, args: [] });
@@ -144,6 +147,26 @@ describe('UtilityTransport callback release', () => {
     expect(reply(2)?.ok).toBe(true); // adopted (host owns) → kept
     expect(reply(3)?.ok).toBe(false); // unadopted + not held → swept
     expect(orphan).not.toHaveBeenCalled();
+  });
+
+  it('reconcile preserves a callback registered AFTER the drain-pong (post-watermark)', async () => {
+    const { port, emit, posted } = makePort();
+    const transport = new UtilityTransport(port as never);
+    transport.registerFunction(() => 0); // u1, pre-barrier
+    // Barrier snapshots watermark = 1.
+    emit({ type: 'drain-ping', token: 1 });
+    // Plugin registers a NEW callback after the pong but before reconcile lands.
+    const late = vi.fn(() => 'late');
+    const lateId = transport.registerFunction(late); // u2, post-watermark
+    // Reconcile holds nothing — but must NOT sweep lateId (host hasn't seen it).
+    emit({ type: 'reconcile-callbacks', heldIds: [] });
+
+    emit({ type: 'callback', id: 5, callbackId: lateId, args: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    const reply = posted.find((m) => m.type === 'callback-result' && m.id === 5);
+    expect(reply?.ok).toBe(true); // preserved
+    expect(late).toHaveBeenCalledTimes(1);
   });
 
   it('a settled request reclaims its unadopted callback ids (host never took them)', async () => {

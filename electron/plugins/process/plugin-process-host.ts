@@ -199,10 +199,6 @@ export class PluginProcessHost {
   // adopt callbacks, so the sweep waits for these to finish first.
   private inFlightBrokerRequests = 0;
   private brokerDrainWaiters: Array<() => void> = [];
-  // While a broker request is being handled, adopted callback ids are collected
-  // here and returned IN the broker response (same channel), instead of over IPC
-  // — so the utility learns adoption before its sync call unblocks.
-  private brokerAdoptionSink: string[] | null = null;
   private brokerToken = randomBytes(32).toString('hex');
   private brokerPort = 0;
   private sequence = 0;
@@ -371,7 +367,7 @@ export class PluginProcessHost {
     });
   }
 
-  private decode(value: unknown, abortIds?: string[]): unknown {
+  private decode(value: unknown, abortIds?: string[], adoptSink?: string[]): unknown {
     return decodeWire(value, {
       callFunction: (id, args) => {
         const result = this.invokeChildCallback(id, args);
@@ -382,7 +378,7 @@ export class PluginProcessHost {
         void result.catch(() => {});
         return result;
       },
-      onFunctionStub: (id, stub) => this.trackUtilityCallbackStub(id, stub),
+      onFunctionStub: (id, stub) => this.trackUtilityCallbackStub(id, stub, adoptSink),
       resolveAbortSignal: (id, aborted, reason) => {
         const controller = new AbortController();
         if (aborted) controller.abort(reason);
@@ -404,22 +400,23 @@ export class PluginProcessHost {
    *  last stub for this id is collected. Also ACK adoption to the utility — this
    *  is the authoritative "the host took ownership of this id" signal, so the
    *  utility won't reclaim it on request-settle or reconcile. */
-  private trackUtilityCallbackStub(id: string, stub: object): void {
+  private trackUtilityCallbackStub(id: string, stub: object, adoptSink?: string[]): void {
     this.utilityCallbackRefs.set(id, (this.utilityCallbackRefs.get(id) ?? 0) + 1);
     this.utilityCallbackFinalizer.register(stub, id, stub);
-    this.postCallbackAdopted([id]);
+    this.postCallbackAdopted([id], adoptSink);
   }
 
   /** Tell the utility the host decoded these ids into live references and now
-   *  owns their lifetime. During a broker (sync-call) request, ids are routed
-   *  into the response on the SAME (broker) channel — otherwise a race exists
-   *  where the sync reply unblocks the utility before an IPC adopt-ack arrives,
-   *  and the utility would reclaim an id the host actually adopted. Outside a
-   *  broker request, send over IPC (same channel as the async reply). */
-  private postCallbackAdopted(ids: string[]): void {
+   *  owns their lifetime. When an explicit `sink` is given (a broker request in
+   *  progress), route the ids into it so they ride back on the SAME broker
+   *  response — otherwise a race exists where the sync reply unblocks the utility
+   *  before an IPC adopt-ack arrives. With no sink, send over IPC (same channel
+   *  as the async reply). Each broker handler owns its OWN sink array (passed by
+   *  reference), so overlapping/timed-out handlers never corrupt each other. */
+  private postCallbackAdopted(ids: string[], sink?: string[]): void {
     if (ids.length === 0) return;
-    if (this.brokerAdoptionSink) {
-      this.brokerAdoptionSink.push(...ids);
+    if (sink) {
+      sink.push(...ids);
       return;
     }
     if (!this.child || this.disposed) return;
@@ -586,7 +583,7 @@ export class PluginProcessHost {
     return { owner, fn: fn as (...args: unknown[]) => unknown };
   }
 
-  private async dispatch(method: string, args: unknown[]): Promise<unknown> {
+  private async dispatch(method: string, args: unknown[], adoptSink?: string[]): Promise<unknown> {
     if (method === '__ping') return null;
     if (method === '__mainCallback') {
       const callbackId = String(args[0] ?? '');
@@ -611,8 +608,9 @@ export class PluginProcessHost {
       const streamId = descriptor.streamId;
       // Adopt both ids: the host now owns their lifetime (GC-driven release via
       // the provider-object finalizer + poll teardown), so the utility must not
-      // reclaim them on request-settle/reconcile.
-      this.postCallbackAdopted([isAvailableId, streamId]);
+      // reclaim them on request-settle/reconcile. Route via the caller's sink
+      // (broker response) when present so the sync reply can't beat the ack.
+      this.postCallbackAdopted([isAvailableId, streamId], adoptSink);
       this.inferenceAvailable = descriptor.available === true;
       this.inferenceAvailabilityCallbackId = isAvailableId;
       this.liveInferenceStreamIds.add(streamId);
@@ -875,16 +873,14 @@ export class PluginProcessHost {
   private async handleBrokerRequest(socket: Socket, request: BrokerRequest): Promise<void> {
     this.inFlightBrokerRequests += 1;
     const abortIds: string[] = [];
-    // Collect ids adopted while handling THIS request so they ride back on the
-    // broker response (see postCallbackAdopted). Nested handlers can't overlap
-    // on one socket read loop, but guard by save/restore regardless.
-    const previousSink = this.brokerAdoptionSink;
+    // This handler's OWN adoption sink (passed by reference through decode +
+    // dispatch). Ids adopted while handling THIS request ride back on its broker
+    // response — never a shared instance field, so overlapping/timed-out
+    // handlers can't corrupt each other's routing.
     const adopted: string[] = [];
-    this.brokerAdoptionSink = adopted;
     try {
-      const args = this.decode(request.args, abortIds) as unknown[];
-      const value = await this.dispatch(request.method, args);
-      this.brokerAdoptionSink = previousSink;
+      const args = this.decode(request.args, abortIds, adopted) as unknown[];
+      const value = await this.dispatch(request.method, args, adopted);
       this.writeBrokerResponse(socket, {
         id: request.id,
         ok: true,
@@ -892,7 +888,6 @@ export class PluginProcessHost {
         adopted: adopted.length ? adopted : undefined,
       });
     } catch (error) {
-      this.brokerAdoptionSink = previousSink;
       this.writeBrokerResponse(socket, {
         id: request.id,
         ok: false,
@@ -900,7 +895,6 @@ export class PluginProcessHost {
         adopted: adopted.length ? adopted : undefined,
       });
     } finally {
-      this.brokerAdoptionSink = previousSink;
       this.releaseRemoteAbortControllers(abortIds);
       this.inFlightBrokerRequests -= 1;
       if (this.inFlightBrokerRequests === 0) {
