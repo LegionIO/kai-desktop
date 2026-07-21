@@ -21,6 +21,10 @@ export type WireEncodeOptions = {
 
 export type WireDecodeOptions = {
   callFunction?: (id: string, args: unknown[], isAsync: boolean) => unknown;
+  /** Called with each function stub the decoder creates, paired with its wire
+   *  id. Lets the caller track the stub's lifetime (e.g. a FinalizationRegistry
+   *  that releases the remote callback once every stub for the id is collected). */
+  onFunctionStub?: (id: string, stub: (...args: unknown[]) => unknown) => void;
   resolveAbortSignal?: (id: string, aborted: boolean, reason: unknown) => AbortSignal;
 };
 
@@ -212,7 +216,10 @@ export function decodeWire(value: unknown, options: WireDecodeOptions = {}): unk
           if (!options.callFunction || typeof candidate.id !== 'string') {
             throw new Error('Plugin IPC received a function without a callback transport');
           }
-          return (...args: unknown[]) => options.callFunction!(candidate.id as string, args, candidate.async === true);
+          const fnId = candidate.id;
+          const stub = (...args: unknown[]) => options.callFunction!(fnId, args, candidate.async === true);
+          options.onFunctionStub?.(fnId, stub);
+          return stub;
         }
         case 'abort-signal': {
           const id = typeof candidate.id === 'string' ? candidate.id : '';

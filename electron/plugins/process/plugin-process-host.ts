@@ -200,6 +200,31 @@ export class PluginProcessHost {
   private mainFunctions = new Map<string, (...args: unknown[]) => unknown>();
   private mainFunctionIds = new WeakMap<(...args: unknown[]) => unknown, string>();
   private remoteAbortControllers = new Map<string, AbortController>();
+  // Utility-side callback bookkeeping. Each utility function id is decoded into
+  // one or more host-side stubs (the utility dedups fn→id, but each wire
+  // occurrence yields a fresh stub here). We refcount live stubs per id and, via
+  // a FinalizationRegistry, tell the utility to release the callback once EVERY
+  // stub for that id has been garbage-collected — so a long-running plugin that
+  // churns registrations can't retain callbacks (+ captured data) forever, and
+  // we never release an id the host still holds a stub for (no use-after-free).
+  private utilityCallbackRefs = new Map<string, number>();
+  private utilityCallbackFinalizer = new FinalizationRegistry<string>((id) => {
+    const remaining = (this.utilityCallbackRefs.get(id) ?? 0) - 1;
+    if (remaining > 0) {
+      this.utilityCallbackRefs.set(id, remaining);
+      return;
+    }
+    this.utilityCallbackRefs.delete(id);
+    // Only worth (and only safe) telling a live child; a dead/disposed child has
+    // already dropped its whole function table.
+    if (this.child && !this.disposed) {
+      try {
+        this.child.postMessage({ type: 'release-callback', callbackId: id });
+      } catch {
+        /* child may be tearing down — the release is moot then */
+      }
+    }
+  });
   private activation = deferred<void>();
   private exit = deferred<number>();
   private expectedExit = false;
@@ -308,6 +333,7 @@ export class PluginProcessHost {
         void result.catch(() => {});
         return result;
       },
+      onFunctionStub: (id, stub) => this.trackUtilityCallbackStub(id, stub),
       resolveAbortSignal: (id, aborted, reason) => {
         const controller = new AbortController();
         if (aborted) controller.abort(reason);
@@ -322,6 +348,15 @@ export class PluginProcessHost {
 
   private releaseRemoteAbortControllers(abortIds: string[]): void {
     for (const id of abortIds) this.remoteAbortControllers.delete(id);
+  }
+
+  /** Register a freshly-decoded utility-callback stub for GC tracking: bump the
+   *  per-id live-stub count and arm the finalizer so we post a release once the
+   *  last stub for this id is collected. Keyed by the stub object identity so
+   *  each distinct stub is counted (and unregistered) independently. */
+  private trackUtilityCallbackStub(id: string, stub: object): void {
+    this.utilityCallbackRefs.set(id, (this.utilityCallbackRefs.get(id) ?? 0) + 1);
+    this.utilityCallbackFinalizer.register(stub, id, stub);
   }
 
   private releaseMainFunctions(functionIds: string[]): void {

@@ -99,6 +99,16 @@ export function createUtilityPluginAPI(options: {
   const asyncCall = <T>(method: string, args: unknown[] = []): Promise<T> =>
     transport.asyncCall(method, args) as Promise<T>;
 
+  // Ids of the currently-registered inference-provider callbacks. Unlike wire-
+  // passed callbacks (GC-released on the host side), these travel as raw ids and
+  // .bind() makes a fresh function each call — so the host never releases them.
+  // Release them ourselves when the provider is replaced or unregistered.
+  let inferenceCallbackIds: string[] = [];
+  const releaseInferenceCallbacks = (): void => {
+    for (const id of inferenceCallbackIds) transport.releaseFunction(id);
+    inferenceCallbackIds = [];
+  };
+
   const api: PluginAPI = {
     pluginName: manifest.name,
     pluginDir,
@@ -384,21 +394,26 @@ export function createUtilityPluginAPI(options: {
         if (!provider || typeof provider.isAvailable !== 'function' || typeof provider.stream !== 'function') {
           throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
         }
+        // Replacing a provider: drop the previous registration's callback ids.
+        releaseInferenceCallbacks();
         const isAvailableId = transport.registerFunction(provider.isAvailable.bind(provider));
+        const streamId = transport.registerFunction(
+          provider.stream.bind(provider) as unknown as (...args: unknown[]) => unknown,
+        );
+        inferenceCallbackIds = [isAvailableId, streamId];
         sync('agent.registerInferenceProvider', [
           {
             name: provider.name,
             available: Boolean(provider.isAvailable()),
             isAvailableId,
-            streamId: transport.registerFunction(
-              provider.stream.bind(provider) as unknown as (...args: unknown[]) => unknown,
-            ),
+            streamId,
           },
         ]);
       },
       unregisterInferenceProvider: () => {
         checkPermission('agent:inference-provider');
         sync('agent.unregisterInferenceProvider');
+        releaseInferenceCallbacks();
       },
       registerCliTool: (tool) => {
         checkPermission('agent:register-cli-tool');

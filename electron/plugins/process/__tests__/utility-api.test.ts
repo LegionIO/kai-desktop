@@ -66,6 +66,9 @@ function setup() {
       functions.set(id, fn);
       return id;
     }),
+    releaseFunction: vi.fn((id: string) => {
+      functions.delete(id);
+    }),
   } as unknown as UtilityTransport;
   const manifest: PluginManifest = {
     name: 'compat-test',
@@ -154,5 +157,41 @@ describe('utility-process plugin API compatibility proxy', () => {
     const events = [];
     for await (const event of api.agent.stream({ messages: [] })) events.push(event);
     expect(events).toEqual([{ type: 'text-delta', text: 'streamed', conversationId: 'c1' }]);
+  });
+
+  it('releases prior inference-provider callback ids on re-register and unregister', () => {
+    const { api, calls, functions } = setup();
+    const makeProvider = () => ({
+      name: 'Fixture',
+      isAvailable: () => true,
+      stream: async function* () {
+        yield { type: 'done' as const, conversationId: 'p' };
+      },
+    });
+
+    api.agent.registerInferenceProvider(makeProvider());
+    const first = calls.find((c) => c.method === 'agent.registerInferenceProvider')!.args[0] as {
+      isAvailableId: string;
+      streamId: string;
+    };
+    expect(functions.has(first.isAvailableId)).toBe(true);
+    expect(functions.has(first.streamId)).toBe(true);
+
+    // Re-registering must release the FIRST registration's ids (they'd otherwise
+    // leak — .bind() makes fresh functions so registerFunction never dedups).
+    api.agent.registerInferenceProvider(makeProvider());
+    expect(functions.has(first.isAvailableId)).toBe(false);
+    expect(functions.has(first.streamId)).toBe(false);
+
+    const second = calls.filter((c) => c.method === 'agent.registerInferenceProvider')[1].args[0] as {
+      isAvailableId: string;
+      streamId: string;
+    };
+    expect(functions.has(second.isAvailableId)).toBe(true);
+
+    // Unregister releases the live registration's ids too.
+    api.agent.unregisterInferenceProvider();
+    expect(functions.has(second.isAvailableId)).toBe(false);
+    expect(functions.has(second.streamId)).toBe(false);
   });
 });

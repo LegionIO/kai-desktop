@@ -48,6 +48,23 @@ describe('plugin process wire encoding', () => {
     expect(original).toHaveBeenCalledWith(21);
   });
 
+  it('reports each decoded function stub with its id via onFunctionStub', () => {
+    const encoded = encodeWire(
+      { a: (x: number) => x, b: (y: number) => y },
+      { registerFunction: (fn) => (fn.length >= 0 ? { id: `cb-${Math.random()}`, async: false } : { id: 'x' }) },
+    );
+    const seen: Array<{ id: string; isFn: boolean }> = [];
+    const decoded = decodeWire(encoded, {
+      callFunction: (id, args) => id + String(args),
+      onFunctionStub: (id, stub) => seen.push({ id, isFn: typeof stub === 'function' }),
+    }) as { a: unknown; b: unknown };
+    // One stub reported per decoded function, each paired with a real function.
+    expect(seen).toHaveLength(2);
+    expect(seen.every((s) => s.isFn && typeof s.id === 'string')).toBe(true);
+    expect(typeof decoded.a).toBe('function');
+    expect(typeof decoded.b).toBe('function');
+  });
+
   it('preserves whether a callback uses the asynchronous transport', async () => {
     const original = async (value: number) => value + 1;
     const encoded = encodeWire(original, {

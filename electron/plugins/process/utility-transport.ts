@@ -147,6 +147,18 @@ export class UtilityTransport {
     return id;
   }
 
+  /** Drop a callback the host will no longer invoke (it released all its stubs,
+   *  or a caller like the inference provider explicitly replaced/unregistered
+   *  it). Clears both the id→fn strong map and the fn→id dedup entry so the
+   *  closure can be GC'd. Idempotent; a stray release for an unknown id no-ops. */
+  releaseFunction(id: string): void {
+    if (!id) return;
+    const fn = this.functions.get(id);
+    if (!fn) return;
+    this.functions.delete(id);
+    this.functionIds.delete(fn);
+  }
+
   private registerAbortSignal(signal: AbortSignal): string {
     const id = `ua${++this.abortSequence}`;
     const transportRef = new WeakRef(this);
@@ -323,6 +335,13 @@ export class UtilityTransport {
       case 'callback':
         await this.invokeFunction(message);
         return;
+      case 'release-callback': {
+        // The host GC'd every stub referencing this callback id — it will never
+        // invoke it again, so drop our strong reference and let the closure (and
+        // whatever it captured) be collected. Idempotent.
+        this.releaseFunction(String(message.callbackId ?? ''));
+        return;
+      }
       case 'callback-stream':
         await this.invokeFunctionStream(message);
         return;
