@@ -116,7 +116,8 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
   switch (event.type) {
     case 'user-message': {
       // Skip our OWN optimistic echo, identified by a nonce the backend echoes.
-      const nonce = (event.data as { submitNonce?: string } | undefined)?.submitNonce;
+      const data = event.data as { submitNonce?: string; continuation?: boolean } | undefined;
+      const nonce = data?.submitNonce;
       if (nonce && state.ownNonces.has(nonce)) {
         const ownNonces = new Set(state.ownNonces);
         ownNonces.delete(nonce);
@@ -126,7 +127,10 @@ export function reduceCliStreamEvent(state: CliStreamState, event: CliStreamEven
       // clean slate (empty streaming, re-armed terminal guard) before this
       // turn's deltas arrive.
       const flushed = finalizeAssistant(state);
-      const turns = event.text ? [...flushed.turns, { kind: 'user' as const, text: event.text }] : flushed.turns;
+      const turns =
+        event.text && !data?.continuation
+          ? [...flushed.turns, { kind: 'user' as const, text: event.text }]
+          : flushed.turns;
       return { ...flushed, turns, streaming: '', turnSettled: false, status: 'running' };
     }
 

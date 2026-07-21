@@ -456,7 +456,8 @@ export function App({
           // A user turn submitted into THIS conversation (the guard above already
           // scoped it). Skip our OWN echo — we showed it optimistically in
           // sendMessage and tagged it with a nonce the backend echoes here.
-          const nonce = (e.data as { submitNonce?: string } | undefined)?.submitNonce;
+          const data = e.data as { submitNonce?: string; continuation?: boolean } | undefined;
+          const nonce = data?.submitNonce;
           if (nonce && ownSubmitNoncesRef.current.has(nonce)) {
             ownSubmitNoncesRef.current.delete(nonce);
             break;
@@ -468,7 +469,9 @@ export function App({
           finalizeAssistant();
           streamingRef.current = '';
           turnSettledRef.current = false; // arm the terminal-event (done/error) guard
-          if (e.text) pushTurn({ kind: 'user', text: e.text });
+          // Drain-at-end continuation re-broadcasts the already-rendered/persisted
+          // user turn solely to re-arm clients after the first run's `done`.
+          if (e.text && !data?.continuation) pushTurn({ kind: 'user', text: e.text });
           setStatus('running');
           break;
         }

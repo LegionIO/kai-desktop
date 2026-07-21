@@ -2607,9 +2607,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (stillOwnsRun && serverPersistedRun && hasInjects(conversationId)) {
           const stranded = drainInjects(conversationId);
           let lastInjectedHead: string | null = null;
+          let lastInjectedText = '';
           for (const entry of stranded) {
             const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
-            if (persisted) lastInjectedHead = persisted.messageId;
+            if (persisted) {
+              lastInjectedHead = persisted.messageId;
+              lastInjectedText = entry.text;
+            }
           }
           if (lastInjectedHead && !controller.signal.aborted) {
             const updated = readConversation(appHome, conversationId);
@@ -2618,6 +2622,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               const continuationBranch = getConversationBranch(continuationTree, continuationHead);
               pendingServerPersist.add(conversationId);
               pendingServerPersistParent.set(conversationId, lastInjectedHead);
+              // The prior run already broadcast `done`, settling CLI/GUI clients.
+              // Re-arm them before the automatic continuation. Mark it as a
+              // continuation so CLI clients set running without rendering a
+              // duplicate user turn; renderer dedup handles the same stable id.
+              broadcastStreamEventRaw({
+                conversationId,
+                type: 'user-message',
+                text: lastInjectedText,
+                serverPersisted: true,
+                data: { messageId: lastInjectedHead, continuation: true },
+              });
               queueMicrotask(() => {
                 void streamHandler(
                   null,
@@ -3066,10 +3081,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     activeObserverSessions.delete(conversationId);
     // Drop any server-side persistence accumulation + ownership for a cancelled
     // turn, and reset a CLI turn's runStatus so it doesn't look stuck 'running'.
+    // First preserve any ACCEPTED cooperative injects still queued (a cancellation
+    // deletes activeStreams before the stream finally runs, so the terminal drain
+    // there no longer owns the token). Persist the partial assistant + injected
+    // user boundary now, then respect the cancellation by NOT restarting.
+    const wasServerPersist = serverPersistTokens.has(conversationId);
+    if (wasServerPersist && hasInjects(conversationId)) {
+      const stranded = drainInjects(conversationId);
+      for (const entry of stranded) {
+        persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+      }
+    }
     pendingServerPersist.delete(conversationId);
     pendingServerPersistParent.delete(conversationId);
     serverPersistParents.delete(conversationId);
-    const wasServerPersist = serverPersistTokens.delete(conversationId);
+    serverPersistTokens.delete(conversationId);
     if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
       try {

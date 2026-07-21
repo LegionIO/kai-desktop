@@ -41,6 +41,23 @@ describe('reduceCliStreamEvent — own-echo dedup', () => {
     expect(s.status).toBe('running');
     expect(s.turnSettled).toBe(false);
   });
+
+  it('re-arms a drain-at-end continuation without duplicating the persisted user turn', () => {
+    const start: CliStreamState = {
+      ...initialCliStreamState(),
+      turns: [{ kind: 'user', text: 'late follow-up' }],
+      status: 'idle',
+      turnSettled: true,
+    };
+    const s = reduceCliStreamEvent(start, {
+      type: 'user-message',
+      text: 'late follow-up',
+      data: { continuation: true },
+    });
+    expect(s.turns).toEqual([{ kind: 'user', text: 'late follow-up' }]);
+    expect(s.status).toBe('running');
+    expect(s.turnSettled).toBe(false);
+  });
 });
 
 describe('reduceCliStreamEvent — peer-turn response streaming (#217)', () => {
