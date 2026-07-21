@@ -1,7 +1,7 @@
 {
   "name": "kai",
   "productName": "Kai",
-  "version": "1.0.197",
+  "version": "1.0.198",
   "pluginProcessProtocolVersion": 3,
   "description": "Kai - Local AI Assistant",
   "main": "./out/main/index.js",
