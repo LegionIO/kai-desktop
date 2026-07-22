@@ -1055,13 +1055,31 @@ export const appConfigSchema = z.object({
       uiTreeDepth: z.number().int().min(1).max(10).default(4),
       /** When true, also auto-attach to the active composer on capture (otherwise clipboard-only). */
       autoAttach: z.boolean().default(false),
+      /** Persisted gallery/retention settings. Canonical home for the formerly
+       * separate lowercase `appshots` feature. */
+      persisted: z
+        .object({
+          enabled: z.boolean().default(false),
+          autoCapture: z.boolean().default(false),
+          captureVisibleText: z.boolean().default(false),
+          retention: z
+            .object({
+              maxCount: z.number().int().min(0).max(100000).default(200),
+              maxAgeDays: z.number().int().min(0).max(3650).default(30),
+              maxTotalBytes: z
+                .number()
+                .int()
+                .min(0)
+                .max(50 * 1024 * 1024 * 1024)
+                .default(524288000),
+            })
+            .default({ maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 }),
+        })
+        .optional(),
     })
     .optional(),
-  /**
-   * Appshots (#81) — the PERSISTED, browsable screenshot store (distinct from
-   * `appShots` above, which is the ephemeral capture-to-attach hotkey feature).
-   * All OFF by default; no capture happens until an operator opts in.
-   */
+  /** @deprecated Legacy persisted App Shots config. Read only as a fallback;
+   * new UI writes `appShots.persisted`. */
   appshots: z
     .object({
       enabled: z.boolean().default(false),
@@ -1087,6 +1105,40 @@ export const appConfigSchema = z.object({
       autoCapture: false,
       captureVisibleText: false,
       retention: { maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 },
+    }),
+  diagnostics: z
+    .object({
+      debugTrace: z
+        .object({
+          enabled: z.boolean().default(false),
+          /** Off by default: metadata/IDs/state only. Explicit opt-in may include
+           * bounded/redacted message, prompt, tool argument/result content. */
+          includeContent: z.boolean().default(false),
+          scopes: z
+            .array(z.enum(['agent', 'automation', 'alert', 'plugin', 'renderer', 'window']))
+            .default(['agent', 'automation', 'alert', 'plugin', 'renderer', 'window']),
+          retention: z
+            .object({
+              maxFileBytes: z.number().int().min(1048576).max(104857600).default(10485760),
+              maxFiles: z.number().int().min(1).max(10).default(3),
+              maxAgeDays: z.number().int().min(1).max(90).default(7),
+            })
+            .default({ maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 }),
+        })
+        .default({
+          enabled: false,
+          includeContent: false,
+          scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
+          retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
+        }),
+    })
+    .default({
+      debugTrace: {
+        enabled: false,
+        includeContent: false,
+        scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
+        retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
+      },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
@@ -1119,4 +1171,23 @@ export const appConfigSchema = z.object({
 });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;
+
+export type PersistedAppShotsConfig = NonNullable<NonNullable<AppConfig['appShots']>['persisted']>;
+
+/** Canonical persisted App Shots settings with backward-compatible fallback to
+ * the legacy lowercase `appshots` section. New writes go to appShots.persisted. */
+export function resolvePersistedAppShotsConfig(
+  config: Pick<AppConfig, 'appShots' | 'appshots'>,
+): PersistedAppShotsConfig {
+  return (
+    config.appShots?.persisted ??
+    config.appshots ?? {
+      enabled: false,
+      autoCapture: false,
+      captureVisibleText: false,
+      retention: { maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 },
+    }
+  );
+}
+
 export type CliToolConfig = z.infer<typeof cliToolSchema>;

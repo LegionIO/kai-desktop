@@ -57,6 +57,7 @@ import { arePermissionSetsEqual, hashPluginDirectory, hashPluginFile, readPlugin
 import { checkPluginCompatibility } from './plugin-compat.js';
 import { PluginProcessHost } from './process/plugin-process-host.js';
 import { selectPluginHostRuntime } from './process/runtime-selection.js';
+import { newDiagnosticCorrelationId, traceDiagnostic } from '../diagnostics/debug-trace.js';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -546,6 +547,14 @@ export class PluginManager {
   }
 
   private async loadPlugin(manifest: PluginManifest, dir: string): Promise<void> {
+    const pluginCorrelationId = newDiagnosticCorrelationId(`plugin-${manifest.name}`);
+    traceDiagnostic({
+      scope: 'plugin',
+      event: 'plugin.load-start',
+      correlationId: pluginCorrelationId,
+      pluginName: manifest.name,
+      fields: { version: manifest.version },
+    });
     // Honor disabled plugins in every load path (startup, marketplace
     // update/reinstall swaps, etc.) so a disabled plugin can never be silently
     // reactivated. This covers both persistent disables (config-backed) and
@@ -741,6 +750,13 @@ export class PluginManager {
 
       instance.state = 'active';
       instance.error = undefined;
+      traceDiagnostic({
+        scope: 'plugin',
+        event: 'plugin.load-complete',
+        correlationId: pluginCorrelationId,
+        pluginName: manifest.name,
+        fields: { runtime: runtimeSelection.runtime, reason: runtimeSelection.reason },
+      });
 
       // Show compatibility warning banner if loaded in warn mode
       if (instance.compatWarning) {
@@ -758,6 +774,14 @@ export class PluginManager {
       this.notifyToolsChanged();
       console.info(`[PluginManager] Plugin "${manifest.name}" activated`);
     } catch (err) {
+      traceDiagnostic({
+        scope: 'plugin',
+        event: 'plugin.load-failed',
+        level: 'error',
+        correlationId: pluginCorrelationId,
+        pluginName: manifest.name,
+        fields: { error: err },
+      });
       instance.state = 'error';
       instance.error = err instanceof Error ? err.message : String(err);
       for (const off of instance.eventUnsubscribers) {

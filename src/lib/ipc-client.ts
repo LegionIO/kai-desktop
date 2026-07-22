@@ -362,12 +362,24 @@ type AppAPI = {
     list: () => Promise<Array<{ name: string; sizeBytes: number }>>;
     delete: (names: string[]) => Promise<{ success?: boolean; deleted?: string[]; error?: string }>;
   };
+  debug: {
+    log: (file: string, message: string) => void;
+    trace: (event: {
+      event: string;
+      level?: 'debug' | 'info' | 'warn' | 'error';
+      correlationId?: string;
+      conversationId?: string;
+      fields?: Record<string, unknown>;
+    }) => void;
+  };
   diagnostics: {
     getSummary: () => Promise<{
       logPath: string;
       logSizeBytes: number;
       windowHealthLogPath: string;
       windowHealthLogSizeBytes: number;
+      debugTracePath: string;
+      debugTraceSizeBytes: number;
       sinceBoot: string;
       totalErrors: number;
       counters: Array<{
@@ -403,6 +415,8 @@ type AppAPI = {
     tailWindowHealthLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
     clearLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
     clearWindowHealthLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
+    tailDebugTrace: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
+    clearDebugTrace: () => Promise<{ success: boolean; logSizeBytes: number }>;
     resetCounters: () => Promise<{ success: boolean }>;
   };
   plans: {
@@ -470,6 +484,16 @@ type AppAPI = {
     resumeHotkey: () => Promise<unknown>;
     resolveRef: (refId: string) => Promise<AppShotPayload | null>;
     onCaptured: (callback: (payload: AppShotPayload) => void) => () => void;
+    list: () => Promise<Appshot[]>;
+    get: (id: string) => Promise<Appshot | null>;
+    getImage: (id: string) => Promise<string | null>;
+    delete: (id: string) => Promise<{ ok: boolean; error?: string }>;
+    deleteAll: () => Promise<{ ok: boolean }>;
+    update: (
+      id: string,
+      patch: { tags?: string[]; pinned?: boolean },
+    ) => Promise<{ ok: boolean; error?: string; appshot?: Appshot }>;
+    onChanged: (callback: () => void) => () => void;
   };
   appshots: {
     list: () => Promise<Appshot[]>;

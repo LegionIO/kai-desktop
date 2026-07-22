@@ -203,6 +203,11 @@ function summarizeToolParts(parts: ContentPart[]): Array<Record<string, unknown>
 
 function logRuntimeToolDebug(stage: string, details: Record<string, unknown>): void {
   console.info(`[RuntimeToolDebug] ${stage} ${JSON.stringify(details)}`);
+  app.debug?.trace?.({ event: `tool.${stage}`, fields: details });
+}
+
+function traceRuntime(event: string, conversationId: string | null, fields?: Record<string, unknown>): void {
+  app.debug?.trace?.({ event, conversationId: conversationId ?? undefined, fields });
 }
 
 function msgId(): string {
@@ -1731,6 +1736,14 @@ export function RuntimeProvider({
       }
     }
 
+    traceRuntime('conversation.loaded', id, {
+      persistedTreeLength: t.length,
+      displayTreeLength: displayTree.length,
+      persistedHeadId: h,
+      displayHeadId: displayHead,
+      usedAccumulator: Boolean(existingAcc),
+      runStatus: conv.runStatus,
+    });
     setActiveConversationId(id);
     setTree(displayTree);
     setHeadId(displayHead);
@@ -2286,6 +2299,13 @@ export function RuntimeProvider({
             };
             acc.messages.push(userMsg);
             acc.headId = userMsg.id;
+            traceRuntime('stream.user-message', convId, {
+              messageId: userMsg.id,
+              parentId: userMsg.parentId,
+              eventServerPersisted: Boolean(e.serverPersisted),
+              eventAutomation: Boolean(e.automation),
+              treeLength: acc.messages.length,
+            });
           }
         }
         // Falls through to the shared setTree/setHeadId flush at the end of the
@@ -2813,6 +2833,12 @@ export function RuntimeProvider({
             persistTimersRef.current.delete(convId);
           }
           streamAccumulators.delete(convId);
+          traceRuntime('stream.authoritative-done', convId, {
+            eventAutomation: Boolean(e.automation),
+            eventServerPersisted: Boolean(e.serverPersisted),
+            accumulatorMessages: acc.messages.length,
+            accumulatorHeadId: acc.headId,
+          });
           if (isActiveConv) {
             setIsRunning(false);
             void loadConversationState(convId);

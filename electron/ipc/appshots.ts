@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { createAppshotStore, type AppshotRetentionConfig } from '../computer-use/appshot-store.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { isValidAppshotId } from '../../shared/appshots.js';
-import type { AppConfig } from '../config/schema.js';
+import { resolvePersistedAppShotsConfig, type AppConfig } from '../config/schema.js';
 
 // Only tags + pinned are mutable. Extra keys are stripped (not passed through),
 // so a forged { imageRef, id, createdAt } can never overwrite stored fields.
@@ -22,7 +22,7 @@ const appshotUpdateSchema = z
   .strict();
 
 function resolveRetention(config: AppConfig): AppshotRetentionConfig {
-  const r = (config.appshots as { retention?: Partial<AppshotRetentionConfig> } | undefined)?.retention;
+  const r = resolvePersistedAppShotsConfig(config).retention as Partial<AppshotRetentionConfig> | undefined;
   return {
     maxCount: r?.maxCount ?? 200,
     maxAgeDays: r?.maxAgeDays ?? 30,

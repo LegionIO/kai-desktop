@@ -1,5 +1,6 @@
 import type { BrowserWindow, NativeImage, ProcessMetric, WebContents } from 'electron';
 import { appendBoundedLog } from './main-diagnostics.js';
+import { traceDiagnostic } from './debug-trace.js';
 
 const HEALTH_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 2_500;
@@ -256,6 +257,7 @@ export class WindowHealthMonitor {
       `[${new Date(this.now()).toISOString()}] [WINDOW_HEALTH] event=${event} data=${JSON.stringify(payload)}\n`,
       HEALTH_LOG_MAX_BYTES,
     );
+    traceDiagnostic({ scope: 'window', event, fields: payload });
   }
 
   logSession(details: Record<string, unknown>): void {

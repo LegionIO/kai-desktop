@@ -3,6 +3,7 @@ import type { AdapterCapabilities } from '../../../electron/platform/types.js';
 import { app } from '@/lib/ipc-client';
 import { settingsSelectClass, SliderField, Toggle, type SettingsProps } from './shared';
 import { HotkeyRecorder } from './shared/HotkeyRecorder';
+import { AppshotsSettings } from './AppshotGallerySettings';
 
 type AppShotsConfig = {
   enabled?: boolean;
@@ -12,6 +13,7 @@ type AppShotsConfig = {
   includeSelectedText?: boolean;
   uiTreeDepth?: number;
   autoAttach?: boolean;
+  persisted?: Record<string, unknown>;
 };
 
 export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
@@ -27,6 +29,7 @@ export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
 
   const set = <K extends keyof AppShotsConfig>(key: K, value: AppShotsConfig[K]) => {
     void updateConfig('appShots', {
+      ...cfg,
       enabled: cfg.enabled ?? false,
       hotkey: cfg.hotkey ?? 'CommandOrControl+Shift+1',
       captureMode: cfg.captureMode ?? 'window',
@@ -132,6 +135,10 @@ export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       >
         {cfg.enabled ? 'Capture now (test)' : 'Enable App Shots to test capture'}
       </button>
+
+      <div className="border-t border-border/60 pt-6">
+        <AppshotsSettings config={config} updateConfig={updateConfig} hideTitle />
+      </div>
     </div>
   );
 };

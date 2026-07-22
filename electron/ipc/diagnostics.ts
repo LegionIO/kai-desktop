@@ -1,5 +1,6 @@
 import type { IpcMain } from 'electron';
 import { statSync, writeFileSync, rmSync } from 'fs';
+import { getDiagnosticTracePath } from '../diagnostics/debug-trace.js';
 import {
   getDiagnosticCounters,
   getDiagnosticsBootTs,
@@ -18,6 +19,8 @@ export interface DiagnosticsSummary {
   logSizeBytes: number;
   windowHealthLogPath: string;
   windowHealthLogSizeBytes: number;
+  debugTracePath: string;
+  debugTraceSizeBytes: number;
   sinceBoot: string;
   totalErrors: number;
   counters: DiagnosticCounter[];
@@ -49,6 +52,8 @@ export function registerDiagnosticsHandlers(
       logSizeBytes: logSize(mainProcessLogPath),
       windowHealthLogPath,
       windowHealthLogSizeBytes: logSize(windowHealthLogPath),
+      debugTracePath: getDiagnosticTracePath(),
+      debugTraceSizeBytes: logSize(getDiagnosticTracePath()),
       sinceBoot: getDiagnosticsBootTs(),
       totalErrors: counters.reduce((sum, c) => sum + c.count, 0),
       counters,
@@ -64,6 +69,11 @@ export function registerDiagnosticsHandlers(
   ipcMain.handle('diagnostics:tail-window-health-log', async (_event, maxBytes?: number) => {
     const cap = Math.min(TAIL_MAX_BYTES, Math.max(1024, typeof maxBytes === 'number' ? maxBytes : TAIL_MAX_BYTES));
     return readLogTail(windowHealthLogPath, cap);
+  });
+
+  ipcMain.handle('diagnostics:tail-debug-trace', async (_event, maxBytes?: number) => {
+    const cap = Math.min(TAIL_MAX_BYTES, Math.max(1024, typeof maxBytes === 'number' ? maxBytes : TAIL_MAX_BYTES));
+    return readLogTail(getDiagnosticTracePath(), cap);
   });
 
   ipcMain.handle('diagnostics:clear-log', async () => {
@@ -93,6 +103,23 @@ export function registerDiagnosticsHandlers(
       /* noop */
     }
     return { success: true, logSizeBytes: logSize(windowHealthLogPath) };
+  });
+
+  ipcMain.handle('diagnostics:clear-debug-trace', async () => {
+    const path = getDiagnosticTracePath();
+    try {
+      writeFileSync(path, '');
+    } catch {
+      /* absent */
+    }
+    for (let i = 1; i <= 10; i += 1) {
+      try {
+        rmSync(`${path}.${i}`, { force: true });
+      } catch {
+        /* noop */
+      }
+    }
+    return { success: true, logSizeBytes: logSize(path) };
   });
 
   ipcMain.handle('diagnostics:reset-counters', async () => {

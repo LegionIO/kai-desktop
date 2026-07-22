@@ -1,10 +1,10 @@
 /**
- * AppshotGallerySettings (#81) — gallery + viewer for PERSISTED appshots, plus
- * the enable/retention controls. Distinct from AppShotsSettings (the ephemeral
- * capture-to-attach hotkey feature). Exported as AppshotsSettings.
+ * AppshotGallerySettings (#81) — saved-capture controls + gallery, rendered
+ * inside the unified App Shots settings tab. Exported as AppshotsSettings for
+ * source compatibility; new config writes use appShots.persisted.
  *
- * (File named AppshotGallerySettings to avoid a case-insensitive-filesystem
- * collision with AppShotsSettings.tsx on macOS.)
+ * (File name retained to avoid a case-insensitive-filesystem collision with
+ * AppShotsSettings.tsx on macOS.)
  */
 import { useState, useEffect, useCallback, useRef, type FC } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
@@ -61,7 +61,7 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
 
   useEffect(() => {
     let cancelled = false;
-    void app.appshots
+    void app.appShots
       .getImage(appshot.id)
       .then((url) => {
         if (!cancelled) setDataUrl(url);
@@ -90,7 +90,7 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
 
   const del = useCallback(async () => {
     try {
-      await app.appshots.delete(appshot.id);
+      await app.appShots.delete(appshot.id);
     } catch {
       /* best-effort; broadcast/refresh keeps UI consistent */
     }
@@ -102,7 +102,7 @@ const AppshotViewer: FC<{ appshot: Appshot; onClose: () => void; onChanged: () =
     const next = !pinned;
     setPinned(next); // optimistic
     try {
-      await app.appshots.update(appshot.id, { pinned: next });
+      await app.appShots.update(appshot.id, { pinned: next });
     } catch {
       setPinned(!next); // revert on failure
       return;
@@ -198,7 +198,7 @@ const GalleryThumb: FC<{ appshot: Appshot; onOpen: () => void }> = ({ appshot, o
   const [thumb, setThumb] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    void app.appshots
+    void app.appShots
       .getImage(appshot.id)
       .then((url) => {
         if (!cancelled) setThumb(url);
@@ -230,7 +230,8 @@ const GalleryThumb: FC<{ appshot: Appshot; onOpen: () => void }> = ({ appshot, o
 };
 
 export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
-  const cfg = (config.appshots as AppshotsConfig | undefined) ?? {};
+  const canonical = (config.appShots as { persisted?: AppshotsConfig } | undefined)?.persisted;
+  const cfg = canonical ?? (config.appshots as AppshotsConfig | undefined) ?? {};
   const [appshots, setAppshots] = useState<Appshot[]>([]);
   const [viewing, setViewing] = useState<Appshot | null>(null);
   // Monotonic guard: a slow older list() response must not overwrite a newer one.
@@ -238,7 +239,7 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
 
   const refresh = useCallback(() => {
     const seq = ++refreshSeqRef.current;
-    void app.appshots
+    void app.appShots
       .list()
       .then((list) => {
         if (seq === refreshSeqRef.current) setAppshots([...list].reverse()); // newest first
@@ -250,13 +251,13 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
 
   useEffect(() => {
     refresh();
-    const off = app.appshots.onChanged(refresh);
+    const off = app.appShots.onChanged(refresh);
     return off;
   }, [refresh]);
 
   const deleteAll = useCallback(async () => {
     try {
-      await app.appshots.deleteAll();
+      await app.appShots.deleteAll();
     } catch {
       /* best-effort */
     }
@@ -267,9 +268,9 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
     <div className="space-y-6">
       {!hideTitle && (
         <div>
-          <h3 className="text-sm font-semibold">Appshots</h3>
+          <h3 className="text-sm font-semibold">Saved App Shots</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            Persisted, metadata-enhanced screenshots you can browse and re-attach into a chat.
+            Persisted, metadata-enhanced captures you can browse and re-attach into a chat.
           </p>
         </div>
       )}
@@ -277,22 +278,22 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Capture</legend>
         <Toggle
-          id="appshots.enabled"
-          label="Enable appshots"
+          id="appShots.persisted.enabled"
+          label="Enable saved App Shots"
           checked={cfg.enabled ?? false}
-          onChange={(v) => void updateConfig('appshots.enabled', v)}
+          onChange={(v) => void updateConfig('appShots.persisted.enabled', v)}
         />
         <Toggle
-          id="appshots.autoCapture"
+          id="appShots.persisted.autoCapture"
           label="Auto-capture frames during computer use"
           checked={cfg.autoCapture ?? false}
-          onChange={(v) => void updateConfig('appshots.autoCapture', v)}
+          onChange={(v) => void updateConfig('appShots.persisted.autoCapture', v)}
         />
         <Toggle
-          id="appshots.captureVisibleText"
+          id="appShots.persisted.captureVisibleText"
           label="Store visible text metadata"
           checked={cfg.captureVisibleText ?? false}
-          onChange={(v) => void updateConfig('appshots.captureVisibleText', v)}
+          onChange={(v) => void updateConfig('appShots.persisted.captureVisibleText', v)}
         />
         <p className="text-[10px] text-muted-foreground/80">
           Appshots are stored unencrypted under <span className="font-mono">~/.kai/data/appshots</span> (protected only
@@ -303,18 +304,18 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       <fieldset className="rounded-lg border p-3 space-y-3">
         <legend className="text-xs font-semibold px-1">Retention</legend>
         <NumberField
-          id="appshots.retention.maxCount"
+          id="appShots.persisted.retention.maxCount"
           label="Max appshots"
           value={cfg.retention?.maxCount ?? 200}
-          onChange={(v) => void updateConfig('appshots.retention.maxCount', v)}
+          onChange={(v) => void updateConfig('appShots.persisted.retention.maxCount', v)}
           min={0}
           max={100000}
         />
         <NumberField
-          id="appshots.retention.maxAgeDays"
+          id="appShots.persisted.retention.maxAgeDays"
           label="Max age (days)"
           value={cfg.retention?.maxAgeDays ?? 30}
-          onChange={(v) => void updateConfig('appshots.retention.maxAgeDays', v)}
+          onChange={(v) => void updateConfig('appShots.persisted.retention.maxAgeDays', v)}
           min={0}
           max={3650}
         />

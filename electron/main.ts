@@ -15,7 +15,7 @@ import {
   powerMonitor,
 } from 'electron';
 import { basename, join, sep } from 'path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import {
   appendBoundedLog,
   enterErrorHandler,
@@ -26,6 +26,7 @@ import {
 } from './diagnostics/main-diagnostics.js';
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
+import { initDiagnosticTrace, traceDiagnostic } from './diagnostics/debug-trace.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
   registerAgentHandlers,
@@ -1143,6 +1144,7 @@ if (gotSingleInstanceLock) {
 
     // Config reader (used by tools and OAuth)
     const getConfig = () => readEffectiveConfig(APP_HOME);
+    initDiagnosticTrace(APP_HOME, getConfig);
 
     // Apply launch-at-login setting from config at startup
     try {
@@ -1359,16 +1361,40 @@ if (gotSingleInstanceLock) {
     }
     registerAppShotsHandlers(ipcMain);
 
-    // Debug logging: renderer can write to debug-logs/ via IPC
-    const debugLogDir = join(process.cwd(), 'debug-logs');
+    // Structured renderer diagnostics. The legacy debug:log path used to be
+    // ALWAYS ON + unbounded and wrote relative to process.cwd() (often `/` in a
+    // packaged app). Route it through the gated/bounded/redacted trace instead.
     ipcMain.on('debug:log', (_event, file: string, message: string) => {
-      try {
-        mkdirSync(debugLogDir, { recursive: true });
-        const safeName = file.replace(/[^a-zA-Z0-9_-]/g, '');
-        appendFileSync(join(debugLogDir, `${safeName}.log`), `[${new Date().toISOString()}] ${message}\n`);
-      } catch {
-        /* ignore */
-      }
+      traceDiagnostic({
+        scope: 'renderer',
+        event: `legacy.${file.replace(/[^a-zA-Z0-9_-]/g, '')}`,
+        fields: { message },
+      });
+    });
+    ipcMain.on('debug:trace', (_event, event: unknown) => {
+      if (!event || typeof event !== 'object') return;
+      const candidate = event as {
+        event?: unknown;
+        level?: unknown;
+        correlationId?: unknown;
+        conversationId?: unknown;
+        fields?: unknown;
+      };
+      if (typeof candidate.event !== 'string') return;
+      traceDiagnostic({
+        scope: 'renderer',
+        event: candidate.event.slice(0, 160),
+        level:
+          candidate.level === 'debug' || candidate.level === 'warn' || candidate.level === 'error'
+            ? candidate.level
+            : 'info',
+        correlationId: typeof candidate.correlationId === 'string' ? candidate.correlationId : undefined,
+        conversationId: typeof candidate.conversationId === 'string' ? candidate.conversationId : undefined,
+        fields:
+          candidate.fields && typeof candidate.fields === 'object'
+            ? (candidate.fields as Record<string, unknown>)
+            : undefined,
+      });
     });
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);

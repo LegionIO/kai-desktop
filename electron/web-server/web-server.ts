@@ -523,7 +523,14 @@ export function getBridgeScript(): string {
       suspendHotkey: function() { return invoke('app-shots:suspend-hotkey'); },
       resumeHotkey: function() { return invoke('app-shots:resume-hotkey'); },
       resolveRef: function(refId) { return invoke('app-shots:resolve-ref', refId); },
-      onCaptured: function(cb) { return on('app-shots:captured', cb); }
+      onCaptured: function(cb) { return on('app-shots:captured', cb); },
+      list: function() { return invoke('appshots:list'); },
+      get: function(id) { return invoke('appshots:get', id); },
+      getImage: function(id) { return invoke('appshots:get-image', id); },
+      delete: function(id) { return invoke('appshots:delete', id); },
+      deleteAll: function() { return invoke('appshots:delete-all'); },
+      update: function(id, patch) { return invoke('appshots:update', id, patch); },
+      onChanged: function(cb) { return on('appshots:changed', cb); }
     },
     appshots: {
       list: function() { return invoke('appshots:list'); },
@@ -667,6 +674,8 @@ export function getBridgeScript(): string {
       tailWindowHealthLog: function(maxBytes) { return invoke('diagnostics:tail-window-health-log', maxBytes); },
       clearLog: function() { return invoke('diagnostics:clear-log'); },
       clearWindowHealthLog: function() { return invoke('diagnostics:clear-window-health-log'); },
+      tailDebugTrace: function(maxBytes) { return invoke('diagnostics:tail-debug-trace', maxBytes); },
+      clearDebugTrace: function() { return invoke('diagnostics:clear-debug-trace'); },
       resetCounters: function() { return invoke('diagnostics:reset-counters'); }
     },
     dictation: {

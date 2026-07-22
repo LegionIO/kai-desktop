@@ -28,6 +28,7 @@ import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { isGuiFocused } from '../agent/kai-presence.js';
+import { newDiagnosticCorrelationId, traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
@@ -126,6 +127,16 @@ export function notifyNewAlert(alert: Alert): void {
     }
   })();
 
+  const surface = deps?.alertSurface() ?? 'off';
+  traceDiagnostic({
+    scope: 'alert',
+    event: 'alert.created',
+    correlationId: newDiagnosticCorrelationId('alert'),
+    conversationId: alert.conversationId,
+    alertId: alert.id,
+    fields: { kind: alert.kind, present, surface, status: alert.status },
+  });
+
   const verb = alert.kind === 'fyi' ? 'Flagged for review' : alert.kind === 'approval' ? 'Approval needed' : 'Question';
   if (!present) {
     try {
@@ -150,7 +161,6 @@ export function notifyNewAlert(alert: Alert): void {
   broadcastAlertsChanged({ reason: 'created', alert, suppressSurface: present });
   // Surface (modal/pop-out) only when AWAY and not an fyi (fyi never steals focus).
   if (!present && alert.kind !== 'fyi') {
-    const surface = deps?.alertSurface() ?? 'off';
     if (surface === 'modal') {
       focusMainWindowForModal();
     } else if (surface === 'window') {
@@ -231,11 +241,38 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
     }
     const resolved = resolveAlert(deps.appHome, id, clean);
     if (!resolved) return { ok: false, error: 'alert not open' };
+    traceDiagnostic({
+      scope: 'alert',
+      event: 'alert.answered',
+      correlationId: `alert-${id}`,
+      conversationId: resolved.conversationId,
+      alertId: id,
+      fields: { answerKeys: Object.keys(clean) },
+    });
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
     // Resume in the background; don't make the UI wait on a full agent turn.
-    void resume(resolved, formatAnswer(resolved, clean)).catch((err) => {
-      console.error('[alerts] resume after answer failed:', err);
-    });
+    void resume(resolved, formatAnswer(resolved, clean))
+      .then(() => {
+        traceDiagnostic({
+          scope: 'alert',
+          event: 'alert.resume-complete',
+          correlationId: `alert-${id}`,
+          conversationId: resolved.conversationId,
+          alertId: id,
+        });
+      })
+      .catch((err) => {
+        traceDiagnostic({
+          scope: 'alert',
+          event: 'alert.resume-failed',
+          level: 'error',
+          correlationId: `alert-${id}`,
+          conversationId: resolved.conversationId,
+          alertId: id,
+          fields: { error: err },
+        });
+        console.error('[alerts] resume after answer failed:', err);
+      });
     return { ok: true };
   });
 

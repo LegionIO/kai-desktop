@@ -130,6 +130,29 @@ describe('DiagnosticsSettings plugin process controls', () => {
     await waitFor(() => expect(mocks.resume).toHaveBeenCalledWith('calendar'));
   });
 
+  it('wires metadata-only diagnostic trace controls to persisted config paths', async () => {
+    const updateConfig = vi.fn().mockResolvedValue(undefined);
+    render(
+      <DiagnosticsSettings
+        config={{
+          diagnostics: {
+            debugTrace: {
+              enabled: false,
+              includeContent: false,
+              scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
+              retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
+            },
+          },
+        }}
+        updateConfig={updateConfig}
+      />,
+    );
+
+    fireEvent.click(await screen.findByLabelText('Enable diagnostic trace'));
+    expect(updateConfig).toHaveBeenCalledWith('diagnostics.debugTrace.enabled', true);
+    expect(screen.getByLabelText('Include bounded message/tool content')).toBeDisabled();
+  });
+
   it('identifies the Electron fallback runtime', async () => {
     mocks.getSummary.mockResolvedValue({
       ...summary,

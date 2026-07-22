@@ -21,7 +21,7 @@ import { isComputerSessionTerminal, makeComputerUseId, nowIso } from '../../shar
 import type { AppshotMetadata } from '../../shared/appshots.js';
 import { createAppshotStore, jpegBytesFromDataUrl } from './appshot-store.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
-import type { AppConfig } from '../config/schema.js';
+import { resolvePersistedAppShotsConfig, type AppConfig } from '../config/schema.js';
 import { resolveModelCatalog, resolveModelForThread } from '../agent/model-catalog.js';
 import { ComputerUseOrchestrator } from './orchestrator.js';
 import { closeOperatorWindow, openComputerSetupWindow, openOperatorWindow } from './operator-window.js';
@@ -314,13 +314,13 @@ export class ComputerUseSessionManager extends EventEmitter {
 
   /** Config-gated, single-flight, never-throwing appshot persist for a frame. */
   private maybePersistAppshot(sessionId: string, frame: ComputerFrame): void {
-    let cfg: AppConfig['appshots'];
+    let cfg: ReturnType<typeof resolvePersistedAppShotsConfig>;
     try {
-      cfg = this.getConfig().appshots;
+      cfg = resolvePersistedAppShotsConfig(this.getConfig());
     } catch {
       return;
     }
-    if (!cfg?.enabled || !cfg.autoCapture) return;
+    if (!cfg.enabled || !cfg.autoCapture) return;
     // Single-flight: drop a new appshot if a prior write for this session is
     // still running (no unbounded queue on a frame burst).
     if (this.appshotInFlight.has(sessionId)) return;

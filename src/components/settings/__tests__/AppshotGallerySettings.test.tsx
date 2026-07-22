@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * Component test for AppshotsSettings (#81) — gallery render + "Attach to chat".
- * window.app.appshots and the attachment context are mocked.
+ * window.app.appShots and the attachment context are mocked.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react';
@@ -37,17 +37,19 @@ vi.mock('@/providers/AttachmentContext', () => ({
 }));
 
 vi.mock('@/lib/ipc-client', () => ({
-  app: { appshots: appshotsApi },
+  app: { appShots: appshotsApi },
 }));
 
 import { AppshotsSettings } from '../AppshotGallerySettings';
 
 const config = {
-  appshots: {
-    enabled: true,
-    autoCapture: false,
-    captureVisibleText: false,
-    retention: { maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 },
+  appShots: {
+    persisted: {
+      enabled: true,
+      autoCapture: false,
+      captureVisibleText: false,
+      retention: { maxCount: 200, maxAgeDays: 30, maxTotalBytes: 524288000 },
+    },
   },
 } as unknown as Record<string, unknown>;
 

@@ -267,7 +267,16 @@ export const AutomationsSettings: FC<SettingsProps & { onOpenConversation?: (id:
             automations.alertSurface ??
             (automations.surfaceAlertsAsWindow ? 'window' : automations.surfaceAlertsAsModal ? 'modal' : 'off')
           }
-          onChange={(e) => updateConfig('automations.alertSurface', e.target.value)}
+          onChange={(e) => {
+            // alertSurface is the sole source of truth. Clear deprecated booleans
+            // so persisted config and diagnostics cannot present contradictory
+            // values (e.g. alertSurface:'off' beside surfaceAlertsAsModal:true).
+            void Promise.all([
+              updateConfig('automations.alertSurface', e.target.value),
+              updateConfig('automations.surfaceAlertsAsModal', false),
+              updateConfig('automations.surfaceAlertsAsWindow', false),
+            ]);
+          }}
         >
           <option value="off">Notification + tab only</option>
           <option value="modal">In-app modal</option>

@@ -887,6 +887,13 @@ const appAPI = {
 
   debug: {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
+    trace: (event: {
+      event: string;
+      level?: 'debug' | 'info' | 'warn' | 'error';
+      correlationId?: string;
+      conversationId?: string;
+      fields?: Record<string, unknown>;
+    }) => ipcRenderer.send('debug:trace', event),
   },
 
   diagnostics: {
@@ -896,6 +903,8 @@ const appAPI = {
         logSizeBytes: number;
         windowHealthLogPath: string;
         windowHealthLogSizeBytes: number;
+        debugTracePath: string;
+        debugTraceSizeBytes: number;
         sinceBoot: string;
         totalErrors: number;
         counters: Array<{
@@ -945,6 +954,14 @@ const appAPI = {
         success: boolean;
         logSizeBytes: number;
       }>,
+    tailDebugTrace: (maxBytes?: number) =>
+      ipcRenderer.invoke('diagnostics:tail-debug-trace', maxBytes) as Promise<{
+        text: string;
+        sizeBytes: number;
+        truncated: boolean;
+      }>,
+    clearDebugTrace: () =>
+      ipcRenderer.invoke('diagnostics:clear-debug-trace') as Promise<{ success: boolean; logSizeBytes: number }>,
     resetCounters: () => ipcRenderer.invoke('diagnostics:reset-counters') as Promise<{ success: boolean }>,
   },
 
@@ -958,9 +975,24 @@ const appAPI = {
       ipcRenderer.on('app-shots:captured', handler);
       return () => ipcRenderer.removeListener('app-shots:captured', handler);
     },
+    // Saved App Shots gallery — canonical unified namespace.
+    list: (): Promise<Appshot[]> => ipcRenderer.invoke('appshots:list'),
+    get: (id: string): Promise<Appshot | null> => ipcRenderer.invoke('appshots:get', id),
+    getImage: (id: string): Promise<string | null> => ipcRenderer.invoke('appshots:get-image', id),
+    delete: (id: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('appshots:delete', id),
+    deleteAll: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('appshots:delete-all'),
+    update: (
+      id: string,
+      patch: { tags?: string[]; pinned?: boolean },
+    ): Promise<{ ok: boolean; error?: string; appshot?: Appshot }> => ipcRenderer.invoke('appshots:update', id, patch),
+    onChanged: (callback: () => void) => {
+      const handler = () => callback();
+      ipcRenderer.on('appshots:changed', handler);
+      return () => ipcRenderer.removeListener('appshots:changed', handler);
+    },
   },
 
-  // Persisted appshot gallery (#81) — distinct from `appShots` (ephemeral capture).
+  // Deprecated lowercase alias retained for older renderer/plugin clients.
   appshots: {
     list: (): Promise<Appshot[]> => ipcRenderer.invoke('appshots:list'),
     get: (id: string): Promise<Appshot | null> => ipcRenderer.invoke('appshots:get', id),

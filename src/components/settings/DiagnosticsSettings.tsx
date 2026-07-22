@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import type { SettingsProps } from './shared';
-import { CollapsibleSection } from './shared';
+import { CollapsibleSection, Toggle } from './shared';
 
 type Summary = Awaited<ReturnType<typeof app.diagnostics.getSummary>>;
 type PluginList = Awaited<ReturnType<typeof app.plugins.list>>;
@@ -40,11 +40,29 @@ function formatTs(iso: string): string {
  * to hundreds of MB) is visible and attributable to the offending plugin,
  * rather than only discoverable by manually inspecting ~/.kai/logs.
  */
-export const DiagnosticsSettings: FC<SettingsProps> = () => {
+export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig }) => {
+  const diagnostics = (
+    config as {
+      diagnostics?: {
+        debugTrace?: {
+          enabled?: boolean;
+          includeContent?: boolean;
+          scopes?: string[];
+          retention?: { maxFileBytes?: number; maxFiles?: number; maxAgeDays?: number };
+        };
+      };
+    }
+  ).diagnostics;
+  const debugTrace = diagnostics?.debugTrace;
   const [summary, setSummary] = useState<Summary | null>(null);
   const [plugins, setPlugins] = useState<PluginList>([]);
   const [tail, setTail] = useState<{ text: string; sizeBytes: number; truncated: boolean } | null>(null);
   const [windowHealthTail, setWindowHealthTail] = useState<{
+    text: string;
+    sizeBytes: number;
+    truncated: boolean;
+  } | null>(null);
+  const [debugTraceTail, setDebugTraceTail] = useState<{
     text: string;
     sizeBytes: number;
     truncated: boolean;
@@ -84,6 +102,25 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
       setWindowHealthTail(null);
     }
   }, []);
+
+  const loadDebugTrace = useCallback(async () => {
+    try {
+      setDebugTraceTail(await app.diagnostics.tailDebugTrace());
+    } catch {
+      setDebugTraceTail(null);
+    }
+  }, []);
+
+  const clearDebugTrace = useCallback(async () => {
+    setBusy(true);
+    try {
+      await app.diagnostics.clearDebugTrace();
+      setDebugTraceTail(null);
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
 
   const clearLog = useCallback(async () => {
     setBusy(true);
@@ -153,6 +190,160 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
           Each plugin backend runs in its own isolated process. CPU, memory, crashes, and unhandled errors are
           attributed to the owning plugin instead of being hidden inside the main app process.
         </p>
+      </div>
+
+      {/* Cross-process structured trace controls */}
+      <div className="rounded-xl border border-border/70 bg-card/60 p-4" data-setting-id="diagnostics.debugTrace">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h4 className="text-xs font-semibold">Diagnostic trace</h4>
+            <p className="mt-1 max-w-2xl text-[11px] text-muted-foreground">
+              Correlates renderer, agent, automation, alert, plugin, and window-health lifecycle events in a bounded
+              JSONL trace under ~/.kai/logs. Disabled by default. Metadata mode records IDs, parent/head relationships,
+              timestamps, state transitions, sizes, hashes, and statuses without message or tool contents.
+            </p>
+          </div>
+          <span
+            className={`text-[10px] font-semibold uppercase tracking-wide ${debugTrace?.enabled ? 'text-emerald-500' : 'text-muted-foreground'}`}
+          >
+            {debugTrace?.enabled ? 'Recording' : 'Off'}
+          </span>
+        </div>
+
+        <div className="mt-3 grid gap-2 md:grid-cols-2">
+          <Toggle
+            id="diagnostics.debugTrace.enabled"
+            label="Enable diagnostic trace"
+            checked={debugTrace?.enabled ?? false}
+            onChange={(value) => void updateConfig('diagnostics.debugTrace.enabled', value)}
+          />
+          <Toggle
+            id="diagnostics.debugTrace.includeContent"
+            label="Include bounded message/tool content"
+            checked={debugTrace?.includeContent ?? false}
+            disabled={!debugTrace?.enabled}
+            onChange={(value) => void updateConfig('diagnostics.debugTrace.includeContent', value)}
+          />
+        </div>
+
+        {debugTrace?.includeContent && (
+          <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-600 dark:text-amber-400">
+            <AlertTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Content mode may record bounded Teams messages, prompts, tool arguments/results, URLs, and file paths.
+              Secret-like fields are redacted, but only enable this while reproducing an issue and clear the trace
+              afterward.
+            </span>
+          </div>
+        )}
+
+        <div className="mt-4">
+          <div className="text-[11px] font-medium text-muted-foreground">Scopes</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {(['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const).map((scope) => {
+              const scopes = debugTrace?.scopes?.length
+                ? debugTrace.scopes
+                : ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'];
+              const checked = scopes.includes(scope);
+              return (
+                <label
+                  key={scope}
+                  className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-[11px] capitalize"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={!debugTrace?.enabled}
+                    onChange={(event) => {
+                      const next = event.target.checked
+                        ? [...new Set([...scopes, scope])]
+                        : scopes.filter((entry) => entry !== scope);
+                      void updateConfig('diagnostics.debugTrace.scopes', next);
+                    }}
+                  />
+                  {scope}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <label className="text-[11px] text-muted-foreground">
+            Max file size (MB)
+            <input
+              type="number"
+              min={1}
+              max={100}
+              value={Math.round((debugTrace?.retention?.maxFileBytes ?? 10485760) / 1048576)}
+              onChange={(event) =>
+                void updateConfig(
+                  'diagnostics.debugTrace.retention.maxFileBytes',
+                  Math.max(1, Number(event.target.value) || 10) * 1048576,
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground"
+            />
+          </label>
+          <label className="text-[11px] text-muted-foreground">
+            Rotated files
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={debugTrace?.retention?.maxFiles ?? 3}
+              onChange={(event) =>
+                void updateConfig(
+                  'diagnostics.debugTrace.retention.maxFiles',
+                  Math.min(10, Math.max(1, Number(event.target.value) || 3)),
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground"
+            />
+          </label>
+          <label className="text-[11px] text-muted-foreground">
+            Max age (days)
+            <input
+              type="number"
+              min={1}
+              max={90}
+              value={debugTrace?.retention?.maxAgeDays ?? 7}
+              onChange={(event) =>
+                void updateConfig(
+                  'diagnostics.debugTrace.retention.maxAgeDays',
+                  Math.min(90, Math.max(1, Number(event.target.value) || 7)),
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground"
+            />
+          </label>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <span className="text-[11px] text-muted-foreground">
+            Trace size: {summary ? formatBytes(summary.debugTraceSizeBytes) : '—'}
+          </span>
+          <button
+            type="button"
+            onClick={() => void loadDebugTrace()}
+            className="rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-[11px] hover:bg-accent"
+          >
+            View trace tail
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void clearDebugTrace()}
+            className="rounded-lg border border-destructive/50 bg-destructive/10 px-2.5 py-1.5 text-[11px] text-destructive hover:bg-destructive/20 disabled:opacity-50"
+          >
+            Clear trace
+          </button>
+        </div>
+        {debugTraceTail && (
+          <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-border/60 bg-background/70 p-3 text-[10px] text-muted-foreground">
+            {debugTraceTail.text || '(empty)'}
+          </pre>
+        )}
       </div>
 
       {/* Health summary card */}

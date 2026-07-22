@@ -288,6 +288,14 @@ function getDefaultConfig() {
       },
       debugLogging: false,
     },
+    diagnostics: {
+      debugTrace: {
+        enabled: false,
+        includeContent: false,
+        scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const,
+        retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
+      },
+    },
     advanced: {
       temperature: 0.4,
       maxSteps: 25,
@@ -1051,6 +1059,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     dictation: config.dictation,
     appShots: config.appShots,
     appshots: config.appshots,
+    diagnostics: config.diagnostics,
     advanced: config.advanced,
     profiles: config.profiles,
     defaultProfileKey: config.defaultProfileKey,

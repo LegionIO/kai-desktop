@@ -43,7 +43,6 @@ export const TAB_LABELS: Record<string, string> = {
   // Application
   general: 'General',
   'app-shots': 'App Shots',
-  appshots: 'Appshots',
   // Voice
   realtime: 'Voice Chat',
   dictation: 'Dictation',
@@ -406,38 +405,38 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
 
   // ─── Application › Appshots (persisted gallery) ───
   {
-    id: 'appshots.enabled',
+    id: 'appShots.persisted.enabled',
     label: 'Enable appshots',
     section: 'general',
-    tab: 'appshots',
+    tab: 'app-shots',
     keywords: ['appshot', 'screenshot', 'gallery', 'persisted', 'snapshot'],
   },
   {
-    id: 'appshots.autoCapture',
+    id: 'appShots.persisted.autoCapture',
     label: 'Auto-capture frames during computer use',
     section: 'general',
-    tab: 'appshots',
+    tab: 'app-shots',
     keywords: ['appshot', 'screenshot', 'automatic', 'computer use', 'capture'],
   },
   {
-    id: 'appshots.captureVisibleText',
+    id: 'appShots.persisted.captureVisibleText',
     label: 'Store visible text metadata',
     section: 'general',
-    tab: 'appshots',
+    tab: 'app-shots',
     keywords: ['appshot', 'ocr', 'visible text', 'metadata', 'privacy'],
   },
   {
-    id: 'appshots.retention.maxCount',
+    id: 'appShots.persisted.retention.maxCount',
     label: 'Max appshots',
     section: 'general',
-    tab: 'appshots',
+    tab: 'app-shots',
     keywords: ['appshot', 'retention', 'limit', 'count', 'cleanup'],
   },
   {
-    id: 'appshots.retention.maxAgeDays',
+    id: 'appShots.persisted.retention.maxAgeDays',
     label: 'Appshot max age (days)',
     section: 'general',
-    tab: 'appshots',
+    tab: 'app-shots',
     keywords: ['appshot', 'retention', 'age', 'expiry', 'cleanup'],
   },
 
@@ -706,6 +705,13 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
     section: 'web-server',
     keywords: ['login', 'credential'],
     fallbackId: 'webServer.enabled',
+  },
+  {
+    id: 'diagnostics.debugTrace.enabled',
+    label: 'Diagnostic trace logging',
+    section: 'diagnostics',
+    keywords: ['debug', 'trace', 'structured logs', 'correlation', 'automation race', 'alert lifecycle'],
+    fallbackId: 'diagnostics.debugTrace',
   },
   {
     id: 'diagnostics-log-tail',

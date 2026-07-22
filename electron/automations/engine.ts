@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AutomationRule, AutomationsConfig } from '../config/schema.js';
 import { getRuleTriggers } from '../config/schema.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import type { ActionDeps } from './actions.js';
 import { executeActions } from './actions.js';
 import { evaluateConditions } from './conditions.js';
@@ -208,6 +209,23 @@ export class AutomationEngine {
   }
 
   private pushLog(record: AutomationRunRecord): void {
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'rule.result',
+      correlationId: `automation-run-${record.id}`,
+      ruleId: record.ruleId,
+      level: record.error ? 'error' : 'info',
+      fields: {
+        ruleName: record.ruleName,
+        matched: record.matched,
+        skippedReason: record.skippedReason,
+        eventKey: record.event.key,
+        source: record.event.source,
+        event: record.event.event,
+        resultCount: record.results.length,
+        error: record.error,
+      },
+    });
     const safe = toJsonSafeRecord(record);
     const max = this.deps.getAutomationsConfig().log.maxEntries;
     this.runLog.unshift(safe);
