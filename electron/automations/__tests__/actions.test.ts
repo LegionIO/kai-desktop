@@ -284,7 +284,11 @@ describe('agent conversationTarget', () => {
     vi.mocked(writeConversation).mockClear();
     vi.mocked(appendConversationMessages).mockClear();
     vi.mocked(generateForPlugin).mockClear();
-    vi.mocked(streamForPlugin).mockClear();
+    vi.mocked(streamForPlugin).mockReset();
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
   });
 
   it('per-invocation creates a shell (automationSingleton=false) then writes prompt + assistant', async () => {
@@ -490,6 +494,50 @@ describe('agent conversationTarget', () => {
     expect(hasInjects('convResume')).toBe(false);
     // The answer was appended as a user turn on that conversation.
     expect(vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convResume')).toBe(true);
+  });
+
+  it('orders an alert answer before later automation events without disabling ordinary mid-turn injects', async () => {
+    clearInjects('convOrdered');
+    resetMockStore({
+      convOrdered: { id: 'convOrdered', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let streamCalls = 0;
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      streamCalls += 1;
+      if (streamCalls === 1) await firstGate;
+      yield { type: 'text-delta', text: `reply-${streamCalls}` } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+    const d = deps({ injectUserTurnAndRestart: vi.fn(async () => ({ ok: true })) });
+
+    const original = executeActions(agentAction({ type: 'existing', conversationId: 'convOrdered' }), evt, d);
+    await vi.waitFor(() => {
+      if (!vi.mocked(appendConversationMessages).mock.calls.some((call) => call[1] === 'convOrdered')) {
+        throw new Error('original turn did not start');
+      }
+    });
+
+    // The alert answer establishes the ordered barrier while the original run is
+    // still active. A later Matt event must queue BEHIND it rather than injecting
+    // into/overtaking the original turn.
+    const answer = resumeConversationWithMessage('convOrdered', '[Answer] A little', d);
+    await Promise.resolve();
+    const later = executeActions(agentAction({ type: 'existing', conversationId: 'convOrdered' }), evt, d);
+    expect(hasInjects('convOrdered')).toBe(false);
+
+    releaseFirst();
+    await Promise.all([original, answer, later]);
+
+    expect(streamCalls).toBe(3);
+    const userPrompts = vi
+      .mocked(appendConversationMessages)
+      .mock.calls.flatMap((call) => call[2] as Array<{ role: string; content: Array<{ text?: string }> }>)
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content?.[0]?.text);
+    expect(userPrompts).toEqual(['do the thing', '[Answer] A little', 'do the thing']);
+    expect(hasInjects('convOrdered')).toBe(false);
   });
 
   it('alert resume force-clears a STUCK runStatus:"running" and still runs a real turn', async () => {

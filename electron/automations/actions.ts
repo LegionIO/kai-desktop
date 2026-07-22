@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { newDiagnosticCorrelationId, traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { Notification } from 'electron';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
@@ -45,6 +46,26 @@ type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; 
 
 const inFlightAutomationTargets = new Set<string>();
 
+/** Ordered fresh-turn barriers (primarily alert answers) per conversation. Once
+ * an answer is queued, later automation events for that same singleton queue
+ * behind it instead of overtaking it via true mid-turn injection. Ordinary busy
+ * events still inject cooperatively when no barrier exists. */
+const orderedConversationTails = new Map<string, Promise<void>>();
+
+function enqueueOrderedConversationTurn<T>(conversationId: string, task: () => Promise<T>): Promise<T> {
+  const previous = orderedConversationTails.get(conversationId) ?? Promise.resolve();
+  const run = previous.catch(() => {}).then(task);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  orderedConversationTails.set(conversationId, tail);
+  void tail.finally(() => {
+    if (orderedConversationTails.get(conversationId) === tail) orderedConversationTails.delete(conversationId);
+  });
+  return run;
+}
+
 /** Abort controllers for in-flight agent runs, keyed by target conversationId.
  * Lets the renderer's stop button interrupt a live automation run. */
 const automationRunAborts = new Map<string, AbortController>();
@@ -68,9 +89,12 @@ export function abortAutomationRun(conversationId: string): boolean {
  * before a forced fresh turn (alert resume) so the answer runs AFTER the prior
  * run finishes, not racing/stranded against its final step. Proceeds on timeout.
  */
-async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 8000): Promise<void> {
+async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 5 * 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (isAutomationRunInFlight(conversationId) && Date.now() < deadline) {
+  while (isAutomationRunInFlight(conversationId)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for automation turn ${conversationId} to settle`);
+    }
     await new Promise((r) => setTimeout(r, 25));
   }
 }
@@ -285,9 +309,14 @@ async function runAgentAction(
      *  for the in-flight run to settle, then run a normal turn that appends the
      *  answer + responds. */
     forceFreshTurn?: boolean;
+    /** Internal: this invocation already owns its slot in orderedConversationTails. */
+    orderedExecution?: boolean;
+    correlationId?: string;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
+  const correlationId =
+    opts?.correlationId ?? newDiagnosticCorrelationId(opts?.forceFreshTurn ? 'alert-resume' : 'automation');
   const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
   const tools = action.tools ? deps.getRegisteredTools() : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
@@ -310,34 +339,51 @@ async function runAgentAction(
   const canInject = typeof deps.injectUserTurnAndRestart === 'function';
   let resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
 
-  // Alert resume (forceFreshTurn): a busy target must NOT cooperatively enqueue
-  // (that can strand the answer if the in-flight run is on its final step). Wait
-  // for the run to settle, then RE-RESOLVE — the conversation is now idle, so the
-  // normal existing-target path below appends the answer + runs a real turn.
-  if (opts?.forceFreshTurn && action.conversationTarget?.type === 'existing') {
-    const targetConvId = action.conversationTarget.conversationId;
-    const busyish = resolved && 'busyInject' in resolved;
-    const strandedNull = resolved === null && !!readConversation(deps.appHome, targetConvId);
-    if (busyish || strandedNull) {
-      await waitForAutomationRunToSettle(targetConvId);
-      resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
-      // Still not a clean target AND no automation run is actually in flight →
-      // the conversation's runStatus is STUCK 'running' (a live turn that
-      // suspended to raise this alert never reset it). A resume answers a
-      // persisted alert, so the raising turn is definitively over — force-clear
-      // the stale status and re-resolve so the answer runs a real turn instead of
-      // being enqueued / diverted.
-      const stillBad = !resolved || 'busyInject' in resolved;
-      if (stillBad && !isAutomationRunInFlight(targetConvId)) {
-        try {
-          const stuck = readConversation(deps.appHome, targetConvId);
-          if (stuck && (stuck.runStatus === 'running' || stuck.runStatus === 'awaiting-approval')) {
-            writeConversation(deps.appHome, { ...stuck, runStatus: 'idle' });
-            resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
-          }
-        } catch {
-          // force-clear stuck runStatus failed; best-effort
-        }
+  const orderingConversationId =
+    resolved && 'busyInject' in resolved
+      ? resolved.busyInject
+      : resolved && 'targetId' in resolved
+        ? resolved.targetId
+        : action.conversationTarget?.type === 'existing'
+          ? action.conversationTarget.conversationId
+          : null;
+  if (
+    !opts?.orderedExecution &&
+    orderingConversationId &&
+    (opts?.forceFreshTurn || orderedConversationTails.has(orderingConversationId))
+  ) {
+    // Alert answers create an ordered barrier. Later events for this singleton
+    // join the same FIFO instead of overtaking the answer via mid-turn injection.
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.queued',
+      correlationId,
+      conversationId: orderingConversationId,
+      ruleId: rule.id,
+      fields: { reason: opts?.forceFreshTurn ? 'alert-resume' : 'ordered-follower' },
+    });
+    return enqueueOrderedConversationTurn(orderingConversationId, async () => {
+      await waitForAutomationRunToSettle(orderingConversationId);
+      return runAgentAction(action, ctx, rule, event, deps, {
+        ...opts,
+        forceFreshTurn: false,
+        orderedExecution: true,
+        correlationId,
+      });
+    });
+  }
+
+  // An ordered alert/follower resumes after the preceding automation released
+  // its in-memory reservation. If disk still says running/awaiting (the raising
+  // turn suspended to alert and left a stale flag), clear only that stale status
+  // and re-resolve; never inject the ordered turn into a non-existent run.
+  if (opts?.orderedExecution && action.conversationTarget?.type === 'existing') {
+    const targetId = action.conversationTarget.conversationId;
+    if (!isAutomationRunInFlight(targetId)) {
+      const stuck = readConversation(deps.appHome, targetId);
+      if (stuck && (stuck.runStatus === 'running' || stuck.runStatus === 'awaiting-approval')) {
+        writeConversation(deps.appHome, { ...stuck, runStatus: 'idle' });
+        resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
       }
     }
   }
@@ -358,17 +404,27 @@ async function runAgentAction(
     // step boundary. NO abort — the partial turn continues, the model sees the
     // new message in the SAME turn.
     if (isAutomationRunInFlight(targetConvId)) {
-      enqueueInject(targetConvId, prompt);
-      const write = appendConversationMessages(
-        deps.appHome,
-        targetConvId,
-        [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
-        { runStatus: 'running' }, // still live — extending the turn
-      );
-      if (!write) {
-        throw new Error(`mid-turn injection into ${targetConvId} failed: conversation missing`);
-      }
-      broadcastAgentStreamEvent({ conversationId: targetConvId, type: 'user-message', text: prompt });
+      const injectId = enqueueInject(targetConvId, prompt);
+      if (!injectId) throw new Error(`mid-turn injection into ${targetConvId} failed: could not enqueue`);
+      // Display immediately with the stable queue id, but defer authoritative
+      // persistence to the running turn's prepareStep consumption boundary. At
+      // that point the previous tool results are complete and the run can split:
+      // partial assistant → injected user → continuation assistant.
+      traceDiagnostic({
+        scope: 'automation',
+        event: 'turn.injected',
+        correlationId,
+        conversationId: targetConvId,
+        ruleId: rule.id,
+        messageId: injectId,
+        fields: { eventKey: event.key },
+      });
+      broadcastAgentStreamEvent({
+        conversationId: targetConvId,
+        type: 'user-message',
+        text: prompt,
+        data: { messageId: injectId },
+      });
       return { injectedInto: targetConvId, ok: true };
     }
 
@@ -404,6 +460,14 @@ async function runAgentAction(
   let conversationId = target?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
   let created = target ? (target.created ?? false) : true;
   inFlightAutomationTargets.add(conversationId);
+  traceDiagnostic({
+    scope: 'automation',
+    event: 'turn.start',
+    correlationId,
+    conversationId,
+    ruleId: rule.id,
+    fields: { eventKey: event.key, ordered: Boolean(opts?.orderedExecution), created },
+  });
 
   const abortController = new AbortController();
   automationRunAborts.set(conversationId, abortController);
@@ -446,8 +510,10 @@ async function runAgentAction(
 
     // continueOnBranch: skip the prompt append (the user turn is already on the
     // branch). Just flip runStatus to running for the continuation turn.
+    let userTurnHeadId = parentId ?? null;
     if (opts?.continueOnBranch) {
-      appendConversationMessages(deps.appHome, conversationId, [], { runStatus: 'running' });
+      const statusWrite = appendConversationMessages(deps.appHome, conversationId, [], { runStatus: 'running' });
+      userTurnHeadId = statusWrite?.headId ?? userTurnHeadId;
     } else {
       const promptWrite = appendConversationMessages(
         deps.appHome,
@@ -458,6 +524,7 @@ async function runAgentAction(
         // chat, so the answer vanishes from the thread the user is watching).
         { skipIfBusy: !opts?.strictExistingTarget, parentId, runStatus: 'running' },
       );
+      if (promptWrite?.headId) userTurnHeadId = promptWrite.headId;
       if (!promptWrite) {
         // Target was genuinely busy (a concurrent run) or deleted mid-flight —
         // divert to a fresh conversation and write the prompt there. NEVER divert
@@ -475,15 +542,26 @@ async function runAgentAction(
         created = true;
         inFlightAutomationTargets.add(conversationId);
         automationRunAborts.set(conversationId, abortController);
-        appendConversationMessages(
+        const divertedWrite = appendConversationMessages(
           deps.appHome,
           conversationId,
           [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
           { parentId: null, runStatus: 'running' },
         );
+        userTurnHeadId = divertedWrite?.headId ?? null;
       }
     }
-    const userTurnHeadId = readConversation(deps.appHome, conversationId)?.headId ?? parentId ?? null;
+
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.prompt-persisted',
+      correlationId,
+      conversationId,
+      ruleId: rule.id,
+      messageId: userTurnHeadId ?? undefined,
+      parentMessageId: parentId ?? null,
+      fields: { historyMessages: messages.length },
+    });
 
     // Stream the model response, broadcasting each event tagged `automation` so
     // the renderer renders it live in this conversation but defers persistence
@@ -519,6 +597,55 @@ async function runAgentAction(
       else contentParts.push({ type: 'text', text: delta });
     };
 
+    /** Persist a genuine mid-turn boundary when prepareStep consumes queued
+     * automation injects. This runs after the prior step's tool results, so all
+     * tool-call parts are complete before rotating the accumulator. */
+    const persistInjectedBoundary = (entries: Array<{ id: string; text: string; at: number }>): void => {
+      if (entries.length === 0) return;
+      traceDiagnostic({
+        scope: 'automation',
+        event: 'inject.consumed',
+        correlationId,
+        conversationId,
+        ruleId: rule.id,
+        parentMessageId: userTurnHeadId,
+        fields: { injectIds: entries.map((entry) => entry.id), count: entries.length },
+      });
+      if (contentParts.length > 0) {
+        const partial = appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
+          { parentId: userTurnHeadId, runStatus: 'running' },
+        );
+        if (partial?.headId) userTurnHeadId = partial.headId;
+      }
+      for (const entry of entries) {
+        const injected = appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [
+            {
+              id: entry.id,
+              role: 'user',
+              content: [{ type: 'text', text: entry.text }],
+              createdAt: new Date(entry.at).toISOString(),
+            },
+          ],
+          { parentId: userTurnHeadId, runStatus: 'running' },
+        );
+        if (injected?.headId) userTurnHeadId = injected.headId;
+      }
+      text = '';
+      contentParts.length = 0;
+      toolPartById.clear();
+      // Keep the cumulative toolCalls result for automation run records even
+      // though persistence starts a fresh assistant segment after the inject.
+      pendingToolCalls.clear();
+      lastEventWasToolResult = false;
+      error = null;
+    };
+
     // The stream (and its setup, e.g. resolving a model) can throw. If it does
     // AFTER we've written the prompt turn, we must still finalize: write an
     // assistant (error) turn, flip runStatus back to idle, and broadcast a
@@ -535,6 +662,7 @@ async function runAgentAction(
         fallbackEnabled: Boolean(action.profileKey),
         tools,
         abortSignal: abortController.signal,
+        onInjected: persistInjectedBoundary,
       })) {
         // Don't forward the inner stream's `done` — the renderer treats an
         // automation `done` as terminal (clears + reloads). We broadcast exactly
@@ -683,6 +811,19 @@ async function runAgentAction(
         }
       }
     }
+
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.finalized',
+      correlationId,
+      conversationId,
+      ruleId: rule.id,
+      messageId: appended?.headId ?? undefined,
+      parentMessageId: userTurnHeadId,
+      headId: appended?.headId ?? null,
+      level: finalizeError ? 'error' : 'info',
+      fields: { aborted, caughtStreamError, persistDropped: appended === null && !finalizeError },
+    });
 
     // Tell the renderer the automation stream is finished so it clears the
     // running indicator and reloads the authoritative tree from disk. Emitted

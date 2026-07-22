@@ -104,6 +104,9 @@ type AgentConfig = ConstructorParameters<typeof Agent>[0];
 
 export type ToolLifecycleHooks = {
   emitEvent?: (event: StreamEvent) => void;
+  /** Called when cooperative mid-turn injects are actually consumed at a
+   * prepareStep boundary (after the prior step's tool results). */
+  onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
   /** Return `{ skip, result }` to short-circuit execution (e.g. PreToolUse deny). */
   onToolExecutionStart?: (state: {
     toolCallId: string;
@@ -1331,6 +1334,7 @@ async function* generateWithSyntheticEvents(
   options?: {
     abortSignal?: AbortSignal;
     emitEvent?: (event: StreamEvent) => void;
+    onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
   },
 ): AsyncGenerator<StreamEvent> {
   let terminalFinishReason: string | undefined;
@@ -1361,7 +1365,7 @@ async function* generateWithSyntheticEvents(
         abortSignal: options?.abortSignal,
         // Cooperative mid-turn injection (see streamOptions): splice queued
         // follow-ups at each step boundary. No-op when the queue is empty.
-        prepareStep: buildMastraPrepareStep(conversationId),
+        prepareStep: buildMastraPrepareStep(conversationId, undefined, options?.onInjected),
         experimental_generateMessageId: () => responseMessageId,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),
@@ -1559,6 +1563,7 @@ async function* streamWithRealEvents(
   responseMessageId: string,
   options?: {
     abortSignal?: AbortSignal;
+    onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
   },
 ): AsyncGenerator<StreamEvent> {
   const toolStartByCallId = new Map<string, { startedAt: string; toolName: string }>();
@@ -1602,7 +1607,7 @@ async function* streamWithRealEvents(
           // Cooperative mid-turn injection: drain the conversation's inject queue
           // at each step boundary and splice queued follow-ups into this turn's
           // context (no abort). No-op when the queue is empty.
-          prepareStep: buildMastraPrepareStep(conversationId),
+          prepareStep: buildMastraPrepareStep(conversationId, undefined, options?.onInjected),
           experimental_generateMessageId: () => responseMessageId,
           ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
           ...(providerOptions ? { providerOptions } : {}),

@@ -53,6 +53,7 @@ export function setInjectConsumedHandler(handler: InjectConsumedHandler | null):
 export function buildMastraPrepareStep(
   conversationId: string,
   onInjected?: (texts: string[]) => void,
+  onInjectedEntries?: (entries: QueuedInject[]) => void,
 ): (args: PrepareStepArgs) => PrepareStepResult {
   return ({ messages }: PrepareStepArgs): PrepareStepResult => {
     const queued = drainInjects(conversationId);
@@ -70,6 +71,13 @@ export function buildMastraPrepareStep(
         onInjected(queued.map((q) => q.text));
       } catch {
         // bookkeeping only — never break the step
+      }
+    }
+    if (onInjectedEntries) {
+      try {
+        onInjectedEntries(queued);
+      } catch {
+        // persistence bookkeeping only — never break the step
       }
     }
     return { messages: appended };

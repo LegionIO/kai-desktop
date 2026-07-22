@@ -21,6 +21,8 @@ export type PluginGenerateOptions = {
   systemPrompt?: string;
   tools?: ToolDefinition[];
   abortSignal?: AbortSignal;
+  /** Cooperative injects consumed at a prepareStep boundary. */
+  onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
 };
 
 export type PluginGenerateToolCall = {
@@ -116,6 +118,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
         abortSignal: options.abortSignal,
         reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
         isHeadless: true,
+        onInjected: options.onInjected,
       },
     );
     return { stream, modelKey: fallbackEntry.key };
@@ -143,6 +146,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       isHeadless: true,
       parentProfileKey,
       parentModelKey,
+      onInjected: options.onInjected,
     });
   } else {
     stream = streamAgentResponse(conversationId, sanitized, modelConfig, configForStream, pluginTools ?? [], dbPath, {
@@ -151,6 +155,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       isHeadless: true,
       parentProfileKey,
       parentModelKey,
+      onInjected: options.onInjected,
     });
   }
 
