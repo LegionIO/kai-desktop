@@ -85,6 +85,7 @@ export async function runPluginRuntime(options: PluginRuntimeOptions): Promise<v
   const fetchImpl = options.fetchImpl ?? options.createFetchImpl?.(transport) ?? globalThis.fetch;
   const configMirror = createUtilityConfigMirror(init.initialConfig, init.initialPluginData);
   let pluginModule: PluginModule | null = null;
+  let zodWireCodecLoading: Promise<void> | null = null;
 
   const reportResourceUsage = (): void => {
     try {
@@ -99,13 +100,16 @@ export async function runPluginRuntime(options: PluginRuntimeOptions): Promise<v
   };
 
   transport.setSyncWorkerStateChangeHandler(reportResourceUsage);
+  transport.setZodWireCodecLoader(() => {
+    zodWireCodecLoading ??= import('./zod-wire-codec.js').then(({ zodWireCodec }) => {
+      installZodWireCodec(zodWireCodec);
+      reportResourceUsage();
+    });
+    return zodWireCodecLoading;
+  });
 
   try {
     await verifyBackend(init);
-    if (init.manifest.permissions.includes('tools:register')) {
-      const { zodWireCodec } = await import('./zod-wire-codec.js');
-      installZodWireCodec(zodWireCodec);
-    }
     const api = createUtilityPluginAPI({
       manifest: init.manifest,
       pluginDir: init.pluginDir,

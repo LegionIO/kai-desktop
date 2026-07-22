@@ -77,15 +77,19 @@ executable. Optional compatibility machinery is demand-driven in both hosts:
   value-returning synchronous host call;
 - app/plugin config reads and read-after-write behavior use local mirrors;
 - void calls are sent over ordered IPC without changing the public API shape;
-- the Zod transport bundle is loaded only for plugins with `tools:register`.
+- JSON-Schema tools require no Zod transport bundle; Zod 4 tool schemas use
+  their own converter, and the optional decoder loads only when an encoded
+  schema actually travels from the host toward a plugin.
 
 This keeps lightweight config/UI plugins isolated without charging them for
 Electron, tool-schema code, or a second V8 isolate. Plugins declaring APIs that
 load enough compatibility machinery to make Electron cheaper are routed to the
 utility host based on measured private footprint. The routing set currently
-includes tools, safe storage, conversations, system environment, and inference
-providers. Diagnostics continues to attribute the selected runtime's full
-baseline to each plugin rather than hiding it in the main process.
+includes safe storage, conversations, system environment, inference providers,
+and tool plugins whose source/root dependency declares Zod. Workerless
+JSON-Schema tool plugins use SEA. Diagnostics continues to attribute the
+selected runtime's full baseline to each plugin rather than hiding it in the
+main process.
 
 `network:fetch` remains available in SEA. Upload and response bodies are
 streamed through the bounded broker to main's existing Electron fetch

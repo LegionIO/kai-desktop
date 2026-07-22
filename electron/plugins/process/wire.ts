@@ -24,10 +24,14 @@ export function isZodWireCodecLoaded(): boolean {
 }
 
 export function zodSchemaToJsonSchema(schema: unknown): unknown {
-  if (!zodWireCodec) {
-    throw new Error('Zod schema transport is unavailable because the optional codec was not loaded');
+  const selfDescribing = schema as {
+    toJSONSchema?: (options?: { io?: 'input' | 'output'; unrepresentable?: 'throw' | 'any' }) => unknown;
+  };
+  if (typeof selfDescribing?.toJSONSchema === 'function') {
+    return selfDescribing.toJSONSchema({ io: 'input', unrepresentable: 'any' });
   }
-  return zodWireCodec.toJSONSchema(schema);
+  if (zodWireCodec) return zodWireCodec.toJSONSchema(schema);
+  throw new Error('Zod schema transport is unavailable because the schema has no JSON Schema converter');
 }
 
 function jsonSchemaToZod(schema: unknown): unknown {
@@ -62,6 +66,36 @@ function marker(kind: string, values: Record<string, unknown> = {}): Marker {
   const result = { [MARKER]: kind, ...values } as Marker;
   Object.defineProperty(result, INTERNAL_MARKER, { value: true });
   return result;
+}
+
+/** Detect whether an already-encoded payload needs the optional JSON-Schema →
+ * Zod decoder. Plugin hosts use this before decoding inbound values so the
+ * relatively heavy codec is loaded only when a schema actually crosses toward
+ * the plugin, rather than for every plugin allowed to register tools. */
+export function wireValueContainsZodSchema(value: unknown): boolean {
+  const seen = new WeakSet<object>();
+
+  const visit = (current: unknown, depth: number): boolean => {
+    if (depth > 100 || current === null || typeof current !== 'object') return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    if (Array.isArray(current)) return current.some((entry) => visit(entry, depth + 1));
+    const candidate = current as Marker;
+    const kind = candidate[MARKER];
+    if (kind === 'zod-schema') return true;
+    if (kind === 'escaped-object') {
+      const escaped = candidate.value;
+      return (
+        !!escaped &&
+        typeof escaped === 'object' &&
+        !Array.isArray(escaped) &&
+        Object.values(escaped).some((entry) => visit(entry, depth + 1))
+      );
+    }
+    return Object.entries(current).some(([key, entry]) => key !== MARKER && visit(entry, depth + 1));
+  };
+
+  return visit(value, 0);
 }
 
 function assignOwn(target: Record<string, unknown>, key: string, value: unknown): void {

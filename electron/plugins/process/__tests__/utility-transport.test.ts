@@ -115,6 +115,46 @@ describe('UtilityTransport callback release', () => {
     await flushing;
   });
 
+  it('loads the optional Zod decoder only when an inbound schema actually crosses the wire', async () => {
+    const { port, posted, emit } = makePort();
+    const transport = new UtilityTransport(port as never);
+    const loadCodec = vi.fn(async () => {
+      const [{ installZodWireCodec }, { zodWireCodec }] = await Promise.all([
+        import('../wire.js'),
+        import('../zod-wire-codec.js'),
+      ]);
+      installZodWireCodec(zodWireCodec);
+    });
+    transport.setZodWireCodecLoader(loadCodec);
+
+    const plainResult = transport.asyncCall('plain', []);
+    const plainRequest = posted.find((message) => message.method === 'plain');
+    emit({ type: 'invoke-result', id: plainRequest?.id, ok: true, value: { ready: true } });
+    await expect(plainResult).resolves.toEqual({ ready: true });
+    expect(loadCodec).not.toHaveBeenCalled();
+
+    const schemaResult = transport.asyncCall('schema', []);
+    const schemaRequest = posted.find((message) => message.method === 'schema');
+    emit({
+      type: 'invoke-result',
+      id: schemaRequest?.id,
+      ok: true,
+      value: {
+        __kaiPluginWire: 'zod-schema',
+        schema: {
+          type: 'object',
+          properties: { value: { type: 'string' } },
+          required: ['value'],
+        },
+      },
+    });
+    const schema = (await schemaResult) as { safeParse: (value: unknown) => { success: boolean } };
+    expect(schema.safeParse({ value: 'ok' }).success).toBe(true);
+    expect(schema.safeParse({ value: 1 }).success).toBe(false);
+    expect(loadCodec).toHaveBeenCalledTimes(1);
+    await transport.close();
+  });
+
   it('drops a released callback so it can no longer be invoked', async () => {
     const { port, posted, emit } = makePort();
     const transport = new UtilityTransport(port as never);

@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { decodeWire, deserializeWireError, encodeWire, installZodWireCodec, serializeWireError } from '../wire.js';
+import {
+  decodeWire,
+  deserializeWireError,
+  encodeWire,
+  installZodWireCodec,
+  serializeWireError,
+  wireValueContainsZodSchema,
+} from '../wire.js';
 import { zodWireCodec } from '../zod-wire-codec.js';
 
 installZodWireCodec(zodWireCodec);
@@ -104,6 +111,18 @@ describe('plugin process wire encoding', () => {
     expect(decoded.safeParse({ value: 1 }).success).toBe(false);
   });
 
+  it('uses a Zod 4 schema own converter without consulting the optional transport codec', () => {
+    const toJSONSchema = vi.fn(() => ({ type: 'string', minLength: 1 }));
+    const encoded = encodeWire({ safeParse: () => ({ success: true }), toJSONSchema });
+
+    expect(toJSONSchema).toHaveBeenCalledWith({ io: 'input', unrepresentable: 'any' });
+    expect(encoded).toMatchObject({
+      __kaiPluginWire: 'zod-schema',
+      schema: { type: 'string', minLength: 1 },
+    });
+    expect(wireValueContainsZodSchema(encoded)).toBe(true);
+  });
+
   it('preserves error name, message, stack, and cause', () => {
     const source = new TypeError('bad plugin value', { cause: new Error('root cause') });
     const result = deserializeWireError(serializeWireError(source));
@@ -123,5 +142,12 @@ describe('plugin process wire encoding', () => {
   it('round-trips plugin data that happens to use the wire marker key', () => {
     const input = { __kaiPluginWire: 'function', id: 'ordinary-plugin-data', nested: { ok: true } };
     expect(decodeWire(encodeWire(input))).toEqual(input);
+  });
+
+  it('does not treat escaped plugin data as a schema transport marker', () => {
+    const input = { __kaiPluginWire: 'zod-schema', schema: { type: 'string' } };
+    const encoded = encodeWire(input);
+    expect(wireValueContainsZodSchema(encoded)).toBe(false);
+    expect(decodeWire(encoded)).toEqual(input);
   });
 });

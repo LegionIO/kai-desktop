@@ -1,6 +1,6 @@
 import { accessSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { constants } from 'node:fs';
-import { extname, join, resolve } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import type { PluginHostRuntime } from './plugin-process-host.js';
 import type { PluginManifest } from '../types.js';
 
@@ -9,8 +9,8 @@ const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const SOURCE_EXTENSIONS = new Set(['.js', '.cjs', '.mjs', '.jsx', '.ts', '.tsx']);
 const ELECTRON_DEPENDENCY =
   /(?:from\s*|import\s*\(|require\s*\()\s*['"](?:node:)?electron(?:\/[^'"]*)?['"]|process\.(?:versions\.electron|type)\b/;
+const ZOD_DEPENDENCY = /(?:from\s*|import\s*\(|require\s*\()\s*['"]zod(?:\/[^'"]*)?['"]/;
 const UTILITY_MEMORY_PERMISSIONS = new Set<PluginManifest['permissions'][number]>([
-  'tools:register',
   'safe-storage',
   'conversations:read',
   'conversations:write',
@@ -51,7 +51,14 @@ export function resolveSeaHostExecutable(): string | null {
   return candidates.find(isExecutable) ?? null;
 }
 
-type Compatibility = { compatible: true } | { compatible: false; reason: string };
+type Compatibility = { compatible: true; usesZod: boolean } | { compatible: false; reason: string };
+
+function packageUsesZod(manifest: Record<string, unknown>): boolean {
+  return ['dependencies', 'optionalDependencies', 'peerDependencies'].some((field) => {
+    const dependencies = manifest[field];
+    return !!dependencies && typeof dependencies === 'object' && 'zod' in dependencies;
+  });
+}
 
 /**
  * Conservatively classify a plugin before activation. A false negative only
@@ -65,6 +72,9 @@ export function inspectSeaCompatibility(pluginDir: string, backendPath: string):
   const visitedDirectories = new Set<string>();
   const stack = [pluginDir];
   let backendInspected = false;
+  let usesZod = false;
+  const rootPackagePath = resolve(pluginDir, 'package.json');
+  const dependencySegment = `${sep}node_modules${sep}`;
 
   try {
     while (stack.length > 0) {
@@ -99,6 +109,7 @@ export function inspectSeaCompatibility(pluginDir: string, backendPath: string):
           if (manifest.gypfile === true || (manifest.binary && typeof manifest.binary === 'object')) {
             return { compatible: false, reason: `native package metadata detected (${path})` };
           }
+          if (resolve(path) === rootPackagePath && packageUsesZod(manifest)) usesZod = true;
         }
         if (!SOURCE_EXTENSIONS.has(extension)) continue;
         const size = statSync(path).size;
@@ -111,6 +122,7 @@ export function inspectSeaCompatibility(pluginDir: string, backendPath: string):
         if (ELECTRON_DEPENDENCY.test(source)) {
           return { compatible: false, reason: `direct Electron dependency detected (${entry.name})` };
         }
+        if (!resolve(path).includes(dependencySegment) && ZOD_DEPENDENCY.test(source)) usesZod = true;
       }
     }
   } catch (error) {
@@ -121,7 +133,7 @@ export function inspectSeaCompatibility(pluginDir: string, backendPath: string):
   }
 
   if (!backendInspected) return { compatible: false, reason: 'plugin backend was outside the scanned plugin tree' };
-  return { compatible: true };
+  return { compatible: true, usesZod };
 }
 
 export function selectPluginHostRuntime(
@@ -153,6 +165,12 @@ export function selectPluginHostRuntime(
   const compatibility = inspectSeaCompatibility(pluginDir, backendPath);
   if (!compatibility.compatible) {
     return { runtime: 'electron-utility', reason: compatibility.reason };
+  }
+  if (manifest.permissions.includes('tools:register') && compatibility.usesZod) {
+    return {
+      runtime: 'electron-utility',
+      reason: 'Electron host has the lower measured footprint for Zod-backed tool compatibility',
+    };
   }
   return { runtime: 'node-sea', seaHostPath, reason: 'pure JavaScript plugin passed SEA compatibility preflight' };
 }

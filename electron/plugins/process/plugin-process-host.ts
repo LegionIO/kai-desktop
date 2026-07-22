@@ -14,8 +14,8 @@ import { PLUGIN_PROCESS_PROTOCOL_VERSION, type PluginRuntimeInit } from './plugi
 import { sampleProcessResources, type ProcessResourceSample } from './process-resource-sampler.js';
 
 // The main process already uses Zod for config/tool validation. Install its
-// codec eagerly here; utility processes load the same code only for plugins
-// that can actually register schema-bearing tools.
+// codec eagerly here; plugin processes use schema-owned outbound conversion
+// and load this decoder only if an encoded schema actually travels inbound.
 installZodWireCodec(zodWireCodec);
 
 const BROKER_MAX_BUFFER_BYTES = 32 * 1024 * 1024;

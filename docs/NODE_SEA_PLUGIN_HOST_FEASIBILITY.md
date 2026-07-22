@@ -37,13 +37,15 @@ when all of the following are true:
 - the plugin does not request a permission class measured locally as cheaper in
   the Electron host.
 
-The currently measured Electron-favored permission classes are
-`tools:register`, `safe-storage`, conversation reads/writes, `system:env`, and
-`agent:inference-provider`. These APIs often load the Zod codec or synchronous
-compatibility worker, at which point Electron's shared framework pages make its
-private footprint competitive or lower. This is a routing optimization, not a
-capability restriction: those plugins remain isolated in their own Electron
-utility process.
+The currently measured Electron-favored permission classes are `safe-storage`,
+conversation reads/writes, `system:env`, and `agent:inference-provider`. These
+APIs can start the synchronous compatibility worker, at which point Electron's
+shared framework pages make its private footprint lower. `tools:register` by
+itself stays workerless: JSON-Schema tool plugins use SEA, while a root Zod
+dependency or direct Zod import routes the plugin to Electron because the
+repeated Zod-only measurement remains slightly lower there. This is a routing
+optimization, not a capability restriction: those plugins remain isolated in
+their own Electron utility process.
 
 Native addons and direct Electron consumers also use the utility host. A scan
 error or configured size/file limit is treated the same way. Kai never retries
@@ -63,7 +65,9 @@ hosts. It preserves:
 - true synchronous calls through the demand-started worker bridge;
 - callbacks, hooks, actions, tools, progress events, and inference providers;
 - async generators and bidirectional `AbortSignal` propagation;
-- Zod schemas through the lazy external codec; and
+- outbound Zod 4 tool schemas through their own JSON-Schema converter, with the
+  external decoder loaded only if a schema actually crosses toward the plugin;
+  and
 - activation, config change, graceful deactivation, crash, and kill behavior.
 
 The SEA runtime cannot import Electron's `net` module. Its `fetch` adapter
@@ -98,15 +102,20 @@ its permissions.
 Local macOS arm64 measurements using the production protocol and OS physical
 footprint sampler were:
 
-| Fixture                               |           Node SEA | Electron utility |
-| ------------------------------------- | -----------------: | ---------------: |
-| Lightweight mirrored-config plugin    |      about 16.1 MB |    about 18.0 MB |
-| Unchanged LLM Gateway backend         | about 17.2-17.5 MB |    about 18.3 MB |
-| Full tools/sync compatibility fixture |     about 32-37 MB |      about 27 MB |
+| Fixture                                        |           Node SEA |   Electron utility |
+| ---------------------------------------------- | -----------------: | -----------------: |
+| Lightweight mirrored-config plugin             | about 16.2-16.5 MB | about 17.9-18.2 MB |
+| JSON-Schema tool plugin                        | about 16.3-16.5 MB | about 17.9-18.1 MB |
+| Zod-backed tool plugin                         | about 23.0-23.5 MB | about 22.5-22.8 MB |
+| Unchanged LLM Gateway backend                  | about 17.2-17.5 MB |      about 18.3 MB |
+| Full sync/inbound-schema compatibility fixture |     about 36-37 MB |        about 27 MB |
 
-The last row is why selection includes permission-based cost routing rather
-than assuming SEA is always smaller. Values vary with OS/runtime versions and
-plugin behavior; the Diagnostics GUI is the source of truth for a running app.
+The isolated tool rows are five-run ranges. They replace the earlier inference
+from the mixed tools/sync fixture: tool registration itself does not justify an
+Electron host. The Zod row supports the narrow source/dependency preflight,
+while the last row supports permission-based routing for true synchronous APIs.
+Values vary with OS/runtime versions and plugin behavior; the Diagnostics GUI
+is the source of truth for a running app.
 The stripped arm64 host is roughly 110 MB on disk, paid once per architecture
 in the application rather than once per plugin.
 

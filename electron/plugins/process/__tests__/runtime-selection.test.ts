@@ -42,7 +42,7 @@ afterEach(() => {
 describe('SEA plugin compatibility preflight', () => {
   it('allows a pure JavaScript plugin without requiring a manifest rewrite', () => {
     const { root, backend } = fixture();
-    expect(inspectSeaCompatibility(root, backend)).toEqual({ compatible: true });
+    expect(inspectSeaCompatibility(root, backend)).toEqual({ compatible: true, usesZod: false });
   });
 
   it('routes native addons to the Electron compatibility host before activation', () => {
@@ -77,6 +77,46 @@ describe('SEA plugin compatibility preflight', () => {
     });
   });
 
+  it('keeps workerless tool registration on SEA when no synchronous compatibility permission is requested', () => {
+    const { root, backend } = fixture();
+    const seaHost = join(root, 'kai-plugin-host');
+    writeFileSync(seaHost, '#!/bin/sh\n');
+    chmodSync(seaHost, 0o755);
+    process.env.KAI_PLUGIN_SEA_HOST = seaHost;
+    delete process.env.KAI_PLUGIN_HOST_RUNTIME;
+
+    expect(selectPluginHostRuntime(manifest(['tools:register']), root, backend)).toMatchObject({
+      runtime: 'node-sea',
+      seaHostPath: seaHost,
+      reason: expect.stringContaining('pure JavaScript'),
+    });
+  });
+
+  it('keeps Zod-backed tools on the slightly lower-footprint Electron host', () => {
+    const { root, backend } = fixture(
+      "import { z } from 'zod'; export function activate(api) { api.tools.register([{ inputSchema: z.string() }]); }",
+    );
+    const seaHost = join(root, 'kai-plugin-host');
+    writeFileSync(seaHost, '#!/bin/sh\n');
+    chmodSync(seaHost, 0o755);
+    process.env.KAI_PLUGIN_SEA_HOST = seaHost;
+    delete process.env.KAI_PLUGIN_HOST_RUNTIME;
+
+    expect(selectPluginHostRuntime(manifest(['tools:register']), root, backend)).toMatchObject({
+      runtime: 'electron-utility',
+      reason: expect.stringContaining('Zod-backed'),
+    });
+  });
+
+  it('recognizes a root Zod dependency even when tool schemas live in another module', () => {
+    const { root, backend } = fixture();
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'fixture', type: 'module', dependencies: { zod: '^4.0.0' } }),
+    );
+    expect(inspectSeaCompatibility(root, backend)).toEqual({ compatible: true, usesZod: true });
+  });
+
   it('resolves the architecture-specific host from a packaged resources directory', () => {
     const { root } = fixture();
     const name = process.platform === 'win32' ? 'kai-plugin-host.exe' : 'kai-plugin-host';
@@ -91,7 +131,6 @@ describe('SEA plugin compatibility preflight', () => {
   });
 
   it.each([
-    'tools:register',
     'safe-storage',
     'conversations:read',
     'conversations:write',

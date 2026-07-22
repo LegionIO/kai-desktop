@@ -9,6 +9,7 @@ import { createServer } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { z } from 'zod';
 import {
   PluginProcessHost,
   getPluginProcessMetrics,
@@ -347,7 +348,7 @@ async function run() {
     manifest,
     pluginDir: resolve('electron/plugins/process/__fixtures__'),
     backendPath: resolve('electron/plugins/process/__fixtures__/compat-plugin.js'),
-    fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/compat-plugin.js')),
+    backendHash: hashFile(resolve('electron/plugins/process/__fixtures__/compat-plugin.js')),
     api,
     utilityEntryPath: resolve('out/main/plugin-host.js'),
     syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -445,7 +446,7 @@ async function run() {
         {
           name: 'provider_tool',
           description: 'Verify an async main callback retains Promise semantics.',
-          inputSchema: { type: 'object' },
+          inputSchema: z.object({ value: z.number() }),
           execute: async ({ value }) => value + 1,
         },
       ],
@@ -463,7 +464,7 @@ async function run() {
     assert(metric.privateMemoryBytes > 0, 'plugin private/physical footprint was not reported by the utility');
     assert(metric.memorySource === 'private', 'plugin footprint did not take priority over RSS');
     assert(metric.syncWorkerRunning === true, 'a true synchronous API did not start the bridge worker');
-    assert(metric.zodCodecLoaded === true, 'schema-capable plugin did not load the Zod transport chunk');
+    assert(metric.zodCodecLoaded === true, 'an inbound Zod schema did not load the optional decoder on demand');
 
     const workerlessManifest = {
       name: 'process-workerless-smoke',
@@ -477,7 +478,7 @@ async function run() {
       manifest: workerlessManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/workerless-plugin.js'),
-      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/workerless-plugin.js')),
+      backendHash: hashFile(resolve('electron/plugins/process/__fixtures__/workerless-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -502,6 +503,65 @@ async function run() {
     );
     await workerlessHost.deactivate();
 
+    console.info('Verifying workerless JSON Schema and Zod tool registration…');
+    const toolFixtures = [
+      { name: 'idle-tools-smoke', backend: 'idle-plugin.js', expectedTools: 0 },
+      { name: 'json-schema-tool-smoke', backend: 'json-schema-tool-plugin.js', expectedTools: 1 },
+      { name: 'zod-tool-smoke', backend: 'zod-tool-plugin.js', expectedTools: 1 },
+    ];
+    const toolFootprints = [];
+    for (const fixture of toolFixtures) {
+      const toolManifest = {
+        name: fixture.name,
+        displayName: fixture.name,
+        version: '1.0.0',
+        description: 'Workerless tool registration fixture',
+        permissions: ['tools:register'],
+      };
+      const backendPath = resolve('electron/plugins/process/__fixtures__', fixture.backend);
+      const toolsBefore = captured.tools.length;
+      const toolHost = new PluginProcessHost({
+        ...runtimeOptions,
+        manifest: toolManifest,
+        pluginDir: resolve('electron/plugins/process/__fixtures__'),
+        backendPath,
+        backendHash: hashFile(backendPath),
+        api,
+        utilityEntryPath: resolve('out/main/plugin-host.js'),
+        syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
+        onUnexpectedExit: ({ code, error }) => {
+          throw new Error(`Tool plugin ${fixture.name} exited unexpectedly (${code}): ${error ?? ''}`);
+        },
+      });
+      await toolHost.activate();
+      assert(
+        captured.tools.length === toolsBefore + fixture.expectedTools,
+        `${fixture.name} registered an unexpected number of tools`,
+      );
+      if (fixture.expectedTools > 0) {
+        const registered = captured.tools.at(-1);
+        const result = await registered.execute({ value: 'tool-ok' }, { toolCallId: `${fixture.name}-call` });
+        assert(result.value === 'tool-ok', `${fixture.name} tool callback failed`);
+        if (fixture.name === 'zod-tool-smoke') {
+          let invalidRejected = false;
+          try {
+            await registered.execute({ value: 42 }, { toolCallId: `${fixture.name}-invalid` });
+          } catch {
+            invalidRejected = true;
+          }
+          assert(invalidRejected, 'Zod tool validation was not preserved across the process boundary');
+        }
+      }
+      await refreshPluginProcessPrivateMemory(true);
+      const toolMetric = getPluginProcessMetrics().find((entry) => entry.pluginName === fixture.name);
+      assert(toolMetric?.privateMemoryBytes > 0, `${fixture.name} did not report its footprint`);
+      assert(toolMetric.syncWorkerRunning === false, `${fixture.name} eagerly started the synchronous worker`);
+      assert(toolMetric.zodCodecLoaded === false, `${fixture.name} loaded the optional inbound Zod decoder`);
+      toolFootprints.push(`${fixture.name} ${(toolMetric.privateMemoryBytes / 1024 / 1024).toFixed(1)} MB`);
+      await toolHost.deactivate();
+    }
+    console.info(`Tool-only footprints: ${toolFootprints.join('; ')}`);
+
     if (process.env.KAI_PLUGIN_SMOKE_BACKEND && process.env.KAI_PLUGIN_SMOKE_MANIFEST) {
       console.info('Verifying an unchanged external plugin backend…');
       const externalBackend = resolve(process.env.KAI_PLUGIN_SMOKE_BACKEND);
@@ -511,7 +571,7 @@ async function run() {
         manifest: externalManifest,
         pluginDir: dirname(externalBackend),
         backendPath: externalBackend,
-        fileHash: hashFile(externalBackend),
+        backendHash: hashFile(externalBackend),
         api,
         utilityEntryPath: resolve('out/main/plugin-host.js'),
         syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -564,7 +624,7 @@ async function run() {
       manifest: crashManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/crash-plugin.js'),
-      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
+      backendHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -590,7 +650,7 @@ async function run() {
       manifest: floodManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/flood-plugin.js'),
-      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/flood-plugin.js')),
+      backendHash: hashFile(resolve('electron/plugins/process/__fixtures__/flood-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),
@@ -616,7 +676,7 @@ async function run() {
       manifest: killManifest,
       pluginDir: resolve('electron/plugins/process/__fixtures__'),
       backendPath: resolve('electron/plugins/process/__fixtures__/crash-plugin.js'),
-      fileHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
+      backendHash: hashFile(resolve('electron/plugins/process/__fixtures__/crash-plugin.js')),
       api,
       utilityEntryPath: resolve('out/main/plugin-host.js'),
       syncWorkerPath: resolve('out/main/plugin-sync-worker.js'),

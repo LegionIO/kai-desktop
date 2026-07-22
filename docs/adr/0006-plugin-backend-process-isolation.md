@@ -2,7 +2,7 @@
 
 - **Status**: Accepted and implemented
 - **Date**: 2026-07-20
-- **Amended**: 2026-07-21 — hybrid Node SEA/Electron host selection
+- **Amended**: 2026-07-22 — schema-aware Node SEA/Electron host selection
 - **Deciders**: maintainers
 
 ## Context
@@ -53,10 +53,12 @@ only on first use; Electron uses the packaged worker entry point.
 Runtime selection completes before activation. A bounded plugin-tree scan
 routes `.node` addons, native package metadata, direct Electron dependencies,
 scan failures, and oversized trees to Electron. Permissions whose measured
-compatibility cost makes Electron smaller (`tools:register`, safe storage,
-conversation access, system environment, and inference providers) also use the
-utility host. There is no post-activation fallback because retrying could
-duplicate plugin side effects.
+compatibility cost starts the synchronous bridge (safe storage, conversation
+access, system environment, and inference providers) also use the utility host.
+Workerless JSON-Schema tool plugins use SEA. Tool plugins with a root Zod
+dependency or direct Zod import use Electron because repeated isolated
+measurements remain slightly lower there. There is no post-activation fallback
+because retrying could duplicate plugin side effects.
 
 ### Synchronous compatibility channel
 
@@ -93,9 +95,11 @@ The Electron message port or SEA authenticated control socket carries:
 
 Functions are represented by opaque callback IDs, never source serialization.
 Zod tool schemas cross as JSON Schema and are reconstructed on the receiving
-side. The bundled Zod codec is loaded as a separate dynamic chunk only for
-plugins declaring `tools:register`; plugins without schemas do not load it.
-Other supported non-JSON values use explicit tagged wire forms.
+side. Zod 4 schemas use their own synchronous JSON-Schema converter, so merely
+declaring or calling `tools.register` does not load Kai's duplicate codec. The
+bundled decoder is loaded as a separate dynamic chunk only when an encoded
+schema actually crosses toward the plugin. Other supported non-JSON values use
+explicit tagged wire forms.
 
 ### Main-side broker responsibilities
 
@@ -180,10 +184,11 @@ the OS could not provide per-plugin accounting.
 ### Node SEA for every plugin
 
 Rejected because native addons and direct Electron dependencies require the
-compatibility host, and measured tools/synchronous fixtures used less private
-memory in Electron than in SEA. Conservative pre-activation routing preserves
-functionality while still reducing the baseline for light plugins such as LLM
-Gateway.
+compatibility host, and measured synchronous fixtures use less private memory
+in Electron than in SEA. Isolated measurements also leave Zod-backed tools
+slightly lower in Electron, while JSON-Schema tools are lower in SEA.
+Conservative pre-activation routing preserves functionality while reducing the
+baseline for light plugins such as LLM Gateway.
 
 ## Consequences
 
@@ -239,13 +244,15 @@ the release classifier rejects OTA eligibility when it changes.
 
 ## Verification
 
-- Unit tests cover wire encoding, callback references, Zod schemas, synchronous
-  compatibility, state mirroring, tools, generators, and inference providers.
+- Unit tests cover wire encoding, callback references, self-converting and
+  on-demand-decoded Zod schemas, synchronous compatibility, state mirroring,
+  tools, generators, runtime selection, and inference providers.
 - `pnpm verify:plugin-process` launches real Electron utility processes and
   verifies activation, config/event callbacks, tools and progress, hooks,
   actions, safe storage, agent streams, inference-provider streams, metrics,
-  pause/resume, forced termination, graceful teardown, crash containment, and a
-  workerless LLM-Gateway-shaped activation path.
+  JSON-Schema/Zod tool-only footprints, pause/resume, forced termination,
+  graceful teardown, crash containment, and a workerless LLM-Gateway-shaped
+  activation path.
 - The same real-process smoke against the production SEA executable additionally
   verifies mutual authentication and invalid-proof rejection, streamed fetch
   upload/download and abort, unchanged LLM Gateway activation, lazy worker/Zod

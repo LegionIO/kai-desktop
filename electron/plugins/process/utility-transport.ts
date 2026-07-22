@@ -1,6 +1,13 @@
 import { Worker } from 'node:worker_threads';
 import type { PluginMessagePort } from './message-port.js';
-import { decodeWire, deserializeWireError, encodeWire, serializeWireError } from './wire.js';
+import {
+  decodeWire,
+  deserializeWireError,
+  encodeWire,
+  isZodWireCodecLoaded,
+  serializeWireError,
+  wireValueContainsZodSchema,
+} from './wire.js';
 
 const SYNC_BUFFER_BYTES = 16 * 1024 * 1024;
 const SYNC_CALL_TIMEOUT_MS = 120_000;
@@ -179,6 +186,7 @@ export class UtilityTransport {
   private activeCallbackStreams = new Map<number, AsyncIterator<unknown>>();
   private controlHandler: ControlHandler | null = null;
   private syncWorkerStateChangeHandler: (() => void) | null = null;
+  private zodWireCodecLoader: (() => Promise<void>) | null = null;
   private closed = false;
 
   constructor(private parentPort: PluginMessagePort) {
@@ -198,6 +206,10 @@ export class UtilityTransport {
 
   setSyncWorkerStateChangeHandler(handler: () => void): void {
     this.syncWorkerStateChangeHandler = handler;
+  }
+
+  setZodWireCodecLoader(loader: () => Promise<void>): void {
+    this.zodWireCodecLoader = loader;
   }
 
   private ensureSyncWorker(): Worker {
@@ -393,6 +405,14 @@ export class UtilityTransport {
     });
   }
 
+  private prepareDecode(value: unknown): Promise<void> | null {
+    if (!wireValueContainsZodSchema(value) || isZodWireCodecLoaded()) return null;
+    if (!this.zodWireCodecLoader) {
+      return Promise.reject(new Error('Plugin IPC received a Zod schema without an available decoder'));
+    }
+    return this.zodWireCodecLoader();
+  }
+
   private releaseRemoteAbortControllers(abortIds: string[]): void {
     for (const id of abortIds) this.remoteAbortControllers.delete(id);
   }
@@ -554,6 +574,8 @@ export class UtilityTransport {
     }
     const abortIds: string[] = [];
     try {
+      const preparing = this.prepareDecode(message.args);
+      if (preparing) await preparing;
       const args = this.decode(message.args, abortIds) as unknown[];
       const value = await fn(...args);
       await this.flushOrderedCalls();
@@ -579,6 +601,8 @@ export class UtilityTransport {
     }
     const abortIds: string[] = [];
     try {
+      const preparing = this.prepareDecode(message.args);
+      if (preparing) await preparing;
       const args = this.decode(message.args, abortIds) as unknown[];
       const iterable = (await fn(...args)) as AsyncIterable<unknown>;
       if (!iterable || typeof iterable[Symbol.asyncIterator] !== 'function') {
@@ -612,8 +636,15 @@ export class UtilityTransport {
         // The host processed this request; reclaim any callback ids it carried
         // that were never adopted.
         this.settleRequest(requestId);
-        if (message.ok === true) item.resolve(this.decode(message.value));
-        else item.reject(deserializeWireError(message.error));
+        if (message.ok === true) {
+          try {
+            const preparing = this.prepareDecode(message.value);
+            if (preparing) await preparing;
+            item.resolve(this.decode(message.value));
+          } catch (error) {
+            item.reject(error);
+          }
+        } else item.reject(deserializeWireError(message.error));
         return;
       }
       case 'callback':
@@ -672,7 +703,16 @@ export class UtilityTransport {
         return;
       case 'stream-event': {
         const stream = this.streams.get(Number(message.id));
-        if (stream) stream.push(this.decode(message.value));
+        if (stream) {
+          try {
+            const preparing = this.prepareDecode(message.value);
+            if (preparing) await preparing;
+            stream.push(this.decode(message.value));
+          } catch (error) {
+            stream.fail(error instanceof Error ? error : new Error(String(error)));
+            this.streams.delete(Number(message.id));
+          }
+        }
         return;
       }
       case 'stream-end': {
@@ -698,7 +738,11 @@ export class UtilityTransport {
       case 'abort': {
         const id = String(message.abortId ?? '');
         const controller = this.remoteAbortControllers.get(id);
-        if (controller && !controller.signal.aborted) controller.abort(this.decode(message.reason));
+        if (controller && !controller.signal.aborted) {
+          const preparing = this.prepareDecode(message.reason);
+          if (preparing) await preparing;
+          controller.abort(this.decode(message.reason));
+        }
         this.remoteAbortControllers.delete(id);
         return;
       }
@@ -715,6 +759,8 @@ export class UtilityTransport {
         }
         const abortIds: string[] = [];
         try {
+          const preparing = this.prepareDecode(message.args);
+          if (preparing) await preparing;
           const args = this.decode(message.args, abortIds) as unknown[];
           const value = await this.controlHandler(String(message.command ?? ''), args);
           await this.flushOrderedCalls();

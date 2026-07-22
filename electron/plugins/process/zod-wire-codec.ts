@@ -3,7 +3,7 @@ import type { ZodWireCodec } from './wire.js';
 
 /**
  * Heavy, optional Zod bridge. Keeping this in its own module lets Rollup emit a
- * lazy chunk for utility processes whose plugins never transport schemas.
+ * lazy chunk for plugin processes until an encoded schema travels inbound.
  */
 export const zodWireCodec: ZodWireCodec = {
   toJSONSchema: (schema) =>
