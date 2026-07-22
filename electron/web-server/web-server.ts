@@ -664,7 +664,9 @@ export function getBridgeScript(): string {
     diagnostics: {
       getSummary: function() { return invoke('diagnostics:get-summary'); },
       tailLog: function(maxBytes) { return invoke('diagnostics:tail-log', maxBytes); },
+      tailWindowHealthLog: function(maxBytes) { return invoke('diagnostics:tail-window-health-log', maxBytes); },
       clearLog: function() { return invoke('diagnostics:clear-log'); },
+      clearWindowHealthLog: function() { return invoke('diagnostics:clear-window-health-log'); },
       resetCounters: function() { return invoke('diagnostics:reset-counters'); }
     },
     dictation: {

@@ -16,6 +16,8 @@ import {
 export interface DiagnosticsSummary {
   logPath: string;
   logSizeBytes: number;
+  windowHealthLogPath: string;
+  windowHealthLogSizeBytes: number;
   sinceBoot: string;
   totalErrors: number;
   counters: DiagnosticCounter[];
@@ -34,13 +36,19 @@ function logSize(logPath: string): number {
   }
 }
 
-export function registerDiagnosticsHandlers(ipcMain: IpcMain, mainProcessLogPath: string): void {
+export function registerDiagnosticsHandlers(
+  ipcMain: IpcMain,
+  mainProcessLogPath: string,
+  windowHealthLogPath: string,
+): void {
   ipcMain.handle('diagnostics:get-summary', async (): Promise<DiagnosticsSummary> => {
     await refreshPluginProcessPrivateMemory();
     const counters = getDiagnosticCounters();
     return {
       logPath: mainProcessLogPath,
       logSizeBytes: logSize(mainProcessLogPath),
+      windowHealthLogPath,
+      windowHealthLogSizeBytes: logSize(windowHealthLogPath),
       sinceBoot: getDiagnosticsBootTs(),
       totalErrors: counters.reduce((sum, c) => sum + c.count, 0),
       counters,
@@ -51,6 +59,11 @@ export function registerDiagnosticsHandlers(ipcMain: IpcMain, mainProcessLogPath
   ipcMain.handle('diagnostics:tail-log', async (_event, maxBytes?: number) => {
     const cap = Math.min(TAIL_MAX_BYTES, Math.max(1024, typeof maxBytes === 'number' ? maxBytes : TAIL_MAX_BYTES));
     return readLogTail(mainProcessLogPath, cap);
+  });
+
+  ipcMain.handle('diagnostics:tail-window-health-log', async (_event, maxBytes?: number) => {
+    const cap = Math.min(TAIL_MAX_BYTES, Math.max(1024, typeof maxBytes === 'number' ? maxBytes : TAIL_MAX_BYTES));
+    return readLogTail(windowHealthLogPath, cap);
   });
 
   ipcMain.handle('diagnostics:clear-log', async () => {
@@ -66,6 +79,20 @@ export function registerDiagnosticsHandlers(ipcMain: IpcMain, mainProcessLogPath
       /* noop */
     }
     return { success: true, logSizeBytes: logSize(mainProcessLogPath) };
+  });
+
+  ipcMain.handle('diagnostics:clear-window-health-log', async () => {
+    try {
+      writeFileSync(windowHealthLogPath, '');
+    } catch {
+      /* file may not exist */
+    }
+    try {
+      rmSync(`${windowHealthLogPath}.1`, { force: true });
+    } catch {
+      /* noop */
+    }
+    return { success: true, logSizeBytes: logSize(windowHealthLogPath) };
   });
 
   ipcMain.handle('diagnostics:reset-counters', async () => {

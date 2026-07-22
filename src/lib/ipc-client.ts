@@ -366,6 +366,8 @@ type AppAPI = {
     getSummary: () => Promise<{
       logPath: string;
       logSizeBytes: number;
+      windowHealthLogPath: string;
+      windowHealthLogSizeBytes: number;
       sinceBoot: string;
       totalErrors: number;
       counters: Array<{
@@ -398,7 +400,9 @@ type AppAPI = {
       }>;
     }>;
     tailLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
+    tailWindowHealthLog: (maxBytes?: number) => Promise<{ text: string; sizeBytes: number; truncated: boolean }>;
     clearLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
+    clearWindowHealthLog: () => Promise<{ success: boolean; logSizeBytes: number }>;
     resetCounters: () => Promise<{ success: boolean }>;
   };
   plans: {

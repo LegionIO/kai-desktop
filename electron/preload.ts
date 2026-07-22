@@ -894,6 +894,8 @@ const appAPI = {
       ipcRenderer.invoke('diagnostics:get-summary') as Promise<{
         logPath: string;
         logSizeBytes: number;
+        windowHealthLogPath: string;
+        windowHealthLogSizeBytes: number;
         sinceBoot: string;
         totalErrors: number;
         counters: Array<{
@@ -931,7 +933,18 @@ const appAPI = {
         sizeBytes: number;
         truncated: boolean;
       }>,
+    tailWindowHealthLog: (maxBytes?: number) =>
+      ipcRenderer.invoke('diagnostics:tail-window-health-log', maxBytes) as Promise<{
+        text: string;
+        sizeBytes: number;
+        truncated: boolean;
+      }>,
     clearLog: () => ipcRenderer.invoke('diagnostics:clear-log') as Promise<{ success: boolean; logSizeBytes: number }>,
+    clearWindowHealthLog: () =>
+      ipcRenderer.invoke('diagnostics:clear-window-health-log') as Promise<{
+        success: boolean;
+        logSizeBytes: number;
+      }>,
     resetCounters: () => ipcRenderer.invoke('diagnostics:reset-counters') as Promise<{ success: boolean }>,
   },
 

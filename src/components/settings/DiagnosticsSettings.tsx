@@ -44,6 +44,11 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [plugins, setPlugins] = useState<PluginList>([]);
   const [tail, setTail] = useState<{ text: string; sizeBytes: number; truncated: boolean } | null>(null);
+  const [windowHealthTail, setWindowHealthTail] = useState<{
+    text: string;
+    sizeBytes: number;
+    truncated: boolean;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [pluginControlBusy, setPluginControlBusy] = useState<string | null>(null);
   const [pluginControlError, setPluginControlError] = useState<string | null>(null);
@@ -72,12 +77,31 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
     }
   }, []);
 
+  const loadWindowHealthTail = useCallback(async () => {
+    try {
+      setWindowHealthTail(await app.diagnostics.tailWindowHealthLog());
+    } catch {
+      setWindowHealthTail(null);
+    }
+  }, []);
+
   const clearLog = useCallback(async () => {
     setBusy(true);
     try {
       await app.diagnostics.clearLog();
       await refresh();
       setTail(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const clearWindowHealthLog = useCallback(async () => {
+    setBusy(true);
+    try {
+      await app.diagnostics.clearWindowHealthLog();
+      await refresh();
+      setWindowHealthTail(null);
     } finally {
       setBusy(false);
     }
@@ -144,6 +168,12 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
             <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Errors since boot</div>
             <div className={`mt-0.5 text-sm font-medium ${hasErrors ? 'text-amber-500' : ''}`}>
               {summary?.totalErrors ?? '—'}
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Window health log</div>
+            <div className="mt-0.5 text-sm font-medium">
+              {summary ? formatBytes(summary.windowHealthLogSizeBytes) : '—'}
             </div>
           </div>
           <div>
@@ -399,6 +429,47 @@ export const DiagnosticsSettings: FC<SettingsProps> = () => {
               )}
               <pre className="max-h-96 overflow-auto rounded-lg border border-border/70 bg-black/80 p-3 text-[11px] leading-relaxed text-green-300">
                 {tail.text || '(empty)'}
+              </pre>
+            </>
+          )}
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="diagnostics-window-health-log" title="Window health log (tail)" defaultOpen={false}>
+        <div className="space-y-2">
+          <p className="text-[11px] text-muted-foreground">
+            Renderer, GPU, sleep/wake, display, paint-probe, and automatic recovery events. Full log:{' '}
+            <span className="select-text font-mono">{summary?.windowHealthLogPath ?? '—'}</span>
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void loadWindowHealthTail()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs hover:bg-accent"
+            >
+              <RefreshCwIcon className="h-3.5 w-3.5" />
+              Load latest
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void clearWindowHealthLog()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/50 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive hover:bg-destructive/20 disabled:opacity-50"
+            >
+              <Trash2Icon className="h-3.5 w-3.5" />
+              Clear window log
+            </button>
+          </div>
+          {windowHealthTail && (
+            <>
+              {windowHealthTail.truncated && (
+                <p className="text-[11px] text-muted-foreground">
+                  Showing the last {formatBytes(windowHealthTail.text.length)} of{' '}
+                  {formatBytes(windowHealthTail.sizeBytes)}.
+                </p>
+              )}
+              <pre className="max-h-96 overflow-auto rounded-lg border border-border/70 bg-black/80 p-3 text-[11px] leading-relaxed text-green-300">
+                {windowHealthTail.text || '(empty)'}
               </pre>
             </>
           )}

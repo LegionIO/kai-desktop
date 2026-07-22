@@ -12,6 +12,7 @@ import {
   systemPreferences,
   protocol,
   screen,
+  powerMonitor,
 } from 'electron';
 import { basename, join, sep } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'fs';
@@ -23,7 +24,8 @@ import {
   isInErrorHandler,
   recordDiagnostic,
 } from './diagnostics/main-diagnostics.js';
-import { homedir } from 'os';
+import { homedir, release as osRelease } from 'os';
+import { WindowHealthMonitor } from './diagnostics/window-health.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
   registerAgentHandlers,
@@ -296,6 +298,7 @@ let demoteWindowedToHeadlessRef: () => void = () => {};
 let hasEverBeenWindowed = !IS_HEADLESS;
 
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
+const WINDOW_HEALTH_LOG = join(APP_HOME, 'logs', 'window-health.log');
 
 function formatMainProcessError(error: unknown): string {
   if (error instanceof Error) {
@@ -701,6 +704,26 @@ const APP_ICON = join(import.meta.dirname, '../../build/icon.png');
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
 
+const windowHealthMonitor = new WindowHealthMonitor({
+  logPath: WINDOW_HEALTH_LOG,
+  getPrimaryWindow: () => primaryWindowRef,
+  getProcessMetrics: () => app.getAppMetrics(),
+  hasActiveWork: hasActiveStreams,
+  reviveNativeSurface: async () => {
+    if (!IS_MAC) return;
+    const win = primaryWindowRef;
+    if (!win || win.isDestroyed()) return;
+    // Recreate the NSVisualEffectView backing the transparent macOS window.
+    // This is intentionally attempted before a renderer reload because it does
+    // not disturb React state, drafts, or active IPC subscriptions.
+    win.setVibrancy(null);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (win.isDestroyed()) return;
+    win.setVibrancy('sidebar');
+    win.webContents.invalidate();
+  },
+});
+
 function setMacDockIcon(): void {
   setPaddedMacDockIcon(APP_ICON);
 }
@@ -746,6 +769,7 @@ function createWindow(): BrowserWindow {
     },
   });
   primaryWindowRef = mainWindow;
+  windowHealthMonitor.attachWindow(mainWindow);
   applyBrandUserAgent(mainWindow.webContents);
 
   if (IS_MAC) {
@@ -971,6 +995,7 @@ function createWindow(): BrowserWindow {
   });
   mainWindow.on('closed', () => {
     if (primaryWindowRef === mainWindow) {
+      windowHealthMonitor.detachWindow();
       primaryWindowRef = null;
     }
     // The primary window is gone. If CLI/web clients still depend on this
@@ -1040,6 +1065,55 @@ if (gotSingleInstanceLock) {
     ensureAppHome();
     applyTheme();
     buildMenu();
+    windowHealthMonitor.logSession({
+      appVersion: app.getVersion(),
+      electronVersion: process.versions.electron,
+      chromeVersion: process.versions.chrome,
+      nodeVersion: process.versions.node,
+      platform: process.platform,
+      arch: process.arch,
+      osRelease: osRelease(),
+      headless: IS_HEADLESS,
+    });
+    app.on('child-process-gone', (_event, details) => {
+      windowHealthMonitor.recordChildProcessGone({ ...details });
+    });
+    app.on('render-process-gone', (_event, contents, details) => {
+      windowHealthMonitor.recordRendererGone(contents, { ...details });
+    });
+    powerMonitor.on('suspend', () => windowHealthMonitor.recordLifecycleEvent('system-suspend'));
+    powerMonitor.on('resume', () => {
+      windowHealthMonitor.recordLifecycleEvent('system-resume');
+      windowHealthMonitor.requestRecovery('system-resume', 1_000);
+    });
+    powerMonitor.on('lock-screen', () => windowHealthMonitor.recordLifecycleEvent('screen-locked'));
+    powerMonitor.on('unlock-screen', () => {
+      windowHealthMonitor.recordLifecycleEvent('screen-unlocked');
+      windowHealthMonitor.requestRecovery('screen-unlocked', 750);
+    });
+    powerMonitor.on('user-did-resign-active', () => {
+      windowHealthMonitor.recordLifecycleEvent('user-became-inactive');
+    });
+    powerMonitor.on('user-did-become-active', () => {
+      windowHealthMonitor.recordLifecycleEvent('user-became-active');
+      windowHealthMonitor.requestRecovery('user-became-active', 750);
+    });
+    screen.on('display-added', (_event, display) => {
+      windowHealthMonitor.recordLifecycleEvent('display-added', { displayId: display.id, bounds: display.bounds });
+      windowHealthMonitor.requestRecovery('display-added', 750);
+    });
+    screen.on('display-removed', (_event, display) => {
+      windowHealthMonitor.recordLifecycleEvent('display-removed', { displayId: display.id, bounds: display.bounds });
+      windowHealthMonitor.requestRecovery('display-removed', 750);
+    });
+    screen.on('display-metrics-changed', (_event, display, changedMetrics) => {
+      windowHealthMonitor.recordLifecycleEvent('display-metrics-changed', {
+        displayId: display.id,
+        bounds: display.bounds,
+        changedMetrics,
+      });
+      windowHealthMonitor.requestRecovery('display-metrics-changed', 750);
+    });
     const shellPathReady = primeResolvedShellPath().catch((error) => {
       console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to resolve shell PATH, using inherited environment:`, error);
       return process.env.PATH ?? '';
@@ -1300,7 +1374,7 @@ if (gotSingleInstanceLock) {
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
     registerPartitionHandlers(ipcMain);
-    registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG);
+    registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG, WINDOW_HEALTH_LOG);
     const taskTerminalManager = new TaskTerminalManager();
     taskTerminalManagerRef = taskTerminalManager;
     registerTaskTerminalHandlers(ipcMain, taskTerminalManager);
