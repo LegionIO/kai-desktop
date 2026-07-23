@@ -493,6 +493,39 @@ describe('agent conversationTarget', () => {
     });
   });
 
+  it('persists a queued inject onto the branch even when the turn stream fails', async () => {
+    clearInjects('convFail');
+    resetMockStore({
+      convFail: { id: 'convFail', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // Enqueue mid-stream, then throw before another prepareStep consumes it. The
+    // finally block must still persist the queued user turn (not lose it or leave
+    // it queued for an unrelated future turn).
+    vi.mocked(streamForPlugin).mockImplementationOnce(async function* () {
+      enqueueInject('convFail', 'inject before failure');
+      yield { type: 'text-delta', text: 'partial' } as never;
+      throw new Error('stream exploded');
+    });
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convFail' }), evt, deps()).catch(() => {});
+
+    expect(hasInjects('convFail')).toBe(false);
+    const persisted = vi
+      .mocked(appendConversationMessages)
+      .mock.calls.some(
+        (call) =>
+          call[1] === 'convFail' &&
+          (call[2] as Array<{ role: string; content: Array<{ text?: string }> }>).some(
+            (message) => message.role === 'user' && message.content?.[0]?.text === 'inject before failure',
+          ),
+      );
+    expect(persisted).toBe(true);
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('alert resume (forceFreshTurn) runs a real turn on the existing conversation (never enqueues/strands)', async () => {
     // Regression for the reported bug: an answered alert appended to the thread
     // but no turn ran. resumeConversationWithMessage must RUN a turn (streamForPlugin)

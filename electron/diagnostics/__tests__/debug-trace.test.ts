@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { getDiagnosticTracePath, initDiagnosticTrace, invalidateDiagnosticTraceConfig, isDiagnosticTraceEnabled, traceDiagnostic } from '../debug-trace';
+import {
+  getDiagnosticTracePath,
+  initDiagnosticTrace,
+  invalidateDiagnosticTraceConfig,
+  isDiagnosticTraceEnabled,
+  sweepDiagnosticTraceRetention,
+  traceDiagnostic,
+} from '../debug-trace';
 import type { AppConfig } from '../../config/schema';
 
 let home: string;
@@ -93,6 +100,29 @@ describe('diagnostic trace', () => {
     traceDiagnostic({ scope: 'automation', event: 'turn.start' });
     expect(existsSync(`${base}.2`)).toBe(false);
     expect(existsSync(`${base}.3`)).toBe(false);
+  });
+
+  it('omits url/path fields in metadata-only mode', () => {
+    mutateTrace({ enabled: true, scopes: ['window'] });
+    traceDiagnostic({
+      scope: 'window',
+      event: 'main-renderer-load-finished',
+      fields: { url: 'file:///Users/secret/app/index.html', reloadCount: 1 },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.url).toEqual({ omitted: true, chars: 'file:///Users/secret/app/index.html'.length });
+    expect(row.fields.reloadCount).toBe(1);
+  });
+
+  it('prunes expired trace files even after tracing is disabled', () => {
+    const base = getDiagnosticTracePath();
+    mkdirSync(dirname(base), { recursive: true });
+    writeFileSync(`${base}.1`, 'stale');
+    const old = Date.now() / 1000 - 40 * 24 * 60 * 60;
+    utimesSync(`${base}.1`, old, old);
+    mutateTrace({ enabled: false });
+    sweepDiagnosticTraceRetention();
+    expect(existsSync(`${base}.1`)).toBe(false);
   });
 
   it('includes bounded content only when explicitly enabled', () => {

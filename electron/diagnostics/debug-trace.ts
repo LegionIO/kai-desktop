@@ -38,7 +38,7 @@ const SECRET_KEY_RE = /(authorization|cookie|token|secret|password|api[-_]?key|c
 // Content fields only — deliberately NOT broad substrings, or metadata keys like
 // messageId / parentMessageId would be omitted in the default mode (the exact
 // branch-correlation data this trace exists to capture).
-const CONTENT_KEY_RE = /(?:^|_)(body|content|text|prompt|message|args|result|payload|response)$/i;
+const CONTENT_KEY_RE = /(?:^|_)(body|content|text|prompt|message|args|result|payload|response|url|uri|href|path|filepath|filename)$/i;
 const MAX_STRING = 4000;
 
 let appHome = '';
@@ -182,8 +182,29 @@ function prune(path: string, cfg: TraceConfig): void {
   }
 }
 
+let lastRetentionSweep = 0;
+const RETENTION_SWEEP_INTERVAL_MS = 5 * 60_000;
+
+/** Age/count-prune existing trace files. Runs independently of whether tracing
+ * is currently enabled, so files recorded before disabling still expire. */
+export function sweepDiagnosticTraceRetention(): void {
+  if (!appHome) return;
+  try {
+    prune(getDiagnosticTracePath(), config());
+  } catch {
+    /* best effort */
+  }
+}
+
 export function traceDiagnostic(event: DiagnosticTraceEvent): void {
   const cfg = config();
+  // Retention runs even when tracing is OFF (throttled), so traces recorded
+  // before disabling still expire by maxAgeDays/maxFiles.
+  const now = Date.now();
+  if (appHome && now - lastRetentionSweep > RETENTION_SWEEP_INTERVAL_MS) {
+    lastRetentionSweep = now;
+    sweepDiagnosticTraceRetention();
+  }
   if (!cfg.enabled || !cfg.scopes.includes(event.scope) || !appHome) return;
   const path = getDiagnosticTracePath();
   try {

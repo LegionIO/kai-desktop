@@ -474,6 +474,7 @@ async function runAgentAction(
 
   let turnSucceeded = false;
   let turnResult: unknown;
+  let strandedInjects: ReturnType<typeof drainInjects> = [];
   try {
     // Build the model input (optionally including prior history), then write the
     // user prompt turn immediately with runStatus:'running' so the conversation
@@ -853,55 +854,60 @@ async function runAgentAction(
         (persistDropped ? `conversation ${conversationId} was removed before the reply could be saved` : null);
       throw new Error(failMsg ?? 'Automation agent run failed');
     }
-    // Success — record whether a stranded mid-turn inject remains for this
-    // conversation (an inject that landed after the final step boundary, so
-    // prepareStep never spliced it). Handled AFTER the finally clears in-flight
-    // state, so the continuation sees an idle conversation.
     turnSucceeded = true;
     turnResult = { text, modelKey, toolCalls, conversationId };
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);
+    // Persist any leftover queued injects UNCONDITIONALLY (even on stream
+    // failure/abort). They were displayed but their authoritative persistence was
+    // deferred to prepareStep; if the turn errored before consuming them, this is
+    // the only place they land on the branch, so they aren't lost or misrouted
+    // into an unrelated later turn. The continuation run (success-only, below)
+    // then answers them.
+    if (hasInjects(conversationId)) {
+      const leftover = drainInjects(conversationId);
+      let branchHead = readConversation(deps.appHome, conversationId)?.headId ?? null;
+      for (const entry of leftover) {
+        const injected = appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [
+            {
+              id: entry.id,
+              role: 'user',
+              content: [{ type: 'text', text: entry.text }],
+              createdAt: new Date(entry.at).toISOString(),
+            },
+          ],
+          { parentId: branchHead, runStatus: 'idle' },
+        );
+        if (injected?.headId) branchHead = injected.headId;
+      }
+      if (leftover.length > 0) {
+        strandedInjects = leftover;
+        traceDiagnostic({
+          scope: 'automation',
+          event: 'inject.drained-at-end',
+          correlationId,
+          conversationId,
+          ruleId: rule.id,
+          headId: branchHead,
+          fields: {
+            injectIds: leftover.map((entry) => entry.id),
+            count: leftover.length,
+            turnSucceeded,
+          },
+        });
+      }
+    }
   }
 
-  // Drain-at-end: a mid-turn inject may have arrived AFTER this turn's final step
-  // boundary (so prepareStep never spliced it). Its user turn is already on the
-  // branch; now that the turn is done + in-flight state cleared, run one more
-  // turn on the current branch to answer it. Bounded to avoid loops.
+  // Drain-at-end continuation: only on success, and only if we persisted stranded
+  // injects above. The user turns are already on the branch (idle); run one more
+  // turn on the current branch to answer them. Bounded to avoid loops.
   const continueBudget = opts?.continueBudget ?? 3;
-  if (turnSucceeded && continueBudget > 0 && hasInjects(conversationId)) {
-    // Consume the queue and PERSIST each entry onto the current head. The turn's
-    // assistant reply is already finalized above, so these injected user turns
-    // parent off it in order. (They are no longer written pre-emptively at
-    // enqueue time — the running turn persists them at its prepareStep boundary;
-    // an inject that landed after the final boundary reaches here unpersisted.)
-    const stranded = drainInjects(conversationId);
-    let branchHead = readConversation(deps.appHome, conversationId)?.headId ?? null;
-    for (const entry of stranded) {
-      const injected = appendConversationMessages(
-        deps.appHome,
-        conversationId,
-        [
-          {
-            id: entry.id,
-            role: 'user',
-            content: [{ type: 'text', text: entry.text }],
-            createdAt: new Date(entry.at).toISOString(),
-          },
-        ],
-        { parentId: branchHead, runStatus: 'idle' },
-      );
-      if (injected?.headId) branchHead = injected.headId;
-    }
-    traceDiagnostic({
-      scope: 'automation',
-      event: 'inject.drained-at-end',
-      correlationId,
-      conversationId,
-      ruleId: rule.id,
-      headId: branchHead,
-      fields: { injectIds: stranded.map((entry) => entry.id), count: stranded.length },
-    });
+  if (turnSucceeded && continueBudget > 0 && strandedInjects.length > 0) {
     try {
       // Force the SAME conversation (not per-invocation/singleton re-resolution)
       // and continue on its current branch without appending a new prompt.

@@ -26,7 +26,7 @@ import {
 } from './diagnostics/main-diagnostics.js';
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
-import { initDiagnosticTrace, traceDiagnostic } from './diagnostics/debug-trace.js';
+import { initDiagnosticTrace, sweepDiagnosticTraceRetention, traceDiagnostic } from './diagnostics/debug-trace.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
   registerAgentHandlers,
@@ -168,6 +168,13 @@ function resolveUserDataDir(): string {
 }
 
 const APP_HOME = resolveUserDataDir();
+
+// Initialize the diagnostic trace at module scope so events emitted early in
+// startup (e.g. WindowHealthMonitor.logSession) are captured when tracing was
+// enabled in persisted config before launch. Uses a lazy config read.
+initDiagnosticTrace(APP_HOME, () => readEffectiveConfig(APP_HOME));
+// Expire old trace files on launch even if tracing is now disabled.
+sweepDiagnosticTraceRetention();
 
 /**
  * Headless mode: run the full main-process backend (IPC handlers, tools, local
@@ -1144,7 +1151,6 @@ if (gotSingleInstanceLock) {
 
     // Config reader (used by tools and OAuth)
     const getConfig = () => readEffectiveConfig(APP_HOME);
-    initDiagnosticTrace(APP_HOME, getConfig);
 
     // Apply launch-at-login setting from config at startup
     try {
