@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -265,15 +266,213 @@ export function readAllConversations(appHome: string): ConversationRecord[] {
   return out;
 }
 
+type TreeNodeLike = {
+  id?: unknown;
+  role?: unknown;
+  parentId?: unknown;
+  content?: unknown;
+};
+
+/** Result of a tree-integrity repair, for optional diagnostics by the caller. */
+export type TreeSanitizeReport = {
+  changed: boolean;
+  /** ids that appeared more than once and were merged into a single node. */
+  dedupedIds: string[];
+  /** ids whose parentId formed a cycle and was detached. */
+  cycleBrokenIds: string[];
+  /** true if headId was unreachable and had to be repointed. */
+  headRepointed: boolean;
+};
+
+/**
+ * Enforce the message-tree invariants that the branch walker
+ * (`getConversationBranch`) depends on, at the single write chokepoint so NO
+ * path can persist a corrupt tree:
+ *
+ *   1. No duplicate node ids. A repeated id (produced by a read-modify-write
+ *      race between two finalizes + the renderer `put` merge — see the mid-turn
+ *      inject corruption) is merged into ONE node: later occurrences' content is
+ *      concatenated onto the first.
+ *   2. No parent cycles. A back-edge (e.g. assistant.parentId=inject AND
+ *      inject.parentId=assistant) is DETACHED by making the node that closes the
+ *      loop a root. Without this, the branch walker's cycle-guard silently
+ *      truncates the active branch and orphans real history.
+ *   3. headId reachable. If the recorded head can't be reached (or is gone),
+ *      repoint to the deepest node on the longest resolvable chain.
+ *
+ * Pure and cheap (linear passes); returns the possibly-repaired tree plus a
+ * report. Exported for unit tests and reuse by a recovery pass.
+ */
+export function sanitizeMessageTree(
+  rawTree: unknown[],
+  headId: string | null | undefined,
+): { tree: TreeNodeLike[]; headId: string | null; report: TreeSanitizeReport } {
+  const report: TreeSanitizeReport = { changed: false, dedupedIds: [], cycleBrokenIds: [], headRepointed: false };
+  const input = Array.isArray(rawTree) ? (rawTree as TreeNodeLike[]) : [];
+
+  // ── Pass 1: dedupe by id, concatenating content of repeated ids ──
+  const order: string[] = [];
+  const byId = new Map<string, TreeNodeLike>();
+  for (const node of input) {
+    if (!node || typeof node !== 'object') continue;
+    const id = typeof node.id === 'string' && node.id.length > 0 ? node.id : null;
+    if (!id) continue; // drop id-less nodes — they can't be linked and break the walk
+    const existing = byId.get(id);
+    if (!existing) {
+      byId.set(id, { ...node, id });
+      order.push(id);
+      continue;
+    }
+    // Duplicate id: same logical message split by a race; concatenate array
+    // contents so no tool call/text is lost. Keep the first-writer's parent edge
+    // (cycle repair below fixes it if bad).
+    if (!report.dedupedIds.includes(id)) report.dedupedIds.push(id);
+    report.changed = true;
+    const a = existing.content;
+    const b = node.content;
+    if (Array.isArray(a) && Array.isArray(b)) existing.content = [...a, ...b];
+    else if (Array.isArray(a)) {
+      /* keep a */
+    } else if (Array.isArray(b)) existing.content = b;
+    else if (typeof b === 'string' && typeof a === 'string' && b.length > a.length) existing.content = b;
+  }
+
+  const ids = new Set(order);
+
+  // ── Pass 2: normalize parents (self-parent, dangling → null) ──
+  for (const id of order) {
+    const node = byId.get(id)!;
+    const orig = typeof node.parentId === 'string' ? node.parentId : null;
+    let parent = orig;
+    if (parent === id) parent = null; // self-parent → root
+    if (parent !== null && !ids.has(parent)) parent = null; // dangling → root
+    if (parent !== orig) {
+      node.parentId = parent;
+      report.changed = true;
+    }
+  }
+
+  // ── Pass 3: break parent cycles by detaching the node that closes the loop ──
+  for (const startId of order) {
+    const seen = new Set<string>();
+    let cur: string | null = startId;
+    while (cur !== null) {
+      if (seen.has(cur)) {
+        const node = byId.get(cur)!;
+        node.parentId = null;
+        if (!report.cycleBrokenIds.includes(cur)) report.cycleBrokenIds.push(cur);
+        report.changed = true;
+        break;
+      }
+      seen.add(cur);
+      const node = byId.get(cur);
+      cur = node && typeof node.parentId === 'string' ? node.parentId : null;
+    }
+  }
+
+  const tree = order.map((id) => byId.get(id)!);
+
+  // ── Pass 4: ensure headId is reachable; else repoint to the deepest chain ──
+  let head = typeof headId === 'string' && ids.has(headId) ? headId : null;
+  const depthReachable = (leaf: string): number => {
+    let d = 0;
+    const seen = new Set<string>();
+    let cur: string | null = leaf;
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      d++;
+      const node = byId.get(cur);
+      cur = node && typeof node.parentId === 'string' ? node.parentId : null;
+    }
+    return d;
+  };
+  if (head === null && order.length > 0) {
+    const parentSet = new Set<string>();
+    for (const id of order) {
+      const p = byId.get(id)!.parentId;
+      if (typeof p === 'string') parentSet.add(p);
+    }
+    const leaves = order.filter((id) => !parentSet.has(id));
+    const candidates = leaves.length > 0 ? leaves : order;
+    let best = candidates[0];
+    let bestDepth = -1;
+    for (const id of candidates) {
+      const d = depthReachable(id);
+      if (d > bestDepth) {
+        bestDepth = d;
+        best = id;
+      }
+    }
+    head = best;
+    report.headRepointed = true;
+    report.changed = true;
+  }
+
+  return { tree, headId: head, report };
+}
+
+/**
+ * Apply {@link sanitizeMessageTree} to a full record, keeping `messageTree`,
+ * `headId`, `messages` (active branch) and counts consistent. Returns the SAME
+ * object when nothing changed (no allocation churn on the hot write path).
+ */
+export function sanitizeConversationTree(conv: ConversationRecord): ConversationRecord {
+  const rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
+  if (!rawTree || rawTree.length === 0) return conv;
+  const { tree, headId, report } = sanitizeMessageTree(rawTree, conv.headId ?? null);
+  if (!report.changed) return conv;
+
+  // A repair here means an upstream write produced a corrupt tree (dup id / parent
+  // cycle / unreachable head) — the exact mid-turn-inject failure that orphaned
+  // history. Trace it (metadata only) so a recurrence is visible in diagnostics
+  // instead of only reconstructable from the file after the fact.
+  traceDiagnostic({
+    scope: 'agent',
+    event: 'conversation.tree-repaired',
+    level: 'warn',
+    conversationId: conv.id,
+    fields: {
+      dedupedCount: report.dedupedIds.length,
+      cycleBrokenCount: report.cycleBrokenIds.length,
+      headRepointed: report.headRepointed,
+      dedupedIds: report.dedupedIds,
+      cycleBrokenIds: report.cycleBrokenIds,
+    },
+  });
+
+  const byId = new Map(tree.map((n) => [n.id as string, n] as const));
+  const branch: TreeNodeLike[] = [];
+  const seen = new Set<string>();
+  let cur: string | null = headId;
+  while (cur !== null && !seen.has(cur)) {
+    seen.add(cur);
+    const node = byId.get(cur);
+    if (!node) break;
+    branch.push(node);
+    cur = typeof node.parentId === 'string' ? node.parentId : null;
+  }
+  branch.reverse();
+
+  return {
+    ...conv,
+    messageTree: tree as unknown[],
+    headId,
+    messages: branch as unknown[],
+    messageCount: branch.length,
+    userMessageCount: branch.filter((n) => n.role === 'user').length,
+  };
+}
+
 /** Write one conversation file and update its index entry (single-file cost). */
 export function writeConversation(appHome: string, conv: ConversationRecord): void {
   // Migrate BEFORE touching per-file state, and refuse to write if a legacy
   // monolith is still un-migrated — a partial index would strand old chats.
   assertMigratedBeforeWrite(appHome);
   ensureDirs(appHome);
-  atomicWriteFileSync(conversationPath(appHome, conv.id), JSON.stringify(conv, null, 2));
+  const sanitized = sanitizeConversationTree(conv);
+  atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   const index = readIndex(appHome);
-  index.conversations[conv.id] = toIndexEntry(conv);
+  index.conversations[sanitized.id] = toIndexEntry(sanitized);
   writeIndex(appHome, index);
 }
 

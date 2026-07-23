@@ -28,8 +28,10 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
   persistCooperativeInjectedUserTurn,
+  clearFinalizedResponseIds,
 } from '../agent/stream-persistence.js';
 import { drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
   shouldCompact,
@@ -379,6 +381,7 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         if (event.type === 'done') {
           serverPersistTokens.delete(event.conversationId);
           serverPersistParents.delete(event.conversationId);
+          clearFinalizedResponseIds(event.conversationId);
           void maybeAutoTitle(serverPersistAppHome, event.conversationId);
         }
       }
@@ -776,7 +779,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     let lastMessageId: string | null = null;
     for (const entry of entries) {
       const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
-      if (persisted) lastMessageId = persisted.messageId;
+      if (persisted) {
+        lastMessageId = persisted.messageId;
+        traceDiagnostic({
+          scope: 'agent',
+          event: 'inject.boundary-persisted',
+          conversationId,
+          messageId: persisted.messageId,
+          parentMessageId: persisted.parentId,
+        });
+      }
     }
     if (lastMessageId) {
       // Continuation output from this same turn now persists after the last
@@ -3096,6 +3108,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     pendingServerPersistParent.delete(conversationId);
     serverPersistParents.delete(conversationId);
     serverPersistTokens.delete(conversationId);
+    clearFinalizedResponseIds(conversationId);
     if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
       try {

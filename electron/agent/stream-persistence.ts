@@ -47,6 +47,42 @@ type Accumulator = {
 
 const accumulators = new Map<string, Accumulator>();
 
+/**
+ * Response ids already persisted as an assistant node for a conversation, so a
+ * second finalize of the SAME logical reply (the inject-consumed handler, the
+ * stop/cancel path, and the terminal drain can all reach a finalize) does not
+ * append a duplicate node. Bounded per conversation; cleared when a conversation's
+ * turn fully settles (`done`) via clearFinalizedResponseIds. Belt-and-suspenders
+ * with sanitizeMessageTree, which repairs a dup if one still slips through.
+ */
+const finalizedResponseIds = new Map<string, Set<string>>();
+
+function markResponseFinalized(conversationId: string, responseMessageId: string | undefined): void {
+  if (!responseMessageId) return;
+  let set = finalizedResponseIds.get(conversationId);
+  if (!set) {
+    set = new Set();
+    finalizedResponseIds.set(conversationId, set);
+  }
+  set.add(responseMessageId);
+  // Bound growth on a pathological long-lived conversation.
+  if (set.size > 64) {
+    const first = set.values().next().value;
+    if (first !== undefined) set.delete(first);
+  }
+}
+
+function isResponseAlreadyFinalized(conversationId: string, responseMessageId: string | undefined): boolean {
+  if (!responseMessageId) return false;
+  return finalizedResponseIds.get(conversationId)?.has(responseMessageId) ?? false;
+}
+
+/** Clear finalized-response tracking for a conversation (call on terminal `done`
+ *  / cancel so a genuinely new turn reusing an id space starts clean). */
+export function clearFinalizedResponseIds(conversationId: string): void {
+  finalizedResponseIds.delete(conversationId);
+}
+
 function ensureAcc(conversationId: string, parentId?: string, responseMessageId?: string): Accumulator {
   let acc = accumulators.get(conversationId);
   if (!acc) {
@@ -338,6 +374,13 @@ function persistAccumulatedReturningHead(
     }
     return null;
   }
+  // Idempotence: if this exact response id was already persisted (a second
+  // finalize of the same reply from the stop/drain/inject-consumed paths), do NOT
+  // append a duplicate assistant node. Return the existing node's id as the head
+  // so the caller's parent-rebind still points at the real message.
+  if (acc.responseMessageId && isResponseAlreadyFinalized(conversationId, acc.responseMessageId)) {
+    return acc.responseMessageId;
+  }
   try {
     // Parent on the head captured at submit so a mid-run branch change
     // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
@@ -360,6 +403,7 @@ function persistAccumulatedReturningHead(
         ...(acc.parentId !== undefined ? { parentId: acc.parentId } : {}),
       },
     );
+    if (updated?.headId) markResponseFinalized(conversationId, acc.responseMessageId);
     return updated?.headId ?? null;
   } catch {
     // Persistence is best-effort; a failure must not break the stream.

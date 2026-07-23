@@ -17,6 +17,8 @@ import {
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
+  sanitizeMessageTree,
+  sanitizeConversationTree,
   type ConversationRecord,
 } from '../conversation-store.js';
 
@@ -245,5 +247,149 @@ describe('migration from the monolith', () => {
     const index = readIndex(appHome);
     expect(Object.keys(index.conversations)).toEqual(['a']);
     expect(index.conversations.a.title).toBe('Alpha');
+  });
+});
+
+describe('sanitizeMessageTree (tree-integrity invariant)', () => {
+  it('is a no-op on a well-formed linear tree', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'hi' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: 'hello' },
+    ];
+    const { tree: out, headId, report } = sanitizeMessageTree(tree, 'a1');
+    expect(report.changed).toBe(false);
+    expect(out).toHaveLength(2);
+    expect(headId).toBe('a1');
+  });
+
+  it('merges a duplicate id by concatenating array content', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: [{ type: 'text', text: 'hi' }] },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'tool-call', toolCallId: 't1' }] },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'tool-call', toolCallId: 't2' }] },
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'a1');
+    expect(report.dedupedIds).toContain('a1');
+    const ids = out.map((n) => n.id);
+    expect(ids.filter((i) => i === 'a1')).toHaveLength(1);
+    const a1 = out.find((n) => n.id === 'a1')!;
+    expect((a1.content as unknown[]).length).toBe(2); // both tool-calls preserved
+  });
+
+  it('breaks a 2-node parent cycle and keeps the branch reachable (the inject-corruption shape)', () => {
+    // assistant.parentId = inject AND inject.parentId = assistant → cycle that
+    // truncated the active branch and orphaned earlier history.
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'first' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: 'reply' },
+      { id: 'asst', role: 'assistant', parentId: 'inj', content: 'partial' },
+      { id: 'inj', role: 'user', parentId: 'asst', content: 'guiding' },
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'inj');
+    expect(report.cycleBrokenIds.length).toBeGreaterThan(0);
+    // No cycle remains: every node's parent chain terminates.
+    const byId = new Map(out.map((n) => [n.id as string, n] as const));
+    for (const n of out) {
+      const seen = new Set<string>();
+      let cur: string | null = n.id as string;
+      while (cur) {
+        expect(seen.has(cur)).toBe(false);
+        seen.add(cur);
+        const node = byId.get(cur);
+        cur = node && typeof node.parentId === 'string' ? node.parentId : null;
+      }
+    }
+  });
+
+  it('detaches a self-parent and drops a dangling parent to root', () => {
+    const tree = [
+      { id: 'x', role: 'user', parentId: 'x', content: 'self' },
+      { id: 'y', role: 'assistant', parentId: 'ghost', content: 'dangling' },
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'y');
+    expect(report.changed).toBe(true);
+    expect(out.find((n) => n.id === 'x')!.parentId).toBeNull();
+    expect(out.find((n) => n.id === 'y')!.parentId).toBeNull();
+  });
+
+  it('repoints an unreachable head to the deepest resolvable chain', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'a' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: 'b' },
+      { id: 'u2', role: 'user', parentId: 'a1', content: 'c' },
+    ];
+    const { headId, report } = sanitizeMessageTree(tree, 'gone');
+    expect(report.headRepointed).toBe(true);
+    expect(headId).toBe('u2'); // deepest leaf
+  });
+
+  it('sanitizeConversationTree rebuilds messages + counts from the repaired tree', () => {
+    const conv = {
+      id: 'c',
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'first' },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: 'reply' },
+        { id: 'asst', role: 'assistant', parentId: 'inj', content: 'partial' },
+        { id: 'inj', role: 'user', parentId: 'asst', content: 'guiding' },
+      ],
+      headId: 'inj',
+      messages: [],
+      messageCount: 0,
+      userMessageCount: 0,
+    } as unknown as ConversationRecord;
+    const out = sanitizeConversationTree(conv);
+    expect(out).not.toBe(conv); // repaired copy
+    // Active branch reachable from head has no cycle and includes real messages.
+    expect(out.messageCount).toBeGreaterThan(0);
+    expect((out.messages as Array<{ id: string }>).length).toBe(out.messageCount);
+  });
+});
+
+describe('writeConversation repairs a corrupt tree at the write chokepoint', () => {
+  it('persists a de-cycled, de-duped tree even if handed a corrupt one', () => {
+    const conv = {
+      id: 'corrupt',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'first' },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: 'reply' },
+        { id: 'asst', role: 'assistant', parentId: 'inj', content: [{ type: 'tool-call', toolCallId: 't1' }] },
+        { id: 'inj', role: 'user', parentId: 'asst', content: 'guiding' },
+        { id: 'asst', role: 'assistant', parentId: 'inj', content: [{ type: 'tool-call', toolCallId: 't2' }] },
+      ],
+      headId: 'inj',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 0,
+      userMessageCount: 0,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    writeConversation(appHome, conv);
+    const back = readConversation(appHome, 'corrupt')!;
+    const tree = back.messageTree as Array<{ id: string; parentId: string | null }>;
+    // No duplicate ids.
+    expect(new Set(tree.map((n) => n.id)).size).toBe(tree.length);
+    // No cycle from any node.
+    const byId = new Map(tree.map((n) => [n.id, n] as const));
+    for (const n of tree) {
+      const seen = new Set<string>();
+      let cur: string | null = n.id;
+      while (cur) {
+        expect(seen.has(cur)).toBe(false);
+        seen.add(cur);
+        cur = byId.get(cur)?.parentId ?? null;
+      }
+    }
   });
 });

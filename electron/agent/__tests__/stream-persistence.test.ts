@@ -30,6 +30,7 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
   persistCooperativeInjectedUserTurn,
+  clearFinalizedResponseIds,
 } from '../stream-persistence.js';
 import type { StreamEvent } from '../mastra-agent.js';
 
@@ -67,6 +68,38 @@ describe('stream persistence accumulator', () => {
         content: [{ type: 'text', source: 'assistant', text: 'Hello' }],
       },
     ]);
+  });
+
+  it('does NOT append the same response id twice (idempotent finalize)', () => {
+    // A second finalize of the same reply (stop/drain/inject-consumed all reach a
+    // finalize) must not create a duplicate assistant node — this is what produced
+    // the two-node cycle + orphaned history in the mid-turn-inject corruption.
+    clearFinalizedResponseIds('idem');
+    feed({ conversationId: 'idem', type: 'text-delta', text: 'partial', responseMessageId: 'resp-1' });
+    const firstHead = finalizeInterruptedTurn(APP_HOME, 'idem');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    expect(firstHead).toBeTruthy();
+
+    // Repopulate the same accumulator id and finalize again.
+    feed({ conversationId: 'idem', type: 'text-delta', text: ' more', responseMessageId: 'resp-1' });
+    const secondHead = finalizeInterruptedTurn(APP_HOME, 'idem');
+    // Still only one append; the second finalize is a no-op that returns the id.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    expect(secondHead).toBe('resp-1');
+    clearFinalizedResponseIds('idem');
+  });
+
+  it('a fresh turn reusing the id space after clear can persist again', () => {
+    clearFinalizedResponseIds('reuse');
+    feed({ conversationId: 'reuse', type: 'text-delta', text: 'x', responseMessageId: 'resp-2' });
+    finalizeInterruptedTurn(APP_HOME, 'reuse');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    // done clears tracking in production; simulate it here.
+    clearFinalizedResponseIds('reuse');
+    feed({ conversationId: 'reuse', type: 'text-delta', text: 'y', responseMessageId: 'resp-2' });
+    finalizeInterruptedTurn(APP_HOME, 'reuse');
+    expect(appendMock).toHaveBeenCalledTimes(2);
+    clearFinalizedResponseIds('reuse');
   });
 
   it('merges a tool-call and its result into one tool part', () => {
