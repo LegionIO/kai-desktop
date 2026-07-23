@@ -668,6 +668,9 @@ export function getBridgeScript(): string {
       install: function() { return invoke('auto-update:install'); },
       onStatus: function(cb) { return on('auto-update:status', cb); }
     },
+    debug: {
+      trace: function(event) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'send', channel: 'debug:trace', data: event })); }
+    },
     diagnostics: {
       getSummary: function() { return invoke('diagnostics:get-summary'); },
       tailLog: function(maxBytes) { return invoke('diagnostics:tail-log', maxBytes); },

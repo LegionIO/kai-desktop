@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { AppConfig } from '../config/schema.js';
 
 export type DiagnosticTraceScope = 'agent' | 'automation' | 'alert' | 'plugin' | 'renderer' | 'window';
@@ -145,10 +145,13 @@ function rotate(path: string, cfg: TraceConfig): void {
   } catch {
     return;
   }
-  // Drop any rotated siblings above the (possibly reduced) limit so a lowered
-  // maxFiles is enforced immediately rather than waiting for age pruning.
+  // Drop rotated siblings of THIS trace file above the (possibly reduced) limit
+  // so a lowered maxFiles is enforced promptly. Scoped to the trace basename so
+  // unrelated *.jsonl.N logs in ~/.kai/logs are never touched.
+  const baseName = basename(path);
+  const siblingRe = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)$`);
   for (const name of readdirSync(dirname(path))) {
-    const match = /\.jsonl\.(\d+)$/.exec(name);
+    const match = siblingRe.exec(name);
     if (match && Number(match[1]) >= cfg.maxFiles) {
       try {
         rmSync(join(dirname(path), name), { force: true });
@@ -175,12 +178,17 @@ function rotate(path: string, cfg: TraceConfig): void {
 
 function prune(path: string, cfg: TraceConfig): void {
   const cutoff = Date.now() - cfg.maxAgeDays * 24 * 60 * 60 * 1000;
+  const baseName = basename(path);
+  const escaped = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Only this trace file and its rotated siblings (baseName + baseName.N).
+  const ownedRe = new RegExp(`^${escaped}(\\.(\\d+))?$`);
+  const suffixRe = new RegExp(`^${escaped}\\.(\\d+)$`);
   try {
     for (const name of readdirSync(dirname(path))) {
-      if (!name.startsWith('diagnostic-trace.jsonl')) continue;
+      if (!ownedRe.test(name)) continue;
       const candidate = join(dirname(path), name);
       // Enforce the (possibly reduced) rotated-file count: drop suffixes >= limit.
-      const match = /\.jsonl\.(\d+)$/.exec(name);
+      const match = suffixRe.exec(name);
       if (match && Number(match[1]) >= cfg.maxFiles) {
         try {
           rmSync(candidate, { force: true });

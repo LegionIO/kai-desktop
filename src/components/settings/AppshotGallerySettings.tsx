@@ -241,6 +241,15 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
     maxAgeDays: cfg.retention?.maxAgeDays ?? 30,
     maxTotalBytes: cfg.retention?.maxTotalBytes ?? 524288000,
   };
+  const [appshots, setAppshots] = useState<Appshot[]>([]);
+  const [viewing, setViewing] = useState<Appshot | null>(null);
+  // Monotonic guard: a slow older list() response must not overwrite a newer one.
+  const refreshSeqRef = useRef(0);
+  // Accumulates patches applied during the one-time legacy→canonical migration so
+  // two edits made before the first config round-trip merge instead of the second
+  // (which still sees `canonical` undefined) clobbering the first with stale cfg.
+  const migrationPatchRef = useRef<Partial<AppshotsConfig>>({});
+
   const setPersisted = (patch: Partial<AppshotsConfig>) => {
     if (canonical) {
       // Canonical object already exists: write only the changed leaf/leaves so
@@ -251,21 +260,19 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       }
       return;
     }
-    // First edit of a legacy-only config: write the FULL resolved object once so
+    // First edit(s) of a legacy-only config: write the FULL resolved object so
     // the other legacy fields aren't stranded when the resolver switches to the
-    // canonical location.
+    // canonical location. Merge into the accumulated migration patch so a second
+    // rapid edit (still seeing canonical=undefined) doesn't undo the first.
+    migrationPatchRef.current = { ...migrationPatchRef.current, ...patch };
     void updateConfig('appShots.persisted', {
       enabled: cfg.enabled ?? false,
       autoCapture: cfg.autoCapture ?? false,
       captureVisibleText: cfg.captureVisibleText ?? false,
       retention,
-      ...patch,
+      ...migrationPatchRef.current,
     });
   };
-  const [appshots, setAppshots] = useState<Appshot[]>([]);
-  const [viewing, setViewing] = useState<Appshot | null>(null);
-  // Monotonic guard: a slow older list() response must not overwrite a newer one.
-  const refreshSeqRef = useRef(0);
 
   const refresh = useCallback(() => {
     const seq = ++refreshSeqRef.current;

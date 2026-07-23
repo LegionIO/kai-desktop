@@ -168,6 +168,19 @@ describe('diagnostic trace', () => {
     expect(row.fields.resultCount).toBe(3);
   });
 
+  it('does not delete unrelated *.jsonl.N logs when enforcing maxFiles', () => {
+    mutateTrace({ enabled: true });
+    const base = getDiagnosticTracePath();
+    mkdirSync(dirname(base), { recursive: true });
+    const unrelated = join(dirname(base), 'custom.jsonl.3');
+    writeFileSync(unrelated, 'keep me');
+    writeFileSync(`${base}.3`, 'stale trace');
+    mutateTrace({ retention: { maxFileBytes: 10485760, maxFiles: 2, maxAgeDays: 7 } });
+    traceDiagnostic({ scope: 'automation', event: 'turn.start' });
+    expect(existsSync(unrelated)).toBe(true);
+    expect(existsSync(`${base}.3`)).toBe(false);
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
     mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
