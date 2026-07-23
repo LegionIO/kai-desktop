@@ -232,13 +232,22 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             id="diagnostics.debugTrace.enabled"
             label="Enable diagnostic trace"
             checked={debugTrace?.enabled ?? false}
-            onChange={(value) => void updateConfig('diagnostics.debugTrace.enabled', value)}
+            onChange={(value) => {
+              // Turning tracing OFF also clears content mode, so it can't silently
+              // remain enabled and record content during the round trip when
+              // tracing is later re-enabled.
+              if (!value && debugTrace?.includeContent) {
+                void updateConfig('diagnostics.debugTrace.includeContent', false);
+              }
+              void updateConfig('diagnostics.debugTrace.enabled', value);
+            }}
           />
           <Toggle
             id="diagnostics.debugTrace.includeContent"
             label="Include bounded message/tool content"
             checked={debugTrace?.includeContent ?? false}
-            disabled={!debugTrace?.enabled}
+            // Kept usable even while tracing is off so a user can return to
+            // metadata-only mode without first re-enabling tracing.
             onChange={(value) => void updateConfig('diagnostics.debugTrace.includeContent', value)}
           />
         </div>

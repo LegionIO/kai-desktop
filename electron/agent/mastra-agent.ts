@@ -1610,7 +1610,8 @@ async function* streamWithRealEvents(
   const BASE_DELAY_MS = 500;
   const MAX_DELAY_MS = 32_000;
 
-  compatibilityLoop: while (true) {
+  try {
+    compatibilityLoop: while (true) {
     let requestCompleted = false;
     let compatibilityRetryRequested = false;
     let sanitizationRetryRequested = false;
@@ -2012,13 +2013,19 @@ async function* streamWithRealEvents(
         totalTokens: accInputTokens + accOutputTokens,
       },
     };
-  }
+    }
 
-  yield {
-    conversationId,
-    type: 'done',
-    ...(terminalFinishReason ? { data: { finishReason: terminalFinishReason } } : {}),
-  };
+    yield {
+      conversationId,
+      type: 'done',
+      ...(terminalFinishReason ? { data: { finishReason: terminalFinishReason } } : {}),
+    };
+  } finally {
+    // Unconditional cleanup: an abort/throw before the trailing-marker drain must
+    // not leave queued inject entries (incl. user text) in the module-level map
+    // for a conversation that may never run again.
+    clearInjectConsumedMarkers(conversationId);
+  }
 }
 
 /**

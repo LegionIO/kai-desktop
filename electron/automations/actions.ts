@@ -536,6 +536,9 @@ async function runAgentAction(
   let drainRequeued = false;
   // Injected user turns whose boundary persist failed twice — retried PERSIST-ONLY
   // (never re-fed to the model) in the finally so they aren't lost on reload.
+  // Because anyBoundaryFailed defers ALL later boundaries once one fails, no
+  // assistant segment is persisted BETWEEN failed entries, so inserting them in
+  // FIFO order before the terminal assistant preserves chronology.
   const failedBoundaryUsers: Array<{ id: string; text: string; at: number }> = [];
   // Turn-scoped: once ANY boundary entry fails to persist, all later boundaries'
   // entries are also deferred to recovery (preserving chronology) — a per-flush

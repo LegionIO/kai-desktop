@@ -150,7 +150,9 @@ describe('DiagnosticsSettings plugin process controls', () => {
 
     fireEvent.click(await screen.findByLabelText('Enable diagnostic trace'));
     expect(updateConfig).toHaveBeenCalledWith('diagnostics.debugTrace.enabled', true);
-    expect(screen.getByLabelText('Include bounded message/tool content')).toBeDisabled();
+    // Content toggle stays usable even when tracing is off (so the user can
+    // return to metadata-only without re-enabling tracing first).
+    expect(screen.getByLabelText('Include bounded message/tool content')).not.toBeDisabled();
   });
 
   it('identifies the Electron fallback runtime', async () => {
