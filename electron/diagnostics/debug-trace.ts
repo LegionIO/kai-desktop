@@ -34,7 +34,8 @@ type TraceConfig = {
 };
 
 const DEFAULT_SCOPES: DiagnosticTraceScope[] = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'];
-const SECRET_KEY_RE = /(authorization|cookie|token|secret|password|api[-_]?key|credential|session)/i;
+const SECRET_KEY_RE =
+  /(authorization|cookie|token|secret|password|passphrase|api[-_]?key|credential|session|(?:private|public|access|signing|encryption|auth|client|refresh|bearer)[-_]?key)/i;
 // Content words matched anywhere in a key (camelCase, snake_case, or plain), so
 // `body`, `messageBody`, `promptText`, `toolArgs`, `request_url` are all caught.
 const CONTENT_WORD_RE = /(body|content|text|prompt|message|args|result|payload|response|url|uri|href|path|filename)/i;

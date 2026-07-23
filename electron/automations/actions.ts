@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -122,7 +122,7 @@ export async function resumeConversationWithMessage(
   conversationId: string,
   promptText: string,
   deps: ActionDeps,
-  opts?: { modelKey?: string; profileKey?: string; tools?: boolean },
+  opts?: { modelKey?: string; profileKey?: string; tools?: boolean; correlationId?: string },
 ): Promise<unknown> {
   const action: Extract<AutomationAction, { type: 'agent' }> = {
     type: 'agent',
@@ -159,6 +159,9 @@ export async function resumeConversationWithMessage(
     literalPrompt: true,
     strictExistingTarget: true,
     forceFreshTurn: true,
+    // Thread the alert's stable correlation id so the resumed agent turn's traces
+    // share the alert's `alert-<id>` id (creation → answer → resume all correlate).
+    ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
   });
 }
 
@@ -968,34 +971,50 @@ async function runAgentAction(
           // re-injecting the follow-up with its original id into the freed slot)
           // keeps a single navigable branch. Variant preservation still applies
           // normally to non-injected turns (handled by the stream layer).
+          let rollbackConfirmed = true;
           if (boundaryPersistedIds.length > 0) {
             try {
               dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], {
                 runStatus: 'running',
               });
             } catch {
-              /* best effort */
+              /* best effort — verified below */
             }
+            // Verify the nodes were actually removed. If the drop threw before
+            // committing, some may remain; reusing their ids would make the retry
+            // adopt stale failed-branch nodes.
+            const remainingTree = (readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{
+              id?: unknown;
+            }>;
+            rollbackConfirmed = !boundaryPersistedIds.some((id) => remainingTree.some((m) => m.id === id));
             traceDiagnostic({
               scope: 'automation',
               event: 'inject.boundary-rolled-back',
               correlationId,
               conversationId,
               ruleId: rule.id,
-              fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback' },
+              fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback', rollbackConfirmed },
             });
             userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
           }
           boundaryPersistedIds.length = 0;
           preBoundaryParentId = undefined;
-          // Re-inject the follow-up for the retry (its on-disk node was just
-          // deleted, so reuse the SAME id into the freed slot). Reverse order so
-          // the head-insert restores FIFO. Without this the retry model — which
-          // restarts from the ORIGINAL messages with the queue already drained —
-          // never sees the follow-up.
+          // Re-inject the follow-up for the retry (streamWithFallback restarts from
+          // the ORIGINAL messages with the queue already drained, so without this
+          // the retry never sees the follow-up). If rollback CONFIRMED the on-disk
+          // nodes were removed, reuse the SAME ids into the freed slots (reverse →
+          // FIFO). If rollback could NOT be confirmed (stale nodes remain), use
+          // FRESH ids so the retry doesn't adopt the stale failed-branch nodes.
           if (consumedInjectEntries.length > 0) {
-            for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
-              reenqueueInject(conversationId, consumedInjectEntries[i]);
+            if (rollbackConfirmed) {
+              for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
+                reenqueueInject(conversationId, consumedInjectEntries[i]);
+              }
+            } else {
+              reenqueueFreshAtFront(
+                conversationId,
+                consumedInjectEntries.map((entry) => entry.text),
+              );
             }
           }
           consumedInjectEntries.length = 0;

@@ -28,7 +28,7 @@ import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { isGuiFocused } from '../agent/kai-presence.js';
-import { newDiagnosticCorrelationId, traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
@@ -131,7 +131,9 @@ export function notifyNewAlert(alert: Alert): void {
   traceDiagnostic({
     scope: 'alert',
     event: 'alert.created',
-    correlationId: newDiagnosticCorrelationId('alert'),
+    // Stable id derived from alert.id so a filter follows the alert from creation
+    // through answer → resumed agent turn (answer/resume use the same `alert-<id>`).
+    correlationId: `alert-${alert.id}`,
     conversationId: alert.conversationId,
     alertId: alert.id,
     fields: { kind: alert.kind, present, surface, status: alert.status },
@@ -197,7 +199,9 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
   try {
-    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps());
+    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
+      correlationId: `alert-${alert.id}`,
+    });
   } catch (err) {
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
     if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });

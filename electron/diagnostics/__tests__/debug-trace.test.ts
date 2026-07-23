@@ -209,6 +209,21 @@ describe('diagnostic trace', () => {
     expect(row.event).toBe('turn.start');
   });
 
+  it('redacts credential-style *Key fields in both modes', () => {
+    mutateTrace({ enabled: true, scopes: ['plugin'] });
+    traceDiagnostic({
+      scope: 'plugin',
+      event: 'plugin.load-complete',
+      fields: { privateKey: 'PK', accessKey: 'AK', modelKey: 'anthropic/claude', apiKey: 'sk-xxx' },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.privateKey).toBe('[redacted]');
+    expect(row.fields.accessKey).toBe('[redacted]');
+    expect(row.fields.apiKey).toBe('[redacted]');
+    // A model identifier key is NOT a credential — kept as metadata.
+    expect(row.fields.modelKey).toBe('anthropic/claude');
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
     mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
