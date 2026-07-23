@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -629,6 +629,11 @@ async function runAgentAction(
     // back so discarded/failed segments don't remain on disk as ancestors of the
     // successful retry.
     const boundaryPersistedIds: string[] = [];
+    // The actual inject entries consumed at boundaries this turn, so a
+    // model-fallback (which regenerates the whole response from the ORIGINAL
+    // messages and has already drained the queue) can re-enqueue them for the
+    // retry's prepareStep to re-consume — otherwise the follow-up is lost.
+    const consumedInjectEntries: Array<{ id: string; text: string; at: number }> = [];
     let preBoundaryParentId: string | null | undefined;
 
     /** Persist a genuine mid-turn boundary when prepareStep consumes queued
@@ -636,6 +641,7 @@ async function runAgentAction(
      * tool-call parts are complete before rotating the accumulator. */
     const persistInjectedBoundary = (entries: Array<{ id: string; text: string; at: number }>): void => {
       if (entries.length === 0) return;
+      consumedInjectEntries.push(...entries);
       if (preBoundaryParentId === undefined) preBoundaryParentId = userTurnHeadId;
       traceDiagnostic({
         scope: 'automation',
@@ -890,6 +896,16 @@ async function runAgentAction(
             userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
             boundaryPersistedIds.length = 0;
             preBoundaryParentId = undefined;
+          }
+          // Re-enqueue the injected turns the fallback discarded so the retry's
+          // prepareStep re-consumes them (streamWithFallback retries from the
+          // ORIGINAL messages and the queue was already drained). Reverse order so
+          // the head-insert restores FIFO. Without this the follow-up is lost.
+          if (consumedInjectEntries.length > 0) {
+            for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
+              reenqueueInject(conversationId, consumedInjectEntries[i]);
+            }
+            consumedInjectEntries.length = 0;
           }
         }
       }

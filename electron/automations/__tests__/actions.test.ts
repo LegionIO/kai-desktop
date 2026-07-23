@@ -701,6 +701,17 @@ describe('agent conversationTarget', () => {
     expect(dropConversationMessages).toHaveBeenCalled();
     const droppedIds = vi.mocked(dropConversationMessages).mock.calls.flatMap((c) => c[2] as string[]);
     expect(droppedIds).toContain('inj-fb');
+    // The injected follow-up is NOT lost: it's re-enqueued so the fallback retry's
+    // prepareStep re-consumes it and it lands on the branch again.
+    const injPersistedAfter = vi
+      .mocked(appendConversationMessages)
+      .mock.calls.some(
+        (call) =>
+          call[1] === 'convFbBoundary' &&
+          (call[2] as Array<{ id?: string; role: string }>).some((m) => m.id === 'inj-fb' && m.role === 'user'),
+      );
+    expect(injPersistedAfter).toBe(true);
+    expect(hasInjects('convFbBoundary')).toBe(false);
 
     vi.mocked(streamForPlugin).mockImplementation(async function* () {
       yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
