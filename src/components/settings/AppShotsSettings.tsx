@@ -27,18 +27,10 @@ export const AppShotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
       .catch(() => {});
   }, []);
 
+  // Write only the changed leaf so a concurrent saved-App-Shots (persisted.*)
+  // edit still in flight isn't clobbered by a stale whole-object write.
   const set = <K extends keyof AppShotsConfig>(key: K, value: AppShotsConfig[K]) => {
-    void updateConfig('appShots', {
-      ...cfg,
-      enabled: cfg.enabled ?? false,
-      hotkey: cfg.hotkey ?? 'CommandOrControl+Shift+1',
-      captureMode: cfg.captureMode ?? 'window',
-      includeUiTree: cfg.includeUiTree ?? true,
-      includeSelectedText: cfg.includeSelectedText ?? true,
-      uiTreeDepth: cfg.uiTreeDepth ?? 4,
-      autoAttach: cfg.autoAttach ?? false,
-      [key]: value,
-    });
+    void updateConfig(`appShots.${String(key)}`, value);
   };
 
   return (

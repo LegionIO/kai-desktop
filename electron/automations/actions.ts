@@ -654,7 +654,9 @@ async function runAgentAction(
         // partial assistant). prepareStep already drained the queue, so RE-ENQUEUE
         // the entries — the run's finally re-drains + persists them onto the
         // branch, so the injected user turns are never silently lost.
-        for (const entry of entries) reenqueueInject(conversationId, entry);
+        // Re-enqueue in REVERSE so the head-insert (unshift) restores original
+        // FIFO order (A→B), matching the order the model consumed them.
+        for (let i = entries.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, entries[i]);
         traceDiagnostic({
           scope: 'automation',
           event: 'inject.persist-failed',

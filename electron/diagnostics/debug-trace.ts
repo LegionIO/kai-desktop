@@ -89,14 +89,26 @@ export function isDiagnosticTraceEnabled(scope?: DiagnosticTraceScope): boolean 
   return cfg.enabled && (!scope || cfg.scopes.includes(scope));
 }
 
+function sanitizeScalar(value: unknown): unknown {
+  if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…` : value;
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
+  return String(value);
+}
+
 function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0): unknown {
   if (depth > 6) return '[depth-limit]';
   if (SECRET_KEY_RE.test(key)) return '[redacted]';
   // Error details can carry provider response bodies, prompts, file paths, or
-  // embedded credentials. In metadata-only mode surface just the shape/type, not
-  // the message/stack. `error`/`stack` are treated as content keys.
-  const isErrorKey = /(?:^|_)(error|stack|reason|cause)$/i.test(key);
-  if (!includeContent && (CONTENT_KEY_RE.test(key) || isErrorKey)) {
+  // embedded credentials — omit their message/stack in metadata-only mode.
+  const isErrorKey = /(?:^|_)(error|stack)$/i.test(key);
+  // `reason`/`cause` are usually short categorical codes (queued, disabled,
+  // reload-loop-guard, …) that ARE the useful metadata; keep short scalars but
+  // omit Errors / long strings that may embed sensitive detail.
+  const isReasonKey = /(?:^|_)(reason|cause)$/i.test(key);
+  if (!includeContent && isReasonKey && !(value instanceof Error) && !(typeof value === 'string' && value.length > 200)) {
+    return sanitizeScalar(value);
+  }
+  if (!includeContent && (CONTENT_KEY_RE.test(key) || isErrorKey || isReasonKey)) {
     if (value instanceof Error) return { omitted: true, name: value.name };
     if (typeof value === 'string') return { omitted: true, chars: value.length };
     if (Array.isArray(value)) return { omitted: true, items: value.length };

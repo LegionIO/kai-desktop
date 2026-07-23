@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject } from '../inject-queue.js';
+import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject, reenqueueInject } from '../inject-queue.js';
 
 describe('inject-queue (cooperative mid-turn injection)', () => {
   beforeEach(() => {
@@ -63,6 +63,19 @@ describe('inject-queue (cooperative mid-turn injection)', () => {
     clearInjects('c1');
     expect(hasInjects('c1')).toBe(false);
     expect(drainInjects('c1')).toEqual([]);
+  });
+
+  it('reenqueueInject (reverse iteration) restores original FIFO order + preserves id/at', () => {
+    const drained = [
+      { id: 'a', text: 'A', at: 1 },
+      { id: 'b', text: 'B', at: 2 },
+    ];
+    // Callers re-enqueue in reverse so head-inserts restore A→B.
+    for (let i = drained.length - 1; i >= 0; i -= 1) reenqueueInject('c1', drained[i]);
+    const out = drainInjects('c1');
+    expect(out.map((e) => e.id)).toEqual(['a', 'b']);
+    expect(out.map((e) => e.text)).toEqual(['A', 'B']);
+    expect(out.map((e) => e.at)).toEqual([1, 2]);
   });
 
   it('ignores empty conversationId or text (returns null)', () => {
