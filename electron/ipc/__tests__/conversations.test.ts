@@ -37,6 +37,7 @@ import {
   getConversationBranch,
   registerConversationHandlers,
 } from '../conversations.js';
+import { sumBranchTokenCounts } from '../../agent/tokenization.js';
 import {
   readIndex,
   readConversation,
@@ -564,6 +565,45 @@ describe('appendConversationMessages', () => {
     expect(stored.userMessageCount).toBe(2);
     expect(stored.hasUnread).toBe(true);
     expect(stored.lastAssistantUpdateAt).toBeTruthy();
+  });
+
+  it('populates a per-message tokenCount on appended nodes and sums correctly over a branch', () => {
+    writeConversationStore(appHome, {
+      conversations: {
+        c1: makeConversation('c1', {
+          messageTree: [{ id: 'u1', parentId: null, role: 'user', content: 'hi', createdAt: '2026-01-01T00:00:00Z' }],
+          headId: 'u1',
+          messageCount: 1,
+          userMessageCount: 1,
+        }) as never,
+      },
+      activeConversationId: null,
+      settings: {},
+    });
+
+    appendConversationMessages(appHome, 'c1', [
+      { role: 'user', content: 'a follow-up question with several words' },
+      { role: 'assistant', content: 'a reasonably detailed answer to the follow-up question' },
+    ]);
+
+    const stored = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; tokenCount?: number }>;
+      headId: string;
+    };
+    // Appended nodes carry a positive integer token count.
+    const appended = stored.messageTree.slice(1);
+    expect(appended).toHaveLength(2);
+    for (const node of appended) {
+      expect(typeof node.tokenCount).toBe('number');
+      expect(node.tokenCount).toBeGreaterThan(0);
+    }
+
+    // Branch sum equals the sum of the active-branch node counts (the pre-existing
+    // 'u1' node has no cached count and falls back to an estimate, still additive).
+    const branch = getConversationBranch(stored.messageTree as never, stored.headId);
+    const branchSum = sumBranchTokenCounts(branch as Array<{ tokenCount?: number; role?: unknown; content?: unknown }>);
+    const appendedSum = appended.reduce((acc, n) => acc + (n.tokenCount ?? 0), 0);
+    expect(branchSum).toBeGreaterThanOrEqual(appendedSum);
   });
 
   it('converts a legacy flat-messages conversation to a tree before appending', () => {

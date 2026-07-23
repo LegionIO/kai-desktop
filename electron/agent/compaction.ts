@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto';
 import {
   countBranchTokensCached,
-  estimateSerializedTokens,
   resolveConversationTokenization,
   serializeForTokenCounting,
+  sumBranchTokenCounts,
+  encodeCappedWith,
 } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { auxAgentGenerate } from './generate-fallback.js';
@@ -15,6 +16,13 @@ export type ChatMessage = {
   content: string | unknown[];
   tool_calls?: Array<{ id: string; [key: string]: unknown }>;
   tool_call_id?: string;
+  /**
+   * Cached per-message token count carried from the stored tree node (see
+   * StoredTreeMessage). When present, `shouldCompact` sums these instead of
+   * serializing + estimating the whole history each turn. Optional — missing
+   * counts fall back to a safe over-biased estimate.
+   */
+  tokenCount?: number;
 };
 
 function extractToolCallIds(message: ChatMessage): Set<string> {
@@ -144,18 +152,20 @@ export function shouldCompact(
   }
   const triggerTokens = Math.floor(tokenization.contextWindowTokens * triggerPercent);
 
-  // Cheap pre-check: an over-biased estimate from serialized length (no WASM).
-  // Because the estimate is >= the true token count, if even it is below the
-  // trigger the exact count must be too — skip tiktoken entirely. This is the
-  // common case every turn on a normal-length chat and keeps the expensive
-  // encode off the hot send path. Only when the estimate reaches the trigger do
-  // we pay for the exact count (memoized per branch).
-  const estimatedTokens = estimateSerializedTokens(messages);
-  if (estimatedTokens < triggerTokens) {
+  // Cheap pre-check: sum the cached per-message token counts over the branch
+  // (integer add, no whole-history JSON.stringify + WASM encode). Missing counts
+  // fall back to an over-biased char estimate, so the sum is >= the true whole-
+  // array token count: if even the sum is below the trigger, the exact count must
+  // be too — skip tiktoken entirely. This is the common case every turn and keeps
+  // the expensive encode off the hot send path. Only when the sum reaches the
+  // trigger do we pay for the exact count (memoized per branch, and byte-capped
+  // so a pathological history can never freeze the main thread).
+  const summedTokens = sumBranchTokenCounts(messages);
+  if (summedTokens < triggerTokens) {
     return {
       shouldCompact: false,
-      // Report the estimate for context-usage telemetry; it's an upper bound.
-      usedTokens: estimatedTokens,
+      // Report the sum for context-usage telemetry; it's an upper bound.
+      usedTokens: summedTokens,
       contextWindowTokens: tokenization.contextWindowTokens,
     };
   }
@@ -242,7 +252,7 @@ export async function compactConversationPrefix(
   let droppedForBudget = false;
   while (fittedPrefix.length > 0) {
     const candidatePromptText = serializeForTokenCounting(fittedPrefix);
-    const candidateTokens = tokenization.encoding.encode(candidatePromptText).length;
+    const candidateTokens = encodeCappedWith(candidatePromptText, tokenization.encoding);
     if (candidateTokens <= promptInputBudget) break;
     fittedPrefix.shift();
     droppedForBudget = true;
@@ -339,7 +349,7 @@ export async function compactConversationPrefix(
   // risk a provider hard-limit error). If it still doesn't fit, return the null
   // no-op — the turn proceeds on the full (uncompacted) context, preserving the
   // "null ⇒ no message loss" contract.
-  const compactedTokens = tokenization.encoding.encode(serializeForTokenCounting(compactedMessages)).length;
+  const compactedTokens = encodeCappedWith(serializeForTokenCounting(compactedMessages), tokenization.encoding);
   if (compactedTokens > promptInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
@@ -379,7 +389,7 @@ export function estimateToolTokens(text: string, modelName?: string): number {
   if (modelName) {
     const tokenization = resolveConversationTokenization(modelName);
     if (tokenization.encoding) {
-      return tokenization.encoding.encode(text).length;
+      return encodeCappedWith(text, tokenization.encoding);
     }
   }
   return Math.ceil(text.length / 4);

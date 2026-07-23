@@ -64,9 +64,50 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     }
   });
 
-  it('returns not-compact with zeros when the model has no known context window', () => {
+  it('uses a conservative fallback window for an unknown model (compaction stays enabled)', () => {
+    // Unknown models previously resolved a null window → shouldCompact bailed with
+    // zeros and compaction NEVER ran, so history grew unbounded and froze the main
+    // thread. Now an unknown model gets a conservative window: a tiny history still
+    // doesn't compact, but the window is reported (nonzero) so a large one WILL.
     const res = shouldCompact([{ role: 'user', content: 'hi' }], 'totally-made-up-model-xyz', 0.85);
-    expect(res).toEqual({ shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 });
+    expect(res.shouldCompact).toBe(false);
+    expect(res.contextWindowTokens).toBeGreaterThan(0);
+  });
+
+  it('summed per-message tokenCount gates the exact check (accumulator on the hot path)', () => {
+    // The cheap gate is the SUM of cached per-message tokenCounts (integer add, no
+    // whole-history stringify+encode). When the sum crosses the trigger we run the
+    // authoritative exact count. Here real content is genuinely large AND carries
+    // cached counts, so the sum gate trips and the exact check confirms → compacts.
+    const trigger = 0.85;
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(30000);
+    const tokenization = resolveConversationTokenization(MODEL);
+    const realCount = countSerializedTokens([{ role: 'user', content: big }], tokenization)!;
+    const msgs: ChatMessage[] = [{ role: 'user', content: big, tokenCount: realCount }];
+    const res = shouldCompact(msgs, MODEL, trigger);
+    expect(res.shouldCompact).toBe(true);
+  });
+
+  it('a large summed count with tiny real content does NOT compact (exact check is authoritative)', () => {
+    // Guards the design contract: the cheap sum only decides whether to RUN the
+    // exact encode; it never forces compaction on its own. A bogus/high cached
+    // count trips the gate but the exact count (tiny) vetoes.
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'a', tokenCount: 1_000_000 },
+      { role: 'assistant', content: 'b', tokenCount: 1_000_000 },
+    ];
+    const res = shouldCompact(msgs, MODEL, 0.85);
+    expect(res.shouldCompact).toBe(false);
+  });
+
+  it('does NOT compact when summed tokenCounts stay below the trigger', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'a', tokenCount: 10 },
+      { role: 'assistant', content: 'b', tokenCount: 20 },
+    ];
+    const res = shouldCompact(msgs, MODEL, 0.85);
+    expect(res.shouldCompact).toBe(false);
+    expect(res.usedTokens).toBe(30); // reports the sum
   });
 });
 

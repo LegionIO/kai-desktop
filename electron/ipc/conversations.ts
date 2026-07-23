@@ -12,6 +12,7 @@ import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { resolveStreamConfig } from '../agent/model-catalog.js';
 import { compactConversationPrefix } from '../agent/compaction.js';
+import { countMessageTokensCanonical } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
@@ -66,6 +67,15 @@ export type StoredTreeMessage = {
   content: unknown;
   parentId: string | null;
   createdAt: string;
+  /**
+   * Cached exact token count of this single message (JSON.stringify(msg) through
+   * tiktoken), computed once at creation. Tree nodes are immutable, so this never
+   * needs invalidation. Summed over the active branch to gate compaction WITHOUT
+   * re-encoding the whole history every turn (the cause of the main-thread
+   * freeze). Optional: older messages and untrusted persisted trees may lack it,
+   * and `sumBranchTokenCounts` falls back to a cheap over-biased estimate.
+   */
+  tokenCount?: number;
 };
 
 export function ensureConversationTree(conv: ConversationRecord): {
@@ -149,6 +159,11 @@ export function appendConversationMessages(
       content: m.content,
       parentId,
       createdAt: m.createdAt ?? now,
+      // Cache the exact per-message token count at creation (cheap — one small
+      // message). Summed over the branch to gate compaction without re-encoding
+      // the whole history each turn. undefined when no encoding is available;
+      // sumBranchTokenCounts then falls back to a safe over-biased estimate.
+      tokenCount: countMessageTokensCanonical(m),
     };
     usedIds.add(node.id);
     parentId = node.id;
@@ -265,6 +280,7 @@ export function insertConversationMessageBefore(
     content: message.content,
     parentId: target.parentId,
     createdAt: message.createdAt ?? now,
+    tokenCount: countMessageTokensCanonical(message),
   };
   const nextTree = tree.map((m) => (m.id === beforeId ? { ...m, parentId: newId } : m));
   nextTree.push(node);
@@ -650,6 +666,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
         content,
         parentId: source.parentId,
         createdAt: new Date().toISOString(),
+        tokenCount: countMessageTokensCanonical({ role: source.role, content }),
       };
       const nextTree = [...tree, edited];
       return { ok: true, conversation: commitTreeUpdate(conv, nextTree, edited.id) };

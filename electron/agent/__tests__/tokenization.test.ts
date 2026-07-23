@@ -6,6 +6,11 @@ import {
   countBranchTokensCached,
   countSerializedTokens,
   serializeForTokenCounting,
+  sumBranchTokenCounts,
+  countMessageTokensCanonical,
+  encodeCappedWith,
+  resolveEncodingForModel,
+  MAX_SYNC_ENCODE_CHARS,
   __clearExactTokenCacheForTests,
   MODEL_CONTEXT_WINDOWS,
 } from '../tokenization';
@@ -48,8 +53,12 @@ describe('resolveConversationTokenization', () => {
     expect(resolveConversationTokenization('o3', Number.NaN).contextWindowTokens).toBe(MODEL_CONTEXT_WINDOWS.o3);
   });
 
-  it('returns null context window for a wholly unknown model with no override', () => {
-    expect(resolveConversationTokenization('totally-made-up-model-xyz').contextWindowTokens).toBeNull();
+  it('falls back to a conservative context window for a wholly unknown model (compaction stays enabled)', () => {
+    // Previously returned null, which silently disabled compaction and let an
+    // unknown model's history grow unbounded until it froze the main thread.
+    const win = resolveConversationTokenization('totally-made-up-model-xyz').contextWindowTokens;
+    expect(win).not.toBeNull();
+    expect(win).toBeGreaterThan(0);
   });
 });
 
@@ -137,5 +146,110 @@ describe('serializeForTokenCounting', () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     expect(serializeForTokenCounting(cyclic)).toBe('');
+  });
+});
+
+describe('gpt-5.5 + unknown-model context windows', () => {
+  it('recognizes gpt-5.5 and gpt-5.5-pro with a context window', () => {
+    expect(normalizeConversationModelName('openai/gpt-5.5-2026-01-01')).toBe('gpt-5.5');
+    expect(normalizeConversationModelName('gpt-5.5-pro')).toBe('gpt-5.5-pro');
+    expect(resolveConversationTokenization('gpt-5.5').contextWindowTokens).toBe(MODEL_CONTEXT_WINDOWS['gpt-5.5']);
+    expect(resolveConversationTokenization('gpt-5.5-pro').contextWindowTokens).toBe(
+      MODEL_CONTEXT_WINDOWS['gpt-5.5-pro'],
+    );
+  });
+
+  it('falls back to a conservative window for an unknown model (so compaction still runs)', () => {
+    const info = resolveConversationTokenization('some-brand-new-model-9');
+    // Was previously null (which silently disabled compaction and let history grow unbounded).
+    expect(info.contextWindowTokens).toBeGreaterThan(0);
+  });
+
+  it('an explicit override always wins over the default', () => {
+    expect(resolveConversationTokenization('some-brand-new-model-9', 999_999).contextWindowTokens).toBe(999_999);
+  });
+});
+
+describe('sumBranchTokenCounts', () => {
+  it('sums cached per-message tokenCount values', () => {
+    expect(sumBranchTokenCounts([{ tokenCount: 10 }, { tokenCount: 5 }, { tokenCount: 0 }])).toBe(15);
+  });
+
+  it('falls back to an over-biased estimate for messages missing a count', () => {
+    const withCount = sumBranchTokenCounts([{ role: 'user', content: 'hello world', tokenCount: 3 }]);
+    expect(withCount).toBe(3);
+    const missing = sumBranchTokenCounts([{ role: 'user', content: 'hello world' }]);
+    // No count → estimate; estimate is a positive over-biased number.
+    expect(missing).toBeGreaterThan(0);
+  });
+
+  it('ignores invalid (negative/NaN) counts and estimates instead', () => {
+    const s = sumBranchTokenCounts([
+      { role: 'user', content: 'x', tokenCount: -4 },
+      { role: 'user', content: 'y', tokenCount: Number.NaN },
+    ]);
+    expect(s).toBeGreaterThan(0);
+  });
+
+  it('the summed value is a safe over-estimate of the whole-array exact count', () => {
+    const msgs = [
+      { role: 'user' as const, content: 'The quick brown fox jumps over the lazy dog.' },
+      { role: 'assistant' as const, content: 'A summary of the prior message with some detail.' },
+      { role: 'user' as const, content: 'Another follow-up question about the topic at hand.' },
+    ];
+    const withCounts = msgs.map((m) => ({ ...m, tokenCount: countMessageTokensCanonical(m) }));
+    const tokenization = resolveConversationTokenization('gpt-5');
+    const exactWhole = countSerializedTokens(
+      msgs.map((m) => ({ role: m.role, content: m.content })),
+      tokenization,
+    )!;
+    const summed = sumBranchTokenCounts(withCounts);
+    // Per-message counts don't share BPE merges across delimiters, so the sum is
+    // >= the whole-array encode. Never-skip property: gate value must not undercount.
+    expect(summed).toBeGreaterThanOrEqual(exactWhole);
+  });
+});
+
+describe('countMessageTokensCanonical', () => {
+  it('counts a single message via the canonical encoding', () => {
+    const n = countMessageTokensCanonical({ role: 'user', content: 'hello' });
+    expect(typeof n).toBe('number');
+    expect(n).toBeGreaterThan(0);
+  });
+
+  it('counts only the {role, content} projection (tree bookkeeping is irrelevant)', () => {
+    const a = countMessageTokensCanonical({ role: 'user', content: 'hello' });
+    const b = countMessageTokensCanonical({
+      // extra tree fields must not change the count
+      ...{ id: 'x', parentId: 'y', createdAt: 'z' },
+      role: 'user',
+      content: 'hello',
+    } as { role: string; content: string });
+    expect(a).toBe(b);
+  });
+});
+
+describe('encode cap (main-thread freeze backstop)', () => {
+  it('encodes normally below the cap', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    const small = 'hello world '.repeat(10);
+    expect(encodeCappedWith(small, enc)).toBe(enc.encode(small).length);
+  });
+
+  it('falls back to the char estimate above the cap instead of encoding', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    const huge = 'a'.repeat(MAX_SYNC_ENCODE_CHARS + 1);
+    const capped = encodeCappedWith(huge, enc);
+    // Must return a positive estimate WITHOUT the (slow) real encode; estimate is length/MIN_CHARS_PER_TOKEN.
+    expect(capped).toBeGreaterThan(0);
+    expect(capped).toBeLessThan(huge.length);
+  });
+
+  it('countBranchTokensCached honors the cap for a pathological branch', () => {
+    __clearExactTokenCacheForTests();
+    const tokenization = resolveConversationTokenization('gpt-5');
+    const bigContent = 'z'.repeat(MAX_SYNC_ENCODE_CHARS + 100);
+    const n = countBranchTokensCached([{ role: 'user', content: bigContent }], tokenization, 'big');
+    expect(n).toBeGreaterThan(0);
   });
 });
