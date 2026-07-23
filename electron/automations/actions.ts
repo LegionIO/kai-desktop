@@ -677,11 +677,18 @@ async function runAgentAction(
     // retry's prepareStep to re-consume — otherwise the follow-up is lost.
     const consumedInjectEntries: Array<{ id: string; text: string; at: number }> = [];
     let preBoundaryParentId: string | null | undefined;
+    // prepareStep can fire the inject callback BEFORE the current step's
+    // tool-call/result events reach this fullStream consumer. Buffer the entries
+    // here and flush (persist the boundary) only at the TOP of the next loop
+    // iteration / after the loop, by which point contentParts holds all prior
+    // events — so the injected user lands AFTER the completed tool result, not
+    // before it.
+    let pendingBoundary: Array<{ id: string; text: string; at: number }> = [];
 
-    /** Persist a genuine mid-turn boundary when prepareStep consumes queued
-     * automation injects. This runs after the prior step's tool results, so all
+    /** Persist a genuine mid-turn boundary. Called from the stream loop (NOT
+     * directly from prepareStep) once the prior step's events are consumed, so all
      * tool-call parts are complete before rotating the accumulator. */
-    const persistInjectedBoundary = (entries: Array<{ id: string; text: string; at: number }>): void => {
+    const flushInjectedBoundary = (entries: Array<{ id: string; text: string; at: number }>): void => {
       if (entries.length === 0) return;
       consumedInjectEntries.push(...entries);
       if (preBoundaryParentId === undefined) preBoundaryParentId = userTurnHeadId;
@@ -880,8 +887,21 @@ async function runAgentAction(
         fallbackEnabled: Boolean(action.profileKey),
         tools,
         abortSignal: abortController.signal,
-        onInjected: persistInjectedBoundary,
+        // prepareStep may fire this BEFORE the prior step's events reach this
+        // loop; buffer, don't persist synchronously. Flushed at the top of each
+        // iteration (below) once those events have been consumed.
+        onInjected: (entries) => {
+          pendingBoundary.push(...entries);
+        },
       })) {
+        // Flush any buffered inject boundary FIRST — all events from the prior
+        // step have now been consumed into contentParts, so the boundary splits
+        // after the completed tool result, not before it.
+        if (pendingBoundary.length > 0) {
+          const toFlush = pendingBoundary;
+          pendingBoundary = [];
+          flushInjectedBoundary(toFlush);
+        }
         // Don't forward the inner stream's `done` — the renderer treats an
         // automation `done` as terminal (clears + reloads). We broadcast exactly
         // one terminal `done` AFTER the authoritative append below. Consume the
@@ -1019,6 +1039,13 @@ async function runAgentAction(
           }
           consumedInjectEntries.length = 0;
         }
+      }
+      // Flush a boundary buffered on the FINAL step (no further iteration will).
+      // Its prior-step events are all consumed by now.
+      if (pendingBoundary.length > 0) {
+        const toFlush = pendingBoundary;
+        pendingBoundary = [];
+        flushInjectedBoundary(toFlush);
       }
     } catch (streamErr) {
       // Setup or mid-stream failure after the prompt was written. Record it and

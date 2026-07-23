@@ -295,7 +295,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
               onChange={(event) =>
                 void updateConfig(
                   'diagnostics.debugTrace.retention.maxFileBytes',
-                  Math.max(1, Number(event.target.value) || 10) * 1048576,
+                  Math.min(100, Math.max(1, Number(event.target.value) || 10)) * 1048576,
                 )
               }
               className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground"
