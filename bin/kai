@@ -107,13 +107,12 @@ BIN=$(find_binary) || {
   exit 127
 }
 
-# Filter ONLY the noise Node's internal path prints to stderr on startup — the
-# "ExperimentalWarning: SQLite is an experimental feature" line (emitted when a
-# transitive dep imports node:sqlite; it can't be intercepted in-process, and
-# NODE_OPTIONS is fuse-disabled) plus its companion "(Use `... --trace-warnings`)"
-# hint. stdout (the Ink TUI) and stdin (the TTY) are untouched, so the terminal
-# UI is unaffected; the child's real exit code is preserved via a temp file. If
-# grep/mktemp are unavailable, fall back to a plain exec so the CLI always runs.
+# Defensively filter the historical SQLite warning when this launcher is pointed
+# at an older app binary via KAI_APP_BINARY. Current builds keep Undici external
+# and fail the build if node:sqlite is eagerly imported, so they do not emit it.
+# stdout (the Ink TUI) and stdin (the TTY) are untouched; the child's real exit
+# code is preserved via a temp file. If grep/mktemp are unavailable, fall back to
+# a plain exec so the CLI always runs.
 if command -v grep >/dev/null 2>&1 && command -v mktemp >/dev/null 2>&1; then
   __kai_status=$(mktemp) || exec "$BIN" --kai-cli "$@"
   # fd3 = the terminal's stdout. Child stdout → fd1 (terminal); child stderr →

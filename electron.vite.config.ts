@@ -82,6 +82,12 @@ export default defineConfig({
           // esbuild must stay external — its JS API locates its native
           // binary via a relative path and breaks when bundled.
           'esbuild',
+          // Undici's CommonJS entry exports an optional SqliteCacheStore whose
+          // `require('node:sqlite')` is intentionally lazy. Bundling hoists that
+          // require into an eager top-level import, making every Kai process load
+          // Node's experimental SQLite module even though we never use the cache.
+          // Keep Undici external so its original lazy-loading boundary survives.
+          'undici',
           // Native addons that can't be bundled
           'better-sqlite3',
           'tiktoken',
@@ -113,12 +119,6 @@ export default defineConfig({
           // function (e.g. runCliClient) is too late in the packaged app: main.ts's
           // large static import graph loads first and fires the warning to the
           // CLI's stderr before our code runs.
-          //
-          // (The SQLite ExperimentalWarning is handled separately: it's emitted
-          // by Node's internal path — not JS process.emitWarning, and not
-          // reachable via NODE_OPTIONS since that fuse is off — so it can't be
-          // intercepted here; the `kai` launcher (bin/kai) filters that one line
-          // out of the CLI's stderr instead.)
           banner: 'process.noDeprecation = true;',
         },
       },
