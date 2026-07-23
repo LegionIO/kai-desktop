@@ -236,13 +236,15 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(encodeCappedWith(small, enc)).toBe(enc.encode(small).length);
   });
 
-  it('falls back to the char estimate above the cap instead of encoding', () => {
+  it('falls back to a TRUE-UPPER-BOUND char count above the cap instead of encoding', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
     const huge = 'a'.repeat(MAX_SYNC_ENCODE_CHARS + 1);
     const capped = encodeCappedWith(huge, enc);
-    // Must return a positive estimate WITHOUT the (slow) real encode; estimate is length/MIN_CHARS_PER_TOKEN.
-    expect(capped).toBeGreaterThan(0);
-    expect(capped).toBeLessThan(huge.length);
+    // Above the cap we must NOT run the slow encode, and must return a value that
+    // can never UNDER-count (1 token/char worst case), so budget-fit never accepts
+    // an over-window prefix. For this ASCII string the real count is far smaller,
+    // so the ceiling being >= real is the safe property.
+    expect(capped).toBe(huge.length);
   });
 
   it('countBranchTokensCached honors the cap for a pathological branch', () => {

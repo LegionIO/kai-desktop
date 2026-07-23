@@ -189,9 +189,9 @@ export function appendConversationMessages(
     ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
   };
 
-  writeConversation(appHome, next);
-  broadcastUpsert(appHome, next);
-  return next;
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return written;
 }
 
 /**
@@ -242,9 +242,9 @@ export function dropConversationMessages(
     userMessageCount: branch.filter((m) => m.role === 'user').length,
     ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
   };
-  writeConversation(appHome, next);
-  broadcastUpsert(appHome, next);
-  return next;
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return written;
 }
 
 /**
@@ -294,9 +294,9 @@ export function insertConversationMessageBefore(
     userMessageCount: branch.filter((m) => m.role === 'user').length,
     ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
   };
-  writeConversation(appHome, next);
-  broadcastUpsert(appHome, next);
-  return next;
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return written;
 }
 
 function timestampMs(value: string | null | undefined): number {
@@ -564,8 +564,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       nextConversation = reconcileConversationActivity(undefined, nextConversation);
     }
 
-    writeConversation(appHome, nextConversation);
-    broadcastUpsert(appHome, nextConversation);
+    const written = writeConversation(appHome, nextConversation);
+    broadcastUpsert(appHome, written);
     if (!prev) {
       eventBus.emit('conversation', 'created', { id: conversation.id, title: nextConversation.title });
       void hookDispatcher.dispatch('ConversationStart', {
@@ -639,9 +639,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       lastAssistantUpdateAt: activity.lastAssistantUpdateAt,
       ...extra,
     };
-    writeConversation(appHome, next);
-    broadcastUpsert(appHome, next);
-    return next;
+    const written = writeConversation(appHome, next);
+    broadcastUpsert(appHome, written);
+    return written;
   };
 
   ipcMain.handle(
@@ -820,8 +820,8 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       if (kind === 'model') conv.selectedModelKey = value;
       else conv.selectedProfileKey = value;
       conv.updatedAt = new Date().toISOString();
-      writeConversation(appHome, conv);
-      broadcastUpsert(appHome, conv);
+      const writtenConv = writeConversation(appHome, conv);
+      broadcastUpsert(appHome, writtenConv);
 
       // Resolve the effective model display name for the banner.
       let modelLabel: string | null = null;
@@ -905,11 +905,11 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       })(),
     };
 
-    writeConversation(appHome, forked);
-    broadcastUpsert(appHome, forked);
+    const writtenFork = writeConversation(appHome, forked);
+    broadcastUpsert(appHome, writtenFork);
     eventBus.emit('conversation', 'created', { id: forked.id, title: forked.title });
     void hookDispatcher.dispatch('ConversationStart', { conversationId: forked.id, title: forked.title });
-    return { ok: true, conversation: forked };
+    return { ok: true, conversation: writtenFork };
   });
 
   ipcMain.handle(

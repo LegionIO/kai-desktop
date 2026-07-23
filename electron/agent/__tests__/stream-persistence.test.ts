@@ -70,23 +70,44 @@ describe('stream persistence accumulator', () => {
     ]);
   });
 
-  it('does NOT append the same response id twice (idempotent finalize)', () => {
-    // A second finalize of the same reply (stop/drain/inject-consumed all reach a
-    // finalize) must not create a duplicate assistant node — this is what produced
-    // the two-node cycle + orphaned history in the mid-turn-inject corruption.
-    clearFinalizedResponseIds('idem');
-    feed({ conversationId: 'idem', type: 'text-delta', text: 'partial', responseMessageId: 'resp-1' });
-    const firstHead = finalizeInterruptedTurn(APP_HOME, 'idem');
+  it('preserves a continuation segment after an inject boundary (same responseMessageId) with a fresh id', () => {
+    // Mastra reuses the SAME responseMessageId across steps of a run. After a
+    // mid-turn inject we finalize the partial under that id; the run then CONTINUES
+    // streaming new content under the same id. The continuation must NOT be
+    // discarded — it is persisted as its own assistant node under a fresh id.
+    clearFinalizedResponseIds('cont');
+    feed({ conversationId: 'cont', type: 'text-delta', text: 'partial', responseMessageId: 'resp-1' });
+    const firstHead = finalizeInterruptedTurn(APP_HOME, 'cont');
     expect(appendMock).toHaveBeenCalledTimes(1);
     expect(firstHead).toBeTruthy();
+    const firstId = (appendMock.mock.calls[0][2] as Array<{ id?: string }>)[0].id;
+    expect(firstId).toBe('resp-1'); // partial persisted under the real id
 
-    // Repopulate the same accumulator id and finalize again.
-    feed({ conversationId: 'idem', type: 'text-delta', text: ' more', responseMessageId: 'resp-1' });
-    const secondHead = finalizeInterruptedTurn(APP_HOME, 'idem');
-    // Still only one append; the second finalize is a no-op that returns the id.
+    // Continuation: a NEW accumulator with genuinely new content, same response id.
+    feed({ conversationId: 'cont', type: 'text-delta', text: ' continued', responseMessageId: 'resp-1' });
+    const secondHead = finalizeInterruptedTurn(APP_HOME, 'cont');
+    // The continuation IS persisted (not dropped) — a second append.
+    expect(appendMock).toHaveBeenCalledTimes(2);
+    const secondMsg = (appendMock.mock.calls[1][2] as Array<{ id?: string; content: unknown }>)[0];
+    // …under a FRESH id (not the already-taken resp-1) so it's a distinct node.
+    expect(secondMsg.id).not.toBe('resp-1');
+    expect(secondMsg.id).toContain('resp-1'); // derived from it for traceability
+    expect(secondHead).toBeTruthy();
+    clearFinalizedResponseIds('cont');
+  });
+
+  it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
+    // finalize deletes the accumulator, so a second finalize with nothing newly
+    // accumulated hits the empty guard and does not append.
+    clearFinalizedResponseIds('empty');
+    feed({ conversationId: 'empty', type: 'text-delta', text: 'x', responseMessageId: 'resp-e' });
+    finalizeInterruptedTurn(APP_HOME, 'empty');
     expect(appendMock).toHaveBeenCalledTimes(1);
-    expect(secondHead).toBe('resp-1');
-    clearFinalizedResponseIds('idem');
+    // No new feed → accumulator is gone → second finalize appends nothing.
+    const head = finalizeInterruptedTurn(APP_HOME, 'empty');
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    expect(head).toBeNull();
+    clearFinalizedResponseIds('empty');
   });
 
   it('a fresh turn reusing the id space after clear can persist again', () => {

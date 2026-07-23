@@ -392,4 +392,80 @@ describe('writeConversation repairs a corrupt tree at the write chokepoint', () 
       }
     }
   });
+
+  it('returns the SANITIZED record so callers broadcast the repaired tree (not the corrupt input)', () => {
+    const conv = {
+      id: 'ret',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'a' },
+        { id: 'dup', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'x' }] },
+        { id: 'dup', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'y' }] },
+      ],
+      headId: 'dup',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 0,
+      userMessageCount: 0,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    const returned = writeConversation(appHome, conv);
+    const rtree = returned.messageTree as Array<{ id: string }>;
+    // The returned record is de-duped (matches disk), not the 3-node corrupt input.
+    expect(rtree.filter((n) => n.id === 'dup')).toHaveLength(1);
+    expect(rtree.length).toBe(2);
+    // And it matches what is on disk.
+    const disk = readConversation(appHome, 'ret')!;
+    expect((disk.messageTree as unknown[]).length).toBe(rtree.length);
+  });
+
+  it('backfills missing per-message tokenCount at the write chokepoint (covers the put path)', () => {
+    const conv = {
+      id: 'bf',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'hello there' },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: 'a reply' },
+      ],
+      headId: 'a1',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 0,
+      userMessageCount: 0,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    const returned = writeConversation(appHome, conv);
+    const rtree = returned.messageTree as Array<{ id: string; tokenCount?: number }>;
+    for (const n of rtree) {
+      expect(typeof n.tokenCount).toBe('number');
+      expect(n.tokenCount).toBeGreaterThan(0);
+    }
+    // Persisted on disk too.
+    const disk = readConversation(appHome, 'bf')!;
+    for (const n of disk.messageTree as Array<{ tokenCount?: number }>) {
+      expect(typeof n.tokenCount).toBe('number');
+    }
+  });
 });

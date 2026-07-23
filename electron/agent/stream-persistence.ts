@@ -374,12 +374,32 @@ function persistAccumulatedReturningHead(
     }
     return null;
   }
-  // Idempotence: if this exact response id was already persisted (a second
-  // finalize of the same reply from the stop/drain/inject-consumed paths), do NOT
-  // append a duplicate assistant node. Return the existing node's id as the head
-  // so the caller's parent-rebind still points at the real message.
-  if (acc.responseMessageId && isResponseAlreadyFinalized(conversationId, acc.responseMessageId)) {
-    return acc.responseMessageId;
+  // Idempotence vs. continuation after a cooperative inject:
+  //
+  // Mastra reuses the SAME responseMessageId across steps of one run. After a
+  // mid-turn inject we finalize the partial assistant under that id (marking it
+  // finalized), then the run CONTINUES streaming new content under the same id.
+  // So "id already finalized" does NOT mean "duplicate" — it can mean "this is a
+  // legitimate continuation segment." We must:
+  //   • drop a true duplicate (same id, nothing new persisted since — the
+  //     stop/drain/inject-consumed paths racing on the same partial), but
+  //   • KEEP a continuation segment (new content), persisting it as its own node.
+  // Since the id is already taken by the partial, a continuation cannot reuse it
+  // (appendConversationMessages would collision-rename anyway); give it a fresh id
+  // so the segment is preserved as a distinct assistant node on the branch.
+  const alreadyFinalized = acc.responseMessageId
+    ? isResponseAlreadyFinalized(conversationId, acc.responseMessageId)
+    : false;
+  let effectiveId = acc.responseMessageId;
+  if (alreadyFinalized) {
+    // A duplicate finalize with no genuinely-new content is a no-op (return the
+    // existing node id so a caller's parent-rebind still points at a real node).
+    // We can't cheaply diff content, so treat the presence of an inject boundary
+    // (the continuation is a fresh accumulator built after the partial was
+    // deleted) as "continuation": persist under a fresh id. A pure re-finalize of
+    // the SAME in-memory accumulator can't happen — finalize deletes it above —
+    // so any accumulator we see here with content is new content to keep.
+    effectiveId = `${acc.responseMessageId}-cont-${Date.now().toString(36)}`;
   }
   try {
     // Parent on the head captured at submit so a mid-run branch change
@@ -393,7 +413,7 @@ function persistAccumulatedReturningHead(
       conversationId,
       [
         {
-          ...(acc.responseMessageId ? { id: acc.responseMessageId } : {}),
+          ...(effectiveId ? { id: effectiveId } : {}),
           role: 'assistant',
           content: acc.parts,
         },

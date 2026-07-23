@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rename
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { countMessageTokensCanonical } from '../agent/tokenization.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -352,22 +353,35 @@ export function sanitizeMessageTree(
     }
   }
 
-  // ── Pass 3: break parent cycles by detaching the node that closes the loop ──
+  // ── Pass 3: break parent cycles — LINEAR via DFS color-marking ──
+  // 0 = unvisited, 1 = on the current chain (gray), 2 = proven acyclic (black).
+  // Following parent edges from each node, a gray node hit again is a back-edge →
+  // detach it. Black nodes are already known cycle-free, so we stop early instead
+  // of re-walking to the root from every node (the previous O(n²) behavior).
+  const color = new Map<string, 0 | 1 | 2>();
+  for (const id of order) color.set(id, 0);
   for (const startId of order) {
-    const seen = new Set<string>();
+    if (color.get(startId) !== 0) continue;
+    const chain: string[] = [];
     let cur: string | null = startId;
     while (cur !== null) {
-      if (seen.has(cur)) {
+      const c = color.get(cur);
+      if (c === 2) break; // reached a proven-acyclic node — rest of chain is fine
+      if (c === 1) {
+        // Back-edge: `cur` closes a cycle. Detach it so the chain terminates.
         const node = byId.get(cur)!;
         node.parentId = null;
         if (!report.cycleBrokenIds.includes(cur)) report.cycleBrokenIds.push(cur);
         report.changed = true;
         break;
       }
-      seen.add(cur);
+      color.set(cur, 1); // gray
+      chain.push(cur);
       const node = byId.get(cur);
       cur = node && typeof node.parentId === 'string' ? node.parentId : null;
     }
+    // Everything we just walked is now proven acyclic → mark black.
+    for (const id of chain) color.set(id, 2);
   }
 
   const tree = order.map((id) => byId.get(id)!);
@@ -420,27 +434,69 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
   const rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
   if (!rawTree || rawTree.length === 0) return conv;
   const { tree, headId, report } = sanitizeMessageTree(rawTree, conv.headId ?? null);
-  if (!report.changed) return conv;
 
-  // A repair here means an upstream write produced a corrupt tree (dup id / parent
-  // cycle / unreachable head) — the exact mid-turn-inject failure that orphaned
-  // history. Trace it (metadata only) so a recurrence is visible in diagnostics
-  // instead of only reconstructable from the file after the fact.
-  traceDiagnostic({
-    scope: 'agent',
-    event: 'conversation.tree-repaired',
-    level: 'warn',
-    conversationId: conv.id,
-    fields: {
-      dedupedCount: report.dedupedIds.length,
-      cycleBrokenCount: report.cycleBrokenIds.length,
-      headRepointed: report.headRepointed,
-      dedupedIds: report.dedupedIds,
-      cycleBrokenIds: report.cycleBrokenIds,
-    },
-  });
+  // Backfill per-message tokenCount for any node missing one. Interactive GUI
+  // turns persist via conversations:put (bypassing appendConversationMessages, the
+  // only path that populated counts), so without this their branches lack counts
+  // and sumBranchTokenCounts re-serializes every message every turn — the hot-path
+  // cost the accumulator exists to avoid. Only nodes MISSING a count are encoded
+  // (nodes are immutable, so an existing count stays valid), keeping this cheap.
+  let backfilled = 0;
+  for (const node of tree) {
+    const n = node as TreeNodeLike & { tokenCount?: unknown };
+    if (typeof n.tokenCount !== 'number') {
+      const count = countMessageTokensCanonical({ role: n.role, content: n.content });
+      if (typeof count === 'number') {
+        n.tokenCount = count;
+        backfilled++;
+      }
+    }
+  }
+
+  if (!report.changed && backfilled === 0) return conv;
+
+  if (report.changed) {
+    // A repair means an upstream write produced a corrupt tree (dup id / parent
+    // cycle / unreachable head) — the exact mid-turn-inject failure that orphaned
+    // history. Trace it (metadata only) so a recurrence is visible in diagnostics.
+    traceDiagnostic({
+      scope: 'agent',
+      event: 'conversation.tree-repaired',
+      level: 'warn',
+      conversationId: conv.id,
+      fields: {
+        dedupedCount: report.dedupedIds.length,
+        cycleBrokenCount: report.cycleBrokenIds.length,
+        headRepointed: report.headRepointed,
+        dedupedIds: report.dedupedIds,
+        cycleBrokenIds: report.cycleBrokenIds,
+      },
+    });
+  }
 
   const byId = new Map(tree.map((n) => [n.id as string, n] as const));
+
+  // Backfill-only path (no structural repair): the caller set headId / messages /
+  // counts deliberately (e.g. reconcileConversationActivity derives messageCount
+  // from `messages`, and a stale-write guard compares those counts). We must NOT
+  // override them — only swap in the tree with backfilled counts, and mirror those
+  // counts onto the existing `messages` nodes by id so both views agree without
+  // changing the branch shape / lengths the caller chose.
+  if (!report.changed) {
+    const prevMessages = Array.isArray(conv.messages) ? (conv.messages as TreeNodeLike[]) : [];
+    const messages = prevMessages.map((m) => {
+      const id = typeof m?.id === 'string' ? m.id : null;
+      const repaired = id ? byId.get(id) : undefined;
+      // Carry the backfilled tokenCount onto the message-branch copy if present.
+      return repaired && typeof (repaired as { tokenCount?: unknown }).tokenCount === 'number'
+        ? { ...m, tokenCount: (repaired as { tokenCount?: number }).tokenCount }
+        : m;
+    });
+    return { ...conv, messageTree: tree as unknown[], messages: messages as unknown[] };
+  }
+
+  // Structural repair path: head/branch/counts may all have changed, so rebuild
+  // them from the repaired tree + repaired head.
   const branch: TreeNodeLike[] = [];
   const seen = new Set<string>();
   let cur: string | null = headId;
@@ -463,8 +519,15 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
   };
 }
 
-/** Write one conversation file and update its index entry (single-file cost). */
-export function writeConversation(appHome: string, conv: ConversationRecord): void {
+/**
+ * Write one conversation file and update its index entry (single-file cost).
+ * Returns the record actually written — which may be a SANITIZED/backfilled copy
+ * (dedup, cycle-break, head repoint, tokenCount backfill) differing from the
+ * argument. Callers that broadcast or return the record to the renderer should
+ * use THIS return value, not the input, so clients never see a tree that
+ * disagrees with disk/index.
+ */
+export function writeConversation(appHome: string, conv: ConversationRecord): ConversationRecord {
   // Migrate BEFORE touching per-file state, and refuse to write if a legacy
   // monolith is still un-migrated — a partial index would strand old chats.
   assertMigratedBeforeWrite(appHome);
@@ -474,6 +537,7 @@ export function writeConversation(appHome: string, conv: ConversationRecord): vo
   const index = readIndex(appHome);
   index.conversations[sanitized.id] = toIndexEntry(sanitized);
   writeIndex(appHome, index);
+  return sanitized;
 }
 
 export function deleteConversation(appHome: string, id: string): void {

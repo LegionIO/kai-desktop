@@ -155,13 +155,21 @@ export const MAX_SYNC_ENCODE_CHARS = 1_500_000;
 
 /**
  * Exact token count of a serialized string via tiktoken, UNLESS the string is
- * larger than {@link MAX_SYNC_ENCODE_CHARS}, in which case fall back to the
- * over-biased char estimate rather than blocking the main thread. Returns null
- * only when no encoding is available (mirrors the encode-less fallbacks).
+ * larger than {@link MAX_SYNC_ENCODE_CHARS}, in which case fall back to a
+ * char-based estimate rather than blocking the main thread. Returns the count.
+ *
+ * The over-cap fallback is a TRUE UPPER BOUND: `length` (1 token/char). The
+ * cheaper `length / 3` estimate used elsewhere assumes ~English density and is
+ * NOT a ceiling — CJK / high-entropy text can approach one token per character,
+ * so `length/3` could UNDER-count and let compaction's budget-fit accept an
+ * over-window prefix. `length` can never under-count for these BPE encodings, so
+ * it is safe for both the shouldCompact gate (over-estimate → maybe run the exact
+ * check, never skip it) and the budget-fit loop (over-estimate → drop more/refuse,
+ * never ship an over-limit request).
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
   if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
-    return Math.ceil(serialized.length / MIN_CHARS_PER_TOKEN);
+    return serialized.length; // 1 token/char worst case — a true upper bound
   }
   return encoding.encode(serialized).length;
 }
