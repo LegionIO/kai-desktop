@@ -959,17 +959,13 @@ async function runAgentAction(
           pendingBoundary.push(...entries);
         },
       })) {
-        // Flush a buffered inject boundary only when it's provably safe: the next
-        // event is NEW-step content (text-delta / tool-call) AND no tool call is
-        // still awaiting its result (all prior-step tool-results consumed). This
-        // avoids splitting the branch before a buffered tool-result chunk arrives,
-        // which would leave the persisted tool call unresolved. A tool-result or
-        // done event does NOT trigger a flush (prior step not yet complete).
-        if (
-          pendingBoundary.length > 0 &&
-          pendingToolCalls.size === 0 &&
-          (ev.type === 'text-delta' || ev.type === 'tool-call')
-        ) {
+        // Flush a buffered inject boundary only at a CONSUMED step boundary: a
+        // `step-progress` event is emitted after ALL of the prior step's text/
+        // tool-call/tool-result events, so consuming it guarantees they're already
+        // in contentParts. Flushing on a mere text-delta/tool-call could split the
+        // branch before a still-buffered prior-step event arrives. Require no
+        // tool call awaiting its result as an extra guard.
+        if (pendingBoundary.length > 0 && pendingToolCalls.size === 0 && ev.type === 'step-progress') {
           const toFlush = pendingBoundary;
           pendingBoundary = [];
           flushInjectedBoundary(toFlush);

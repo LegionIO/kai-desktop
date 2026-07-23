@@ -839,6 +839,9 @@ describe('agent conversationTarget', () => {
       return (async function* () {
         yield { type: 'text-delta', text: 'pre' } as never;
         onInjected?.([{ id: 'inj-pv', text: 'follow-up', at: Date.now() }]);
+        // step-progress flushes the buffered boundary (persists it), so there is
+        // something to roll back on the subsequent fallback.
+        yield { type: 'step-progress', data: {} } as never;
         yield { type: 'text-delta', text: 'partial that stays as a variant' } as never;
         yield { type: 'model-fallback', modelKey: 'fallback', data: { preserveErroredVariant: true } } as never;
         yield { type: 'text-delta', text: 'retry answer' } as never;
@@ -868,8 +871,10 @@ describe('agent conversationTarget', () => {
         .onInjected;
       return (async function* () {
         yield { type: 'text-delta', text: 'pre-inject text' } as never;
-        // Inject consumed at a boundary → partial assistant + injected user persist.
+        // Inject consumed at a boundary → flushed on step-progress (persists the
+        // partial assistant + injected user).
         onInjected?.([{ id: 'inj-fb', text: 'the follow-up', at: Date.now() }]);
+        yield { type: 'step-progress', data: {} } as never;
         yield { type: 'text-delta', text: 'post-inject (will be discarded)' } as never;
         // Whole response regenerated on the fallback model.
         yield { type: 'model-fallback', modelKey: 'fallback' } as never;

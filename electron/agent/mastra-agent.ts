@@ -1802,6 +1802,14 @@ async function* streamWithRealEvents(
         }
 
         if (compatibilityRetryRequested || sanitizationRetryRequested) {
+          // Signal a restart so cooperative-injection consumers (automations)
+          // replay any inject drained by prepareStep this attempt — this loop
+          // restarts from activeMessages with the queue already emptied.
+          yield {
+            conversationId,
+            type: 'retry',
+            data: { attempt: attempt + 1, reason: 'compatibility-restart' },
+          };
           continue compatibilityLoop;
         }
 
@@ -1820,6 +1828,11 @@ async function* streamWithRealEvents(
             `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
             getErrorMessage(error),
           );
+          yield {
+            conversationId,
+            type: 'retry',
+            data: { attempt: attempt + 1, reason: 'temperature-omit-restart' },
+          };
           continue compatibilityLoop;
         }
 
@@ -1831,6 +1844,11 @@ async function* streamWithRealEvents(
             `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
             getErrorMessage(error),
           );
+          yield {
+            conversationId,
+            type: 'retry',
+            data: { attempt: attempt + 1, reason: 'sanitize-restart' },
+          };
           continue compatibilityLoop;
         }
 

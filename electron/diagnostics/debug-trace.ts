@@ -76,6 +76,15 @@ const SAFE_METADATA_KEY_EXACT = new Set([
 function isSafeMetadataKey(key: string): boolean {
   return SAFE_METADATA_KEY_EXACT.has(key) || SAFE_METADATA_KEY_RE.test(key);
 }
+// A bounded identifier/enum-shaped VALUE: ids, model keys (anthropic/claude-x),
+// statuses, uuids, correlation ids. No whitespace (rules out prose), reasonable
+// length, and only identifier-ish chars (alnum, - _ . : / @). A path or URL
+// value fails this (contains spaces or exceeds length / has other punctuation),
+// so it's omitted even under an identifier-shaped key.
+const IDENTIFIER_VALUE_RE = /^[A-Za-z0-9._:/@-]{0,200}$/;
+function isIdentifierShaped(value: string): boolean {
+  return IDENTIFIER_VALUE_RE.test(value);
+}
 // Explicitly-safe categorical `reason`/`cause` codes. Anything not listed here is
 // omitted in metadata-only mode (a free-text reason like runtimeSelection.reason
 // can embed absolute plugin paths or raw scan errors).
@@ -170,11 +179,12 @@ function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0):
     if (value && typeof value === 'object') return { omitted: true, keys: Object.keys(value as object).length };
     return '[omitted]';
   }
-  // Metadata-only default: strings are omitted UNLESS their key is an allowlisted
-  // safe-metadata key (id/correlation/status/scope/type/name-style identifiers).
-  // `debug:trace` accepts arbitrary renderer/web fields, so an unrecognized key
-  // like `note`/`command`/`data` must not leak prose without content consent.
-  if (!includeContent && typeof value === 'string' && !isSafeMetadataKey(key)) {
+  // Metadata-only default: a string is kept ONLY when its key is allowlisted AND
+  // its VALUE looks like a bounded identifier/enum (no whitespace, no path/url
+  // chars, length-capped). This prevents a caller from smuggling prose/paths
+  // under an identifier-shaped key like runId/status/modelName without content
+  // consent. Anything else is omitted with its length.
+  if (!includeContent && typeof value === 'string' && !(isSafeMetadataKey(key) && isIdentifierShaped(value))) {
     return { omitted: true, chars: value.length };
   }
   if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…` : value;

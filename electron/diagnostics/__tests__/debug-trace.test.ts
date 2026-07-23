@@ -224,6 +224,25 @@ describe('diagnostic trace', () => {
     expect(row.fields.modelKey).toBe('anthropic/claude');
   });
 
+  it('omits prose/paths smuggled under identifier-shaped metadata keys', () => {
+    mutateTrace({ enabled: true });
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.start',
+      fields: {
+        runId: 'run-abc123', // real identifier — kept
+        status: 'this is a sentence of prose', // has spaces → omitted
+        modelName: 'anthropic/claude-sonnet-5', // model key shape — kept
+        note: 'arbitrary', // non-allowlisted key — omitted
+      },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.runId).toBe('run-abc123');
+    expect(row.fields.modelName).toBe('anthropic/claude-sonnet-5');
+    expect(row.fields.status).toEqual({ omitted: true, chars: 'this is a sentence of prose'.length });
+    expect(row.fields.note).toEqual({ omitted: true, chars: 'arbitrary'.length });
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
     mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
