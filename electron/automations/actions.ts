@@ -52,26 +52,10 @@ const inFlightAutomationTargets = new Set<string>();
  * behind it instead of overtaking it via true mid-turn injection. Ordinary busy
  * events still inject cooperatively when no barrier exists. */
 const orderedConversationTails = new Map<string, Promise<void>>();
-// Cancellation epoch per conversation. Bumped when an alert resume times out so
-// followers ALREADY queued behind it abort at their turn instead of running
-// ahead of the re-answer (deleting the tail alone doesn't stop chained promises).
-const orderedTurnEpoch = new Map<string, number>();
-
-class OrderedTurnCancelled extends Error {}
 
 function enqueueOrderedConversationTurn<T>(conversationId: string, task: () => Promise<T>): Promise<T> {
   const previous = orderedConversationTails.get(conversationId) ?? Promise.resolve();
-  const epochAtEnqueue = orderedTurnEpoch.get(conversationId) ?? 0;
-  const guarded = async () => {
-    // If the epoch advanced since this task was queued (an earlier alert resume
-    // timed out and cancelled its followers), abort rather than run ahead of the
-    // re-answer. The source event re-fires independently if still relevant.
-    if ((orderedTurnEpoch.get(conversationId) ?? 0) !== epochAtEnqueue) {
-      throw new OrderedTurnCancelled(`ordered turn for ${conversationId} cancelled`);
-    }
-    return task();
-  };
-  const run = previous.catch(() => {}).then(guarded);
+  const run = previous.catch(() => {}).then(task);
   const tail = run.then(
     () => undefined,
     () => undefined,
@@ -81,12 +65,6 @@ function enqueueOrderedConversationTurn<T>(conversationId: string, task: () => P
     if (orderedConversationTails.get(conversationId) === tail) orderedConversationTails.delete(conversationId);
   });
   return run;
-}
-
-/** Cancel ordered followers already queued for a conversation (bump the epoch). */
-function cancelOrderedFollowers(conversationId: string): void {
-  orderedTurnEpoch.set(conversationId, (orderedTurnEpoch.get(conversationId) ?? 0) + 1);
-  orderedConversationTails.delete(conversationId);
 }
 
 /** Abort controllers for in-flight agent runs, keyed by target conversationId.
@@ -401,13 +379,15 @@ async function runAgentAction(
       try {
         await waitForAutomationRunToSettle(orderingConversationId, settleMs);
       } catch (settleErr) {
-        // Alert resume timed out → the caller re-opens the alert. Cancel any
-        // followers queued BEHIND this answer so they don't run ahead of the
-        // re-answer (which would otherwise queue behind them, inverting the
-        // answer-before-followers guarantee). Their source events re-fire
-        // independently if still relevant. Only alert resumes do this.
+        // Alert resume timed out → the caller re-opens the alert (returns it to
+        // the Alerts list for re-answer). Do NOT cancel followers already queued
+        // behind it: one-shot plugin events (e.g. Teams message-received) are not
+        // replayed by AutomationEventBus, so cancelling would permanently lose
+        // them. Since the answer is now re-opened (no pending in-memory delivery),
+        // letting the followers proceed does not violate answer-before-followers
+        // — there is no longer a pending answer to precede. The re-answer, when it
+        // arrives, is a genuinely later user action and queues after them.
         if (opts?.forceFreshTurn) {
-          cancelOrderedFollowers(orderingConversationId);
           traceDiagnostic({
             scope: 'automation',
             event: 'turn.alert-resume-timeout',
@@ -943,15 +923,24 @@ async function runAgentAction(
           }
           boundaryPersistedIds.length = 0;
           preBoundaryParentId = undefined;
-          // Re-enqueue the injected turns ONLY when the failed variant was
-          // discarded (rolled back). If preserveErroredVariant retained the
-          // boundary nodes, the injected user (with its stable id) still exists on
-          // disk — re-enqueuing would re-persist it, and since the id is taken
-          // appendConversationMessages would mint a new id, duplicating the user
-          // turn and making the retry a descendant rather than a sibling variant.
-          if (!preserveErroredVariant && consumedInjectEntries.length > 0) {
-            for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
-              reenqueueInject(conversationId, consumedInjectEntries[i]);
+          // The fallback attempt retries from the ORIGINAL messages with the
+          // queue already drained, so the follow-up must be re-queued or the retry
+          // model never sees it. HOW depends on whether the failed variant was
+          // kept:
+          //  - rolled back (discarded): the on-disk inject node was deleted, so
+          //    reuse the SAME id (reenqueueInject) — the retry re-persists it in
+          //    the freed slot, no duplication.
+          //  - preserved variant: the inject node with its stable id still exists
+          //    on disk. Re-queue with a FRESH id (enqueueInject) so the retry both
+          //    sees the follow-up AND persists it as a distinct node on the new
+          //    sibling branch, instead of colliding with the retained id.
+          if (consumedInjectEntries.length > 0) {
+            if (preserveErroredVariant) {
+              for (const entry of consumedInjectEntries) enqueueInject(conversationId, entry.text);
+            } else {
+              for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
+                reenqueueInject(conversationId, consumedInjectEntries[i]);
+              }
             }
           }
           consumedInjectEntries.length = 0;
