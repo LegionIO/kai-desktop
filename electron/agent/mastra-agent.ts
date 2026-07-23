@@ -29,7 +29,7 @@ import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-saniti
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
-import { buildMastraPrepareStep } from './prepare-step-inject.js';
+import { buildMastraPrepareStep, drainInjectConsumedMarkers } from './prepare-step-inject.js';
 import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
@@ -59,6 +59,10 @@ export type StreamEvent = {
     | 'retry'
     | 'step-progress'
     | 'max-steps-reached'
+    // Emitted in-order (by the fullStream wrapper) right before a step's chunks
+    // when prepareStep consumed queued mid-turn injects for that step. Lets
+    // automation persistence split the branch at the exact, race-free boundary.
+    | 'inject-consumed'
     // Broadcast when a user turn is submitted (so OTHER attached clients — e.g.
     // the `kai` CLI when the GUI sends — render the prompt, not just the reply).
     // Carries the text; `submitNonce` (in `data`) lets the originating client
@@ -1633,6 +1637,19 @@ async function* streamWithRealEvents(
             : asAsyncIterable(fullStream as ReadableStream<unknown>);
 
         for await (const chunk of iterator) {
+          // Surface any injects prepareStep consumed since the last chunk as an
+          // in-ORDER marker BEFORE this chunk (which is the next step's first
+          // event). This is race-free: prepareStep ran between the prior chunk and
+          // this one, so emitting here places the boundary exactly after the prior
+          // step's events and before the new step's.
+          const consumedMarkers = drainInjectConsumedMarkers(conversationId);
+          if (consumedMarkers.length > 0) {
+            yield {
+              conversationId,
+              type: 'inject-consumed',
+              data: { entries: consumedMarkers },
+            };
+          }
           const c = chunk as RawStreamChunk;
           const type = c?.type;
           const payload = (c?.payload ?? c) as Record<string, unknown> | undefined;

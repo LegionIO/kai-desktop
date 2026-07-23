@@ -59,6 +59,7 @@ import type {
   SessionCookieInfo,
   AutomationEvent,
   PluginActionHandler,
+  PluginAgentStreamEvent,
 } from './types.js';
 import { executeCommand, detectTool, findBinary, SAFE_ENV_VARS } from './sandboxed-exec.js';
 import { isExternallyOpenableUrl } from '../utils/safe-external-url.js';
@@ -1432,7 +1433,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
         const allTools = options.tools ? getRegisteredTools() : [];
-        yield* streamForPlugin({
+        for await (const ev of streamForPlugin({
           messages: options.messages,
           config,
           appHome: callbacks.appHome,
@@ -1443,7 +1444,12 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           systemPrompt: options.systemPrompt,
           tools: allTools,
           abortSignal: options.abortSignal,
-        });
+        })) {
+          // `inject-consumed` is an internal branch-split marker for automation
+          // persistence; plugins never need it. Filter it out of the plugin API.
+          if ((ev as { type?: string }).type === 'inject-consumed') continue;
+          yield ev as unknown as PluginAgentStreamEvent;
+        }
       },
 
       registerInferenceProvider: (provider: PluginInferenceProvider) => {

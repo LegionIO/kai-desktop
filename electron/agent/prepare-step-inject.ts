@@ -42,6 +42,25 @@ export function setInjectConsumedHandler(handler: InjectConsumedHandler | null):
 }
 
 /**
+ * In-band marker queue: entries consumed by prepareStep for a conversation that
+ * the fullStream wrapper has NOT yet surfaced as an in-order `inject-consumed`
+ * stream event. Because prepareStep is a side-channel callback that races the
+ * fullStream consumer, this lets the wrapper emit an ordered marker right before
+ * the next step's chunks, so downstream persistence splits the branch at the
+ * exact, race-free point (after the prior step's events, before the next).
+ */
+const injectConsumedMarkers = new Map<string, QueuedInject[]>();
+
+/** Drain (and clear) the pending in-band inject-consumed markers for a
+ * conversation. Called by the fullStream wrapper to emit an ordered event. */
+export function drainInjectConsumedMarkers(conversationId: string): QueuedInject[] {
+  const m = injectConsumedMarkers.get(conversationId);
+  if (!m || m.length === 0) return [];
+  injectConsumedMarkers.delete(conversationId);
+  return m;
+}
+
+/**
  * Build the prepareStep function for a conversation's Mastra turn. Returns
  * undefined-safe results: an empty object when nothing is queued, otherwise a
  * `messages` override with the queued user turn(s) appended in FIFO order.
@@ -59,6 +78,11 @@ export function buildMastraPrepareStep(
     const queued = drainInjects(conversationId);
     if (queued.length === 0) return {};
     const appended: ModelMessageLike[] = [...messages, ...queued.map((q) => ({ role: 'user', content: q.text }))];
+    // Record an in-band marker so the fullStream wrapper can emit an ordered
+    // `inject-consumed` event before the next step's chunks (race-free split).
+    const existing = injectConsumedMarkers.get(conversationId);
+    if (existing) existing.push(...queued);
+    else injectConsumedMarkers.set(conversationId, [...queued]);
     if (injectConsumedHandler) {
       try {
         injectConsumedHandler(conversationId, queued);

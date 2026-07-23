@@ -959,20 +959,15 @@ async function runAgentAction(
           pendingBoundary.push(...entries);
         },
       })) {
-        // Flush a buffered inject boundary before consuming the NEXT step's
-        // output. onInjected fires at prepareStep for the next step — AFTER the
-        // prior step's step-progress — so the prior step's text/tool events are
-        // already in contentParts. Flush when the first next-step content arrives
-        // (text-delta/tool-call) OR a step-progress, gated by pendingToolCalls
-        // being empty (all prior tool-results consumed) so we never split before a
-        // still-pending tool result. Waiting for a FURTHER step-progress would
-        // persist the next step's response before the injected user (empty
-        // assistant appended after).
-        if (
-          pendingBoundary.length > 0 &&
-          pendingToolCalls.size === 0 &&
-          (ev.type === 'text-delta' || ev.type === 'tool-call' || ev.type === 'step-progress')
-        ) {
+        // Flush a buffered inject boundary when the in-band `inject-consumed`
+        // marker arrives. The mastra fullStream wrapper emits it in-ORDER right
+        // before the next step's first chunk (prepareStep ran between the prior
+        // chunk and it), so by this point ALL of the prior step's text/tool-call/
+        // tool-result events are already in contentParts — the branch splits at the
+        // exact, race-free boundary (…assistant/tool → injected user → continuation).
+        // A boundary consumed on the FINAL step (no following chunk/marker) is
+        // handled by the post-loop flush.
+        if (pendingBoundary.length > 0 && ev.type === 'inject-consumed') {
           const toFlush = pendingBoundary;
           pendingBoundary = [];
           flushInjectedBoundary(toFlush);

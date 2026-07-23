@@ -472,8 +472,11 @@ describe('agent conversationTarget', () => {
         .onInjected;
       return (async function* () {
         yield { type: 'tool-call', toolCallId: 't1', toolName: 'search', args: {} } as never;
-        onInjected?.([{ id: 'inj-tool', text: 'follow-up', at: Date.now() }]);
         yield { type: 'tool-result', toolCallId: 't1', result: { ok: true } } as never;
+        // prepareStep consumed the inject after the tool step; the wrapper emits
+        // the in-band marker before the next step's content.
+        onInjected?.([{ id: 'inj-tool', text: 'follow-up', at: Date.now() }]);
+        yield { type: 'inject-consumed', data: {} } as never;
         yield { type: 'text-delta', text: 'answer after tool' } as never;
         yield { type: 'done', modelKey: 'test' } as never;
       })();
@@ -839,9 +842,9 @@ describe('agent conversationTarget', () => {
       return (async function* () {
         yield { type: 'text-delta', text: 'pre' } as never;
         onInjected?.([{ id: 'inj-pv', text: 'follow-up', at: Date.now() }]);
-        // step-progress flushes the buffered boundary (persists it), so there is
-        // something to roll back on the subsequent fallback.
-        yield { type: 'step-progress', data: {} } as never;
+        // inject-consumed marker flushes the buffered boundary (persists it), so
+        // there is something to roll back on the subsequent fallback.
+        yield { type: 'inject-consumed', data: {} } as never;
         yield { type: 'text-delta', text: 'partial that stays as a variant' } as never;
         yield { type: 'model-fallback', modelKey: 'fallback', data: { preserveErroredVariant: true } } as never;
         yield { type: 'text-delta', text: 'retry answer' } as never;
@@ -871,10 +874,10 @@ describe('agent conversationTarget', () => {
         .onInjected;
       return (async function* () {
         yield { type: 'text-delta', text: 'pre-inject text' } as never;
-        // Inject consumed at a boundary → flushed on step-progress (persists the
-        // partial assistant + injected user).
+        // Inject consumed at a boundary → flushed on inject-consumed marker
+        // (persists the partial assistant + injected user).
         onInjected?.([{ id: 'inj-fb', text: 'the follow-up', at: Date.now() }]);
-        yield { type: 'step-progress', data: {} } as never;
+        yield { type: 'inject-consumed', data: {} } as never;
         yield { type: 'text-delta', text: 'post-inject (will be discarded)' } as never;
         // Whole response regenerated on the fallback model.
         yield { type: 'model-fallback', modelKey: 'fallback' } as never;
