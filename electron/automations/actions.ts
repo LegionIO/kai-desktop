@@ -759,7 +759,16 @@ async function runAgentAction(
       // (it already consumed them) and do NOT defer to `finally` (which would
       // parent the user AFTER the continuation assistant, heading the branch on an
       // apparently-unanswered prompt).
+      // Once any entry fails to persist, ALL subsequent entries are deferred to
+      // recovery too (without attempting to persist), so failed entries keep their
+      // original FIFO position relative to each other rather than being inserted
+      // out of order before a later entry that succeeded.
+      let boundaryFailed = false;
       for (const entry of entries) {
+        if (boundaryFailed) {
+          failedBoundaryUsers.push(entry);
+          continue;
+        }
         const appendUser = () =>
           appendConversationMessages(
             deps.appHome,
@@ -821,8 +830,10 @@ async function runAgentAction(
                 // prepareStep already drained the queue. Track for a PERSIST-ONLY
                 // end-of-turn retry (see finally) — do NOT re-enqueue here, or this
                 // running turn's next prepareStep could re-consume + re-feed the
-                // model (double answer / repeated side effects).
+                // model (double answer / repeated side effects). Mark the boundary
+                // failed so subsequent entries are deferred too, preserving FIFO.
                 failedBoundaryUsers.push(entry);
+                boundaryFailed = true;
                 traceDiagnostic({
                   scope: 'automation',
                   event: 'inject.persist-failed',

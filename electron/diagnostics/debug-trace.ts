@@ -40,16 +40,19 @@ const SECRET_KEY_RE = /(authorization|cookie|token|secret|password|api[-_]?key|c
 const CONTENT_WORD_RE = /(body|content|text|prompt|message|args|result|payload|response|url|uri|href|path|filename)/i;
 // Metadata suffixes that make a key an ID/counter/timestamp, NOT content — these
 // override the content-word match so branch-correlation data (messageId,
-// parentMessageId, resultCount, …) is preserved in metadata-only mode.
-const METADATA_SUFFIX_RE = /(id|ids|count|at|ms|len|length|bytes|chars|index|hash|status|kind|type|name)$/i;
+// parentMessageId, resultCount, …) is preserved in metadata-only mode. NOTE:
+// `name` is deliberately NOT here — `filename` is a path, so it must stay a
+// content key; safe identifier *Name keys are exact-allowlisted below instead.
+const METADATA_SUFFIX_RE = /(id|ids|count|at|ms|len|length|bytes|chars|index|hash|status|kind|type)$/i;
 function isContentKey(key: string): boolean {
   return CONTENT_WORD_RE.test(key) && !METADATA_SUFFIX_RE.test(key);
 }
 // Keys whose STRING values are safe identifiers/codes to keep in metadata-only
 // mode. Everything else (arbitrary renderer/web `fields`) is omitted. Matches
-// the common identifier suffixes plus a few exact metadata keys.
+// common identifier suffixes plus an exact allowlist. `name` is NOT a suffix
+// match (would pass `filename`); safe *Name keys are listed exactly.
 const SAFE_METADATA_KEY_RE =
-  /(id|ids|hash|status|kind|type|name|scope|scopes|key|version|model|mode|stage|event|source|level|phase|role|state|reason|trigger)$/i;
+  /(id|ids|hash|status|kind|type|scope|scopes|key|version|mode|stage|event|source|level|phase|role|state|trigger)$/i;
 const SAFE_METADATA_KEY_EXACT = new Set([
   'correlationId',
   'parentCorrelationId',
@@ -62,6 +65,8 @@ const SAFE_METADATA_KEY_EXACT = new Set([
   'ruleId',
   'pluginName',
   'toolName',
+  'displayName',
+  'modelName',
   'ts',
   'scope',
   'event',
