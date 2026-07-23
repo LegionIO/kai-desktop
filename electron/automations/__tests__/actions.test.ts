@@ -755,6 +755,36 @@ describe('agent conversationTarget', () => {
     }) as never);
   });
 
+  it('recovers a buffered inject when the stream throws before it is flushed', async () => {
+    clearInjects('convThrow');
+    resetMockStore({
+      convThrow: { id: 'convThrow', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // onInjected drains an entry, then the stream throws before the loop flushes
+    // it. It must be re-queued so the finally drain persists it (not lost).
+    vi.mocked(streamForPlugin).mockImplementationOnce(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'text-delta', text: 'partial' } as never;
+        onInjected?.([{ id: 'inj-throw', text: 'lost follow-up', at: Date.now() }]);
+        throw new Error('stream exploded before flush');
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convThrow' }), evt, deps()).catch(() => {});
+
+    const users = (mockStore.conversations.convThrow.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+      .filter((m) => m.role === 'user')
+      .map((m) => m.content?.[0]?.text);
+    expect(users).toContain('lost follow-up');
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('replays a pending (unflushed) inject when a transient retry restarts the attempt', async () => {
     clearInjects('convRetry');
     resetMockStore({

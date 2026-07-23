@@ -254,8 +254,20 @@ function prune(path: string, cfg: TraceConfig): void {
         }
         continue;
       }
+      const isActive = name === baseName;
       try {
-        if (statSync(candidate).mtimeMs < cutoff) rmSync(candidate, { force: true });
+        const st = statSync(candidate);
+        if (isActive) {
+          // The active file's mtime is refreshed on every append, so use its
+          // CREATION time — under low-volume tracing, old records would otherwise
+          // never age out (size rotation could take years). When the active file
+          // itself is older than maxAgeDays, ROTATE it (don't delete — it may hold
+          // recent records too); the rotated sibling then ages out by mtime.
+          const bornMs = Number.isFinite(st.birthtimeMs) && st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs;
+          if (bornMs < cutoff) rotate(candidate, { ...cfg, maxFileBytes: 0 });
+        } else if (st.mtimeMs < cutoff) {
+          rmSync(candidate, { force: true });
+        }
       } catch {
         /* best effort */
       }

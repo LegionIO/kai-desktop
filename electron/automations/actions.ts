@@ -911,12 +911,21 @@ async function runAgentAction(
       boundaryPersistedIds.length = 0;
       preBoundaryParentId = undefined;
       // Replay the follow-up so the retry (which restarts from the ORIGINAL
-      // messages with the queue already drained) still sees it.
-      //  - consumedInjectEntries were persisted at a boundary: reuse SAME ids into
-      //    freed slots when rollback confirmed (reverse → FIFO), else FRESH ids.
-      //  - pendingBoundary entries were drained by prepareStep but NOT yet
-      //    persisted (restart fired before flush) — no on-disk node, replay FRESH,
-      //    ordered AFTER the consumed ones.
+      // messages with the queue already drained) still sees it, in correct order
+      // relative to any inject still in the LIVE queue (a newer B). We insert at
+      // the FRONT so replayed entries precede B, and insert pending BEFORE
+      // consumed so the final front order is: consumed → pending → B.
+      //  - pendingBoundary: drained by prepareStep but NOT persisted — no on-disk
+      //    node, replay with FRESH ids.
+      //  - consumedInjectEntries: persisted at a boundary — reuse SAME ids into the
+      //    freed slots when rollback confirmed, else FRESH ids.
+      if (pendingBoundary.length > 0) {
+        reenqueueFreshAtFront(
+          conversationId,
+          pendingBoundary.map((entry) => entry.text),
+        );
+        pendingBoundary = [];
+      }
       if (consumedInjectEntries.length > 0) {
         if (rollbackConfirmed) {
           for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
@@ -928,10 +937,6 @@ async function runAgentAction(
             consumedInjectEntries.map((entry) => entry.text),
           );
         }
-      }
-      if (pendingBoundary.length > 0) {
-        for (const entry of pendingBoundary) enqueueInject(conversationId, entry.text);
-        pendingBoundary = [];
       }
       consumedInjectEntries.length = 0;
     };
@@ -1056,6 +1061,13 @@ async function runAgentAction(
       // fall through to finalize (assistant turn + idle + terminal done).
       error = streamErr instanceof Error ? streamErr.message : String(streamErr);
       caughtStreamError = true;
+      // A buffered-but-unflushed inject was drained from the queue by prepareStep
+      // and is neither persisted nor tracked; re-queue it so the finally drain
+      // persists it (otherwise the already-rendered message vanishes on reload).
+      if (pendingBoundary.length > 0) {
+        for (let i = pendingBoundary.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, pendingBoundary[i]);
+        pendingBoundary = [];
+      }
     }
 
     const aborted = abortController.signal.aborted;
