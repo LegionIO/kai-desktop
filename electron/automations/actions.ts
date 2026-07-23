@@ -376,7 +376,28 @@ async function runAgentAction(
       // run where a crash would silently lose it. Non-alert ordered followers are
       // re-derivable from their source event, so they keep the generous wait.
       const settleMs = opts?.forceFreshTurn ? 60_000 : undefined;
-      await waitForAutomationRunToSettle(orderingConversationId, settleMs);
+      try {
+        await waitForAutomationRunToSettle(orderingConversationId, settleMs);
+      } catch (settleErr) {
+        // Alert resume timed out → the caller re-opens the alert. Cancel any
+        // followers queued BEHIND this answer so they don't run ahead of the
+        // re-answer (which would otherwise queue behind them, inverting the
+        // answer-before-followers guarantee). Their source events re-fire
+        // independently if still relevant. Only alert resumes do this.
+        if (opts?.forceFreshTurn) {
+          const currentTail = orderedConversationTails.get(orderingConversationId);
+          if (currentTail) orderedConversationTails.delete(orderingConversationId);
+          traceDiagnostic({
+            scope: 'automation',
+            event: 'turn.alert-resume-timeout',
+            level: 'warn',
+            correlationId,
+            conversationId: orderingConversationId,
+            ruleId: rule.id,
+          });
+        }
+        throw settleErr;
+      }
       return runAgentAction(action, ctx, rule, event, deps, {
         ...opts,
         forceFreshTurn: false,
@@ -858,6 +879,9 @@ async function runAgentAction(
         } else if (ev.type === 'error') {
           error = ev.error ?? 'Unknown error';
         } else if (ev.type === 'model-fallback') {
+          const preserveErroredVariant = Boolean(
+            (ev as { data?: { preserveErroredVariant?: unknown } }).data?.preserveErroredVariant,
+          );
           // A mid-stream fallback restarts the response on the next model. The
           // failed attempt's partial text + tool parts have already accumulated
           // into the buffers that build the PERSISTED assistant message; drop them
@@ -872,12 +896,13 @@ async function runAgentAction(
           pendingToolCalls.clear();
           lastEventWasToolResult = false;
           error = null;
-          // Also roll back any assistant/user segments already PERSISTED at a
-          // mid-turn inject boundary this turn: the fallback regenerates the whole
-          // response, so those on-disk segments (incl. content-filter-discarded
-          // output) must not remain as ancestors of the successful retry. Restore
-          // the head to the pre-boundary parent.
-          if (boundaryPersistedIds.length > 0) {
+          // Roll back segments PERSISTED at a mid-turn inject boundary this turn —
+          // but ONLY when the failed variant is being discarded. When
+          // streamWithFallback set preserveErroredVariant (a transient provider
+          // error after content streamed), the failed assistant stays as a
+          // selectable sibling variant, so we must NOT delete it; we only
+          // re-enqueue the injected user below so the retry sees the follow-up too.
+          if (boundaryPersistedIds.length > 0 && !preserveErroredVariant) {
             try {
               dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], {
                 runStatus: 'running',
@@ -894,9 +919,9 @@ async function runAgentAction(
               fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback' },
             });
             userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
-            boundaryPersistedIds.length = 0;
-            preBoundaryParentId = undefined;
           }
+          boundaryPersistedIds.length = 0;
+          preBoundaryParentId = undefined;
           // Re-enqueue the injected turns the fallback discarded so the retry's
           // prepareStep re-consumes them (streamWithFallback retries from the
           // ORIGINAL messages and the queue was already drained). Reverse order so

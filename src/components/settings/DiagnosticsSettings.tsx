@@ -60,9 +60,16 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
   // whole-array write restores the first toggle. Reset when the prop catches up.
   const propScopes = debugTrace?.scopes ?? [...ALL_SCOPES];
   const [scopeOverride, setScopeOverride] = useState<string[] | null>(null);
+  // Clear the optimistic override only once the incoming prop MATCHES it (i.e.
+  // our write round-tripped). An intermediate config response from an earlier
+  // overlapping write must not clear a still-pending newer override, or the next
+  // toggle would merge against the stale intermediate array.
   useEffect(() => {
-    setScopeOverride(null);
-  }, [debugTrace?.scopes]);
+    if (!scopeOverride) return;
+    const same =
+      propScopes.length === scopeOverride.length && propScopes.every((s) => scopeOverride.includes(s));
+    if (same) setScopeOverride(null);
+  }, [propScopes, scopeOverride]);
   const effectiveScopes = scopeOverride ?? propScopes;
   const [summary, setSummary] = useState<Summary | null>(null);
   const [plugins, setPlugins] = useState<PluginList>([]);

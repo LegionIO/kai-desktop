@@ -674,6 +674,37 @@ describe('agent conversationTarget', () => {
     }) as never);
   });
 
+  it('keeps the failed boundary variant when the fallback sets preserveErroredVariant', async () => {
+    clearInjects('convPreserve');
+    resetMockStore({
+      convPreserve: { id: 'convPreserve', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    vi.mocked(dropConversationMessages).mockClear();
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'text-delta', text: 'pre' } as never;
+        onInjected?.([{ id: 'inj-pv', text: 'follow-up', at: Date.now() }]);
+        yield { type: 'text-delta', text: 'partial that stays as a variant' } as never;
+        // Transient provider error → preserve the failed variant.
+        yield { type: 'model-fallback', modelKey: 'fallback', data: { preserveErroredVariant: true } } as never;
+        yield { type: 'text-delta', text: 'retry answer' } as never;
+        yield { type: 'done', modelKey: 'fallback' } as never;
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convPreserve' }), evt, deps());
+
+    // preserveErroredVariant → the boundary nodes are NOT deleted.
+    expect(dropConversationMessages).not.toHaveBeenCalled();
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('rolls back boundary-persisted segments when the model falls back after an inject', async () => {
     clearInjects('convFbBoundary');
     resetMockStore({
