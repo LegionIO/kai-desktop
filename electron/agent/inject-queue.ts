@@ -55,6 +55,21 @@ export function reenqueueInject(conversationId: string, entry: QueuedInject): vo
   else queues.set(conversationId, [entry]);
 }
 
+/** Insert entries with FRESH ids at the FRONT of the queue, preserving their
+ *  given order (used to replay injects for a fallback retry when the original
+ *  nodes are retained on disk — a fresh id avoids a persistence collision, and
+ *  front-insertion keeps them AHEAD of any inject queued after they were first
+ *  consumed, so the retry sees them in original chronological order). */
+export function reenqueueFreshAtFront(conversationId: string, texts: string[]): void {
+  if (!conversationId || texts.length === 0) return;
+  const fresh: QueuedInject[] = texts
+    .filter((t) => !!t)
+    .map((text, i) => ({ id: nextInjectId(), text, at: Date.now() + i }));
+  const q = queues.get(conversationId);
+  if (q) q.unshift(...fresh);
+  else queues.set(conversationId, fresh);
+}
+
 /**
  * Return and REMOVE all queued injects for a conversation, in FIFO order.
  * Empty array if none. Called by prepareStep at each step boundary.

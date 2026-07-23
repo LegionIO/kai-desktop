@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -883,6 +883,24 @@ async function runAgentAction(
           const preserveErroredVariant = Boolean(
             (ev as { data?: { preserveErroredVariant?: unknown } }).data?.preserveErroredVariant,
           );
+          // When preserving the failed variant AND a mid-turn inject boundary was
+          // already persisted this turn, the current contentParts hold the
+          // continuation produced AFTER the injected user. Persist it first so the
+          // retained variant ends with the model's (failed) answer rather than a
+          // dangling unanswered user turn that disappears after reload.
+          if (preserveErroredVariant && boundaryPersistedIds.length > 0 && contentParts.length > 0) {
+            try {
+              const cont = appendConversationMessages(
+                deps.appHome,
+                conversationId,
+                [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
+                { parentId: userTurnHeadId, runStatus: 'running' },
+              );
+              if (cont?.headId) boundaryPersistedIds.push(cont.headId);
+            } catch {
+              /* best effort — the variant may end at the user turn */
+            }
+          }
           // A mid-stream fallback restarts the response on the next model. The
           // failed attempt's partial text + tool parts have already accumulated
           // into the buffers that build the PERSISTED assistant message; drop them
@@ -945,7 +963,13 @@ async function runAgentAction(
           //    sibling branch, instead of colliding with the retained id.
           if (consumedInjectEntries.length > 0) {
             if (preserveErroredVariant) {
-              for (const entry of consumedInjectEntries) enqueueInject(conversationId, entry.text);
+              // Fresh ids (retained node still holds the old id) at the FRONT, in
+              // original order, so they stay ahead of any inject queued after they
+              // were first consumed and the retry sees them chronologically.
+              reenqueueFreshAtFront(
+                conversationId,
+                consumedInjectEntries.map((entry) => entry.text),
+              );
             } else {
               for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
                 reenqueueInject(conversationId, consumedInjectEntries[i]);
@@ -1076,24 +1100,35 @@ async function runAgentAction(
     if (hasInjects(conversationId)) {
       const leftover = drainInjects(conversationId);
       let branchHead = readConversation(deps.appHome, conversationId)?.headId ?? null;
+      const persisted: typeof leftover = [];
       for (const entry of leftover) {
-        const injected = appendConversationMessages(
-          deps.appHome,
-          conversationId,
-          [
-            {
-              id: entry.id,
-              role: 'user',
-              content: [{ type: 'text', text: entry.text }],
-              createdAt: new Date(entry.at).toISOString(),
-            },
-          ],
-          { parentId: branchHead, runStatus: 'idle' },
-        );
-        if (injected?.headId) branchHead = injected.headId;
+        try {
+          const injected = appendConversationMessages(
+            deps.appHome,
+            conversationId,
+            [
+              {
+                id: entry.id,
+                role: 'user',
+                content: [{ type: 'text', text: entry.text }],
+                createdAt: new Date(entry.at).toISOString(),
+              },
+            ],
+            { parentId: branchHead, runStatus: 'idle' },
+          );
+          if (injected?.headId) branchHead = injected.headId;
+          persisted.push(entry);
+        } catch {
+          // Transient disk/index failure: re-queue THIS and all remaining entries
+          // (preserving FIFO) so they aren't lost, and don't let the throw escape
+          // the finally (which would skip later entries + the continuation).
+          const remaining = leftover.slice(leftover.indexOf(entry));
+          for (let i = remaining.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, remaining[i]);
+          break;
+        }
       }
-      if (leftover.length > 0) {
-        strandedInjects = leftover;
+      if (persisted.length > 0) {
+        strandedInjects = persisted;
         traceDiagnostic({
           scope: 'automation',
           event: 'inject.drained-at-end',
@@ -1102,8 +1137,8 @@ async function runAgentAction(
           ruleId: rule.id,
           headId: branchHead,
           fields: {
-            injectIds: leftover.map((entry) => entry.id),
-            count: leftover.length,
+            injectIds: persisted.map((entry) => entry.id),
+            count: persisted.length,
             turnSucceeded,
           },
         });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject, reenqueueInject } from '../inject-queue.js';
+import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject, reenqueueInject, reenqueueFreshAtFront } from '../inject-queue.js';
 
 describe('inject-queue (cooperative mid-turn injection)', () => {
   beforeEach(() => {
@@ -76,6 +76,15 @@ describe('inject-queue (cooperative mid-turn injection)', () => {
     expect(out.map((e) => e.id)).toEqual(['a', 'b']);
     expect(out.map((e) => e.text)).toEqual(['A', 'B']);
     expect(out.map((e) => e.at)).toEqual([1, 2]);
+  });
+
+  it('reenqueueFreshAtFront inserts fresh-id entries at the front in original order', () => {
+    enqueueInject('c1', 'newer'); // queued after the originals were consumed
+    reenqueueFreshAtFront('c1', ['A', 'B']);
+    const out = drainInjects('c1');
+    // Replayed A,B ahead of the newer entry, in original order, with fresh ids.
+    expect(out.map((e) => e.text)).toEqual(['A', 'B', 'newer']);
+    expect(new Set(out.map((e) => e.id)).size).toBe(3);
   });
 
   it('ignores empty conversationId or text (returns null)', () => {
