@@ -458,6 +458,49 @@ describe('agent conversationTarget', () => {
     expect(appendedId).toBe('convA');
   });
 
+  it('persists two successive inject boundaries in order (per-marker partition)', async () => {
+    clearInjects('convTwo');
+    resetMockStore({
+      convTwo: { id: 'convTwo', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // Both boundaries' entries can be buffered together, but each inject-consumed
+    // marker names only its own boundary — they must persist in order A then B,
+    // each after its intervening assistant segment.
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'text-delta', text: 'seg0' } as never;
+        const a = { id: 'inj-A', text: 'follow A', at: Date.now() };
+        const b = { id: 'inj-B', text: 'follow B', at: Date.now() + 1 };
+        // Upstream buffered BOTH boundaries before we consume markers.
+        onInjected?.([a]);
+        onInjected?.([b]);
+        yield { type: 'inject-consumed', data: { entries: [a] } } as never;
+        yield { type: 'text-delta', text: 'seg1' } as never;
+        yield { type: 'inject-consumed', data: { entries: [b] } } as never;
+        yield { type: 'text-delta', text: 'seg2' } as never;
+        yield { type: 'done', modelKey: 'test' } as never;
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convTwo' }), evt, deps());
+
+    const tree = mockStore.conversations.convTwo.messageTree as Array<{ id?: string; role?: string }>;
+    const idxA = tree.findIndex((m) => m.id === 'inj-A');
+    const idxB = tree.findIndex((m) => m.id === 'inj-B');
+    expect(idxA).toBeGreaterThan(-1);
+    expect(idxB).toBeGreaterThan(idxA); // A persisted before B
+    // An assistant segment sits between A and B.
+    const between = tree.slice(idxA + 1, idxB).filter((m) => m.role === 'assistant');
+    expect(between.length).toBeGreaterThan(0);
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('flushes an inject boundary only after the prior step tool-result is consumed', async () => {
     clearInjects('convToolInj');
     resetMockStore({
@@ -475,8 +518,9 @@ describe('agent conversationTarget', () => {
         yield { type: 'tool-result', toolCallId: 't1', result: { ok: true } } as never;
         // prepareStep consumed the inject after the tool step; the wrapper emits
         // the in-band marker before the next step's content.
-        onInjected?.([{ id: 'inj-tool', text: 'follow-up', at: Date.now() }]);
-        yield { type: 'inject-consumed', data: {} } as never;
+        const injToolEntry = { id: 'inj-tool', text: 'follow-up', at: Date.now() };
+        onInjected?.([injToolEntry]);
+        yield { type: 'inject-consumed', data: { entries: [injToolEntry] } } as never;
         yield { type: 'text-delta', text: 'answer after tool' } as never;
         yield { type: 'done', modelKey: 'test' } as never;
       })();
@@ -841,10 +885,11 @@ describe('agent conversationTarget', () => {
         .onInjected;
       return (async function* () {
         yield { type: 'text-delta', text: 'pre' } as never;
-        onInjected?.([{ id: 'inj-pv', text: 'follow-up', at: Date.now() }]);
+        const injPvEntry = { id: 'inj-pv', text: 'follow-up', at: Date.now() };
+        onInjected?.([injPvEntry]);
         // inject-consumed marker flushes the buffered boundary (persists it), so
         // there is something to roll back on the subsequent fallback.
-        yield { type: 'inject-consumed', data: {} } as never;
+        yield { type: 'inject-consumed', data: { entries: [injPvEntry] } } as never;
         yield { type: 'text-delta', text: 'partial that stays as a variant' } as never;
         yield { type: 'model-fallback', modelKey: 'fallback', data: { preserveErroredVariant: true } } as never;
         yield { type: 'text-delta', text: 'retry answer' } as never;
@@ -876,8 +921,9 @@ describe('agent conversationTarget', () => {
         yield { type: 'text-delta', text: 'pre-inject text' } as never;
         // Inject consumed at a boundary → flushed on inject-consumed marker
         // (persists the partial assistant + injected user).
-        onInjected?.([{ id: 'inj-fb', text: 'the follow-up', at: Date.now() }]);
-        yield { type: 'inject-consumed', data: {} } as never;
+        const injFbEntry = { id: 'inj-fb', text: 'the follow-up', at: Date.now() };
+        onInjected?.([injFbEntry]);
+        yield { type: 'inject-consumed', data: { entries: [injFbEntry] } } as never;
         yield { type: 'text-delta', text: 'post-inject (will be discarded)' } as never;
         // Whole response regenerated on the fallback model.
         yield { type: 'model-fallback', modelKey: 'fallback' } as never;

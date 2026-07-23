@@ -21,11 +21,25 @@ describe('buildMastraPrepareStep (cooperative mid-turn splice)', () => {
     prepareStep({ messages: [{ role: 'user', content: 'x' }], stepNumber: 2 });
     // Prior step (1) not yet fully consumed → nothing ready.
     expect(drainInjectConsumedMarkers('c1', 1)).toEqual([]);
-    // Once consumed steps reach 2, the marker is ready in order.
+    // Once consumed steps reach 2, the marker batch is ready in order.
     const ready = drainInjectConsumedMarkers('c1', 2);
-    expect(ready.map((e) => e.text)).toEqual(['follow-up']);
+    expect(ready.length).toBe(1);
+    expect(ready[0].map((e) => e.text)).toEqual(['follow-up']);
     // Drained — no longer returned.
     expect(drainInjectConsumedMarkers('c1', 99)).toEqual([]);
+  });
+
+  it('returns separate batches per step boundary, drained as each prior step completes', () => {
+    enqueueInject('c1', 'a');
+    const ps = buildMastraPrepareStep('c1');
+    ps({ messages: [], stepNumber: 1 });
+    enqueueInject('c1', 'b');
+    ps({ messages: [], stepNumber: 2 });
+    // Only the step-1 boundary is ready when 1 step consumed.
+    const first = drainInjectConsumedMarkers('c1', 1);
+    expect(first.map((b) => b.map((e) => e.text))).toEqual([['a']]);
+    const second = drainInjectConsumedMarkers('c1', 2);
+    expect(second.map((b) => b.map((e) => e.text))).toEqual([['b']]);
   });
 
   it('clearInjectConsumedMarkers discards recorded markers', () => {

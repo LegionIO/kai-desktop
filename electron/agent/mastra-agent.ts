@@ -1654,12 +1654,12 @@ async function* streamWithRealEvents(
           // even when the upstream pipeline buffers ahead: a marker for step N is
           // only emitted once step N-1's chunks (incl. its tool-result) are in the
           // accumulator, so the boundary can't split before a buffered tool result.
-          const consumedMarkers = drainInjectConsumedMarkers(conversationId, currentStepCount);
-          if (consumedMarkers.length > 0) {
+          const consumedBatches = drainInjectConsumedMarkers(conversationId, currentStepCount);
+          for (const batch of consumedBatches) {
             yield {
               conversationId,
               type: 'inject-consumed',
-              data: { entries: consumedMarkers },
+              data: { entries: batch },
             };
           }
           const c = chunk as RawStreamChunk;
@@ -1833,12 +1833,12 @@ async function* streamWithRealEvents(
         // The chunk loop ended: emit any inject marker recorded on the final step
         // (its prior step is necessarily done now) so a last-step follow-up still
         // splits the branch. Use a high consumed-steps bound.
-        const trailingMarkers = drainInjectConsumedMarkers(conversationId, Number.MAX_SAFE_INTEGER);
-        if (trailingMarkers.length > 0) {
+        const trailingBatches = drainInjectConsumedMarkers(conversationId, Number.MAX_SAFE_INTEGER);
+        for (const batch of trailingBatches) {
           yield {
             conversationId,
             type: 'inject-consumed',
-            data: { entries: trailingMarkers },
+            data: { entries: batch },
           };
         }
 

@@ -56,15 +56,17 @@ const injectConsumedMarkers = new Map<string, ConsumedMarker[]>();
  * the caller has processed step events up to `consumedSteps`. prepareStep for
  * step N (0-based) runs AFTER step N-1's events, so a marker recorded at
  * stepNumber N is safe to emit once `consumedSteps >= N` (all of step N-1's
- * chunks, incl. its tool-result, are in the accumulator). Returns the entries in
- * order and removes only the drained markers. */
-export function drainInjectConsumedMarkers(conversationId: string, consumedSteps: number): QueuedInject[] {
+ * chunks, incl. its tool-result, are in the accumulator). Returns ready markers
+ * as SEPARATE per-boundary batches (in step order) — the caller emits one
+ * `inject-consumed` event per batch so each boundary commits at its own stream
+ * position. Removes only the drained markers. */
+export function drainInjectConsumedMarkers(conversationId: string, consumedSteps: number): QueuedInject[][] {
   const markers = injectConsumedMarkers.get(conversationId);
   if (!markers || markers.length === 0) return [];
-  const ready: QueuedInject[] = [];
+  const ready: QueuedInject[][] = [];
   const remaining: ConsumedMarker[] = [];
   for (const m of markers) {
-    if (m.stepNumber <= consumedSteps) ready.push(...m.entries);
+    if (m.stepNumber <= consumedSteps) ready.push(m.entries);
     else remaining.push(m);
   }
   if (remaining.length > 0) injectConsumedMarkers.set(conversationId, remaining);

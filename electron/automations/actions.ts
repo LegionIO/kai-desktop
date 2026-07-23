@@ -964,18 +964,22 @@ async function runAgentAction(
           pendingBoundary.push(...entries);
         },
       })) {
-        // Flush a buffered inject boundary when the in-band `inject-consumed`
-        // marker arrives. The mastra fullStream wrapper emits it in-ORDER right
-        // before the next step's first chunk (prepareStep ran between the prior
-        // chunk and it), so by this point ALL of the prior step's text/tool-call/
-        // tool-result events are already in contentParts — the branch splits at the
-        // exact, race-free boundary (…assistant/tool → injected user → continuation).
-        // A boundary consumed on the FINAL step (no following chunk/marker) is
-        // handled by the post-loop flush.
-        if (pendingBoundary.length > 0 && ev.type === 'inject-consumed') {
-          const toFlush = pendingBoundary;
-          pendingBoundary = [];
-          flushInjectedBoundary(toFlush);
+        // Flush ONLY the entries named by THIS in-band `inject-consumed` marker.
+        // The wrapper emits one marker per step boundary, in order; when upstream
+        // buffering delivers two boundaries close together, pendingBoundary may
+        // hold entries for both, but each marker identifies just the boundary safe
+        // to commit at its stream position. Flushing the whole array would persist
+        // a later follow-up before its intervening assistant/tool segment. The
+        // remaining entries stay buffered for their own marker (or post-loop /
+        // restart recovery). A final-step boundary is handled post-loop.
+        if (ev.type === 'inject-consumed') {
+          const markerEntries = ((ev as { data?: { entries?: Array<{ id?: unknown }> } }).data?.entries ?? []).filter(
+            (e): e is { id: string; text: string; at: number } => typeof (e as { id?: unknown }).id === 'string',
+          );
+          const markerIds = new Set(markerEntries.map((e) => e.id));
+          const toFlush = pendingBoundary.filter((e) => markerIds.has(e.id));
+          pendingBoundary = pendingBoundary.filter((e) => !markerIds.has(e.id));
+          if (toFlush.length > 0) flushInjectedBoundary(toFlush);
         }
         // Don't forward the inner stream's `done` — the renderer treats an
         // automation `done` as terminal (clears + reloads). We broadcast exactly
