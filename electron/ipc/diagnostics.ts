@@ -107,8 +107,11 @@ export function registerDiagnosticsHandlers(
 
   ipcMain.handle('diagnostics:clear-debug-trace', async () => {
     const path = getDiagnosticTracePath();
+    // Remove rather than truncate: appendFileSync recreates it with mode 0o600.
+    // writeFileSync on an absent path would create it with the process umask
+    // (often 0o644), leaving content-mode traces readable by other local users.
     try {
-      writeFileSync(path, '');
+      rmSync(path, { force: true });
     } catch {
       /* absent */
     }

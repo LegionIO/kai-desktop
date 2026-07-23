@@ -127,6 +127,18 @@ function rotate(path: string, cfg: TraceConfig): void {
   } catch {
     return;
   }
+  // Drop any rotated siblings above the (possibly reduced) limit so a lowered
+  // maxFiles is enforced immediately rather than waiting for age pruning.
+  for (const name of readdirSync(dirname(path))) {
+    const match = /\.jsonl\.(\d+)$/.exec(name);
+    if (match && Number(match[1]) >= cfg.maxFiles) {
+      try {
+        rmSync(join(dirname(path), name), { force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
   if (cfg.maxFiles <= 1) {
     rmSync(path, { force: true });
     return;
@@ -149,6 +161,16 @@ function prune(path: string, cfg: TraceConfig): void {
     for (const name of readdirSync(dirname(path))) {
       if (!name.startsWith('diagnostic-trace.jsonl')) continue;
       const candidate = join(dirname(path), name);
+      // Enforce the (possibly reduced) rotated-file count: drop suffixes >= limit.
+      const match = /\.jsonl\.(\d+)$/.exec(name);
+      if (match && Number(match[1]) >= cfg.maxFiles) {
+        try {
+          rmSync(candidate, { force: true });
+        } catch {
+          /* best effort */
+        }
+        continue;
+      }
       try {
         if (statSync(candidate).mtimeMs < cutoff) rmSync(candidate, { force: true });
       } catch {

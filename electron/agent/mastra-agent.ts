@@ -1363,9 +1363,12 @@ async function* generateWithSyntheticEvents(
       const generateOptions = {
         maxSteps: maxStepsLimit,
         abortSignal: options?.abortSignal,
-        // Cooperative mid-turn injection (see streamOptions): splice queued
-        // follow-ups at each step boundary. No-op when the queue is empty.
-        prepareStep: buildMastraPrepareStep(conversationId, undefined, options?.onInjected),
+        // The synthetic-events path runs agent.generate() to completion and only
+        // yields step events afterward, so a prepareStep boundary callback would
+        // fire before the prior tool step is observable and misorder persistence.
+        // Do NOT install a queue-draining prepareStep here — leave injects queued
+        // for the caller's drain-at-end fallback, which persists them correctly
+        // after the turn (the streaming path handles true mid-turn injection).
         experimental_generateMessageId: () => responseMessageId,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),

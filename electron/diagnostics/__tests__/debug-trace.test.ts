@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { getDiagnosticTracePath, initDiagnosticTrace, invalidateDiagnosticTraceConfig, isDiagnosticTraceEnabled, traceDiagnostic } from '../debug-trace';
 import type { AppConfig } from '../../config/schema';
 
@@ -79,6 +79,20 @@ describe('diagnostic trace', () => {
     });
     const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
     expect(row.fields.error).toEqual({ omitted: true, name: 'Error' });
+  });
+
+  it('enforces a reduced maxFiles by dropping rotated siblings above the limit', () => {
+    mutateTrace({ enabled: true });
+    const base = getDiagnosticTracePath();
+    mkdirSync(dirname(base), { recursive: true });
+    writeFileSync(`${base}.1`, 'old1');
+    writeFileSync(`${base}.2`, 'old2');
+    writeFileSync(`${base}.3`, 'old3');
+    mutateTrace({ retention: { maxFileBytes: 10485760, maxFiles: 2, maxAgeDays: 7 } });
+    // A trace write triggers prune(), which removes suffixes >= maxFiles.
+    traceDiagnostic({ scope: 'automation', event: 'turn.start' });
+    expect(existsSync(`${base}.2`)).toBe(false);
+    expect(existsSync(`${base}.3`)).toBe(false);
   });
 
   it('includes bounded content only when explicitly enabled', () => {
