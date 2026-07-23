@@ -919,6 +919,15 @@ async function runAgentAction(
               ruleId: rule.id,
               fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback' },
             });
+          }
+          // Rewind the head to the pre-boundary parent in BOTH cases: the retry
+          // must branch a fresh sibling from before the boundary, not descend from
+          // the failed variant's injected user (which would produce consecutive
+          // duplicate user turns and make the retry a descendant, not a sibling).
+          // Rolled-back: the boundary nodes are gone. Preserved: they remain as a
+          // sibling variant, and the fresh-id re-queue below re-persists the
+          // follow-up on the new branch off preBoundaryParentId.
+          if (boundaryPersistedIds.length > 0) {
             userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
           }
           boundaryPersistedIds.length = 0;
