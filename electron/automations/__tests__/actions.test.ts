@@ -458,6 +458,50 @@ describe('agent conversationTarget', () => {
     expect(appendedId).toBe('convA');
   });
 
+  it('flushes an inject boundary only after the prior step tool-result is consumed', async () => {
+    clearInjects('convToolInj');
+    resetMockStore({
+      convToolInj: { id: 'convToolInj', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // Simulate prepareStep firing onInjected DURING a tool step: tool-call, then
+    // onInjected (inject consumed), then the tool-result arrives, then new-step
+    // text. The boundary must NOT split until the tool-result is consumed, so the
+    // persisted partial assistant includes the resolved tool call.
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'tool-call', toolCallId: 't1', toolName: 'search', args: {} } as never;
+        onInjected?.([{ id: 'inj-tool', text: 'follow-up', at: Date.now() }]);
+        yield { type: 'tool-result', toolCallId: 't1', result: { ok: true } } as never;
+        yield { type: 'text-delta', text: 'answer after tool' } as never;
+        yield { type: 'done', modelKey: 'test' } as never;
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convToolInj' }), evt, deps());
+
+    // The injected user must appear AFTER an assistant node that carries the
+    // resolved tool call — not before it.
+    const tree = mockStore.conversations.convToolInj.messageTree as Array<{
+      id?: string;
+      role?: string;
+      content?: Array<{ type?: string; toolCallId?: string; result?: unknown }>;
+    }>;
+    const injIdx = tree.findIndex((m) => m.id === 'inj-tool');
+    expect(injIdx).toBeGreaterThan(-1);
+    const priorAssistants = tree.slice(0, injIdx).filter((m) => m.role === 'assistant');
+    const hasResolvedTool = priorAssistants.some((m) =>
+      (m.content ?? []).some((p) => p.type === 'tool-call' && p.toolCallId === 't1' && p.result !== undefined),
+    );
+    expect(hasResolvedTool).toBe(true);
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('busy target held by an in-flight AUTOMATION run injects COOPERATIVELY (enqueue, no abort/restart)', async () => {
     // An in-flight automation run is always Mastra (steppable), so a second
     // automation targeting it must enqueue for prepareStep to splice mid-turn —
