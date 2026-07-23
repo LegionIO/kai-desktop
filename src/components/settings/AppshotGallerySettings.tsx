@@ -262,6 +262,8 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
   };
   const [appshots, setAppshots] = useState<Appshot[]>([]);
   const [viewing, setViewing] = useState<Appshot | null>(null);
+  // Gallery thumbnails fetch full JPEGs — only load them when the user opts in.
+  const [showGallery, setShowGallery] = useState(false);
   // Monotonic guard: a slow older list() response must not overwrite a newer one.
   const refreshSeqRef = useRef(0);
   // Accumulates patches applied during the one-time legacy→canonical migration so
@@ -381,6 +383,16 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
         <legend className="text-xs font-semibold px-1">Gallery ({appshots.length})</legend>
         {appshots.length === 0 ? (
           <p className="text-xs text-muted-foreground">No appshots yet.</p>
+        ) : !showGallery ? (
+          // Lazy: thumbnails fetch full JPEGs, so don't mount them (up to hundreds
+          // of MB at default retention) just because the App Shots tab was opened.
+          <button
+            type="button"
+            onClick={() => setShowGallery(true)}
+            className="rounded-lg border border-border/60 px-3 py-1.5 text-xs hover:bg-accent"
+          >
+            Show {appshots.length} saved App Shot{appshots.length === 1 ? '' : 's'}
+          </button>
         ) : (
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
             {appshots.map((a) => (

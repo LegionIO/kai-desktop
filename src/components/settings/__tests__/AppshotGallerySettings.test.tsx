@@ -76,8 +76,11 @@ describe('AppshotsSettings', () => {
     render(<AppshotsSettings config={config} updateConfig={vi.fn()} hideTitle />);
     await waitFor(() => expect(screen.getByText(/Gallery \(1\)/)).toBeInTheDocument());
 
+    // Gallery is lazy — reveal the thumbnails first.
+    fireEvent.click(screen.getByText(/Show 1 saved App Shot/));
+
     // Open the viewer by clicking the thumbnail button.
-    fireEvent.click(screen.getByTitle('Safari'));
+    fireEvent.click(await screen.findByTitle('Safari'));
     await waitFor(() => expect(screen.getByTestId('appshot-viewer')).toBeInTheDocument());
 
     // Wait for the image to load, then attach.
