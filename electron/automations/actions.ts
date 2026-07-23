@@ -52,10 +52,26 @@ const inFlightAutomationTargets = new Set<string>();
  * behind it instead of overtaking it via true mid-turn injection. Ordinary busy
  * events still inject cooperatively when no barrier exists. */
 const orderedConversationTails = new Map<string, Promise<void>>();
+// Cancellation epoch per conversation. Bumped when an alert resume times out so
+// followers ALREADY queued behind it abort at their turn instead of running
+// ahead of the re-answer (deleting the tail alone doesn't stop chained promises).
+const orderedTurnEpoch = new Map<string, number>();
+
+class OrderedTurnCancelled extends Error {}
 
 function enqueueOrderedConversationTurn<T>(conversationId: string, task: () => Promise<T>): Promise<T> {
   const previous = orderedConversationTails.get(conversationId) ?? Promise.resolve();
-  const run = previous.catch(() => {}).then(task);
+  const epochAtEnqueue = orderedTurnEpoch.get(conversationId) ?? 0;
+  const guarded = async () => {
+    // If the epoch advanced since this task was queued (an earlier alert resume
+    // timed out and cancelled its followers), abort rather than run ahead of the
+    // re-answer. The source event re-fires independently if still relevant.
+    if ((orderedTurnEpoch.get(conversationId) ?? 0) !== epochAtEnqueue) {
+      throw new OrderedTurnCancelled(`ordered turn for ${conversationId} cancelled`);
+    }
+    return task();
+  };
+  const run = previous.catch(() => {}).then(guarded);
   const tail = run.then(
     () => undefined,
     () => undefined,
@@ -65,6 +81,12 @@ function enqueueOrderedConversationTurn<T>(conversationId: string, task: () => P
     if (orderedConversationTails.get(conversationId) === tail) orderedConversationTails.delete(conversationId);
   });
   return run;
+}
+
+/** Cancel ordered followers already queued for a conversation (bump the epoch). */
+function cancelOrderedFollowers(conversationId: string): void {
+  orderedTurnEpoch.set(conversationId, (orderedTurnEpoch.get(conversationId) ?? 0) + 1);
+  orderedConversationTails.delete(conversationId);
 }
 
 /** Abort controllers for in-flight agent runs, keyed by target conversationId.
@@ -385,8 +407,7 @@ async function runAgentAction(
         // answer-before-followers guarantee). Their source events re-fire
         // independently if still relevant. Only alert resumes do this.
         if (opts?.forceFreshTurn) {
-          const currentTail = orderedConversationTails.get(orderingConversationId);
-          if (currentTail) orderedConversationTails.delete(orderingConversationId);
+          cancelOrderedFollowers(orderingConversationId);
           traceDiagnostic({
             scope: 'automation',
             event: 'turn.alert-resume-timeout',
@@ -922,16 +943,18 @@ async function runAgentAction(
           }
           boundaryPersistedIds.length = 0;
           preBoundaryParentId = undefined;
-          // Re-enqueue the injected turns the fallback discarded so the retry's
-          // prepareStep re-consumes them (streamWithFallback retries from the
-          // ORIGINAL messages and the queue was already drained). Reverse order so
-          // the head-insert restores FIFO. Without this the follow-up is lost.
-          if (consumedInjectEntries.length > 0) {
+          // Re-enqueue the injected turns ONLY when the failed variant was
+          // discarded (rolled back). If preserveErroredVariant retained the
+          // boundary nodes, the injected user (with its stable id) still exists on
+          // disk — re-enqueuing would re-persist it, and since the id is taken
+          // appendConversationMessages would mint a new id, duplicating the user
+          // turn and making the retry a descendant rather than a sibling variant.
+          if (!preserveErroredVariant && consumedInjectEntries.length > 0) {
             for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
               reenqueueInject(conversationId, consumedInjectEntries[i]);
             }
-            consumedInjectEntries.length = 0;
           }
+          consumedInjectEntries.length = 0;
         }
       }
     } catch (streamErr) {
