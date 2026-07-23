@@ -703,6 +703,16 @@ async function runAgentAction(
       if (entries.length === 0) return;
       consumedInjectEntries.push(...entries);
       if (preBoundaryParentId === undefined) preBoundaryParentId = userTurnHeadId;
+      // Once an earlier boundary's user write failed this turn, we must NOT persist
+      // this boundary's intervening continuation assistant either — doing so would
+      // leave an assistant (answering the failed earlier user) on disk before the
+      // deferred users, so recovery would order reply-before-prompt. Defer the
+      // whole boundary (assistant content stays in contentParts for the terminal
+      // finalize; users go to recovery in order).
+      if (anyBoundaryFailed) {
+        for (const entry of entries) failedBoundaryUsers.push(entry);
+        return;
+      }
       traceDiagnostic({
         scope: 'automation',
         event: 'inject.consumed',
