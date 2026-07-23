@@ -35,10 +35,16 @@ type TraceConfig = {
 
 const DEFAULT_SCOPES: DiagnosticTraceScope[] = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'];
 const SECRET_KEY_RE = /(authorization|cookie|token|secret|password|api[-_]?key|credential|session)/i;
-// Content fields only — deliberately NOT broad substrings, or metadata keys like
-// messageId / parentMessageId would be omitted in the default mode (the exact
-// branch-correlation data this trace exists to capture).
-const CONTENT_KEY_RE = /(?:^|_)(body|content|text|prompt|message|args|result|payload|response|url|uri|href|path|filepath|filename)$/i;
+// Content words matched anywhere in a key (camelCase, snake_case, or plain), so
+// `body`, `messageBody`, `promptText`, `toolArgs`, `request_url` are all caught.
+const CONTENT_WORD_RE = /(body|content|text|prompt|message|args|result|payload|response|url|uri|href|path|filename)/i;
+// Metadata suffixes that make a key an ID/counter/timestamp, NOT content — these
+// override the content-word match so branch-correlation data (messageId,
+// parentMessageId, resultCount, …) is preserved in metadata-only mode.
+const METADATA_SUFFIX_RE = /(id|ids|count|at|ms|len|length|bytes|chars|index|hash|status|kind|type|name)$/i;
+function isContentKey(key: string): boolean {
+  return CONTENT_WORD_RE.test(key) && !METADATA_SUFFIX_RE.test(key);
+}
 const MAX_STRING = 4000;
 
 let appHome = '';
@@ -108,7 +114,7 @@ function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0):
   if (!includeContent && isReasonKey && !(value instanceof Error) && !(typeof value === 'string' && value.length > 200)) {
     return sanitizeScalar(value);
   }
-  if (!includeContent && (CONTENT_KEY_RE.test(key) || isErrorKey || isReasonKey)) {
+  if (!includeContent && (isContentKey(key) || isErrorKey || isReasonKey)) {
     if (value instanceof Error) return { omitted: true, name: value.name };
     if (typeof value === 'string') return { omitted: true, chars: value.length };
     if (Array.isArray(value)) return { omitted: true, items: value.length };

@@ -242,6 +242,18 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
     maxTotalBytes: cfg.retention?.maxTotalBytes ?? 524288000,
   };
   const setPersisted = (patch: Partial<AppshotsConfig>) => {
+    if (canonical) {
+      // Canonical object already exists: write only the changed leaf/leaves so
+      // two rapid edits before a config round-trip don't clobber each other via
+      // stale whole-object rebuilds.
+      for (const [key, value] of Object.entries(patch)) {
+        void updateConfig(`appShots.persisted.${key}`, value);
+      }
+      return;
+    }
+    // First edit of a legacy-only config: write the FULL resolved object once so
+    // the other legacy fields aren't stranded when the resolver switches to the
+    // canonical location.
     void updateConfig('appShots.persisted', {
       enabled: cfg.enabled ?? false,
       autoCapture: cfg.autoCapture ?? false,

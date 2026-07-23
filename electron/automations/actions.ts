@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -623,8 +623,11 @@ async function runAgentAction(
         parentMessageId: userTurnHeadId,
         fields: { injectIds: entries.map((entry) => entry.id), count: entries.length },
       });
-      try {
-        if (contentParts.length > 0) {
+      // Persist the partial assistant. If its content won't serialize (e.g. an
+      // exotic tool result), fall back to a text-only assistant so the segment +
+      // subsequent injected-user ordering is still recorded.
+      if (contentParts.length > 0) {
+        try {
           const partial = appendConversationMessages(
             deps.appHome,
             conversationId,
@@ -632,8 +635,41 @@ async function runAgentAction(
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
           if (partial?.headId) userTurnHeadId = partial.headId;
+        } catch (partialErr) {
+          try {
+            const fallback = appendConversationMessages(
+              deps.appHome,
+              conversationId,
+              [
+                {
+                  role: 'assistant',
+                  content: [{ type: 'text', text: text || '⚠️ (assistant content could not be saved)' }],
+                  createdAt: new Date().toISOString(),
+                },
+              ],
+              { parentId: userTurnHeadId, runStatus: 'running' },
+            );
+            if (fallback?.headId) userTurnHeadId = fallback.headId;
+          } catch {
+            /* give up on the partial; still persist the injected users below */
+          }
+          traceDiagnostic({
+            scope: 'automation',
+            event: 'inject.partial-persist-failed',
+            level: 'error',
+            correlationId,
+            conversationId,
+            ruleId: rule.id,
+            fields: { error: partialErr },
+          });
         }
-        for (const entry of entries) {
+      }
+      // Persist the injected user turns. These are plain text so this effectively
+      // never fails; if it does we log but do NOT re-enqueue — the model has
+      // ALREADY consumed them (prepareStep spliced them into the input), so
+      // re-injecting would double-answer + repeat tool side effects.
+      for (const entry of entries) {
+        try {
           const injected = appendConversationMessages(
             deps.appHome,
             conversationId,
@@ -648,25 +684,17 @@ async function runAgentAction(
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
           if (injected?.headId) userTurnHeadId = injected.headId;
+        } catch (injErr) {
+          traceDiagnostic({
+            scope: 'automation',
+            event: 'inject.persist-failed',
+            level: 'error',
+            correlationId,
+            conversationId,
+            ruleId: rule.id,
+            fields: { injectId: entry.id, error: injErr },
+          });
         }
-      } catch (persistErr) {
-        // Boundary persistence failed (e.g. an unserializable tool result in the
-        // partial assistant). prepareStep already drained the queue, so RE-ENQUEUE
-        // the entries — the run's finally re-drains + persists them onto the
-        // branch, so the injected user turns are never silently lost.
-        // Re-enqueue in REVERSE so the head-insert (unshift) restores original
-        // FIFO order (A→B), matching the order the model consumed them.
-        for (let i = entries.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, entries[i]);
-        traceDiagnostic({
-          scope: 'automation',
-          event: 'inject.persist-failed',
-          level: 'error',
-          correlationId,
-          conversationId,
-          ruleId: rule.id,
-          fields: { injectIds: entries.map((entry) => entry.id), error: persistErr },
-        });
-        return;
       }
       // Preserve this segment's text in the cumulative result before resetting
       // the per-segment accumulator (separator mirrors the tool-result spacing).

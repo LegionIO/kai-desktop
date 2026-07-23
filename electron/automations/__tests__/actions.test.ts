@@ -493,7 +493,7 @@ describe('agent conversationTarget', () => {
     });
   });
 
-  it('re-enqueues an inject when boundary persistence fails, so it still lands via drain-at-end', async () => {
+  it('persists an inject directly (no replay) when the partial-assistant append fails', async () => {
     clearInjects('convBoundaryFail');
     resetMockStore({
       convBoundaryFail: { id: 'convBoundaryFail', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
@@ -553,6 +553,11 @@ describe('agent conversationTarget', () => {
           ),
       );
     expect(persisted).toBe(true);
+    // The model already consumed the inject this turn; it must NOT be replayed
+    // via a drain-at-end continuation (which would double-answer + repeat tool
+    // side effects). Exactly one stream run.
+    expect(calls).toBe(1);
+    expect(hasInjects('convBoundaryFail')).toBe(false);
 
     // Restore shared mocks.
     vi.mocked(streamForPlugin).mockImplementation(async function* () {

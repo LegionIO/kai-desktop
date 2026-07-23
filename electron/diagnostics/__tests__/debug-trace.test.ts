@@ -143,6 +143,31 @@ describe('diagnostic trace', () => {
     expect(row.fields.reason).toEqual({ omitted: true, chars: 300 });
   });
 
+  it('omits camelCase/snake_case content keys but keeps id/count metadata', () => {
+    mutateTrace({ enabled: true });
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.start',
+      fields: {
+        messageBody: 'secret prose',
+        promptText: 'do the thing',
+        toolArgs: { k: 'v' },
+        request_url: 'https://x/y',
+        messageId: 'm-1',
+        parentMessageId: 'm-0',
+        resultCount: 3,
+      },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.messageBody).toEqual({ omitted: true, chars: 'secret prose'.length });
+    expect(row.fields.promptText).toEqual({ omitted: true, chars: 'do the thing'.length });
+    expect(row.fields.toolArgs).toEqual({ omitted: true, keys: 1 });
+    expect(row.fields.request_url).toEqual({ omitted: true, chars: 'https://x/y'.length });
+    expect(row.fields.messageId).toBe('m-1');
+    expect(row.fields.parentMessageId).toBe('m-0');
+    expect(row.fields.resultCount).toBe(3);
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
     mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
