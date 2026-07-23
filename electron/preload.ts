@@ -889,6 +889,7 @@ const appAPI = {
     log: (file: string, message: string) => ipcRenderer.send('debug:log', file, message),
     trace: (event: {
       event: string;
+      scope?: 'agent' | 'automation' | 'alert' | 'renderer';
       level?: 'debug' | 'info' | 'warn' | 'error';
       correlationId?: string;
       conversationId?: string;

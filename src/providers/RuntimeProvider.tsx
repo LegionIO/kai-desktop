@@ -203,11 +203,14 @@ function summarizeToolParts(parts: ContentPart[]): Array<Record<string, unknown>
 
 function logRuntimeToolDebug(stage: string, details: Record<string, unknown>): void {
   console.info(`[RuntimeToolDebug] ${stage} ${JSON.stringify(details)}`);
-  app.debug?.trace?.({ event: `tool.${stage}`, fields: details });
+  app.debug?.trace?.({ event: `tool.${stage}`, scope: 'agent', fields: details });
 }
 
+// Renderer-side agent lifecycle (stream events, conversation loads). Tagged
+// 'agent' so the Diagnostics "agent" scope captures them (not lumped under
+// 'renderer', which is for generic renderer diagnostics).
 function traceRuntime(event: string, conversationId: string | null, fields?: Record<string, unknown>): void {
-  app.debug?.trace?.({ event, conversationId: conversationId ?? undefined, fields });
+  app.debug?.trace?.({ event, scope: 'agent', conversationId: conversationId ?? undefined, fields });
 }
 
 function msgId(): string {

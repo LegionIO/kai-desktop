@@ -1375,14 +1375,21 @@ if (gotSingleInstanceLock) {
       if (!event || typeof event !== 'object') return;
       const candidate = event as {
         event?: unknown;
+        scope?: unknown;
         level?: unknown;
         correlationId?: unknown;
         conversationId?: unknown;
         fields?: unknown;
       };
       if (typeof candidate.event !== 'string') return;
+      // Renderer emits both agent-lifecycle (stream/conversation) and generic
+      // events; honor an explicit agent/automation/alert scope, else 'renderer'.
+      const scope =
+        candidate.scope === 'agent' || candidate.scope === 'automation' || candidate.scope === 'alert'
+          ? candidate.scope
+          : 'renderer';
       traceDiagnostic({
-        scope: 'renderer',
+        scope,
         event: candidate.event.slice(0, 160),
         level:
           candidate.level === 'debug' || candidate.level === 'warn' || candidate.level === 'error'

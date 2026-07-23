@@ -241,9 +241,15 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           <div className="text-[11px] font-medium text-muted-foreground">Scopes</div>
           <div className="mt-2 flex flex-wrap gap-2">
             {(['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const).map((scope) => {
-              const scopes = debugTrace?.scopes?.length
-                ? debugTrace.scopes
-                : ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'];
+              // An explicit [] means "no scopes"; only a missing value defaults.
+              const scopes = debugTrace?.scopes ?? [
+                'agent',
+                'automation',
+                'alert',
+                'plugin',
+                'renderer',
+                'window',
+              ];
               const checked = scopes.includes(scope);
               return (
                 <label

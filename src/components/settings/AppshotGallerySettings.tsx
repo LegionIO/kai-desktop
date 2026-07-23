@@ -232,6 +232,24 @@ const GalleryThumb: FC<{ appshot: Appshot; onOpen: () => void }> = ({ appshot, o
 export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ config, updateConfig, hideTitle }) => {
   const canonical = (config.appShots as { persisted?: AppshotsConfig } | undefined)?.persisted;
   const cfg = canonical ?? (config.appshots as AppshotsConfig | undefined) ?? {};
+  // Write the FULL resolved object (not a single nested key) so the first
+  // canonical edit of an upgraded config doesn't strand the other legacy fields:
+  // once appShots.persisted exists the resolver stops consulting legacy appshots,
+  // so every field must be carried over on that first write.
+  const retention = {
+    maxCount: cfg.retention?.maxCount ?? 200,
+    maxAgeDays: cfg.retention?.maxAgeDays ?? 30,
+    maxTotalBytes: cfg.retention?.maxTotalBytes ?? 524288000,
+  };
+  const setPersisted = (patch: Partial<AppshotsConfig>) => {
+    void updateConfig('appShots.persisted', {
+      enabled: cfg.enabled ?? false,
+      autoCapture: cfg.autoCapture ?? false,
+      captureVisibleText: cfg.captureVisibleText ?? false,
+      retention,
+      ...patch,
+    });
+  };
   const [appshots, setAppshots] = useState<Appshot[]>([]);
   const [viewing, setViewing] = useState<Appshot | null>(null);
   // Monotonic guard: a slow older list() response must not overwrite a newer one.
@@ -281,19 +299,19 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           id="appShots.persisted.enabled"
           label="Enable saved App Shots"
           checked={cfg.enabled ?? false}
-          onChange={(v) => void updateConfig('appShots.persisted.enabled', v)}
+          onChange={(v) => setPersisted({ enabled: v })}
         />
         <Toggle
           id="appShots.persisted.autoCapture"
           label="Auto-capture frames during computer use"
           checked={cfg.autoCapture ?? false}
-          onChange={(v) => void updateConfig('appShots.persisted.autoCapture', v)}
+          onChange={(v) => setPersisted({ autoCapture: v })}
         />
         <Toggle
           id="appShots.persisted.captureVisibleText"
           label="Store visible text metadata"
           checked={cfg.captureVisibleText ?? false}
-          onChange={(v) => void updateConfig('appShots.persisted.captureVisibleText', v)}
+          onChange={(v) => setPersisted({ captureVisibleText: v })}
         />
         <p className="text-[10px] text-muted-foreground/80">
           Appshots are stored unencrypted under <span className="font-mono">~/.kai/data/appshots</span> (protected only
@@ -307,7 +325,7 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           id="appShots.persisted.retention.maxCount"
           label="Max appshots"
           value={cfg.retention?.maxCount ?? 200}
-          onChange={(v) => void updateConfig('appShots.persisted.retention.maxCount', v)}
+          onChange={(v) => setPersisted({ retention: { ...retention, maxCount: v } })}
           min={0}
           max={100000}
         />
@@ -315,7 +333,7 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           id="appShots.persisted.retention.maxAgeDays"
           label="Max age (days)"
           value={cfg.retention?.maxAgeDays ?? 30}
-          onChange={(v) => void updateConfig('appShots.persisted.retention.maxAgeDays', v)}
+          onChange={(v) => setPersisted({ retention: { ...retention, maxAgeDays: v } })}
           min={0}
           max={3650}
         />

@@ -11,6 +11,7 @@ import { binaryExists } from '../tools/cli-tools.js';
 import { primeResolvedShellPath } from '../utils/shell-env.js';
 import { getLanAddresses } from '../web-server/network.js';
 import { createLoginToken } from '../web-server/web-server.js';
+import { invalidateDiagnosticTraceConfig } from '../diagnostics/debug-trace.js';
 export type { AppConfig } from '../config/schema.js';
 
 /**
@@ -1145,6 +1146,7 @@ function normalizeResponsesApiConfig(config: AppConfig): AppConfig {
 }
 
 export function writeDesktopConfig(appHome: string, config: AppConfig): void {
+  invalidateDiagnosticTraceConfig();
   const configPath = getDesktopSettingsPath(appHome);
   const settingsDir = join(appHome, 'settings');
   mkdirSync(settingsDir, { recursive: true, mode: 0o700 });

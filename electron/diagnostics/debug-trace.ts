@@ -43,10 +43,17 @@ const MAX_STRING = 4000;
 
 let appHome = '';
 let getConfig: (() => AppConfig) | null = null;
+let cachedConfig: TraceConfig | null = null;
 
 export function initDiagnosticTrace(home: string, configProvider: () => AppConfig): void {
   appHome = home;
   getConfig = configProvider;
+  cachedConfig = null;
+}
+
+/** Invalidate the cached trace config (wired to every config write). */
+export function invalidateDiagnosticTraceConfig(): void {
+  cachedConfig = null;
 }
 
 export function newDiagnosticCorrelationId(prefix = 'trace'): string {
@@ -58,15 +65,23 @@ export function getDiagnosticTracePath(): string {
 }
 
 function config(): TraceConfig {
+  // Cached because getConfig is readEffectiveConfig(APP_HOME) — a synchronous
+  // disk read + zod parse — and the renderer can emit a trace call per
+  // tool-progress delta. The cache is invalidated on every config write, so a
+  // toggle from the Diagnostics UI takes effect immediately.
+  if (cachedConfig) return cachedConfig;
   const raw = getConfig?.().diagnostics?.debugTrace;
-  return {
+  cachedConfig = {
     enabled: raw?.enabled ?? false,
     includeContent: raw?.includeContent ?? false,
-    scopes: (raw?.scopes?.length ? raw.scopes : DEFAULT_SCOPES) as DiagnosticTraceScope[],
+    // An explicit empty array means "no scopes" (trace nothing) — do NOT treat
+    // it as the default set. Only a missing/undefined value falls back.
+    scopes: (raw?.scopes ?? DEFAULT_SCOPES) as DiagnosticTraceScope[],
     maxFileBytes: raw?.retention?.maxFileBytes ?? 10 * 1024 * 1024,
     maxFiles: raw?.retention?.maxFiles ?? 3,
     maxAgeDays: raw?.retention?.maxAgeDays ?? 7,
   };
+  return cachedConfig;
 }
 
 export function isDiagnosticTraceEnabled(scope?: DiagnosticTraceScope): boolean {
@@ -77,7 +92,12 @@ export function isDiagnosticTraceEnabled(scope?: DiagnosticTraceScope): boolean 
 function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0): unknown {
   if (depth > 6) return '[depth-limit]';
   if (SECRET_KEY_RE.test(key)) return '[redacted]';
-  if (!includeContent && CONTENT_KEY_RE.test(key)) {
+  // Error details can carry provider response bodies, prompts, file paths, or
+  // embedded credentials. In metadata-only mode surface just the shape/type, not
+  // the message/stack. `error`/`stack` are treated as content keys.
+  const isErrorKey = /(?:^|_)(error|stack|reason|cause)$/i.test(key);
+  if (!includeContent && (CONTENT_KEY_RE.test(key) || isErrorKey)) {
+    if (value instanceof Error) return { omitted: true, name: value.name };
     if (typeof value === 'string') return { omitted: true, chars: value.length };
     if (Array.isArray(value)) return { omitted: true, items: value.length };
     if (value && typeof value === 'object') return { omitted: true, keys: Object.keys(value as object).length };
@@ -88,7 +108,9 @@ function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0):
   if (value === undefined) return undefined;
   if (Array.isArray(value)) return value.slice(0, 100).map((entry) => sanitize(entry, includeContent, key, depth + 1));
   if (value instanceof Error)
-    return { name: value.name, message: value.message, stack: value.stack?.slice(0, MAX_STRING) };
+    return includeContent
+      ? { name: value.name, message: value.message, stack: value.stack?.slice(0, MAX_STRING) }
+      : { name: value.name, omitted: true };
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [childKey, child] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {

@@ -366,6 +366,7 @@ type AppAPI = {
     log: (file: string, message: string) => void;
     trace: (event: {
       event: string;
+      scope?: 'agent' | 'automation' | 'alert' | 'renderer';
       level?: 'debug' | 'info' | 'warn' | 'error';
       correlationId?: string;
       conversationId?: string;

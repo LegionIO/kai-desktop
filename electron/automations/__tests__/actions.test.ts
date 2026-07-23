@@ -473,6 +473,19 @@ describe('agent conversationTarget', () => {
     // Exactly one continuation turn ran (2 total), and the queue was drained.
     expect(calls).toBe(2);
     expect(hasInjects('convDrain')).toBe(false);
+    // The stranded inject must be PERSISTED as a user turn before the
+    // continuation (otherwise the model never sees it and the UI message
+    // vanishes). It's no longer written at enqueue time.
+    const persistedStranded = vi
+      .mocked(appendConversationMessages)
+      .mock.calls.some(
+        (call) =>
+          call[1] === 'convDrain' &&
+          (call[2] as Array<{ role: string; content: Array<{ text?: string }> }>).some(
+            (message) => message.role === 'user' && message.content?.[0]?.text === 'stranded follow-up',
+          ),
+      );
+    expect(persistedStranded).toBe(true);
     // Restore the shared default streaming impl for any later test.
     vi.mocked(streamForPlugin).mockImplementation(async function* () {
       yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;

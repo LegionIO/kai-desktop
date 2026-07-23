@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getDiagnosticTracePath, initDiagnosticTrace, isDiagnosticTraceEnabled, traceDiagnostic } from '../debug-trace';
+import { getDiagnosticTracePath, initDiagnosticTrace, invalidateDiagnosticTraceConfig, isDiagnosticTraceEnabled, traceDiagnostic } from '../debug-trace';
 import type { AppConfig } from '../../config/schema';
 
 let home: string;
@@ -25,19 +25,26 @@ beforeEach(() => {
 
 afterEach(() => rmSync(home, { recursive: true, force: true }));
 
+/** Mutate the in-memory trace config and invalidate the module cache (prod
+ * invalidates on every config write; tests mutate the object in place). */
+function mutateTrace(patch: Partial<AppConfig['diagnostics']['debugTrace']>): void {
+  Object.assign(cfg.diagnostics.debugTrace, patch);
+  invalidateDiagnosticTraceConfig();
+}
+
 describe('diagnostic trace', () => {
   it('is disabled by default and scope-gated', () => {
     expect(isDiagnosticTraceEnabled('automation')).toBe(false);
     traceDiagnostic({ scope: 'automation', event: 'turn.start' });
     expect(() => statSync(getDiagnosticTracePath())).toThrow();
 
-    cfg.diagnostics.debugTrace.enabled = true;
+    mutateTrace({ enabled: true });
     expect(isDiagnosticTraceEnabled('automation')).toBe(true);
     expect(isDiagnosticTraceEnabled('plugin')).toBe(false);
   });
 
   it('records metadata while omitting content and redacting secrets', () => {
-    cfg.diagnostics.debugTrace.enabled = true;
+    mutateTrace({ enabled: true });
     traceDiagnostic({
       scope: 'automation',
       event: 'turn.start',
@@ -57,9 +64,25 @@ describe('diagnostic trace', () => {
     expect(row.fields.count).toBe(2);
   });
 
+  it('treats an explicit empty scope list as trace-nothing', () => {
+    mutateTrace({ enabled: true, scopes: [] });
+    expect(isDiagnosticTraceEnabled('automation')).toBe(false);
+    expect(isDiagnosticTraceEnabled('agent')).toBe(false);
+  });
+
+  it('omits error message/stack in metadata-only mode', () => {
+    mutateTrace({ enabled: true });
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.finalized',
+      fields: { error: new Error('provider said https://secret/path failed') },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.error).toEqual({ omitted: true, name: 'Error' });
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
-    cfg.diagnostics.debugTrace.enabled = true;
-    cfg.diagnostics.debugTrace.includeContent = true;
+    mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
     const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
     expect(row.fields.body).toBe('hello');
