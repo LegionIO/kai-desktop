@@ -703,19 +703,30 @@ async function runAgentAction(
           const injected = appendUser();
           if (injected?.headId) userTurnHeadId = injected.headId;
         } catch (injErr) {
-          try {
-            const retried = appendUser();
-            if (retried?.headId) userTurnHeadId = retried.headId;
-          } catch (retryErr) {
-            traceDiagnostic({
-              scope: 'automation',
-              event: 'inject.persist-failed',
-              level: 'error',
-              correlationId,
-              conversationId,
-              ruleId: rule.id,
-              fields: { injectId: entry.id, error: retryErr ?? injErr },
-            });
+          // The first append may have written the conversation file but thrown
+          // while updating the index. Re-appending would let
+          // appendConversationMessages mint a NEW id and fork a sibling. Only
+          // retry if entry.id is NOT already on disk; otherwise treat it as
+          // committed and adopt it as the head.
+          const existingTree = readConversation(deps.appHome, conversationId)?.messageTree ?? [];
+          const already = (existingTree as Array<{ id?: unknown }>).some((m) => m.id === entry.id);
+          if (already) {
+            userTurnHeadId = entry.id;
+          } else {
+            try {
+              const retried = appendUser();
+              if (retried?.headId) userTurnHeadId = retried.headId;
+            } catch (retryErr) {
+              traceDiagnostic({
+                scope: 'automation',
+                event: 'inject.persist-failed',
+                level: 'error',
+                correlationId,
+                conversationId,
+                ruleId: rule.id,
+                fields: { injectId: entry.id, error: retryErr ?? injErr },
+              });
+            }
           }
         }
       }

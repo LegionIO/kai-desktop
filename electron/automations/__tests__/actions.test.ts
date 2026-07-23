@@ -592,6 +592,78 @@ describe('agent conversationTarget', () => {
     }) as never);
   });
 
+  it('does not fork a sibling when the inject user append persisted the node before throwing', async () => {
+    clearInjects('convIdem');
+    resetMockStore({
+      convIdem: { id: 'convIdem', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'text-delta', text: 'partial' } as never;
+        onInjected?.([{ id: 'inj-idem', text: 'the follow-up', at: Date.now() }]);
+        yield { type: 'done', modelKey: 'test' } as never;
+      })();
+    } as never);
+    // Simulate: the inject user append WRITES the node to the tree, then throws
+    // (as if the index update failed). The retry must detect the existing id and
+    // NOT append a second sibling copy.
+    let userThrowOnce = true;
+    vi.mocked(appendConversationMessages).mockImplementation(((
+      _home: string,
+      id: string,
+      msgs: Array<{ id?: string; role: string; content: unknown }>,
+      o?: { runStatus?: string },
+    ) => {
+      const conv = mockStore.conversations[id];
+      if (!conv) return null;
+      const tree = (conv.messageTree as Array<{ id?: string }>) ?? [];
+      const isInjectUser = msgs.length === 1 && msgs[0].role === 'user' && msgs[0].id === 'inj-idem';
+      if (userThrowOnce && isInjectUser && id === 'convIdem') {
+        userThrowOnce = false;
+        // Persist the node THEN throw (partial write / index-update failure).
+        conv.messageTree = [...tree, { id: 'inj-idem', ...msgs[0] }];
+        conv.headId = 'inj-idem';
+        throw new Error('index update failed');
+      }
+      const appended = msgs.map((m, i) => ({ id: m.id ?? `mock-${id}-${tree.length + i}`, ...m }));
+      conv.messageTree = [...tree, ...appended];
+      conv.headId = appended[appended.length - 1]?.id ?? conv.headId ?? null;
+      if (o?.runStatus !== undefined) conv.runStatus = o.runStatus;
+      return conv;
+    }) as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convIdem' }), evt, deps()).catch(() => {});
+
+    const injUserNodes = (mockStore.conversations.convIdem.messageTree as Array<{ id?: string; role?: string }>).filter(
+      (m) => m.id === 'inj-idem',
+    );
+    expect(injUserNodes.length).toBe(1);
+
+    // Restore shared mocks.
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+    vi.mocked(appendConversationMessages).mockImplementation(((
+      _home: string,
+      id: string,
+      msgs: Array<{ role: string; content: unknown }>,
+      o?: { skipIfBusy?: boolean; runStatus?: string },
+    ) => {
+      const conv = mockStore.conversations[id];
+      if (!conv) return null;
+      if (o?.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) return null;
+      const tree = (conv.messageTree as unknown[]) ?? [];
+      const appended = msgs.map((m, i) => ({ id: `mock-${id}-${tree.length + i}`, ...m }));
+      conv.messageTree = [...tree, ...appended];
+      conv.headId = appended[appended.length - 1]?.id ?? conv.headId ?? null;
+      if (o?.runStatus !== undefined) conv.runStatus = o.runStatus;
+      return conv;
+    }) as never);
+  });
+
   it('drops pre-injection text on a model fallback (result reflects the successful retry only)', async () => {
     clearInjects('convFb');
     resetMockStore({
