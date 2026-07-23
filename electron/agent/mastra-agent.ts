@@ -1556,6 +1556,10 @@ async function* generateWithSyntheticEvents(
     }
   }
 
+  // Discard any markers recorded by this path's prepareStep (never drained here —
+  // no chunk loop). GUI persistence went through the global handler; automation
+  // uses drain-at-end. Prevents unbounded retention / stale markers on a later stream.
+  clearInjectConsumedMarkers(conversationId);
   yield {
     conversationId,
     type: 'done',
@@ -1644,12 +1648,13 @@ async function* streamWithRealEvents(
             : asAsyncIterable(fullStream as ReadableStream<unknown>);
 
         for await (const chunk of iterator) {
-          // Surface any injects prepareStep consumed since the last chunk as an
-          // in-ORDER marker BEFORE this chunk (which is the next step's first
-          // event). This is race-free: prepareStep ran between the prior chunk and
-          // this one, so emitting here places the boundary exactly after the prior
-          // step's events and before the new step's.
-          const consumedMarkers = drainInjectConsumedMarkers(conversationId);
+          // Surface injects prepareStep consumed for a step whose PRIOR step has
+          // now been fully consumed (currentStepCount steps finished). Tying the
+          // marker to the step number — rather than "the next chunk" — is race-free
+          // even when the upstream pipeline buffers ahead: a marker for step N is
+          // only emitted once step N-1's chunks (incl. its tool-result) are in the
+          // accumulator, so the boundary can't split before a buffered tool result.
+          const consumedMarkers = drainInjectConsumedMarkers(conversationId, currentStepCount);
           if (consumedMarkers.length > 0) {
             yield {
               conversationId,
@@ -1825,6 +1830,18 @@ async function* streamWithRealEvents(
           }
         }
 
+        // The chunk loop ended: emit any inject marker recorded on the final step
+        // (its prior step is necessarily done now) so a last-step follow-up still
+        // splits the branch. Use a high consumed-steps bound.
+        const trailingMarkers = drainInjectConsumedMarkers(conversationId, Number.MAX_SAFE_INTEGER);
+        if (trailingMarkers.length > 0) {
+          yield {
+            conversationId,
+            type: 'inject-consumed',
+            data: { entries: trailingMarkers },
+          };
+        }
+
         if (compatibilityRetryRequested || sanitizationRetryRequested) {
           // Signal a restart so cooperative-injection consumers (automations)
           // replay any inject drained by prepareStep this attempt — this loop
@@ -1845,6 +1862,7 @@ async function* streamWithRealEvents(
 
         console.info(`[Agent] Stream completed for ${conversationId}`);
         requestCompleted = true;
+        clearInjectConsumedMarkers(conversationId);
         break;
       } catch (error) {
         if (options?.abortSignal?.aborted) break compatibilityLoop;

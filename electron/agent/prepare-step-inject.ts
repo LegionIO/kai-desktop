@@ -49,15 +49,27 @@ export function setInjectConsumedHandler(handler: InjectConsumedHandler | null):
  * the next step's chunks, so downstream persistence splits the branch at the
  * exact, race-free point (after the prior step's events, before the next).
  */
-const injectConsumedMarkers = new Map<string, QueuedInject[]>();
+type ConsumedMarker = { entries: QueuedInject[]; stepNumber: number };
+const injectConsumedMarkers = new Map<string, ConsumedMarker[]>();
 
-/** Drain (and clear) the pending in-band inject-consumed markers for a
- * conversation. Called by the fullStream wrapper to emit an ordered event. */
-export function drainInjectConsumedMarkers(conversationId: string): QueuedInject[] {
-  const m = injectConsumedMarkers.get(conversationId);
-  if (!m || m.length === 0) return [];
-  injectConsumedMarkers.delete(conversationId);
-  return m;
+/** Drain markers whose prior step (stepNumber) has been fully CONSUMED — i.e.
+ * the caller has processed step events up to `consumedSteps`. prepareStep for
+ * step N (0-based) runs AFTER step N-1's events, so a marker recorded at
+ * stepNumber N is safe to emit once `consumedSteps >= N` (all of step N-1's
+ * chunks, incl. its tool-result, are in the accumulator). Returns the entries in
+ * order and removes only the drained markers. */
+export function drainInjectConsumedMarkers(conversationId: string, consumedSteps: number): QueuedInject[] {
+  const markers = injectConsumedMarkers.get(conversationId);
+  if (!markers || markers.length === 0) return [];
+  const ready: QueuedInject[] = [];
+  const remaining: ConsumedMarker[] = [];
+  for (const m of markers) {
+    if (m.stepNumber <= consumedSteps) ready.push(...m.entries);
+    else remaining.push(m);
+  }
+  if (remaining.length > 0) injectConsumedMarkers.set(conversationId, remaining);
+  else injectConsumedMarkers.delete(conversationId);
+  return ready;
 }
 
 /** Discard any pending in-band markers for a conversation (call at stream
@@ -82,15 +94,18 @@ export function buildMastraPrepareStep(
   onInjected?: (texts: string[]) => void,
   onInjectedEntries?: (entries: QueuedInject[]) => void,
 ): (args: PrepareStepArgs) => PrepareStepResult {
-  return ({ messages }: PrepareStepArgs): PrepareStepResult => {
+  return ({ messages, stepNumber }: PrepareStepArgs): PrepareStepResult => {
     const queued = drainInjects(conversationId);
     if (queued.length === 0) return {};
     const appended: ModelMessageLike[] = [...messages, ...queued.map((q) => ({ role: 'user', content: q.text }))];
-    // Record an in-band marker so the fullStream wrapper can emit an ordered
-    // `inject-consumed` event before the next step's chunks (race-free split).
+    // Record an in-band marker TAGGED with this step number. prepareStep for step
+    // N runs after step N-1's events, so the wrapper emits the marker only once it
+    // has consumed step N-1 (all its chunks incl. tool-result) — a race-free split
+    // even when the upstream pipeline buffers ahead.
+    const stepNo = typeof stepNumber === 'number' ? stepNumber : Number.MAX_SAFE_INTEGER;
     const existing = injectConsumedMarkers.get(conversationId);
-    if (existing) existing.push(...queued);
-    else injectConsumedMarkers.set(conversationId, [...queued]);
+    if (existing) existing.push({ entries: [...queued], stepNumber: stepNo });
+    else injectConsumedMarkers.set(conversationId, [{ entries: [...queued], stepNumber: stepNo }]);
     if (injectConsumedHandler) {
       try {
         injectConsumedHandler(conversationId, queued);

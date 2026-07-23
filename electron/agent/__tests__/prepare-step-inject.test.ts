@@ -1,11 +1,38 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildMastraPrepareStep, setInjectConsumedHandler } from '../prepare-step-inject.js';
+import {
+  buildMastraPrepareStep,
+  setInjectConsumedHandler,
+  drainInjectConsumedMarkers,
+  clearInjectConsumedMarkers,
+} from '../prepare-step-inject.js';
 import { enqueueInject, clearInjects, hasInjects } from '../inject-queue.js';
 
 describe('buildMastraPrepareStep (cooperative mid-turn splice)', () => {
   beforeEach(() => {
     clearInjects('c1');
+    clearInjectConsumedMarkers('c1');
     setInjectConsumedHandler(null);
+  });
+
+  it('records a step-numbered marker drained only once the prior step is consumed', () => {
+    enqueueInject('c1', 'follow-up');
+    const prepareStep = buildMastraPrepareStep('c1');
+    // prepareStep for step 2 runs after step 1's events.
+    prepareStep({ messages: [{ role: 'user', content: 'x' }], stepNumber: 2 });
+    // Prior step (1) not yet fully consumed → nothing ready.
+    expect(drainInjectConsumedMarkers('c1', 1)).toEqual([]);
+    // Once consumed steps reach 2, the marker is ready in order.
+    const ready = drainInjectConsumedMarkers('c1', 2);
+    expect(ready.map((e) => e.text)).toEqual(['follow-up']);
+    // Drained — no longer returned.
+    expect(drainInjectConsumedMarkers('c1', 99)).toEqual([]);
+  });
+
+  it('clearInjectConsumedMarkers discards recorded markers', () => {
+    enqueueInject('c1', 'x');
+    buildMastraPrepareStep('c1')({ messages: [], stepNumber: 1 });
+    clearInjectConsumedMarkers('c1');
+    expect(drainInjectConsumedMarkers('c1', 99)).toEqual([]);
   });
 
   it('returns {} (no override) when nothing is queued', () => {
