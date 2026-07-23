@@ -442,9 +442,13 @@ async function runAgentAction(
       const injectId = enqueueInject(targetConvId, prompt);
       if (!injectId) throw new Error(`mid-turn injection into ${targetConvId} failed: could not enqueue`);
       // Display immediately with the stable queue id, but defer authoritative
-      // persistence to the running turn's prepareStep consumption boundary. At
-      // that point the previous tool results are complete and the run can split:
-      // partial assistant → injected user → continuation assistant.
+      // persistence to the running turn's prepareStep consumption boundary so the
+      // node parents correctly as: partial assistant → injected user →
+      // continuation. (Persisting here instead would parent it on the current disk
+      // head, which mid-stream differs from the boundary's parent and forks the
+      // branch — the failure mode fixed in round 12.) Trade-off: a crash in the
+      // sub-second window before the next step boundary loses this queued event;
+      // the drain-at-end path covers the far more common turn-end case.
       traceDiagnostic({
         scope: 'automation',
         event: 'turn.injected',
@@ -744,6 +748,15 @@ async function runAgentAction(
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
         try {
+          // If the inject was already durably persisted at enqueue time (crash
+          // safety), ADOPT that node instead of re-appending — re-appending would
+          // let appendConversationMessages mint a fresh id and fork a duplicate.
+          const existingTree = readConversation(deps.appHome, conversationId)?.messageTree ?? [];
+          if ((existingTree as Array<{ id?: unknown }>).some((m) => m.id === entry.id)) {
+            userTurnHeadId = entry.id;
+            boundaryPersistedIds.push(entry.id);
+            continue;
+          }
           const injected = appendUser();
           if (injected?.headId) {
             userTurnHeadId = injected.headId;
@@ -1101,30 +1114,63 @@ async function runAgentAction(
       const leftover = drainInjects(conversationId);
       let branchHead = readConversation(deps.appHome, conversationId)?.headId ?? null;
       const persisted: typeof leftover = [];
+      const idOnDisk = (id: string): boolean =>
+        ((readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>).some(
+          (m) => m.id === id,
+        );
+      const appendEntry = (entry: (typeof leftover)[number]) =>
+        appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [
+            {
+              id: entry.id,
+              role: 'user',
+              content: [{ type: 'text', text: entry.text }],
+              createdAt: new Date(entry.at).toISOString(),
+            },
+          ],
+          { parentId: branchHead, runStatus: 'idle' },
+        );
       for (const entry of leftover) {
+        // Idempotent: if a prior attempt committed the conversation file but
+        // failed the index update, the id is already on disk — adopt it instead
+        // of re-appending (which would mint a fresh id and duplicate the turn).
+        if (idOnDisk(entry.id)) {
+          branchHead = entry.id;
+          persisted.push(entry);
+          continue;
+        }
         try {
-          const injected = appendConversationMessages(
-            deps.appHome,
-            conversationId,
-            [
-              {
-                id: entry.id,
-                role: 'user',
-                content: [{ type: 'text', text: entry.text }],
-                createdAt: new Date(entry.at).toISOString(),
-              },
-            ],
-            { parentId: branchHead, runStatus: 'idle' },
-          );
+          const injected = appendEntry(entry);
           if (injected?.headId) branchHead = injected.headId;
           persisted.push(entry);
         } catch {
-          // Transient disk/index failure: re-queue THIS and all remaining entries
-          // (preserving FIFO) so they aren't lost, and don't let the throw escape
-          // the finally (which would skip later entries + the continuation).
-          const remaining = leftover.slice(leftover.indexOf(entry));
-          for (let i = remaining.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, remaining[i]);
-          break;
+          // Retry once after re-reading (adopt if the first attempt actually
+          // committed it); otherwise re-queue this + remaining entries (FIFO).
+          if (idOnDisk(entry.id)) {
+            branchHead = entry.id;
+            persisted.push(entry);
+            continue;
+          }
+          try {
+            const retried = appendEntry(entry);
+            if (retried?.headId) branchHead = retried.headId;
+            persisted.push(entry);
+          } catch {
+            const remaining = leftover.slice(leftover.indexOf(entry));
+            for (let i = remaining.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, remaining[i]);
+            traceDiagnostic({
+              scope: 'automation',
+              event: 'inject.drain-persist-failed',
+              level: 'error',
+              correlationId,
+              conversationId,
+              ruleId: rule.id,
+              fields: { injectIds: remaining.map((r) => r.id), count: remaining.length },
+            });
+            break;
+          }
         }
       }
       if (persisted.length > 0) {
