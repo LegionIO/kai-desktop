@@ -405,6 +405,43 @@ describe('agent conversationTarget', () => {
     expect(divertedId).not.toBe('convA');
   });
 
+  it('divert rule does NOT join an active alert barrier (creates a new chat, not the existing one)', async () => {
+    clearInjects('convBar');
+    resetMockStore({
+      convBar: { id: 'convBar', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // Hold an alert resume in-flight to establish an ordered barrier on convBar.
+    let releaseResume!: () => void;
+    const resumeGate = new Promise<void>((r) => (releaseResume = r));
+    vi.mocked(streamForPlugin).mockImplementationOnce(async function* () {
+      yield { type: 'text-delta', text: 'answering' } as never;
+      await resumeGate;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+    const d = deps({ injectUserTurnAndRestart: vi.fn(async () => ({ ok: true })) });
+    const resume = resumeConversationWithMessage('convBar', '[Answer] ok', d);
+    await vi.waitFor(() => {
+      if (!vi.mocked(appendConversationMessages).mock.calls.some((c) => c[1] === 'convBar')) {
+        throw new Error('resume not started');
+      }
+    });
+    // A divert rule targeting the same busy conversation must NOT queue behind the
+    // barrier — it creates a fresh chat immediately.
+    const action = agentAction({ type: 'existing', conversationId: 'convBar' });
+    (action.actions[0] as { onBusyTarget?: string }).onBusyTarget = 'divert';
+    const rec = await executeActions(action, evt, d);
+    const divertedId = (rec.results[0].output as { conversationId?: string }).conversationId;
+    expect(divertedId).toBeTruthy();
+    expect(divertedId).not.toBe('convBar');
+
+    releaseResume();
+    await resume;
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('idle existing target is unaffected by inject (normal append path)', async () => {
     resetMockStore({
       convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },

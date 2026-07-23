@@ -232,6 +232,57 @@ export function dropConversationMessages(
   return next;
 }
 
+/**
+ * Insert a new message as the PARENT of an existing node (reparenting that node
+ * and any of its children-by-position onto the new node). Used to recover an
+ * injected user turn that the model already answered but whose persistence failed
+ * at the boundary: the terminal assistant is already on disk, so insert the user
+ * BEFORE it to restore `… → user → assistant` order. No-op if `beforeId` is absent
+ * or the new id already exists.
+ */
+export function insertConversationMessageBefore(
+  appHome: string,
+  conversationId: string,
+  message: { id?: string; role: StoredTreeMessage['role']; content: unknown; createdAt?: string },
+  beforeId: string,
+  options: { runStatus?: ConversationRecord['runStatus'] } = {},
+): ConversationRecord | null {
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const target = tree.find((m) => m.id === beforeId);
+  if (!target) return null;
+  const usedIds = new Set(tree.map((m) => m.id));
+  const newId =
+    typeof message.id === 'string' && message.id.length > 0 && !usedIds.has(message.id)
+      ? message.id
+      : `auto-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  if (usedIds.has(newId)) return conv; // already present — no-op
+  const now = new Date().toISOString();
+  const node: StoredTreeMessage = {
+    id: newId,
+    role: message.role,
+    content: message.content,
+    parentId: target.parentId,
+    createdAt: message.createdAt ?? now,
+  };
+  const nextTree = tree.map((m) => (m.id === beforeId ? { ...m, parentId: newId } : m));
+  nextTree.push(node);
+  const branch = getConversationBranch(nextTree, headId);
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    updatedAt: now,
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+    ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
+  };
+  writeConversation(appHome, next);
+  broadcastUpsert(appHome, next);
+  return next;
+}
+
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);

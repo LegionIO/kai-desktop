@@ -11,6 +11,7 @@ import {
   appendConversationMessages,
   broadcastUpsert,
   dropConversationMessages,
+  insertConversationMessageBefore,
   ensureConversationTree,
   getConversationBranch,
 } from '../ipc/conversations.js';
@@ -345,12 +346,18 @@ async function runAgentAction(
   const canInject = typeof deps.injectUserTurnAndRestart === 'function';
   let resolved = resolveConversationTarget(action, rule, deps.appHome, title, canInject);
 
+  // The conversation this turn will order against, ONLY when it actually targets
+  // an existing conversation for injection/resume. A `null` resolution means the
+  // target was missing or the rule opted into `divert` (create a new chat) — such
+  // turns must NOT join the alert barrier (that would rerun them in the existing
+  // conversation instead of diverting). Forced resumes (alert answers) always
+  // order against their explicit existing target.
   const orderingConversationId =
     resolved && 'busyInject' in resolved
       ? resolved.busyInject
       : resolved && 'targetId' in resolved
         ? resolved.targetId
-        : action.conversationTarget?.type === 'existing'
+        : opts?.forceFreshTurn && action.conversationTarget?.type === 'existing'
           ? action.conversationTarget.conversationId
           : null;
   if (
@@ -523,6 +530,9 @@ async function runAgentAction(
   // Injected user turns whose boundary persist failed twice — retried PERSIST-ONLY
   // (never re-fed to the model) in the finally so they aren't lost on reload.
   const failedBoundaryUsers: Array<{ id: string; text: string; at: number }> = [];
+  // The finalized terminal-assistant node id (set at finalize) so a recovered
+  // injected user can be inserted BEFORE it (user → assistant), not after.
+  let finalizedAssistantId: string | null = null;
   try {
     // Build the model input (optionally including prior history), then write the
     // user prompt turn immediately with runStatus:'running' so the conversation
@@ -798,21 +808,31 @@ async function runAgentAction(
                 boundaryPersistedIds.push(retried.headId);
               }
             } catch (retryErr) {
-              // Both attempts failed and the id is NOT on disk. prepareStep already
-              // drained the queue. Track it for a PERSIST-ONLY end-of-turn retry
-              // (see finally) — do NOT re-enqueue here, or this same running turn's
-              // next prepareStep could re-consume + re-feed the model (double
-              // answer / repeated side effects).
-              failedBoundaryUsers.push(entry);
-              traceDiagnostic({
-                scope: 'automation',
-                event: 'inject.persist-failed',
-                level: 'error',
-                correlationId,
-                conversationId,
-                ruleId: rule.id,
-                fields: { injectId: entry.id, error: retryErr ?? injErr },
-              });
+              // The retry may itself have committed the file before throwing on the
+              // index update. Recheck: if the id is now on disk, ADOPT it (so the
+              // continuation parents after it: user → assistant) rather than
+              // treating it as absent (which would fork a sibling and skip it in
+              // the final recovery). Otherwise track for a persist-only retry.
+              const retriedTree = readConversation(deps.appHome, conversationId)?.messageTree ?? [];
+              if ((retriedTree as Array<{ id?: unknown }>).some((m) => m.id === entry.id)) {
+                userTurnHeadId = entry.id;
+                boundaryPersistedIds.push(entry.id);
+              } else {
+                // prepareStep already drained the queue. Track for a PERSIST-ONLY
+                // end-of-turn retry (see finally) — do NOT re-enqueue here, or this
+                // running turn's next prepareStep could re-consume + re-feed the
+                // model (double answer / repeated side effects).
+                failedBoundaryUsers.push(entry);
+                traceDiagnostic({
+                  scope: 'automation',
+                  event: 'inject.persist-failed',
+                  level: 'error',
+                  correlationId,
+                  conversationId,
+                  ruleId: rule.id,
+                  fields: { injectId: entry.id, error: retryErr ?? injErr },
+                });
+              }
             }
           }
         }
@@ -1034,6 +1054,7 @@ async function runAgentAction(
         }
       }
     }
+    finalizedAssistantId = appended?.headId ?? null;
 
     traceDiagnostic({
       scope: 'automation',
@@ -1091,13 +1112,24 @@ async function runAgentAction(
           (m) => m.id === entry.id,
         );
         if (onDisk) continue;
-        const head = readConversation(deps.appHome, conversationId)?.headId ?? null;
-        appendConversationMessages(
-          deps.appHome,
-          conversationId,
-          [{ id: entry.id, role: 'user', content: [{ type: 'text', text: entry.text }], createdAt: new Date(entry.at).toISOString() }],
-          { parentId: head, runStatus: 'idle' },
-        );
+        const userMsg = {
+          id: entry.id,
+          role: 'user' as const,
+          content: [{ type: 'text', text: entry.text }],
+          createdAt: new Date(entry.at).toISOString(),
+        };
+        // The model already answered this user; the terminal assistant is on disk.
+        // Insert the user BEFORE it so the stored order is `… → user → assistant`,
+        // not `assistant → user` (which would look unanswered). Fall back to a
+        // plain append at the head only if the assistant id is unknown.
+        if (finalizedAssistantId) {
+          insertConversationMessageBefore(deps.appHome, conversationId, userMsg, finalizedAssistantId, {
+            runStatus: 'idle',
+          });
+        } else {
+          const head = readConversation(deps.appHome, conversationId)?.headId ?? null;
+          appendConversationMessages(deps.appHome, conversationId, [userMsg], { parentId: head, runStatus: 'idle' });
+        }
       } catch {
         /* best effort — already traced at the boundary */
       }
@@ -1156,7 +1188,16 @@ async function runAgentAction(
             if (retried?.headId) branchHead = retried.headId;
             persisted.push(entry);
           } catch {
-            const remaining = leftover.slice(leftover.indexOf(entry));
+            // The retry may have committed the file before failing the index
+            // update — recheck and adopt rather than re-queue (which would let a
+            // later turn re-feed the same text). Only re-queue entries genuinely
+            // absent from disk.
+            if (idOnDisk(entry.id)) {
+              branchHead = entry.id;
+              persisted.push(entry);
+              continue;
+            }
+            const remaining = leftover.slice(leftover.indexOf(entry)).filter((r) => !idOnDisk(r.id));
             for (let i = remaining.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, remaining[i]);
             traceDiagnostic({
               scope: 'automation',
