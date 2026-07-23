@@ -10,6 +10,7 @@ import type { AppConfig, AutomationAction, AutomationRule } from '../config/sche
 import {
   appendConversationMessages,
   broadcastUpsert,
+  dropConversationMessages,
   ensureConversationTree,
   getConversationBranch,
 } from '../ipc/conversations.js';
@@ -622,11 +623,20 @@ async function runAgentAction(
       else contentParts.push({ type: 'text', text: delta });
     };
 
+    // Assistant/user nodes persisted at mid-turn inject boundaries THIS turn, and
+    // the branch head just before the first boundary. If the model then falls
+    // back (whole response regenerated — e.g. content filter), these are rolled
+    // back so discarded/failed segments don't remain on disk as ancestors of the
+    // successful retry.
+    const boundaryPersistedIds: string[] = [];
+    let preBoundaryParentId: string | null | undefined;
+
     /** Persist a genuine mid-turn boundary when prepareStep consumes queued
      * automation injects. This runs after the prior step's tool results, so all
      * tool-call parts are complete before rotating the accumulator. */
     const persistInjectedBoundary = (entries: Array<{ id: string; text: string; at: number }>): void => {
       if (entries.length === 0) return;
+      if (preBoundaryParentId === undefined) preBoundaryParentId = userTurnHeadId;
       traceDiagnostic({
         scope: 'automation',
         event: 'inject.consumed',
@@ -647,7 +657,10 @@ async function runAgentAction(
             [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
-          if (partial?.headId) userTurnHeadId = partial.headId;
+          if (partial?.headId) {
+            userTurnHeadId = partial.headId;
+            boundaryPersistedIds.push(partial.headId);
+          }
         } catch (partialErr) {
           try {
             const fallback = appendConversationMessages(
@@ -662,7 +675,10 @@ async function runAgentAction(
               ],
               { parentId: userTurnHeadId, runStatus: 'running' },
             );
-            if (fallback?.headId) userTurnHeadId = fallback.headId;
+            if (fallback?.headId) {
+              userTurnHeadId = fallback.headId;
+              boundaryPersistedIds.push(fallback.headId);
+            }
           } catch {
             /* give up on the partial; still persist the injected users below */
           }
@@ -701,7 +717,10 @@ async function runAgentAction(
           );
         try {
           const injected = appendUser();
-          if (injected?.headId) userTurnHeadId = injected.headId;
+          if (injected?.headId) {
+            userTurnHeadId = injected.headId;
+            boundaryPersistedIds.push(injected.headId);
+          }
         } catch (injErr) {
           // The first append may have written the conversation file but thrown
           // while updating the index. Re-appending would let
@@ -712,10 +731,14 @@ async function runAgentAction(
           const already = (existingTree as Array<{ id?: unknown }>).some((m) => m.id === entry.id);
           if (already) {
             userTurnHeadId = entry.id;
+            boundaryPersistedIds.push(entry.id);
           } else {
             try {
               const retried = appendUser();
-              if (retried?.headId) userTurnHeadId = retried.headId;
+              if (retried?.headId) {
+                userTurnHeadId = retried.headId;
+                boundaryPersistedIds.push(retried.headId);
+              }
             } catch (retryErr) {
               traceDiagnostic({
                 scope: 'automation',
@@ -843,6 +866,31 @@ async function runAgentAction(
           pendingToolCalls.clear();
           lastEventWasToolResult = false;
           error = null;
+          // Also roll back any assistant/user segments already PERSISTED at a
+          // mid-turn inject boundary this turn: the fallback regenerates the whole
+          // response, so those on-disk segments (incl. content-filter-discarded
+          // output) must not remain as ancestors of the successful retry. Restore
+          // the head to the pre-boundary parent.
+          if (boundaryPersistedIds.length > 0) {
+            try {
+              dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], {
+                runStatus: 'running',
+              });
+            } catch {
+              /* best effort */
+            }
+            traceDiagnostic({
+              scope: 'automation',
+              event: 'inject.boundary-rolled-back',
+              correlationId,
+              conversationId,
+              ruleId: rule.id,
+              fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback' },
+            });
+            userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
+            boundaryPersistedIds.length = 0;
+            preBoundaryParentId = undefined;
+          }
         }
       }
     } catch (streamErr) {

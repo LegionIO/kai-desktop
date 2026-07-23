@@ -179,6 +179,59 @@ export function appendConversationMessages(
   return next;
 }
 
+/**
+ * Remove the given message IDs from a conversation's tree (used to roll back
+ * assistant segments persisted at a mid-turn inject boundary when the model then
+ * falls back and the whole response is regenerated). Children of a removed node
+ * are re-parented to the removed node's parent so the branch stays connected; the
+ * head is repointed to the deepest surviving node on the prior branch. No-op if
+ * none of the ids are present.
+ */
+export function dropConversationMessages(
+  appHome: string,
+  conversationId: string,
+  ids: string[],
+  options: { runStatus?: ConversationRecord['runStatus'] } = {},
+): ConversationRecord | null {
+  if (ids.length === 0) return null;
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const dropping = new Set(ids);
+  if (![...dropping].some((id) => tree.some((m) => m.id === id))) return null;
+
+  // Re-parent survivors: walk each dropped node to its nearest surviving ancestor.
+  const byId = new Map(tree.map((m) => [m.id, m] as const));
+  const survivingParent = (parentId: string | null): string | null => {
+    let p = parentId;
+    while (p && dropping.has(p)) p = byId.get(p)?.parentId ?? null;
+    return p;
+  };
+  const nextTree = tree
+    .filter((m) => !dropping.has(m.id))
+    .map((m) => ({ ...m, parentId: survivingParent(m.parentId) }));
+
+  // Repoint head: if the current head was dropped, use its nearest survivor.
+  let nextHeadId: string | null = headId && dropping.has(headId) ? survivingParent(headId) : headId;
+  if (nextHeadId && !nextTree.some((m) => m.id === nextHeadId)) nextHeadId = null;
+
+  const branch = getConversationBranch(nextTree, nextHeadId);
+  const now = new Date().toISOString();
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    headId: nextHeadId,
+    updatedAt: now,
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+    ...(options.runStatus !== undefined ? { runStatus: options.runStatus } : {}),
+  };
+  writeConversation(appHome, next);
+  broadcastUpsert(appHome, next);
+  return next;
+}
+
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);

@@ -54,6 +54,16 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
     }
   ).diagnostics;
   const debugTrace = diagnostics?.debugTrace;
+  const ALL_SCOPES = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const;
+  // Optimistic scope selection: rapid checkbox toggles before a config round-trip
+  // must merge against the LATEST intended set, not the stale prop, or the second
+  // whole-array write restores the first toggle. Reset when the prop catches up.
+  const propScopes = debugTrace?.scopes ?? [...ALL_SCOPES];
+  const [scopeOverride, setScopeOverride] = useState<string[] | null>(null);
+  useEffect(() => {
+    setScopeOverride(null);
+  }, [debugTrace?.scopes]);
+  const effectiveScopes = scopeOverride ?? propScopes;
   const [summary, setSummary] = useState<Summary | null>(null);
   const [plugins, setPlugins] = useState<PluginList>([]);
   const [tail, setTail] = useState<{ text: string; sizeBytes: number; truncated: boolean } | null>(null);
@@ -241,15 +251,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           <div className="text-[11px] font-medium text-muted-foreground">Scopes</div>
           <div className="mt-2 flex flex-wrap gap-2">
             {(['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const).map((scope) => {
-              // An explicit [] means "no scopes"; only a missing value defaults.
-              const scopes = debugTrace?.scopes ?? [
-                'agent',
-                'automation',
-                'alert',
-                'plugin',
-                'renderer',
-                'window',
-              ];
+              const scopes = effectiveScopes;
               const checked = scopes.includes(scope);
               return (
                 <label
@@ -264,6 +266,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
                       const next = event.target.checked
                         ? [...new Set([...scopes, scope])]
                         : scopes.filter((entry) => entry !== scope);
+                      setScopeOverride(next);
                       void updateConfig('diagnostics.debugTrace.scopes', next);
                     }}
                   />

@@ -45,6 +45,25 @@ const METADATA_SUFFIX_RE = /(id|ids|count|at|ms|len|length|bytes|chars|index|has
 function isContentKey(key: string): boolean {
   return CONTENT_WORD_RE.test(key) && !METADATA_SUFFIX_RE.test(key);
 }
+// Explicitly-safe categorical `reason`/`cause` codes. Anything not listed here is
+// omitted in metadata-only mode (a free-text reason like runtimeSelection.reason
+// can embed absolute plugin paths or raw scan errors).
+const CATEGORICAL_REASONS = new Set([
+  'alert-resume',
+  'ordered-follower',
+  'model-fallback',
+  'disabled',
+  'approval-required',
+  'incompatible-strict',
+  'missing-backend',
+  'active-agent-stream',
+  'no-primary-window',
+  'reload-loop-guard',
+  'renderer-not-loaded',
+  'two-failed-health-probes',
+  'window-destroyed-during-probe',
+  'window-not-presented',
+]);
 const MAX_STRING = 4000;
 
 let appHome = '';
@@ -95,26 +114,25 @@ export function isDiagnosticTraceEnabled(scope?: DiagnosticTraceScope): boolean 
   return cfg.enabled && (!scope || cfg.scopes.includes(scope));
 }
 
-function sanitizeScalar(value: unknown): unknown {
-  if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…` : value;
-  if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
-  return String(value);
-}
-
 function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0): unknown {
   if (depth > 6) return '[depth-limit]';
   if (SECRET_KEY_RE.test(key)) return '[redacted]';
   // Error details can carry provider response bodies, prompts, file paths, or
-  // embedded credentials — omit their message/stack in metadata-only mode.
-  const isErrorKey = /(?:^|_)(error|stack)$/i.test(key);
-  // `reason`/`cause` are usually short categorical codes (queued, disabled,
-  // reload-loop-guard, …) that ARE the useful metadata; keep short scalars but
-  // omit Errors / long strings that may embed sensitive detail.
+  // embedded credentials — omit their message/stack in metadata-only mode. Match
+  // the word anywhere (camelCase/plural: error, errors, metricsError, lastError).
+  const isErrorKey = /(error|stack|exception|trace)/i.test(key);
+  // `reason`/`cause` values are only safe when they are a KNOWN categorical code
+  // (queued, disabled, reload-loop-guard, …). A short arbitrary reason string can
+  // still embed a path or raw scan error (e.g. runtimeSelection.reason), so only
+  // an allowlisted enum passes through; everything else is omitted.
   const isReasonKey = /(?:^|_)(reason|cause)$/i.test(key);
-  if (!includeContent && isReasonKey && !(value instanceof Error) && !(typeof value === 'string' && value.length > 200)) {
-    return sanitizeScalar(value);
+  if (!includeContent && isReasonKey) {
+    if (typeof value === 'string' && CATEGORICAL_REASONS.has(value)) return value;
+    if (typeof value === 'string') return { omitted: true, chars: value.length };
+    if (value instanceof Error) return { omitted: true, name: value.name };
+    return '[omitted]';
   }
-  if (!includeContent && (isContentKey(key) || isErrorKey || isReasonKey)) {
+  if (!includeContent && (isContentKey(key) || isErrorKey)) {
     if (value instanceof Error) return { omitted: true, name: value.name };
     if (typeof value === 'string') return { omitted: true, chars: value.length };
     if (Array.isArray(value)) return { omitted: true, items: value.length };

@@ -59,6 +59,15 @@ vi.mock('../../ipc/conversations.js', () => ({
     headId: c.headId ?? null,
   })),
   getConversationBranch: vi.fn((tree: unknown[]) => tree),
+  dropConversationMessages: vi.fn((_home: string, id: string, ids: string[]) => {
+    const conv = mockStore.conversations[id];
+    if (!conv) return null;
+    const dropping = new Set(ids);
+    const tree = ((conv.messageTree as Array<{ id?: string }>) ?? []).filter((m) => !dropping.has(m.id ?? ''));
+    conv.messageTree = tree;
+    conv.headId = (tree[tree.length - 1] as { id?: string })?.id ?? null;
+    return conv;
+  }),
 }));
 vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
 vi.mock('../../ipc/conversation-store.js', () => ({
@@ -79,6 +88,7 @@ import { executeActions, interpolateString, resumeConversationWithMessage, type 
 import { AutomationEventBus } from '../event-bus.js';
 import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.js';
 import { appendConversationMessages } from '../../ipc/conversations.js';
+import { dropConversationMessages } from '../../ipc/conversations.js';
 import { writeConversation } from '../../ipc/conversation-store.js';
 import { hasInjects, clearInjects, drainInjects, enqueueInject } from '../../agent/inject-queue.js';
 import { broadcastAgentStreamEvent } from '../../ipc/agent.js';
@@ -662,6 +672,40 @@ describe('agent conversationTarget', () => {
       if (o?.runStatus !== undefined) conv.runStatus = o.runStatus;
       return conv;
     }) as never);
+  });
+
+  it('rolls back boundary-persisted segments when the model falls back after an inject', async () => {
+    clearInjects('convFbBoundary');
+    resetMockStore({
+      convFbBoundary: { id: 'convFbBoundary', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    vi.mocked(dropConversationMessages).mockClear();
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        yield { type: 'text-delta', text: 'pre-inject text' } as never;
+        // Inject consumed at a boundary → partial assistant + injected user persist.
+        onInjected?.([{ id: 'inj-fb', text: 'the follow-up', at: Date.now() }]);
+        yield { type: 'text-delta', text: 'post-inject (will be discarded)' } as never;
+        // Whole response regenerated on the fallback model.
+        yield { type: 'model-fallback', modelKey: 'fallback' } as never;
+        yield { type: 'text-delta', text: 'clean retry answer' } as never;
+        yield { type: 'done', modelKey: 'fallback' } as never;
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convFbBoundary' }), evt, deps());
+
+    // The boundary-persisted assistant + injected user were rolled back on fallback.
+    expect(dropConversationMessages).toHaveBeenCalled();
+    const droppedIds = vi.mocked(dropConversationMessages).mock.calls.flatMap((c) => c[2] as string[]);
+    expect(droppedIds).toContain('inj-fb');
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
   });
 
   it('drops pre-injection text on a model fallback (result reflects the successful retry only)', async () => {
