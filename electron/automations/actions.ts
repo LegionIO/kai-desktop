@@ -585,6 +585,12 @@ async function runAgentAction(
     const contentParts: Array<TextPart | ToolCallPart> = [];
     const toolPartById = new Map<string, ToolCallPart>();
     let text = '';
+    // Text from segments already finalized at mid-turn inject boundaries. The
+    // full transcript for the action result / run log / {{result[N].text}} is
+    // `committedText + text` — `text` is reset per persisted segment, but the
+    // cumulative result must survive inject splits. Model-fallback resets only
+    // `text` (current segment), so committedText is unaffected.
+    let committedText = '';
     let error: string | null = null;
     let caughtStreamError = false;
     let modelKey = '';
@@ -637,6 +643,9 @@ async function runAgentAction(
         );
         if (injected?.headId) userTurnHeadId = injected.headId;
       }
+      // Preserve this segment's text in the cumulative result before resetting
+      // the per-segment accumulator (separator mirrors the tool-result spacing).
+      if (text) committedText += (committedText ? '\n\n' : '') + text;
       text = '';
       contentParts.length = 0;
       toolPartById.clear();
@@ -855,7 +864,8 @@ async function runAgentAction(
       throw new Error(failMsg ?? 'Automation agent run failed');
     }
     turnSucceeded = true;
-    turnResult = { text, modelKey, toolCalls, conversationId };
+    const resultText = committedText && text ? `${committedText}\n\n${text}` : committedText || text;
+    turnResult = { text: resultText, modelKey, toolCalls, conversationId };
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);

@@ -1363,12 +1363,16 @@ async function* generateWithSyntheticEvents(
       const generateOptions = {
         maxSteps: maxStepsLimit,
         abortSignal: options?.abortSignal,
-        // The synthetic-events path runs agent.generate() to completion and only
-        // yields step events afterward, so a prepareStep boundary callback would
-        // fire before the prior tool step is observable and misorder persistence.
-        // Do NOT install a queue-draining prepareStep here — leave injects queued
-        // for the caller's drain-at-end fallback, which persists them correctly
-        // after the turn (the streaming path handles true mid-turn injection).
+        // Synthetic-events path: agent.generate() runs to completion and only
+        // yields step events afterward. A per-run boundary-persist callback
+        // (options.onInjected, used by automation) would therefore fire before
+        // any prior step content is observable and misorder the persisted branch.
+        // - GUI/server-persisted runs (no onInjected) persist via the global
+        //   injectConsumedHandler, which reconstructs from the persisted stream
+        //   independent of path — safe to install prepareStep + drain here.
+        // - Automation runs (onInjected present) must NOT drain here; leave the
+        //   inject queued for the order-correct drain-at-end fallback.
+        prepareStep: options?.onInjected ? undefined : buildMastraPrepareStep(conversationId),
         experimental_generateMessageId: () => responseMessageId,
         ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
         ...(providerOptions ? { providerOptions } : {}),

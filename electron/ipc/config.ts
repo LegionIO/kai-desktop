@@ -1241,6 +1241,9 @@ export function registerConfigHandlers(
     reloadDebounceTimer = setTimeout(() => {
       try {
         currentConfig = readEffectiveConfig(appHome);
+        // External edit to desktop.json (enabled/content/scopes/retention) must
+        // take effect without an internal write or restart.
+        invalidateDiagnosticTraceConfig();
         scheduleConfigBroadcast();
       } catch {
         // Ignore read errors during write
