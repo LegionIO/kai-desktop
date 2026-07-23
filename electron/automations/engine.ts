@@ -216,7 +216,8 @@ export class AutomationEngine {
       ruleId: record.ruleId,
       level: record.error ? 'error' : 'info',
       fields: {
-        ruleName: record.ruleName,
+        // ruleName is free-form user text — omit it (ruleId identifies the rule);
+        // it must not appear in metadata-only traces.
         matched: record.matched,
         skippedReason: record.skippedReason,
         eventKey: record.event.key,

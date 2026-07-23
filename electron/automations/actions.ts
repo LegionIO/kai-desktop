@@ -682,11 +682,18 @@ async function runAgentAction(
       // exotic tool result), fall back to a text-only assistant so the segment +
       // subsequent injected-user ordering is still recorded.
       if (contentParts.length > 0) {
+        // Stable id so a partial commit (file written, index update threw) can be
+        // ADOPTED on retry instead of appending a phantom sibling.
+        const partialId = `auto-partial-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const partialOnDisk = () =>
+          ((readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>).some(
+            (m) => m.id === partialId,
+          );
         try {
           const partial = appendConversationMessages(
             deps.appHome,
             conversationId,
-            [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
+            [{ id: partialId, role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
           if (partial?.headId) {
@@ -694,25 +701,32 @@ async function runAgentAction(
             boundaryPersistedIds.push(partial.headId);
           }
         } catch (partialErr) {
-          try {
-            const fallback = appendConversationMessages(
-              deps.appHome,
-              conversationId,
-              [
-                {
-                  role: 'assistant',
-                  content: [{ type: 'text', text: text || '⚠️ (assistant content could not be saved)' }],
-                  createdAt: new Date().toISOString(),
-                },
-              ],
-              { parentId: userTurnHeadId, runStatus: 'running' },
-            );
-            if (fallback?.headId) {
-              userTurnHeadId = fallback.headId;
-              boundaryPersistedIds.push(fallback.headId);
+          // The failed append may have committed the file before throwing. If the
+          // partial is already on disk, adopt it (don't append a second sibling).
+          if (partialOnDisk()) {
+            userTurnHeadId = partialId;
+            boundaryPersistedIds.push(partialId);
+          } else {
+            try {
+              const fallback = appendConversationMessages(
+                deps.appHome,
+                conversationId,
+                [
+                  {
+                    role: 'assistant',
+                    content: [{ type: 'text', text: text || '⚠️ (assistant content could not be saved)' }],
+                    createdAt: new Date().toISOString(),
+                  },
+                ],
+                { parentId: userTurnHeadId, runStatus: 'running' },
+              );
+              if (fallback?.headId) {
+                userTurnHeadId = fallback.headId;
+                boundaryPersistedIds.push(fallback.headId);
+              }
+            } catch {
+              /* give up on the partial; still persist the injected users below */
             }
-          } catch {
-            /* give up on the partial; still persist the injected users below */
           }
           traceDiagnostic({
             scope: 'automation',
@@ -897,16 +911,21 @@ async function runAgentAction(
             (ev as { data?: { preserveErroredVariant?: unknown } }).data?.preserveErroredVariant,
           );
           // When preserving the failed variant AND a mid-turn inject boundary was
-          // already persisted this turn, the current contentParts hold the
-          // continuation produced AFTER the injected user. Persist it first so the
-          // retained variant ends with the model's (failed) answer rather than a
-          // dangling unanswered user turn that disappears after reload.
-          if (preserveErroredVariant && boundaryPersistedIds.length > 0 && contentParts.length > 0) {
+          // already persisted this turn, the retained variant must end with the
+          // model's (failed) answer, not a dangling unanswered user turn.
+          // contentParts holds the post-inject continuation; if it's empty (the
+          // failure hit before any continuation content), persist a short error
+          // assistant so the variant is still terminated by an assistant node.
+          if (preserveErroredVariant && boundaryPersistedIds.length > 0) {
+            const failedContent =
+              contentParts.length > 0
+                ? [...contentParts]
+                : [{ type: 'text', text: `⚠️ ${error ?? 'Model attempt failed; retried on a fallback model.'}` }];
             try {
               const cont = appendConversationMessages(
                 deps.appHome,
                 conversationId,
-                [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
+                [{ role: 'assistant', content: failedContent, createdAt: new Date().toISOString() }],
                 { parentId: userTurnHeadId, runStatus: 'running' },
               );
               if (cont?.headId) boundaryPersistedIds.push(cont.headId);
