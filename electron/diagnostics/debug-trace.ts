@@ -77,12 +77,15 @@ function isSafeMetadataKey(key: string): boolean {
   return SAFE_METADATA_KEY_EXACT.has(key) || SAFE_METADATA_KEY_RE.test(key);
 }
 // A bounded identifier/enum-shaped VALUE: ids, model keys (anthropic/claude-x),
-// statuses, uuids, correlation ids. No whitespace (rules out prose), reasonable
-// length, and only identifier-ish chars (alnum, - _ . : / @). A path or URL
-// value fails this (contains spaces or exceeds length / has other punctuation),
-// so it's omitted even under an identifier-shaped key.
-const IDENTIFIER_VALUE_RE = /^[A-Za-z0-9._:/@-]{0,200}$/;
+// statuses, uuids, correlation ids. No whitespace (rules out prose), bounded
+// length, identifier chars only, and NOT path/URL-shaped: reject a leading `/`,
+// any `://` scheme, any `..`, and more than one `/` (a model key has at most one
+// provider/name segment; a path/URL has more). So `file:///…` and `/Users/…`
+// are omitted even under an identifier-shaped key.
+const IDENTIFIER_VALUE_RE = /^[A-Za-z0-9._:@-]+(?:\/[A-Za-z0-9._:@-]+)?$/;
 function isIdentifierShaped(value: string): boolean {
+  if (value.length === 0 || value.length > 128) return false;
+  if (value.includes('://') || value.includes('..')) return false;
   return IDENTIFIER_VALUE_RE.test(value);
 }
 // Explicitly-safe categorical `reason`/`cause` codes. Anything not listed here is

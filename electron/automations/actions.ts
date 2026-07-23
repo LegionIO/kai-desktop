@@ -959,13 +959,20 @@ async function runAgentAction(
           pendingBoundary.push(...entries);
         },
       })) {
-        // Flush a buffered inject boundary only at a CONSUMED step boundary: a
-        // `step-progress` event is emitted after ALL of the prior step's text/
-        // tool-call/tool-result events, so consuming it guarantees they're already
-        // in contentParts. Flushing on a mere text-delta/tool-call could split the
-        // branch before a still-buffered prior-step event arrives. Require no
-        // tool call awaiting its result as an extra guard.
-        if (pendingBoundary.length > 0 && pendingToolCalls.size === 0 && ev.type === 'step-progress') {
+        // Flush a buffered inject boundary before consuming the NEXT step's
+        // output. onInjected fires at prepareStep for the next step — AFTER the
+        // prior step's step-progress — so the prior step's text/tool events are
+        // already in contentParts. Flush when the first next-step content arrives
+        // (text-delta/tool-call) OR a step-progress, gated by pendingToolCalls
+        // being empty (all prior tool-results consumed) so we never split before a
+        // still-pending tool result. Waiting for a FURTHER step-progress would
+        // persist the next step's response before the injected user (empty
+        // assistant appended after).
+        if (
+          pendingBoundary.length > 0 &&
+          pendingToolCalls.size === 0 &&
+          (ev.type === 'text-delta' || ev.type === 'tool-call' || ev.type === 'step-progress')
+        ) {
           const toFlush = pendingBoundary;
           pendingBoundary = [];
           flushInjectedBoundary(toFlush);

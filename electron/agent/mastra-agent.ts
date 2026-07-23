@@ -1808,7 +1808,13 @@ async function* streamWithRealEvents(
           yield {
             conversationId,
             type: 'retry',
-            data: { attempt: attempt + 1, reason: 'compatibility-restart' },
+            data: {
+              attempt: attempt + 1,
+              maxRetries: MAX_RETRIES,
+              delayMs: 0,
+              reason: 'Adjusting request for provider compatibility',
+              category: 'compatibility',
+            },
           };
           continue compatibilityLoop;
         }
@@ -1831,7 +1837,13 @@ async function* streamWithRealEvents(
           yield {
             conversationId,
             type: 'retry',
-            data: { attempt: attempt + 1, reason: 'temperature-omit-restart' },
+            data: {
+              attempt: attempt + 1,
+              maxRetries: MAX_RETRIES,
+              delayMs: 0,
+              reason: 'Retrying without temperature for provider compatibility',
+              category: 'compatibility',
+            },
           };
           continue compatibilityLoop;
         }
@@ -1847,7 +1859,13 @@ async function* streamWithRealEvents(
           yield {
             conversationId,
             type: 'retry',
-            data: { attempt: attempt + 1, reason: 'sanitize-restart' },
+            data: {
+              attempt: attempt + 1,
+              maxRetries: MAX_RETRIES,
+              delayMs: 0,
+              reason: 'Retrying with sanitized messages for provider compatibility',
+              category: 'compatibility',
+            },
           };
           continue compatibilityLoop;
         }
