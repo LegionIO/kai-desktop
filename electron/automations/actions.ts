@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -87,13 +87,18 @@ export function abortAutomationRun(conversationId: string): boolean {
  * Wait (bounded) until no automation run is in flight for this conversation — its
  * finally block has flushed the reply + cleared inFlightAutomationTargets. Used
  * before a forced fresh turn (alert resume) so the answer runs AFTER the prior
- * run finishes, not racing/stranded against its final step. Proceeds on timeout.
+ * run finishes, not racing/stranded against its final step. On timeout it throws;
+ * the alert-resume caller re-opens the alert so the recorded answer returns to
+ * the Alerts tab for retry rather than being silently dropped. The cap is
+ * generous (long tools) but bounded so a wedged run can't pin the queue forever.
  */
-async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 5 * 60_000): Promise<void> {
+async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 30 * 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (isAutomationRunInFlight(conversationId)) {
     if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for automation turn ${conversationId} to settle`);
+      throw new Error(
+        `Timed out waiting for automation turn ${conversationId} to settle; alert answer returned for retry`,
+      );
     }
     await new Promise((r) => setTimeout(r, 25));
   }
@@ -618,30 +623,48 @@ async function runAgentAction(
         parentMessageId: userTurnHeadId,
         fields: { injectIds: entries.map((entry) => entry.id), count: entries.length },
       });
-      if (contentParts.length > 0) {
-        const partial = appendConversationMessages(
-          deps.appHome,
+      try {
+        if (contentParts.length > 0) {
+          const partial = appendConversationMessages(
+            deps.appHome,
+            conversationId,
+            [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
+            { parentId: userTurnHeadId, runStatus: 'running' },
+          );
+          if (partial?.headId) userTurnHeadId = partial.headId;
+        }
+        for (const entry of entries) {
+          const injected = appendConversationMessages(
+            deps.appHome,
+            conversationId,
+            [
+              {
+                id: entry.id,
+                role: 'user',
+                content: [{ type: 'text', text: entry.text }],
+                createdAt: new Date(entry.at).toISOString(),
+              },
+            ],
+            { parentId: userTurnHeadId, runStatus: 'running' },
+          );
+          if (injected?.headId) userTurnHeadId = injected.headId;
+        }
+      } catch (persistErr) {
+        // Boundary persistence failed (e.g. an unserializable tool result in the
+        // partial assistant). prepareStep already drained the queue, so RE-ENQUEUE
+        // the entries — the run's finally re-drains + persists them onto the
+        // branch, so the injected user turns are never silently lost.
+        for (const entry of entries) reenqueueInject(conversationId, entry);
+        traceDiagnostic({
+          scope: 'automation',
+          event: 'inject.persist-failed',
+          level: 'error',
+          correlationId,
           conversationId,
-          [{ role: 'assistant', content: [...contentParts], createdAt: new Date().toISOString() }],
-          { parentId: userTurnHeadId, runStatus: 'running' },
-        );
-        if (partial?.headId) userTurnHeadId = partial.headId;
-      }
-      for (const entry of entries) {
-        const injected = appendConversationMessages(
-          deps.appHome,
-          conversationId,
-          [
-            {
-              id: entry.id,
-              role: 'user',
-              content: [{ type: 'text', text: entry.text }],
-              createdAt: new Date(entry.at).toISOString(),
-            },
-          ],
-          { parentId: userTurnHeadId, runStatus: 'running' },
-        );
-        if (injected?.headId) userTurnHeadId = injected.headId;
+          ruleId: rule.id,
+          fields: { injectIds: entries.map((entry) => entry.id), error: persistErr },
+        });
+        return;
       }
       // Preserve this segment's text in the cumulative result before resetting
       // the per-segment accumulator (separator mirrors the tool-result spacing).

@@ -44,6 +44,17 @@ export function enqueueInject(conversationId: string, text: string): string | nu
   return entry.id;
 }
 
+/** Re-insert a previously-drained entry at the FRONT of the queue, preserving its
+ *  original id + enqueue time (used when boundary persistence fails and the entry
+ *  must be retried without becoming a duplicate). FIFO order is restored across
+ *  multiple re-enqueues by inserting in reverse at the head. */
+export function reenqueueInject(conversationId: string, entry: QueuedInject): void {
+  if (!conversationId || !entry?.text) return;
+  const q = queues.get(conversationId);
+  if (q) q.unshift(entry);
+  else queues.set(conversationId, [entry]);
+}
+
 /**
  * Return and REMOVE all queued injects for a conversation, in FIFO order.
  * Empty array if none. Called by prepareStep at each step boundary.

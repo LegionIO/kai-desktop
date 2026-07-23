@@ -493,6 +493,90 @@ describe('agent conversationTarget', () => {
     });
   });
 
+  it('re-enqueues an inject when boundary persistence fails, so it still lands via drain-at-end', async () => {
+    clearInjects('convBoundaryFail');
+    resetMockStore({
+      convBoundaryFail: { id: 'convBoundaryFail', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // First streamForPlugin run: emit some text, enqueue an inject, then invoke
+    // the boundary callback via a second yielded step. Make the FIRST append that
+    // the boundary attempts (partial assistant) throw once to simulate an
+    // unserializable tool result; the entry must be re-enqueued and persisted by
+    // the drain-at-end continuation instead of being lost.
+    let calls = 0;
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        calls += 1;
+        if (calls === 1) {
+          yield { type: 'text-delta', text: 'partial before inject' } as never;
+          onInjected?.([{ id: 'inj-x', text: 'boundary follow-up', at: Date.now() }]);
+        }
+        yield { type: 'done', modelKey: 'test' } as never;
+      })();
+    } as never);
+    let throwOnce = true;
+    vi.mocked(appendConversationMessages).mockImplementation(((
+      _home: string,
+      id: string,
+      msgs: Array<{ role: string; content: unknown }>,
+      o?: { runStatus?: string },
+    ) => {
+      const isPartialAssistant = msgs.length === 1 && msgs[0].role === 'assistant' && o?.runStatus === 'running';
+      if (throwOnce && isPartialAssistant && id === 'convBoundaryFail') {
+        throwOnce = false;
+        throw new Error('unserializable tool result');
+      }
+      const conv = mockStore.conversations[id];
+      if (!conv) return null;
+      const tree = (conv.messageTree as unknown[]) ?? [];
+      const appended = msgs.map((m, i) => ({ id: `mock-${id}-${tree.length + i}`, ...m }));
+      conv.messageTree = [...tree, ...appended];
+      conv.headId = appended[appended.length - 1]?.id ?? conv.headId ?? null;
+      if (o?.runStatus !== undefined) conv.runStatus = o.runStatus;
+      return conv;
+    }) as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convBoundaryFail' }), evt, deps()).catch(
+      () => {},
+    );
+
+    expect(hasInjects('convBoundaryFail')).toBe(false);
+    const persisted = vi
+      .mocked(appendConversationMessages)
+      .mock.calls.some(
+        (call) =>
+          call[1] === 'convBoundaryFail' &&
+          (call[2] as Array<{ role: string; content: Array<{ text?: string }> }>).some(
+            (m) => m.role === 'user' && m.content?.[0]?.text === 'boundary follow-up',
+          ),
+      );
+    expect(persisted).toBe(true);
+
+    // Restore shared mocks.
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+    vi.mocked(appendConversationMessages).mockImplementation(((
+      _home: string,
+      id: string,
+      msgs: Array<{ role: string; content: unknown }>,
+      o?: { skipIfBusy?: boolean; runStatus?: string },
+    ) => {
+      const conv = mockStore.conversations[id];
+      if (!conv) return null;
+      if (o?.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) return null;
+      const tree = (conv.messageTree as unknown[]) ?? [];
+      const appended = msgs.map((m, i) => ({ id: `mock-${id}-${tree.length + i}`, ...m }));
+      conv.messageTree = [...tree, ...appended];
+      conv.headId = appended[appended.length - 1]?.id ?? conv.headId ?? null;
+      if (o?.runStatus !== undefined) conv.runStatus = o.runStatus;
+      return conv;
+    }) as never);
+  });
+
   it('drops pre-injection text on a model fallback (result reflects the successful retry only)', async () => {
     clearInjects('convFb');
     resetMockStore({
