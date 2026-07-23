@@ -871,11 +871,71 @@ async function runAgentAction(
       error = null;
     };
 
-    // The stream (and its setup, e.g. resolving a model) can throw. If it does
-    // AFTER we've written the prompt turn, we must still finalize: write an
-    // assistant (error) turn, flip runStatus back to idle, and broadcast a
-    // terminal `done` — otherwise the conversation is stuck `running` forever
-    // with no reply. Catch here and fall through to the shared finalize path.
+    /** Handle a model-fallback or transient-retry: both restart the response from
+     * the ORIGINAL messages, so reset accumulators, roll back any persisted inject
+     * boundary this turn, and replay the follow-up injects for the retry. */
+    const handleAttemptRestart = (reason: 'model-fallback' | 'retry'): void => {
+      text = '';
+      committedText = '';
+      contentParts.length = 0;
+      toolPartById.clear();
+      toolCalls.length = 0;
+      pendingToolCalls.clear();
+      lastEventWasToolResult = false;
+      error = null;
+      // Always roll back a persisted inject boundary (regardless of any variant-
+      // preservation): a branch interleaving an injected USER turn between
+      // assistant segments is unreachable as a variant (RuntimeProvider surfaces
+      // only same-role siblings), and the retry re-branches parent→user→assistant.
+      let rollbackConfirmed = true;
+      if (boundaryPersistedIds.length > 0) {
+        try {
+          dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], { runStatus: 'running' });
+        } catch {
+          /* best effort — verified below */
+        }
+        const remainingTree = (readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{
+          id?: unknown;
+        }>;
+        rollbackConfirmed = !boundaryPersistedIds.some((id) => remainingTree.some((m) => m.id === id));
+        traceDiagnostic({
+          scope: 'automation',
+          event: 'inject.boundary-rolled-back',
+          correlationId,
+          conversationId,
+          ruleId: rule.id,
+          fields: { droppedIds: [...boundaryPersistedIds], reason, rollbackConfirmed },
+        });
+        userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
+      }
+      boundaryPersistedIds.length = 0;
+      preBoundaryParentId = undefined;
+      // Replay the follow-up so the retry (which restarts from the ORIGINAL
+      // messages with the queue already drained) still sees it.
+      //  - consumedInjectEntries were persisted at a boundary: reuse SAME ids into
+      //    freed slots when rollback confirmed (reverse → FIFO), else FRESH ids.
+      //  - pendingBoundary entries were drained by prepareStep but NOT yet
+      //    persisted (restart fired before flush) — no on-disk node, replay FRESH,
+      //    ordered AFTER the consumed ones.
+      if (consumedInjectEntries.length > 0) {
+        if (rollbackConfirmed) {
+          for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
+            reenqueueInject(conversationId, consumedInjectEntries[i]);
+          }
+        } else {
+          reenqueueFreshAtFront(
+            conversationId,
+            consumedInjectEntries.map((entry) => entry.text),
+          );
+        }
+      }
+      if (pendingBoundary.length > 0) {
+        for (const entry of pendingBoundary) enqueueInject(conversationId, entry.text);
+        pendingBoundary = [];
+      }
+      consumedInjectEntries.length = 0;
+    };
+
     try {
       for await (const ev of streamForPlugin({
         messages,
@@ -976,75 +1036,12 @@ async function runAgentAction(
           pendingToolCalls.delete(ev.toolCallId);
         } else if (ev.type === 'error') {
           error = ev.error ?? 'Unknown error';
-        } else if (ev.type === 'model-fallback') {
-          // A mid-stream fallback restarts the response on the next model. Reset
-          // the in-memory accumulators so the collected/persisted result is the
-          // successful retry only, not a failed-prefix + success concatenation.
-          text = '';
-          committedText = '';
-          contentParts.length = 0;
-          toolPartById.clear();
-          toolCalls.length = 0;
-          pendingToolCalls.clear();
-          lastEventWasToolResult = false;
-          error = null;
-          // If a mid-turn inject boundary was already persisted this turn, ALWAYS
-          // roll it back on fallback — regardless of preserveErroredVariant.
-          // Variant preservation would otherwise retain a branch that interleaves
-          // an injected USER turn between assistant segments (parent→assistant→
-          // user→assistant), but the retry re-branches as parent→user→assistant;
-          // RuntimeProvider only surfaces SAME-ROLE siblings as variants, so the
-          // retained branch would be unreachable after reload. Discarding it (and
-          // re-injecting the follow-up with its original id into the freed slot)
-          // keeps a single navigable branch. Variant preservation still applies
-          // normally to non-injected turns (handled by the stream layer).
-          let rollbackConfirmed = true;
-          if (boundaryPersistedIds.length > 0) {
-            try {
-              dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], {
-                runStatus: 'running',
-              });
-            } catch {
-              /* best effort — verified below */
-            }
-            // Verify the nodes were actually removed. If the drop threw before
-            // committing, some may remain; reusing their ids would make the retry
-            // adopt stale failed-branch nodes.
-            const remainingTree = (readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{
-              id?: unknown;
-            }>;
-            rollbackConfirmed = !boundaryPersistedIds.some((id) => remainingTree.some((m) => m.id === id));
-            traceDiagnostic({
-              scope: 'automation',
-              event: 'inject.boundary-rolled-back',
-              correlationId,
-              conversationId,
-              ruleId: rule.id,
-              fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback', rollbackConfirmed },
-            });
-            userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
-          }
-          boundaryPersistedIds.length = 0;
-          preBoundaryParentId = undefined;
-          // Re-inject the follow-up for the retry (streamWithFallback restarts from
-          // the ORIGINAL messages with the queue already drained, so without this
-          // the retry never sees the follow-up). If rollback CONFIRMED the on-disk
-          // nodes were removed, reuse the SAME ids into the freed slots (reverse →
-          // FIFO). If rollback could NOT be confirmed (stale nodes remain), use
-          // FRESH ids so the retry doesn't adopt the stale failed-branch nodes.
-          if (consumedInjectEntries.length > 0) {
-            if (rollbackConfirmed) {
-              for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
-                reenqueueInject(conversationId, consumedInjectEntries[i]);
-              }
-            } else {
-              reenqueueFreshAtFront(
-                conversationId,
-                consumedInjectEntries.map((entry) => entry.text),
-              );
-            }
-          }
-          consumedInjectEntries.length = 0;
+        } else if (ev.type === 'model-fallback' || ev.type === 'retry') {
+          // Both restart the response (fallback = next model; retry = same model
+          // after a transient error) from the ORIGINAL messages, so reset the
+          // accumulators, roll back any persisted inject boundary, and replay the
+          // follow-up for the retry.
+          handleAttemptRestart(ev.type);
         }
       }
       // Flush a boundary buffered on the FINAL step (no further iteration will).

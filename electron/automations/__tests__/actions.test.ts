@@ -755,6 +755,44 @@ describe('agent conversationTarget', () => {
     }) as never);
   });
 
+  it('replays a pending (unflushed) inject when a transient retry restarts the attempt', async () => {
+    clearInjects('convRetry');
+    resetMockStore({
+      convRetry: { id: 'convRetry', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    // onInjected fires (queue drained), then a `retry` event before any text/tool
+    // event flushes the boundary — the entry is still in pendingBoundary. The
+    // retry restarts from original messages, so it must be re-queued or lost.
+    let attempts = 0;
+    vi.mocked(streamForPlugin).mockImplementation(function (opts: unknown) {
+      const onInjected = (opts as { onInjected?: (e: Array<{ id: string; text: string; at: number }>) => void })
+        .onInjected;
+      return (async function* () {
+        attempts += 1;
+        if (attempts === 1) {
+          onInjected?.([{ id: 'inj-retry', text: 'the follow-up', at: Date.now() }]);
+          yield { type: 'retry', data: { attempt: 2, maxRetries: 4 } } as never;
+        }
+        yield { type: 'text-delta', text: `answer ${attempts}` } as never;
+        yield { type: 'done', modelKey: 'test' } as never;
+      })();
+    } as never);
+
+    await executeActions(agentAction({ type: 'existing', conversationId: 'convRetry' }), evt, deps());
+
+    // The follow-up must have been re-queued (with a fresh id, since it was never
+    // persisted) so the restarted attempt could consume + persist it.
+    const users = (mockStore.conversations.convRetry.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+      .filter((m) => m.role === 'user')
+      .map((m) => m.content?.[0]?.text);
+    expect(users).toContain('the follow-up');
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('rolls back injected boundary nodes on fallback even when preserveErroredVariant is set', async () => {
     // Variant preservation does NOT apply to mid-turn-injected turns: retaining a
     // branch that interleaves a user turn between assistants would be unreachable
