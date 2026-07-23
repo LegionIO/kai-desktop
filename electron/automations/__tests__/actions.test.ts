@@ -674,7 +674,11 @@ describe('agent conversationTarget', () => {
     }) as never);
   });
 
-  it('keeps the failed boundary variant when the fallback sets preserveErroredVariant', async () => {
+  it('rolls back injected boundary nodes on fallback even when preserveErroredVariant is set', async () => {
+    // Variant preservation does NOT apply to mid-turn-injected turns: retaining a
+    // branch that interleaves a user turn between assistants would be unreachable
+    // as a variant (RuntimeProvider only surfaces same-role siblings). So the
+    // injected boundary is always rolled back + the follow-up re-injected.
     clearInjects('convPreserve');
     resetMockStore({
       convPreserve: { id: 'convPreserve', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
@@ -687,7 +691,6 @@ describe('agent conversationTarget', () => {
         yield { type: 'text-delta', text: 'pre' } as never;
         onInjected?.([{ id: 'inj-pv', text: 'follow-up', at: Date.now() }]);
         yield { type: 'text-delta', text: 'partial that stays as a variant' } as never;
-        // Transient provider error → preserve the failed variant.
         yield { type: 'model-fallback', modelKey: 'fallback', data: { preserveErroredVariant: true } } as never;
         yield { type: 'text-delta', text: 'retry answer' } as never;
         yield { type: 'done', modelKey: 'fallback' } as never;
@@ -696,8 +699,8 @@ describe('agent conversationTarget', () => {
 
     await executeActions(agentAction({ type: 'existing', conversationId: 'convPreserve' }), evt, deps());
 
-    // preserveErroredVariant → the boundary nodes are NOT deleted.
-    expect(dropConversationMessages).not.toHaveBeenCalled();
+    // Injected boundary rolled back regardless of preserveErroredVariant.
+    expect(dropConversationMessages).toHaveBeenCalled();
 
     vi.mocked(streamForPlugin).mockImplementation(async function* () {
       yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;

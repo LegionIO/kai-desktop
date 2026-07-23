@@ -5,7 +5,7 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
+import { enqueueInject, hasInjects, drainInjects, reenqueueInject } from '../agent/inject-queue.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -520,6 +520,9 @@ async function runAgentAction(
   let turnSucceeded = false;
   let turnResult: unknown;
   let strandedInjects: ReturnType<typeof drainInjects> = [];
+  // Injected user turns whose boundary persist failed twice — retried PERSIST-ONLY
+  // (never re-fed to the model) in the finally so they aren't lost on reload.
+  const failedBoundaryUsers: Array<{ id: string; text: string; at: number }> = [];
   try {
     // Build the model input (optionally including prior history), then write the
     // user prompt turn immediately with runStatus:'running' so the conversation
@@ -795,6 +798,12 @@ async function runAgentAction(
                 boundaryPersistedIds.push(retried.headId);
               }
             } catch (retryErr) {
+              // Both attempts failed and the id is NOT on disk. prepareStep already
+              // drained the queue. Track it for a PERSIST-ONLY end-of-turn retry
+              // (see finally) — do NOT re-enqueue here, or this same running turn's
+              // next prepareStep could re-consume + re-feed the model (double
+              // answer / repeated side effects).
+              failedBoundaryUsers.push(entry);
               traceDiagnostic({
                 scope: 'automation',
                 event: 'inject.persist-failed',
@@ -907,38 +916,9 @@ async function runAgentAction(
         } else if (ev.type === 'error') {
           error = ev.error ?? 'Unknown error';
         } else if (ev.type === 'model-fallback') {
-          const preserveErroredVariant = Boolean(
-            (ev as { data?: { preserveErroredVariant?: unknown } }).data?.preserveErroredVariant,
-          );
-          // When preserving the failed variant AND a mid-turn inject boundary was
-          // already persisted this turn, the retained variant must end with the
-          // model's (failed) answer, not a dangling unanswered user turn.
-          // contentParts holds the post-inject continuation; if it's empty (the
-          // failure hit before any continuation content), persist a short error
-          // assistant so the variant is still terminated by an assistant node.
-          if (preserveErroredVariant && boundaryPersistedIds.length > 0) {
-            const failedContent =
-              contentParts.length > 0
-                ? [...contentParts]
-                : [{ type: 'text', text: `⚠️ ${error ?? 'Model attempt failed; retried on a fallback model.'}` }];
-            try {
-              const cont = appendConversationMessages(
-                deps.appHome,
-                conversationId,
-                [{ role: 'assistant', content: failedContent, createdAt: new Date().toISOString() }],
-                { parentId: userTurnHeadId, runStatus: 'running' },
-              );
-              if (cont?.headId) boundaryPersistedIds.push(cont.headId);
-            } catch {
-              /* best effort — the variant may end at the user turn */
-            }
-          }
-          // A mid-stream fallback restarts the response on the next model. The
-          // failed attempt's partial text + tool parts have already accumulated
-          // into the buffers that build the PERSISTED assistant message; drop them
-          // so the persisted/collected result is the SUCCESSFUL retry only, not a
-          // failed-prefix + success concatenation. (The event was already
-          // broadcast above; we only reset the local accumulation, not the wire.)
+          // A mid-stream fallback restarts the response on the next model. Reset
+          // the in-memory accumulators so the collected/persisted result is the
+          // successful retry only, not a failed-prefix + success concatenation.
           text = '';
           committedText = '';
           contentParts.length = 0;
@@ -947,13 +927,17 @@ async function runAgentAction(
           pendingToolCalls.clear();
           lastEventWasToolResult = false;
           error = null;
-          // Roll back segments PERSISTED at a mid-turn inject boundary this turn —
-          // but ONLY when the failed variant is being discarded. When
-          // streamWithFallback set preserveErroredVariant (a transient provider
-          // error after content streamed), the failed assistant stays as a
-          // selectable sibling variant, so we must NOT delete it; we only
-          // re-enqueue the injected user below so the retry sees the follow-up too.
-          if (boundaryPersistedIds.length > 0 && !preserveErroredVariant) {
+          // If a mid-turn inject boundary was already persisted this turn, ALWAYS
+          // roll it back on fallback — regardless of preserveErroredVariant.
+          // Variant preservation would otherwise retain a branch that interleaves
+          // an injected USER turn between assistant segments (parent→assistant→
+          // user→assistant), but the retry re-branches as parent→user→assistant;
+          // RuntimeProvider only surfaces SAME-ROLE siblings as variants, so the
+          // retained branch would be unreachable after reload. Discarding it (and
+          // re-injecting the follow-up with its original id into the freed slot)
+          // keeps a single navigable branch. Variant preservation still applies
+          // normally to non-injected turns (handled by the stream layer).
+          if (boundaryPersistedIds.length > 0) {
             try {
               dropConversationMessages(deps.appHome, conversationId, [...boundaryPersistedIds], {
                 runStatus: 'running',
@@ -969,43 +953,18 @@ async function runAgentAction(
               ruleId: rule.id,
               fields: { droppedIds: [...boundaryPersistedIds], reason: 'model-fallback' },
             });
-          }
-          // Rewind the head to the pre-boundary parent in BOTH cases: the retry
-          // must branch a fresh sibling from before the boundary, not descend from
-          // the failed variant's injected user (which would produce consecutive
-          // duplicate user turns and make the retry a descendant, not a sibling).
-          // Rolled-back: the boundary nodes are gone. Preserved: they remain as a
-          // sibling variant, and the fresh-id re-queue below re-persists the
-          // follow-up on the new branch off preBoundaryParentId.
-          if (boundaryPersistedIds.length > 0) {
             userTurnHeadId = preBoundaryParentId ?? userTurnHeadId;
           }
           boundaryPersistedIds.length = 0;
           preBoundaryParentId = undefined;
-          // The fallback attempt retries from the ORIGINAL messages with the
-          // queue already drained, so the follow-up must be re-queued or the retry
-          // model never sees it. HOW depends on whether the failed variant was
-          // kept:
-          //  - rolled back (discarded): the on-disk inject node was deleted, so
-          //    reuse the SAME id (reenqueueInject) — the retry re-persists it in
-          //    the freed slot, no duplication.
-          //  - preserved variant: the inject node with its stable id still exists
-          //    on disk. Re-queue with a FRESH id (enqueueInject) so the retry both
-          //    sees the follow-up AND persists it as a distinct node on the new
-          //    sibling branch, instead of colliding with the retained id.
+          // Re-inject the follow-up for the retry (its on-disk node was just
+          // deleted, so reuse the SAME id into the freed slot). Reverse order so
+          // the head-insert restores FIFO. Without this the retry model — which
+          // restarts from the ORIGINAL messages with the queue already drained —
+          // never sees the follow-up.
           if (consumedInjectEntries.length > 0) {
-            if (preserveErroredVariant) {
-              // Fresh ids (retained node still holds the old id) at the FRONT, in
-              // original order, so they stay ahead of any inject queued after they
-              // were first consumed and the retry sees them chronologically.
-              reenqueueFreshAtFront(
-                conversationId,
-                consumedInjectEntries.map((entry) => entry.text),
-              );
-            } else {
-              for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
-                reenqueueInject(conversationId, consumedInjectEntries[i]);
-              }
+            for (let i = consumedInjectEntries.length - 1; i >= 0; i -= 1) {
+              reenqueueInject(conversationId, consumedInjectEntries[i]);
             }
           }
           consumedInjectEntries.length = 0;
@@ -1123,6 +1082,26 @@ async function runAgentAction(
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);
+    // Persist-only retry for injected user turns whose boundary persist failed
+    // twice (the model already consumed them; never re-feed). Idempotent: adopt an
+    // already-committed id, else append; best-effort.
+    for (const entry of failedBoundaryUsers) {
+      try {
+        const onDisk = ((readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>).some(
+          (m) => m.id === entry.id,
+        );
+        if (onDisk) continue;
+        const head = readConversation(deps.appHome, conversationId)?.headId ?? null;
+        appendConversationMessages(
+          deps.appHome,
+          conversationId,
+          [{ id: entry.id, role: 'user', content: [{ type: 'text', text: entry.text }], createdAt: new Date(entry.at).toISOString() }],
+          { parentId: head, runStatus: 'idle' },
+        );
+      } catch {
+        /* best effort — already traced at the boundary */
+      }
+    }
     // Persist any leftover queued injects UNCONDITIONALLY (even on stream
     // failure/abort). They were displayed but their authoritative persistence was
     // deferred to prepareStep; if the turn errored before consuming them, this is
