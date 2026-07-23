@@ -81,6 +81,7 @@ import { generateForPlugin, streamForPlugin } from '../../agent/plugin-generate.
 import { appendConversationMessages } from '../../ipc/conversations.js';
 import { writeConversation } from '../../ipc/conversation-store.js';
 import { hasInjects, clearInjects, drainInjects, enqueueInject } from '../../agent/inject-queue.js';
+import { broadcastAgentStreamEvent } from '../../ipc/agent.js';
 
 function rule(actions: AutomationRule['actions']): AutomationRule {
   return {
@@ -284,6 +285,7 @@ describe('agent conversationTarget', () => {
     vi.mocked(writeConversation).mockClear();
     vi.mocked(appendConversationMessages).mockClear();
     vi.mocked(generateForPlugin).mockClear();
+    vi.mocked(broadcastAgentStreamEvent).mockClear();
     vi.mocked(streamForPlugin).mockReset();
     vi.mocked(streamForPlugin).mockImplementation(async function* () {
       yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
@@ -443,6 +445,14 @@ describe('agent conversationTarget', () => {
     expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
     expect(hasInjects('convCoop')).toBe(true);
     expect(drainInjects('convCoop').map((q) => q.text)).toContain('do the thing');
+    // The deferred user-message broadcast MUST be tagged automation:true so the
+    // renderer defers persistence to the main process (prepareStep boundary)
+    // instead of persisting it renderer-owned → duplicate/forked user nodes.
+    const injectedBroadcast = vi
+      .mocked(broadcastAgentStreamEvent)
+      .mock.calls.map((c) => c[0] as { type?: string; conversationId?: string; automation?: boolean })
+      .find((e) => e.type === 'user-message' && e.conversationId === 'convCoop');
+    expect(injectedBroadcast?.automation).toBe(true);
 
     release();
     await first;

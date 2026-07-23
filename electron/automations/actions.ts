@@ -436,6 +436,12 @@ async function runAgentAction(
         type: 'user-message',
         text: prompt,
         data: { messageId: injectId },
+        // Tag automation-owned so the renderer renders it live but DEFERS
+        // persistence to the main process (prepareStep boundary). Without this,
+        // an inject arriving before the first automation-tagged event would be
+        // treated as renderer-owned and persisted immediately → duplicate/forked
+        // user nodes racing the boundary write.
+        automation: true,
       });
       return { injectedInto: targetConvId, ok: true };
     }
@@ -487,10 +493,6 @@ async function runAgentAction(
   let turnSucceeded = false;
   let turnResult: unknown;
   let strandedInjects: ReturnType<typeof drainInjects> = [];
-  // Injected user turns the model already consumed this turn but whose branch
-  // persistence failed — retried (persist-only, NOT re-fed to the model) in the
-  // finally so the triggering message isn't permanently lost.
-  const pendingPersistUsers: ReturnType<typeof drainInjects> = [];
   try {
     // Build the model input (optionally including prior history), then write the
     // user prompt turn immediately with runStatus:'running' so the conversation
@@ -676,12 +678,15 @@ async function runAgentAction(
         }
       }
       // Persist the injected user turns. These are plain text so this effectively
-      // never fails; if it does we log but do NOT re-enqueue — the model has
-      // ALREADY consumed them (prepareStep spliced them into the input), so
-      // re-injecting would double-answer + repeat tool side effects.
+      // never fails; if it does, retry ONCE immediately (still before the model's
+      // continuation is persisted, so the parent relationship stays
+      // …assistant(partial) → user → continuation). We do NOT re-feed the model
+      // (it already consumed them) and do NOT defer to `finally` (which would
+      // parent the user AFTER the continuation assistant, heading the branch on an
+      // apparently-unanswered prompt).
       for (const entry of entries) {
-        try {
-          const injected = appendConversationMessages(
+        const appendUser = () =>
+          appendConversationMessages(
             deps.appHome,
             conversationId,
             [
@@ -694,20 +699,24 @@ async function runAgentAction(
             ],
             { parentId: userTurnHeadId, runStatus: 'running' },
           );
+        try {
+          const injected = appendUser();
           if (injected?.headId) userTurnHeadId = injected.headId;
         } catch (injErr) {
-          // Model already consumed this entry; retry PERSIST-ONLY in the finally
-          // (never re-fed to the model, so no double-answer / repeated side effect).
-          pendingPersistUsers.push(entry);
-          traceDiagnostic({
-            scope: 'automation',
-            event: 'inject.persist-failed',
-            level: 'error',
-            correlationId,
-            conversationId,
-            ruleId: rule.id,
-            fields: { injectId: entry.id, error: injErr },
-          });
+          try {
+            const retried = appendUser();
+            if (retried?.headId) userTurnHeadId = retried.headId;
+          } catch (retryErr) {
+            traceDiagnostic({
+              scope: 'automation',
+              event: 'inject.persist-failed',
+              level: 'error',
+              correlationId,
+              conversationId,
+              ruleId: rule.id,
+              fields: { injectId: entry.id, error: retryErr ?? injErr },
+            });
+          }
         }
       }
       // Preserve this segment's text in the cumulative result before resetting
@@ -937,32 +946,6 @@ async function runAgentAction(
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);
-    // Persist-only retry for injected user turns the MODEL ALREADY CONSUMED but
-    // whose branch write failed at the boundary. Append-only, never re-fed to the
-    // model (so no double-answer / repeated tool side effects); best-effort.
-    if (pendingPersistUsers.length > 0) {
-      let retryHead = readConversation(deps.appHome, conversationId)?.headId ?? null;
-      for (const entry of pendingPersistUsers) {
-        try {
-          const persisted = appendConversationMessages(
-            deps.appHome,
-            conversationId,
-            [
-              {
-                id: entry.id,
-                role: 'user',
-                content: [{ type: 'text', text: entry.text }],
-                createdAt: new Date(entry.at).toISOString(),
-              },
-            ],
-            { parentId: retryHead, runStatus: 'idle' },
-          );
-          if (persisted?.headId) retryHead = persisted.headId;
-        } catch {
-          /* give up on this entry after the retry; already traced above */
-        }
-      }
-    }
     // Persist any leftover queued injects UNCONDITIONALLY (even on stream
     // failure/abort). They were displayed but their authoritative persistence was
     // deferred to prepareStep; if the turn errored before consuming them, this is

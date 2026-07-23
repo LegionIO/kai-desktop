@@ -247,7 +247,9 @@ export function registerAlertsHandlers(ipcMain: IpcMain): void {
       correlationId: `alert-${id}`,
       conversationId: resolved.conversationId,
       alertId: id,
-      fields: { answerKeys: Object.keys(clean) },
+      // Count only — question headers can carry sensitive prose and must not be
+      // written in metadata-only trace mode.
+      fields: { answerCount: Object.keys(clean).length },
     });
     broadcastAlertsChanged({ reason: 'resolved', alert: resolved });
     // Resume in the background; don't make the UI wait on a full agent turn.
