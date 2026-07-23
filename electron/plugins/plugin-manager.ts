@@ -565,6 +565,13 @@ export class PluginManager {
       this.plugins.set(manifest.name, this.createPluginInstance(manifest, dir, 'disabled'));
       this.broadcastUIState();
       this.notifyToolsChanged();
+      traceDiagnostic({
+        scope: 'plugin',
+        event: 'plugin.load-skipped',
+        correlationId: pluginCorrelationId,
+        pluginName: manifest.name,
+        fields: { reason: 'disabled' },
+      });
       console.info(`[PluginManager] Plugin "${manifest.name}" is disabled — skipping load`);
       return;
     }
@@ -582,6 +589,14 @@ export class PluginManager {
           : 'Plugin permission approval is required before it can be loaded.';
         this.broadcastUIState();
         this.notifyToolsChanged();
+        traceDiagnostic({
+          scope: 'plugin',
+          event: 'plugin.load-rejected',
+          level: 'warn',
+          correlationId: pluginCorrelationId,
+          pluginName: manifest.name,
+          fields: { reason: 'approval-required' },
+        });
         return;
       }
 
@@ -597,6 +612,14 @@ export class PluginManager {
           console.warn(`[PluginManager] Plugin "${manifest.name}" blocked (strict mode): ${compat.errors.join('; ')}`);
           this.broadcastUIState();
           this.notifyToolsChanged();
+          traceDiagnostic({
+            scope: 'plugin',
+            event: 'plugin.load-rejected',
+            level: 'warn',
+            correlationId: pluginCorrelationId,
+            pluginName: manifest.name,
+            fields: { reason: 'incompatible-strict', errors: compat.errors },
+          });
           return;
         }
         // warn mode: store warning, continue loading
@@ -612,6 +635,14 @@ export class PluginManager {
         instance.error = `Plugin backend not found: ${backendPath}`;
         this.broadcastUIState();
         this.notifyToolsChanged();
+        traceDiagnostic({
+          scope: 'plugin',
+          event: 'plugin.load-rejected',
+          level: 'warn',
+          correlationId: pluginCorrelationId,
+          pluginName: manifest.name,
+          fields: { reason: 'missing-backend' },
+        });
         return;
       }
 

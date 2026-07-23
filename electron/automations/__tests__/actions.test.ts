@@ -493,6 +493,27 @@ describe('agent conversationTarget', () => {
     });
   });
 
+  it('drops pre-injection text on a model fallback (result reflects the successful retry only)', async () => {
+    clearInjects('convFb');
+    resetMockStore({
+      convFb: { id: 'convFb', messageTree: [], headId: null, metadata: {}, runStatus: 'idle' },
+    });
+    vi.mocked(streamForPlugin).mockImplementationOnce(async function* () {
+      yield { type: 'text-delta', text: 'failed-prefix' } as never;
+      yield { type: 'model-fallback', modelKey: 'fallback' } as never;
+      yield { type: 'text-delta', text: 'good-answer' } as never;
+      yield { type: 'done', modelKey: 'fallback' } as never;
+    });
+
+    const rec = await executeActions(agentAction({ type: 'existing', conversationId: 'convFb' }), evt, deps());
+    expect(rec.results[0].output).toMatchObject({ text: 'good-answer' });
+
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'text-delta', text: 'AGENT SAYS HI' } as never;
+      yield { type: 'done', modelKey: 'test' } as never;
+    });
+  });
+
   it('persists a queued inject onto the branch even when the turn stream fails', async () => {
     clearInjects('convFail');
     resetMockStore({

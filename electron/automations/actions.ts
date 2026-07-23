@@ -749,6 +749,7 @@ async function runAgentAction(
           // failed-prefix + success concatenation. (The event was already
           // broadcast above; we only reset the local accumulation, not the wire.)
           text = '';
+          committedText = '';
           contentParts.length = 0;
           toolPartById.clear();
           toolCalls.length = 0;
