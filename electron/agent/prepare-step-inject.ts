@@ -60,6 +60,14 @@ export function drainInjectConsumedMarkers(conversationId: string): QueuedInject
   return m;
 }
 
+/** Discard any pending in-band markers for a conversation (call at stream
+ * start/end so a path that records but never drains — e.g. the synthetic-events
+ * reasoning-gateway path, or a stream that ends before the next chunk — can't
+ * leak user text or emit a stale marker on a later stream). */
+export function clearInjectConsumedMarkers(conversationId: string): void {
+  injectConsumedMarkers.delete(conversationId);
+}
+
 /**
  * Build the prepareStep function for a conversation's Mastra turn. Returns
  * undefined-safe results: an empty object when nothing is queued, otherwise a

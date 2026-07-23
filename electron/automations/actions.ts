@@ -939,6 +939,11 @@ async function runAgentAction(
         }
       }
       consumedInjectEntries.length = 0;
+      // The discarded attempt's failed-boundary entries are obsolete — the whole
+      // response is regenerating and the follow-up was just re-queued for the
+      // retry. Clearing them prevents the finally recovery from ALSO inserting the
+      // original ids (duplicate consecutive user turns).
+      failedBoundaryUsers.length = 0;
     };
 
     try {

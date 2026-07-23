@@ -29,7 +29,7 @@ import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-saniti
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
-import { buildMastraPrepareStep, drainInjectConsumedMarkers } from './prepare-step-inject.js';
+import { buildMastraPrepareStep, drainInjectConsumedMarkers, clearInjectConsumedMarkers } from './prepare-step-inject.js';
 import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
@@ -1341,6 +1341,10 @@ async function* generateWithSyntheticEvents(
     onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
   },
 ): AsyncGenerator<StreamEvent> {
+  // The synthetic-events path drains injects via prepareStep but never yields an
+  // in-band marker (no fullStream chunk loop). Clear markers at start AND end so
+  // recorded entries can't leak or emit stale markers on a later stream.
+  clearInjectConsumedMarkers(conversationId);
   let terminalFinishReason: string | undefined;
   let activeModelSettings = { ...modelSettings };
   let activeModelConfig = { ...modelConfig };
@@ -1577,6 +1581,9 @@ async function* streamWithRealEvents(
     onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
   },
 ): AsyncGenerator<StreamEvent> {
+  // Clear any stale in-band inject markers from a prior stream so this turn can't
+  // emit markers left behind by a path that recorded but never drained them.
+  clearInjectConsumedMarkers(conversationId);
   const toolStartByCallId = new Map<string, { startedAt: string; toolName: string }>();
   let emittedAnyOutput = false;
   let emittedTerminalError = false;
