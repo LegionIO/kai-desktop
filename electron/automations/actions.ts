@@ -530,9 +530,17 @@ async function runAgentAction(
   let turnSucceeded = false;
   let turnResult: unknown;
   let strandedInjects: ReturnType<typeof drainInjects> = [];
+  // Set when the drain-at-end path requeued entries it couldn't persist. The
+  // continuation must then still run (its prepareStep drains the queue) even
+  // though nothing landed on the branch, or the follow-up would sit unconsumed.
+  let drainRequeued = false;
   // Injected user turns whose boundary persist failed twice — retried PERSIST-ONLY
   // (never re-fed to the model) in the finally so they aren't lost on reload.
   const failedBoundaryUsers: Array<{ id: string; text: string; at: number }> = [];
+  // Turn-scoped: once ANY boundary entry fails to persist, all later boundaries'
+  // entries are also deferred to recovery (preserving chronology) — a per-flush
+  // flag would let a later boundary persist ahead of the failed earlier one.
+  let anyBoundaryFailed = false;
   // The finalized terminal-assistant node id (set at finalize) so a recovered
   // injected user can be inserted BEFORE it (user → assistant), not after.
   let finalizedAssistantId: string | null = null;
@@ -769,13 +777,12 @@ async function runAgentAction(
       // (it already consumed them) and do NOT defer to `finally` (which would
       // parent the user AFTER the continuation assistant, heading the branch on an
       // apparently-unanswered prompt).
-      // Once any entry fails to persist, ALL subsequent entries are deferred to
-      // recovery too (without attempting to persist), so failed entries keep their
-      // original FIFO position relative to each other rather than being inserted
-      // out of order before a later entry that succeeded.
-      let boundaryFailed = false;
+      // Once any entry fails to persist (this boundary OR an earlier one this
+      // turn), ALL subsequent entries are deferred to recovery too (without
+      // attempting to persist), so failed entries keep their original FIFO
+      // position rather than being inserted out of order before a later success.
       for (const entry of entries) {
-        if (boundaryFailed) {
+        if (anyBoundaryFailed) {
           failedBoundaryUsers.push(entry);
           continue;
         }
@@ -843,7 +850,7 @@ async function runAgentAction(
                 // model (double answer / repeated side effects). Mark the boundary
                 // failed so subsequent entries are deferred too, preserving FIFO.
                 failedBoundaryUsers.push(entry);
-                boundaryFailed = true;
+                anyBoundaryFailed = true;
                 traceDiagnostic({
                   scope: 'automation',
                   event: 'inject.persist-failed',
@@ -944,6 +951,7 @@ async function runAgentAction(
       // retry. Clearing them prevents the finally recovery from ALSO inserting the
       // original ids (duplicate consecutive user turns).
       failedBoundaryUsers.length = 0;
+      anyBoundaryFailed = false;
     };
 
     try {
@@ -1279,6 +1287,7 @@ async function runAgentAction(
             }
             const remaining = leftover.slice(leftover.indexOf(entry)).filter((r) => !idOnDisk(r.id));
             for (let i = remaining.length - 1; i >= 0; i -= 1) reenqueueInject(conversationId, remaining[i]);
+            drainRequeued = drainRequeued || remaining.length > 0;
             traceDiagnostic({
               scope: 'automation',
               event: 'inject.drain-persist-failed',
@@ -1311,11 +1320,12 @@ async function runAgentAction(
     }
   }
 
-  // Drain-at-end continuation: only on success, and only if we persisted stranded
-  // injects above. The user turns are already on the branch (idle); run one more
-  // turn on the current branch to answer them. Bounded to avoid loops.
+  // Drain-at-end continuation: on success, run one more turn when we persisted
+  // stranded injects OR requeued unpersisted ones (the continuation's prepareStep
+  // drains the queue so a transiently-failed follow-up still gets consumed +
+  // persisted). Bounded to avoid loops.
   const continueBudget = opts?.continueBudget ?? 3;
-  if (turnSucceeded && continueBudget > 0 && strandedInjects.length > 0) {
+  if (turnSucceeded && continueBudget > 0 && (strandedInjects.length > 0 || (drainRequeued && hasInjects(conversationId)))) {
     try {
       // Force the SAME conversation (not per-invocation/singleton re-resolution)
       // and continue on its current branch without appending a new prompt.
