@@ -241,6 +241,25 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
     maxAgeDays: cfg.retention?.maxAgeDays ?? 30,
     maxTotalBytes: cfg.retention?.maxTotalBytes ?? 524288000,
   };
+  const setRetention = (patch: Partial<NonNullable<AppshotsConfig['retention']>>) => {
+    if (canonical) {
+      for (const [key, value] of Object.entries(patch)) {
+        void updateConfig(`appShots.persisted.retention.${key}`, value);
+      }
+      return;
+    }
+    // Migration: cumulatively deep-merge retention into the accumulated patch so
+    // two rapid retention edits before the first round-trip don't clobber.
+    const mergedRetention = { ...retention, ...(migrationPatchRef.current.retention ?? {}), ...patch };
+    migrationPatchRef.current = { ...migrationPatchRef.current, retention: mergedRetention };
+    void updateConfig('appShots.persisted', {
+      enabled: cfg.enabled ?? false,
+      autoCapture: cfg.autoCapture ?? false,
+      captureVisibleText: cfg.captureVisibleText ?? false,
+      retention,
+      ...migrationPatchRef.current,
+    });
+  };
   const [appshots, setAppshots] = useState<Appshot[]>([]);
   const [viewing, setViewing] = useState<Appshot | null>(null);
   // Monotonic guard: a slow older list() response must not overwrite a newer one.
@@ -344,7 +363,7 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           id="appShots.persisted.retention.maxCount"
           label="Max appshots"
           value={cfg.retention?.maxCount ?? 200}
-          onChange={(v) => setPersisted({ retention: { ...retention, maxCount: v } })}
+          onChange={(v) => setRetention({ maxCount: v })}
           min={0}
           max={100000}
         />
@@ -352,7 +371,7 @@ export const AppshotsSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ 
           id="appShots.persisted.retention.maxAgeDays"
           label="Max age (days)"
           value={cfg.retention?.maxAgeDays ?? 30}
-          onChange={(v) => setPersisted({ retention: { ...retention, maxAgeDays: v } })}
+          onChange={(v) => setRetention({ maxAgeDays: v })}
           min={0}
           max={3650}
         />

@@ -235,8 +235,10 @@ export function traceDiagnostic(event: DiagnosticTraceEvent): void {
   const path = getDiagnosticTracePath();
   try {
     mkdirSync(dirname(path), { recursive: true });
+    // Size-triggered rotation is cheap (statSync + readdir only when actually
+    // rotating). Age/count pruning is handled by the throttled sweep above, not
+    // per-event, so high-frequency traces don't repeatedly scan the logs dir.
     rotate(path, cfg);
-    prune(path, cfg);
     const record = sanitize({ ts: new Date().toISOString(), ...event }, cfg.includeContent) as Record<string, unknown>;
     appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
   } catch {

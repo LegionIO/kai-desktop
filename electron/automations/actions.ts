@@ -368,7 +368,14 @@ async function runAgentAction(
       fields: { reason: opts?.forceFreshTurn ? 'alert-resume' : 'ordered-follower' },
     });
     return enqueueOrderedConversationTurn(orderingConversationId, async () => {
-      await waitForAutomationRunToSettle(orderingConversationId);
+      // Alert resumes: the answer is the ONLY in-memory copy while we wait (the
+      // alert is already marked answered). Cap the wait so a still-busy run
+      // re-opens the alert (via the resume() catch → reopenAlert) and returns it
+      // to the Alerts list rather than holding delivery in memory across a long
+      // run where a crash would silently lose it. Non-alert ordered followers are
+      // re-derivable from their source event, so they keep the generous wait.
+      const settleMs = opts?.forceFreshTurn ? 60_000 : undefined;
+      await waitForAutomationRunToSettle(orderingConversationId, settleMs);
       return runAgentAction(action, ctx, rule, event, deps, {
         ...opts,
         forceFreshTurn: false,

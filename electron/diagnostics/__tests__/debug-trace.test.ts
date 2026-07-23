@@ -96,8 +96,8 @@ describe('diagnostic trace', () => {
     writeFileSync(`${base}.2`, 'old2');
     writeFileSync(`${base}.3`, 'old3');
     mutateTrace({ retention: { maxFileBytes: 10485760, maxFiles: 2, maxAgeDays: 7 } });
-    // A trace write triggers prune(), which removes suffixes >= maxFiles.
-    traceDiagnostic({ scope: 'automation', event: 'turn.start' });
+    // Retention (age/count prune) runs on the throttled sweep, not per-event.
+    sweepDiagnosticTraceRetention();
     expect(existsSync(`${base}.2`)).toBe(false);
     expect(existsSync(`${base}.3`)).toBe(false);
   });
@@ -176,7 +176,7 @@ describe('diagnostic trace', () => {
     writeFileSync(unrelated, 'keep me');
     writeFileSync(`${base}.3`, 'stale trace');
     mutateTrace({ retention: { maxFileBytes: 10485760, maxFiles: 2, maxAgeDays: 7 } });
-    traceDiagnostic({ scope: 'automation', event: 'turn.start' });
+    sweepDiagnosticTraceRetention();
     expect(existsSync(unrelated)).toBe(true);
     expect(existsSync(`${base}.3`)).toBe(false);
   });
