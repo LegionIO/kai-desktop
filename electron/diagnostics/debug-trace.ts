@@ -45,6 +45,31 @@ const METADATA_SUFFIX_RE = /(id|ids|count|at|ms|len|length|bytes|chars|index|has
 function isContentKey(key: string): boolean {
   return CONTENT_WORD_RE.test(key) && !METADATA_SUFFIX_RE.test(key);
 }
+// Keys whose STRING values are safe identifiers/codes to keep in metadata-only
+// mode. Everything else (arbitrary renderer/web `fields`) is omitted. Matches
+// the common identifier suffixes plus a few exact metadata keys.
+const SAFE_METADATA_KEY_RE =
+  /(id|ids|hash|status|kind|type|name|scope|scopes|key|version|model|mode|stage|event|source|level|phase|role|state|reason|trigger)$/i;
+const SAFE_METADATA_KEY_EXACT = new Set([
+  'correlationId',
+  'parentCorrelationId',
+  'conversationId',
+  'runId',
+  'messageId',
+  'parentMessageId',
+  'headId',
+  'alertId',
+  'ruleId',
+  'pluginName',
+  'toolName',
+  'ts',
+  'scope',
+  'event',
+  'level',
+]);
+function isSafeMetadataKey(key: string): boolean {
+  return SAFE_METADATA_KEY_EXACT.has(key) || SAFE_METADATA_KEY_RE.test(key);
+}
 // Explicitly-safe categorical `reason`/`cause` codes. Anything not listed here is
 // omitted in metadata-only mode (a free-text reason like runtimeSelection.reason
 // can embed absolute plugin paths or raw scan errors).
@@ -139,6 +164,13 @@ function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0):
     if (value && typeof value === 'object') return { omitted: true, keys: Object.keys(value as object).length };
     return '[omitted]';
   }
+  // Metadata-only default: strings are omitted UNLESS their key is an allowlisted
+  // safe-metadata key (id/correlation/status/scope/type/name-style identifiers).
+  // `debug:trace` accepts arbitrary renderer/web fields, so an unrecognized key
+  // like `note`/`command`/`data` must not leak prose without content consent.
+  if (!includeContent && typeof value === 'string' && !isSafeMetadataKey(key)) {
+    return { omitted: true, chars: value.length };
+  }
   if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…` : value;
   if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
   if (value === undefined) return undefined;
@@ -157,11 +189,12 @@ function sanitize(value: unknown, includeContent: boolean, key = '', depth = 0):
   return String(value);
 }
 
-function rotate(path: string, cfg: TraceConfig): void {
+function rotate(path: string, cfg: TraceConfig, addedBytes = 0): void {
   try {
-    if (statSync(path).size < cfg.maxFileBytes) return;
+    if (statSync(path).size + addedBytes <= cfg.maxFileBytes) return;
   } catch {
-    return;
+    // File doesn't exist yet: only the incoming record's bytes matter.
+    if (addedBytes <= cfg.maxFileBytes) return;
   }
   // Drop rotated siblings of THIS trace file above the (possibly reduced) limit
   // so a lowered maxFiles is enforced promptly. Scoped to the trace basename so
@@ -253,12 +286,28 @@ export function traceDiagnostic(event: DiagnosticTraceEvent): void {
   const path = getDiagnosticTracePath();
   try {
     mkdirSync(dirname(path), { recursive: true });
-    // Size-triggered rotation is cheap (statSync + readdir only when actually
-    // rotating). Age/count pruning is handled by the throttled sweep above, not
-    // per-event, so high-frequency traces don't repeatedly scan the logs dir.
-    rotate(path, cfg);
     const record = sanitize({ ts: new Date().toISOString(), ...event }, cfg.includeContent) as Record<string, unknown>;
-    appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+    let line = `${JSON.stringify(record)}\n`;
+    // Per-record cap: a single event with a large nested object/array must not
+    // blow past maxFileBytes even though individual strings are capped. Cap a
+    // record at min(1 MiB, half the file budget); replace an over-cap line with a
+    // truncation marker carrying the correlation/scope/event for triage.
+    const perRecordCap = Math.max(64 * 1024, Math.min(1024 * 1024, Math.floor(cfg.maxFileBytes / 2)));
+    if (Buffer.byteLength(line, 'utf8') > perRecordCap) {
+      line =
+        `${JSON.stringify({
+          ts: record.ts,
+          scope: (record as { scope?: unknown }).scope,
+          event: (record as { event?: unknown }).event,
+          correlationId: (record as { correlationId?: unknown }).correlationId,
+          truncated: true,
+          bytes: Buffer.byteLength(line, 'utf8'),
+        })}\n`;
+    }
+    // Rotate based on CURRENT size + this record's bytes so a single append can't
+    // push the active file substantially over the budget.
+    rotate(path, cfg, Buffer.byteLength(line, 'utf8'));
+    appendFileSync(path, line, { encoding: 'utf8', mode: 0o600 });
   } catch {
     /* diagnostics must never affect app behavior */
   }

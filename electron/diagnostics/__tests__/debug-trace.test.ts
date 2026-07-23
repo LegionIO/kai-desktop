@@ -181,6 +181,34 @@ describe('diagnostic trace', () => {
     expect(existsSync(`${base}.3`)).toBe(false);
   });
 
+  it('omits arbitrary non-allowlisted string fields in metadata-only mode', () => {
+    mutateTrace({ enabled: true });
+    traceDiagnostic({
+      scope: 'automation',
+      event: 'turn.start',
+      fields: { note: 'sensitive prose', command: 'rm -rf /secret', runId: 'r-1', count: 4 },
+    });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.fields.note).toEqual({ omitted: true, chars: 'sensitive prose'.length });
+    expect(row.fields.command).toEqual({ omitted: true, chars: 'rm -rf /secret'.length });
+    // Allowlisted identifier/number metadata still passes.
+    expect(row.fields.runId).toBe('r-1');
+    expect(row.fields.count).toBe(4);
+  });
+
+  it('replaces an over-cap record with a truncation marker', () => {
+    mutateTrace({ enabled: true, includeContent: true, retention: { maxFileBytes: 262144, maxFiles: 3, maxAgeDays: 7 } });
+    // Many capped strings summing large (per-record cap = max(64KiB, min(1MiB,
+    // maxFileBytes/2)) = 131072 here). Build ~150 arrays each with a 3900-char
+    // string so the serialized record exceeds the per-record cap.
+    const big: Record<string, string> = {};
+    for (let i = 0; i < 200; i += 1) big[`contentField${i}`] = 'y'.repeat(3900);
+    traceDiagnostic({ scope: 'automation', event: 'turn.start', fields: big });
+    const row = JSON.parse(readFileSync(getDiagnosticTracePath(), 'utf8').trim());
+    expect(row.truncated).toBe(true);
+    expect(row.event).toBe('turn.start');
+  });
+
   it('includes bounded content only when explicitly enabled', () => {
     mutateTrace({ enabled: true, includeContent: true });
     traceDiagnostic({ scope: 'alert', event: 'alert.created', fields: { body: 'hello', password: 'nope' } });
