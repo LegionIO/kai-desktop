@@ -265,18 +265,34 @@ function looksRepetitive(s: string): boolean {
 }
 
 /**
+ * Even for DIVERSE content (no long run, many distinct chars — e.g. a base64 image
+ * payload or a huge tool result), a single synchronous tiktoken encode of a
+ * multi-megabyte string blocks the main thread. `appendConversationMessages`
+ * counts each message on the main thread as it persists CLI attachments /
+ * server-persisted tool results (image payloads near 7 MiB), so we cap the EXACT
+ * encode by size regardless of diversity: above this many chars, use the safe
+ * UTF-8 byte ceiling instead. Set to match the store's per-write backfill budget
+ * (1.5M chars ≈ 375k+ tokens) — far above any normal message, so precision is kept
+ * for real content while a pathological/large single payload can't stall the UI.
+ */
+const SAFE_EXACT_ENCODE_CHARS = 1_500_000;
+
+/**
  * Exact token count of a serialized string via tiktoken, UNLESS encoding it
  * synchronously would risk blocking the main thread, in which case fall back to
  * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
- * The encode is skipped when the string (a) exceeds the hard char cap, (b) contains
- * a long single-character RUN, or (c) is large with very few DISTINCT code units
- * (repetitive of any multi-char pattern / emoji). These are the input shapes that
- * make tiktoken's BPE merge search pathological (toward quadratic). Cost-aware, so
- * a repetitive prompt/tool result can't stall the UI regardless of the pattern.
- * The ceiling is a safe over-estimate for both the gate and budget-fit.
+ * The encode is skipped when the string (a) exceeds the hard char cap, (b) is over
+ * the safe per-encode size ({@link SAFE_EXACT_ENCODE_CHARS}) even if diverse,
+ * (c) contains a long single-character RUN, or (d) is large with very few DISTINCT
+ * code units (repetitive of any multi-char pattern / emoji). These are the input
+ * shapes/sizes that make a synchronous encode slow. Cost- AND size-aware, so a
+ * large or repetitive prompt/tool result can't stall the UI. The ceiling is a safe
+ * over-estimate for both the gate and budget-fit.
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
-  if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
+  if (serialized.length > SAFE_EXACT_ENCODE_CHARS) {
+    // Too large to encode synchronously without risking a main-thread stall
+    // (covers the >8M hard cap too). Byte ceiling is a safe over-estimate.
     return Buffer.byteLength(serialized, 'utf8');
   }
   if (longestCharRun(serialized) > MAX_ENCODE_RUN || looksRepetitive(serialized)) {

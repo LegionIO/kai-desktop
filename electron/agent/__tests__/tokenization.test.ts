@@ -420,6 +420,21 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(capped).toBe(enc.encode(diverse).length); // exact encode, not the ceiling
   });
 
+  it('byte-ceilings a LARGE DIVERSE payload (e.g. a multi-MB image) instead of encoding', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // Diverse content (no long run, many distinct chars) but >1.5M chars — like a
+    // ~2MB base64 image payload. Must NOT synchronously encode (main-thread stall);
+    // byte-ceiling by size regardless of diversity.
+    let big = '';
+    let i = 0;
+    while (big.length < 2_000_000) {
+      big += `chunk-${i}-${(i * 2654435761 >>> 0).toString(36)}-${String.fromCharCode(33 + (i % 90))} `;
+      i++;
+    }
+    expect(big.length).toBeGreaterThan(1_500_000);
+    expect(encodeCappedWith(big, enc)).toBe(Buffer.byteLength(big, 'utf8')); // byte ceiling, no encode
+  });
+
   it('does NOT flag ordinary lowercase ASCII prose as repetitive (encodes exactly)', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
     // ~112K chars of plain lowercase prose: ~27 distinct chars — must still encode

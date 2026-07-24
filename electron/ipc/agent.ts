@@ -965,11 +965,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
 
       // A pre-send hook may have rewritten message content (even IN PLACE on the
-      // same array reference), leaving a now-stale cached tokenCount. Drop the
-      // count on any message whose content no longer matches its signature — a
-      // reference check would miss in-place edits. Untouched messages keep their
-      // count (accumulator fast path).
-      messages = invalidateStaleTokenCounts(stripDisplayOnlyParts(hookResult.messages));
+      // same array reference), leaving a now-stale cached tokenCount. Only when a
+      // pre-send hook actually EXISTS do we drop counts whose content-signature no
+      // longer matches — otherwise skip the O(total-history) scan entirely so a
+      // normal no-hook send keeps the integer-only fast path.
+      messages = stripDisplayOnlyParts(hookResult.messages);
+      if (pluginManager.hasPreSendHooks()) messages = invalidateStaleTokenCounts(messages);
       if (typeof hookResult.systemPrompt === 'string') {
         effectiveSystemPrompt = hookResult.systemPrompt;
         if (streamConfig) {
@@ -1029,9 +1030,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const beforeContent = jsonStableString(beforeMsg?.content);
         const beforeUsers = countUsers(messages);
         // A modify hook may have rewritten content (even in place); drop counts on
-        // any message whose content no longer matches its signature so the
-        // read-side sum recomputes. Untouched messages keep their count.
-        messages = invalidateStaleTokenCounts(stripDisplayOnlyParts(next.messages));
+        // any message whose content no longer matches its signature. Only scan when
+        // an enforcing UserPromptSubmit hook actually exists — otherwise skip the
+        // O(total-history) work so a normal send keeps the integer-only fast path.
+        messages = stripDisplayOnlyParts(next.messages);
+        if (hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+          messages = invalidateStaleTokenCounts(messages);
+        }
         const afterMsg = lastUserMessage(messages);
         const afterContent = jsonStableString(afterMsg?.content);
         const afterUsers = countUsers(messages);

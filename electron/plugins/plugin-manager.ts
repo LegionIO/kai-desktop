@@ -1485,6 +1485,16 @@ export class PluginManager {
     return result;
   }
 
+  /** True if any active plugin has registered a pre-send hook. Lets callers skip
+   *  per-message work (e.g. stale-token-count invalidation) when no hook can
+   *  possibly have modified the outgoing messages. */
+  hasPreSendHooks(): boolean {
+    for (const instance of this.plugins.values()) {
+      if (instance.state === 'active' && instance.preSendHooks.length > 0) return true;
+    }
+    return false;
+  }
+
   async runPreSendHooks(args: Omit<PreSendHookArgs, 'config'> & { config: AppConfig }): Promise<PreSendHookResult> {
     let result: PreSendHookResult = {
       messages: args.messages,

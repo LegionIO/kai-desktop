@@ -606,6 +606,39 @@ describe('appendConversationMessages', () => {
     expect(branchSum).toBeGreaterThanOrEqual(appendedSum);
   });
 
+  it('appending a LARGE diverse message byte-ceilings its count (no multi-MB sync encode / freeze)', () => {
+    writeConversationStore(appHome, {
+      conversations: {
+        c1: makeConversation('c1', {
+          messageTree: [{ id: 'u1', parentId: null, role: 'user', content: 'hi', createdAt: '2026-01-01T00:00:00Z' }],
+          headId: 'u1',
+          messageCount: 1,
+          userMessageCount: 1,
+        }) as never,
+      },
+      activeConversationId: null,
+      settings: {},
+    });
+    // ~2MB diverse payload (like a base64 image / huge tool result). appendConversation
+    // Messages counts on the main thread — must not run a full tiktoken encode.
+    let big = '';
+    let i = 0;
+    while (big.length < 2_000_000) {
+      big += `seg-${i}-${(i * 2654435761 >>> 0).toString(36)} `;
+      i++;
+    }
+    const start = Date.now();
+    appendConversationMessages(appHome, 'c1', [{ role: 'user', content: big }]);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(1500); // bounded — byte ceiling, not a multi-MB encode
+    const stored = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; tokenCount?: number }>;
+    };
+    const appendedNode = stored.messageTree[stored.messageTree.length - 1];
+    expect(typeof appendedNode.tokenCount).toBe('number');
+    expect(appendedNode.tokenCount).toBeGreaterThan(0);
+  });
+
   it('converts a legacy flat-messages conversation to a tree before appending', () => {
     writeConversationStore(appHome, {
       conversations: {
