@@ -331,29 +331,19 @@ export async function compactConversationPrefix(
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
-  // Fit prefix to the input budget by dropping oldest messages until it fits.
-  // If we would have to DROP any prefix message to fit, fail safe: a dropped
-  // message is neither summarized nor kept, so it would be silently lost from
-  // the conversation. Returning a null result leaves the history uncompacted
-  // (the turn proceeds on the full context) rather than losing content.
-  const fittedPrefix = [...prefix];
-  let droppedForBudget = false;
-  while (fittedPrefix.length > 0) {
-    const candidatePromptText = serializeForTokenCounting(fittedPrefix);
-    const candidateTokens = await encodeCappedWithAsync(candidatePromptText, tokenization, signal);
-    // If the turn was cancelled during the (off-thread) encode, bail immediately.
-    // Otherwise a byte-ceiling fallback that exceeds budget would keep the loop
-    // shifting + re-serializing the large prefix (O(n²) main-thread work) and
-    // queuing stale worker encodes before the later signal check is reached.
-    if (signal?.aborted) {
-      return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
-    }
-    if (candidateTokens <= promptInputBudget) break;
-    fittedPrefix.shift();
-    droppedForBudget = true;
-  }
-
-  if (fittedPrefix.length === 0 || droppedForBudget) {
+  // Fit prefix to the input budget. Fail safe: dropping any prefix message would
+  // silently lose it (it's neither summarized nor kept), so we NEVER drop — a
+  // prefix that doesn't fit whole yields the null no-op (history stays
+  // uncompacted, the turn proceeds on full context). Because dropping is never
+  // acceptable, there's no fitting LOOP: encode the whole prefix ONCE and bail if
+  // it's over budget. (Looping-then-shifting would be pure wasted O(n²)
+  // serialization + repeated worker encodes, since the shifted result is rejected
+  // anyway.)
+  const fittedPrefix = prefix;
+  const candidateTokens = await encodeCappedWithAsync(serializeForTokenCounting(fittedPrefix), tokenization, signal);
+  // Cancelled during the (off-thread) encode, or the whole prefix doesn't fit the
+  // budget → null no-op (no message loss, no wasted retries).
+  if (signal?.aborted || candidateTokens > promptInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
