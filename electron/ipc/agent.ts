@@ -188,8 +188,8 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
     // Recompute the flat `messages` mirror of the active branch so exports/list
     // reflect the redaction immediately.
     conv.messages = getConversationBranch(tree, headId) as never;
-    writeConversation(appHome, conv);
-    broadcastUpsert(appHome, conv);
+    const writtenConv = writeConversation(appHome, conv);
+    broadcastUpsert(appHome, writtenConv);
     // The renderer ignores conversations:changed while a stream accumulator is
     // active (and then renders/persists its raw in-memory copy), so also emit a
     // stream event carrying the sanitized content + target node id so the live
@@ -524,8 +524,8 @@ async function maybeAutoTitle(appHome: string, conversationId: string): Promise<
     latest.title = title;
     latest.titleStatus = 'ready';
     latest.titleUpdatedAt = new Date().toISOString();
-    writeConversation(appHome, latest);
-    broadcastUpsert(appHome, latest);
+    const writtenLatest = writeConversation(appHome, latest);
+    broadcastUpsert(appHome, writtenLatest);
   } catch {
     // Best-effort — never let titling break the turn.
   }
@@ -3115,8 +3115,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const conv = readConversation(appHome, conversationId);
         if (conv && conv.runStatus === 'running') {
           conv.runStatus = 'idle';
-          writeConversation(appHome, conv);
-          broadcastUpsert(appHome, conv);
+          const writtenIdle = writeConversation(appHome, conv);
+          broadcastUpsert(appHome, writtenIdle);
         }
       } catch {
         // best-effort

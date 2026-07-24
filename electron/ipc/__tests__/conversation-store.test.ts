@@ -276,6 +276,21 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect((a1.content as unknown[]).length).toBe(2); // both tool-calls preserved
   });
 
+  it('clears a stale tokenCount on the merged node so it gets recomputed (content changed)', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: [{ type: 'text', text: 'hi' }], tokenCount: 5 },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'x' }], tokenCount: 3 },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'yyyy' }], tokenCount: 9 },
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'a1');
+    const a1 = out.find((n) => n.id === 'a1') as { tokenCount?: unknown };
+    // Merged content ⇒ the pre-merge count is invalid and must be dropped (a later
+    // backfill recomputes it); leaving 3 or 9 could under-count and miss the gate.
+    expect(a1.tokenCount).toBeUndefined();
+    // Untouched node keeps its count.
+    expect((out.find((n) => n.id === 'u1') as { tokenCount?: number }).tokenCount).toBe(5);
+  });
+
   it('breaks a 2-node parent cycle and keeps the branch reachable (the inject-corruption shape)', () => {
     // assistant.parentId = inject AND inject.parentId = assistant → cycle that
     // truncated the active branch and orphaned earlier history.
@@ -321,6 +336,19 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     const { headId, report } = sanitizeMessageTree(tree, 'gone');
     expect(report.headRepointed).toBe(true);
     expect(headId).toBe('u2'); // deepest leaf
+  });
+
+  it('preserves a DELIBERATELY null head (rewind through the first user turn)', () => {
+    // conversations:rewind writes headId:null to mean "empty active branch, tree
+    // kept as shelved history". This is valid, NOT corruption — the sanitizer must
+    // not repoint it to the old branch.
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'a' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: 'b' },
+    ];
+    const { headId, report } = sanitizeMessageTree(tree, null);
+    expect(report.headRepointed).toBe(false);
+    expect(headId).toBeNull();
   });
 
   it('sanitizeConversationTree rebuilds messages + counts from the repaired tree', () => {

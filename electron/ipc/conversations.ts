@@ -555,7 +555,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       if (redacted.size > 0 && Array.isArray(nextConversation.messageTree)) {
         const nextTree = (nextConversation.messageTree as StoredTreeMessage[]).map((m) => {
           const r = redacted.get(m.id);
-          return r ? { ...m, content: r.content, redactedByHook: true } : m;
+          // Replacing content invalidates any cached tokenCount — drop it so the
+          // write chokepoint's backfill recomputes it for the redacted content.
+          return r ? { ...m, content: r.content, redactedByHook: true, tokenCount: undefined } : m;
         });
         const nextBranch = getConversationBranch(nextTree, nextConversation.headId ?? null);
         nextConversation = { ...nextConversation, messageTree: nextTree, messages: nextBranch };

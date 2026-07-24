@@ -336,6 +336,10 @@ export function sanitizeMessageTree(
       /* keep a */
     } else if (Array.isArray(b)) existing.content = b;
     else if (typeof b === 'string' && typeof a === 'string' && b.length > a.length) existing.content = b;
+    // Content changed → any cached tokenCount is now stale. Clear it so the
+    // backfill pass in sanitizeConversationTree recomputes it (a stale low count
+    // could keep shouldCompact under its cheap gate and skip the exact check).
+    delete (existing as { tokenCount?: unknown }).tokenCount;
   }
 
   const ids = new Set(order);
@@ -386,7 +390,12 @@ export function sanitizeMessageTree(
 
   const tree = order.map((id) => byId.get(id)!);
 
-  // ── Pass 4: ensure headId is reachable; else repoint to the deepest chain ──
+  // ── Pass 4: repoint headId ONLY when it is a non-null id that's unreachable ──
+  // A DELIBERATELY null head is valid state (conversations:rewind rewinds through
+  // the first user turn → null head = empty active branch, tree kept as shelved
+  // history). We must NOT treat that as corruption and restore the old branch.
+  // Only a non-null head whose id is absent from the tree is genuinely lost.
+  const headWasNull = headId === null || headId === undefined;
   let head = typeof headId === 'string' && ids.has(headId) ? headId : null;
   const depthReachable = (leaf: string): number => {
     let d = 0;
@@ -400,7 +409,7 @@ export function sanitizeMessageTree(
     }
     return d;
   };
-  if (head === null && order.length > 0) {
+  if (head === null && !headWasNull && order.length > 0) {
     const parentSet = new Set<string>();
     for (const id of order) {
       const p = byId.get(id)!.parentId;

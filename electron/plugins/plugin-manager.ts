@@ -2207,8 +2207,8 @@ export class PluginManager {
     if (!conversationId) {
       throw new Error('Conversation id is required');
     }
-    writeConversation(this.appHome, conversation as unknown as ConversationRecord);
-    broadcastUpsert(this.appHome, conversation as unknown as ConversationRecord);
+    const written = writeConversation(this.appHome, conversation as unknown as ConversationRecord);
+    broadcastUpsert(this.appHome, written);
   }
 
   setActiveConversation(conversationId: string): void {
@@ -2271,9 +2271,9 @@ export class PluginManager {
       hasUnread: normalizedRole === 'assistant' ? true : conversation.hasUnread,
     };
 
-    writeConversation(this.appHome, nextConversation as unknown as ConversationRecord);
-    broadcastUpsert(this.appHome, nextConversation as unknown as ConversationRecord);
-    return nextConversation;
+    const written = writeConversation(this.appHome, nextConversation as unknown as ConversationRecord);
+    broadcastUpsert(this.appHome, written);
+    return written as unknown as Record<string, unknown>;
   }
 
   markConversationUnread(conversationId: string, unread: boolean): void {
@@ -2284,7 +2284,7 @@ export class PluginManager {
       hasUnread: unread,
       updatedAt: new Date().toISOString(),
     };
-    writeConversation(this.appHome, next);
-    broadcastUpsert(this.appHome, next);
+    const written = writeConversation(this.appHome, next);
+    broadcastUpsert(this.appHome, written);
   }
 }

@@ -228,8 +228,8 @@ function createAutomationConversation(
     selectedProfileKey: action.profileKey ?? null,
     metadata: { automationRuleId: rule.id, automationSingleton: singleton },
   };
-  writeConversation(appHome, conv);
-  broadcastUpsert(appHome, conv);
+  const written = writeConversation(appHome, conv);
+  broadcastUpsert(appHome, written);
   return id;
 }
 

@@ -366,8 +366,8 @@ function persistAccumulatedReturningHead(
       const conv = readConversation(appHome, conversationId);
       if (conv && conv.runStatus === 'running') {
         conv.runStatus = 'idle';
-        writeConversation(appHome, conv);
-        broadcastUpsert(appHome, conv);
+        const written = writeConversation(appHome, conv);
+        broadcastUpsert(appHome, written);
       }
     } catch {
       // best-effort

@@ -1663,8 +1663,8 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
   api.conversations.upsert = (conversation: PluginConversationRecord) => {
     requirePermission('conversations:write');
     const normalizedConversation = normalizeConversationRecord(conversation);
-    writeConversation(callbacks.appHome, normalizedConversation as never);
-    broadcastUpsert(callbacks.appHome, normalizedConversation as never);
+    const written = writeConversation(callbacks.appHome, normalizedConversation as never);
+    broadcastUpsert(callbacks.appHome, written);
   };
 
   api.conversations.getActiveId = () => {

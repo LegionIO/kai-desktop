@@ -734,6 +734,41 @@ describe('conversations IPC: rewind', () => {
     expect(res.error).toBe('compacted');
   });
 
+  it('rewinding through the first user turn yields an empty active branch (null head), not the old branch', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('rwall', {
+        messages: twoExchangeTree,
+        messageTree: twoExchangeTree,
+        headId: 'a2',
+        messageCount: 4,
+        userMessageCount: 2,
+      }),
+    );
+
+    // Rewind past BOTH user turns → head becomes null (empty active branch, tree
+    // shelved). The write-path sanitizer must NOT treat null head as corruption and
+    // restore the old branch.
+    const res = await harness.invoke<{ ok: boolean }>('conversations:rewind', FAKE_EVENT, 'rwall', 5);
+    expect(res.ok).toBe(true);
+    const after = await harness.invoke<{ messages: unknown[]; headId: string | null }>(
+      'conversations:get',
+      FAKE_EVENT,
+      'rwall',
+    );
+    expect(after.messages).toHaveLength(0);
+    expect(after.headId).toBeNull();
+    // The tree is retained as shelved history.
+    const stored = readConversationStore(appHome).conversations.rwall as { messageTree: unknown[] };
+    expect(stored.messageTree.length).toBe(4);
+  });
+
   it('normalizes a NaN steps value to 1 instead of nulling the head', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
