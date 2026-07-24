@@ -371,6 +371,30 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(out.messageCount).toBeGreaterThan(0);
     expect((out.messages as Array<{ id: string }>).length).toBe(out.messageCount);
   });
+
+  it('does NOT hide history when a legacy OMITTED head coincides with a structural repair', () => {
+    // headId omitted (undefined) = legacy "final node is the active head". If the
+    // same write also repairs a dup/cycle, the structural path must NOT rebuild
+    // messages from a null head (which would hide the whole active branch). The
+    // omitted head resolves to the last node instead of null.
+    const conv = {
+      id: 'legacy',
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'first' },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'x' }] },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'text', text: 'y' }] }, // dup ⇒ structural repair
+      ],
+      // headId intentionally omitted (undefined)
+      messages: [],
+      messageCount: 0,
+      userMessageCount: 0,
+    } as unknown as ConversationRecord;
+    const out = sanitizeConversationTree(conv);
+    // History is preserved (not hidden): the active branch reaches the last node.
+    expect(out.messageCount).toBeGreaterThan(0);
+    expect(out.headId).toBe('a1');
+    expect((out.messages as Array<{ id: string }>).map((m) => m.id)).toContain('u1');
+  });
 });
 
 describe('writeConversation repairs a corrupt tree at the write chokepoint', () => {

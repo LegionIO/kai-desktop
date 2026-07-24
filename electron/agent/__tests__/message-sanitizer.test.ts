@@ -6,7 +6,12 @@
  * array (and same message objects) when nothing changed.
  */
 import { describe, it, expect } from 'vitest';
-import { sanitizeMessagesForModel, stripDisplayOnlyParts, deepSanitizeMessages } from '../message-sanitizer.js';
+import {
+  sanitizeMessagesForModel,
+  stripDisplayOnlyParts,
+  stripTokenCounts,
+  deepSanitizeMessages,
+} from '../message-sanitizer.js';
 
 describe('sanitizeMessagesForModel', () => {
   const target = 'model-B';
@@ -189,5 +194,24 @@ describe('stripDisplayOnlyParts empty-content guard', () => {
     expect(out).not.toBe(msgs);
     expect((out[0].content as unknown[]).length).toBe(1);
     expect((out[0].content as Array<Record<string, unknown>>)[0].type).toBe('text');
+  });
+});
+
+describe('stripTokenCounts', () => {
+  it('returns the same array when no message carries a tokenCount', () => {
+    const msgs = [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'yo' }];
+    expect(stripTokenCounts(msgs)).toBe(msgs);
+  });
+
+  it('removes a stale tokenCount so the compaction gate recomputes (post-hook rewrite)', () => {
+    const msgs = [
+      { role: 'user', content: 'expanded by a modify hook', tokenCount: 2 },
+      { role: 'assistant', content: 'reply' },
+    ];
+    const out = stripTokenCounts(msgs) as Array<Record<string, unknown>>;
+    expect(out).not.toBe(msgs);
+    expect('tokenCount' in out[0]).toBe(false);
+    expect(out[0].content).toBe('expanded by a modify hook'); // content preserved
+    expect(out[1]).toBe(msgs[1]); // untouched message kept by reference
   });
 });

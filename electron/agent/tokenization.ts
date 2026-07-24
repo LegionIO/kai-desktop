@@ -162,14 +162,17 @@ export const MAX_SYNC_ENCODE_CHARS = 1_500_000;
  * cheaper `length / 3` estimate used elsewhere assumes ~English density and is
  * NOT a ceiling — CJK / high-entropy text can approach one token per character,
  * so `length/3` could UNDER-count and let compaction's budget-fit accept an
- * over-window prefix. `length` can never under-count for these BPE encodings, so
- * it is safe for both the shouldCompact gate (over-estimate → maybe run the exact
- * check, never skip it) and the budget-fit loop (over-estimate → drop more/refuse,
- * never ship an over-limit request).
+ * over-window prefix. The UTF-8 BYTE length is the true ceiling: these encodings
+ * are byte-level BPE, so the token count can never exceed the number of UTF-8
+ * bytes (worst case one token per byte). JS string `.length` (UTF-16 code units)
+ * is NOT safe — a rare-Unicode code unit can be multiple UTF-8 bytes / tokens. So
+ * this is safe for both the shouldCompact gate (over-estimate → maybe run the
+ * exact check, never skip it) and budget-fit (over-estimate → drop more, never
+ * ship an over-limit request).
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
   if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
-    return serialized.length; // 1 token/char worst case — a true upper bound
+    return Buffer.byteLength(serialized, 'utf8'); // UTF-8 bytes — a true token ceiling
   }
   return encoding.encode(serialized).length;
 }

@@ -85,6 +85,34 @@ export function sanitizeMessagesForModel(messages: unknown[], targetModelId: str
 }
 
 /**
+ * Strip a cached per-message `tokenCount` from every message that carries one.
+ *
+ * Apply this right after a transform hook (plugin pre-send / UserPromptSubmit
+ * modify) rewrites message content via `{ ...message, content: ... }`: the spread
+ * preserves the OLD `tokenCount`, which is now stale. `sumBranchTokenCounts` (the
+ * cheap shouldCompact gate) trusts that number, so a hook that EXPANDS content
+ * could keep the sum under the trigger and skip the exact check — allowing an
+ * over-context request. Stripping the count forces the gate to fall back to the
+ * over-biased estimate for this (transient, per-turn) message array, which can
+ * never under-count. Only runs when an enforcing hook actually fired, so the
+ * common no-hook path keeps the accumulator's O(1) benefit. Returns the same
+ * array reference when nothing carried a count.
+ */
+export function stripTokenCounts(messages: unknown[]): unknown[] {
+  let changed = false;
+  const out = messages.map((m) => {
+    if (m && typeof m === 'object' && 'tokenCount' in (m as Record<string, unknown>)) {
+      changed = true;
+      const { tokenCount: _drop, ...rest } = m as Record<string, unknown>;
+      void _drop;
+      return rest;
+    }
+    return m;
+  });
+  return changed ? out : messages;
+}
+
+/**
  * Strip user-message `file` parts flagged `displayOnly` — the renderer keeps
  * these for the attachment chip but already inlines their content as a
  * sibling text part, so providers (which reject e.g. `application/json`)

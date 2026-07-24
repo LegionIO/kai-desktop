@@ -442,7 +442,18 @@ export function sanitizeMessageTree(
 export function sanitizeConversationTree(conv: ConversationRecord): ConversationRecord {
   const rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
   if (!rawTree || rawTree.length === 0) return conv;
-  const { tree, headId, report } = sanitizeMessageTree(rawTree, conv.headId ?? null);
+  // Distinguish an OMITTED head (undefined — legacy/plugin records where
+  // ensureConversationTree treats the final node as the active head) from a
+  // DELIBERATE null head (an intentional rewind → empty active branch). Passing
+  // `undefined ?? null` would collapse both to null; then a structural repair on
+  // the same write would rebuild `messages` from a null head and HIDE all history.
+  // So when the head is omitted, resolve it to the last-node fallback first; only
+  // an explicit null is treated as the intentional empty-branch state.
+  const headInput =
+    conv.headId === undefined
+      ? ((rawTree[rawTree.length - 1] as { id?: unknown })?.id as string | undefined) ?? null
+      : conv.headId;
+  const { tree, headId, report } = sanitizeMessageTree(rawTree, headInput);
 
   // Backfill per-message tokenCount for any node missing one. Interactive GUI
   // turns persist via conversations:put (bypassing appendConversationMessages, the
