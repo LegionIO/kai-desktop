@@ -420,11 +420,10 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(capped).toBe(enc.encode(diverse).length); // exact encode, not the ceiling
   });
 
-  it('byte-ceilings a LARGE DIVERSE payload (e.g. a multi-MB image) instead of encoding', () => {
-    const enc = resolveEncodingForModel('gpt-5')!;
+  it('PER-MESSAGE count byte-ceilings a LARGE DIVERSE payload (e.g. a multi-MB image)', () => {
     // Diverse content (no long run, many distinct chars) but >1.5M chars — like a
-    // ~2MB base64 image payload. Must NOT synchronously encode (main-thread stall);
-    // byte-ceiling by size regardless of diversity.
+    // ~2MB base64 image. The per-message path (computeMessageCount, used on append)
+    // must NOT synchronously encode; byte-ceiling by size regardless of diversity.
     let big = '';
     let i = 0;
     while (big.length < 2_000_000) {
@@ -432,7 +431,24 @@ describe('encode cap (main-thread freeze backstop)', () => {
       i++;
     }
     expect(big.length).toBeGreaterThan(1_500_000);
-    expect(encodeCappedWith(big, enc)).toBe(Buffer.byteLength(big, 'utf8')); // byte ceiling, no encode
+    const count = countMessageTokensCanonical({ role: 'user', content: big })!;
+    // Byte ceiling ≈ serialized byte length, far above a real token count for prose
+    // (~chars/4). If it had encoded, count would be roughly big.length/4.
+    expect(count).toBeGreaterThan(big.length / 2);
+  });
+
+  it('COMPACTION-path encodeCappedWith encodes a ~2M diverse string EXACTLY (large-window budget-fit)', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // GPT-4.1's ~1M-token window ≈ ~4M chars; the compaction budget-fit needs an
+    // exact count for such histories (byte-ceiling would inflate → never compact).
+    // A 2M diverse string is under the 8M compaction cap → exact encode.
+    let big = '';
+    let i = 0;
+    while (big.length < 2_000_000) {
+      big += `chunk-${i}-${(i * 2654435761 >>> 0).toString(36)}-${String.fromCharCode(33 + (i % 90))} `;
+      i++;
+    }
+    expect(encodeCappedWith(big, enc)).toBe(enc.encode(big).length); // exact, not byte ceiling
   });
 
   it('does NOT flag ordinary lowercase ASCII prose as repetitive (encodes exactly)', () => {

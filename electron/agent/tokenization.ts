@@ -269,11 +269,16 @@ function looksRepetitive(s: string): boolean {
  * payload or a huge tool result), a single synchronous tiktoken encode of a
  * multi-megabyte string blocks the main thread. `appendConversationMessages`
  * counts each message on the main thread as it persists CLI attachments /
- * server-persisted tool results (image payloads near 7 MiB), so we cap the EXACT
- * encode by size regardless of diversity: above this many chars, use the safe
- * UTF-8 byte ceiling instead. Set to match the store's per-write backfill budget
- * (1.5M chars ≈ 375k+ tokens) — far above any normal message, so precision is kept
- * for real content while a pathological/large single payload can't stall the UI.
+ * server-persisted tool results (image payloads near 7 MiB), so the PER-MESSAGE
+ * path caps the EXACT encode at this size regardless of diversity: above it, use
+ * the safe UTF-8 byte ceiling. Set to the store's per-write backfill budget (1.5M
+ * chars ≈ 375k+ tokens) — far above any normal single message.
+ *
+ * The COMPACTION budget-fit path passes a higher cap ({@link MAX_SYNC_ENCODE_CHARS})
+ * because it needs an EXACT whole-branch count for large-context models (GPT-4.1's
+ * ~1M-token window ≈ ~4M chars); byte-ceiling there would inflate the value and make
+ * budget-fit drop-and-null so compaction could never succeed. The run/repetition
+ * guards still apply to both, so a pathological 4M input is still byte-ceilinged.
  */
 const SAFE_EXACT_ENCODE_CHARS = 1_500_000;
 
@@ -281,18 +286,18 @@ const SAFE_EXACT_ENCODE_CHARS = 1_500_000;
  * Exact token count of a serialized string via tiktoken, UNLESS encoding it
  * synchronously would risk blocking the main thread, in which case fall back to
  * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
- * The encode is skipped when the string (a) exceeds the hard char cap, (b) is over
- * the safe per-encode size ({@link SAFE_EXACT_ENCODE_CHARS}) even if diverse,
- * (c) contains a long single-character RUN, or (d) is large with very few DISTINCT
- * code units (repetitive of any multi-char pattern / emoji). These are the input
- * shapes/sizes that make a synchronous encode slow. Cost- AND size-aware, so a
- * large or repetitive prompt/tool result can't stall the UI. The ceiling is a safe
- * over-estimate for both the gate and budget-fit.
+ * The encode is skipped when the string (a) exceeds `maxExactChars`, (b) contains a
+ * long single-character RUN, or (c) is large with very few DISTINCT code units
+ * (repetitive of any multi-char pattern / emoji). Cost- AND size-aware. The ceiling
+ * is a safe over-estimate for both the gate and budget-fit.
  */
-function encodeCapped(serialized: string, encoding: ModelEncoding): number {
-  if (serialized.length > SAFE_EXACT_ENCODE_CHARS) {
-    // Too large to encode synchronously without risking a main-thread stall
-    // (covers the >8M hard cap too). Byte ceiling is a safe over-estimate.
+function encodeCapped(
+  serialized: string,
+  encoding: ModelEncoding,
+  maxExactChars: number = SAFE_EXACT_ENCODE_CHARS,
+): number {
+  if (serialized.length > maxExactChars) {
+    // Too large to encode synchronously without risking a main-thread stall.
     return Buffer.byteLength(serialized, 'utf8');
   }
   if (longestCharRun(serialized) > MAX_ENCODE_RUN || looksRepetitive(serialized)) {
@@ -304,13 +309,14 @@ function encodeCapped(serialized: string, encoding: ModelEncoding): number {
 }
 
 /**
- * Public capped-encode for callers that hold an encoding directly (e.g. the
- * compaction budget-fit loop and final safety re-encode). Encodes `serialized`
- * unless it exceeds {@link MAX_SYNC_ENCODE_CHARS}, in which case it returns the
- * over-biased char estimate instead of blocking the main thread.
+ * Public capped-encode for the COMPACTION path (budget-fit loop + final safety
+ * re-encode). Uses the HIGHER {@link MAX_SYNC_ENCODE_CHARS} exact-encode cap so a
+ * legitimate large-context whole-branch prefix (up to ~4M chars for a 1M-token
+ * window) is counted exactly and budget-fit can succeed — while the run/repetition
+ * guards still byte-ceiling genuinely pathological content.
  */
 export function encodeCappedWith(serialized: string, encoding: ModelEncoding): number {
-  return encodeCapped(serialized, encoding);
+  return encodeCapped(serialized, encoding, MAX_SYNC_ENCODE_CHARS);
 }
 
 /**
