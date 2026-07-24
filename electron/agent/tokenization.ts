@@ -70,6 +70,10 @@ function defaultWindowForModel(rawLowerName: string): number {
   if (/gemini/.test(n)) return 128_000;
   // Anthropic Claude: 200K standard.
   if (/claude/.test(n)) return 200_000;
+  // Amazon Bedrock large families: Nova (~300K), Titan/other large → 128K floor.
+  // Official IDs look like `amazon.nova-pro-v1:0`.
+  if (/nova/.test(n)) return 300_000;
+  if (/amazon\.|bedrock|titan/.test(n)) return 128_000;
   // Llama-3.1+/Mistral/Qwen/Command-R/DeepSeek etc. commonly 32K-128K; 32K middle.
   if (/llama|mistral|mixtral|qwen|command-?r|deepseek/.test(n)) return 32_768;
   // Modern OpenAI GPT / o-series / ChatGPT that slipped the table → 128K floor.

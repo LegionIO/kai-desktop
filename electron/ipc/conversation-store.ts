@@ -611,9 +611,26 @@ export function sanitizeMessageTree(
  * `headId`, `messages` (active branch) and counts consistent. Returns the SAME
  * object when nothing changed (no allocation churn on the hot write path).
  */
-export function sanitizeConversationTree(conv: ConversationRecord): ConversationRecord {
+export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: unknown[] | null): ConversationRecord {
   const rawTree = Array.isArray(conv.messageTree) ? conv.messageTree : null;
   if (!rawTree || rawTree.length === 0) return conv;
+  // Cached counts from the PREVIOUSLY-persisted tree, keyed by id, each carrying the
+  // content signature the count was computed against. The backfill reuses one of
+  // these (instead of re-encoding) when the incoming node's current content matches
+  // the prior signature — so a renderer that keeps re-sending a count-less tree
+  // doesn't force a tiktoken sweep on every debounced put.
+  const priorCounts = new Map<string, { tokenCount: number; tokenCountSig: number }>();
+  if (Array.isArray(priorTree)) {
+    for (const pn of priorTree as Array<{ id?: unknown; tokenCount?: unknown; tokenCountSig?: unknown }>) {
+      if (
+        typeof pn?.id === 'string' &&
+        typeof pn.tokenCount === 'number' &&
+        typeof pn.tokenCountSig === 'number'
+      ) {
+        priorCounts.set(pn.id, { tokenCount: pn.tokenCount, tokenCountSig: pn.tokenCountSig });
+      }
+    }
+  }
   // Distinguish an OMITTED head (undefined — legacy/plugin records where
   // ensureConversationTree treats the final node as the active head) from a
   // DELIBERATE null head (an intentional rewind → empty active branch). Passing
@@ -667,6 +684,18 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
     const sig = messageContentSig(projection);
     const valid = typeof n.tokenCount === 'number' && typeof n.tokenCountSig === 'number' && n.tokenCountSig === sig;
     if (valid) continue;
+    // Reuse the PRIOR on-disk count when this node's content is unchanged (its
+    // signature matches what the prior count was computed against) — no re-encode.
+    // This is what makes repeated debounced puts of a count-less renderer tree cheap.
+    if (typeof n.id === 'string') {
+      const prior = priorCounts.get(n.id);
+      if (prior && prior.tokenCountSig === sig) {
+        n.tokenCount = prior.tokenCount;
+        n.tokenCountSig = sig;
+        backfilled++;
+        continue;
+      }
+    }
     const serializedLen = tokenProjectionSerializedLength(projection);
     if (exactCharsUsed + serializedLen <= BACKFILL_EXACT_CHAR_BUDGET) {
       // Within budget → exact count.
@@ -768,7 +797,18 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   // monolith is still un-migrated — a partial index would strand old chats.
   assertMigratedBeforeWrite(appHome);
   ensureDirs(appHome);
-  const sanitized = sanitizeConversationTree(conv);
+  // Read the prior on-disk record so the backfill can REUSE its cached token counts
+  // (by id + matching content signature) instead of re-encoding on every debounced
+  // put — the renderer keeps sending a count-less tree, so without this the write
+  // path would re-run tiktoken each time.
+  let priorTree: unknown[] | null = null;
+  try {
+    const prior = readConversation(appHome, conv.id);
+    priorTree = prior && Array.isArray(prior.messageTree) ? prior.messageTree : null;
+  } catch {
+    /* best-effort — fall back to fresh backfill */
+  }
+  const sanitized = sanitizeConversationTree(conv, priorTree);
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   const index = readIndex(appHome);
   index.conversations[sanitized.id] = toIndexEntry(sanitized);

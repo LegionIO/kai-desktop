@@ -713,6 +713,45 @@ describe('writeConversation repairs a corrupt tree at the write chokepoint', () 
     expect(second).toBe(first);
   });
 
+  it('reuses on-disk counts when the renderer re-sends a COUNT-LESS tree (no re-encode per put)', () => {
+    const makeCountless = () =>
+      ({
+        id: 'countless',
+        title: null,
+        fallbackTitle: null,
+        messages: [],
+        messageTree: [
+          { id: 'u1', role: 'user', parentId: null, content: 'a question the user asked' },
+          { id: 'a1', role: 'assistant', parentId: 'u1', content: 'a detailed answer to it' },
+        ],
+        headId: 'a1',
+        conversationCompaction: null,
+        lastContextUsage: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        lastMessageAt: null,
+        titleStatus: 'idle',
+        titleUpdatedAt: null,
+        messageCount: 2,
+        userMessageCount: 1,
+        runStatus: 'idle',
+        hasUnread: false,
+        lastAssistantUpdateAt: null,
+        selectedModelKey: null,
+      }) as unknown as ConversationRecord;
+
+    // First write: backfills + persists counts to disk.
+    const first = writeConversation(appHome, makeCountless());
+    const firstCounts = (first.messageTree as Array<{ id: string; tokenCount?: number }>).map((n) => n.tokenCount);
+    expect(firstCounts.every((c) => typeof c === 'number')).toBe(true);
+
+    // Second write of a fresh COUNT-LESS tree (as the renderer keeps sending): the
+    // backfill must REUSE the on-disk counts by id+signature, not re-encode.
+    const second = writeConversation(appHome, makeCountless());
+    const secondCounts = (second.messageTree as Array<{ id: string; tokenCount?: number }>).map((n) => n.tokenCount);
+    expect(secondCounts).toEqual(firstCounts); // reused from disk, identical
+  });
+
   it('backfill RECOMPUTES when content changed under the same id (signature mismatch)', () => {
     // A node whose stored count/sig describe OLD, shorter content; current content
     // is longer (a same-id plugin/hook rewrite). The sig no longer matches, so the

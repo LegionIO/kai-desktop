@@ -79,6 +79,8 @@ describe('resolveConversationTokenization', () => {
     expect(resolveConversationTokenization('llama-3.1-70b').contextWindowTokens!).toBeGreaterThanOrEqual(32768);
     // chatgpt-4o-latest embeds "gpt" without a word boundary — must still be 128K.
     expect(resolveConversationTokenization('chatgpt-4o-latest').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
+    // Bedrock Nova (~300K ctx) via its official id must not fall to the 8K floor.
+    expect(resolveConversationTokenization('amazon.nova-pro-v1:0').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
     // A genuinely unknown name still gets the small floor.
     expect(resolveConversationTokenization('mystery-model-42').contextWindowTokens!).toBeLessThanOrEqual(8192);
   });
