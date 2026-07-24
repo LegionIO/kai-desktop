@@ -494,10 +494,15 @@ export function sanitizeMessageTree(
     const node = byId.get(id);
     if (!node) continue;
     const cur = typeof node.parentId === 'string' ? node.parentId : null;
-    // Only intervene if the current parent forms a cycle back to this node.
-    if (cur === null || !leadsBackTo(cur, id)) continue;
+    // Intervene when the current parent is unusable — a cycle back to this node OR
+    // null because Pass 2 normalized away a dangling/self first parent — AND a
+    // recorded alternate is a valid, in-tree, acyclic ancestor. Without the null
+    // case, a node whose first snapshot had a bad parent (normalized to null) would
+    // stay detached even though a later snapshot named a valid ancestor.
+    const currentUnusable = cur === null || leadsBackTo(cur, id);
+    if (!currentUnusable) continue;
     for (const alt of alts) {
-      if (alt === id || !ids.has(alt)) continue;
+      if (alt === id || alt === cur || !ids.has(alt)) continue;
       if (!leadsBackTo(alt, id)) {
         node.parentId = alt; // an acyclic alternate keeps history connected
         report.changed = true;

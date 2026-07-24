@@ -372,6 +372,31 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(reach.has('u0')).toBe(true);
   });
 
+  it('recovers a valid parent when the first snapshots parent was dangling (normalized to null)', () => {
+    // Snapshot #1 of `asst` points to a DANGLING parent (Pass 2 normalizes it to
+    // null); snapshot #2 points to a valid ancestor. The node must adopt the valid
+    // ancestor rather than stay a detached root.
+    const tree = [
+      { id: 'u0', role: 'user', parentId: null, content: 'q' },
+      { id: 'a0', role: 'assistant', parentId: 'u0', content: 'a' },
+      { id: 'asst', role: 'assistant', parentId: 'ghost', content: 'partial' }, // dangling → null
+      { id: 'asst', role: 'assistant', parentId: 'a0', content: 'partial more' }, // valid ancestor
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'asst');
+    const asst = out.find((n) => n.id === 'asst')!;
+    expect(asst.parentId).toBe('a0'); // recovered the valid ancestor, not left null
+    const byId = new Map(out.map((n) => [n.id as string, n] as const));
+    const reach = new Set<string>();
+    let cur: string | null = 'asst';
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      reach.add(cur);
+      cur = (byId.get(cur)?.parentId as string | null) ?? null;
+    }
+    expect(reach.has('u0')).toBe(true); // earlier history reachable
+  });
+
   it('records an id-less node drop as a structural repair (report.changed)', () => {
     const tree = [
       { id: 'u1', role: 'user', parentId: null, content: 'q' },

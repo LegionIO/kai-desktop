@@ -3,7 +3,7 @@ import {
   countBranchTokensCached,
   resolveConversationTokenization,
   serializeForTokenCounting,
-  sumBranchTokenCounts,
+  sumBranchTokensForGate,
   encodeCappedWith,
 } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
@@ -154,15 +154,15 @@ export function shouldCompact(
   }
   const triggerTokens = Math.floor(tokenization.contextWindowTokens * triggerPercent);
 
-  // Cheap pre-check: sum the cached per-message token counts over the branch
-  // (integer add, no whole-history JSON.stringify + WASM encode). Missing counts
-  // fall back to an over-biased char estimate, so the sum is >= the true whole-
-  // array token count: if even the sum is below the trigger, the exact count must
-  // be too — skip tiktoken entirely. This is the common case every turn and keeps
-  // the expensive encode off the hot send path. Only when the sum reaches the
-  // trigger do we pay for the exact count (memoized per branch, and byte-capped
-  // so a pathological history can never freeze the main thread).
-  const summedTokens = sumBranchTokenCounts(messages);
+  // Cheap pre-check: a tokenizer-SAFE sum over the branch (integer add of cached
+  // counts when the target model shares the canonical o200k tokenizer; a
+  // model-independent UTF-8 byte ceiling otherwise, so an o200k-cached count can't
+  // under-count for a cl100k model and skip a needed compaction). Missing counts
+  // fall back to an over-biased estimate. If even this safe sum is below the
+  // trigger, the exact count must be too → skip tiktoken entirely (the common,
+  // hot-path case). Only when it reaches the trigger do we pay the exact count
+  // (memoized per branch, byte-capped so a pathological history can't freeze main).
+  const summedTokens = sumBranchTokensForGate(messages, tokenization);
   if (summedTokens < triggerTokens) {
     return {
       shouldCompact: false,

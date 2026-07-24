@@ -248,6 +248,43 @@ export function sumBranchTokenCounts(
   return sum;
 }
 
+/** The encoding-model name the storage-layer cached counts are computed with
+ *  (gpt-5 / o200k). Cached tokenCounts are only a SAFE gate floor for a target
+ *  model that resolves to this same encoding. */
+let canonicalEncodingModelNameCache: string | null | undefined;
+export function canonicalCountEncodingModelName(): string | null {
+  if (canonicalEncodingModelNameCache === undefined) {
+    canonicalEncodingModelNameCache = resolveConversationTokenization('gpt-5').encodingModelName;
+  }
+  return canonicalEncodingModelNameCache;
+}
+
+/**
+ * Tokenizer-SAFE branch token sum for the compaction gate. Cached per-message
+ * `tokenCount`s are computed with the canonical o200k encoding; they are only a
+ * safe gate FLOOR for a target model that resolves to that same encoding. For a
+ * model on a DIFFERENT tokenizer (e.g. a custom cl100k `gpt-4`), an o200k count
+ * can under-count relative to the target — so the branch could be over-window
+ * while the cached sum stays under the trigger, skipping compaction and failing
+ * the provider request. In that case fall back to a model-INDEPENDENT upper bound
+ * (UTF-8 byte length, ≤ 1 token/byte for any BPE) so the gate never under-counts.
+ * When the target IS canonical (the common gpt-5/o-family case), use the fast
+ * cached-count sum.
+ */
+export function sumBranchTokensForGate(
+  messages: Array<{ tokenCount?: number; role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown }>,
+  tokenization: ConversationTokenizationInfo,
+): number {
+  const canonical = canonicalCountEncodingModelName();
+  if (tokenization.encodingModelName !== null && tokenization.encodingModelName === canonical) {
+    return sumBranchTokenCounts(messages); // same tokenizer → cached counts are a safe floor
+  }
+  // Different tokenizer → model-independent true ceiling (never under-counts).
+  let sum = 0;
+  for (const msg of messages) sum += tokenProjectionByteCeiling(msg ?? {});
+  return sum;
+}
+
 /**
  * Exact token count for a SINGLE message, for populating a message's cached
  * `tokenCount` at creation time. Cheap (one small message, not the whole

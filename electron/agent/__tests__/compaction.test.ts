@@ -100,15 +100,26 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     expect(res.shouldCompact).toBe(false);
   });
 
-  it('does NOT compact when summed tokenCounts stay below the trigger', () => {
-    // Present numeric counts are trusted directly (integer-only read path).
+  it('trusts cached counts for a CANONICAL-tokenizer model (integer-only fast path)', () => {
+    // gpt-5 shares the o200k encoding the cached counts are computed with, so the
+    // gate trusts them directly and reports their sum.
     const msgs: ChatMessage[] = [
       { role: 'user', content: 'a', tokenCount: 10 },
       { role: 'assistant', content: 'b', tokenCount: 20 },
     ];
-    const res = shouldCompact(msgs, MODEL, 0.85);
+    const res = shouldCompact(msgs, 'gpt-5', 0.85);
     expect(res.shouldCompact).toBe(false);
-    expect(res.usedTokens).toBe(30); // reports the trusted sum
+    expect(res.usedTokens).toBe(30); // cached sum trusted
+  });
+
+  it('does NOT trust an o200k cached count for a NON-canonical tokenizer (uses a safe ceiling)', () => {
+    // For a cl100k-family model (gpt-4o), an o200k cached count is not a safe floor.
+    // A bogus tiny count on large content must NOT let the gate under-count: the
+    // model-independent byte ceiling is used, so usedTokens reflects real size.
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(50);
+    const msgs: ChatMessage[] = [{ role: 'user', content: big, tokenCount: 1 }];
+    const res = shouldCompact(msgs, 'gpt-4o', 0.85);
+    expect(res.usedTokens).toBeGreaterThan(1); // did not trust the bogus low count
   });
 });
 
