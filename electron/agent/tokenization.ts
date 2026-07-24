@@ -918,6 +918,10 @@ function encodeSerializedAsync(
   fallback: EncodeFallback,
   signal?: AbortSignal,
 ): Promise<EncodeOutcome> | null {
+  // Already cancelled before we even start → don't spawn/post anything (no
+  // watchdog is needed for a job that was never submitted, and posting would
+  // occupy the sole worker and delay the replacement run). Byte-ceiling now.
+  if (signal?.aborted) return Promise.resolve({ count: fallback.ceiling(), exact: false });
   const worker = ensureTokenizerWorker();
   if (!worker) return null;
   const id = nextEncodeId++;
@@ -939,7 +943,7 @@ function encodeSerializedAsync(
     }, WORKER_ENCODE_TIMEOUT_MS);
     pendingEncodes.set(id, { settle, fallback, timer });
 
-    // If the owning turn is cancelled/superseded during the encode, stop awaiting
+    // If the owning turn is cancelled/superseded AFTER submission, stop awaiting
     // and settle THIS caller with the byte ceiling. We do NOT terminate the
     // shared worker (it may be mid-encode for OTHER live conversations) and — key
     // for the watchdog — we DELIBERATELY leave the pending entry and its timeout
@@ -947,20 +951,11 @@ function encodeSerializedAsync(
     // armed: if the worker is genuinely stuck on this (possibly pathological)
     // encode, the timeout still fires terminateStuckWorker so it can't spin a CPU
     // core forever; if the job completes normally, its result clears the timer.
-    // The now-idempotent settle() means the later result/timeout won't re-resolve
-    // the caller.
+    // The idempotent settle() means the later result/timeout won't re-resolve the
+    // caller. (An already-aborted signal was handled before submission above.)
     if (signal) {
-      const abortSettle = (): void => {
-        settle({ count: fallback.ceiling(), exact: false });
-      };
-      if (signal.aborted) {
-        // Post the job first (below) so the watchdog has something to guard, then
-        // settle the caller. Fall through to postMessage; resolve after.
-        queueMicrotask(abortSettle);
-      } else {
-        onAbort = abortSettle;
-        signal.addEventListener('abort', onAbort, { once: true });
-      }
+      onAbort = () => settle({ count: fallback.ceiling(), exact: false });
+      signal.addEventListener('abort', onAbort, { once: true });
     }
 
     try {

@@ -341,6 +341,13 @@ export async function compactConversationPrefix(
   while (fittedPrefix.length > 0) {
     const candidatePromptText = serializeForTokenCounting(fittedPrefix);
     const candidateTokens = await encodeCappedWithAsync(candidatePromptText, tokenization, signal);
+    // If the turn was cancelled during the (off-thread) encode, bail immediately.
+    // Otherwise a byte-ceiling fallback that exceeds budget would keep the loop
+    // shifting + re-serializing the large prefix (O(n²) main-thread work) and
+    // queuing stale worker encodes before the later signal check is reached.
+    if (signal?.aborted) {
+      return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+    }
     if (candidateTokens <= promptInputBudget) break;
     fittedPrefix.shift();
     droppedForBudget = true;

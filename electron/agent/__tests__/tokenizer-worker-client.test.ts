@@ -322,13 +322,15 @@ describe('tokenizer worker client', () => {
     expect(await p2).toBe(88);
   });
 
-  it('byte-ceilings immediately when the signal is already aborted', async () => {
+  it('byte-ceilings immediately (no worker spawned/posted) when already aborted', async () => {
     const messages = [{ role: 'user', content: 'already gone' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const controller = new AbortController();
     controller.abort();
     const count = await tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', controller.signal);
     expect(count).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
+    // Nothing was submitted to the sole worker (no wasted spawn / 15s timer).
+    expect(FakeWorker.instances).toHaveLength(0);
   });
 
   it('does NOT cache a byte-ceiling fallback (unchanged branch re-reaches the worker)', async () => {
