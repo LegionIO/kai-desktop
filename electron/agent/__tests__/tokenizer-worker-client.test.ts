@@ -296,6 +296,32 @@ describe('tokenizer worker client', () => {
     expect(w.terminated).toBe(false);
   });
 
+  it('keeps the watchdog armed after abort so a stuck worker is still terminated', async () => {
+    const messages = [{ role: 'user', content: 'aborted but worker wedged' }];
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const controller = new AbortController();
+    const promise = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', controller.signal);
+    const w = FakeWorker.instances[0];
+    await flush();
+    w.ready();
+    controller.abort(); // caller bails, but the worker never answers (stuck)
+    expect(await promise).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
+    expect(w.terminated).toBe(false); // not killed on abort
+
+    // The orphan job's watchdog is still armed: a genuinely stuck worker gets
+    // force-terminated when the timeout elapses (can't spin a core forever).
+    vi.advanceTimersByTime(20_000);
+    expect(w.terminated).toBe(true);
+    // Next encode respawns a fresh worker.
+    const p2 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'after' }], tokenization, 'm2');
+    expect(FakeWorker.instances.length).toBe(2);
+    const w2 = FakeWorker.instances[1];
+    await flush();
+    w2.ready();
+    w2.result(w2.posted[0].id, 88);
+    expect(await p2).toBe(88);
+  });
+
   it('byte-ceilings immediately when the signal is already aborted', async () => {
     const messages = [{ role: 'user', content: 'already gone' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');

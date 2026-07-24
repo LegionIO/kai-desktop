@@ -940,24 +940,27 @@ function encodeSerializedAsync(
     pendingEncodes.set(id, { settle, fallback, timer });
 
     // If the owning turn is cancelled/superseded during the encode, stop awaiting
-    // and settle THIS request with the byte ceiling. We do NOT terminate the
-    // shared worker: it may be mid-encode for OTHER live conversations, and
-    // killing it would byte-ceiling their healthy encodes. The orphaned job
-    // finishes on its own; its result arrives with an id no longer in the map and
-    // is dropped. A genuinely stuck job is still caught by the timeout above.
+    // and settle THIS caller with the byte ceiling. We do NOT terminate the
+    // shared worker (it may be mid-encode for OTHER live conversations) and — key
+    // for the watchdog — we DELIBERATELY leave the pending entry and its timeout
+    // in place. The caller has its answer, but the orphan job's watchdog stays
+    // armed: if the worker is genuinely stuck on this (possibly pathological)
+    // encode, the timeout still fires terminateStuckWorker so it can't spin a CPU
+    // core forever; if the job completes normally, its result clears the timer.
+    // The now-idempotent settle() means the later result/timeout won't re-resolve
+    // the caller.
     if (signal) {
       const abortSettle = (): void => {
-        if (settled) return;
-        pendingEncodes.delete(id);
-        clearTimeout(timer);
         settle({ count: fallback.ceiling(), exact: false });
       };
       if (signal.aborted) {
-        abortSettle();
-        return;
+        // Post the job first (below) so the watchdog has something to guard, then
+        // settle the caller. Fall through to postMessage; resolve after.
+        queueMicrotask(abortSettle);
+      } else {
+        onAbort = abortSettle;
+        signal.addEventListener('abort', onAbort, { once: true });
       }
-      onAbort = abortSettle;
-      signal.addEventListener('abort', onAbort, { once: true });
     }
 
     try {
