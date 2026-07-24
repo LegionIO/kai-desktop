@@ -6,7 +6,8 @@
  * array (and same message objects) when nothing changed.
  */
 import { describe, it, expect } from 'vitest';
-import { sanitizeMessagesForModel, stripDisplayOnlyParts, deepSanitizeMessages } from '../message-sanitizer.js';
+import { sanitizeMessagesForModel, stripDisplayOnlyParts, invalidateStaleTokenCounts, deepSanitizeMessages } from '../message-sanitizer.js';
+import { messageContentSig } from '../tokenization.js';
 
 describe('sanitizeMessagesForModel', () => {
   const target = 'model-B';
@@ -189,5 +190,38 @@ describe('stripDisplayOnlyParts empty-content guard', () => {
     expect(out).not.toBe(msgs);
     expect((out[0].content as unknown[]).length).toBe(1);
     expect((out[0].content as Array<Record<string, unknown>>)[0].type).toBe('text');
+  });
+});
+
+describe('invalidateStaleTokenCounts', () => {
+  it('keeps a count whose signature still matches the content (untouched message)', () => {
+    const m = { role: 'user', content: 'hello world' };
+    const withCount = { ...m, tokenCount: 3, tokenCountSig: messageContentSig(m) };
+    const out = invalidateStaleTokenCounts([withCount]) as Array<Record<string, unknown>>;
+    expect(out[0]).toBe(withCount); // untouched → same object reference
+    expect(out[0].tokenCount).toBe(3); // preserved — no hook change
+  });
+
+  it('drops a count when content was rewritten IN PLACE (signature no longer matches)', () => {
+    const m: Record<string, unknown> = { role: 'user', content: 'short' };
+    m.tokenCount = 2;
+    m.tokenCountSig = messageContentSig({ role: 'user', content: 'short' });
+    // Simulate an in-place hook rewrite: content grew, but the SAME object/array ref.
+    m.content = 'a much longer expanded prompt injected by a hook in place';
+    const out = invalidateStaleTokenCounts([m]) as Array<Record<string, unknown>>;
+    expect('tokenCount' in out[0]).toBe(false); // stale count dropped → sum will estimate
+    expect(out[0].content).toBe('a much longer expanded prompt injected by a hook in place');
+  });
+
+  it('drops a count that has no signature (unverifiable)', () => {
+    const out = invalidateStaleTokenCounts([{ role: 'user', content: 'x', tokenCount: 5 }]) as Array<
+      Record<string, unknown>
+    >;
+    expect('tokenCount' in out[0]).toBe(false);
+  });
+
+  it('returns the same array reference when nothing was stale', () => {
+    const msgs = [{ role: 'user', content: 'no count here' }];
+    expect(invalidateStaleTokenCounts(msgs)).toBe(msgs);
   });
 });

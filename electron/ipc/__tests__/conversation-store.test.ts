@@ -19,6 +19,7 @@ import {
   __resetMigrationGuardForTests,
   sanitizeMessageTree,
   sanitizeConversationTree,
+  mergeSnapshotContent,
   type ConversationRecord,
 } from '../conversation-store.js';
 
@@ -293,6 +294,24 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     const toolIds = parts.filter((p) => p.type === 'tool-call').map((p) => p.toolCallId);
     expect(toolIds).toEqual(['t1', 't2']); // no repeated toolCallId
     expect(parts.filter((p) => p.type === 'text')).toHaveLength(1); // text not doubled
+  });
+
+  it('mergeSnapshotContent keeps the FULLER same-toolCallId part (final result, not partial)', () => {
+    const partial = [{ type: 'tool-call', toolCallId: 't1', args: { q: 'x' } }];
+    const final = [{ type: 'tool-call', toolCallId: 't1', args: { q: 'x' }, result: 'DONE' }];
+    const merged = mergeSnapshotContent(partial, final) as Array<{ toolCallId?: string; result?: unknown }>;
+    expect(merged).toHaveLength(1); // one tool part, not two
+    expect(merged[0].toolCallId).toBe('t1');
+    expect(merged[0].result).toBe('DONE'); // the completed snapshot won, not the partial
+  });
+
+  it('mergeSnapshotContent does not duplicate streamed text that grew partial→final', () => {
+    const partial = [{ type: 'text', text: 'The answer is' }];
+    const final = [{ type: 'text', text: 'The answer is 42.' }];
+    const merged = mergeSnapshotContent(partial, final) as Array<{ text?: string }>;
+    // The partial text is a strict prefix of the final → dropped; only the full text remains.
+    expect(merged).toHaveLength(1);
+    expect(merged[0].text).toBe('The answer is 42.');
   });
 
   it('records an id-less node drop as a structural repair (report.changed)', () => {

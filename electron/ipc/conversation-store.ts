@@ -305,38 +305,70 @@ export type TreeSanitizeReport = {
  * report. Exported for unit tests and reuse by a recovery pass.
  */
 /**
- * Merge the content of two duplicate-id message snapshots without duplicating
- * parts. The finalizer/renderer race produces two OVERLAPPING snapshots of one
- * message; a blind concat would double text and repeat toolCallIds in the
- * model-facing content. Strategy:
- *  - Both arrays: union, keyed by a part identity (toolCallId when present, else a
- *    JSON of the part), preserving first-seen order — so a part appearing in both
- *    snapshots is kept once, and a part only in the second is appended.
- *  - One array, one scalar: keep the array (the richer snapshot).
- *  - Both scalar strings: keep the longer (the more complete snapshot); identical
- *    strings collapse to one.
+ * Merge the content of two duplicate-id message snapshots without losing updates
+ * or duplicating parts. The finalizer/renderer race yields two OVERLAPPING
+ * snapshots of ONE reply (typically final ⊇ partial). Naive union by first-seen
+ * toolCallId would DROP the later, fuller tool part (same toolCallId but now with
+ * a `result`/updated args), and appending partial+final text parts (different
+ * JSON) would DUPLICATE the assistant text. Strategy:
+ *  - Both arrays: index by identity — `tc:<toolCallId>` for tool parts, else exact
+ *    JSON. For a repeated tool identity keep the MORE COMPLETE part (one that has a
+ *    `result`, else the longer serialization). Distinct parts are unioned in
+ *    first-seen order. A text part that is a strict prefix of another kept text is
+ *    dropped (partial → final growth), so text isn't duplicated.
+ *  - One array, one scalar: keep the array (richer snapshot).
+ *  - Both scalar strings: keep the longer; identical collapse to one.
  * Pure; exported for unit tests.
  */
 export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
   if (Array.isArray(a) && Array.isArray(b)) {
-    const seen = new Set<string>();
-    const out: unknown[] = [];
+    const partText = (p: unknown): string | null =>
+      p && typeof p === 'object' && (p as { type?: unknown }).type === 'text' && typeof (p as { text?: unknown }).text === 'string'
+        ? ((p as { text: string }).text)
+        : null;
+    const toolId = (p: unknown): string | null =>
+      p && typeof p === 'object' && typeof (p as { toolCallId?: unknown }).toolCallId === 'string'
+        ? ((p as { toolCallId: string }).toolCallId)
+        : null;
+    const hasResult = (p: unknown): boolean =>
+      !!(p && typeof p === 'object' && (p as { result?: unknown }).result !== undefined);
+    const jlen = (p: unknown): number => {
+      try {
+        return JSON.stringify(p).length;
+      } catch {
+        return 0;
+      }
+    };
+    // More-complete of two same-toolCallId parts: prefer one with a result, else longer.
+    const fuller = (x: unknown, y: unknown): unknown => {
+      if (hasResult(x) !== hasResult(y)) return hasResult(x) ? x : y;
+      return jlen(y) > jlen(x) ? y : x;
+    };
+
+    const order: string[] = [];
+    const byKey = new Map<string, unknown>();
     for (const part of [...a, ...b]) {
-      const key =
-        part && typeof part === 'object' && typeof (part as { toolCallId?: unknown }).toolCallId === 'string'
-          ? `tc:${(part as { toolCallId: string }).toolCallId}`
-          : `j:${(() => {
-              try {
-                return JSON.stringify(part);
-              } catch {
-                return String(part);
-              }
-            })()}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(part);
+      const tc = toolId(part);
+      const key = tc !== null ? `tc:${tc}` : `j:${jlen(part)}:${(() => { try { return JSON.stringify(part); } catch { return String(part); } })()}`;
+      const existing = byKey.get(key);
+      if (existing === undefined) {
+        byKey.set(key, part);
+        order.push(key);
+      } else if (tc !== null) {
+        byKey.set(key, fuller(existing, part)); // keep the completer tool snapshot
+      }
+      // non-tool exact-JSON duplicate → already present, skip.
     }
-    return out;
+    let parts = order.map((k) => byKey.get(k));
+    // Drop any text part that is a strict prefix of another kept text (partial→final
+    // growth of the same run), so streamed text isn't duplicated.
+    const texts = parts.map(partText);
+    parts = parts.filter((p, i) => {
+      const t = texts[i];
+      if (t === null) return true;
+      return !texts.some((other, j) => j !== i && other !== null && other !== t && other.startsWith(t));
+    });
+    return parts;
   }
   if (Array.isArray(a)) return a;
   if (Array.isArray(b)) return b;

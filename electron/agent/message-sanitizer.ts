@@ -1,3 +1,5 @@
+import { messageContentSig } from './tokenization.js';
+
 type MessageLike = {
   role?: string;
   content?: unknown;
@@ -85,30 +87,31 @@ export function sanitizeMessagesForModel(messages: unknown[], targetModelId: str
 }
 
 /**
- * Strip a cached per-message `tokenCount` (and its signature) from messages that
- * carry one. Applied on the send path ONLY when a transform hook (plugin pre-send
- * / UserPromptSubmit modify) actually REPLACED the messages array — a rewritten
- * node keeps the OLD count via `{ ...message, content }`, and the compaction gate
- * (`sumBranchTokenCounts`) trusts a present count directly, so a stale one would
- * under-count. Callers gate this on a real modification (array reference change),
- * so a normal no-hook turn keeps its counts and the accumulator fast path. Returns
- * the same array reference when nothing carried a count.
+ * Drop a cached `tokenCount` from any message whose CURRENT content no longer
+ * matches its stored `tokenCountSig`. Applied on the send path after a transform
+ * hook (plugin pre-send / UserPromptSubmit modify) MAY have rewritten messages —
+ * including IN PLACE on the same array reference (so an array-identity check would
+ * miss it). Recomputing the signature and comparing catches both in-place and
+ * replacement rewrites; a message the hook left untouched keeps its count (and the
+ * accumulator fast path). A message with a count but NO signature is treated as
+ * unverifiable → count dropped (safe: the read-side sum then estimates).
+ * Returns the same array reference when nothing changed.
  */
-export function stripTokenCounts(messages: unknown[]): unknown[] {
+export function invalidateStaleTokenCounts(messages: unknown[]): unknown[] {
   let changed = false;
   const out = messages.map((m) => {
-    if (
-      m &&
-      typeof m === 'object' &&
-      ('tokenCount' in (m as Record<string, unknown>) || 'tokenCountSig' in (m as Record<string, unknown>))
-    ) {
-      changed = true;
-      const { tokenCount: _c, tokenCountSig: _s, ...rest } = m as Record<string, unknown>;
-      void _c;
-      void _s;
-      return rest;
-    }
-    return m;
+    if (!m || typeof m !== 'object') return m;
+    const rec = m as Record<string, unknown>;
+    if (!('tokenCount' in rec)) return m; // nothing cached → nothing to invalidate
+    const sig = rec.tokenCountSig;
+    const stillValid =
+      typeof sig === 'number' && sig === messageContentSig({ role: rec.role, content: rec.content });
+    if (stillValid) return m;
+    changed = true;
+    const { tokenCount: _c, tokenCountSig: _s, ...rest } = rec;
+    void _c;
+    void _s;
+    return rest;
   });
   return changed ? out : messages;
 }

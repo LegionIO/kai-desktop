@@ -361,7 +361,7 @@ function branchSignature(
   lastMessageId: string | undefined,
   encodingModelName: string,
 ): string {
-  return `${encodingModelName} ${serialized.length} ${messageCount} ${lastMessageId ?? ''}`;
+  return `${encodingModelName}\0${serialized.length}\0${messageCount}\0${lastMessageId ?? ''}`;
 }
 
 /**
