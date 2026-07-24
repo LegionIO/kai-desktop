@@ -172,33 +172,49 @@ export function serializeForTokenCounting(value: unknown): string {
  * legitimate context window's char-equivalent, or a valid in-window prefix would
  * be over-estimated by the ceiling and compaction's budget-fit would wrongly
  * no-op. The biggest current window is GPT-4.1 at 1,048,576 tokens ≈ ~4M chars
- * of English; 8M chars (≈2M tokens) clears every real window, so only a truly
- * pathological >8M-char history hits the ceiling. Encoding an ~8MB string once is
- * bounded and rare — and the per-message accumulator means the whole-history
- * exact encode is only reached when a branch genuinely nears the window.
+ * of English; 8M chars (≈2M tokens) clears every real window.
  */
 export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
 
 /**
- * Exact token count of a serialized string via tiktoken, UNLESS the string is
- * larger than {@link MAX_SYNC_ENCODE_CHARS}, in which case fall back to a
- * char-based estimate rather than blocking the main thread. Returns the count.
- *
- * The over-cap fallback is a TRUE UPPER BOUND: `length` (1 token/char). The
- * cheaper `length / 3` estimate used elsewhere assumes ~English density and is
- * NOT a ceiling — CJK / high-entropy text can approach one token per character,
- * so `length/3` could UNDER-count and let compaction's budget-fit accept an
- * over-window prefix. The UTF-8 BYTE length is the true ceiling: these encodings
- * are byte-level BPE, so the token count can never exceed the number of UTF-8
- * bytes (worst case one token per byte). JS string `.length` (UTF-16 code units)
- * is NOT safe — a rare-Unicode code unit can be multiple UTF-8 bytes / tokens. So
- * this is safe for both the shouldCompact gate (over-estimate → maybe run the
- * exact check, never skip it) and budget-fit (over-estimate → drop more, never
- * ship an over-limit request).
+ * tiktoken's BPE cost is CONTENT-dependent, not just length-dependent: a long run
+ * with few token boundaries (whitespace/punctuation) makes the merge search
+ * expensive and can block the main thread well below the hard char cap. Above this
+ * soft length we therefore encode ONLY when the string has enough boundary
+ * characters (see {@link MIN_BOUNDARY_RATIO}); otherwise we skip the encode and use
+ * the safe byte ceiling. Normal prose/JSON (boundary ratio ~0.15–0.30) always
+ * encodes; only large low-entropy repetitive blobs take the ceiling.
+ */
+const SOFT_ENCODE_CHARS = 200_000;
+/** Minimum fraction of boundary chars (whitespace + common punctuation) required to
+ *  encode a string longer than {@link SOFT_ENCODE_CHARS} on the main thread. */
+const MIN_BOUNDARY_RATIO = 0.02;
+const BOUNDARY_CHAR_RE = /[\s.,;:!?(){}\[\]"'`~/\\<>|=+\-*&^%$#@]/g;
+
+function boundaryRatio(s: string): number {
+  const m = s.match(BOUNDARY_CHAR_RE);
+  return (m ? m.length : 0) / s.length;
+}
+
+/**
+ * Exact token count of a serialized string via tiktoken, UNLESS encoding it
+ * synchronously would risk blocking the main thread, in which case fall back to
+ * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
+ * The encode is skipped when the string exceeds the hard char cap, OR when it is
+ * past the soft length AND too low-boundary (repetitive → expensive BPE). This is
+ * cost-aware, not just length-aware, so a large repetitive prompt/tool result can
+ * no longer stall the UI. The ceiling is a safe over-estimate for both the gate
+ * (maybe run the exact check, never skip it) and budget-fit (drop more, never ship
+ * over-limit).
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
-  if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
-    return Buffer.byteLength(serialized, 'utf8'); // UTF-8 bytes — a true token ceiling
+  const len = serialized.length;
+  if (len > MAX_SYNC_ENCODE_CHARS) {
+    return Buffer.byteLength(serialized, 'utf8');
+  }
+  if (len > SOFT_ENCODE_CHARS && boundaryRatio(serialized) < MIN_BOUNDARY_RATIO) {
+    // Large + low-boundary (repetitive) → skip the potentially-O(n²) BPE encode.
+    return Buffer.byteLength(serialized, 'utf8');
   }
   return encoding.encode(serialized).length;
 }

@@ -341,4 +341,22 @@ describe('encode cap (main-thread freeze backstop)', () => {
     const n = countBranchTokensCached([{ role: 'user', content: bigContent }], tokenization, 'big');
     expect(n).toBeGreaterThan(0);
   });
+
+  it('skips the encode for a LARGE LOW-BOUNDARY (repetitive) string — cost-aware, not just length', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // 300K repeated chars: past the soft length AND ~zero boundary chars → the BPE
+    // encode is potentially O(n^2), so we must return the byte ceiling instead.
+    const repetitive = 'a'.repeat(300_000);
+    const capped = encodeCappedWith(repetitive, enc);
+    expect(capped).toBe(Buffer.byteLength(repetitive, 'utf8')); // byte ceiling, no encode
+  });
+
+  it('STILL encodes a large NORMAL string (enough boundaries) exactly', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // 300K of prose: plenty of whitespace/punctuation → safe to encode exactly.
+    const prose = 'The quick brown fox jumps over the lazy dog. '.repeat(6700); // ~300K chars
+    expect(prose.length).toBeGreaterThan(200_000);
+    const capped = encodeCappedWith(prose, enc);
+    expect(capped).toBe(enc.encode(prose).length); // exact encode, not the ceiling
+  });
 });
