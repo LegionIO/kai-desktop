@@ -756,8 +756,15 @@ const WORKER_ENCODE_TIMEOUT_MS = 15_000;
  */
 type EncodeFallback = { ceiling: () => number };
 
+/** Resolution of an off-thread encode: the token count plus whether it is an
+ *  EXACT worker result (`exact: true`) or a byte-ceiling FALLBACK (`exact:
+ *  false`). Only exact results are cached — a fallback ceiling must not poison
+ *  the shared per-branch cache, or an unchanged branch would keep reusing the
+ *  inflated value and never re-reach a healthy worker. */
+type EncodeOutcome = { count: number; exact: boolean };
+
 type PendingEncode = {
-  settle: (count: number) => void;
+  settle: (outcome: EncodeOutcome) => void;
   fallback: EncodeFallback;
   timer: ReturnType<typeof setTimeout>;
 };
@@ -796,7 +803,7 @@ export function __setTokenizerWorkerPathForTests(path: string | null): void {
 function flushPending(): void {
   for (const p of pendingEncodes.values()) {
     clearTimeout(p.timer);
-    p.settle(p.fallback.ceiling());
+    p.settle({ count: p.fallback.ceiling(), exact: false });
   }
   pendingEncodes.clear();
 }
@@ -860,11 +867,12 @@ function ensureTokenizerWorker(): Worker | null {
       if (!pending) return;
       pendingEncodes.delete(msg.id);
       clearTimeout(pending.timer);
-      // A normal result carries the exact count; a worker-reported encode error
-      // is defensive (the worker already byte-ceilings pathological input) →
-      // settle via the byte ceiling, never a whole-branch sync encode on main.
-      if (msg.type === 'result') pending.settle(msg.count);
-      else pending.settle(pending.fallback.ceiling());
+      // A normal result carries the EXACT count (cacheable); a worker-reported
+      // encode error is defensive (the worker already byte-ceilings pathological
+      // input) → byte-ceiling fallback (not cacheable), never a whole-branch sync
+      // encode on main.
+      if (msg.type === 'result') pending.settle({ count: msg.count, exact: true });
+      else pending.settle({ count: pending.fallback.ceiling(), exact: false });
     });
     worker.on('error', () => handleWorkerDown(worker));
     worker.on('exit', () => handleWorkerDown(worker));
@@ -909,18 +917,18 @@ function encodeSerializedAsync(
   maxExactChars: number,
   fallback: EncodeFallback,
   signal?: AbortSignal,
-): Promise<number> | null {
+): Promise<EncodeOutcome> | null {
   const worker = ensureTokenizerWorker();
   if (!worker) return null;
   const id = nextEncodeId++;
-  return new Promise<number>((resolve) => {
+  return new Promise<EncodeOutcome>((resolve) => {
     let settled = false;
     let onAbort: (() => void) | null = null;
-    const settle = (count: number): void => {
+    const settle = (outcome: EncodeOutcome): void => {
       if (settled) return;
       settled = true;
       if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-      resolve(count);
+      resolve(outcome);
     };
     const timer = setTimeout(() => {
       // Live worker but stuck (possibly mid-WASM on a pathological input) →
@@ -931,26 +939,24 @@ function encodeSerializedAsync(
     }, WORKER_ENCODE_TIMEOUT_MS);
     pendingEncodes.set(id, { settle, fallback, timer });
 
-    // If the owning turn is cancelled/superseded during the encode, don't keep
-    // awaiting: settle this caller with the byte ceiling AND force-terminate the
-    // worker so the now-stale WASM job (which can't be interrupted in-thread)
-    // stops occupying the single worker and delaying the replacement turn. The
-    // next encode respawns a fresh worker.
+    // If the owning turn is cancelled/superseded during the encode, stop awaiting
+    // and settle THIS request with the byte ceiling. We do NOT terminate the
+    // shared worker: it may be mid-encode for OTHER live conversations, and
+    // killing it would byte-ceiling their healthy encodes. The orphaned job
+    // finishes on its own; its result arrives with an id no longer in the map and
+    // is dropped. A genuinely stuck job is still caught by the timeout above.
     if (signal) {
-      if (signal.aborted) {
-        pendingEncodes.delete(id);
-        clearTimeout(timer);
-        terminateStuckWorker(worker);
-        settle(fallback.ceiling());
-        return;
-      }
-      onAbort = () => {
+      const abortSettle = (): void => {
         if (settled) return;
         pendingEncodes.delete(id);
         clearTimeout(timer);
-        terminateStuckWorker(worker);
-        settle(fallback.ceiling());
+        settle({ count: fallback.ceiling(), exact: false });
       };
+      if (signal.aborted) {
+        abortSettle();
+        return;
+      }
+      onAbort = abortSettle;
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
@@ -961,7 +967,7 @@ function encodeSerializedAsync(
       clearTimeout(timer);
       // postMessage failed (worker dying) → byte ceiling (never a whole-branch
       // sync encode on main).
-      settle(fallback.ceiling());
+      settle({ count: fallback.ceiling(), exact: false });
     }
   });
 }
@@ -990,7 +996,7 @@ export async function encodeCappedWithAsync(
     { ceiling: () => Buffer.byteLength(serialized, 'utf8') },
     signal,
   );
-  return pending ? pending : Buffer.byteLength(serialized, 'utf8');
+  return pending ? (await pending).count : Buffer.byteLength(serialized, 'utf8');
 }
 
 /**
@@ -1026,12 +1032,19 @@ export async function countBranchTokensCachedAsync(
   const ceiling = (): number => Buffer.byteLength(serialized, 'utf8');
   const pending = encodeSerializedAsync(serialized, encodingModel, MAX_SYNC_ENCODE_CHARS, { ceiling }, signal);
   // pending === null → worker unavailable → byte ceiling (safe, non-blocking).
-  const count = pending ? await pending : ceiling();
+  const outcome: EncodeOutcome = pending ? await pending : { count: ceiling(), exact: false };
 
-  exactTokenCache.set(key, count);
-  if (exactTokenCache.size > EXACT_TOKEN_CACHE_MAX) {
-    const oldest = exactTokenCache.keys().next().value;
-    if (oldest !== undefined) exactTokenCache.delete(oldest);
+  // Cache ONLY genuine exact worker results. A byte-ceiling fallback (worker
+  // unavailable/crash/timeout/abort) must not poison the shared per-branch cache
+  // — otherwise an unchanged branch would keep reusing the inflated ceiling and
+  // never re-reach a healthy (respawned) worker, potentially compacting far below
+  // the real trigger.
+  if (outcome.exact) {
+    exactTokenCache.set(key, outcome.count);
+    if (exactTokenCache.size > EXACT_TOKEN_CACHE_MAX) {
+      const oldest = exactTokenCache.keys().next().value;
+      if (oldest !== undefined) exactTokenCache.delete(oldest);
+    }
   }
-  return count;
+  return outcome.count;
 }
