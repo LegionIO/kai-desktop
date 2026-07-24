@@ -365,6 +365,23 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(n).toBeGreaterThan(0);
   });
 
+  it('countBranchTokensCached uses the COMPACTION cap — counts a ~2M diverse branch exactly', () => {
+    __clearExactTokenCacheForTests();
+    const tokenization = resolveConversationTokenization('gpt-5');
+    // ~2M chars of diverse content (like a large GPT-4.1 history, ~450k tokens). The
+    // whole-branch count must be EXACT (via the 8M compaction cap), not the 1.5M
+    // per-message ceiling — else a byte-ceiling would falsely trip shouldCompact.
+    let big = '';
+    let i = 0;
+    while (big.length < 2_000_000) {
+      big += `entry ${i}: value=${(i * 2654435761 >>> 0).toString(36)} note ${String.fromCharCode(65 + (i % 40))}. `;
+      i++;
+    }
+    const n = countBranchTokensCached([{ role: 'user', content: big }], tokenization, 'big2m')!;
+    // Real token count for diverse prose is ~chars/4; a byte ceiling would be ~2M.
+    expect(n).toBeLessThan(big.length / 2);
+  });
+
   it('skips the encode for a long repeated RUN — even below the old soft length', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
     // 60K repeated chars (a run > MAX_ENCODE_RUN) — tiktoken's quadratic case — must

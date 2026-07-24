@@ -596,7 +596,11 @@ export function countBranchTokensCached(
     exactTokenCache.set(key, cached);
     return cached;
   }
-  const count = encodeCapped(serialized, tokenization.encoding);
+  // Whole-branch count for the compaction decision → use the HIGHER compaction
+  // exact-encode cap (via encodeCappedWith), not the low per-message default. A 2M+
+  // char diverse large-context branch (e.g. ~450k GPT-4.1 tokens, under trigger)
+  // must be counted exactly, or byte-ceiling it would falsely trip compaction.
+  const count = encodeCappedWith(serialized, tokenization.encoding);
   exactTokenCache.set(key, count);
   if (exactTokenCache.size > EXACT_TOKEN_CACHE_MAX) {
     const oldest = exactTokenCache.keys().next().value;
