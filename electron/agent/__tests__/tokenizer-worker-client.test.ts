@@ -357,6 +357,43 @@ describe('tokenizer worker client', () => {
     expect(await p2).toBe(5);
     expect(5).not.toBe(ceiling);
   });
+
+  it('byte-ceilings an over-cap input WITHOUT posting to the worker', async () => {
+    // Over MAX_SYNC_ENCODE_CHARS (8M) the worker could only byte-ceiling anyway,
+    // so we must not structured-clone the whole string through postMessage.
+    const huge = 'x'.repeat(8_000_001);
+    const messages = [{ role: 'user', content: huge }];
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const count = await tok.countBranchTokensCachedAsync(messages, tokenization, 'm1');
+    expect(count).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
+    // No worker was ever spawned/posted for the oversized input.
+    expect(FakeWorker.instances).toHaveLength(0);
+  });
+
+  it('retires the worker once a live result settles and only detached jobs remain', async () => {
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const cA = new AbortController();
+    // A is queued, then B (live). A aborts while B is live → A detaches, worker
+    // preserved for B.
+    const pA = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'A' }], tokenization, 'a1', cA.signal);
+    const pB = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'B' }], tokenization, 'b1');
+    const w = FakeWorker.instances[0];
+    await flush();
+    w.ready();
+    const postedA = w.posted[0];
+    const postedB = w.posted[1];
+    cA.abort();
+    await pA;
+    expect(w.terminated).toBe(false); // B still live
+
+    // B's result settles → only the detached A remains → worker retired so a
+    // replacement request doesn't wait on A's stale job.
+    w.result(postedB.id, 42);
+    expect(await pB).toBe(42);
+    expect(w.terminated).toBe(true);
+    // A late result for A is harmless.
+    w.result(postedA.id, 999);
+  });
 });
 
 describe('tokenizer worker build wiring', () => {

@@ -877,6 +877,14 @@ function ensureTokenizerWorker(): Worker | null {
       // encode on main.
       if (msg.type === 'result') pending.settle({ count: msg.count, exact: true });
       else pending.settle({ count: pending.fallback.ceiling(), exact: false });
+      // After settling, if only DETACHED (aborted) jobs remain, no live caller
+      // depends on the worker — retire it so a queued stale job can't delay the
+      // next request. (A job that was aborted while another was live couldn't
+      // terminate then; this is where it finally gets freed.) Their watchdogs
+      // are cleared by terminateStuckWorker's flushPending.
+      if (pendingEncodes.size > 0 && [...pendingEncodes.values()].every((p) => p.detached)) {
+        terminateStuckWorker(worker);
+      }
     });
     worker.on('error', () => handleWorkerDown(worker));
     worker.on('exit', () => handleWorkerDown(worker));
@@ -926,6 +934,12 @@ function encodeSerializedAsync(
   // watchdog is needed for a job that was never submitted, and posting would
   // occupy the sole worker and delay the replacement run). Byte-ceiling now.
   if (signal?.aborted) return Promise.resolve({ count: fallback.ceiling(), exact: false });
+  // Over the exact-encode size cap the worker can ONLY return the byte ceiling
+  // anyway (its own size guard) — so byte-ceiling here WITHOUT posting. Avoids a
+  // synchronous multi-megabyte structured-clone of the string through
+  // postMessage (duplicate memory + main-thread copy) and the pointless 15s
+  // watchdog wait on an input that can never be exactly encoded.
+  if (serialized.length > maxExactChars) return Promise.resolve({ count: fallback.ceiling(), exact: false });
   const worker = ensureTokenizerWorker();
   if (!worker) return null;
   const id = nextEncodeId++;
