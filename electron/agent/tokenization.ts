@@ -789,9 +789,18 @@ export function __setTokenizerWorkerPathForTests(path: string | null): void {
   tokenizerWorkerUnavailable = false;
   // Settle any in-flight encode via its sync fallback (a reset is not a
   // pathological-input signal).
+  flushPending('sync');
+}
+
+/** Settle and clear all in-flight encodes. `mode` picks the value:
+ *  - 'sync': the exact synchronous encode (correct + safe — used when the worker
+ *    went down for a reason UNRELATED to the input, e.g. a crash or a test reset).
+ *  - 'ceiling': the byte ceiling (never re-run a possibly-pathological input on
+ *    main — used on quit and when a stuck worker is force-terminated). */
+function flushPending(mode: 'sync' | 'ceiling'): void {
   for (const p of pendingEncodes.values()) {
     clearTimeout(p.timer);
-    p.settle(p.fallback.sync());
+    p.settle(mode === 'sync' ? p.fallback.sync() : p.fallback.ceiling());
   }
   pendingEncodes.clear();
 }
@@ -808,14 +817,35 @@ function handleWorkerDown(worker: Worker): void {
   // and ignore events from a worker we've already replaced.
   if (tokenizerWorker !== worker) return;
   const wasReady = tokenizerWorkerReady;
-  for (const p of pendingEncodes.values()) {
-    clearTimeout(p.timer);
-    p.settle(p.fallback.sync());
-  }
-  pendingEncodes.clear();
+  flushPending('sync');
   tokenizerWorker = null;
   tokenizerWorkerReady = false;
   if (!wasReady) tokenizerWorkerUnavailable = true;
+}
+
+/**
+ * A live encode exceeded the timeout. The worker may still be spinning in a
+ * synchronous WASM encode of a pathological input, so leaving it in place would
+ * make it hold a CPU core and force EVERY later encode to wait another full
+ * timeout behind it. Force-terminate it and drop the handle so the next encode
+ * spawns a fresh worker. Its OTHER queued encodes settle via the BYTE CEILING —
+ * they were stuck behind the same (possibly pathological) worker, so re-running
+ * them synchronously on main could freeze too; the ceiling is safe and never
+ * under-counts. Terminating a still-ready worker does NOT mark it unavailable.
+ */
+function terminateStuckWorker(worker: Worker): void {
+  if (tokenizerWorker !== worker) return;
+  // Detach handlers so the pending exit/error from terminate() doesn't re-enter
+  // handleWorkerDown and sync-encode the very input we're avoiding.
+  worker.removeAllListeners();
+  try {
+    void worker.terminate();
+  } catch {
+    // ignore
+  }
+  tokenizerWorker = null;
+  tokenizerWorkerReady = false;
+  flushPending('ceiling');
 }
 
 function ensureTokenizerWorker(): Worker | null {
@@ -852,13 +882,11 @@ function ensureTokenizerWorker(): Worker | null {
 }
 
 /** Terminate the tokenizer worker (call on app quit). Safe to call when none
- *  was ever spawned. In-flight encodes settle via their sync fallback. */
+ *  was ever spawned. In-flight encodes settle via the BYTE CEILING — never the
+ *  synchronous encode: doing that in the `before-quit` handler could freeze
+ *  shutdown on the exact large/pathological input this worker exists to isolate. */
 export function terminateTokenizerWorker(): void {
-  for (const p of pendingEncodes.values()) {
-    clearTimeout(p.timer);
-    p.settle(p.fallback.sync());
-  }
-  pendingEncodes.clear();
+  flushPending('ceiling');
   if (tokenizerWorker) {
     try {
       void tokenizerWorker.terminate();
@@ -895,10 +923,11 @@ function encodeSerializedAsync(
       resolve(count);
     };
     const timer = setTimeout(() => {
-      pendingEncodes.delete(id);
-      // Live worker but stuck → byte ceiling (never re-run a possibly-pathological
-      // input on the main thread).
-      settle(fallback.ceiling());
+      // Live worker but stuck (possibly mid-WASM on a pathological input) →
+      // force-terminate + respawn-on-next so it can't hold a core and make
+      // every later encode wait behind it. This settles THIS request (and any
+      // other queued behind the same worker) via the byte ceiling.
+      terminateStuckWorker(worker);
     }, WORKER_ENCODE_TIMEOUT_MS);
     pendingEncodes.set(id, { settle, fallback, timer });
     try {

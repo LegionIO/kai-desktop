@@ -2041,6 +2041,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 modelEntry.modelConfig.maxInputTokens,
               );
 
+          // The exact-recount gate can await the off-thread tokenizer; the run may
+          // have been cancelled or superseded during that await. Bail before doing
+          // any further work (notably before compactConversationPrefix, which would
+          // issue a summarizer LLM request) so a cancelled run doesn't proceed.
+          if (controller.signal.aborted) {
+            emit({ conversationId, type: 'done' });
+            return;
+          }
+
           if (check.shouldCompact) {
             emit({
               conversationId,

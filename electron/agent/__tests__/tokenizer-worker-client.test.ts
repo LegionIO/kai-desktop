@@ -32,6 +32,10 @@ class FakeWorker {
     (this.handlers[event] ??= []).push(cb);
     return this;
   }
+  removeAllListeners(): this {
+    this.handlers = {};
+    return this;
+  }
   unref(): this {
     return this;
   }
@@ -147,6 +151,27 @@ describe('tokenizer worker client', () => {
     vi.advanceTimersByTime(20_000); // trip the encode timeout
     const expected = Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8');
     expect(await promise).toBe(expected);
+  });
+
+  it('force-terminates a stuck worker on timeout and respawns on the next encode', async () => {
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const p1 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'stuck' }], tokenization, 'm1');
+    const w1 = FakeWorker.instances[0];
+    await flush();
+    w1.ready();
+    vi.advanceTimersByTime(20_000); // timeout → terminate the stuck worker
+    await p1;
+    expect(w1.terminated).toBe(true);
+
+    // Next encode must spawn a FRESH worker (the stuck one was dropped) rather
+    // than queue behind the wedged one for another full timeout.
+    const p2 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'fresh' }], tokenization, 'm2');
+    expect(FakeWorker.instances.length).toBe(2);
+    const w2 = FakeWorker.instances[1];
+    await flush();
+    w2.ready();
+    w2.result(w2.posted[0].id, 33);
+    expect(await p2).toBe(33);
   });
 
   it('falls back to the synchronous count when the worker crashes BEFORE ready', async () => {
