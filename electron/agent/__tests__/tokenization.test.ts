@@ -99,8 +99,11 @@ describe('resolveConversationTokenization', () => {
     // have wrongly labeled them o200k and let the gate trust o200k cached counts.
     expect(base('text-davinci-003')).not.toBe(base('gpt-5')); // p50k_base
     expect(base('davinci-002')).not.toBe(base('gpt-5')); // cl100k_base
-    // A non-tiktoken model (gemini) resolves to the gpt-5 o200k fallback → canonical.
-    expect(base('gemini-1.5-pro')).toBe(base('gpt-5'));
+    // A non-tiktoken model (gemini) is NOT labeled as the canonical o200k base — its
+    // real tokenizer is unknown, so the gate must fall back to a safe ceiling rather
+    // than trust o200k counts (round 22 fix). encodingBaseName is null for it.
+    expect(base('gemini-1.5-pro')).not.toBe(base('gpt-5'));
+    expect(base('gemini-1.5-pro')).toBeNull();
   });
 });
 

@@ -130,6 +130,29 @@ export function resolveEncodingForModel(modelName: string): ModelEncoding | null
   }
 }
 
+/**
+ * Whether tiktoken ACTUALLY recognizes `modelName` (vs falling back to a default
+ * encoder). Used to decide if the resolved encoding's `.name` reflects the target
+ * model's real tokenizer: for a recognized model it does (o200k/cl100k/p50k…); for
+ * an UNRECOGNIZED model (Claude/Gemini/Llama/most providers) resolveEncodingForModel
+ * returns the gpt-5 fallback whose `.name` would MISlabel it o200k, so callers must
+ * NOT trust that name for tokenizer-compatibility gating.
+ */
+const tiktokenRecognizedCache = new Map<string, boolean>();
+export function tiktokenRecognizesModel(modelName: string): boolean {
+  const cached = tiktokenRecognizedCache.get(modelName);
+  if (cached !== undefined) return cached;
+  let ok = false;
+  try {
+    const enc = encoding_for_model(modelName as Parameters<typeof encoding_for_model>[0]);
+    ok = !!enc;
+  } catch {
+    ok = false;
+  }
+  tiktokenRecognizedCache.set(modelName, ok);
+  return ok;
+}
+
 export type ConversationTokenizationInfo = {
   normalizedModelName: string;
   contextWindowTokens: number | null;
@@ -179,13 +202,16 @@ export function resolveConversationTokenization(
   const encodingModelName = MODEL_ENCODING_ALIASES[normalizedModelName] ?? normalizedModelName;
   const encoding = resolveEncodingForModel(encodingModelName);
 
-  // Prefer the ACTUAL base reported by the resolved tiktoken encoding (e.g.
-  // 'o200k_base', 'cl100k_base', 'p50k_base') — authoritative, so davinci/legacy
-  // models aren't mislabeled by a name regex. Fall back to the name heuristic only
-  // if the encoding doesn't expose a usable name. (gemini/claude etc. resolve to the
-  // gpt-5 o200k fallback encoding, so they correctly report o200k_base → fast path.)
+  // encodingBaseName is the tokenizer-compatibility key for the compaction gate.
+  // Trust the resolved encoding's real `.name` ONLY when tiktoken actually
+  // recognizes the model (so davinci→p50k/cl100k, gpt→o200k are correct). For a
+  // model tiktoken does NOT recognize (Claude/Gemini/Llama/most providers),
+  // resolveEncodingForModel returns the gpt-5 fallback whose `.name` would MISlabel
+  // it o200k and make the gate trust o200k cached counts — which can undercount the
+  // provider's real tokenizer and skip needed compaction. So leave it null there:
+  // sumBranchTokensForGate then uses the tokenizer-independent byte ceiling.
   let encodingBaseName: string | null = null;
-  if (encoding) {
+  if (encoding && tiktokenRecognizesModel(encodingModelName)) {
     const nm = (encoding as { name?: unknown }).name;
     encodingBaseName = typeof nm === 'string' && nm.length > 0 ? nm : encodingBaseFor(normalizedModelName);
   }

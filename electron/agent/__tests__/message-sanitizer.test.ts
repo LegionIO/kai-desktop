@@ -113,6 +113,27 @@ describe('stripDisplayOnlyParts', () => {
     expect(stripDisplayOnlyParts(msgs)).toBe(msgs);
   });
 
+  it('clears the cached tokenCount/signature on a message it strips parts from', () => {
+    // The count/sig were computed from the ORIGINAL (file+inline) content; after
+    // stripping a displayOnly part the content is smaller, so the count is stale and
+    // must be dropped (otherwise the no-hook gate trusts an inflated stale value).
+    const msgs = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'see attached' },
+          { type: 'file', mediaType: 'application/json', displayOnly: true, data: 'x'.repeat(5000) },
+        ],
+        tokenCount: 1234,
+        tokenCountSig: 5678,
+      },
+    ];
+    const out = stripDisplayOnlyParts(msgs) as Array<Record<string, unknown>>;
+    expect('tokenCount' in out[0]).toBe(false);
+    expect('tokenCountSig' in out[0]).toBe(false);
+    expect((out[0].content as unknown[]).length).toBe(1); // displayOnly part removed
+  });
+
   it('ignores non-user messages and non-array content', () => {
     const msgs = [
       { role: 'assistant', content: [{ type: 'file', displayOnly: true }] },

@@ -124,6 +124,18 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     const res = shouldCompact(msgs, 'gpt-4', 0.85);
     expect(res.usedTokens).toBeGreaterThan(1); // did not trust the bogus low count
   });
+
+  it('does NOT trust an o200k cached count for a NON-TIKTOKEN provider (claude/gemini)', () => {
+    // Claude/Gemini fall back to the gpt-5 encoder, but their real tokenizer is
+    // unknown — the gate must use the byte ceiling, not trust the o200k cached count,
+    // or it could undercount and skip needed compaction (provider over-window).
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(50);
+    const msgs: ChatMessage[] = [{ role: 'user', content: big, tokenCount: 1 }];
+    for (const model of ['claude-3-5-sonnet', 'gemini-1.5-pro']) {
+      const res = shouldCompact(msgs, model, 0.85);
+      expect(res.usedTokens).toBeGreaterThan(1); // bogus low count NOT trusted
+    }
+  });
 });
 
 describe('isStrictPrefix (compaction reuse / divergence detector)', () => {

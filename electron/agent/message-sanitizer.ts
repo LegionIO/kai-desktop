@@ -149,7 +149,15 @@ export function stripDisplayOnlyParts(messages: unknown[]): unknown[] {
     if (filtered.length === 0) return rawMsg;
 
     changed = true;
-    return { ...msg, content: filtered };
+    // Content changed (a displayOnly part was removed) → any cached tokenCount/sig
+    // (computed from the ORIGINAL file+inline content) is now stale. Drop them so
+    // the compaction gate recomputes against the stripped content rather than
+    // trusting an inflated count. Otherwise a large attachment's stale count lingers
+    // on the no-hook path (which skips invalidation).
+    const { tokenCount: _tc, tokenCountSig: _ts, ...restMsg } = msg as Record<string, unknown>;
+    void _tc;
+    void _ts;
+    return { ...restMsg, content: filtered };
   });
 
   return changed ? result : messages;
