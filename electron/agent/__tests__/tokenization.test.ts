@@ -64,6 +64,21 @@ describe('resolveConversationTokenization', () => {
     expect(win).not.toBeNull();
     expect(win).toBeGreaterThan(0);
   });
+
+  it('uses a CONSERVATIVE (small) window for an unknown model — never assumes 128K', () => {
+    // A custom/local model with no declared limit is often 8K/32K; assuming 128K
+    // compacts too late and the provider rejects the over-window request.
+    const win = resolveConversationTokenization('some-local-llm-with-no-declared-limit').contextWindowTokens!;
+    expect(win).toBeLessThanOrEqual(32768);
+  });
+
+  it('classifies o200k models to the same base (fast path) and legacy gpt-4 to cl100k', () => {
+    const base = (m: string) => resolveConversationTokenization(m).encodingBaseName;
+    for (const m of ['gpt-5', 'gpt-4o', 'gpt-4.1', 'o3', 'o4-mini']) {
+      expect(base(m)).toBe(base('gpt-5')); // all share the canonical o200k base
+    }
+    expect(base('gpt-4')).not.toBe(base('gpt-5')); // legacy gpt-4 → cl100k, different base
+  });
 });
 
 describe('estimateSerializedTokens (cheap pre-check, no WASM)', () => {
@@ -139,7 +154,13 @@ describe('countBranchTokensCached (memoized exact count)', () => {
   });
 
   it('returns null when no encoding is available', () => {
-    const noEnc = { normalizedModelName: 'x', contextWindowTokens: null, encodingModelName: null, encoding: null };
+    const noEnc = {
+      normalizedModelName: 'x',
+      contextWindowTokens: null,
+      encodingModelName: null,
+      encodingBaseName: null,
+      encoding: null,
+    };
     expect(countBranchTokensCached([{ role: 'user', content: 'hi' }], noEnc, 'm1')).toBeNull();
   });
 });

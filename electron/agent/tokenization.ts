@@ -48,14 +48,17 @@ const encodingCache = new Map<string, ModelEncoding>();
 
 /**
  * Conservative context window used when a model is not in
- * {@link MODEL_CONTEXT_WINDOWS} and the caller gave no explicit override. Without
- * this, an unknown model (e.g. a newly-added `gpt-5.5` before its entry existed)
- * resolves to a `null` window, which makes `shouldCompact` bail early and
- * DISABLES compaction — so the history grows unbounded and eventually freezes the
- * main thread on the token count. A conservative default keeps compaction working
- * for any model; a real entry or `maxInputTokens` override always takes priority.
+ * {@link MODEL_CONTEXT_WINDOWS} and the caller gave no explicit override. Two goals:
+ * (1) never leave the window null (that disables compaction → unbounded growth →
+ * the main-thread freeze); (2) don't ASSUME a large window for an unknown
+ * OpenAI-compatible / local model — those are often 8K/32K, and assuming 128K means
+ * compaction fires far too late and the provider rejects the over-window request.
+ * So the fallback is deliberately SMALL: compacting early for a model that turns out
+ * to be large is harmless (it just summarizes sooner), whereas compacting late for a
+ * genuinely small model fails the request. A real catalog entry or `maxInputTokens`
+ * override always takes priority over this floor.
  */
-const DEFAULT_UNKNOWN_CONTEXT_WINDOW = 128000;
+const DEFAULT_UNKNOWN_CONTEXT_WINDOW = 8192;
 
 function normalizeModelBaseName(modelName: string): string {
   const trimmed = modelName.trim().toLowerCase();
@@ -107,8 +110,30 @@ export type ConversationTokenizationInfo = {
   normalizedModelName: string;
   contextWindowTokens: number | null;
   encodingModelName: string | null;
+  /** The tiktoken BASE encoding this model uses (e.g. 'o200k_base', 'cl100k_base').
+   *  Distinct model names can share a base (gpt-5, gpt-4o, gpt-4.1, o3, o4-mini all
+   *  use o200k_base); the compaction gate compares THIS, not encodingModelName, so
+   *  every model on the canonical base keeps the fast cached-count path. */
+  encodingBaseName: string | null;
   encoding: ModelEncoding | null;
 };
+
+/**
+ * Map a normalized model name to its tiktoken BASE encoding name. o200k_base is
+ * the modern base (GPT-5/4o/4.1 + o-series reasoning models); cl100k_base is the
+ * legacy base (gpt-4/gpt-3.5). Unknown models default to o200k_base (matching the
+ * resolveEncodingForModel gpt-5 fallback), so an OpenAI-compatible model is treated
+ * as sharing the canonical cache base.
+ */
+function encodingBaseFor(normalizedModelName: string): string {
+  if (/^gpt-4(\b|[.o-])/.test(normalizedModelName) && !/^gpt-4o|^gpt-4\.1/.test(normalizedModelName)) {
+    // Legacy gpt-4 / gpt-4-turbo / gpt-4-32k → cl100k_base. (gpt-4o and gpt-4.1 are
+    // o200k, handled by falling through to the default below.)
+    return 'cl100k_base';
+  }
+  if (/^gpt-3\.5|^gpt-35/.test(normalizedModelName)) return 'cl100k_base';
+  return 'o200k_base';
+}
 
 export function resolveConversationTokenization(
   modelName: string,
@@ -127,6 +152,7 @@ export function resolveConversationTokenization(
     normalizedModelName,
     contextWindowTokens,
     encodingModelName: encoding ? encodingModelName : null,
+    encodingBaseName: encoding ? encodingBaseFor(normalizedModelName) : null,
     encoding,
   };
 }
@@ -241,45 +267,48 @@ export function sumBranchTokenCounts(
     if (typeof count === 'number' && Number.isFinite(count) && count >= 0) {
       sum += count;
     } else {
-      // Missing/invalid count → cheap over-biased estimate (never under-counts).
-      sum += estimateSerializedTokens(messageTokenProjection(msg ?? {}));
+      // Missing/invalid count → a TRUE ceiling (UTF-8 byte length), not length/3.
+      // length/3 assumes ~English density and can UNDER-count token-dense Unicode,
+      // letting a genuinely over-window request stay under the gate; the byte
+      // ceiling (≤ 1 token/byte for any BPE) never under-counts.
+      sum += tokenProjectionByteCeiling(msg ?? {});
     }
   }
   return sum;
 }
 
-/** The encoding-model name the storage-layer cached counts are computed with
- *  (gpt-5 / o200k). Cached tokenCounts are only a SAFE gate floor for a target
- *  model that resolves to this same encoding. */
-let canonicalEncodingModelNameCache: string | null | undefined;
-export function canonicalCountEncodingModelName(): string | null {
-  if (canonicalEncodingModelNameCache === undefined) {
-    canonicalEncodingModelNameCache = resolveConversationTokenization('gpt-5').encodingModelName;
+/** The tiktoken BASE encoding the storage-layer cached counts are computed with
+ *  (gpt-5 → o200k_base). Cached counts are a SAFE gate floor for any model on this
+ *  same base — regardless of its specific model name. */
+let canonicalBaseCache: string | null | undefined;
+export function canonicalCountEncodingBaseName(): string | null {
+  if (canonicalBaseCache === undefined) {
+    canonicalBaseCache = resolveConversationTokenization('gpt-5').encodingBaseName;
   }
-  return canonicalEncodingModelNameCache;
+  return canonicalBaseCache;
 }
 
 /**
  * Tokenizer-SAFE branch token sum for the compaction gate. Cached per-message
- * `tokenCount`s are computed with the canonical o200k encoding; they are only a
- * safe gate FLOOR for a target model that resolves to that same encoding. For a
- * model on a DIFFERENT tokenizer (e.g. a custom cl100k `gpt-4`), an o200k count
- * can under-count relative to the target — so the branch could be over-window
- * while the cached sum stays under the trigger, skipping compaction and failing
- * the provider request. In that case fall back to a model-INDEPENDENT upper bound
- * (UTF-8 byte length, ≤ 1 token/byte for any BPE) so the gate never under-counts.
- * When the target IS canonical (the common gpt-5/o-family case), use the fast
- * cached-count sum.
+ * `tokenCount`s are computed with the canonical o200k base; they are a safe gate
+ * FLOOR for any target model on that SAME base (GPT-5/4o/4.1 + o-series all share
+ * o200k_base, even though their model-name strings differ — comparing base, not
+ * name, keeps them all on the fast cached-count path). For a model on a DIFFERENT
+ * base (e.g. a legacy cl100k `gpt-4`), an o200k count can under-count relative to
+ * the target — the branch could be over-window while the cached sum stays under
+ * the trigger, skipping compaction and failing the provider request. There we fall
+ * back to a model-INDEPENDENT upper bound (UTF-8 byte length, ≤ 1 token/byte for
+ * any BPE) so the gate never under-counts.
  */
 export function sumBranchTokensForGate(
   messages: Array<{ tokenCount?: number; role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown }>,
   tokenization: ConversationTokenizationInfo,
 ): number {
-  const canonical = canonicalCountEncodingModelName();
-  if (tokenization.encodingModelName !== null && tokenization.encodingModelName === canonical) {
-    return sumBranchTokenCounts(messages); // same tokenizer → cached counts are a safe floor
+  const canonicalBase = canonicalCountEncodingBaseName();
+  if (tokenization.encodingBaseName !== null && tokenization.encodingBaseName === canonicalBase) {
+    return sumBranchTokenCounts(messages); // same tokenizer base → cached counts are a safe floor
   }
-  // Different tokenizer → model-independent true ceiling (never under-counts).
+  // Different tokenizer base → model-independent true ceiling (never under-counts).
   let sum = 0;
   for (const msg of messages) sum += tokenProjectionByteCeiling(msg ?? {});
   return sum;

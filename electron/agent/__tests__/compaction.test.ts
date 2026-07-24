@@ -100,25 +100,27 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     expect(res.shouldCompact).toBe(false);
   });
 
-  it('trusts cached counts for a CANONICAL-tokenizer model (integer-only fast path)', () => {
-    // gpt-5 shares the o200k encoding the cached counts are computed with, so the
-    // gate trusts them directly and reports their sum.
+  it('trusts cached counts for models on the o200k base — gpt-5, gpt-4o, gpt-4.1, o3, o4-mini', () => {
+    // All share o200k_base (the cache base), even though their model-name strings
+    // differ — the gate compares the tokenizer BASE, so they all take the fast
+    // cached-count path (no whole-branch reserialize/encode → no main-thread stall).
     const msgs: ChatMessage[] = [
       { role: 'user', content: 'a', tokenCount: 10 },
       { role: 'assistant', content: 'b', tokenCount: 20 },
     ];
-    const res = shouldCompact(msgs, 'gpt-5', 0.85);
-    expect(res.shouldCompact).toBe(false);
-    expect(res.usedTokens).toBe(30); // cached sum trusted
+    for (const model of ['gpt-5', 'gpt-4o', 'gpt-4.1', 'o3', 'o4-mini']) {
+      const res = shouldCompact(msgs, model, 0.85);
+      expect(res.usedTokens).toBe(30); // cached sum trusted for every o200k model
+    }
   });
 
-  it('does NOT trust an o200k cached count for a NON-canonical tokenizer (uses a safe ceiling)', () => {
-    // For a cl100k-family model (gpt-4o), an o200k cached count is not a safe floor.
-    // A bogus tiny count on large content must NOT let the gate under-count: the
-    // model-independent byte ceiling is used, so usedTokens reflects real size.
+  it('does NOT trust an o200k cached count for a legacy cl100k model (uses a safe ceiling)', () => {
+    // A legacy gpt-4 (cl100k_base) differs from the o200k cache base, so an o200k
+    // cached count is not a safe floor. A bogus tiny count on large content must not
+    // let the gate under-count — the model-independent byte ceiling is used instead.
     const big = 'The quick brown fox jumps over the lazy dog. '.repeat(50);
     const msgs: ChatMessage[] = [{ role: 'user', content: big, tokenCount: 1 }];
-    const res = shouldCompact(msgs, 'gpt-4o', 0.85);
+    const res = shouldCompact(msgs, 'gpt-4', 0.85);
     expect(res.usedTokens).toBeGreaterThan(1); // did not trust the bogus low count
   });
 });
