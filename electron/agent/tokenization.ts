@@ -179,11 +179,22 @@ export function resolveConversationTokenization(
   const encodingModelName = MODEL_ENCODING_ALIASES[normalizedModelName] ?? normalizedModelName;
   const encoding = resolveEncodingForModel(encodingModelName);
 
+  // Prefer the ACTUAL base reported by the resolved tiktoken encoding (e.g.
+  // 'o200k_base', 'cl100k_base', 'p50k_base') — authoritative, so davinci/legacy
+  // models aren't mislabeled by a name regex. Fall back to the name heuristic only
+  // if the encoding doesn't expose a usable name. (gemini/claude etc. resolve to the
+  // gpt-5 o200k fallback encoding, so they correctly report o200k_base → fast path.)
+  let encodingBaseName: string | null = null;
+  if (encoding) {
+    const nm = (encoding as { name?: unknown }).name;
+    encodingBaseName = typeof nm === 'string' && nm.length > 0 ? nm : encodingBaseFor(normalizedModelName);
+  }
+
   return {
     normalizedModelName,
     contextWindowTokens,
     encodingModelName: encoding ? encodingModelName : null,
-    encodingBaseName: encoding ? encodingBaseFor(normalizedModelName) : null,
+    encodingBaseName,
     encoding,
   };
 }
@@ -309,7 +320,16 @@ function encodeCapped(
     // content → skip the potentially-quadratic BPE encode; use the byte ceiling.
     return Buffer.byteLength(serialized, 'utf8');
   }
-  return encoding.encode(serialized).length;
+  try {
+    return encoding.encode(serialized).length;
+  } catch {
+    // tiktoken.encode() THROWS on literal reserved-marker text (e.g. `<|endoftext|>`)
+    // — special tokens are disallowed by default. This runs on the write/append path,
+    // so a throw would block persisting the turn (and any later write to a
+    // conversation already containing the marker). Fall back to the safe byte ceiling
+    // rather than crash; the count is only a gate/budget input.
+    return Buffer.byteLength(serialized, 'utf8');
+  }
 }
 
 /**

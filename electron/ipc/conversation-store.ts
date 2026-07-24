@@ -636,12 +636,22 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
   // DELIBERATE null head (an intentional rewind → empty active branch). Passing
   // `undefined ?? null` would collapse both to null; then a structural repair on
   // the same write would rebuild `messages` from a null head and HIDE all history.
-  // So when the head is omitted, resolve it to the last-node fallback first; only
-  // an explicit null is treated as the intentional empty-branch state.
-  const headInput =
-    conv.headId === undefined
-      ? ((rawTree[rawTree.length - 1] as { id?: unknown })?.id as string | undefined) ?? null
-      : conv.headId;
+  // So when the head is omitted, resolve it to the last VALID-id node (scanning
+  // from the end — the very last entry may itself be an id-less/malformed node that
+  // sanitize will drop; using its missing id would yield a null head that the
+  // sanitizer then treats as an intentional rewind and hides all earlier history).
+  // Only an explicit null is treated as the intentional empty-branch state.
+  let headInput: string | null | undefined = conv.headId;
+  if (conv.headId === undefined) {
+    headInput = null;
+    for (let i = rawTree.length - 1; i >= 0; i--) {
+      const id = (rawTree[i] as { id?: unknown })?.id;
+      if (typeof id === 'string' && id.length > 0) {
+        headInput = id;
+        break;
+      }
+    }
+  }
   const { tree, headId, report } = sanitizeMessageTree(rawTree, headInput);
 
   // Backfill/refresh per-message tokenCount. A count is refreshed when it's MISSING

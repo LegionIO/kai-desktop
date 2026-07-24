@@ -92,6 +92,16 @@ describe('resolveConversationTokenization', () => {
     }
     expect(base('gpt-4')).not.toBe(base('gpt-5')); // legacy gpt-4 → cl100k, different base
   });
+
+  it('derives the base from the RESOLVED encoding, so davinci models are not mislabeled o200k', () => {
+    const base = (m: string) => resolveConversationTokenization(m).encodingBaseName;
+    // These are recognized by tiktoken with NON-o200k bases; a name regex would
+    // have wrongly labeled them o200k and let the gate trust o200k cached counts.
+    expect(base('text-davinci-003')).not.toBe(base('gpt-5')); // p50k_base
+    expect(base('davinci-002')).not.toBe(base('gpt-5')); // cl100k_base
+    // A non-tiktoken model (gemini) resolves to the gpt-5 o200k fallback → canonical.
+    expect(base('gemini-1.5-pro')).toBe(base('gpt-5'));
+  });
 });
 
 describe('estimateSerializedTokens (cheap pre-check, no WASM)', () => {
@@ -346,6 +356,18 @@ describe('encode cap (main-thread freeze backstop)', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
     const small = 'hello world '.repeat(10);
     expect(encodeCappedWith(small, enc)).toBe(enc.encode(small).length);
+  });
+
+  it('does NOT throw on reserved-marker content (<|endoftext|>) — byte-ceiling fallback', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // Raw tiktoken.encode() throws on this literal marker; encodeCapped must catch
+    // and fall back so the write/append path never fails to persist the turn.
+    const withMarker = 'here is a literal <|endoftext|> marker in user content';
+    expect(() => encodeCappedWith(withMarker, enc)).not.toThrow();
+    expect(encodeCappedWith(withMarker, enc)).toBeGreaterThan(0);
+    // And via the per-message path (computeMessageCount / countMessageTokensCanonical).
+    expect(() => countMessageTokensCanonical({ role: 'user', content: withMarker })).not.toThrow();
+    expect(countMessageTokensCanonical({ role: 'user', content: withMarker })!).toBeGreaterThan(0);
   });
 
   it('falls back to a TRUE-UPPER-BOUND char count above the cap instead of encoding', () => {

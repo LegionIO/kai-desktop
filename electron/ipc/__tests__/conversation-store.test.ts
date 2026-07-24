@@ -552,6 +552,28 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(out.headId).toBe('a1');
     expect((out.messages as Array<{ id: string }>).map((m) => m.id)).toContain('u1');
   });
+
+  it('preserves history when the OMITTED head coincides with an id-less LAST node', () => {
+    // Legacy record: head omitted AND the final tree entry lacks an id (dropped by
+    // sanitize). The head must resolve to the last VALID-id node, not null — else
+    // the branch would be rebuilt empty and earlier valid history hidden.
+    const conv = {
+      id: 'legacy-idless-tail',
+      messageTree: [
+        { id: 'u1', role: 'user', parentId: null, content: 'first' },
+        { id: 'a1', role: 'assistant', parentId: 'u1', content: 'answer' },
+        { role: 'assistant', parentId: 'a1', content: 'no id here' }, // id-less tail → dropped
+      ],
+      // headId omitted
+      messages: [],
+      messageCount: 0,
+      userMessageCount: 0,
+    } as unknown as ConversationRecord;
+    const out = sanitizeConversationTree(conv);
+    expect(out.headId).toBe('a1'); // last VALID-id node, not null
+    expect(out.messageCount).toBeGreaterThan(0);
+    expect((out.messages as Array<{ id: string }>).map((m) => m.id)).toEqual(['u1', 'a1']);
+  });
 });
 
 describe('writeConversation repairs a corrupt tree at the write chokepoint', () => {
