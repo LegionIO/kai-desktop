@@ -408,6 +408,27 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(out[0].id).toBe('u1');
   });
 
+  it('sanitizes a two-full-snapshot tree (every id duplicated) in BOUNDED time (no O(n^2))', () => {
+    // Two complete snapshots → every id appears twice; a growing-array includes()
+    // for dedup reporting would be O(n^2). Build a large such tree and assert it
+    // sanitizes quickly and reports each duplicated id once.
+    const N = 5000;
+    const snapshot: Array<Record<string, unknown>> = [];
+    let parent: string | null = null;
+    for (let i = 0; i < N; i++) {
+      const id = `m${i}`;
+      snapshot.push({ id, role: i % 2 ? 'assistant' : 'user', parentId: parent, content: `msg ${i}` });
+      parent = id;
+    }
+    const tree = [...snapshot, ...snapshot.map((n) => ({ ...n }))]; // duplicate every id
+    const start = Date.now();
+    const { report } = sanitizeMessageTree(tree, `m${N - 1}`);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(1000); // bounded — Set-based dedup reporting, not O(n^2)
+    expect(report.dedupedIds.length).toBe(N); // each id reported once
+    expect(new Set(report.dedupedIds).size).toBe(report.dedupedIds.length); // no repeats
+  });
+
   it('clears a stale tokenCount on the merged node so it gets recomputed (content changed)', () => {
     const tree = [
       { id: 'u1', role: 'user', parentId: null, content: [{ type: 'text', text: 'hi' }], tokenCount: 5 },

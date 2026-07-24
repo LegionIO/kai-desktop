@@ -377,6 +377,22 @@ describe('countMessageTokensCanonical', () => {
     } as { role: string; content: string });
     expect(a).toBe(b);
   });
+
+  it('byte-ceilings a large PERIODIC message (>24 distinct) instead of a slow exact encode', () => {
+    // A periodic pattern with 25 distinct chars evades the distinct-char guard, but
+    // the content-independent per-message SIZE cap (32K) still byte-ceilings a ~100KB
+    // message so a pathological periodic input can't stall the main thread on append.
+    const periodic = 'abcdefghijklmnopqrstuvwxy'.repeat(4000); // ~100K chars, 25 distinct
+    const count = countMessageTokensCanonical({ role: 'user', content: periodic })!;
+    // Byte ceiling ≈ serialized byte length (~100K), far above a real ~chars/4 count.
+    expect(count).toBeGreaterThan(periodic.length / 2);
+  });
+
+  it('still exact-counts a small message (under the per-message size cap)', () => {
+    const small = 'a normal short user message';
+    const count = countMessageTokensCanonical({ role: 'user', content: small })!;
+    expect(count).toBeLessThan(small.length); // real token count, not a byte ceiling
+  });
 });
 
 describe('encode cap (main-thread freeze backstop)', () => {

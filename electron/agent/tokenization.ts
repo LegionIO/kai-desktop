@@ -348,6 +348,19 @@ function looksRepetitive(s: string): boolean {
 const SAFE_EXACT_ENCODE_CHARS = 1_500_000;
 
 /**
+ * Content-INDEPENDENT per-message exact-encode cap. No distinct-char / run heuristic
+ * is complete — a periodic input just above the distinct threshold (e.g.
+ * `'abc…xy'.repeat(N)`, 25 distinct) can still make tiktoken pathological on some
+ * builds. Since every message is counted synchronously on the main thread as it's
+ * persisted, cap the per-message exact encode by SIZE regardless of content: a
+ * message whose serialized projection exceeds this many chars byte-ceilings instead
+ * of encoding. ~32K chars encodes fast even worst-case; the byte ceiling above it is
+ * a safe over-estimate. (The COMPACTION whole-branch path uses the higher
+ * MAX_SYNC_ENCODE_CHARS cap for accuracy — it runs rarely and is guarded too.)
+ */
+const MAX_PER_MESSAGE_EXACT_CHARS = 32_768;
+
+/**
  * Exact token count of a serialized string via tiktoken, UNLESS encoding it
  * synchronously would risk blocking the main thread, in which case fall back to
  * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
@@ -605,7 +618,16 @@ export function computeMessageCount(message: TokenBearingMessage): {
     canonicalEncoding = resolveEncodingForModel('gpt-5');
   }
   if (!canonicalEncoding) return { count: undefined, sig };
-  return { count: encodeCapped(serializeForTokenCounting(messageTokenProjection(message)), canonicalEncoding), sig };
+  // Per-message path: cap the exact encode at the low content-independent size so a
+  // large/periodic single message can't stall the main thread on append.
+  return {
+    count: encodeCapped(
+      serializeForTokenCounting(messageTokenProjection(message)),
+      canonicalEncoding,
+      MAX_PER_MESSAGE_EXACT_CHARS,
+    ),
+    sig,
+  };
 }
 
 /** Back-compat: just the canonical count (see {@link computeMessageCount}). */

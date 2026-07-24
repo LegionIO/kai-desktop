@@ -402,6 +402,10 @@ export function sanitizeMessageTree(
   headId: string | null | undefined,
 ): { tree: TreeNodeLike[]; headId: string | null; report: TreeSanitizeReport } {
   const report: TreeSanitizeReport = { changed: false, dedupedIds: [], cycleBrokenIds: [], headRepointed: false };
+  // O(1) membership for report de-duplication — a growing-array `.includes()` per
+  // repeated id would be O(n²) for a tree of two full duplicate snapshots.
+  const dedupedIdSet = new Set<string>();
+  const cycleBrokenIdSet = new Set<string>();
   const input = Array.isArray(rawTree) ? (rawTree as TreeNodeLike[]) : [];
 
   // ── Pass 1: dedupe by id, merging content of repeated ids ──
@@ -436,7 +440,10 @@ export function sanitizeMessageTree(
     // message, so MERGE by union instead: keep every distinct part, de-duplicating
     // array parts by toolCallId (or structural identity) and not repeating an
     // identical text/string.
-    if (!report.dedupedIds.includes(id)) report.dedupedIds.push(id);
+    if (!dedupedIdSet.has(id)) {
+      dedupedIdSet.add(id);
+      report.dedupedIds.push(id);
+    }
     report.changed = true;
     existing.content = mergeSnapshotContent(existing.content, node.content);
     // Snapshots may DISAGREE on parentId (the inject-corruption shape: one points
@@ -529,7 +536,10 @@ export function sanitizeMessageTree(
         // Back-edge: `cur` closes a cycle. Detach it so the chain terminates.
         const node = byId.get(cur)!;
         node.parentId = null;
-        if (!report.cycleBrokenIds.includes(cur)) report.cycleBrokenIds.push(cur);
+        if (!cycleBrokenIdSet.has(cur)) {
+          cycleBrokenIdSet.add(cur);
+          report.cycleBrokenIds.push(cur);
+        }
         report.changed = true;
         break;
       }
