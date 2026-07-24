@@ -190,8 +190,13 @@ export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
  * has no boundaries yet is exactly the danger).
  */
 const MAX_ENCODE_RUN = 8_192;
-/** Longest run of a single identical character in `s`. Cheap single O(n) scan;
- *  used to skip the encode for pathological repeated content. */
+/** Above this length, a low DISTINCT-character count is treated as repetitive
+ *  (any pattern — 'a'…, 'ab'…, '😀'… all use few distinct UTF-16 code units) and
+ *  the encode is skipped. Normal prose/JSON has hundreds of distinct code units. */
+const REPETITIVE_LEN_THRESHOLD = 16_384;
+const REPETITIVE_MAX_DISTINCT = 64;
+
+/** Longest run of a single identical character in `s`. Cheap single O(n) scan. */
 function longestCharRun(s: string): number {
   let best = 0;
   let cur = 0;
@@ -213,23 +218,41 @@ function longestCharRun(s: string): number {
 }
 
 /**
+ * Cheap detector for LARGE REPETITIVE content of ANY pattern (not just a single
+ * repeated char): scans distinct UTF-16 code units and bails as soon as more than
+ * REPETITIVE_MAX_DISTINCT are seen. A repeated multi-char pattern ('ab'…) or emoji
+ * ('😀'… = 2 units) still uses very few distinct units, so it's flagged, whereas
+ * real prose/JSON crosses the distinct-unit threshold almost immediately. O(n) with
+ * an early-out, so normal content costs ~64 iterations.
+ */
+function looksRepetitive(s: string): boolean {
+  if (s.length <= REPETITIVE_LEN_THRESHOLD) return false;
+  const seen = new Set<number>();
+  for (let i = 0; i < s.length; i++) {
+    seen.add(s.charCodeAt(i));
+    if (seen.size > REPETITIVE_MAX_DISTINCT) return false; // diverse → not repetitive
+  }
+  return true; // large + few distinct code units → repetitive
+}
+
+/**
  * Exact token count of a serialized string via tiktoken, UNLESS encoding it
  * synchronously would risk blocking the main thread, in which case fall back to
  * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
- * The encode is skipped when the string exceeds the hard char cap, OR when it
- * contains a long consecutive same-character RUN (> {@link MAX_ENCODE_RUN}) — the
- * input shape that makes tiktoken's merge search pathological — regardless of the
- * string's overall length. This is cost-aware, targeting the actual quadratic
- * trigger, so a repetitive prompt/tool result (any size) can't stall the UI. The
- * ceiling is a safe over-estimate for both the gate (maybe run the exact check,
- * never skip it) and budget-fit (drop more, never ship over-limit).
+ * The encode is skipped when the string (a) exceeds the hard char cap, (b) contains
+ * a long single-character RUN, or (c) is large with very few DISTINCT code units
+ * (repetitive of any multi-char pattern / emoji). These are the input shapes that
+ * make tiktoken's BPE merge search pathological (toward quadratic). Cost-aware, so
+ * a repetitive prompt/tool result can't stall the UI regardless of the pattern.
+ * The ceiling is a safe over-estimate for both the gate and budget-fit.
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
   if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
     return Buffer.byteLength(serialized, 'utf8');
   }
-  if (longestCharRun(serialized) > MAX_ENCODE_RUN) {
-    // Long repeated run → skip the potentially-quadratic BPE encode.
+  if (longestCharRun(serialized) > MAX_ENCODE_RUN || looksRepetitive(serialized)) {
+    // Long single-char run OR large low-diversity (repetitive multi-char/emoji)
+    // content → skip the potentially-quadratic BPE encode; use the byte ceiling.
     return Buffer.byteLength(serialized, 'utf8');
   }
   return encoding.encode(serialized).length;
@@ -286,10 +309,14 @@ export function countSerializedTokens(value: unknown, tokenization: Conversation
  * a signature check HERE would re-serialize the whole history every turn — exactly
  * the cost the accumulator exists to avoid (codex round 5).
  *
- * The sum runs slightly HIGH vs a single whole-array `encode()` (per-message
- * counts don't share BPE merges across `},{`, and the estimate is over-biased):
- * that only causes an unnecessary exact check, never skips a needed one.
+ * Per-message counts individually OMIT the array framing (outer `[` `]` and the
+ * inter-element `,`) that a whole-array encode includes, so a naive sum could sit
+ * a few tokens BELOW the authoritative count right at the trigger and wrongly skip
+ * compaction. We add a small conservative framing overhead per message so the sum
+ * stays a true upper bound (over-count only ever causes an unnecessary exact
+ * check, never skips a needed one).
  */
+const FRAMING_TOKENS_PER_MESSAGE = 4;
 export function sumBranchTokenCounts(
   messages: Array<{ tokenCount?: number; role?: unknown; content?: unknown }>,
 ): number {
@@ -305,6 +332,7 @@ export function sumBranchTokenCounts(
       // ceiling (≤ 1 token/byte for any BPE) never under-counts.
       sum += tokenProjectionByteCeiling(msg ?? {});
     }
+    sum += FRAMING_TOKENS_PER_MESSAGE; // account for array delimiters the per-msg count omits
   }
   return sum;
 }

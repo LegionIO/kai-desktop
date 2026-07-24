@@ -110,7 +110,8 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     ];
     for (const model of ['gpt-5', 'gpt-4o', 'gpt-4.1', 'o3', 'o4-mini']) {
       const res = shouldCompact(msgs, model, 0.85);
-      expect(res.usedTokens).toBe(30); // cached sum trusted for every o200k model
+      // 10 + 20 cached + 4 framing tokens/message (2 msgs) = 38.
+      expect(res.usedTokens).toBe(38); // cached sum (+framing) trusted for every o200k model
     }
   });
 

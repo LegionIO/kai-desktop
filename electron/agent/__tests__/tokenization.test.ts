@@ -202,7 +202,8 @@ describe('sumBranchTokenCounts', () => {
       { role: 'user', content: 'bb', tokenCount: 5 },
       { role: 'user', content: 'cc', tokenCount: 0 },
     ];
-    expect(sumBranchTokenCounts(msgs)).toBe(15);
+    // 10 + 5 + 0 cached + 4 framing tokens per message (3 msgs) = 27.
+    expect(sumBranchTokenCounts(msgs)).toBe(27);
   });
 
   it('does NOT re-serialize a message that has a valid cached count', () => {
@@ -216,7 +217,7 @@ describe('sumBranchTokenCounts', () => {
       },
     });
     expect(() => sumBranchTokenCounts([exploding])).not.toThrow();
-    expect(sumBranchTokenCounts([exploding])).toBe(7);
+    expect(sumBranchTokenCounts([exploding])).toBe(7 + 4); // cached count + framing overhead
   });
 
   it('falls back to an over-biased estimate for messages missing a count', () => {
@@ -251,6 +252,17 @@ describe('sumBranchTokenCounts', () => {
     // Per-message counts don't share BPE merges across delimiters, so the sum is
     // >= the whole-array encode. Never-skip property: gate value must not undercount.
     expect(summed).toBeGreaterThanOrEqual(exactWhole);
+  });
+
+  it('framing overhead keeps the sum an upper bound for a TINY branch (boundary case)', () => {
+    // The reviewer's 9-vs-11 case: a single {role,content:'x'} projection encodes to
+    // fewer tokens than the serialized 1-element array. The +framing must cover it.
+    const tokenization = resolveConversationTokenization('gpt-5');
+    const one = [{ role: 'user' as const, content: 'x' }];
+    const perMsgCount = countSerializedTokens(one[0], tokenization)!; // projection alone
+    const exactWhole = countSerializedTokens(one, tokenization)!; // serialized array
+    const summed = sumBranchTokenCounts([{ ...one[0], tokenCount: perMsgCount }]);
+    expect(summed).toBeGreaterThanOrEqual(exactWhole); // framing closes the gap
   });
 });
 
@@ -354,13 +366,30 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(encodeCappedWith(slashes, enc)).toBe(Buffer.byteLength(slashes, 'utf8'));
   });
 
-  it('STILL encodes a large NORMAL string (no long run) exactly', () => {
+  it('skips the encode for repeated MULTI-CHAR patterns and emoji (no single-char run)', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
-    // 300K of prose: longest same-char run is tiny → safe to encode exactly.
-    const prose = 'The quick brown fox jumps over the lazy dog. '.repeat(6700); // ~300K chars
-    expect(prose.length).toBeGreaterThan(200_000);
-    const capped = encodeCappedWith(prose, enc);
-    expect(capped).toBe(enc.encode(prose).length); // exact encode, not the ceiling
+    // 'ab'.repeat has max single-char run of 1, but is still repetitive → caught by
+    // the low-distinct-code-unit guard.
+    const ab = 'ab'.repeat(100_000);
+    expect(encodeCappedWith(ab, enc)).toBe(Buffer.byteLength(ab, 'utf8'));
+    // Emoji (2 UTF-16 units each) — no long identical run, few distinct units.
+    const emoji = '😀'.repeat(20_000);
+    expect(encodeCappedWith(emoji, enc)).toBe(Buffer.byteLength(emoji, 'utf8'));
+  });
+
+  it('STILL encodes a large DIVERSE string (real content, >64 distinct chars) exactly', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // Real large content is diverse (many distinct code units). Build ~250K chars of
+    // varied text so it clears the distinct-char threshold and is encoded exactly.
+    let diverse = '';
+    let i = 0;
+    while (diverse.length < 250_000) {
+      diverse += `Section ${i}: the value is ${(i * 2654435761) % 100000}, note-${String.fromCharCode(33 + (i % 90))} end.\n`;
+      i++;
+    }
+    expect(diverse.length).toBeGreaterThan(200_000);
+    const capped = encodeCappedWith(diverse, enc);
+    expect(capped).toBe(enc.encode(diverse).length); // exact encode, not the ceiling
   });
 
   it('classifies gpt-4.5-preview as the o200k base (keeps the fast cached-count path)', () => {
