@@ -18,11 +18,13 @@ export type ChatMessage = {
   tool_call_id?: string;
   /**
    * Cached per-message token count carried from the stored tree node (see
-   * StoredTreeMessage). When present, `shouldCompact` sums these instead of
-   * serializing + estimating the whole history each turn. Optional — missing
-   * counts fall back to a safe over-biased estimate.
+   * StoredTreeMessage). When present AND its signature still matches the content,
+   * `shouldCompact` sums these instead of serializing the whole history each turn.
+   * Optional — missing/mismatched counts fall back to a safe over-biased estimate.
    */
   tokenCount?: number;
+  /** Content signature validating {@link tokenCount} (see messageProjectionSig). */
+  tokenCountSig?: number;
 };
 
 function extractToolCallIds(message: ChatMessage): Set<string> {

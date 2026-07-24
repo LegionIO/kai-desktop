@@ -12,7 +12,7 @@ import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { resolveStreamConfig } from '../agent/model-catalog.js';
 import { compactConversationPrefix } from '../agent/compaction.js';
-import { countMessageTokensCanonical } from '../agent/tokenization.js';
+import { computeMessageCount } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
@@ -76,6 +76,14 @@ export type StoredTreeMessage = {
    * and `sumBranchTokenCounts` falls back to a cheap over-biased estimate.
    */
   tokenCount?: number;
+  /**
+   * Content signature (projection char length) captured when `tokenCount` was
+   * computed. `sumBranchTokenCounts` trusts the count only while this still
+   * matches the message's current content — so a same-id content rewrite (hook,
+   * redaction, plugin upsert) transparently invalidates the stale count. See
+   * `messageProjectionSig`.
+   */
+  tokenCountSig?: number;
 };
 
 export function ensureConversationTree(conv: ConversationRecord): {
@@ -153,17 +161,20 @@ export function appendConversationMessages(
   const usedIds = new Set(tree.map((message) => message.id));
   const appended: StoredTreeMessage[] = messages.map((m, i) => {
     const requestedId = typeof m.id === 'string' && m.id.length > 0 && !usedIds.has(m.id) ? m.id : undefined;
+    const { count, sig } = computeMessageCount(m);
     const node: StoredTreeMessage = {
       id: requestedId ?? `auto-msg-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`,
       role: m.role,
       content: m.content,
       parentId,
       createdAt: m.createdAt ?? now,
-      // Cache the exact per-message token count at creation (cheap — one small
-      // message). Summed over the branch to gate compaction without re-encoding
-      // the whole history each turn. undefined when no encoding is available;
-      // sumBranchTokenCounts then falls back to a safe over-biased estimate.
-      tokenCount: countMessageTokensCanonical(m),
+      // Cache the exact per-message token count + its content signature at
+      // creation (cheap — one small message). Summed over the branch to gate
+      // compaction without re-encoding the whole history each turn; the signature
+      // lets a later content rewrite invalidate the count. undefined count when no
+      // encoding is available → sumBranchTokenCounts falls back to the estimate.
+      tokenCount: count,
+      tokenCountSig: sig,
     };
     usedIds.add(node.id);
     parentId = node.id;
@@ -274,13 +285,15 @@ export function insertConversationMessageBefore(
       : `auto-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   if (usedIds.has(newId)) return conv; // already present — no-op
   const now = new Date().toISOString();
+  const { count: insCount, sig: insSig } = computeMessageCount(message);
   const node: StoredTreeMessage = {
     id: newId,
     role: message.role,
     content: message.content,
     parentId: target.parentId,
     createdAt: message.createdAt ?? now,
-    tokenCount: countMessageTokensCanonical(message),
+    tokenCount: insCount,
+    tokenCountSig: insSig,
   };
   const nextTree = tree.map((m) => (m.id === beforeId ? { ...m, parentId: newId } : m));
   nextTree.push(node);
@@ -555,9 +568,12 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       if (redacted.size > 0 && Array.isArray(nextConversation.messageTree)) {
         const nextTree = (nextConversation.messageTree as StoredTreeMessage[]).map((m) => {
           const r = redacted.get(m.id);
-          // Replacing content invalidates any cached tokenCount — drop it so the
-          // write chokepoint's backfill recomputes it for the redacted content.
-          return r ? { ...m, content: r.content, redactedByHook: true, tokenCount: undefined } : m;
+          // Replacing content invalidates any cached count. Drop count + signature
+          // so the write chokepoint's backfill recomputes both for the redacted
+          // content (and so a mismatched signature can't linger).
+          return r
+            ? { ...m, content: r.content, redactedByHook: true, tokenCount: undefined, tokenCountSig: undefined }
+            : m;
         });
         const nextBranch = getConversationBranch(nextTree, nextConversation.headId ?? null);
         nextConversation = { ...nextConversation, messageTree: nextTree, messages: nextBranch };
@@ -662,13 +678,15 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
       const content = Array.isArray(newContent)
         ? newContent
         : [{ type: 'text', text: typeof newContent === 'string' ? newContent : String(newContent ?? '') }];
+      const editedCount = computeMessageCount({ role: source.role, content });
       const edited: StoredTreeMessage = {
         id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         role: source.role,
         content,
         parentId: source.parentId,
         createdAt: new Date().toISOString(),
-        tokenCount: countMessageTokensCanonical({ role: source.role, content }),
+        tokenCount: editedCount.count,
+        tokenCountSig: editedCount.sig,
       };
       const nextTree = [...tree, edited];
       return { ok: true, conversation: commitTreeUpdate(conv, nextTree, edited.id) };

@@ -9,6 +9,7 @@ import {
 import {
   resolveConversationTokenization,
   countSerializedTokens,
+  messageProjectionSig,
   __clearExactTokenCacheForTests,
 } from '../tokenization';
 
@@ -101,13 +102,15 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
   });
 
   it('does NOT compact when summed tokenCounts stay below the trigger', () => {
-    const msgs: ChatMessage[] = [
-      { role: 'user', content: 'a', tokenCount: 10 },
-      { role: 'assistant', content: 'b', tokenCount: 20 },
+    const raw = [
+      { role: 'user' as const, content: 'a', tokenCount: 10 },
+      { role: 'assistant' as const, content: 'b', tokenCount: 20 },
     ];
+    // Attach matching signatures so the counts are trusted (summed, not estimated).
+    const msgs: ChatMessage[] = raw.map((m) => ({ ...m, tokenCountSig: messageProjectionSig(m) }));
     const res = shouldCompact(msgs, MODEL, 0.85);
     expect(res.shouldCompact).toBe(false);
-    expect(res.usedTokens).toBe(30); // reports the sum
+    expect(res.usedTokens).toBe(30); // reports the trusted sum
   });
 });
 

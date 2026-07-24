@@ -141,17 +141,17 @@ export function serializeForTokenCounting(value: unknown): string {
 
 /**
  * Hard cap (in characters of the serialized string) above which we must NOT call
- * the synchronous WASM `tiktoken.encode()` on the main thread. Encoding a
- * multi-megabyte string pegs one core for seconds and freezes the UI — this is
- * the exact failure the accumulator is designed to avoid, and this cap is the
- * backstop that guarantees it can never happen on ANY code path (compaction
- * budget-fit loop, final safety re-encode, one-shot counts), independent of
- * whether per-message counts are present. ~1.5M chars ≈ 375–500k tokens, well
- * beyond any real context window, so a legitimate in-window request is never
- * capped; only a pathological over-window history hits it and falls back to the
- * over-biased char estimate (safe: an over-estimate never skips a needed check).
+ * the synchronous WASM `tiktoken.encode()` on the main thread — a backstop so a
+ * PATHOLOGICAL history can never freeze the UI. It must sit ABOVE the largest
+ * legitimate context window's char-equivalent, or a valid in-window prefix would
+ * be over-estimated by the ceiling and compaction's budget-fit would wrongly
+ * no-op. The biggest current window is GPT-4.1 at 1,048,576 tokens ≈ ~4M chars
+ * of English; 8M chars (≈2M tokens) clears every real window, so only a truly
+ * pathological >8M-char history hits the ceiling. Encoding an ~8MB string once is
+ * bounded and rare — and the per-message accumulator means the whole-history
+ * exact encode is only reached when a branch genuinely nears the window.
  */
-export const MAX_SYNC_ENCODE_CHARS = 1_500_000;
+export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
 
 /**
  * Exact token count of a serialized string via tiktoken, UNLESS the string is
@@ -214,28 +214,42 @@ export function countSerializedTokens(value: unknown, tokenization: Conversation
 }
 
 /**
- * Sum of per-message cached token counts over a branch, with a cheap
- * over-biased char-estimate fallback for any message missing a `tokenCount`
- * (older messages, transformed content). This replaces the previous approach of
- * `JSON.stringify(whole history)` + estimate on EVERY turn — the accumulator is
- * an integer sum with no whole-array serialization on the hot path.
+ * Sum of per-message cached token counts over a branch, SIGNATURE-VALIDATED. A
+ * cached `tokenCount` is trusted only when the message's current projection
+ * signature matches the stored `tokenCountSig`; otherwise (missing count, or
+ * content changed under a stable id — a hook rewrite, redaction, or same-id
+ * plugin upsert) it falls back to the over-biased char estimate. This makes the
+ * accumulator self-validating: a stale count can never under-count and slip under
+ * the compaction gate, and no explicit invalidation is needed at mutation sites.
  *
- * The sum is intentionally allowed to run slightly HIGH versus a single
- * whole-array `encode()` (per-message counts don't share BPE merges across the
- * `},{` delimiters, and the fallback estimate is over-biased): the value gates
- * whether the exact/expensive path runs, and an over-count can only cause us to
- * check when we might have skipped — never the reverse. Each message is counted
- * with the SAME serialization used for the whole array (`JSON.stringify(msg)`),
- * so a per-message count is directly comparable.
+ * Unchanged messages (the common case) sum as integers with no whole-array
+ * serialization — the accumulator's O(1)-per-turn benefit. The signature check
+ * itself serializes only the small projection of a message that LACKS a valid
+ * cached count, not the whole history.
+ *
+ * The sum is intentionally allowed to run slightly HIGH vs a single whole-array
+ * `encode()` (per-message counts don't share BPE merges across `},{` delimiters,
+ * and the estimate is over-biased): the value only gates whether the exact path
+ * runs, and an over-count can only cause an unnecessary exact check, never skip a
+ * needed one.
  */
-export function sumBranchTokenCounts(messages: Array<{ tokenCount?: number; role?: unknown; content?: unknown }>): number {
+export function sumBranchTokenCounts(
+  messages: Array<{ tokenCount?: number; tokenCountSig?: number; role?: unknown; content?: unknown }>,
+): number {
   let sum = 0;
   for (const msg of messages) {
-    if (typeof msg?.tokenCount === 'number' && Number.isFinite(msg.tokenCount) && msg.tokenCount >= 0) {
-      sum += msg.tokenCount;
+    const count = msg?.tokenCount;
+    const sig = msg?.tokenCountSig;
+    if (
+      typeof count === 'number' &&
+      Number.isFinite(count) &&
+      count >= 0 &&
+      typeof sig === 'number' &&
+      sig === messageProjectionSig(msg ?? {})
+    ) {
+      sum += count;
     } else {
-      // Same `{ role, content }` projection the stored count uses, so a
-      // fallback-estimated message is comparable to a cached one.
+      // Missing/invalid count OR signature mismatch (content changed) → estimate.
       sum += estimateSerializedTokens(messageTokenProjection(msg ?? {}));
     }
   }
@@ -270,12 +284,44 @@ let canonicalEncoding: ModelEncoding | null | undefined;
 export function messageTokenProjection(message: { role?: unknown; content?: unknown }): { role: unknown; content: unknown } {
   return { role: message?.role, content: message?.content };
 }
-export function countMessageTokensCanonical(message: { role?: unknown; content?: unknown }): number | undefined {
+
+/**
+ * Cheap content SIGNATURE of a message's token-bearing projection — the char
+ * length of `serializeForTokenCounting({role,content})`. A cached `tokenCount`
+ * is only trustworthy while this signature is unchanged: if a hook, redaction, or
+ * same-id plugin upsert rewrites content, the projection length changes, the
+ * signature no longer matches, and `sumBranchTokenCounts` transparently ignores
+ * the stale count and re-estimates. This makes the count self-validating — no
+ * scattered explicit invalidation is needed at every mutation site, and a stale
+ * low count can never sneak under the compaction gate.
+ */
+export function messageProjectionSig(message: { role?: unknown; content?: unknown }): number {
+  return serializeForTokenCounting(messageTokenProjection(message)).length;
+}
+
+/**
+ * Canonical per-message exact count + its content signature, for the storage
+ * layer (no model name at append time; all mapped models alias to the gpt-5
+ * o200k encoding, which `resolveEncodingForModel` also falls back to). Counts the
+ * `{role,content}` projection only (stable across tree bookkeeping). Returns
+ * `{count: undefined}` when no encoding is available; `sig` is always returned so
+ * the caller can still store/compare it.
+ */
+export function computeMessageCount(message: { role?: unknown; content?: unknown }): {
+  count: number | undefined;
+  sig: number;
+} {
+  const sig = messageProjectionSig(message);
   if (canonicalEncoding === undefined) {
     canonicalEncoding = resolveEncodingForModel('gpt-5');
   }
-  if (!canonicalEncoding) return undefined;
-  return encodeCapped(serializeForTokenCounting(messageTokenProjection(message)), canonicalEncoding);
+  if (!canonicalEncoding) return { count: undefined, sig };
+  return { count: encodeCapped(serializeForTokenCounting(messageTokenProjection(message)), canonicalEncoding), sig };
+}
+
+/** Back-compat: just the canonical count (see {@link computeMessageCount}). */
+export function countMessageTokensCanonical(message: { role?: unknown; content?: unknown }): number | undefined {
+  return computeMessageCount(message).count;
 }
 
 /**

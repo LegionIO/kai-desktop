@@ -22,7 +22,7 @@ import {
 } from './conversations.js';
 import { readConversation, writeConversation } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
-import { stripDisplayOnlyParts, stripTokenCounts } from '../agent/message-sanitizer.js';
+import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
@@ -184,11 +184,12 @@ function persistRedactedUserTurn(appHome: string, conversationId: string, saniti
       typeof sanitizedContent === 'string' ? [{ type: 'text', text: sanitizedContent }] : sanitizedContent
     ) as never;
     (node as unknown as { redactedByHook?: boolean }).redactedByHook = true;
-    // Content replaced ⇒ any cached tokenCount is stale. Drop it so the write
-    // sanitizer's backfill recomputes it for the redacted content — the write
-    // sanitizer only backfills MISSING counts, and a CLI/headless turn may have no
-    // later renderer put to correct a stale value.
+    // Content replaced ⇒ the cached count's signature no longer matches. Clearing
+    // both count + signature makes the write sanitizer recompute them for the
+    // redacted content (belt-and-suspenders: sumBranchTokenCounts would already
+    // reject the count on signature mismatch).
     delete (node as unknown as { tokenCount?: number }).tokenCount;
+    delete (node as unknown as { tokenCountSig?: number }).tokenCountSig;
     conv.messageTree = tree as never;
     // Recompute the flat `messages` mirror of the active branch so exports/list
     // reflect the redaction immediately.
@@ -962,9 +963,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { conversationId };
       }
 
-      // A pre-send hook may have rewritten message content while preserving the
-      // stale cached tokenCount; strip counts so the compaction gate recomputes.
-      messages = stripTokenCounts(stripDisplayOnlyParts(hookResult.messages));
+      messages = stripDisplayOnlyParts(hookResult.messages);
       if (typeof hookResult.systemPrompt === 'string') {
         effectiveSystemPrompt = hookResult.systemPrompt;
         if (streamConfig) {
@@ -1023,9 +1022,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const beforeMsg = lastUserMessage(messages);
         const beforeContent = jsonStableString(beforeMsg?.content);
         const beforeUsers = countUsers(messages);
-        // A UserPromptSubmit modify hook may have rewritten content while keeping
-        // the stale cached tokenCount; strip so the compaction gate recomputes.
-        messages = stripTokenCounts(stripDisplayOnlyParts(next.messages));
+        messages = stripDisplayOnlyParts(next.messages);
         const afterMsg = lastUserMessage(messages);
         const afterContent = jsonStableString(afterMsg?.content);
         const afterUsers = countUsers(messages);

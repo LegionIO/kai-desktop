@@ -509,15 +509,93 @@ describe('writeConversation repairs a corrupt tree at the write chokepoint', () 
     } as unknown as ConversationRecord;
 
     const returned = writeConversation(appHome, conv);
-    const rtree = returned.messageTree as Array<{ id: string; tokenCount?: number }>;
+    const rtree = returned.messageTree as Array<{ id: string; tokenCount?: number; tokenCountSig?: number }>;
     for (const n of rtree) {
       expect(typeof n.tokenCount).toBe('number');
       expect(n.tokenCount).toBeGreaterThan(0);
+      expect(typeof n.tokenCountSig).toBe('number'); // signature stored alongside
     }
     // Persisted on disk too.
     const disk = readConversation(appHome, 'bf')!;
-    for (const n of disk.messageTree as Array<{ tokenCount?: number }>) {
+    for (const n of disk.messageTree as Array<{ tokenCount?: number; tokenCountSig?: number }>) {
       expect(typeof n.tokenCount).toBe('number');
+      expect(typeof n.tokenCountSig).toBe('number');
     }
+  });
+
+  it('backfill is idempotent — a node with a matching (count,sig) is not recomputed on re-persist', () => {
+    const base = {
+      id: 'idem',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: [{ id: 'u1', role: 'user', parentId: null, content: 'stable content' }],
+      headId: 'u1',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 1,
+      userMessageCount: 1,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    const first = writeConversation(appHome, base);
+    const firstNode = (first.messageTree as Array<{ tokenCount?: number; tokenCountSig?: number }>)[0];
+    expect(typeof firstNode.tokenCount).toBe('number');
+
+    // Re-persist the SAME (now count-bearing) record: nothing changed, so
+    // sanitizeConversationTree returns the same object reference (no re-encode).
+    const second = writeConversation(appHome, first);
+    expect(second).toBe(first);
+  });
+
+  it('backfill RECOMPUTES when content changed under the same id (signature mismatch)', () => {
+    // A node whose stored count/sig describe OLD, shorter content; current content
+    // is longer (a same-id plugin/hook rewrite). The sig no longer matches, so the
+    // stale count must be recomputed rather than trusted.
+    const staleSig = 5; // deliberately wrong for the current content
+    const conv = {
+      id: 'stale',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: [
+        {
+          id: 'u1',
+          role: 'user',
+          parentId: null,
+          content: 'this content is much longer than the stale signature implies',
+          tokenCount: 2,
+          tokenCountSig: staleSig,
+        },
+      ],
+      headId: 'u1',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 1,
+      userMessageCount: 1,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    const returned = writeConversation(appHome, conv);
+    const node = (returned.messageTree as Array<{ tokenCount?: number; tokenCountSig?: number }>)[0];
+    expect(node.tokenCount).not.toBe(2); // stale count replaced
+    expect(node.tokenCount).toBeGreaterThan(2); // recomputed for the longer content
+    expect(node.tokenCountSig).not.toBe(staleSig); // signature refreshed to match
   });
 });

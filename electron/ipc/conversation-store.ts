@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rename
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
-import { countMessageTokensCanonical } from '../agent/tokenization.js';
+import { computeMessageCount, messageProjectionSig } from '../agent/tokenization.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -340,6 +340,7 @@ export function sanitizeMessageTree(
     // backfill pass in sanitizeConversationTree recomputes it (a stale low count
     // could keep shouldCompact under its cheap gate and skip the exact check).
     delete (existing as { tokenCount?: unknown }).tokenCount;
+    delete (existing as { tokenCountSig?: unknown }).tokenCountSig;
   }
 
   const ids = new Set(order);
@@ -457,17 +458,30 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
 
   // Backfill per-message tokenCount for any node missing one. Interactive GUI
   // turns persist via conversations:put (bypassing appendConversationMessages, the
-  // only path that populated counts), so without this their branches lack counts
-  // and sumBranchTokenCounts re-serializes every message every turn — the hot-path
-  // cost the accumulator exists to avoid. Only nodes MISSING a count are encoded
-  // (nodes are immutable, so an existing count stays valid), keeping this cheap.
+  // Backfill/refresh per-message tokenCount. Recompute when the count is MISSING
+  // or when its stored signature no longer matches the node's current content (a
+  // same-id content rewrite by a plugin/hook/redaction). Interactive GUI turns
+  // persist via conversations:put (which bypassed the append-time population), so
+  // without this their nodes stay count-less and sumBranchTokenCounts re-serializes
+  // every message every turn — the freeze this accumulator exists to prevent. This
+  // is IDEMPOTENT: a node whose (count,sig) already matches its content is skipped,
+  // so repeated debounced puts don't re-encode the growing branch.
   let backfilled = 0;
   for (const node of tree) {
-    const n = node as TreeNodeLike & { tokenCount?: unknown };
-    if (typeof n.tokenCount !== 'number') {
-      const count = countMessageTokensCanonical({ role: n.role, content: n.content });
+    const n = node as TreeNodeLike & { tokenCount?: unknown; tokenCountSig?: unknown };
+    const sig = messageProjectionSig({ role: n.role, content: n.content });
+    const valid = typeof n.tokenCount === 'number' && typeof n.tokenCountSig === 'number' && n.tokenCountSig === sig;
+    if (!valid) {
+      const { count } = computeMessageCount({ role: n.role, content: n.content });
       if (typeof count === 'number') {
         n.tokenCount = count;
+        n.tokenCountSig = sig;
+        backfilled++;
+      } else if (n.tokenCountSig !== sig) {
+        // No encoding available, but keep the signature honest so a future
+        // encoding-available write recomputes rather than trusting a stale count.
+        n.tokenCountSig = sig;
+        delete n.tokenCount;
         backfilled++;
       }
     }
@@ -506,10 +520,11 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
     const prevMessages = Array.isArray(conv.messages) ? (conv.messages as TreeNodeLike[]) : [];
     const messages = prevMessages.map((m) => {
       const id = typeof m?.id === 'string' ? m.id : null;
-      const repaired = id ? byId.get(id) : undefined;
-      // Carry the backfilled tokenCount onto the message-branch copy if present.
-      return repaired && typeof (repaired as { tokenCount?: unknown }).tokenCount === 'number'
-        ? { ...m, tokenCount: (repaired as { tokenCount?: number }).tokenCount }
+      const repaired = id ? (byId.get(id) as (TreeNodeLike & { tokenCount?: unknown; tokenCountSig?: unknown }) | undefined) : undefined;
+      // Carry the backfilled count + signature onto the message-branch copy so the
+      // active-branch view agrees with the tree.
+      return repaired && typeof repaired.tokenCount === 'number'
+        ? { ...m, tokenCount: repaired.tokenCount, tokenCountSig: repaired.tokenCountSig }
         : m;
     });
     return { ...conv, messageTree: tree as unknown[], messages: messages as unknown[] };

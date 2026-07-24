@@ -8,6 +8,8 @@ import {
   serializeForTokenCounting,
   sumBranchTokenCounts,
   countMessageTokensCanonical,
+  computeMessageCount,
+  messageProjectionSig,
   encodeCappedWith,
   resolveEncodingForModel,
   MAX_SYNC_ENCODE_CHARS,
@@ -171,22 +173,45 @@ describe('gpt-5.5 + unknown-model context windows', () => {
 });
 
 describe('sumBranchTokenCounts', () => {
-  it('sums cached per-message tokenCount values', () => {
-    expect(sumBranchTokenCounts([{ tokenCount: 10 }, { tokenCount: 5 }, { tokenCount: 0 }])).toBe(15);
+  const sig = (m: { role?: unknown; content?: unknown }) => messageProjectionSig(m);
+
+  it('sums cached counts that carry a MATCHING signature', () => {
+    const msgs = [
+      { role: 'user', content: 'aa', tokenCount: 10 },
+      { role: 'user', content: 'bb', tokenCount: 5 },
+      { role: 'user', content: 'cc', tokenCount: 0 },
+    ].map((m) => ({ ...m, tokenCountSig: sig(m) }));
+    expect(sumBranchTokenCounts(msgs)).toBe(15);
+  });
+
+  it('IGNORES a count whose signature does not match (content changed) and estimates', () => {
+    // Stale count 3 with a signature for the OLD short content; current content is
+    // longer, so the sig no longer matches → the count is ignored and estimated.
+    const m = { role: 'user', content: 'hello world now much longer than before', tokenCount: 3, tokenCountSig: 5 };
+    const summed = sumBranchTokenCounts([m]);
+    expect(summed).not.toBe(3); // stale count NOT trusted
+    expect(summed).toBeGreaterThan(3); // estimate of the expanded content
+  });
+
+  it('trusts a count only with both a valid number AND a matching signature', () => {
+    const m = { role: 'user', content: 'hello world' };
+    const trusted = { ...m, tokenCount: 3, tokenCountSig: sig(m) };
+    expect(sumBranchTokenCounts([trusted])).toBe(3);
+    // Same count but NO signature → not trusted → estimate.
+    const noSig = sumBranchTokenCounts([{ ...m, tokenCount: 3 }]);
+    expect(noSig).toBeGreaterThan(0);
+    expect(noSig).not.toBe(3);
   });
 
   it('falls back to an over-biased estimate for messages missing a count', () => {
-    const withCount = sumBranchTokenCounts([{ role: 'user', content: 'hello world', tokenCount: 3 }]);
-    expect(withCount).toBe(3);
     const missing = sumBranchTokenCounts([{ role: 'user', content: 'hello world' }]);
-    // No count → estimate; estimate is a positive over-biased number.
     expect(missing).toBeGreaterThan(0);
   });
 
   it('ignores invalid (negative/NaN) counts and estimates instead', () => {
     const s = sumBranchTokenCounts([
-      { role: 'user', content: 'x', tokenCount: -4 },
-      { role: 'user', content: 'y', tokenCount: Number.NaN },
+      { role: 'user', content: 'x', tokenCount: -4, tokenCountSig: sig({ role: 'user', content: 'x' }) },
+      { role: 'user', content: 'y', tokenCount: Number.NaN, tokenCountSig: sig({ role: 'user', content: 'y' }) },
     ]);
     expect(s).toBeGreaterThan(0);
   });
@@ -197,7 +222,10 @@ describe('sumBranchTokenCounts', () => {
       { role: 'assistant' as const, content: 'A summary of the prior message with some detail.' },
       { role: 'user' as const, content: 'Another follow-up question about the topic at hand.' },
     ];
-    const withCounts = msgs.map((m) => ({ ...m, tokenCount: countMessageTokensCanonical(m) }));
+    const withCounts = msgs.map((m) => {
+      const { count, sig: s } = computeMessageCount(m);
+      return { ...m, tokenCount: count, tokenCountSig: s };
+    });
     const tokenization = resolveConversationTokenization('gpt-5');
     const exactWhole = countSerializedTokens(
       msgs.map((m) => ({ role: m.role, content: m.content })),
