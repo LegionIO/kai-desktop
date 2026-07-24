@@ -22,7 +22,7 @@ import {
 } from './conversations.js';
 import { readConversation, writeConversation } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
-import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
+import { stripDisplayOnlyParts, stripTokenCounts } from '../agent/message-sanitizer.js';
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
@@ -963,7 +963,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { conversationId };
       }
 
+      // If a pre-send hook actually replaced the messages array, its rewritten
+      // nodes may carry a now-stale cached tokenCount (spread from the original).
+      // Strip counts ONLY in that case — the read-side sum trusts tokenCount
+      // directly, so a stale one would under-count. When no hook modified anything
+      // (dispatch returns the same array reference), keep counts → accumulator fast
+      // path preserved. (Round-4 bug: this stripped unconditionally.)
+      const preSendModified = hookResult.messages !== (messages as HookMessage[]);
       messages = stripDisplayOnlyParts(hookResult.messages);
+      if (preSendModified) messages = stripTokenCounts(messages);
       if (typeof hookResult.systemPrompt === 'string') {
         effectiveSystemPrompt = hookResult.systemPrompt;
         if (streamConfig) {
@@ -1022,7 +1030,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const beforeMsg = lastUserMessage(messages);
         const beforeContent = jsonStableString(beforeMsg?.content);
         const beforeUsers = countUsers(messages);
+        // A modify hook that replaced the array may carry stale cached counts on
+        // its rewritten nodes; strip them so the read-side sum recomputes. Same
+        // reference ⇒ no modification ⇒ keep counts (accumulator fast path).
+        const promptModified = next.messages !== (messages as unknown[]);
         messages = stripDisplayOnlyParts(next.messages);
+        if (promptModified) messages = stripTokenCounts(messages);
         const afterMsg = lastUserMessage(messages);
         const afterContent = jsonStableString(afterMsg?.content);
         const afterUsers = countUsers(messages);

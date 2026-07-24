@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rename
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
-import { computeMessageCount, messageProjectionSig } from '../agent/tokenization.js';
+import { computeMessageCount, messageContentSig, tokenProjectionSerializedLength } from '../agent/tokenization.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -304,6 +304,46 @@ export type TreeSanitizeReport = {
  * Pure and cheap (linear passes); returns the possibly-repaired tree plus a
  * report. Exported for unit tests and reuse by a recovery pass.
  */
+/**
+ * Merge the content of two duplicate-id message snapshots without duplicating
+ * parts. The finalizer/renderer race produces two OVERLAPPING snapshots of one
+ * message; a blind concat would double text and repeat toolCallIds in the
+ * model-facing content. Strategy:
+ *  - Both arrays: union, keyed by a part identity (toolCallId when present, else a
+ *    JSON of the part), preserving first-seen order — so a part appearing in both
+ *    snapshots is kept once, and a part only in the second is appended.
+ *  - One array, one scalar: keep the array (the richer snapshot).
+ *  - Both scalar strings: keep the longer (the more complete snapshot); identical
+ *    strings collapse to one.
+ * Pure; exported for unit tests.
+ */
+export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    const seen = new Set<string>();
+    const out: unknown[] = [];
+    for (const part of [...a, ...b]) {
+      const key =
+        part && typeof part === 'object' && typeof (part as { toolCallId?: unknown }).toolCallId === 'string'
+          ? `tc:${(part as { toolCallId: string }).toolCallId}`
+          : `j:${(() => {
+              try {
+                return JSON.stringify(part);
+              } catch {
+                return String(part);
+              }
+            })()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(part);
+    }
+    return out;
+  }
+  if (Array.isArray(a)) return a;
+  if (Array.isArray(b)) return b;
+  if (typeof a === 'string' && typeof b === 'string') return b.length > a.length ? b : a;
+  return a ?? b;
+}
+
 export function sanitizeMessageTree(
   rawTree: unknown[],
   headId: string | null | undefined,
@@ -311,34 +351,40 @@ export function sanitizeMessageTree(
   const report: TreeSanitizeReport = { changed: false, dedupedIds: [], cycleBrokenIds: [], headRepointed: false };
   const input = Array.isArray(rawTree) ? (rawTree as TreeNodeLike[]) : [];
 
-  // ── Pass 1: dedupe by id, concatenating content of repeated ids ──
+  // ── Pass 1: dedupe by id, merging content of repeated ids ──
   const order: string[] = [];
   const byId = new Map<string, TreeNodeLike>();
   for (const node of input) {
-    if (!node || typeof node !== 'object') continue;
+    if (!node || typeof node !== 'object') {
+      report.changed = true; // dropping a malformed entry IS a repair — persist it
+      continue;
+    }
     const id = typeof node.id === 'string' && node.id.length > 0 ? node.id : null;
-    if (!id) continue; // drop id-less nodes — they can't be linked and break the walk
+    if (!id) {
+      // Drop id-less nodes (they can't be linked and break the branch walk). This
+      // is a structural repair, so mark changed — otherwise sanitizeConversationTree
+      // could return the ORIGINAL tree (still containing the bad node) and the write
+      // chokepoint wouldn't enforce its invariant.
+      report.changed = true;
+      continue;
+    }
     const existing = byId.get(id);
     if (!existing) {
       byId.set(id, { ...node, id });
       order.push(id);
       continue;
     }
-    // Duplicate id: same logical message split by a race; concatenate array
-    // contents so no tool call/text is lost. Keep the first-writer's parent edge
-    // (cycle repair below fixes it if bad).
+    // Duplicate id: the motivating finalizer/renderer race produces two OVERLAPPING
+    // SNAPSHOTS of the same message, usually with the same parts. Blindly
+    // concatenating would double text and repeat toolCallIds in the model-facing
+    // message, so MERGE by union instead: keep every distinct part, de-duplicating
+    // array parts by toolCallId (or structural identity) and not repeating an
+    // identical text/string.
     if (!report.dedupedIds.includes(id)) report.dedupedIds.push(id);
     report.changed = true;
-    const a = existing.content;
-    const b = node.content;
-    if (Array.isArray(a) && Array.isArray(b)) existing.content = [...a, ...b];
-    else if (Array.isArray(a)) {
-      /* keep a */
-    } else if (Array.isArray(b)) existing.content = b;
-    else if (typeof b === 'string' && typeof a === 'string' && b.length > a.length) existing.content = b;
-    // Content changed → any cached tokenCount is now stale. Clear it so the
-    // backfill pass in sanitizeConversationTree recomputes it (a stale low count
-    // could keep shouldCompact under its cheap gate and skip the exact check).
+    existing.content = mergeSnapshotContent(existing.content, node.content);
+    // Content may have changed → any cached count is stale; drop count+sig so the
+    // backfill recomputes (a stale low count could slip under the compaction gate).
     delete (existing as { tokenCount?: unknown }).tokenCount;
     delete (existing as { tokenCountSig?: unknown }).tokenCountSig;
   }
@@ -456,35 +502,57 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
       : conv.headId;
   const { tree, headId, report } = sanitizeMessageTree(rawTree, headInput);
 
-  // Backfill per-message tokenCount for any node missing one. Interactive GUI
-  // turns persist via conversations:put (bypassing appendConversationMessages, the
-  // Backfill/refresh per-message tokenCount. Recompute when the count is MISSING
-  // or when its stored signature no longer matches the node's current content (a
-  // same-id content rewrite by a plugin/hook/redaction). Interactive GUI turns
-  // persist via conversations:put (which bypassed the append-time population), so
-  // without this their nodes stay count-less and sumBranchTokenCounts re-serializes
-  // every message every turn — the freeze this accumulator exists to prevent. This
-  // is IDEMPOTENT: a node whose (count,sig) already matches its content is skipped,
-  // so repeated debounced puts don't re-encode the growing branch.
+  // Backfill/refresh per-message tokenCount. A count is refreshed when it's MISSING
+  // or its stored signature no longer matches the node's current content (a same-id
+  // rewrite). Two bounds keep the FIRST write of a large/legacy chat from freezing
+  // the main thread on a synchronous tiktoken sweep of the whole tree:
+  //   • only ACTIVE-BRANCH nodes are considered (inactive/shelved branches don't
+  //     affect the compaction gate, so they don't need counts);
+  //   • an AGGREGATE exact-encode budget — once the chars exactly-encoded this write
+  //     exceed BACKFILL_EXACT_CHAR_BUDGET, remaining nodes get the cheap over-biased
+  //     ESTIMATE (no tiktoken) as their count. The gate only needs a safe
+  //     over-estimate, and shouldCompact's own exact path still runs when it trips.
+  // Idempotent: a node whose (count,sig) already matches is skipped, so repeated
+  // debounced puts don't re-encode.
+  const BACKFILL_EXACT_CHAR_BUDGET = 1_500_000; // ~ one bounded encode worth per write
+  const activeIds = new Set<string>();
+  {
+    const byIdForBranch = new Map(tree.map((n) => [n.id as string, n] as const));
+    const seen = new Set<string>();
+    let cur: string | null = headId;
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      activeIds.add(cur);
+      const node = byIdForBranch.get(cur);
+      cur = node && typeof node.parentId === 'string' ? node.parentId : null;
+    }
+  }
   let backfilled = 0;
+  let exactCharsUsed = 0;
   for (const node of tree) {
     const n = node as TreeNodeLike & { tokenCount?: unknown; tokenCountSig?: unknown };
-    const sig = messageProjectionSig({ role: n.role, content: n.content });
+    if (n.id !== undefined && !activeIds.has(n.id as string)) continue; // skip inactive branches
+    const projection = { role: n.role, content: n.content };
+    const sig = messageContentSig(projection);
     const valid = typeof n.tokenCount === 'number' && typeof n.tokenCountSig === 'number' && n.tokenCountSig === sig;
-    if (!valid) {
-      const { count } = computeMessageCount({ role: n.role, content: n.content });
+    if (valid) continue;
+    const serializedLen = tokenProjectionSerializedLength(projection);
+    if (exactCharsUsed + serializedLen <= BACKFILL_EXACT_CHAR_BUDGET) {
+      // Within budget → exact count.
+      const { count } = computeMessageCount(projection);
       if (typeof count === 'number') {
         n.tokenCount = count;
         n.tokenCountSig = sig;
+        exactCharsUsed += serializedLen;
         backfilled++;
-      } else if (n.tokenCountSig !== sig) {
-        // No encoding available, but keep the signature honest so a future
-        // encoding-available write recomputes rather than trusting a stale count.
-        n.tokenCountSig = sig;
-        delete n.tokenCount;
-        backfilled++;
+        continue;
       }
     }
+    // Over budget (or no encoding) → cheap over-biased estimate, no tiktoken.
+    // length/3 matches estimateSerializedTokens' MIN_CHARS_PER_TOKEN bias.
+    n.tokenCount = Math.ceil(serializedLen / 3);
+    n.tokenCountSig = sig;
+    backfilled++;
   }
 
   if (!report.changed && backfilled === 0) return conv;

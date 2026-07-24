@@ -262,7 +262,7 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(headId).toBe('a1');
   });
 
-  it('merges a duplicate id by concatenating array content', () => {
+  it('merges a duplicate id by unioning distinct array parts', () => {
     const tree = [
       { id: 'u1', role: 'user', parentId: null, content: [{ type: 'text', text: 'hi' }] },
       { id: 'a1', role: 'assistant', parentId: 'u1', content: [{ type: 'tool-call', toolCallId: 't1' }] },
@@ -273,7 +273,37 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     const ids = out.map((n) => n.id);
     expect(ids.filter((i) => i === 'a1')).toHaveLength(1);
     const a1 = out.find((n) => n.id === 'a1')!;
-    expect((a1.content as unknown[]).length).toBe(2); // both tool-calls preserved
+    expect((a1.content as unknown[]).length).toBe(2); // both distinct tool-calls preserved
+  });
+
+  it('merges OVERLAPPING duplicate snapshots without doubling parts / repeating toolCallIds', () => {
+    // The finalizer/renderer race: two snapshots of ONE response sharing parts.
+    const shared = { type: 'tool-call', toolCallId: 't1' };
+    const text = { type: 'text', text: 'thinking' };
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: [{ type: 'text', text: 'q' }] },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [text, shared] },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: [text, shared, { type: 'tool-call', toolCallId: 't2' }] },
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'a1');
+    const a1 = out.find((n) => n.id === 'a1')!;
+    const parts = a1.content as Array<{ type?: string; toolCallId?: string; text?: string }>;
+    // Union, not concat: shared text + t1 appear once, t2 appended → 3 parts.
+    expect(parts.length).toBe(3);
+    const toolIds = parts.filter((p) => p.type === 'tool-call').map((p) => p.toolCallId);
+    expect(toolIds).toEqual(['t1', 't2']); // no repeated toolCallId
+    expect(parts.filter((p) => p.type === 'text')).toHaveLength(1); // text not doubled
+  });
+
+  it('records an id-less node drop as a structural repair (report.changed)', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'q' },
+      { role: 'assistant', parentId: 'u1', content: 'no id here' }, // id-less → dropped
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'u1');
+    expect(report.changed).toBe(true);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe('u1');
   });
 
   it('clears a stale tokenCount on the merged node so it gets recomputed (content changed)', () => {
@@ -597,5 +627,55 @@ describe('writeConversation repairs a corrupt tree at the write chokepoint', () 
     expect(node.tokenCount).not.toBe(2); // stale count replaced
     expect(node.tokenCount).toBeGreaterThan(2); // recomputed for the longer content
     expect(node.tokenCountSig).not.toBe(staleSig); // signature refreshed to match
+  });
+
+  it('first write of a huge count-less tree does BOUNDED work (estimate above budget, no freeze)', () => {
+    // Simulate a large legacy/upgraded chat: many count-less nodes whose aggregate
+    // size far exceeds the exact-encode budget. The write must still complete
+    // quickly by falling back to the cheap estimate for over-budget nodes rather
+    // than exact-encoding the whole active branch synchronously.
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(4500); // ~200KB realistic prose
+    const nodes: Array<Record<string, unknown>> = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 40; i++) {
+      // ~8MB of content total, well over the 1.5MB exact budget
+      const id = `m${i}`;
+      nodes.push({ id, role: i % 2 === 0 ? 'user' : 'assistant', parentId: parent, content: big });
+      parent = id;
+    }
+    const conv = {
+      id: 'huge',
+      title: null,
+      fallbackTitle: null,
+      messages: [],
+      messageTree: nodes,
+      headId: 'm39',
+      conversationCompaction: null,
+      lastContextUsage: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastMessageAt: null,
+      titleStatus: 'idle',
+      titleUpdatedAt: null,
+      messageCount: 40,
+      userMessageCount: 20,
+      runStatus: 'idle',
+      hasUnread: false,
+      lastAssistantUpdateAt: null,
+      selectedModelKey: null,
+    } as unknown as ConversationRecord;
+
+    const start = Date.now();
+    const returned = writeConversation(appHome, conv);
+    const elapsed = Date.now() - start;
+    // Bounded: must not synchronously exact-encode ~8MB (that's the freeze). A
+    // generous ceiling that a per-node estimate path clears easily but a full
+    // whole-tree tiktoken sweep would not.
+    expect(elapsed).toBeLessThan(3000);
+    // Every active node still gets SOME count (exact within budget, estimate after).
+    for (const n of returned.messageTree as Array<{ tokenCount?: number }>) {
+      expect(typeof n.tokenCount).toBe('number');
+      expect(n.tokenCount).toBeGreaterThan(0);
+    }
   });
 });

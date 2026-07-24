@@ -77,11 +77,12 @@ export type StoredTreeMessage = {
    */
   tokenCount?: number;
   /**
-   * Content signature (projection char length) captured when `tokenCount` was
-   * computed. `sumBranchTokenCounts` trusts the count only while this still
-   * matches the message's current content — so a same-id content rewrite (hook,
-   * redaction, plugin upsert) transparently invalidates the stale count. See
-   * `messageProjectionSig`.
+   * Collision-resistant content signature captured when `tokenCount` was computed
+   * (see `messageContentSig`). WRITE-side bookkeeping: the store recomputes the
+   * count when a node's content no longer matches this signature (a same-id
+   * rewrite by a hook/redaction/plugin upsert). Not read on the hot summing path
+   * — `sumBranchTokenCounts` trusts the stored count directly and the write
+   * boundary keeps it honest.
    */
   tokenCountSig?: number;
 };

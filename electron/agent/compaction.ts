@@ -23,7 +23,7 @@ export type ChatMessage = {
    * Optional — missing/mismatched counts fall back to a safe over-biased estimate.
    */
   tokenCount?: number;
-  /** Content signature validating {@link tokenCount} (see messageProjectionSig). */
+  /** Content signature validating {@link tokenCount} (see messageContentSig). */
   tokenCountSig?: number;
 };
 

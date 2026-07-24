@@ -214,42 +214,34 @@ export function countSerializedTokens(value: unknown, tokenization: Conversation
 }
 
 /**
- * Sum of per-message cached token counts over a branch, SIGNATURE-VALIDATED. A
- * cached `tokenCount` is trusted only when the message's current projection
- * signature matches the stored `tokenCountSig`; otherwise (missing count, or
- * content changed under a stable id — a hook rewrite, redaction, or same-id
- * plugin upsert) it falls back to the over-biased char estimate. This makes the
- * accumulator self-validating: a stale count can never under-count and slip under
- * the compaction gate, and no explicit invalidation is needed at mutation sites.
+ * Sum of per-message cached token counts over a branch — the INTEGER-ONLY hot
+ * path. A present, valid numeric `tokenCount` is trusted AS-IS (no per-message
+ * re-serialization), so a fully-counted branch sums with zero JSON.stringify.
+ * Only a message MISSING/invalid a count falls back to the over-biased char
+ * estimate.
  *
- * Unchanged messages (the common case) sum as integers with no whole-array
- * serialization — the accumulator's O(1)-per-turn benefit. The signature check
- * itself serializes only the small projection of a message that LACKS a valid
- * cached count, not the whole history.
+ * Correctness of "is a cached count still valid?" lives at the WRITE boundary,
+ * not here: the store recomputes count+signature whenever a node's content
+ * changes (append/edit/redact/plugin upsert — detected via `tokenCountSig`), and
+ * the send path strips counts off messages a transform hook actually rewrote. So
+ * by the time a message reaches this sum its `tokenCount` is authoritative. Doing
+ * a signature check HERE would re-serialize the whole history every turn — exactly
+ * the cost the accumulator exists to avoid (codex round 5).
  *
- * The sum is intentionally allowed to run slightly HIGH vs a single whole-array
- * `encode()` (per-message counts don't share BPE merges across `},{` delimiters,
- * and the estimate is over-biased): the value only gates whether the exact path
- * runs, and an over-count can only cause an unnecessary exact check, never skip a
- * needed one.
+ * The sum runs slightly HIGH vs a single whole-array `encode()` (per-message
+ * counts don't share BPE merges across `},{`, and the estimate is over-biased):
+ * that only causes an unnecessary exact check, never skips a needed one.
  */
 export function sumBranchTokenCounts(
-  messages: Array<{ tokenCount?: number; tokenCountSig?: number; role?: unknown; content?: unknown }>,
+  messages: Array<{ tokenCount?: number; role?: unknown; content?: unknown }>,
 ): number {
   let sum = 0;
   for (const msg of messages) {
     const count = msg?.tokenCount;
-    const sig = msg?.tokenCountSig;
-    if (
-      typeof count === 'number' &&
-      Number.isFinite(count) &&
-      count >= 0 &&
-      typeof sig === 'number' &&
-      sig === messageProjectionSig(msg ?? {})
-    ) {
+    if (typeof count === 'number' && Number.isFinite(count) && count >= 0) {
       sum += count;
     } else {
-      // Missing/invalid count OR signature mismatch (content changed) → estimate.
+      // Missing/invalid count → cheap over-biased estimate (never under-counts).
       sum += estimateSerializedTokens(messageTokenProjection(msg ?? {}));
     }
   }
@@ -285,18 +277,36 @@ export function messageTokenProjection(message: { role?: unknown; content?: unkn
   return { role: message?.role, content: message?.content };
 }
 
-/**
- * Cheap content SIGNATURE of a message's token-bearing projection — the char
- * length of `serializeForTokenCounting({role,content})`. A cached `tokenCount`
- * is only trustworthy while this signature is unchanged: if a hook, redaction, or
- * same-id plugin upsert rewrites content, the projection length changes, the
- * signature no longer matches, and `sumBranchTokenCounts` transparently ignores
- * the stale count and re-estimates. This makes the count self-validating — no
- * scattered explicit invalidation is needed at every mutation site, and a stale
- * low count can never sneak under the compaction gate.
- */
-export function messageProjectionSig(message: { role?: unknown; content?: unknown }): number {
+/** Serialized char length of a message's token-bearing projection — cheap (no
+ *  tiktoken), used to budget backfill work. */
+export function tokenProjectionSerializedLength(message: { role?: unknown; content?: unknown }): number {
   return serializeForTokenCounting(messageTokenProjection(message)).length;
+}
+
+/**
+ * Cheap COLLISION-RESISTANT content signature of a message's token-bearing
+ * projection: a 32-bit FNV-1a hash of `serializeForTokenCounting({role,content})`
+ * combined with its length. Used at the WRITE boundary to decide whether a cached
+ * `tokenCount` must be recomputed: if a hook, redaction, or same-id plugin upsert
+ * rewrites content, the hash changes and the write recomputes count+sig. A
+ * length-only signature would miss a same-length content swap (compressible text →
+ * token-dense Unicode), trusting a stale low count; the hash catches that. Not
+ * used on the read path (see sumBranchTokenCounts), so its per-message cost is
+ * paid only when a message is (re)written.
+ */
+export function messageContentSig(message: { role?: unknown; content?: unknown }): number {
+  const s = serializeForTokenCounting(messageTokenProjection(message));
+  // FNV-1a 32-bit over UTF-16 code units (cheap; collision-resistant enough to
+  // distinguish a same-length content rewrite). Mix in length as the low bits'
+  // companion so length-equal but hash-equal collisions are vanishingly unlikely.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  // Fold length in so two strings with a hash collision but different lengths
+  // still differ; keep it a non-negative 32-bit-ish integer.
+  return (h >>> 0) ^ (s.length * 0x9e3779b1);
 }
 
 /**
@@ -311,7 +321,7 @@ export function computeMessageCount(message: { role?: unknown; content?: unknown
   count: number | undefined;
   sig: number;
 } {
-  const sig = messageProjectionSig(message);
+  const sig = messageContentSig(message);
   if (canonicalEncoding === undefined) {
     canonicalEncoding = resolveEncodingForModel('gpt-5');
   }

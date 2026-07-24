@@ -9,7 +9,7 @@ import {
   sumBranchTokenCounts,
   countMessageTokensCanonical,
   computeMessageCount,
-  messageProjectionSig,
+  messageContentSig,
   encodeCappedWith,
   resolveEncodingForModel,
   MAX_SYNC_ENCODE_CHARS,
@@ -173,34 +173,27 @@ describe('gpt-5.5 + unknown-model context windows', () => {
 });
 
 describe('sumBranchTokenCounts', () => {
-  const sig = (m: { role?: unknown; content?: unknown }) => messageProjectionSig(m);
-
-  it('sums cached counts that carry a MATCHING signature', () => {
+  it('sums present numeric counts directly (integer-only fast path, no reserialize)', () => {
     const msgs = [
       { role: 'user', content: 'aa', tokenCount: 10 },
       { role: 'user', content: 'bb', tokenCount: 5 },
       { role: 'user', content: 'cc', tokenCount: 0 },
-    ].map((m) => ({ ...m, tokenCountSig: sig(m) }));
+    ];
     expect(sumBranchTokenCounts(msgs)).toBe(15);
   });
 
-  it('IGNORES a count whose signature does not match (content changed) and estimates', () => {
-    // Stale count 3 with a signature for the OLD short content; current content is
-    // longer, so the sig no longer matches → the count is ignored and estimated.
-    const m = { role: 'user', content: 'hello world now much longer than before', tokenCount: 3, tokenCountSig: 5 };
-    const summed = sumBranchTokenCounts([m]);
-    expect(summed).not.toBe(3); // stale count NOT trusted
-    expect(summed).toBeGreaterThan(3); // estimate of the expanded content
-  });
-
-  it('trusts a count only with both a valid number AND a matching signature', () => {
-    const m = { role: 'user', content: 'hello world' };
-    const trusted = { ...m, tokenCount: 3, tokenCountSig: sig(m) };
-    expect(sumBranchTokenCounts([trusted])).toBe(3);
-    // Same count but NO signature → not trusted → estimate.
-    const noSig = sumBranchTokenCounts([{ ...m, tokenCount: 3 }]);
-    expect(noSig).toBeGreaterThan(0);
-    expect(noSig).not.toBe(3);
+  it('does NOT re-serialize a message that has a valid cached count', () => {
+    // A content value whose serialization would throw if touched — proves the sum
+    // trusts the count without serializing/estimating it.
+    const exploding: Record<string, unknown> = { role: 'user', tokenCount: 7 };
+    Object.defineProperty(exploding, 'content', {
+      enumerable: true,
+      get() {
+        throw new Error('content must not be read when a valid count is present');
+      },
+    });
+    expect(() => sumBranchTokenCounts([exploding])).not.toThrow();
+    expect(sumBranchTokenCounts([exploding])).toBe(7);
   });
 
   it('falls back to an over-biased estimate for messages missing a count', () => {
@@ -210,8 +203,8 @@ describe('sumBranchTokenCounts', () => {
 
   it('ignores invalid (negative/NaN) counts and estimates instead', () => {
     const s = sumBranchTokenCounts([
-      { role: 'user', content: 'x', tokenCount: -4, tokenCountSig: sig({ role: 'user', content: 'x' }) },
-      { role: 'user', content: 'y', tokenCount: Number.NaN, tokenCountSig: sig({ role: 'user', content: 'y' }) },
+      { role: 'user', content: 'x', tokenCount: -4 },
+      { role: 'user', content: 'y', tokenCount: Number.NaN },
     ]);
     expect(s).toBeGreaterThan(0);
   });
@@ -235,6 +228,21 @@ describe('sumBranchTokenCounts', () => {
     // Per-message counts don't share BPE merges across delimiters, so the sum is
     // >= the whole-array encode. Never-skip property: gate value must not undercount.
     expect(summed).toBeGreaterThanOrEqual(exactWhole);
+  });
+});
+
+describe('messageContentSig', () => {
+  it('differs for same-LENGTH but different content (collision-resistant)', () => {
+    // A length-only signature would collide here; the hash must not.
+    const a = messageContentSig({ role: 'user', content: 'aaaaaaaaaa' });
+    const b = messageContentSig({ role: 'user', content: 'bbbbbbbbbb' });
+    expect(a).not.toBe(b);
+  });
+
+  it('is stable for identical content and changes when content changes', () => {
+    const base = { role: 'user', content: 'hello world' };
+    expect(messageContentSig(base)).toBe(messageContentSig({ ...base }));
+    expect(messageContentSig(base)).not.toBe(messageContentSig({ role: 'user', content: 'hello worlds' }));
   });
 });
 
