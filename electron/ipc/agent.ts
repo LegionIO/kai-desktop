@@ -41,6 +41,7 @@ import {
   estimateToolTokens,
   isStrictPrefix,
 } from '../agent/compaction.js';
+import { messageContentSig } from '../agent/tokenization.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { getAppHome } from '../local-bridge/paths.js';
@@ -1927,7 +1928,46 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
         // Check if compaction is needed (only if runtime supports it)
         if (compactionSupported && config.compaction.conversation.enabled && modelEntry) {
-          const chatMessages = messages as Array<{ role: string; content: unknown; id?: string }>;
+          const chatMessages = messages as Array<{
+            role: string;
+            content: unknown;
+            id?: string;
+            tokenCount?: number;
+            tokenCountSig?: number;
+          }>;
+
+          // The renderer sends its in-memory branch, whose locally-created nodes may
+          // lack the per-message tokenCount the store backfilled on the last put
+          // (RuntimeProvider doesn't round-trip the written record). Merge the
+          // persisted counts by id so the compaction gate stays on the integer-only
+          // fast path instead of re-serializing every message this turn.
+          try {
+            const persisted = readConversation(appHome, conversationId);
+            const persistedTree = persisted && Array.isArray(persisted.messageTree) ? persisted.messageTree : null;
+            if (persistedTree) {
+              const counts = new Map<string, { tokenCount?: number; tokenCountSig?: number }>();
+              for (const node of persistedTree as Array<{ id?: unknown; tokenCount?: number; tokenCountSig?: number }>) {
+                if (typeof node?.id === 'string' && typeof node.tokenCount === 'number') {
+                  counts.set(node.id, { tokenCount: node.tokenCount, tokenCountSig: node.tokenCountSig });
+                }
+              }
+              for (const m of chatMessages) {
+                if (typeof m.tokenCount !== 'number' && typeof m.id === 'string') {
+                  const c = counts.get(m.id);
+                  // Only adopt a persisted count whose signature matches THIS
+                  // message's current content — so a count persisted for older
+                  // content is never applied to a renderer copy the user/hook has
+                  // since changed (that would under/over-count silently).
+                  if (c && typeof c.tokenCountSig === 'number' && c.tokenCountSig === messageContentSig(m)) {
+                    m.tokenCount = c.tokenCount;
+                    m.tokenCountSig = c.tokenCountSig;
+                  }
+                }
+              }
+            }
+          } catch {
+            /* best-effort — the estimate fallback still keeps the gate safe */
+          }
 
           // Reuse a previously-persisted compaction when it still applies to this
           // branch, instead of re-summarizing the same prefix every turn. The

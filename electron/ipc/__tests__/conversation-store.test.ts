@@ -314,6 +314,24 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(merged[0].text).toBe('The answer is 42.');
   });
 
+  it('mergeSnapshotContent treats a same-tool-id result/text update as growth (no text dup)', () => {
+    // Partial: growing text + a tool call without a result. Final: grown text + the
+    // SAME tool call now with a result. isPrefixGrowth must accept this (monotonic)
+    // and return the fuller snapshot wholesale, NOT union (which duplicated text).
+    const partial = [
+      { type: 'text', text: 'Running' },
+      { type: 'tool-call', toolCallId: 't1', args: { q: 1 } },
+    ];
+    const final = [
+      { type: 'text', text: 'Running the query' },
+      { type: 'tool-call', toolCallId: 't1', args: { q: 1 }, result: 'OK' },
+    ];
+    const merged = mergeSnapshotContent(partial, final) as Array<{ type?: string; text?: string; result?: unknown }>;
+    expect(merged.filter((p) => p.type === 'text')).toHaveLength(1); // text not duplicated
+    expect(merged.find((p) => p.type === 'text')?.text).toBe('Running the query');
+    expect(merged.find((p) => p.type === 'tool-call')?.result).toBe('OK'); // fuller tool kept
+  });
+
   it('mergeSnapshotContent keeps DISTINCT segments where one merely starts-with another', () => {
     // Two legitimate, distinct assistant text segments around a tool call: "Checking"
     // then "Checking complete". A naive global prefix-collapse would drop "Checking";

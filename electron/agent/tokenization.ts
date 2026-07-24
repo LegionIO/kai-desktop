@@ -303,6 +303,14 @@ export function tokenProjectionSerializedLength(message: TokenBearingMessage): n
   return serializeForTokenCounting(messageTokenProjection(message)).length;
 }
 
+/** True TOKEN CEILING for a message's projection: UTF-8 byte length (byte-level
+ *  BPE emits ≤ 1 token per UTF-8 byte). Used when the exact encode is skipped
+ *  (over budget / no encoding) so the persisted estimate can never UNDER-count —
+ *  even for CJK / rare-Unicode / high-entropy content — and slip under the gate. */
+export function tokenProjectionByteCeiling(message: TokenBearingMessage): number {
+  return Buffer.byteLength(serializeForTokenCounting(messageTokenProjection(message)), 'utf8');
+}
+
 /**
  * Cheap COLLISION-RESISTANT content signature of a message's token-bearing
  * projection: a 32-bit FNV-1a hash of `serializeForTokenCounting({role,content})`

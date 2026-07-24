@@ -10,6 +10,8 @@ import {
   countMessageTokensCanonical,
   computeMessageCount,
   messageContentSig,
+  tokenProjectionByteCeiling,
+  tokenProjectionSerializedLength,
   encodeCappedWith,
   resolveEncodingForModel,
   MAX_SYNC_ENCODE_CHARS,
@@ -259,6 +261,18 @@ describe('messageContentSig', () => {
     // A change to tool_calls alone flips the signature.
     const changed = { ...withArgs, tool_calls: [{ id: 'c1', function: { name: 'run', arguments: '{}' } }] };
     expect(messageContentSig(changed)).not.toBe(messageContentSig(withArgs));
+  });
+});
+
+describe('tokenProjectionByteCeiling', () => {
+  it('is a true token ceiling (>= exact count) for CJK / token-dense content', () => {
+    const cjk = { role: 'user', content: '日本語のテキストをたくさん'.repeat(50) };
+    const ceiling = tokenProjectionByteCeiling(cjk);
+    const exact = countMessageTokensCanonical(cjk)!;
+    expect(ceiling).toBeGreaterThanOrEqual(exact); // never under-counts
+    // And strictly greater than the old length/3 estimate would be for CJK.
+    const projLen = tokenProjectionSerializedLength(cjk);
+    expect(ceiling).toBeGreaterThan(Math.ceil(projLen / 3));
   });
 });
 

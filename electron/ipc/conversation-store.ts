@@ -2,7 +2,12 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rename
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
-import { computeMessageCount, messageContentSig, tokenProjectionSerializedLength } from '../agent/tokenization.js';
+import {
+  computeMessageCount,
+  messageContentSig,
+  tokenProjectionSerializedLength,
+  tokenProjectionByteCeiling,
+} from '../agent/tokenization.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // On-disk layout (per-conversation files + a lightweight index)
@@ -342,8 +347,9 @@ export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
       }
     };
     // Is `shorter` a positional prefix-growth of `longer`? Each shared position must
-    // be identical OR (both text and longer's text starts with shorter's — the run
-    // grew). Extra trailing parts in `longer` are allowed (streamed later).
+    // be identical OR a monotonic growth: a text run that only grew, or the SAME
+    // tool part (same toolCallId) that gained a result / longer args. Extra trailing
+    // parts in `longer` are allowed (streamed later).
     const isPrefixGrowth = (shorter: unknown[], longer: unknown[]): boolean => {
       if (shorter.length > longer.length) return false;
       for (let i = 0; i < shorter.length; i++) {
@@ -353,6 +359,10 @@ export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
         const st = partText(s);
         const lt = partText(l);
         if (st !== null && lt !== null && lt.startsWith(st)) continue; // text run grew
+        const stc = toolId(s);
+        const ltc = toolId(l);
+        // Same tool position that gained a result / more args ⇒ monotonic growth.
+        if (stc !== null && stc === ltc && !(hasResult(s) && !hasResult(l)) && jstr(l).length >= jstr(s).length) continue;
         return false; // positional mismatch → not a clean growth
       }
       return true;
@@ -646,9 +656,11 @@ export function sanitizeConversationTree(conv: ConversationRecord): Conversation
         continue;
       }
     }
-    // Over budget (or no encoding) → cheap over-biased estimate, no tiktoken.
-    // length/3 matches estimateSerializedTokens' MIN_CHARS_PER_TOKEN bias.
-    n.tokenCount = Math.ceil(serializedLen / 3);
+    // Over budget (or no encoding) → skip tiktoken and persist a TRUE UPPER BOUND
+    // (UTF-8 byte length). Unlike length/3 this never under-counts token-dense
+    // content (CJK/Unicode) in the over-budget tail, so it can't slip under the
+    // compaction gate; the gate stays safe (over-estimate → maybe run exact check).
+    n.tokenCount = tokenProjectionByteCeiling(projection);
     n.tokenCountSig = sig;
     backfilled++;
   }
