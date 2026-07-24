@@ -273,13 +273,33 @@ export function countMessageTokens(message: unknown, tokenization: ConversationT
  * available.
  */
 let canonicalEncoding: ModelEncoding | null | undefined;
-export function messageTokenProjection(message: { role?: unknown; content?: unknown }): { role: unknown; content: unknown } {
-  return { role: message?.role, content: message?.content };
+/** A message shape carrying the fields that count toward tokens sent to the model. */
+export type TokenBearingMessage = {
+  role?: unknown;
+  content?: unknown;
+  tool_calls?: unknown;
+  tool_call_id?: unknown;
+};
+/**
+ * The MODEL-BEARING projection of a message used for counting + signatures.
+ * Includes not just `{role, content}` but also the legacy/plugin top-level
+ * `tool_calls` and `tool_call_id` fields, which are sent to the model and can
+ * carry large serialized arguments. Omitting them let a message with big
+ * top-level tool args under-count (sum below trigger → exact check skipped → an
+ * over-limit request), and a top-level tool_calls rewrite wouldn't change the
+ * signature. Only fields present are included, so a plain `{role, content}`
+ * message projects identically to before.
+ */
+export function messageTokenProjection(message: TokenBearingMessage): Record<string, unknown> {
+  const out: Record<string, unknown> = { role: message?.role, content: message?.content };
+  if (message?.tool_calls !== undefined) out.tool_calls = message.tool_calls;
+  if (message?.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
+  return out;
 }
 
 /** Serialized char length of a message's token-bearing projection — cheap (no
  *  tiktoken), used to budget backfill work. */
-export function tokenProjectionSerializedLength(message: { role?: unknown; content?: unknown }): number {
+export function tokenProjectionSerializedLength(message: TokenBearingMessage): number {
   return serializeForTokenCounting(messageTokenProjection(message)).length;
 }
 
@@ -294,7 +314,7 @@ export function tokenProjectionSerializedLength(message: { role?: unknown; conte
  * used on the read path (see sumBranchTokenCounts), so its per-message cost is
  * paid only when a message is (re)written.
  */
-export function messageContentSig(message: { role?: unknown; content?: unknown }): number {
+export function messageContentSig(message: TokenBearingMessage): number {
   const s = serializeForTokenCounting(messageTokenProjection(message));
   // FNV-1a 32-bit over UTF-16 code units (cheap; collision-resistant enough to
   // distinguish a same-length content rewrite). Mix in length as the low bits'
@@ -317,7 +337,7 @@ export function messageContentSig(message: { role?: unknown; content?: unknown }
  * `{count: undefined}` when no encoding is available; `sig` is always returned so
  * the caller can still store/compare it.
  */
-export function computeMessageCount(message: { role?: unknown; content?: unknown }): {
+export function computeMessageCount(message: TokenBearingMessage): {
   count: number | undefined;
   sig: number;
 } {
@@ -330,7 +350,7 @@ export function computeMessageCount(message: { role?: unknown; content?: unknown
 }
 
 /** Back-compat: just the canonical count (see {@link computeMessageCount}). */
-export function countMessageTokensCanonical(message: { role?: unknown; content?: unknown }): number | undefined {
+export function countMessageTokensCanonical(message: TokenBearingMessage): number | undefined {
   return computeMessageCount(message).count;
 }
 

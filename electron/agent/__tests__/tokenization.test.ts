@@ -244,6 +244,22 @@ describe('messageContentSig', () => {
     expect(messageContentSig(base)).toBe(messageContentSig({ ...base }));
     expect(messageContentSig(base)).not.toBe(messageContentSig({ role: 'user', content: 'hello worlds' }));
   });
+
+  it('accounts for top-level tool_calls (model-bearing) in the count and signature', () => {
+    const withArgs = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'c1', function: { name: 'run', arguments: JSON.stringify({ q: 'x'.repeat(2000) }) } }],
+    };
+    const withoutArgs = { role: 'assistant', content: '' };
+    // Big tool args must raise the count (otherwise it under-counts and can bypass
+    // the compaction gate) and change the signature.
+    expect(countMessageTokensCanonical(withArgs)!).toBeGreaterThan(countMessageTokensCanonical(withoutArgs)!);
+    expect(messageContentSig(withArgs)).not.toBe(messageContentSig(withoutArgs));
+    // A change to tool_calls alone flips the signature.
+    const changed = { ...withArgs, tool_calls: [{ id: 'c1', function: { name: 'run', arguments: '{}' } }] };
+    expect(messageContentSig(changed)).not.toBe(messageContentSig(withArgs));
+  });
 });
 
 describe('countMessageTokensCanonical', () => {

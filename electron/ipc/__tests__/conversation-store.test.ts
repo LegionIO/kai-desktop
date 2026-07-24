@@ -314,6 +314,46 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(merged[0].text).toBe('The answer is 42.');
   });
 
+  it('mergeSnapshotContent keeps DISTINCT segments where one merely starts-with another', () => {
+    // Two legitimate, distinct assistant text segments around a tool call: "Checking"
+    // then "Checking complete". A naive global prefix-collapse would drop "Checking";
+    // the positional model must keep BOTH when the snapshots are identical.
+    const snap = [
+      { type: 'text', text: 'Checking' },
+      { type: 'tool-call', toolCallId: 't1' },
+      { type: 'text', text: 'Checking complete' },
+    ];
+    const merged = mergeSnapshotContent(snap, [...snap]) as Array<{ type?: string; text?: string }>;
+    const texts = merged.filter((p) => p.type === 'text').map((p) => p.text);
+    expect(texts).toEqual(['Checking', 'Checking complete']); // both preserved
+  });
+
+  it('dedup picks the parent that keeps history connected when snapshots disagree', () => {
+    // The inject-corruption shape: assistant snapshot #1 parents on the injected
+    // user (a cycle), snapshot #2 parents on prior history. The merge must keep the
+    // node connected to prior history, not root it and orphan earlier messages.
+    const tree = [
+      { id: 'u0', role: 'user', parentId: null, content: 'first question' },
+      { id: 'a0', role: 'assistant', parentId: 'u0', content: 'first answer' },
+      { id: 'asst', role: 'assistant', parentId: 'inj', content: 'partial' }, // bad parent (→ inject)
+      { id: 'inj', role: 'user', parentId: 'asst', content: 'guiding' },
+      { id: 'asst', role: 'assistant', parentId: 'a0', content: 'partial more' }, // good parent (→ prior history)
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'inj');
+    const byId = new Map(out.map((n) => [n.id as string, n] as const));
+    // Walk up from inj → asst → should reach u0/a0 (prior history), NOT dead-end at a root.
+    const reach = new Set<string>();
+    let cur: string | null = 'inj';
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      reach.add(cur);
+      cur = (byId.get(cur)?.parentId as string | null) ?? null;
+    }
+    expect(reach.has('a0')).toBe(true); // earlier history is reachable
+    expect(reach.has('u0')).toBe(true);
+  });
+
   it('records an id-less node drop as a structural repair (report.changed)', () => {
     const tree = [
       { id: 'u1', role: 'user', parentId: null, content: 'q' },
