@@ -224,4 +224,32 @@ describe('invalidateStaleTokenCounts', () => {
     const msgs = [{ role: 'user', content: 'no count here' }];
     expect(invalidateStaleTokenCounts(msgs)).toBe(msgs);
   });
+
+  it('drops the count when top-level tool_calls changed but content did not', () => {
+    const base = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'c1', function: { name: 'run', arguments: '{"q":1}' } }],
+    };
+    const m: Record<string, unknown> = {
+      ...base,
+      tokenCount: 4,
+      tokenCountSig: messageContentSig(base), // sig over the FULL projection incl tool_calls
+    };
+    // A hook rewrites tool_calls (bigger args) but leaves content untouched.
+    m.tool_calls = [{ id: 'c1', function: { name: 'run', arguments: JSON.stringify({ q: 'x'.repeat(500) }) } }];
+    const out = invalidateStaleTokenCounts([m]) as Array<Record<string, unknown>>;
+    expect('tokenCount' in out[0]).toBe(false); // stale count dropped (tool_calls changed)
+  });
+
+  it('keeps the count when the full projection (incl tool_calls) is unchanged', () => {
+    const base = {
+      role: 'assistant',
+      content: 'answer',
+      tool_calls: [{ id: 'c1', function: { name: 'run', arguments: '{}' } }],
+    };
+    const m = { ...base, tokenCount: 9, tokenCountSig: messageContentSig(base) };
+    const out = invalidateStaleTokenCounts([m]) as Array<Record<string, unknown>>;
+    expect(out[0].tokenCount).toBe(9); // untouched → preserved
+  });
 });

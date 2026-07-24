@@ -104,8 +104,19 @@ export function invalidateStaleTokenCounts(messages: unknown[]): unknown[] {
     const rec = m as Record<string, unknown>;
     if (!('tokenCount' in rec)) return m; // nothing cached → nothing to invalidate
     const sig = rec.tokenCountSig;
+    // Validate against the FULL model-bearing projection (role, content AND
+    // top-level tool_calls / tool_call_id) — the same fields the stored count was
+    // computed from. Passing only {role, content} would miss a hook that rewrote
+    // tool_calls without touching content, wrongly trusting a stale count.
     const stillValid =
-      typeof sig === 'number' && sig === messageContentSig({ role: rec.role, content: rec.content });
+      typeof sig === 'number' &&
+      sig ===
+        messageContentSig({
+          role: rec.role,
+          content: rec.content,
+          tool_calls: rec.tool_calls,
+          tool_call_id: rec.tool_call_id,
+        });
     if (stillValid) return m;
     changed = true;
     const { tokenCount: _c, tokenCountSig: _s, ...rest } = rec;
