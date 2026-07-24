@@ -34,7 +34,7 @@ import { drainInjects, enqueueInject, hasInjects, listInjects, removeInject } fr
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
-  shouldCompact,
+  shouldCompactAsync,
   compactConversationPrefix,
   compactToolResult,
   splitPreservedFields,
@@ -1951,7 +1951,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const persistedTree = persisted && Array.isArray(persisted.messageTree) ? persisted.messageTree : null;
             if (persistedTree) {
               const counts = new Map<string, { tokenCount?: number; tokenCountSig?: number }>();
-              for (const node of persistedTree as Array<{ id?: unknown; tokenCount?: number; tokenCountSig?: number }>) {
+              for (const node of persistedTree as Array<{
+                id?: unknown;
+                tokenCount?: number;
+                tokenCountSig?: number;
+              }>) {
                 if (typeof node?.id === 'string' && typeof node.tokenCount === 'number') {
                   counts.set(node.id, { tokenCount: node.tokenCount, tokenCountSig: node.tokenCountSig });
                 }
@@ -2015,8 +2019,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Only adopt the reuse if the candidate still fits under the trigger;
               // if the branch has grown enough to need a NEW compaction, fall through
               // to recompute (which will overwrite the record + emit a new event).
-              const reuseCheck = shouldCompact(
-                candidate as Parameters<typeof shouldCompact>[0],
+              const reuseCheck = await shouldCompactAsync(
+                candidate as Parameters<typeof shouldCompactAsync>[0],
                 modelEntry.modelConfig.modelName,
                 config.compaction.conversation.triggerPercent,
                 modelEntry.modelConfig.maxInputTokens,
@@ -2030,8 +2034,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
           const check = reusedCompaction
             ? { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 }
-            : shouldCompact(
-                chatMessages as Parameters<typeof shouldCompact>[0],
+            : await shouldCompactAsync(
+                chatMessages as Parameters<typeof shouldCompactAsync>[0],
                 modelEntry.modelConfig.modelName,
                 config.compaction.conversation.triggerPercent,
                 modelEntry.modelConfig.maxInputTokens,

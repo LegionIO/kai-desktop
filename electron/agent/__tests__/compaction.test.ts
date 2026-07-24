@@ -4,6 +4,7 @@ import {
   selectProtectedTail,
   splitPreservedFields,
   shouldCompact,
+  shouldCompactAsync,
   type ChatMessage,
 } from '../compaction';
 import {
@@ -11,6 +12,7 @@ import {
   countSerializedTokens,
   sumBranchTokensForGate,
   __clearExactTokenCacheForTests,
+  __setTokenizerWorkerPathForTests,
 } from '../tokenization';
 
 describe('shouldCompact (cheap pre-check gate + exact count)', () => {
@@ -317,5 +319,54 @@ describe('splitPreservedFields (compaction-exempt tool-result fields)', () => {
     const { resultForCompaction, reattach } = splitPreservedFields(r);
     expect(resultForCompaction).toBe(r); // untouched
     expect(reattach('x')).toBe('x');
+  });
+});
+
+describe('shouldCompactAsync (off-thread exact recount, same result)', () => {
+  const MODEL = 'gpt-4o';
+  const window = 128000;
+
+  beforeEach(() => {
+    __clearExactTokenCacheForTests();
+    // Force the worker-unavailable path so the async recount uses the identical
+    // synchronous encoder — the numeric-parity guarantee for the send-path gate.
+    __setTokenizerWorkerPathForTests('/nonexistent/tokenizer-worker.mjs');
+  });
+
+  it('matches shouldCompact under the trigger (cheap gate, no worker touched)', async () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+    ];
+    const sync = shouldCompact(msgs, MODEL, 0.85);
+    __clearExactTokenCacheForTests();
+    const asyncRes = await shouldCompactAsync(msgs, MODEL, 0.85);
+    expect(asyncRes).toEqual(sync);
+    expect(asyncRes.shouldCompact).toBe(false);
+    expect(asyncRes.contextWindowTokens).toBe(window);
+  });
+
+  it('matches shouldCompact when genuinely over the trigger (exact recount reached)', async () => {
+    const trigger = 0.85;
+    const triggerTokens = Math.floor(window * trigger);
+    const tokenization = resolveConversationTokenization(MODEL);
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(30000);
+    const msgs: ChatMessage[] = [{ role: 'user', content: big }];
+    const exact = countSerializedTokens(msgs, tokenization)!;
+    expect(exact).toBeGreaterThan(triggerTokens);
+
+    __clearExactTokenCacheForTests();
+    const sync = shouldCompact(msgs, MODEL, trigger);
+    __clearExactTokenCacheForTests();
+    const asyncRes = await shouldCompactAsync(msgs, MODEL, trigger);
+    expect(asyncRes).toEqual(sync);
+    expect(asyncRes.shouldCompact).toBe(true);
+  });
+
+  it('matches shouldCompact for a fallback-tokenizer model (byte-ceiling gate, no worker)', async () => {
+    const msgs: ChatMessage[] = [{ role: 'user', content: 'x'.repeat(500000) }];
+    const sync = shouldCompact(msgs, 'claude-3-5-sonnet', 0.85);
+    const asyncRes = await shouldCompactAsync(msgs, 'claude-3-5-sonnet', 0.85);
+    expect(asyncRes).toEqual(sync);
   });
 });

@@ -92,6 +92,7 @@ import {
 } from './ipc/agents.js';
 import { listAllTasks } from './ipc/tasks.js';
 import { TaskDispatcher } from './agent/task-dispatcher.js';
+import { terminateTokenizerWorker } from './agent/tokenization.js';
 import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
 import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { TaskTerminalManager, registerTaskTerminalHandlers } from './terminal/task-terminal-manager.js';
@@ -2411,6 +2412,8 @@ app.on('before-quit', () => {
   closeAllOverlayWindows();
   closeAllApprovalWindows();
   taskTerminalManagerRef?.dispose();
+  // Stop the off-thread tokenizer worker (harmless no-op if never spawned).
+  terminateTokenizerWorker();
   flushOutputBuffers();
   taskDispatcherRef?.stop();
 });

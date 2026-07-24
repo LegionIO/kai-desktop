@@ -1,10 +1,13 @@
 import { randomUUID } from 'crypto';
 import {
   countBranchTokensCached,
+  countBranchTokensCachedAsync,
   resolveConversationTokenization,
   serializeForTokenCounting,
   sumBranchTokensForGate,
   encodeCappedWith,
+  encodeCappedWithAsync,
+  type ConversationTokenizationInfo,
 } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
 import { auxAgentGenerate } from './generate-fallback.js';
@@ -142,15 +145,32 @@ export function selectProtectedTail(
   return { boundaryIndex, protectedIds, protectedToolCallIds };
 }
 
-export function shouldCompact(
+export type ShouldCompactResult = { shouldCompact: boolean; usedTokens: number; contextWindowTokens: number };
+
+/**
+ * Shared cheap gate for {@link shouldCompact}/{@link shouldCompactAsync}. Runs
+ * everything that must stay SYNCHRONOUS on the caller thread — resolve
+ * tokenization, the byte-ceiling/cached-sum pre-check, and the fallback-encoding
+ * short-circuit — WITHOUT ever touching tiktoken's whole-branch encode.
+ *
+ * Returns `{ decided }` with a final result when the decision is settled without
+ * an exact recount (under trigger, or a non-canonical tokenizer where the byte
+ * ceiling is authoritative). Returns `{ decided: null, tokenization, triggerTokens }`
+ * when the exact whole-branch recount is still needed — which the sync path runs
+ * inline and the async path runs off-thread. This is the ONLY expensive step, and
+ * it's reached only when the cheap gate already tripped.
+ */
+function shouldCompactGate(
   messages: ChatMessage[],
   modelName: string,
   triggerPercent: number,
   contextWindowOverride?: number,
-): { shouldCompact: boolean; usedTokens: number; contextWindowTokens: number } {
+):
+  | { decided: ShouldCompactResult }
+  | { decided: null; tokenization: ConversationTokenizationInfo; triggerTokens: number } {
   const tokenization = resolveConversationTokenization(modelName, contextWindowOverride);
   if (!tokenization.encoding || !tokenization.contextWindowTokens) {
-    return { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 };
+    return { decided: { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 } };
   }
   const triggerTokens = Math.floor(tokenization.contextWindowTokens * triggerPercent);
 
@@ -160,41 +180,88 @@ export function shouldCompact(
   // under-count for a cl100k model and skip a needed compaction). Missing counts
   // fall back to an over-biased estimate. If even this safe sum is below the
   // trigger, the exact count must be too → skip tiktoken entirely (the common,
-  // hot-path case). Only when it reaches the trigger do we pay the exact count
-  // (memoized per branch, byte-capped so a pathological history can't freeze main).
+  // hot-path case). Only when it reaches the trigger do we pay the exact count.
   const summedTokens = sumBranchTokensForGate(messages, tokenization);
   if (summedTokens < triggerTokens) {
     return {
-      shouldCompact: false,
-      // Report the sum for context-usage telemetry; it's an upper bound.
-      usedTokens: summedTokens,
-      contextWindowTokens: tokenization.contextWindowTokens,
+      decided: {
+        shouldCompact: false,
+        // Report the sum for context-usage telemetry; it's an upper bound.
+        usedTokens: summedTokens,
+        contextWindowTokens: tokenization.contextWindowTokens,
+      },
     };
   }
 
   // For a model tiktoken does NOT recognize (Claude/Gemini/Bedrock/etc.), the only
   // local encoder is the o200k fallback — the WRONG tokenizer. Its exact count would
   // neither be authoritative (can undercount the provider and skip a needed
-  // compaction) nor cheap (a synchronous whole-history encode every send → freeze).
-  // So for these the byte-ceiling gate sum (a true upper bound, no encode) IS the
-  // authoritative value: decide from it directly, never o200k-recount. A RECOGNIZED
-  // model of ANY base (cl100k gpt-4, p50k davinci, o200k gpt-5) has its CORRECT
-  // encoder, so it falls through to the exact recount below — not the byte ceiling,
-  // which would over-count and compact it at a fraction of capacity.
+  // compaction) nor cheap (a whole-history encode every send). So for these the
+  // byte-ceiling gate sum (a true upper bound, no encode) IS the authoritative
+  // value: decide from it directly, never o200k-recount. A RECOGNIZED model of ANY
+  // base has its CORRECT encoder, so it falls through to the exact recount.
   if (tokenization.isFallbackEncoding) {
     return {
-      shouldCompact: summedTokens >= triggerTokens,
-      usedTokens: summedTokens,
-      contextWindowTokens: tokenization.contextWindowTokens,
+      decided: {
+        shouldCompact: summedTokens >= triggerTokens,
+        usedTokens: summedTokens,
+        contextWindowTokens: tokenization.contextWindowTokens,
+      },
     };
   }
 
+  return { decided: null, tokenization, triggerTokens };
+}
+
+/**
+ * Synchronous compaction gate. Kept for non-async callers and tests. The exact
+ * whole-branch recount (when reached) runs inline on the caller thread; on the
+ * main thread prefer {@link shouldCompactAsync} so that step goes off-thread.
+ */
+export function shouldCompact(
+  messages: ChatMessage[],
+  modelName: string,
+  triggerPercent: number,
+  contextWindowOverride?: number,
+): ShouldCompactResult {
+  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride);
+  if (gate.decided) return gate.decided;
+
+  const { tokenization, triggerTokens } = gate;
   const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
   const usedTokens = countBranchTokensCached(messages, tokenization, lastMessageId) ?? 0;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
-    contextWindowTokens: tokenization.contextWindowTokens,
+    contextWindowTokens: tokenization.contextWindowTokens ?? 0,
+  };
+}
+
+/**
+ * Off-main-thread compaction gate. The cheap gate above stays synchronous and
+ * short-circuits BEFORE any tiktoken work — so the common under-trigger case and
+ * the fallback-tokenizer case never await anything. Only when the exact
+ * whole-branch recount is genuinely needed does this await the tokenizer worker
+ * (see tokenizer-worker.ts): the main thread's event loop stays live while the
+ * CPU-bound encode runs off-thread, and a worker timeout/crash byte-ceilings
+ * rather than freezing the send path. Same numeric result as {@link shouldCompact}.
+ */
+export async function shouldCompactAsync(
+  messages: ChatMessage[],
+  modelName: string,
+  triggerPercent: number,
+  contextWindowOverride?: number,
+): Promise<ShouldCompactResult> {
+  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride);
+  if (gate.decided) return gate.decided;
+
+  const { tokenization, triggerTokens } = gate;
+  const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
+  const usedTokens = (await countBranchTokensCachedAsync(messages, tokenization, lastMessageId)) ?? 0;
+  return {
+    shouldCompact: usedTokens >= triggerTokens,
+    usedTokens,
+    contextWindowTokens: tokenization.contextWindowTokens ?? 0,
   };
 }
 
@@ -271,7 +338,7 @@ export async function compactConversationPrefix(
   let droppedForBudget = false;
   while (fittedPrefix.length > 0) {
     const candidatePromptText = serializeForTokenCounting(fittedPrefix);
-    const candidateTokens = encodeCappedWith(candidatePromptText, tokenization.encoding);
+    const candidateTokens = await encodeCappedWithAsync(candidatePromptText, tokenization);
     if (candidateTokens <= promptInputBudget) break;
     fittedPrefix.shift();
     droppedForBudget = true;
@@ -368,7 +435,7 @@ export async function compactConversationPrefix(
   // risk a provider hard-limit error). If it still doesn't fit, return the null
   // no-op — the turn proceeds on the full (uncompacted) context, preserving the
   // "null ⇒ no message loss" contract.
-  const compactedTokens = encodeCappedWith(serializeForTokenCounting(compactedMessages), tokenization.encoding);
+  const compactedTokens = await encodeCappedWithAsync(serializeForTokenCounting(compactedMessages), tokenization);
   if (compactedTokens > promptInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
