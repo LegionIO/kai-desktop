@@ -47,18 +47,37 @@ const MODEL_NORMALIZATION_RULES: Array<{ pattern: RegExp; normalized: string }> 
 const encodingCache = new Map<string, ModelEncoding>();
 
 /**
- * Conservative context window used when a model is not in
- * {@link MODEL_CONTEXT_WINDOWS} and the caller gave no explicit override. Two goals:
- * (1) never leave the window null (that disables compaction → unbounded growth →
- * the main-thread freeze); (2) don't ASSUME a large window for an unknown
- * OpenAI-compatible / local model — those are often 8K/32K, and assuming 128K means
- * compaction fires far too late and the provider rejects the over-window request.
- * So the fallback is deliberately SMALL: compacting early for a model that turns out
- * to be large is harmless (it just summarizes sooner), whereas compacting late for a
- * genuinely small model fails the request. A real catalog entry or `maxInputTokens`
- * override always takes priority over this floor.
+ * Fallback context window for a model that is not in {@link MODEL_CONTEXT_WINDOWS}
+ * and whose catalog entry omits `maxInputTokens`. Goals: (1) never leave the window
+ * null (that disables compaction → unbounded growth → the main-thread freeze);
+ * (2) don't cripple a supported LARGE-context provider — the config importer creates
+ * Google/Gemini and Anthropic/Claude entries without maxInputTokens, and an 8K
+ * assumption would compact them around ~6.5K, repeatedly summarizing a
+ * huge-context model; (3) don't ASSUME a large window for a truly unknown /local
+ * OpenAI-compatible model — those are often 8K/32K and assuming huge means
+ * compaction fires too late and the provider rejects the request.
+ *
+ * So: recognize common large-context model FAMILIES by name and give them a
+ * representative (conservative-within-family) window; fall back to a modest floor
+ * only for genuinely unrecognized names. A real catalog entry / maxInputTokens
+ * override always takes priority.
  */
-const DEFAULT_UNKNOWN_CONTEXT_WINDOW = 8192;
+const GENERIC_UNKNOWN_CONTEXT_WINDOW = 8192;
+function defaultWindowForModel(rawLowerName: string): number {
+  const n = rawLowerName;
+  // Gemini: 1.5/2.x are 1M+; use a conservative-but-large 128K so a Gemini entry
+  // without an explicit limit isn't compacted at 6.5K.
+  if (/gemini/.test(n)) return 128_000;
+  // Anthropic Claude: 200K standard.
+  if (/claude/.test(n)) return 200_000;
+  // Llama-3.1+/Mistral/Qwen/Command-R/DeepSeek etc. commonly 32K-128K; 32K middle.
+  if (/llama|mistral|mixtral|qwen|command-?r|deepseek/.test(n)) return 32_768;
+  // Modern OpenAI GPT / o-series that slipped the table → 128K floor.
+  if (/\bgpt-|\bo[0-9]/.test(n)) return 128_000;
+  // Genuinely unknown / small local model → modest floor (compact early rather than
+  // fail over-window).
+  return GENERIC_UNKNOWN_CONTEXT_WINDOW;
+}
 
 function normalizeModelBaseName(modelName: string): string {
   const trimmed = modelName.trim().toLowerCase();
@@ -147,7 +166,10 @@ export function resolveConversationTokenization(
   const contextWindowTokens =
     typeof contextWindowOverride === 'number' && Number.isFinite(contextWindowOverride) && contextWindowOverride > 0
       ? Math.floor(contextWindowOverride)
-      : (MODEL_CONTEXT_WINDOWS[normalizedModelName] ?? DEFAULT_UNKNOWN_CONTEXT_WINDOW);
+      : (MODEL_CONTEXT_WINDOWS[normalizedModelName] ??
+        // Family-aware fallback keyed on the raw (lowercased) name so a provider
+        // prefix like "google/gemini-1.5-pro" is still recognized.
+        defaultWindowForModel(String(modelName).toLowerCase()));
 
   const encodingModelName = MODEL_ENCODING_ALIASES[normalizedModelName] ?? normalizedModelName;
   const encoding = resolveEncodingForModel(encodingModelName);
@@ -190,11 +212,15 @@ export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
  * has no boundaries yet is exactly the danger).
  */
 const MAX_ENCODE_RUN = 8_192;
-/** Above this length, a low DISTINCT-character count is treated as repetitive
- *  (any pattern — 'a'…, 'ab'…, '😀'… all use few distinct UTF-16 code units) and
- *  the encode is skipped. Normal prose/JSON has hundreds of distinct code units. */
+/** Above this length, content using at most {@link REPETITIVE_MAX_DISTINCT}
+ *  distinct UTF-16 code units is treated as repetitive and the encode is skipped.
+ *  The threshold is LOW (16) on purpose: true repetition ('a'…, 'ab'…, '😀'…,
+ *  short-pattern loops) uses ≤ a handful of distinct units, whereas ordinary
+ *  English prose already uses ~27+ (lowercase) to ~37+ (mixed case + punctuation),
+ *  and code/base64 ~30+. A higher threshold (e.g. 64) would wrongly flag normal
+ *  prose as repetitive and byte-ceiling it, causing premature/lossy compaction. */
 const REPETITIVE_LEN_THRESHOLD = 16_384;
-const REPETITIVE_MAX_DISTINCT = 64;
+const REPETITIVE_MAX_DISTINCT = 16;
 
 /** Longest run of a single identical character in `s`. Cheap single O(n) scan. */
 function longestCharRun(s: string): number {

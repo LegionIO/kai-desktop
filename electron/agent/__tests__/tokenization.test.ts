@@ -65,11 +65,20 @@ describe('resolveConversationTokenization', () => {
     expect(win).toBeGreaterThan(0);
   });
 
-  it('uses a CONSERVATIVE (small) window for an unknown model — never assumes 128K', () => {
-    // A custom/local model with no declared limit is often 8K/32K; assuming 128K
-    // compacts too late and the provider rejects the over-window request.
+  it('uses a CONSERVATIVE (small) window for an unknown GENERIC/local model — never assumes 128K', () => {
+    // A custom/local model with no declared limit and no known family → small floor.
     const win = resolveConversationTokenization('some-local-llm-with-no-declared-limit').contextWindowTokens!;
     expect(win).toBeLessThanOrEqual(32768);
+  });
+
+  it('gives supported large-context FAMILIES a sensible window (not the 8K local floor)', () => {
+    // The config importer creates these without maxInputTokens; an 8K assumption
+    // would compact them at ~6.5K. Family heuristic must preserve their real scale.
+    expect(resolveConversationTokenization('google/gemini-1.5-pro').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
+    expect(resolveConversationTokenization('claude-3-5-sonnet').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
+    expect(resolveConversationTokenization('llama-3.1-70b').contextWindowTokens!).toBeGreaterThanOrEqual(32768);
+    // A genuinely unknown name still gets the small floor.
+    expect(resolveConversationTokenization('mystery-model-42').contextWindowTokens!).toBeLessThanOrEqual(8192);
   });
 
   it('classifies o200k models to the same base (fast path) and legacy gpt-4 to cl100k', () => {
@@ -390,6 +399,18 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(diverse.length).toBeGreaterThan(200_000);
     const capped = encodeCappedWith(diverse, enc);
     expect(capped).toBe(enc.encode(diverse).length); // exact encode, not the ceiling
+  });
+
+  it('does NOT flag ordinary lowercase ASCII prose as repetitive (encodes exactly)', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // ~112K chars of plain lowercase prose: ~27 distinct chars — must still encode
+    // exactly (a distinct threshold of 64 wrongly byte-ceilinged this → premature
+    // compaction). Token count is far below the char count.
+    const prose = 'the quick brown fox jumps over the lazy dog and then runs away very quickly indeed '.repeat(1350);
+    expect(prose.length).toBeGreaterThan(100_000);
+    const capped = encodeCappedWith(prose, enc);
+    expect(capped).toBe(enc.encode(prose).length); // exact, NOT byte ceiling
+    expect(capped).toBeLessThan(prose.length / 2); // real token count, not the byte count
   });
 
   it('classifies gpt-4.5-preview as the o200k base (keeps the fast cached-count path)', () => {
