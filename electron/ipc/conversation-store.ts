@@ -551,15 +551,33 @@ export function sanitizeMessageTree(
   // Only a non-null head whose id is absent from the tree is genuinely lost.
   const headWasNull = headId === null || headId === undefined;
   let head = typeof headId === 'string' && ids.has(headId) ? headId : null;
+  // Depth (distance to root, counting the node itself) MEMOIZED across nodes: many
+  // regeneration leaves share a long parent prefix, so walking each leaf's full
+  // chain independently would be O(n²) and could freeze a large-conversation write.
+  // Cycles are already broken in Pass 3; the on-stack guard is defensive.
+  const depthCache = new Map<string, number>();
   const depthReachable = (leaf: string): number => {
-    let d = 0;
-    const seen = new Set<string>();
+    const stack: string[] = [];
+    const onStack = new Set<string>();
     let cur: string | null = leaf;
-    while (cur !== null && !seen.has(cur)) {
-      seen.add(cur);
-      d++;
+    let base = 0;
+    while (cur !== null) {
+      const cached = depthCache.get(cur);
+      if (cached !== undefined) {
+        base = cached;
+        break;
+      }
+      if (onStack.has(cur)) break; // defensive: unexpected residual cycle
+      onStack.add(cur);
+      stack.push(cur);
       const node = byId.get(cur);
       cur = node && typeof node.parentId === 'string' ? node.parentId : null;
+    }
+    // Backfill depths for every node on the walked path (deepest-first).
+    let d = base;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      d += 1;
+      depthCache.set(stack[i], d);
     }
     return d;
   };

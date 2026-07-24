@@ -470,6 +470,31 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(headId).toBe('u2'); // deepest leaf
   });
 
+  it('repoints an invalid head in BOUNDED time with many shared-prefix leaves (no O(n^2))', () => {
+    // A long shared prefix + many regeneration leaves off the last node. A per-leaf
+    // full-chain walk would be O(n^2); memoized depths keep it O(n). Just assert it
+    // completes quickly and picks a deepest leaf.
+    const tree: Array<Record<string, unknown>> = [];
+    let parent: string | null = null;
+    const PREFIX = 4000;
+    for (let i = 0; i < PREFIX; i++) {
+      const id = `p${i}`;
+      tree.push({ id, role: i % 2 ? 'assistant' : 'user', parentId: parent, content: `m${i}` });
+      parent = id;
+    }
+    // 2000 leaves all hanging off the last prefix node.
+    const lastPrefix = parent;
+    for (let j = 0; j < 2000; j++) {
+      tree.push({ id: `leaf${j}`, role: 'assistant', parentId: lastPrefix, content: `leaf ${j}` });
+    }
+    const start = Date.now();
+    const { headId, report } = sanitizeMessageTree(tree, 'gone-head');
+    const elapsed = Date.now() - start;
+    expect(report.headRepointed).toBe(true);
+    expect(String(headId).startsWith('leaf')).toBe(true); // a deepest leaf
+    expect(elapsed).toBeLessThan(1000); // bounded — memoization prevents the O(n^2) stall
+  });
+
   it('preserves a DELIBERATELY null head (rewind through the first user turn)', () => {
     // conversations:rewind writes headId:null to mean "empty active branch, tree
     // kept as shelved history". This is valid, NOT corruption — the sanitizer must

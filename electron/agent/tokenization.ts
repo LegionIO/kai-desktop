@@ -72,8 +72,9 @@ function defaultWindowForModel(rawLowerName: string): number {
   if (/claude/.test(n)) return 200_000;
   // Llama-3.1+/Mistral/Qwen/Command-R/DeepSeek etc. commonly 32K-128K; 32K middle.
   if (/llama|mistral|mixtral|qwen|command-?r|deepseek/.test(n)) return 32_768;
-  // Modern OpenAI GPT / o-series that slipped the table → 128K floor.
-  if (/\bgpt-|\bo[0-9]/.test(n)) return 128_000;
+  // Modern OpenAI GPT / o-series / ChatGPT that slipped the table → 128K floor.
+  // NB `chatgpt-4o-latest` embeds "gpt" (no word boundary), so match chatgpt too.
+  if (/\bgpt-|\bo[0-9]|chatgpt/.test(n)) return 128_000;
   // Genuinely unknown / small local model → modest floor (compact early rather than
   // fail over-window).
   return GENERIC_UNKNOWN_CONTEXT_WINDOW;
@@ -214,13 +215,15 @@ export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
 const MAX_ENCODE_RUN = 8_192;
 /** Above this length, content using at most {@link REPETITIVE_MAX_DISTINCT}
  *  distinct UTF-16 code units is treated as repetitive and the encode is skipped.
- *  The threshold is LOW (16) on purpose: true repetition ('a'…, 'ab'…, '😀'…,
- *  short-pattern loops) uses ≤ a handful of distinct units, whereas ordinary
- *  English prose already uses ~27+ (lowercase) to ~37+ (mixed case + punctuation),
- *  and code/base64 ~30+. A higher threshold (e.g. 64) would wrongly flag normal
- *  prose as repetitive and byte-ceiling it, causing premature/lossy compaction. */
+ *  NOTE this runs on the SERIALIZED string (JSON-wrapped message), whose wrapper
+ *  (`{"role":"user","content":"…"}`) already contributes ~14 distinct structural
+ *  chars. So the threshold must sit in the gap between "repetitive payload + JSON
+ *  wrapper" (measured ~16-18, up to ~22 for an 8-char pattern) and "real prose/code
+ *  + wrapper" (~31+): 24 catches every repetitive pattern while letting genuine
+ *  content encode exactly. (A lower value like 16 let `xyz…` slip past once wrapped;
+ *  a higher value like 64 wrongly flagged plain prose.) */
 const REPETITIVE_LEN_THRESHOLD = 16_384;
-const REPETITIVE_MAX_DISTINCT = 16;
+const REPETITIVE_MAX_DISTINCT = 24;
 
 /** Longest run of a single identical character in `s`. Cheap single O(n) scan. */
 function longestCharRun(s: string): number {

@@ -77,6 +77,8 @@ describe('resolveConversationTokenization', () => {
     expect(resolveConversationTokenization('google/gemini-1.5-pro').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
     expect(resolveConversationTokenization('claude-3-5-sonnet').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
     expect(resolveConversationTokenization('llama-3.1-70b').contextWindowTokens!).toBeGreaterThanOrEqual(32768);
+    // chatgpt-4o-latest embeds "gpt" without a word boundary — must still be 128K.
+    expect(resolveConversationTokenization('chatgpt-4o-latest').contextWindowTokens!).toBeGreaterThanOrEqual(128000);
     // A genuinely unknown name still gets the small floor.
     expect(resolveConversationTokenization('mystery-model-42').contextWindowTokens!).toBeLessThanOrEqual(8192);
   });
@@ -384,6 +386,23 @@ describe('encode cap (main-thread freeze backstop)', () => {
     // Emoji (2 UTF-16 units each) — no long identical run, few distinct units.
     const emoji = '😀'.repeat(20_000);
     expect(encodeCappedWith(emoji, enc)).toBe(Buffer.byteLength(emoji, 'utf8'));
+  });
+
+  it('catches repetitive content even after JSON message wrapping (raw payload few distinct)', () => {
+    const enc = resolveEncodingForModel('gpt-5')!;
+    // The guard runs on the SERIALIZED message; the JSON wrapper adds ~14 distinct
+    // chars, so a naive threshold of 16 let 'xyz…' slip past. Threshold 24 keeps it
+    // caught: the whole wrapped message must byte-ceiling.
+    const wrapped = JSON.stringify({ role: 'user', content: 'xyz'.repeat(6000) });
+    expect(wrapped.length).toBeGreaterThan(16_384);
+    expect(encodeCappedWith(wrapped, enc)).toBe(Buffer.byteLength(wrapped, 'utf8'));
+    // An 8-distinct-char pattern wrapped (~22 distinct) is still caught.
+    const wrapped8 = JSON.stringify({ role: 'user', content: 'abcdefgh'.repeat(3000) });
+    expect(encodeCappedWith(wrapped8, enc)).toBe(Buffer.byteLength(wrapped8, 'utf8'));
+    // …but wrapped PROSE (~31 distinct) still encodes exactly.
+    const wrappedProse = JSON.stringify({ role: 'user', content: 'The quick brown fox! It cost $42, yes? '.repeat(600) });
+    expect(wrappedProse.length).toBeGreaterThan(16_384);
+    expect(encodeCappedWith(wrappedProse, enc)).toBe(enc.encode(wrappedProse).length);
   });
 
   it('STILL encodes a large DIVERSE string (real content, >64 distinct chars) exactly', () => {
