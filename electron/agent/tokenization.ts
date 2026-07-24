@@ -767,6 +767,10 @@ type PendingEncode = {
   settle: (outcome: EncodeOutcome) => void;
   fallback: EncodeFallback;
   timer: ReturnType<typeof setTimeout>;
+  /** True once the owning turn aborted: the caller has already been settled via
+   *  the byte ceiling, and the entry survives ONLY to keep the watchdog armed
+   *  for the orphan worker job. No LIVE caller depends on it. */
+  detached: boolean;
 };
 
 let tokenizerWorker: Worker | null = null;
@@ -941,20 +945,27 @@ function encodeSerializedAsync(
       // other queued behind the same worker) via the byte ceiling.
       terminateStuckWorker(worker);
     }, WORKER_ENCODE_TIMEOUT_MS);
-    pendingEncodes.set(id, { settle, fallback, timer });
+    pendingEncodes.set(id, { settle, fallback, timer, detached: false });
 
-    // If the owning turn is cancelled/superseded AFTER submission, stop awaiting
-    // and settle THIS caller with the byte ceiling. We do NOT terminate the
-    // shared worker (it may be mid-encode for OTHER live conversations) and — key
-    // for the watchdog — we DELIBERATELY leave the pending entry and its timeout
-    // in place. The caller has its answer, but the orphan job's watchdog stays
-    // armed: if the worker is genuinely stuck on this (possibly pathological)
-    // encode, the timeout still fires terminateStuckWorker so it can't spin a CPU
-    // core forever; if the job completes normally, its result clears the timer.
-    // The idempotent settle() means the later result/timeout won't re-resolve the
+    // If the owning turn is cancelled/superseded AFTER submission, settle THIS
+    // caller with the byte ceiling and mark the entry DETACHED (no live caller
+    // depends on it anymore). Then: if NO other LIVE request depends on the
+    // worker, it's safe to force-terminate + respawn it right now — that frees
+    // the stale (possibly multi-megabyte / pathological) job immediately so a
+    // replacement turn doesn't queue behind it. If OTHER live requests are still
+    // in flight, we must NOT kill the shared worker (that would byte-ceiling
+    // their healthy encodes); the detached entry's watchdog stays armed so a
+    // genuinely stuck worker is still terminated when the timeout elapses. The
+    // idempotent settle() means a later result/timeout won't re-resolve the
     // caller. (An already-aborted signal was handled before submission above.)
     if (signal) {
-      onAbort = () => settle({ count: fallback.ceiling(), exact: false });
+      onAbort = () => {
+        const entry = pendingEncodes.get(id);
+        if (entry) entry.detached = true;
+        settle({ count: fallback.ceiling(), exact: false });
+        const hasLiveRequest = [...pendingEncodes.values()].some((p) => !p.detached);
+        if (!hasLiveRequest) terminateStuckWorker(worker);
+      };
       signal.addEventListener('abort', onAbort, { once: true });
     }
 

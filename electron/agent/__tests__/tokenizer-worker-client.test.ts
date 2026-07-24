@@ -249,7 +249,7 @@ describe('tokenizer worker client', () => {
     expect(asyncTokens).toBe(Buffer.byteLength(text, 'utf8'));
   });
 
-  it('on abort, byte-ceilings the caller WITHOUT killing the shared worker', async () => {
+  it('on abort with no other live request, frees the worker (terminate + respawn)', async () => {
     const messages = [{ role: 'user', content: 'superseded turn' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const controller = new AbortController();
@@ -261,19 +261,21 @@ describe('tokenizer worker client', () => {
 
     // Caller settles immediately via the byte ceiling (doesn't wait for the job).
     expect(await promise).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
-    // The shared worker is NOT terminated — it may be serving other live
-    // conversations; killing it would byte-ceiling their healthy encodes.
-    expect(w.terminated).toBe(false);
+    // No OTHER live request depends on the worker → free the stale job now so a
+    // replacement turn doesn't queue behind a possibly-huge encode.
+    expect(w.terminated).toBe(true);
 
-    // The next encode reuses the SAME worker (no respawn).
+    // The next encode spawns a fresh worker.
     const p2 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'next' }], tokenization, 'm2');
-    expect(FakeWorker.instances.length).toBe(1);
+    expect(FakeWorker.instances.length).toBe(2);
+    const w2 = FakeWorker.instances[1];
     await flush();
-    w.result(w.posted[w.posted.length - 1].id, 77);
+    w2.ready();
+    w2.result(w2.posted[0].id, 77);
     expect(await p2).toBe(77);
   });
 
-  it('aborting one request does not disturb another concurrent encode', async () => {
+  it('aborting one request does NOT disturb or kill the worker while another is live', async () => {
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const cA = new AbortController();
     const msgsA = [{ role: 'user', content: 'conversation A' }];
@@ -286,40 +288,35 @@ describe('tokenizer worker client', () => {
     const postedA = w.posted[0];
     const postedB = w.posted[1];
 
-    cA.abort(); // cancel A
-    // A byte-ceilings; B is untouched and still resolves with its real count.
+    cA.abort(); // cancel A — but B is still live, so the worker MUST NOT be killed
     expect(await pA).toBe(Buffer.byteLength(tok.serializeForTokenCounting(msgsA), 'utf8'));
+    expect(w.terminated).toBe(false);
     w.result(postedB.id, 123);
-    // A late result for the aborted A is harmless (id no longer pending → dropped).
+    // A late result for the aborted A is harmless (idempotent settle; entry dropped).
     w.result(postedA.id, 999);
     expect(await pB).toBe(123);
-    expect(w.terminated).toBe(false);
   });
 
-  it('keeps the watchdog armed after abort so a stuck worker is still terminated', async () => {
-    const messages = [{ role: 'user', content: 'aborted but worker wedged' }];
+  it('keeps the watchdog armed for a detached job while another request is live', async () => {
     const tokenization = tok.resolveConversationTokenization('gpt-5');
-    const controller = new AbortController();
-    const promise = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', controller.signal);
+    const cA = new AbortController();
+    const pA = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'A wedged' }], tokenization, 'a1', cA.signal);
+    const pB = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'B live' }], tokenization, 'b1');
     const w = FakeWorker.instances[0];
     await flush();
     w.ready();
-    controller.abort(); // caller bails, but the worker never answers (stuck)
-    expect(await promise).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
-    expect(w.terminated).toBe(false); // not killed on abort
+    cA.abort(); // A detaches; B still live → worker not killed yet
+    await pA;
+    expect(w.terminated).toBe(false);
 
-    // The orphan job's watchdog is still armed: a genuinely stuck worker gets
-    // force-terminated when the timeout elapses (can't spin a core forever).
+    // If the worker is genuinely stuck (never answers B either), the detached
+    // job's watchdog still force-terminates it when the timeout elapses.
     vi.advanceTimersByTime(20_000);
     expect(w.terminated).toBe(true);
-    // Next encode respawns a fresh worker.
-    const p2 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'after' }], tokenization, 'm2');
-    expect(FakeWorker.instances.length).toBe(2);
-    const w2 = FakeWorker.instances[1];
-    await flush();
-    w2.ready();
-    w2.result(w2.posted[0].id, 88);
-    expect(await p2).toBe(88);
+    // B settled via ceiling when the stuck worker was force-terminated.
+    expect(await pB).toBe(
+      Buffer.byteLength(tok.serializeForTokenCounting([{ role: 'user', content: 'B live' }]), 'utf8'),
+    );
   });
 
   it('byte-ceilings immediately (no worker spawned/posted) when already aborted', async () => {
@@ -337,22 +334,26 @@ describe('tokenizer worker client', () => {
     const messages = [{ role: 'user', content: 'cache discipline' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');
 
-    // First call aborts → byte-ceiling fallback, which must NOT be cached.
+    // First call aborts → byte-ceiling fallback, which must NOT be cached. With
+    // no other live request, the worker is freed (terminated) on abort.
     const c1 = new AbortController();
     const p1 = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', c1.signal);
-    const w = FakeWorker.instances[0];
+    const w1 = FakeWorker.instances[0];
     await flush();
-    w.ready();
+    w1.ready();
     c1.abort();
     const ceiling = Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8');
     expect(await p1).toBe(ceiling);
 
-    // Second call for the SAME branch must reach the worker again (not serve the
+    // Second call for the SAME branch must reach a worker again (not serve the
     // stale ceiling from cache) and get the exact count.
     const p2 = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1');
-    const lastPost = w.posted[w.posted.length - 1];
+    const w2 = FakeWorker.instances[FakeWorker.instances.length - 1];
+    await flush();
+    w2.ready();
+    const lastPost = w2.posted[w2.posted.length - 1];
     expect(lastPost).toBeDefined();
-    w.result(lastPost.id, 5);
+    w2.result(lastPost.id, 5);
     expect(await p2).toBe(5);
     expect(5).not.toBe(ceiling);
   });
