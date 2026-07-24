@@ -342,21 +342,31 @@ describe('encode cap (main-thread freeze backstop)', () => {
     expect(n).toBeGreaterThan(0);
   });
 
-  it('skips the encode for a LARGE LOW-BOUNDARY (repetitive) string — cost-aware, not just length', () => {
+  it('skips the encode for a long repeated RUN — even below the old soft length', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
-    // 300K repeated chars: past the soft length AND ~zero boundary chars → the BPE
-    // encode is potentially O(n^2), so we must return the byte ceiling instead.
-    const repetitive = 'a'.repeat(300_000);
-    const capped = encodeCappedWith(repetitive, enc);
-    expect(capped).toBe(Buffer.byteLength(repetitive, 'utf8')); // byte ceiling, no encode
+    // 60K repeated chars (a run > MAX_ENCODE_RUN) — tiktoken's quadratic case — must
+    // byte-ceiling regardless of overall length or boundary ratio.
+    const run60k = 'a'.repeat(60_000);
+    expect(encodeCappedWith(run60k, enc)).toBe(Buffer.byteLength(run60k, 'utf8'));
+    // A long run of a former "boundary" char (`/`) is ALSO caught (run-aware, not
+    // boundary-ratio which this would have wrongly passed).
+    const slashes = '/'.repeat(60_000);
+    expect(encodeCappedWith(slashes, enc)).toBe(Buffer.byteLength(slashes, 'utf8'));
   });
 
-  it('STILL encodes a large NORMAL string (enough boundaries) exactly', () => {
+  it('STILL encodes a large NORMAL string (no long run) exactly', () => {
     const enc = resolveEncodingForModel('gpt-5')!;
-    // 300K of prose: plenty of whitespace/punctuation → safe to encode exactly.
+    // 300K of prose: longest same-char run is tiny → safe to encode exactly.
     const prose = 'The quick brown fox jumps over the lazy dog. '.repeat(6700); // ~300K chars
     expect(prose.length).toBeGreaterThan(200_000);
     const capped = encodeCappedWith(prose, enc);
     expect(capped).toBe(enc.encode(prose).length); // exact encode, not the ceiling
+  });
+
+  it('classifies gpt-4.5-preview as the o200k base (keeps the fast cached-count path)', () => {
+    const base = (m: string) => resolveConversationTokenization(m).encodingBaseName;
+    expect(base('gpt-4.5-preview')).toBe(base('gpt-5')); // o200k, not lumped into cl100k
+    expect(base('gpt-4-turbo')).not.toBe(base('gpt-5')); // legacy gpt-4 stays cl100k
+    expect(base('gpt-4-0613')).not.toBe(base('gpt-5'));
   });
 });

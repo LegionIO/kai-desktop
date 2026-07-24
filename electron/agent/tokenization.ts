@@ -120,18 +120,22 @@ export type ConversationTokenizationInfo = {
 
 /**
  * Map a normalized model name to its tiktoken BASE encoding name. o200k_base is
- * the modern base (GPT-5/4o/4.1 + o-series reasoning models); cl100k_base is the
- * legacy base (gpt-4/gpt-3.5). Unknown models default to o200k_base (matching the
- * resolveEncodingForModel gpt-5 fallback), so an OpenAI-compatible model is treated
- * as sharing the canonical cache base.
+ * the modern base (GPT-5, GPT-4o, GPT-4.1, GPT-4.5, o-series); cl100k_base is the
+ * LEGACY base (original gpt-4 / gpt-4-turbo / gpt-4-32k / dated gpt-4 snapshots,
+ * and gpt-3.5). Uses an allowlist of the legacy cl100k families and defaults
+ * everything else to o200k_base (matching the resolveEncodingForModel gpt-5
+ * fallback), so a modern gpt-4.x (4o/4.1/4.5) or an unknown OpenAI-compatible
+ * model is correctly treated as sharing the canonical cache base — NOT lumped into
+ * cl100k by a broad `gpt-4*` match.
  */
 function encodingBaseFor(normalizedModelName: string): string {
-  if (/^gpt-4(\b|[.o-])/.test(normalizedModelName) && !/^gpt-4o|^gpt-4\.1/.test(normalizedModelName)) {
-    // Legacy gpt-4 / gpt-4-turbo / gpt-4-32k → cl100k_base. (gpt-4o and gpt-4.1 are
-    // o200k, handled by falling through to the default below.)
-    return 'cl100k_base';
-  }
-  if (/^gpt-3\.5|^gpt-35/.test(normalizedModelName)) return 'cl100k_base';
+  const n = normalizedModelName;
+  // gpt-3.5 family → cl100k.
+  if (/^gpt-3\.5|^gpt-35/.test(n)) return 'cl100k_base';
+  // Legacy gpt-4 ONLY: bare "gpt-4", gpt-4-turbo/32k/vision, or a dated gpt-4
+  // snapshot (gpt-4-0613 / gpt-4-1106 …). Modern gpt-4o / gpt-4.1 / gpt-4.5 are
+  // o200k and must NOT match here (they have a '.'  or 'o' immediately after 4).
+  if (/^gpt-4(?:-(?:turbo|32k|vision|\d)|$|\b(?![.o]))/.test(n)) return 'cl100k_base';
   return 'o200k_base';
 }
 
@@ -179,41 +183,53 @@ export const MAX_SYNC_ENCODE_CHARS = 8_000_000;
 /**
  * tiktoken's BPE cost is CONTENT-dependent, not just length-dependent: a long run
  * with few token boundaries (whitespace/punctuation) makes the merge search
- * expensive and can block the main thread well below the hard char cap. Above this
- * soft length we therefore encode ONLY when the string has enough boundary
- * characters (see {@link MIN_BOUNDARY_RATIO}); otherwise we skip the encode and use
- * the safe byte ceiling. Normal prose/JSON (boundary ratio ~0.15–0.30) always
- * encodes; only large low-entropy repetitive blobs take the ceiling.
+ * expensive and can block the main thread well below the hard char cap. tiktoken's
+ * pathological case is a long CONSECUTIVE RUN of the same byte (the BPE merge search
+ * degrades toward quadratic), so we bound the longest same-character run directly —
+ * a run-aware limit, not a fragile boundary-ratio heuristic (a long `/` or `a` run
+ * has no boundaries yet is exactly the danger).
  */
-const SOFT_ENCODE_CHARS = 200_000;
-/** Minimum fraction of boundary chars (whitespace + common punctuation) required to
- *  encode a string longer than {@link SOFT_ENCODE_CHARS} on the main thread. */
-const MIN_BOUNDARY_RATIO = 0.02;
-const BOUNDARY_CHAR_RE = /[\s.,;:!?(){}\[\]"'`~/\\<>|=+\-*&^%$#@]/g;
-
-function boundaryRatio(s: string): number {
-  const m = s.match(BOUNDARY_CHAR_RE);
-  return (m ? m.length : 0) / s.length;
+const MAX_ENCODE_RUN = 8_192;
+/** Longest run of a single identical character in `s`. Cheap single O(n) scan;
+ *  used to skip the encode for pathological repeated content. */
+function longestCharRun(s: string): number {
+  let best = 0;
+  let cur = 0;
+  let prev = -1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === prev) {
+      cur++;
+    } else {
+      cur = 1;
+      prev = c;
+    }
+    if (cur > best) {
+      best = cur;
+      if (best > MAX_ENCODE_RUN) return best; // early-out once over the limit
+    }
+  }
+  return best;
 }
 
 /**
  * Exact token count of a serialized string via tiktoken, UNLESS encoding it
  * synchronously would risk blocking the main thread, in which case fall back to
  * the UTF-8 byte ceiling (a true upper bound: ≤ 1 token/byte for byte-level BPE).
- * The encode is skipped when the string exceeds the hard char cap, OR when it is
- * past the soft length AND too low-boundary (repetitive → expensive BPE). This is
- * cost-aware, not just length-aware, so a large repetitive prompt/tool result can
- * no longer stall the UI. The ceiling is a safe over-estimate for both the gate
- * (maybe run the exact check, never skip it) and budget-fit (drop more, never ship
- * over-limit).
+ * The encode is skipped when the string exceeds the hard char cap, OR when it
+ * contains a long consecutive same-character RUN (> {@link MAX_ENCODE_RUN}) — the
+ * input shape that makes tiktoken's merge search pathological — regardless of the
+ * string's overall length. This is cost-aware, targeting the actual quadratic
+ * trigger, so a repetitive prompt/tool result (any size) can't stall the UI. The
+ * ceiling is a safe over-estimate for both the gate (maybe run the exact check,
+ * never skip it) and budget-fit (drop more, never ship over-limit).
  */
 function encodeCapped(serialized: string, encoding: ModelEncoding): number {
-  const len = serialized.length;
-  if (len > MAX_SYNC_ENCODE_CHARS) {
+  if (serialized.length > MAX_SYNC_ENCODE_CHARS) {
     return Buffer.byteLength(serialized, 'utf8');
   }
-  if (len > SOFT_ENCODE_CHARS && boundaryRatio(serialized) < MIN_BOUNDARY_RATIO) {
-    // Large + low-boundary (repetitive) → skip the potentially-O(n²) BPE encode.
+  if (longestCharRun(serialized) > MAX_ENCODE_RUN) {
+    // Long repeated run → skip the potentially-quadratic BPE encode.
     return Buffer.byteLength(serialized, 'utf8');
   }
   return encoding.encode(serialized).length;

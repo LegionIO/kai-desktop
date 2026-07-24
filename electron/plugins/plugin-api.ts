@@ -1715,7 +1715,12 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     next.userMessageCount = nextBranch.filter((entry) => entry.role === 'user').length;
     next.hasUnread = normalizedRole === 'user' ? next.hasUnread : true;
     api.conversations.upsert(next);
-    return next;
+    // Return the SANITIZED persisted record, not the local `next`: writeConversation
+    // may have repaired the tree (dedup / dangling parents / head repoint) + backfilled
+    // token counts, so the plugin must see what's actually on disk — otherwise a
+    // follow-up operation could build on a graph that differs from storage.
+    const persisted = api.conversations.get(conversationId);
+    return (persisted ?? next) as PluginConversationRecord;
   };
 
   api.conversations.markUnread = (conversationId: string, unread: boolean) => {
