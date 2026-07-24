@@ -201,18 +201,18 @@ describe('tokenizer worker client', () => {
     expect(FakeWorker.instances.length).toBe(before); // no new worker spawned
   });
 
-  it('falls back to sync and RESPAWNS when the worker crashes AFTER ready', async () => {
+  it('byte-ceilings and RESPAWNS when a ready worker crashes mid-encode', async () => {
     const messages = [{ role: 'user', content: 'work then die' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const promise = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1');
     const w = FakeWorker.instances[0];
     await flush();
     w.ready();
-    w.crash(); // crash mid-encode, but it HAD become ready
+    w.crash(); // crash mid-encode, but it HAD become ready → possible input OOM
 
-    tok.__clearExactTokenCacheForTests();
-    const syncCount = tok.countBranchTokensCached(messages, tokenization, 'm1');
-    expect(await promise).toBe(syncCount);
+    // A ready-worker crash may be input-correlated → byte ceiling, never re-run
+    // the whole-branch encode synchronously on main.
+    expect(await promise).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
 
     // Ready-then-crash does NOT mark unavailable → next encode respawns.
     tok.__clearExactTokenCacheForTests();

@@ -2025,6 +2025,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 config.compaction.conversation.triggerPercent,
                 modelEntry.modelConfig.maxInputTokens,
               );
+              // This recount can await the off-thread tokenizer; bail if the run
+              // was cancelled during it, rather than falling into a second
+              // full-branch recount below.
+              if (controller.signal.aborted) {
+                emit({ conversationId, type: 'done' });
+                return;
+              }
               if (!reuseCheck.shouldCompact) {
                 messages = candidate as typeof messages;
                 reusedCompaction = true;
@@ -2065,6 +2072,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               chatMessages as Parameters<typeof compactConversationPrefix>[0],
               modelEntry.modelConfig,
               config.compaction.conversation,
+              controller.signal,
             );
             if (controller.signal.aborted) {
               emit({ conversationId, type: 'done' });

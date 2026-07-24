@@ -298,6 +298,7 @@ export async function compactConversationPrefix(
     promptReserveTokens: number;
     contextWindowTokens?: number;
   },
+  signal?: AbortSignal,
 ): Promise<CompactionResult> {
   const tokenization = resolveConversationTokenization(
     modelConfig.modelName,
@@ -351,6 +352,14 @@ export async function compactConversationPrefix(
   // Generate summary
   const { Agent } = await import('@mastra/core/agent');
   type AgentConfig = ConstructorParameters<typeof Agent>[0];
+
+  // The budget-fit loop above can await the off-thread tokenizer; if the run was
+  // cancelled/superseded during that await, bail BEFORE issuing (and billing) the
+  // summarizer LLM request. Returning a null result leaves the history
+  // uncompacted, matching every other early-out here.
+  if (signal?.aborted) {
+    return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+  }
 
   const prompt = [
     'Summarize the conversation prefix for future continuation.',

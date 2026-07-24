@@ -806,21 +806,32 @@ function flushPending(mode: 'sync' | 'ceiling'): void {
 }
 
 /**
- * The worker crashed/exited. Settle every in-flight encode with its SYNC
- * fallback (a crash is not an input-pathology signal — the correct exact value
- * is safe to compute). If the crash happened before the worker was ever ready,
- * mark it permanently unavailable (no built worker); otherwise drop the handle
- * so the next encode respawns a fresh worker.
+ * The worker crashed/exited. How we settle in-flight encodes depends on WHY:
+ *  - crashed BEFORE it ever signaled ready → the worker module failed to load
+ *    (no built worker in dev/test, or a load-time throw). That's input-INDEPENDENT,
+ *    so the exact SYNCHRONOUS encode is both correct and safe (the branch that was
+ *    queued isn't what killed it), and we mark the worker permanently unavailable.
+ *  - crashed AFTER ready (mid-encode) → this can be an input-correlated failure
+ *    (e.g. an OOM on a huge branch). Re-running that same whole-history encode
+ *    synchronously on the main thread could freeze/exhaust it — the exact thing
+ *    this worker exists to prevent. So settle via the BYTE CEILING (safe, never
+ *    under-counts) and drop the handle so the next encode respawns a fresh worker.
  */
 function handleWorkerDown(worker: Worker): void {
   // Idempotent: 'error' and 'exit' both fire on a crash — only act on the first,
   // and ignore events from a worker we've already replaced.
   if (tokenizerWorker !== worker) return;
   const wasReady = tokenizerWorkerReady;
-  flushPending('sync');
   tokenizerWorker = null;
   tokenizerWorkerReady = false;
-  if (!wasReady) tokenizerWorkerUnavailable = true;
+  if (wasReady) {
+    // Possible input-correlated crash → never re-run the big encode on main.
+    flushPending('ceiling');
+  } else {
+    // Load failure → sync is correct + safe; worker is unavailable henceforth.
+    tokenizerWorkerUnavailable = true;
+    flushPending('sync');
+  }
 }
 
 /**
