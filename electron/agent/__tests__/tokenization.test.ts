@@ -85,6 +85,18 @@ describe('resolveConversationTokenization', () => {
     expect(resolveConversationTokenization('mystery-model-42').contextWindowTokens!).toBeLessThanOrEqual(8192);
   });
 
+  it('assigns LEGACY GPT windows (not the modern 128K) when maxInputTokens is omitted', () => {
+    const w = (m: string) => resolveConversationTokenization(m).contextWindowTokens!;
+    // These aren't in MODEL_CONTEXT_WINDOWS, so the fallback classifier applies.
+    expect(w('gpt-3.5-turbo-0125')).toBeLessThanOrEqual(16384); // ~16K, not 128K
+    expect(w('gpt-4-0613')).toBeLessThanOrEqual(8192); // bare/dated gpt-4 ~8K
+    expect(w('gpt-4-vision-preview')).toBeLessThanOrEqual(8192);
+    expect(w('gpt-4-32k-0613')).toBe(32768);
+    expect(w('gpt-4-turbo-2024-04-09')).toBeGreaterThanOrEqual(128000);
+    // Modern models unaffected (table or family → 128K+).
+    expect(w('chatgpt-4o-latest')).toBeGreaterThanOrEqual(128000);
+  });
+
   it('classifies o200k models to the same base (fast path) and legacy gpt-4 to cl100k', () => {
     const base = (m: string) => resolveConversationTokenization(m).encodingBaseName;
     for (const m of ['gpt-5', 'gpt-4o', 'gpt-4.1', 'o3', 'o4-mini']) {

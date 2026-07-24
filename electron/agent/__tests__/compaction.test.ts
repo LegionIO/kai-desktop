@@ -9,6 +9,7 @@ import {
 import {
   resolveConversationTokenization,
   countSerializedTokens,
+  sumBranchTokensForGate,
   __clearExactTokenCacheForTests,
 } from '../tokenization';
 
@@ -135,6 +136,23 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
       const res = shouldCompact(msgs, model, 0.85);
       expect(res.usedTokens).toBeGreaterThan(1); // bogus low count NOT trusted
     }
+  });
+
+  it('non-tiktoken model: byte ceiling is AUTHORITATIVE (no o200k recount, over-limit compacts)', () => {
+    __clearExactTokenCacheForTests();
+    // Claude, 200K window. A branch whose byte-ceiling clearly exceeds 80% of 200K.
+    // usedTokens must equal the byte-ceiling gate sum (NOT a smaller o200k count),
+    // and the over-limit branch must compact — proving we don't fall through to the
+    // wrong-tokenizer o200k recount (which would both undercount and re-encode).
+    const big = 'The quick brown fox jumps over the lazy dog. '.repeat(6000); // ~270K chars
+    const msgs: ChatMessage[] = [{ role: 'user', content: big }];
+    const gateSum = sumBranchTokensForGate(msgs as never, resolveConversationTokenization('claude-3-5-sonnet'));
+    const res = shouldCompact(msgs, 'claude-3-5-sonnet', 0.85);
+    expect(res.usedTokens).toBe(gateSum); // byte ceiling, not an o200k exact recount
+    expect(res.shouldCompact).toBe(true); // over trigger via the safe ceiling
+    // The byte ceiling is far larger than the real o200k token count (~chars/4),
+    // confirming no o200k recount replaced it.
+    expect(res.usedTokens).toBeGreaterThan(big.length / 2);
   });
 });
 

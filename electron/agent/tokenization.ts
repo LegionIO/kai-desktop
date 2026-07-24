@@ -76,6 +76,15 @@ function defaultWindowForModel(rawLowerName: string): number {
   if (/amazon\.|bedrock|titan/.test(n)) return 128_000;
   // Llama-3.1+/Mistral/Qwen/Command-R/DeepSeek etc. commonly 32K-128K; 32K middle.
   if (/llama|mistral|mixtral|qwen|command-?r|deepseek/.test(n)) return 32_768;
+  // LEGACY OpenAI GPT windows — must come BEFORE the modern 128K gpt fallback, or an
+  // imported entry without maxInputTokens would over-assume 128K and never compact
+  // before the provider (16K/8K) rejects the request.
+  if (/gpt-3\.5|gpt-35/.test(n)) return 16_384; // gpt-3.5-turbo family ≈ 16K
+  if (/gpt-4-32k/.test(n)) return 32_768;
+  if (/gpt-4-turbo/.test(n)) return 128_000;
+  // Bare/dated/vision legacy gpt-4 (NOT 4o/4.1/4.5) ≈ 8K. Matches gpt-4, gpt-4-0613,
+  // gpt-4-1106…, gpt-4-vision — but a '.' or 'o' right after 4 means modern → skip.
+  if (/^gpt-4(?:-(?:vision|\d)|$|\b(?![.o]))/.test(n)) return 8_192;
   // Modern OpenAI GPT / o-series / ChatGPT that slipped the table → 128K floor.
   // NB `chatgpt-4o-latest` embeds "gpt" (no word boundary), so match chatgpt too.
   if (/\bgpt-|\bo[0-9]|chatgpt/.test(n)) return 128_000;
