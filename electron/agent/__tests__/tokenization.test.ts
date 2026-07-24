@@ -89,9 +89,13 @@ describe('resolveConversationTokenization', () => {
     const w = (m: string) => resolveConversationTokenization(m).contextWindowTokens!;
     // These aren't in MODEL_CONTEXT_WINDOWS, so the fallback classifier applies.
     expect(w('gpt-3.5-turbo-0125')).toBeLessThanOrEqual(16384); // ~16K, not 128K
-    expect(w('gpt-4-0613')).toBeLessThanOrEqual(8192); // bare/dated gpt-4 ~8K
-    expect(w('gpt-4-vision-preview')).toBeLessThanOrEqual(8192);
+    expect(w('gpt-4-0613')).toBeLessThanOrEqual(8192); // original dated gpt-4 ~8K
+    expect(w('gpt-4-0314')).toBeLessThanOrEqual(8192);
     expect(w('gpt-4-32k-0613')).toBe(32768);
+    // PREVIEWS and turbo are 128K — must NOT be bucketed as 8K.
+    expect(w('gpt-4-1106-preview')).toBeGreaterThanOrEqual(128000);
+    expect(w('gpt-4-0125-preview')).toBeGreaterThanOrEqual(128000);
+    expect(w('gpt-4-vision-preview')).toBeGreaterThanOrEqual(128000);
     expect(w('gpt-4-turbo-2024-04-09')).toBeGreaterThanOrEqual(128000);
     // Modern models unaffected (table or family → 128K+).
     expect(w('chatgpt-4o-latest')).toBeGreaterThanOrEqual(128000);
@@ -197,6 +201,7 @@ describe('countBranchTokensCached (memoized exact count)', () => {
       contextWindowTokens: null,
       encodingModelName: null,
       encodingBaseName: null,
+      isFallbackEncoding: false,
       encoding: null,
     };
     expect(countBranchTokensCached([{ role: 'user', content: 'hi' }], noEnc, 'm1')).toBeNull();

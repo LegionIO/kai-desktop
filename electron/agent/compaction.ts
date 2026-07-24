@@ -4,7 +4,6 @@ import {
   resolveConversationTokenization,
   serializeForTokenCounting,
   sumBranchTokensForGate,
-  canonicalCountEncodingBaseName,
   encodeCappedWith,
 } from './tokenization.js';
 import type { LLMModelConfig } from './model-catalog.js';
@@ -173,14 +172,16 @@ export function shouldCompact(
     };
   }
 
-  // For a NON-TIKTOKEN model (Claude/Gemini/Bedrock/etc.), the only local encoder is
-  // the o200k fallback — the WRONG tokenizer. Its exact count would neither be
-  // authoritative (can undercount the provider and skip a needed compaction) nor
-  // cheap (a synchronous whole-history encode on every send → main-thread freeze).
-  // So for these models the byte-ceiling gate sum (a true upper bound, no encode) IS
-  // the authoritative value: decide from it directly, never o200k-recount. Compacting
-  // somewhat early is the safe cost. Only o200k-family models take the exact recount.
-  if (tokenization.encodingBaseName !== canonicalCountEncodingBaseName()) {
+  // For a model tiktoken does NOT recognize (Claude/Gemini/Bedrock/etc.), the only
+  // local encoder is the o200k fallback — the WRONG tokenizer. Its exact count would
+  // neither be authoritative (can undercount the provider and skip a needed
+  // compaction) nor cheap (a synchronous whole-history encode every send → freeze).
+  // So for these the byte-ceiling gate sum (a true upper bound, no encode) IS the
+  // authoritative value: decide from it directly, never o200k-recount. A RECOGNIZED
+  // model of ANY base (cl100k gpt-4, p50k davinci, o200k gpt-5) has its CORRECT
+  // encoder, so it falls through to the exact recount below — not the byte ceiling,
+  // which would over-count and compact it at a fraction of capacity.
+  if (tokenization.isFallbackEncoding) {
     return {
       shouldCompact: summedTokens >= triggerTokens,
       usedTokens: summedTokens,

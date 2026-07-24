@@ -82,10 +82,12 @@ function defaultWindowForModel(rawLowerName: string): number {
   if (/gpt-3\.5|gpt-35/.test(n)) return 16_384; // gpt-3.5-turbo family ≈ 16K
   if (/gpt-4-32k/.test(n)) return 32_768;
   if (/gpt-4-turbo/.test(n)) return 128_000;
-  // Bare/dated/vision legacy gpt-4 (NOT 4o/4.1/4.5) ≈ 8K. Matches gpt-4, gpt-4-0613,
-  // gpt-4-1106…, gpt-4-vision — but a '.' or 'o' right after 4 means modern → skip.
-  if (/^gpt-4(?:-(?:vision|\d)|$|\b(?![.o]))/.test(n)) return 8_192;
-  // Modern OpenAI GPT / o-series / ChatGPT that slipped the table → 128K floor.
+  // 8K ONLY for the original gpt-4 8K models: bare `gpt-4` or the 0314/0613 dated
+  // snapshots. All PREVIEWS (1106/0125/vision) and later are 128K — they must NOT
+  // match here and fall through to the modern 128K default.
+  if (/^gpt-4(?:-(?:0314|0613)|$)/.test(n)) return 8_192;
+  // Modern OpenAI GPT / o-series / ChatGPT that slipped the table → 128K floor
+  // (includes gpt-4-1106-preview / gpt-4-0125-preview / gpt-4o / gpt-4.1 / …).
   // NB `chatgpt-4o-latest` embeds "gpt" (no word boundary), so match chatgpt too.
   if (/\bgpt-|\bo[0-9]|chatgpt/.test(n)) return 128_000;
   // Genuinely unknown / small local model → modest floor (compact early rather than
@@ -171,6 +173,12 @@ export type ConversationTokenizationInfo = {
    *  use o200k_base); the compaction gate compares THIS, not encodingModelName, so
    *  every model on the canonical base keeps the fast cached-count path. */
   encodingBaseName: string | null;
+  /** True when `encoding` is the o200k FALLBACK (tiktoken didn't recognize the
+   *  model) — i.e. we have NO correct tokenizer for this model. shouldCompact uses
+   *  this to decide whether the exact recount is meaningful: a recognized model (any
+   *  base) is exact-recounted with its own encoder; an unrecognized/fallback model
+   *  uses the byte-ceiling authoritative value (o200k would be the wrong tokenizer). */
+  isFallbackEncoding: boolean;
   encoding: ModelEncoding | null;
 };
 
@@ -219,8 +227,9 @@ export function resolveConversationTokenization(
   // it o200k and make the gate trust o200k cached counts — which can undercount the
   // provider's real tokenizer and skip needed compaction. So leave it null there:
   // sumBranchTokensForGate then uses the tokenizer-independent byte ceiling.
+  const recognized = tiktokenRecognizesModel(encodingModelName);
   let encodingBaseName: string | null = null;
-  if (encoding && tiktokenRecognizesModel(encodingModelName)) {
+  if (encoding && recognized) {
     const nm = (encoding as { name?: unknown }).name;
     encodingBaseName = typeof nm === 'string' && nm.length > 0 ? nm : encodingBaseFor(normalizedModelName);
   }
@@ -230,6 +239,10 @@ export function resolveConversationTokenization(
     contextWindowTokens,
     encodingModelName: encoding ? encodingModelName : null,
     encodingBaseName,
+    // Fallback when we have an encoder but tiktoken didn't recognize the model (it's
+    // the o200k gpt-5 fallback — the wrong tokenizer). A recognized model (any base)
+    // has its correct encoder and is exact-recountable.
+    isFallbackEncoding: !!encoding && !recognized,
     encoding,
   };
 }

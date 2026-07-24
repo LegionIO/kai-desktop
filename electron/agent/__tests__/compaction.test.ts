@@ -154,6 +154,20 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     // confirming no o200k recount replaced it.
     expect(res.usedTokens).toBeGreaterThan(big.length / 2);
   });
+
+  it('RECOGNIZED non-o200k model (cl100k gpt-4) EXACT-recounts, not the byte ceiling', () => {
+    __clearExactTokenCacheForTests();
+    // gpt-4 uses cl100k — a DIFFERENT base than the o200k cache, but tiktoken has its
+    // CORRECT encoder, so it must exact-recount (not the byte ceiling, which would
+    // compact it at ~20% of its 8K window). ~7.5KB English ≈ ~1.5K real tokens, under
+    // the 8K*0.85 trigger → must NOT compact.
+    const text = 'The quick brown fox jumps over the lazy dog. '.repeat(167); // ~7.5KB
+    const msgs: ChatMessage[] = [{ role: 'user', content: text }];
+    const res = shouldCompact(msgs, 'gpt-4', 0.85);
+    // usedTokens is the exact cl100k count (~1.5K), FAR below the byte length (~7.5K).
+    expect(res.usedTokens).toBeLessThan(text.length / 3);
+    expect(res.shouldCompact).toBe(false); // ~1.5K < 8K*0.85 — not compacted at 20%
+  });
 });
 
 describe('isStrictPrefix (compaction reuse / divergence detector)', () => {
