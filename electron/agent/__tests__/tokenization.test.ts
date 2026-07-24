@@ -99,6 +99,14 @@ describe('resolveConversationTokenization', () => {
     expect(w('gpt-4-turbo-2024-04-09')).toBeGreaterThanOrEqual(128000);
     // Modern models unaffected (table or family → 128K+).
     expect(w('chatgpt-4o-latest')).toBeGreaterThanOrEqual(128000);
+    // PROVIDER-PREFIXED legacy names must normalize before classification, so the
+    // anchored legacy gpt-4 rule still matches (→ 8K, not the modern 128K).
+    expect(w('openai/gpt-4')).toBeLessThanOrEqual(8192);
+    expect(w('azure:gpt-4')).toBeLessThanOrEqual(8192);
+    expect(w('openai/gpt-4-0613')).toBeLessThanOrEqual(8192);
+    // Prefixed families still resolve correctly.
+    expect(w('google/gemini-1.5-pro')).toBeGreaterThanOrEqual(128000);
+    expect(w('anthropic/claude-3-5-sonnet')).toBeGreaterThanOrEqual(128000);
   });
 
   it('classifies o200k models to the same base (fast path) and legacy gpt-4 to cl100k', () => {

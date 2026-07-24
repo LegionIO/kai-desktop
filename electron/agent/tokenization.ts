@@ -212,9 +212,11 @@ export function resolveConversationTokenization(
     typeof contextWindowOverride === 'number' && Number.isFinite(contextWindowOverride) && contextWindowOverride > 0
       ? Math.floor(contextWindowOverride)
       : (MODEL_CONTEXT_WINDOWS[normalizedModelName] ??
-        // Family-aware fallback keyed on the raw (lowercased) name so a provider
-        // prefix like "google/gemini-1.5-pro" is still recognized.
-        defaultWindowForModel(String(modelName).toLowerCase()));
+        // Family-aware fallback on the NORMALIZED name: normalization strips provider
+        // prefixes (openai/, azure:) so the anchored legacy GPT rules match
+        // `openai/gpt-4` (→ 8K, not the modern 128K), while family substrings like
+        // `gemini`/`claude` survive normalization for the unanchored rules.
+        defaultWindowForModel(normalizedModelName));
 
   const encodingModelName = MODEL_ENCODING_ALIASES[normalizedModelName] ?? normalizedModelName;
   const encoding = resolveEncodingForModel(encodingModelName);
