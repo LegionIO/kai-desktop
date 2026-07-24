@@ -174,7 +174,7 @@ describe('tokenizer worker client', () => {
     expect(await p2).toBe(33);
   });
 
-  it('falls back to the synchronous count when the worker crashes BEFORE ready', async () => {
+  it('byte-ceilings (never sync-encodes on main) when the worker crashes BEFORE ready', async () => {
     const messages = [
       { role: 'user', content: 'The quick brown fox jumps over the lazy dog.' },
       { role: 'assistant', content: 'A pangram containing every letter.' },
@@ -185,19 +185,18 @@ describe('tokenizer worker client', () => {
     await flush();
     w.crash(); // error + exit before ever posting 'ready'
 
-    const asyncCount = await promise;
-    // Same as the pure synchronous encoder.
-    tok.__clearExactTokenCacheForTests();
-    const syncCount = tok.countBranchTokensCached(messages, tokenization, 'm1');
-    expect(asyncCount).toBe(syncCount);
-    expect(asyncCount).toBeGreaterThan(0);
+    // Even a pre-ready load failure must NOT sync-encode a whole branch on main
+    // (a missing packaged entry / tiktoken load failure doesn't make a
+    // multi-megabyte branch safe to encode) → byte ceiling.
+    const ceiling = Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8');
+    expect(await promise).toBe(ceiling);
 
-    // A crash before ready marks the worker unavailable → the next call uses the
-    // synchronous path directly (no respawn).
+    // A crash before ready marks the worker unavailable → the next call also
+    // byte-ceilings and does NOT respawn.
     const before = FakeWorker.instances.length;
     tok.__clearExactTokenCacheForTests();
     const next = await tok.countBranchTokensCachedAsync(messages, tokenization, 'm1');
-    expect(next).toBe(syncCount);
+    expect(next).toBe(ceiling);
     expect(FakeWorker.instances.length).toBe(before); // no new worker spawned
   });
 
@@ -225,15 +224,13 @@ describe('tokenizer worker client', () => {
     expect(await p2).toBe(55);
   });
 
-  it('uses the synchronous path when worker construction throws', async () => {
+  it('byte-ceilings (no whole-branch sync encode) when worker construction throws', async () => {
     FakeWorker.failConstruction = true;
     tok.__setTokenizerWorkerPathForTests('/fake/tokenizer-worker.js'); // reset unavailable flag
     const messages = [{ role: 'user', content: 'no worker for you' }];
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const asyncCount = await tok.countBranchTokensCachedAsync(messages, tokenization, 'm1');
-    tok.__clearExactTokenCacheForTests();
-    const syncCount = tok.countBranchTokensCached(messages, tokenization, 'm1');
-    expect(asyncCount).toBe(syncCount);
+    expect(asyncCount).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
     expect(FakeWorker.instances).toHaveLength(0);
   });
 
@@ -243,14 +240,49 @@ describe('tokenizer worker client', () => {
     expect(count).toBeNull();
   });
 
-  it('encodeCappedWithAsync matches the sync encode when the worker is unavailable', async () => {
+  it('encodeCappedWithAsync byte-ceilings when the worker is unavailable', async () => {
     FakeWorker.failConstruction = true;
     tok.__setTokenizerWorkerPathForTests('/fake/tokenizer-worker.js');
     const tokenization = tok.resolveConversationTokenization('gpt-5');
     const text = tok.serializeForTokenCounting([{ role: 'user', content: 'budget-fit prefix text' }]);
     const asyncTokens = await tok.encodeCappedWithAsync(text, tokenization);
-    const syncTokens = tok.encodeCappedWith(text, tokenization.encoding!);
-    expect(asyncTokens).toBe(syncTokens);
+    expect(asyncTokens).toBe(Buffer.byteLength(text, 'utf8'));
+  });
+
+  it('on abort, byte-ceilings the caller and terminates the stale worker to free it', async () => {
+    const messages = [{ role: 'user', content: 'superseded turn' }];
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const controller = new AbortController();
+    const promise = tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', controller.signal);
+    const w = FakeWorker.instances[0];
+    await flush();
+    w.ready(); // worker is alive & mid-encode
+    controller.abort(); // turn cancelled/superseded during the encode
+
+    // Caller settles immediately via the byte ceiling (doesn't wait for the
+    // stale worker), and the stale worker is force-terminated so it can't hog
+    // the single worker for the replacement turn.
+    expect(await promise).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
+    expect(w.terminated).toBe(true);
+
+    // The next (replacement) encode spawns a FRESH worker rather than queueing
+    // behind the stale one.
+    const p2 = tok.countBranchTokensCachedAsync([{ role: 'user', content: 'replacement' }], tokenization, 'm2');
+    expect(FakeWorker.instances.length).toBe(2);
+    const w2 = FakeWorker.instances[1];
+    await flush();
+    w2.ready();
+    w2.result(w2.posted[0].id, 77);
+    expect(await p2).toBe(77);
+  });
+
+  it('byte-ceilings immediately when the signal is already aborted', async () => {
+    const messages = [{ role: 'user', content: 'already gone' }];
+    const tokenization = tok.resolveConversationTokenization('gpt-5');
+    const controller = new AbortController();
+    controller.abort();
+    const count = await tok.countBranchTokensCachedAsync(messages, tokenization, 'm1', controller.signal);
+    expect(count).toBe(Buffer.byteLength(tok.serializeForTokenCounting(messages), 'utf8'));
   });
 });
 

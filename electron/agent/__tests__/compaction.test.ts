@@ -322,14 +322,17 @@ describe('splitPreservedFields (compaction-exempt tool-result fields)', () => {
   });
 });
 
-describe('shouldCompactAsync (off-thread exact recount, same result)', () => {
+describe('shouldCompactAsync (off-thread gate)', () => {
   const MODEL = 'gpt-4o';
   const window = 128000;
 
   beforeEach(() => {
     __clearExactTokenCacheForTests();
-    // Force the worker-unavailable path so the async recount uses the identical
-    // synchronous encoder — the numeric-parity guarantee for the send-path gate.
+    // Force the worker-unavailable path. The cheap gate (under-trigger /
+    // fallback-tokenizer) short-circuits BEFORE the worker so it matches
+    // shouldCompact exactly; the exact-recount path byte-ceilings when the worker
+    // is unavailable (never a whole-branch sync encode on main), which is a safe
+    // upper bound of the sync exact count.
     __setTokenizerWorkerPathForTests('/nonexistent/tokenizer-worker.mjs');
   });
 
@@ -346,7 +349,7 @@ describe('shouldCompactAsync (off-thread exact recount, same result)', () => {
     expect(asyncRes.contextWindowTokens).toBe(window);
   });
 
-  it('matches shouldCompact when genuinely over the trigger (exact recount reached)', async () => {
+  it('still compacts when over the trigger; worker-unavailable recount is a safe ceiling', async () => {
     const trigger = 0.85;
     const triggerTokens = Math.floor(window * trigger);
     const tokenization = resolveConversationTokenization(MODEL);
@@ -359,8 +362,12 @@ describe('shouldCompactAsync (off-thread exact recount, same result)', () => {
     const sync = shouldCompact(msgs, MODEL, trigger);
     __clearExactTokenCacheForTests();
     const asyncRes = await shouldCompactAsync(msgs, MODEL, trigger);
-    expect(asyncRes).toEqual(sync);
+    // Same decision; the async worker-unavailable path uses the byte ceiling,
+    // which is a safe upper bound of the sync exact count (never under-counts).
     expect(asyncRes.shouldCompact).toBe(true);
+    expect(sync.shouldCompact).toBe(true);
+    expect(asyncRes.usedTokens).toBeGreaterThanOrEqual(sync.usedTokens);
+    expect(asyncRes.contextWindowTokens).toBe(window);
   });
 
   it('matches shouldCompact for a fallback-tokenizer model (byte-ceiling gate, no worker)', async () => {

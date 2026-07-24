@@ -2024,6 +2024,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 modelEntry.modelConfig.modelName,
                 config.compaction.conversation.triggerPercent,
                 modelEntry.modelConfig.maxInputTokens,
+                controller.signal,
               );
               // This recount can await the off-thread tokenizer; bail if the run
               // was cancelled during it, rather than falling into a second
@@ -2046,6 +2047,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 modelEntry.modelConfig.modelName,
                 config.compaction.conversation.triggerPercent,
                 modelEntry.modelConfig.maxInputTokens,
+                controller.signal,
               );
 
           // The exact-recount gate can await the off-thread tokenizer; the run may

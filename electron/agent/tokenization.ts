@@ -743,17 +743,18 @@ type WorkerMessage =
 const WORKER_ENCODE_TIMEOUT_MS = 15_000;
 
 /**
- * Outcome contract for a rejected worker encode. The caller supplies a
- * `syncFallback` (the exact synchronous encode) and a `byteCeiling`; the client
- * picks between them by REASON:
- *  - worker never became ready / crashed before ready → use `syncFallback`
- *    (the worker is unavailable, e.g. dev/test from source; the sync encode is
- *    the correct value and safe to run — nothing was wrong with the INPUT).
- *  - encode timed out on a live worker → use `byteCeiling` (the input may be
- *    the pathological one we deliberately moved off-thread; never re-run it on
- *    main).
+ * When the worker can't produce the count (unavailable, crashed, timed out, or
+ * the turn was aborted), the whole-branch fallback is ALWAYS the UTF-8 byte
+ * ceiling — NEVER a synchronous whole-branch tiktoken encode. A multi-megabyte
+ * branch is not safe to encode on the Electron main thread regardless of WHY the
+ * worker is missing (a missing packaged entry, a tiktoken load failure, an OOM,
+ * a stuck encode); doing so would recreate the exact main-thread freeze this
+ * worker exists to prevent. The byte ceiling is a true upper bound (≤ 1 token/
+ * byte for byte-level BPE), so the compaction gate can only over-trigger, never
+ * miss a needed compaction. (The per-message path never uses the worker — it
+ * stays synchronous and is already size-capped at MAX_PER_MESSAGE_EXACT_CHARS.)
  */
-type EncodeFallback = { sync: () => number; ceiling: () => number };
+type EncodeFallback = { ceiling: () => number };
 
 type PendingEncode = {
   settle: (count: number) => void;
@@ -767,7 +768,7 @@ let tokenizerWorker: Worker | null = null;
 let tokenizerWorkerReady = false;
 /** Set when the worker is known to be unavailable (spawn threw, or it
  *  crashed/exited BEFORE ever signaling ready — e.g. running from .ts source in
- *  tests/dev with no built worker). Callers then use the synchronous fallback. */
+ *  tests/dev with no built worker). Whole-branch callers then byte-ceiling. */
 let tokenizerWorkerUnavailable = false;
 let nextEncodeId = 1;
 const pendingEncodes = new Map<number, PendingEncode>();
@@ -787,35 +788,28 @@ export function __setTokenizerWorkerPathForTests(path: string | null): void {
   tokenizerWorker = null;
   tokenizerWorkerReady = false;
   tokenizerWorkerUnavailable = false;
-  // Settle any in-flight encode via its sync fallback (a reset is not a
-  // pathological-input signal).
-  flushPending('sync');
+  flushPending();
 }
 
-/** Settle and clear all in-flight encodes. `mode` picks the value:
- *  - 'sync': the exact synchronous encode (correct + safe — used when the worker
- *    went down for a reason UNRELATED to the input, e.g. a crash or a test reset).
- *  - 'ceiling': the byte ceiling (never re-run a possibly-pathological input on
- *    main — used on quit and when a stuck worker is force-terminated). */
-function flushPending(mode: 'sync' | 'ceiling'): void {
+/** Settle and clear all in-flight encodes via the byte ceiling — the only
+ *  main-thread-safe fallback (see {@link EncodeFallback}). */
+function flushPending(): void {
   for (const p of pendingEncodes.values()) {
     clearTimeout(p.timer);
-    p.settle(mode === 'sync' ? p.fallback.sync() : p.fallback.ceiling());
+    p.settle(p.fallback.ceiling());
   }
   pendingEncodes.clear();
 }
 
 /**
- * The worker crashed/exited. How we settle in-flight encodes depends on WHY:
- *  - crashed BEFORE it ever signaled ready → the worker module failed to load
- *    (no built worker in dev/test, or a load-time throw). That's input-INDEPENDENT,
- *    so the exact SYNCHRONOUS encode is both correct and safe (the branch that was
- *    queued isn't what killed it), and we mark the worker permanently unavailable.
- *  - crashed AFTER ready (mid-encode) → this can be an input-correlated failure
- *    (e.g. an OOM on a huge branch). Re-running that same whole-history encode
- *    synchronously on the main thread could freeze/exhaust it — the exact thing
- *    this worker exists to prevent. So settle via the BYTE CEILING (safe, never
- *    under-counts) and drop the handle so the next encode respawns a fresh worker.
+ * The worker crashed/exited. In-flight encodes settle via the BYTE CEILING (the
+ * only main-thread-safe fallback — a crash can be an input-correlated OOM on a
+ * huge branch, and even a pre-ready load failure doesn't make a multi-megabyte
+ * branch safe to encode synchronously on main). If the crash happened BEFORE the
+ * worker ever signaled ready, the worker module failed to load (no built worker
+ * in dev/test, or a tiktoken load throw) → mark it permanently unavailable so we
+ * stop respawning; a post-ready crash drops the handle so the next encode
+ * respawns a fresh worker.
  */
 function handleWorkerDown(worker: Worker): void {
   // Idempotent: 'error' and 'exit' both fire on a crash — only act on the first,
@@ -824,14 +818,8 @@ function handleWorkerDown(worker: Worker): void {
   const wasReady = tokenizerWorkerReady;
   tokenizerWorker = null;
   tokenizerWorkerReady = false;
-  if (wasReady) {
-    // Possible input-correlated crash → never re-run the big encode on main.
-    flushPending('ceiling');
-  } else {
-    // Load failure → sync is correct + safe; worker is unavailable henceforth.
-    tokenizerWorkerUnavailable = true;
-    flushPending('sync');
-  }
+  if (!wasReady) tokenizerWorkerUnavailable = true;
+  flushPending();
 }
 
 /**
@@ -839,15 +827,13 @@ function handleWorkerDown(worker: Worker): void {
  * synchronous WASM encode of a pathological input, so leaving it in place would
  * make it hold a CPU core and force EVERY later encode to wait another full
  * timeout behind it. Force-terminate it and drop the handle so the next encode
- * spawns a fresh worker. Its OTHER queued encodes settle via the BYTE CEILING —
- * they were stuck behind the same (possibly pathological) worker, so re-running
- * them synchronously on main could freeze too; the ceiling is safe and never
- * under-counts. Terminating a still-ready worker does NOT mark it unavailable.
+ * spawns a fresh worker. Its queued encodes settle via the BYTE CEILING.
+ * Terminating a still-ready worker does NOT mark it unavailable.
  */
 function terminateStuckWorker(worker: Worker): void {
   if (tokenizerWorker !== worker) return;
   // Detach handlers so the pending exit/error from terminate() doesn't re-enter
-  // handleWorkerDown and sync-encode the very input we're avoiding.
+  // handleWorkerDown.
   worker.removeAllListeners();
   try {
     void worker.terminate();
@@ -856,7 +842,7 @@ function terminateStuckWorker(worker: Worker): void {
   }
   tokenizerWorker = null;
   tokenizerWorkerReady = false;
-  flushPending('ceiling');
+  flushPending();
 }
 
 function ensureTokenizerWorker(): Worker | null {
@@ -874,11 +860,11 @@ function ensureTokenizerWorker(): Worker | null {
       if (!pending) return;
       pendingEncodes.delete(msg.id);
       clearTimeout(pending.timer);
-      // Both a normal result and a worker-reported encode error resolve to a
-      // number (the worker already byte-ceilings pathological input); a
-      // reported error is defensive → sync fallback for the exact value.
+      // A normal result carries the exact count; a worker-reported encode error
+      // is defensive (the worker already byte-ceilings pathological input) →
+      // settle via the byte ceiling, never a whole-branch sync encode on main.
       if (msg.type === 'result') pending.settle(msg.count);
-      else pending.settle(pending.fallback.sync());
+      else pending.settle(pending.fallback.ceiling());
     });
     worker.on('error', () => handleWorkerDown(worker));
     worker.on('exit', () => handleWorkerDown(worker));
@@ -886,18 +872,18 @@ function ensureTokenizerWorker(): Worker | null {
     tokenizerWorker = worker;
     return worker;
   } catch {
-    // Spawn threw synchronously → unavailable; callers use the sync path.
+    // Spawn threw synchronously → unavailable; whole-branch callers byte-ceiling.
     tokenizerWorkerUnavailable = true;
     return null;
   }
 }
 
 /** Terminate the tokenizer worker (call on app quit). Safe to call when none
- *  was ever spawned. In-flight encodes settle via the BYTE CEILING — never the
- *  synchronous encode: doing that in the `before-quit` handler could freeze
- *  shutdown on the exact large/pathological input this worker exists to isolate. */
+ *  was ever spawned. In-flight encodes settle via the BYTE CEILING — never a
+ *  synchronous whole-branch encode: doing that in the `before-quit` handler
+ *  could freeze shutdown on the large/pathological input this worker isolates. */
 export function terminateTokenizerWorker(): void {
-  flushPending('ceiling');
+  flushPending();
   if (tokenizerWorker) {
     try {
       void tokenizerWorker.terminate();
@@ -922,15 +908,18 @@ function encodeSerializedAsync(
   encodingModel: string,
   maxExactChars: number,
   fallback: EncodeFallback,
+  signal?: AbortSignal,
 ): Promise<number> | null {
   const worker = ensureTokenizerWorker();
   if (!worker) return null;
   const id = nextEncodeId++;
   return new Promise<number>((resolve) => {
     let settled = false;
+    let onAbort: (() => void) | null = null;
     const settle = (count: number): void => {
       if (settled) return;
       settled = true;
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
       resolve(count);
     };
     const timer = setTimeout(() => {
@@ -941,13 +930,38 @@ function encodeSerializedAsync(
       terminateStuckWorker(worker);
     }, WORKER_ENCODE_TIMEOUT_MS);
     pendingEncodes.set(id, { settle, fallback, timer });
+
+    // If the owning turn is cancelled/superseded during the encode, don't keep
+    // awaiting: settle this caller with the byte ceiling AND force-terminate the
+    // worker so the now-stale WASM job (which can't be interrupted in-thread)
+    // stops occupying the single worker and delaying the replacement turn. The
+    // next encode respawns a fresh worker.
+    if (signal) {
+      if (signal.aborted) {
+        pendingEncodes.delete(id);
+        clearTimeout(timer);
+        terminateStuckWorker(worker);
+        settle(fallback.ceiling());
+        return;
+      }
+      onAbort = () => {
+        if (settled) return;
+        pendingEncodes.delete(id);
+        clearTimeout(timer);
+        terminateStuckWorker(worker);
+        settle(fallback.ceiling());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     try {
       worker.postMessage({ type: 'encode', id, encodingModel, text: serialized, maxExactChars });
     } catch {
       pendingEncodes.delete(id);
       clearTimeout(timer);
-      // postMessage failed (worker dying) → sync fallback for the exact value.
-      settle(fallback.sync());
+      // postMessage failed (worker dying) → byte ceiling (never a whole-branch
+      // sync encode on main).
+      settle(fallback.ceiling());
     }
   });
 }
@@ -955,44 +969,50 @@ function encodeSerializedAsync(
 /**
  * Off-thread equivalent of {@link encodeCappedWith} for the COMPACTION path
  * (budget-fit loop + final safety re-encode). Awaits the tokenizer worker so the
- * repeated whole-prefix encodes don't block the main thread; falls back to the
- * synchronous encode when the worker is unavailable, and byte-ceilings on
- * timeout/crash. Requires the tokenization info (for the encoder + model name)
- * plus its resolved encoding for the synchronous fallback.
+ * repeated whole-prefix encodes don't block the main thread. When the worker is
+ * unavailable OR fails/times out, falls back to the UTF-8 BYTE CEILING — never a
+ * synchronous whole-branch encode on main (that would recreate the freeze). The
+ * ceiling is a safe upper bound: budget-fit only ever keeps FEWER messages, and
+ * the final safety check only ever returns the null no-op, so an over-estimate
+ * can't produce an over-budget compacted request.
  */
 export async function encodeCappedWithAsync(
   serialized: string,
   tokenization: ConversationTokenizationInfo,
+  signal?: AbortSignal,
 ): Promise<number> {
   if (!tokenization.encoding) return Buffer.byteLength(serialized, 'utf8');
-  const encoding = tokenization.encoding;
   const encodingModel = tokenization.encodingModelName ?? tokenization.normalizedModelName;
-  const pending = encodeSerializedAsync(serialized, encodingModel, MAX_SYNC_ENCODE_CHARS, {
-    sync: () => encodeCappedWith(serialized, encoding),
-    ceiling: () => Buffer.byteLength(serialized, 'utf8'),
-  });
-  if (!pending) return encodeCappedWith(serialized, encoding);
-  return pending;
+  const pending = encodeSerializedAsync(
+    serialized,
+    encodingModel,
+    MAX_SYNC_ENCODE_CHARS,
+    { ceiling: () => Buffer.byteLength(serialized, 'utf8') },
+    signal,
+  );
+  return pending ? pending : Buffer.byteLength(serialized, 'utf8');
 }
 
 /**
- * Whole-branch exact token count, computed OFF the main thread with the same
- * per-branch memoization as {@link countBranchTokensCached}. The main thread
- * awaits the worker, so the event loop stays live during the CPU-bound encode.
+ * Whole-branch exact token count, computed OFF the main thread, sharing the
+ * per-branch LRU with {@link countBranchTokensCached}. The main thread awaits the
+ * worker, so the event loop stays live during the CPU-bound encode.
  *
- * Falls back to the SYNCHRONOUS {@link countBranchTokensCached} when the worker
- * is unavailable (dev/test from source), and byte-ceilings on the caller if the
- * worker times out or crashes — so a wedged worker can never stall the send
- * path. Result is cached in the same LRU as the sync path (shared key), so a
- * later sync or async call on the same branch reuses it.
+ * When the worker is unavailable (dev/test from source, a missing packaged
+ * entry, a tiktoken load failure) OR it crashes / times out, falls back to the
+ * UTF-8 BYTE CEILING — NEVER a synchronous whole-branch encode on main, which
+ * would recreate the very freeze this worker prevents (a multi-megabyte branch
+ * isn't safe to encode on the main thread regardless of why the worker is
+ * missing). The ceiling never under-counts, so the compaction gate can only
+ * over-trigger, never miss a needed compaction.
  */
 export async function countBranchTokensCachedAsync(
   messages: unknown[],
   tokenization: ConversationTokenizationInfo,
   lastMessageId?: string,
+  signal?: AbortSignal,
 ): Promise<number | null> {
   if (!tokenization.encoding) return null;
-  const encoding = tokenization.encoding;
   const serialized = serializeForTokenCounting(messages);
   const encodingModel = tokenization.encodingModelName ?? tokenization.normalizedModelName;
   const key = branchSignature(serialized, messages.length, lastMessageId, encodingModel);
@@ -1003,20 +1023,10 @@ export async function countBranchTokensCachedAsync(
     return cached;
   }
 
-  const syncEncode = (): number => encodeCappedWith(serialized, encoding);
-  let count: number;
-  const pending = encodeSerializedAsync(serialized, encodingModel, MAX_SYNC_ENCODE_CHARS, {
-    // Worker crashed/unavailable → the exact synchronous count is correct and
-    // safe (crash is not an input-pathology signal).
-    sync: syncEncode,
-    // Live worker timed out → byte ceiling (never re-run a possibly-pathological
-    // input on main; the ceiling never under-counts so the gate can only
-    // over-trigger, never miss a needed compaction).
-    ceiling: () => Buffer.byteLength(serialized, 'utf8'),
-  });
-  // pending === null means the worker is unavailable → synchronous path (this is
-  // the dev/test path and the one-time spawn-failure path).
-  count = pending ? await pending : syncEncode();
+  const ceiling = (): number => Buffer.byteLength(serialized, 'utf8');
+  const pending = encodeSerializedAsync(serialized, encodingModel, MAX_SYNC_ENCODE_CHARS, { ceiling }, signal);
+  // pending === null → worker unavailable → byte ceiling (safe, non-blocking).
+  const count = pending ? await pending : ceiling();
 
   exactTokenCache.set(key, count);
   if (exactTokenCache.size > EXACT_TOKEN_CACHE_MAX) {

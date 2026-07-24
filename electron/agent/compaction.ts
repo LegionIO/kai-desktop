@@ -251,13 +251,14 @@ export async function shouldCompactAsync(
   modelName: string,
   triggerPercent: number,
   contextWindowOverride?: number,
+  signal?: AbortSignal,
 ): Promise<ShouldCompactResult> {
   const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride);
   if (gate.decided) return gate.decided;
 
   const { tokenization, triggerTokens } = gate;
   const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
-  const usedTokens = (await countBranchTokensCachedAsync(messages, tokenization, lastMessageId)) ?? 0;
+  const usedTokens = (await countBranchTokensCachedAsync(messages, tokenization, lastMessageId, signal)) ?? 0;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
@@ -339,7 +340,7 @@ export async function compactConversationPrefix(
   let droppedForBudget = false;
   while (fittedPrefix.length > 0) {
     const candidatePromptText = serializeForTokenCounting(fittedPrefix);
-    const candidateTokens = await encodeCappedWithAsync(candidatePromptText, tokenization);
+    const candidateTokens = await encodeCappedWithAsync(candidatePromptText, tokenization, signal);
     if (candidateTokens <= promptInputBudget) break;
     fittedPrefix.shift();
     droppedForBudget = true;
@@ -444,7 +445,11 @@ export async function compactConversationPrefix(
   // risk a provider hard-limit error). If it still doesn't fit, return the null
   // no-op — the turn proceeds on the full (uncompacted) context, preserving the
   // "null ⇒ no message loss" contract.
-  const compactedTokens = await encodeCappedWithAsync(serializeForTokenCounting(compactedMessages), tokenization);
+  const compactedTokens = await encodeCappedWithAsync(
+    serializeForTokenCounting(compactedMessages),
+    tokenization,
+    signal,
+  );
   if (compactedTokens > promptInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
