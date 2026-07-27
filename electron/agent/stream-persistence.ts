@@ -1,6 +1,31 @@
+import { appendFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import { appendConversationMessages, broadcastUpsert } from '../ipc/conversations.js';
 import { readConversation, writeConversation } from '../ipc/conversation-store.js';
+import { getAppHome } from '../local-bridge/paths.js';
 import type { StreamEvent } from './mastra-agent.js';
+
+// ---------------------------------------------------------------------------
+// Tree-corruption diagnostics (gated by KAI_DEBUG_STREAM).
+//
+// Investigating a mid-turn-inject case where a truncated partial assistant was
+// persisted with parentId:null (a detached second root), severing the injected
+// follow-ups from the original user ask. These logs capture the exact store
+// state at each persist/inject boundary so the real write path can be proven
+// from evidence before any fix. See ~/.kai/debug-logs/tree-corruption.log.
+// ---------------------------------------------------------------------------
+const TREE_DEBUG_ENABLED = !!process.env.KAI_DEBUG_STREAM;
+const TREE_DEBUG_DIR = join(getAppHome(), 'debug-logs');
+const TREE_DEBUG_LOG = join(TREE_DEBUG_DIR, 'tree-corruption.log');
+function treeDebugLog(msg: string): void {
+  if (!TREE_DEBUG_ENABLED) return;
+  try {
+    mkdirSync(TREE_DEBUG_DIR, { recursive: true });
+    appendFileSync(TREE_DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    /* ignore */
+  }
+}
 
 /**
  * Server-side accumulation of assistant stream events into a stored assistant
@@ -318,6 +343,12 @@ export function persistCooperativeInjectedUserTurn(
   const current = readConversation(appHome, conversationId);
   if (!current) return null;
   const parentId = partialAssistantHead ?? current.headId ?? null;
+  treeDebugLog(
+    `[INJECT-BOUNDARY] conv=${conversationId} partialAssistantHead=${JSON.stringify(partialAssistantHead)} ` +
+      `storeHeadId=${JSON.stringify(current.headId)} pinnedParent=${JSON.stringify(parentId)} ` +
+      `treeLen=${Array.isArray(current.messageTree) ? current.messageTree.length : -1} ` +
+      `willPassParentId=${partialAssistantHead !== null}`,
+  );
   const messageId = requestedMessageId || `inject-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const createdAt = new Date().toISOString();
   const updated = appendConversationMessages(
@@ -357,6 +388,10 @@ function persistAccumulatedReturningHead(
   const acc = accumulators.get(conversationId);
   accumulators.delete(conversationId);
   if (!acc || !acc.sawContent || acc.parts.length === 0) {
+    treeDebugLog(
+      `[PERSIST-EMPTY] conv=${conversationId} hasAcc=${!!acc} sawContent=${acc?.sawContent ?? 'n/a'} ` +
+        `parts=${acc?.parts.length ?? 0} accParent=${JSON.stringify(acc?.parentId)} keepRunning=${!!opts?.keepRunning}`,
+    );
     // Nothing to persist, but agent:submit marked the conversation 'running' for
     // this turn — reset it so it doesn't look stuck busy, and broadcast so
     // non-active GUI/web clients drop the running indicator too. (Unless the
@@ -402,6 +437,31 @@ function persistAccumulatedReturningHead(
     effectiveId = `${acc.responseMessageId}-cont-${Date.now().toString(36)}`;
   }
   try {
+    // Diagnostics: capture the exact parent-resolution state at persist time.
+    // appendConversationMessages resolves parent = (acc.parentId !== undefined)
+    //   ? acc.parentId : store.headId. An orphan root is created when that
+    // resolves to null while the tree already has nodes — log that condition
+    // so the real write path is provable from evidence.
+    if (TREE_DEBUG_ENABLED) {
+      let storeHeadId: string | null | undefined;
+      let treeLen = -1;
+      try {
+        const snap = readConversation(appHome, conversationId);
+        storeHeadId = snap?.headId;
+        treeLen = Array.isArray(snap?.messageTree) ? snap!.messageTree.length : -1;
+      } catch {
+        /* best-effort snapshot */
+      }
+      const resolvedParent = acc.parentId !== undefined ? acc.parentId : storeHeadId;
+      const orphanRisk = (resolvedParent === null || resolvedParent === undefined) && treeLen > 0;
+      treeDebugLog(
+        `[PERSIST-ASSISTANT] conv=${conversationId} effectiveId=${effectiveId ?? '(auto)'} ` +
+          `accParent=${JSON.stringify(acc.parentId)} storeHeadId=${JSON.stringify(storeHeadId)} ` +
+          `treeLen=${treeLen} resolvedParent=${JSON.stringify(resolvedParent)} ` +
+          `alreadyFinalized=${alreadyFinalized} keepRunning=${!!opts?.keepRunning} ` +
+          `parts=${acc.parts.length}${orphanRisk ? ' ORPHAN_RISK=true' : ''}`,
+      );
+    }
     // Parent on the head captured at submit so a mid-run branch change
     // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
     // in options falls back to the current head, so only pass it when known.
@@ -424,6 +484,15 @@ function persistAccumulatedReturningHead(
       },
     );
     if (updated?.headId) markResponseFinalized(conversationId, acc.responseMessageId);
+    if (TREE_DEBUG_ENABLED) {
+      const persistedNode = (
+        updated?.messageTree as Array<{ id?: string; parentId?: string | null }> | undefined
+      )?.find((m) => m.id === updated?.headId);
+      treeDebugLog(
+        `[PERSIST-RESULT] conv=${conversationId} newHeadId=${JSON.stringify(updated?.headId)} ` +
+          `persistedParentId=${JSON.stringify(persistedNode?.parentId)}`,
+      );
+    }
     return updated?.headId ?? null;
   } catch {
     // Persistence is best-effort; a failure must not break the stream.
