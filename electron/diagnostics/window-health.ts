@@ -9,6 +9,12 @@ const ACTIVE_WORK_RETRY_MS = 15_000;
 const AUTO_RELOAD_COOLDOWN_MS = 60_000;
 const AUTO_RELOAD_WINDOW_MS = 10 * 60_000;
 const MAX_AUTO_RELOADS_PER_WINDOW = 2;
+// Renderer JS-heap thresholds for the heap-pressure warning. Either an absolute
+// used-MB ceiling OR a used/limit ratio trips it — a V8/cppgc OOM abort (SIGTRAP
+// during GC) is preceded by the heap climbing toward jsHeapSizeLimit, so leaving
+// a flagged trail lets the next crash be attributed to renderer memory growth.
+const HEAP_PRESSURE_USED_MB = 2_048;
+const HEAP_PRESSURE_USED_PCT = 90;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -39,6 +45,12 @@ export interface WindowHealthProbeResult {
   captureEmpty?: boolean;
   captureSize?: { width: number; height: number };
   captureHasVisiblePixels?: boolean;
+  /** Renderer JS-heap usage sampled from performance.memory, in MB. */
+  jsHeapUsedMB?: number;
+  jsHeapTotalMB?: number;
+  jsHeapLimitMB?: number;
+  /** used / limit as a percentage (0–100), when both are known. */
+  jsHeapUsedPct?: number;
   error?: string;
 }
 
@@ -62,6 +74,12 @@ interface RendererProbePayload {
   visibilityState?: unknown;
   rootChildCount?: unknown;
   animationFrameCompleted?: unknown;
+  // performance.memory is Chromium-only and its precision is reduced, but it is
+  // present in Electron renderers and is the cheapest signal for the renderer
+  // JS-heap growth that precedes a V8/cppgc OOM abort (SIGTRAP during GC).
+  jsHeapUsed?: unknown;
+  jsHeapTotal?: unknown;
+  jsHeapLimit?: unknown;
 }
 
 function errorMessage(error: unknown): string {
@@ -161,11 +179,15 @@ export async function probeWindowHealth(window: HealthWindow): Promise<WindowHea
           const finish = (animationFrameCompleted) => {
             if (settled) return;
             settled = true;
+            const mem = (performance && performance.memory) || {};
             resolve({
               readyState: document.readyState,
               visibilityState: document.visibilityState,
               rootChildCount: document.getElementById('root')?.childElementCount ?? 0,
               animationFrameCompleted,
+              jsHeapUsed: mem.usedJSHeapSize,
+              jsHeapTotal: mem.totalJSHeapSize,
+              jsHeapLimit: mem.jsHeapSizeLimit,
             });
           };
           requestAnimationFrame(() => requestAnimationFrame(() => finish(true)));
@@ -187,6 +209,18 @@ export async function probeWindowHealth(window: HealthWindow): Promise<WindowHea
     const animationFrameCompleted = renderer.animationFrameCompleted === true;
     const rendererResponsive = true;
 
+    // performance.memory values are bytes (or absent); convert to MB and derive
+    // the used/limit ratio. Absent → fields stay undefined (non-Chromium/hardened).
+    const bytesToMB = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v / (1024 * 1024)) : undefined;
+    const jsHeapUsedMB = bytesToMB(renderer.jsHeapUsed);
+    const jsHeapTotalMB = bytesToMB(renderer.jsHeapTotal);
+    const jsHeapLimitMB = bytesToMB(renderer.jsHeapLimit);
+    const jsHeapUsedPct =
+      jsHeapUsedMB !== undefined && jsHeapLimitMB !== undefined && jsHeapLimitMB > 0
+        ? Math.round((jsHeapUsedMB / jsHeapLimitMB) * 100)
+        : undefined;
+
     return {
       healthy:
         documentReadyState === 'complete' &&
@@ -204,6 +238,10 @@ export async function probeWindowHealth(window: HealthWindow): Promise<WindowHea
       captureEmpty,
       captureSize,
       captureHasVisiblePixels,
+      jsHeapUsedMB,
+      jsHeapTotalMB,
+      jsHeapLimitMB,
+      jsHeapUsedPct,
     };
   } catch (error) {
     return {
@@ -262,6 +300,37 @@ export class WindowHealthMonitor {
 
   logSession(details: Record<string, unknown>): void {
     this.log('session-start', details, true);
+  }
+
+  /**
+   * Emit a flagged `renderer-heap-pressure` event when a probe reports the
+   * renderer JS heap over either threshold. The renderer OOM abort (SIGTRAP
+   * during V8/cppgc GC) leaves no JS-level exception, so this trail is the only
+   * in-app signal that a crash was preceded by heap growth. Includes a process
+   * metric snapshot so the working-set of the offending Tab is captured too.
+   */
+  private checkHeapPressure(trigger: string, attempt: number, probe: WindowHealthProbeResult): void {
+    const usedMB = probe.jsHeapUsedMB;
+    const usedPct = probe.jsHeapUsedPct;
+    if (usedMB === undefined && usedPct === undefined) return; // heap stats unavailable
+    const overAbsolute = usedMB !== undefined && usedMB >= HEAP_PRESSURE_USED_MB;
+    const overRatio = usedPct !== undefined && usedPct >= HEAP_PRESSURE_USED_PCT;
+    if (!overAbsolute && !overRatio) return;
+    this.log(
+      'renderer-heap-pressure',
+      {
+        trigger,
+        attempt,
+        jsHeapUsedMB: usedMB,
+        jsHeapTotalMB: probe.jsHeapTotalMB,
+        jsHeapLimitMB: probe.jsHeapLimitMB,
+        jsHeapUsedPct: usedPct,
+        thresholdUsedMB: HEAP_PRESSURE_USED_MB,
+        thresholdUsedPct: HEAP_PRESSURE_USED_PCT,
+        trippedBy: overAbsolute && overRatio ? 'both' : overAbsolute ? 'absolute' : 'ratio',
+      },
+      true,
+    );
   }
 
   attachWindow(window: HealthWindow): void {
@@ -391,6 +460,7 @@ export class WindowHealthMonitor {
       this.log('recovery-probe-started', { trigger, ...this.windowDetails(window) }, true);
       const firstProbe = await this.probe(window);
       this.log('recovery-probe-result', { trigger, attempt: 1, ...firstProbe }, !firstProbe.healthy);
+      this.checkHeapPressure(trigger, 1, firstProbe);
       if (firstProbe.healthy) return;
 
       if (this.options.reviveNativeSurface) {
@@ -405,6 +475,7 @@ export class WindowHealthMonitor {
 
       const secondProbe = await this.probe(window);
       this.log('recovery-probe-result', { trigger, attempt: 2, ...secondProbe }, !secondProbe.healthy);
+      this.checkHeapPressure(trigger, 2, secondProbe);
       if (secondProbe.healthy) return;
       if (window.isDestroyed() || window.webContents.isDestroyed()) {
         this.log('recovery-skipped', { trigger, reason: 'window-destroyed-during-probe' });

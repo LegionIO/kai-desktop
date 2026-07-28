@@ -108,6 +108,43 @@ describe('probeWindowHealth', () => {
     expect(result.captureEmpty).toBe(true);
     expect(result.healthy).toBe(false);
   });
+
+  it('maps performance.memory bytes into MB and a used/limit percentage', async () => {
+    const window = new FakeWindow();
+    window.webContents.executeJavaScript.mockResolvedValue({
+      readyState: 'complete',
+      visibilityState: 'visible',
+      rootChildCount: 1,
+      animationFrameCompleted: true,
+      jsHeapUsed: 2_048 * 1024 * 1024, // 2048 MB
+      jsHeapTotal: 3_000 * 1024 * 1024,
+      jsHeapLimit: 4_096 * 1024 * 1024, // 4096 MB → 50% used
+    });
+    window.webContents.capturePage.mockResolvedValue(visibleImage());
+
+    const result = await probeWindowHealth(asHealthWindow(window));
+
+    expect(result.jsHeapUsedMB).toBe(2_048);
+    expect(result.jsHeapTotalMB).toBe(3_000);
+    expect(result.jsHeapLimitMB).toBe(4_096);
+    expect(result.jsHeapUsedPct).toBe(50);
+  });
+
+  it('leaves heap fields undefined when performance.memory is unavailable', async () => {
+    const window = new FakeWindow();
+    window.webContents.executeJavaScript.mockResolvedValue({
+      readyState: 'complete',
+      visibilityState: 'visible',
+      rootChildCount: 1,
+      animationFrameCompleted: true,
+    });
+    window.webContents.capturePage.mockResolvedValue(visibleImage());
+
+    const result = await probeWindowHealth(asHealthWindow(window));
+
+    expect(result.jsHeapUsedMB).toBeUndefined();
+    expect(result.jsHeapUsedPct).toBeUndefined();
+  });
 });
 
 describe('WindowHealthMonitor recovery policy', () => {
@@ -218,6 +255,41 @@ describe('WindowHealthMonitor recovery policy', () => {
     monitor.recordChildProcessGone({ type: 'GPU', reason: 'crashed', exitCode: 9 });
     expect(readFileSync(logPath, 'utf-8')).toContain('event=child-process-gone');
     expect(readFileSync(logPath, 'utf-8')).toContain('"type":"GPU"');
+    monitor.detachWindow();
+  });
+
+  it('emits renderer-heap-pressure when a probe reports the heap over the absolute ceiling', async () => {
+    const probe = vi.fn().mockResolvedValue({
+      ...healthyProbe,
+      jsHeapUsedMB: 2_500,
+      jsHeapTotalMB: 2_800,
+      jsHeapLimitMB: 4_096,
+      jsHeapUsedPct: 61,
+    } satisfies WindowHealthProbeResult);
+    const monitor = makeMonitor({ probe });
+
+    monitor.requestRecovery('heap-pressure', 0);
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1));
+
+    const log = readFileSync(logPath, 'utf-8');
+    expect(log).toContain('event=renderer-heap-pressure');
+    expect(log).toContain('"trippedBy":"absolute"');
+    monitor.detachWindow();
+  });
+
+  it('does not emit renderer-heap-pressure when the heap is below both thresholds', async () => {
+    const probe = vi.fn().mockResolvedValue({
+      ...healthyProbe,
+      jsHeapUsedMB: 800,
+      jsHeapLimitMB: 4_096,
+      jsHeapUsedPct: 20,
+    } satisfies WindowHealthProbeResult);
+    const monitor = makeMonitor({ probe });
+
+    monitor.requestRecovery('heap-ok', 0);
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(1));
+
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('event=renderer-heap-pressure');
     monitor.detachWindow();
   });
 });
