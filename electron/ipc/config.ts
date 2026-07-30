@@ -296,6 +296,7 @@ function getDefaultConfig() {
         scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const,
         retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
       },
+      memoryDiagnostics: { enabled: false },
     },
     advanced: {
       temperature: 0.4,

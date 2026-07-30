@@ -309,6 +309,12 @@ let hasEverBeenWindowed = !IS_HEADLESS;
 const MAIN_PROCESS_LOG = join(APP_HOME, 'logs', 'main-process.log');
 const WINDOW_HEALTH_LOG = join(APP_HOME, 'logs', 'window-health.log');
 
+// Wall-clock of the last system resume / screen unlock, used to timestamp how
+// long after a wake the renderer crashed (the crash correlates with long idle +
+// sleep/wake per the window-health telemetry). null until the first event.
+let lastSystemResumeAt: number | null = null;
+let lastScreenUnlockAt: number | null = null;
+
 function formatMainProcessError(error: unknown): string {
   if (error instanceof Error) {
     return error.stack || error.message;
@@ -718,6 +724,16 @@ const windowHealthMonitor = new WindowHealthMonitor({
   getPrimaryWindow: () => primaryWindowRef,
   getProcessMetrics: () => app.getAppMetrics(),
   hasActiveWork: hasActiveStreams,
+  // Live gate for the renderer heap heartbeat. Read per-tick so toggling the
+  // "In-depth memory & crash logging" setting starts/stops the heartbeat without
+  // a relaunch (unlike the V8 command-line switches, which are startup-only).
+  isHeapHeartbeatEnabled: () => {
+    try {
+      return readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.enabled ?? false;
+    } catch {
+      return false;
+    }
+  },
   reviveNativeSurface: async () => {
     if (!IS_MAC) return;
     const win = primaryWindowRef;
@@ -1048,6 +1064,36 @@ function focusPrimaryWindow(): void {
 app.commandLine.appendSwitch('enable-speech-api');
 app.commandLine.appendSwitch('enable-speech-dispatcher');
 
+// Crash diagnostics: the renderer has been dying with EXC_BREAKPOINT (SIGTRAP,
+// `brk 0`) fired from inside V8/cppgc garbage collection — V8's own fatal-error
+// trap, with no JS-level exception to catch. On its own the abort is opaque: the
+// macOS crash report shows only stripped GC frames. When the "In-depth memory &
+// crash logging" diagnostic setting is on, these flags make V8 print the *reason*
+// string for a fatal error (e.g. "Reached heap limit Allocation failed", "Array
+// buffer allocation failed", "invalid array length") plus a name/value line per
+// GC. That output goes to the renderer's stderr, which in a packaged app is
+// otherwise discarded — so we also route Chromium/V8 logging to a file
+// (chrome-debug.log next to the other logs) via --enable-logging=file. The last
+// lines of that file before an abort are the smoking gun.
+//
+// Gated on config (not an env var) so it is toggleable from Settings →
+// Diagnostics. Command-line switches can only be set before app-ready, so this
+// piece is read once at startup and requires a RELAUNCH to change — the setting
+// UI notes this. The live pieces (heap heartbeat, crash-context enrichment) read
+// the same flag dynamically below and take effect immediately.
+try {
+  if (readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.enabled) {
+    app.commandLine.appendSwitch('js-flags', '--trace-gc-nvp');
+    app.commandLine.appendSwitch('enable-logging', 'file');
+    app.commandLine.appendSwitch('log-file', join(APP_HOME, 'logs', 'chrome-debug.log'));
+    // Include INFO-level so trace-gc-nvp lines (logged at INFO) are not filtered.
+    app.commandLine.appendSwitch('log-level', '0');
+  }
+} catch {
+  /* config unreadable at startup — skip the diagnostic switches, never block boot */
+}
+
+
 if (gotSingleInstanceLock) {
   app.on('second-instance', (_event, argv) => {
     // A second launch arrived. Ignore duplicate BACKEND/CLI launches (e.g. two
@@ -1088,15 +1134,50 @@ if (gotSingleInstanceLock) {
       windowHealthMonitor.recordChildProcessGone({ ...details });
     });
     app.on('render-process-gone', (_event, contents, details) => {
-      windowHealthMonitor.recordRendererGone(contents, { ...details });
+      // Enrich the crash record with main-process memory + timing context. The
+      // renderer abort itself carries `reason` ('crashed' | 'oom' | 'killed' |
+      // 'launch-failed' | …) and `exitCode` (5 = SIGTRAP, the V8/cppgc fatal
+      // trap we're chasing). Attaching how long since the last suspend/resume
+      // and screen lock/unlock lets us confirm the observed "crashes on/after
+      // wake from a long idle" correlation, and main-process RSS rules out a
+      // whole-app memory ceiling. Always recorded (not gated) — it's a rare
+      // one-shot event and the correlation is useful even if the deeper opt-in
+      // logging wasn't enabled for this session. Best-effort — never let
+      // diagnostics throw inside the crash handler.
+      let crashContext: Record<string, unknown> = {};
+      try {
+        const mem = process.memoryUsage();
+        let memoryDiagnosticsEnabled = false;
+        try {
+          memoryDiagnosticsEnabled = readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.enabled ?? false;
+        } catch {
+          /* config unreadable — leave false */
+        }
+        crashContext = {
+          crashCapturedAt: new Date().toISOString(),
+          mainRssMB: Math.round(mem.rss / (1024 * 1024)),
+          mainHeapUsedMB: Math.round(mem.heapUsed / (1024 * 1024)),
+          mainExternalMB: Math.round(mem.external / (1024 * 1024)),
+          msSinceSystemResume: lastSystemResumeAt === null ? null : Date.now() - lastSystemResumeAt,
+          msSinceScreenUnlock: lastScreenUnlockAt === null ? null : Date.now() - lastScreenUnlockAt,
+          // Whether the restart-required V8/Chromium crash logging was active for
+          // this session (so a reader knows to also check chrome-debug.log).
+          memoryDiagnosticsEnabled,
+        };
+      } catch {
+        /* best-effort context only */
+      }
+      windowHealthMonitor.recordRendererGone(contents, { ...details, ...crashContext });
     });
     powerMonitor.on('suspend', () => windowHealthMonitor.recordLifecycleEvent('system-suspend'));
     powerMonitor.on('resume', () => {
+      lastSystemResumeAt = Date.now();
       windowHealthMonitor.recordLifecycleEvent('system-resume');
       windowHealthMonitor.requestRecovery('system-resume', 1_000);
     });
     powerMonitor.on('lock-screen', () => windowHealthMonitor.recordLifecycleEvent('screen-locked'));
     powerMonitor.on('unlock-screen', () => {
+      lastScreenUnlockAt = Date.now();
       windowHealthMonitor.recordLifecycleEvent('screen-unlocked');
       windowHealthMonitor.requestRecovery('screen-unlocked', 750);
     });

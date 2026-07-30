@@ -50,10 +50,12 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           scopes?: string[];
           retention?: { maxFileBytes?: number; maxFiles?: number; maxAgeDays?: number };
         };
+        memoryDiagnostics?: { enabled?: boolean };
       };
     }
   ).diagnostics;
   const debugTrace = diagnostics?.debugTrace;
+  const memoryDiagnostics = diagnostics?.memoryDiagnostics;
   const ALL_SCOPES = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const;
   // Optimistic scope selection: rapid checkbox toggles before a config round-trip
   // must merge against the LATEST intended set, not the stale prop, or the second
@@ -370,6 +372,50 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           </pre>
         )}
       </div>
+
+      {/* In-depth renderer memory & crash instrumentation */}
+      <div
+        className="rounded-xl border border-border/70 bg-card/60 p-4"
+        data-setting-id="diagnostics.memoryDiagnostics"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h4 className="text-xs font-semibold">In-depth memory &amp; crash logging</h4>
+            <p className="mt-1 max-w-2xl text-[11px] text-muted-foreground">
+              For diagnosing renderer crashes (a V8 garbage-collection abort leaves no JavaScript error to catch). When
+              on, the renderer JS-heap is sampled once a minute into the window-health log so the memory trajectory
+              before a crash is captured instead of a multi-hour idle gap, and crash records gain memory + sleep/wake
+              timing context. On the next launch it also routes V8 fatal-error reasons and GC traces to{' '}
+              <span className="select-text font-mono">~/.kai/logs/chrome-debug.log</span>. Off by default.
+            </p>
+          </div>
+          <span
+            className={`text-[10px] font-semibold uppercase tracking-wide ${memoryDiagnostics?.enabled ? 'text-emerald-500' : 'text-muted-foreground'}`}
+          >
+            {memoryDiagnostics?.enabled ? 'On' : 'Off'}
+          </span>
+        </div>
+
+        <div className="mt-3">
+          <Toggle
+            id="diagnostics.memoryDiagnostics.enabled"
+            label="Enable in-depth memory & crash logging"
+            checked={memoryDiagnostics?.enabled ?? false}
+            onChange={(value) => void updateConfig('diagnostics.memoryDiagnostics.enabled', value)}
+          />
+        </div>
+
+        {memoryDiagnostics?.enabled && (
+          <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-600 dark:text-amber-400">
+            <AlertTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              The heap heartbeat is active now. V8 crash logging to chrome-debug.log only starts after you fully quit
+              and reopen the app (Chromium accepts those flags only at launch).
+            </span>
+          </div>
+        )}
+      </div>
+
 
       {/* Health summary card */}
       <div className="rounded-xl border border-border/70 bg-card/60 p-4">

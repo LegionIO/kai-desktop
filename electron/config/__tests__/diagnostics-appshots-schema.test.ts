@@ -11,6 +11,18 @@ describe('diagnostics debug trace schema', () => {
       retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
     });
   });
+
+  it('defaults in-depth memory & crash diagnostics off', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse(undefined);
+    expect(diagnostics.memoryDiagnostics).toEqual({ enabled: false });
+  });
+
+  it('accepts memoryDiagnostics enabled', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { enabled: true } });
+    expect(diagnostics.memoryDiagnostics.enabled).toBe(true);
+    // debugTrace still fills its own defaults independently.
+    expect(diagnostics.debugTrace.enabled).toBe(false);
+  });
 });
 
 describe('unified App Shots config', () => {

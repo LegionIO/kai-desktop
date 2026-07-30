@@ -1131,6 +1131,21 @@ export const appConfigSchema = z.object({
           scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
           retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
         }),
+      /**
+       * In-depth renderer memory & crash instrumentation. Off by default. When
+       * on: (1) a periodic renderer JS-heap heartbeat is logged to window-health
+       * so the trajectory before a V8/cppgc OOM abort (SIGTRAP during GC) is on
+       * disk instead of a multi-hour idle blind spot, (2) render-process-gone
+       * records carry main-process memory + sleep/wake timing context, and (3)
+       * on the NEXT launch, V8 fatal-reason strings and GC traces are routed to
+       * chrome-debug.log (the command-line switches can only be set at startup,
+       * hence restart-required for that piece).
+       */
+      memoryDiagnostics: z
+        .object({
+          enabled: z.boolean().default(false),
+        })
+        .default({ enabled: false }),
     })
     .default({
       debugTrace: {
@@ -1139,6 +1154,7 @@ export const appConfigSchema = z.object({
         scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
         retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
       },
+      memoryDiagnostics: { enabled: false },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

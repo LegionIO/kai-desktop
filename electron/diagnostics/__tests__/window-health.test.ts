@@ -6,8 +6,10 @@ import type { NativeImage, ProcessMetric, WebContents } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   probeWindowHealth,
+  sampleRendererHeap,
   WindowHealthMonitor,
   type HealthWindow,
+  type RendererHeapSample,
   type WindowHealthProbeResult,
 } from '../window-health';
 
@@ -169,6 +171,10 @@ describe('WindowHealthMonitor recovery policy', () => {
       active?: () => boolean;
       now?: () => number;
       revive?: () => void | Promise<void>;
+      heapSampler?: (window: HealthWindow) => Promise<RendererHeapSample>;
+      heapHeartbeatIntervalMs?: number;
+      isHeapHeartbeatEnabled?: () => boolean;
+      skipLoad?: boolean;
     } = {},
   ): WindowHealthMonitor {
     const monitor = new WindowHealthMonitor({
@@ -178,11 +184,19 @@ describe('WindowHealthMonitor recovery policy', () => {
       hasActiveWork: options.active ?? (() => false),
       reviveNativeSurface: options.revive,
       probe: options.probe ? async () => options.probe!() : async () => healthyProbe,
+      heapSampler: options.heapSampler,
+      isHeapHeartbeatEnabled: options.isHeapHeartbeatEnabled,
       now: options.now,
-      timings: { surfaceRetryDelayMs: 0, activeWorkRetryMs: 60_000 },
+      // Heartbeat off by default so recovery tests are deterministic; the
+      // heartbeat suite opts in with a short interval.
+      timings: {
+        surfaceRetryDelayMs: 0,
+        activeWorkRetryMs: 60_000,
+        heapHeartbeatIntervalMs: options.heapHeartbeatIntervalMs ?? 0,
+      },
     });
     monitor.attachWindow(asHealthWindow(window));
-    window.webContents.emit('did-finish-load');
+    if (!options.skipLoad) window.webContents.emit('did-finish-load');
     return monitor;
   }
 
@@ -291,5 +305,121 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     expect(readFileSync(logPath, 'utf-8')).not.toContain('event=renderer-heap-pressure');
     monitor.detachWindow();
+  });
+
+  it('logs a renderer-heap-heartbeat on the heartbeat interval', async () => {
+    const heapSampler = vi.fn().mockResolvedValue({
+      jsHeapUsedMB: 1_024,
+      jsHeapTotalMB: 1_100,
+      jsHeapLimitMB: 4_096,
+      jsHeapUsedPct: 25,
+    } satisfies RendererHeapSample);
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5 });
+
+    await vi.waitFor(() => expect(heapSampler).toHaveBeenCalled());
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-heap-heartbeat'));
+
+    const log = readFileSync(logPath, 'utf-8');
+    expect(log).toContain('"jsHeapUsedMB":1024');
+    // A below-threshold heartbeat must NOT emit the flagged pressure event.
+    expect(log).not.toContain('event=renderer-heap-pressure');
+    monitor.detachWindow();
+  });
+
+  it('escalates a heartbeat over the ceiling to renderer-heap-pressure', async () => {
+    const heapSampler = vi.fn().mockResolvedValue({
+      jsHeapUsedMB: 3_600,
+      jsHeapTotalMB: 3_700,
+      jsHeapLimitMB: 4_096,
+      jsHeapUsedPct: 88,
+    } satisfies RendererHeapSample);
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5 });
+
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-heap-pressure'));
+
+    const log = readFileSync(logPath, 'utf-8');
+    expect(log).toContain('event=renderer-heap-heartbeat');
+    expect(log).toContain('"trippedBy":"absolute"');
+    expect(log).toContain('"trigger":"heartbeat"');
+    monitor.detachWindow();
+  });
+
+  it('does not sample the heap before the renderer has finished loading', async () => {
+    const heapSampler = vi.fn().mockResolvedValue({ jsHeapUsedMB: 10 } satisfies RendererHeapSample);
+    // skipLoad → did-finish-load never fires, so the webContents id is not marked loaded.
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5, skipLoad: true });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(heapSampler).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('stops the heartbeat on detach', async () => {
+    const heapSampler = vi.fn().mockResolvedValue({ jsHeapUsedMB: 10 } satisfies RendererHeapSample);
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5 });
+
+    await vi.waitFor(() => expect(heapSampler).toHaveBeenCalled());
+    monitor.detachWindow();
+    const callsAfterDetach = heapSampler.mock.calls.length;
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(heapSampler.mock.calls.length).toBe(callsAfterDetach);
+  });
+
+  it('does not sample the heap while the diagnostics setting is off', async () => {
+    const heapSampler = vi.fn().mockResolvedValue({ jsHeapUsedMB: 10 } satisfies RendererHeapSample);
+    const monitor = makeMonitor({ heapSampler, heapHeartbeatIntervalMs: 5, isHeapHeartbeatEnabled: () => false });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(heapSampler).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('samples once the diagnostics setting flips on without re-attaching', async () => {
+    let enabled = false;
+    const heapSampler = vi.fn().mockResolvedValue({ jsHeapUsedMB: 10 } satisfies RendererHeapSample);
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      isHeapHeartbeatEnabled: () => enabled,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(heapSampler).not.toHaveBeenCalled();
+
+    enabled = true; // live toggle — no re-attach
+    await vi.waitFor(() => expect(heapSampler).toHaveBeenCalled());
+    monitor.detachWindow();
+  });
+});
+
+describe('sampleRendererHeap', () => {
+  it('maps performance.memory bytes to MB and a used/limit percentage', async () => {
+    const window = new FakeWindow();
+    window.webContents.executeJavaScript.mockResolvedValue({
+      u: 1_024 * 1024 * 1024,
+      t: 1_500 * 1024 * 1024,
+      l: 4_096 * 1024 * 1024,
+    });
+
+    const sample = await sampleRendererHeap(asHealthWindow(window));
+
+    expect(sample.jsHeapUsedMB).toBe(1_024);
+    expect(sample.jsHeapLimitMB).toBe(4_096);
+    expect(sample.jsHeapUsedPct).toBe(25);
+    // Heartbeat probe must NOT capture the surface — that would be too heavy per tick.
+    expect(window.webContents.capturePage).not.toHaveBeenCalled();
+  });
+
+  it('returns an error when the renderer is unreachable', async () => {
+    const window = new FakeWindow();
+    window.webContents.executeJavaScript.mockRejectedValue(new Error('renderer gone'));
+
+    const sample = await sampleRendererHeap(asHealthWindow(window));
+
+    expect(sample.error).toBe('renderer gone');
+    expect(sample.jsHeapUsedMB).toBeUndefined();
   });
 });

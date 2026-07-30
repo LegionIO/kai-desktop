@@ -15,6 +15,14 @@ const MAX_AUTO_RELOADS_PER_WINDOW = 2;
 // a flagged trail lets the next crash be attributed to renderer memory growth.
 const HEAP_PRESSURE_USED_MB = 2_048;
 const HEAP_PRESSURE_USED_PCT = 90;
+// Cadence for the standalone renderer-heap heartbeat. The full health probe only
+// runs on window events (focus, display change, show) — so a renderer that sits
+// idle behind a locked screen and then aborts (SIGTRAP in V8/cppgc GC) leaves a
+// multi-hour telemetry blind spot right before the crash. The heartbeat samples
+// just the JS heap on this interval regardless of window activity, so the heap
+// trajectory approaching the next abort is always on disk. 60s balances signal
+// density against the cost of a trivial executeJavaScript round-trip.
+const HEAP_HEARTBEAT_INTERVAL_MS = 60_000;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -61,11 +69,21 @@ export interface WindowHealthMonitorOptions {
   hasActiveWork: () => boolean;
   /** macOS hook used to rebuild the native vibrancy-backed surface. */
   reviveNativeSurface?: () => void | Promise<void>;
+  /**
+   * Live predicate gating the renderer-heap heartbeat. Checked per tick so the
+   * "In-depth memory & crash logging" setting starts/stops sampling without a
+   * relaunch. When omitted, the heartbeat is always on (used by tests).
+   */
+  isHeapHeartbeatEnabled?: () => boolean;
   now?: () => number;
   probe?: (window: HealthWindow) => Promise<WindowHealthProbeResult>;
+  /** Heap-only sampler for the heartbeat (injectable for tests). */
+  heapSampler?: (window: HealthWindow) => Promise<RendererHeapSample>;
   timings?: {
     surfaceRetryDelayMs?: number;
     activeWorkRetryMs?: number;
+    /** Renderer-heap heartbeat cadence. 0 disables the heartbeat. */
+    heapHeartbeatIntervalMs?: number;
   };
 }
 
@@ -253,6 +271,53 @@ export async function probeWindowHealth(window: HealthWindow): Promise<WindowHea
   }
 }
 
+export interface RendererHeapSample {
+  jsHeapUsedMB?: number;
+  jsHeapTotalMB?: number;
+  jsHeapLimitMB?: number;
+  jsHeapUsedPct?: number;
+  error?: string;
+}
+
+/**
+ * Sample ONLY the renderer JS heap — no rAF wait, no capturePage. This is the
+ * heartbeat's probe: it must be cheap enough to run every minute on an idle,
+ * possibly-backgrounded renderer without perturbing it. The heavier
+ * {@link probeWindowHealth} (surface capture + frame liveness) is reserved for
+ * window-event-triggered recovery. Returns `{}`-ish with an `error` when the
+ * heap stats are unavailable (hardened/non-Chromium) or the renderer is gone.
+ */
+export async function sampleRendererHeap(window: HealthWindow): Promise<RendererHeapSample> {
+  const contents = window.webContents;
+  if (window.isDestroyed() || contents.isDestroyed()) {
+    return { error: 'window-or-webcontents-destroyed' };
+  }
+  try {
+    const mem = (await withTimeout(
+      contents.executeJavaScript(
+        `(() => { const m = (performance && performance.memory) || {};
+          return { u: m.usedJSHeapSize, t: m.totalJSHeapSize, l: m.jsHeapSizeLimit }; })()`,
+        true,
+      ) as Promise<{ u?: unknown; t?: unknown; l?: unknown }>,
+      PROBE_TIMEOUT_MS,
+      'renderer heap sample',
+    )) as { u?: unknown; t?: unknown; l?: unknown };
+    const bytesToMB = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v / (1024 * 1024)) : undefined;
+    const jsHeapUsedMB = bytesToMB(mem.u);
+    const jsHeapTotalMB = bytesToMB(mem.t);
+    const jsHeapLimitMB = bytesToMB(mem.l);
+    const jsHeapUsedPct =
+      jsHeapUsedMB !== undefined && jsHeapLimitMB !== undefined && jsHeapLimitMB > 0
+        ? Math.round((jsHeapUsedMB / jsHeapLimitMB) * 100)
+        : undefined;
+    return { jsHeapUsedMB, jsHeapTotalMB, jsHeapLimitMB, jsHeapUsedPct };
+  } catch (error) {
+    return { error: errorMessage(error) };
+  }
+}
+
+
 /**
  * Owns diagnostics and conservative revival for the primary renderer. Event
  * wiring lives in main.ts so this policy remains unit-testable without booting
@@ -270,14 +335,22 @@ export class WindowHealthMonitor {
   private contentsListeners: Array<{ event: string; listener: (...args: never[]) => void }> = [];
   private blurredAt: number | null = null;
   private readonly probe: (window: HealthWindow) => Promise<WindowHealthProbeResult>;
+  private readonly heapSampler: (window: HealthWindow) => Promise<RendererHeapSample>;
   private readonly surfaceRetryDelayMs: number;
   private readonly activeWorkRetryMs: number;
+  private readonly heapHeartbeatIntervalMs: number;
+  private readonly isHeapHeartbeatEnabled: () => boolean;
+  private heapHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heapHeartbeatRunning = false;
 
   constructor(private readonly options: WindowHealthMonitorOptions) {
     this.now = options.now ?? Date.now;
     this.probe = options.probe ?? probeWindowHealth;
+    this.heapSampler = options.heapSampler ?? sampleRendererHeap;
     this.surfaceRetryDelayMs = options.timings?.surfaceRetryDelayMs ?? SURFACE_RETRY_DELAY_MS;
     this.activeWorkRetryMs = options.timings?.activeWorkRetryMs ?? ACTIVE_WORK_RETRY_MS;
+    this.heapHeartbeatIntervalMs = options.timings?.heapHeartbeatIntervalMs ?? HEAP_HEARTBEAT_INTERVAL_MS;
+    this.isHeapHeartbeatEnabled = options.isHeapHeartbeatEnabled ?? (() => true);
   }
 
   log(event: string, details: Record<string, unknown> = {}, includeMetrics = false): void {
@@ -309,7 +382,11 @@ export class WindowHealthMonitor {
    * in-app signal that a crash was preceded by heap growth. Includes a process
    * metric snapshot so the working-set of the offending Tab is captured too.
    */
-  private checkHeapPressure(trigger: string, attempt: number, probe: WindowHealthProbeResult): void {
+  private checkHeapPressure(
+    trigger: string,
+    attempt: number,
+    probe: Pick<WindowHealthProbeResult, 'jsHeapUsedMB' | 'jsHeapTotalMB' | 'jsHeapLimitMB' | 'jsHeapUsedPct'>,
+  ): void {
     const usedMB = probe.jsHeapUsedMB;
     const usedPct = probe.jsHeapUsedPct;
     if (usedMB === undefined && usedPct === undefined) return; // heap stats unavailable
@@ -377,9 +454,73 @@ export class WindowHealthMonitor {
     onWindow('show', () => this.requestRecovery('window-shown', 250));
 
     this.log('primary-window-attached', this.windowDetails(window), true);
+    this.startHeapHeartbeat();
+  }
+
+  /**
+   * Begin the periodic renderer-heap heartbeat. Idempotent. Uses `setInterval`
+   * whose callback samples only the JS heap (no rAF/capture) so it is safe on an
+   * idle/backgrounded renderer. Skips its own tick if one is still in flight
+   * (a wedged renderer won't queue overlapping executeJavaScript calls). The
+   * timer is `unref`'d so it never keeps the process alive on its own.
+   */
+  private startHeapHeartbeat(): void {
+    if (this.heapHeartbeatIntervalMs <= 0 || this.heapHeartbeatTimer) return;
+    this.heapHeartbeatTimer = setInterval(() => {
+      void this.runHeapHeartbeat();
+    }, this.heapHeartbeatIntervalMs);
+    // unref keeps the heartbeat from holding the event loop open at shutdown.
+    (this.heapHeartbeatTimer as { unref?: () => void }).unref?.();
+  }
+
+  private stopHeapHeartbeat(): void {
+    if (this.heapHeartbeatTimer) {
+      clearInterval(this.heapHeartbeatTimer);
+      this.heapHeartbeatTimer = null;
+    }
+    this.heapHeartbeatRunning = false;
+  }
+
+  private async runHeapHeartbeat(): Promise<void> {
+    if (this.heapHeartbeatRunning) return; // previous sample still in flight
+    // Live gate: the setting can be toggled without a relaunch, so re-check each
+    // tick rather than only at attach. Cheap (a config cache read).
+    if (!this.isHeapHeartbeatEnabled()) return;
+    const window = this.attachedWindow;
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
+    // Only sample once the renderer has finished loading — sampling mid-load
+    // races the executeJavaScript against a document that may swap out.
+    if (!this.loadedWebContentsIds.has(window.webContents.id)) return;
+    this.heapHeartbeatRunning = true;
+    try {
+      const sample = await this.heapSampler(window);
+      if (sample.error) {
+        // Heap stats unavailable or renderer unreachable — record it (an
+        // unreachable renderer just before an abort is itself a useful signal),
+        // but don't spam a metric snapshot for the common "no performance.memory"
+        // case.
+        this.log('renderer-heap-heartbeat', { error: sample.error });
+        return;
+      }
+      // Only the used-MB and derived % are logged per tick; a full process
+      // metric snapshot every 60s would bloat the log. checkHeapPressure adds
+      // the flagged, metric-bearing event when a threshold trips.
+      this.log('renderer-heap-heartbeat', {
+        jsHeapUsedMB: sample.jsHeapUsedMB,
+        jsHeapTotalMB: sample.jsHeapTotalMB,
+        jsHeapLimitMB: sample.jsHeapLimitMB,
+        jsHeapUsedPct: sample.jsHeapUsedPct,
+      });
+      this.checkHeapPressure('heartbeat', 0, sample);
+    } catch {
+      /* heartbeat is best-effort; never let it throw into the interval */
+    } finally {
+      this.heapHeartbeatRunning = false;
+    }
   }
 
   detachWindow(): void {
+    this.stopHeapHeartbeat();
     if (this.recoveryTimer) {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = null;
