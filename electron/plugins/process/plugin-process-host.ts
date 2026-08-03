@@ -853,7 +853,10 @@ export class PluginProcessHost {
       const registrationId = String(args[0] ?? '');
       const targetMethod = String(args[1] ?? '');
       const targetArgs = Array.isArray(args[2]) ? (args[2] as unknown[]) : [];
-      if (!registrationId || !['config.onChanged', 'events.on', 'hooks.register'].includes(targetMethod)) {
+      if (
+        !registrationId ||
+        !['config.onChanged', 'events.on', 'hooks.register', 'tasks.onChanged'].includes(targetMethod)
+      ) {
         throw new Error('Invalid disposable plugin registration');
       }
       const disposable = await this.dispatch(targetMethod, targetArgs, adoptSink);

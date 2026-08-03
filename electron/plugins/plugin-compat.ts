@@ -44,6 +44,8 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'notifications:send',
   'conversations:read',
   'conversations:write',
+  'tasks:read',
+  'tasks:write',
   'navigation:open',
   'state:publish',
   'events:publish',
@@ -62,6 +64,7 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'marketplace', // marketplace service is available
   'renderer-build', // host can build frontend.js bundles
   'plugin-config-schema', // host validates configSchema via Zod
+  'tasks:sync', // origin-aware task hooks + idempotent external task upserts
 ]);
 
 /**

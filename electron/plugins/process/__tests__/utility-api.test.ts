@@ -26,6 +26,8 @@ const allPermissions: PluginManifest['permissions'] = [
   'notifications:send',
   'conversations:read',
   'conversations:write',
+  'tasks:read',
+  'tasks:write',
   'navigation:open',
   'state:publish',
   'events:publish',
@@ -42,7 +44,7 @@ const allPermissions: PluginManifest['permissions'] = [
   'lifecycle:hook',
 ];
 
-function setup() {
+function setup(permissions: PluginManifest['permissions'] = allPermissions) {
   const calls: Array<{ method: string; args: unknown[] }> = [];
   const functions = new Map<string, (...args: unknown[]) => unknown>();
   let functionId = 0;
@@ -85,7 +87,7 @@ function setup() {
     displayName: 'Compatibility Test',
     version: '1.0.0',
     description: 'fixture',
-    permissions: allPermissions,
+    permissions,
   };
   const api = createUtilityPluginAPI({
     manifest,
@@ -137,6 +139,44 @@ describe('utility-process plugin API compatibility proxy', () => {
       { method: 'config.set', args: ['ui.theme', 'light'] },
       { method: 'config.setPluginData', args: ['nested.count', 8] },
     ]);
+  });
+
+  it('routes task sync calls asynchronously and registers a disposable change hook', async () => {
+    const { api, calls, transport } = setup();
+    const handler = vi.fn();
+    const dispose = api.tasks.onChanged(handler);
+
+    await api.tasks.list({ includeArchived: true });
+    await api.tasks.create({ title: 'Imported issue' }, { correlationId: 'pull-1' });
+    await api.tasks.upsertExternal({
+      external: { source: 'jira:acme', externalId: 'ENG-42' },
+      task: { title: 'Imported issue' },
+    });
+    dispose();
+
+    expect(transport.registerDisposable).toHaveBeenCalledWith('tasks.onChanged', [handler]);
+    expect(calls).toContainEqual({ method: 'tasks.list', args: [{ includeArchived: true }] });
+    expect(calls).toContainEqual({
+      method: 'tasks.create',
+      args: [{ title: 'Imported issue' }, { correlationId: 'pull-1' }],
+    });
+    expect(calls).toContainEqual({
+      method: 'tasks.upsertExternal',
+      args: [
+        {
+          external: { source: 'jira:acme', externalId: 'ENG-42' },
+          task: { title: 'Imported issue' },
+        },
+        undefined,
+      ],
+    });
+  });
+
+  it('denies task reads and writes that were not declared by the plugin', () => {
+    const { api } = setup([]);
+    expect(() => api.tasks.list()).toThrow('requires permission "tasks:read"');
+    expect(() => api.tasks.create({ title: 'No access' })).toThrow('requires permission "tasks:write"');
+    expect(() => api.tasks.onChanged(() => {})).toThrow('requires permission "tasks:read"');
   });
 
   it('converts Zod tool schemas while preserving refinements and transforms in the remote callback', async () => {

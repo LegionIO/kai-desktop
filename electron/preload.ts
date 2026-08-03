@@ -340,6 +340,8 @@ const appAPI = {
           brandRequired: boolean;
           icon?: { lucide: string } | { svg: string };
           error?: string;
+          permissions: string[];
+          capabilities: string[];
         }>
       >,
     getConfig: (pluginName: string) =>

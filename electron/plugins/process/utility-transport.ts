@@ -508,7 +508,10 @@ export class UtilityTransport {
     void tracked.finally(() => this.orderedPending.delete(order));
   }
 
-  registerDisposable(method: 'config.onChanged' | 'events.on' | 'hooks.register', args: unknown[]): () => void {
+  registerDisposable(
+    method: 'config.onChanged' | 'events.on' | 'hooks.register' | 'tasks.onChanged',
+    args: unknown[],
+  ): () => void {
     const registrationId = `d${++this.disposableSequence}`;
     let active = true;
     this.orderedCall('__registerDisposable', [registrationId, method, args]);

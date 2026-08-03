@@ -80,6 +80,16 @@ import {
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
 import { hookDispatcher, HOOK_EVENTS } from '../agent/hooks/dispatcher.js';
+import {
+  archivePluginTask,
+  createPluginTask,
+  getTask,
+  listTasks,
+  unarchivePluginTask,
+  updatePluginTask,
+  upsertExternalPluginTask,
+} from '../ipc/tasks.js';
+import { subscribeToTaskChanges } from '../tasks/task-sync.js';
 
 /** Max buffered body for a plugin HTTP server request (1 MB). */
 const PLUGIN_HTTP_MAX_BODY_BYTES = 1_048_576;
@@ -939,6 +949,55 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       getActiveId: () => null,
       appendMessage: (_conversationId: string, _message: PluginConversationAppendMessage) => null,
       markUnread: (_conversationId: string, _unread: boolean) => {},
+    },
+
+    tasks: {
+      list: async (options) => {
+        requirePermission('tasks:read');
+        return listTasks(callbacks.appHome, { includeArchived: options?.includeArchived === true });
+      },
+      get: async (taskId) => {
+        requirePermission('tasks:read');
+        return getTask(callbacks.appHome, taskId);
+      },
+      create: async (task, options) => {
+        requirePermission('tasks:write');
+        return createPluginTask(callbacks.appHome, manifest.name, task, options);
+      },
+      update: async (taskId, updates, options) => {
+        requirePermission('tasks:write');
+        return updatePluginTask(callbacks.appHome, manifest.name, taskId, updates, options);
+      },
+      archive: async (taskId, options) => {
+        requirePermission('tasks:write');
+        return archivePluginTask(callbacks.appHome, manifest.name, taskId, options);
+      },
+      unarchive: async (taskId, options) => {
+        requirePermission('tasks:write');
+        return unarchivePluginTask(callbacks.appHome, manifest.name, taskId, options);
+      },
+      upsertExternal: async (input, options) => {
+        requirePermission('tasks:write');
+        return upsertExternalPluginTask(callbacks.appHome, manifest.name, input, options);
+      },
+      onChanged: (handler) => {
+        requirePermission('tasks:read');
+        const guarded = (event: Parameters<typeof handler>[0]) => {
+          if (callbacks.isLive && !callbacks.isLive()) return undefined;
+          return handler(event);
+        };
+        const off = subscribeToTaskChanges(
+          callbacks.appHome,
+          listTasks(callbacks.appHome, { includeArchived: true }),
+          guarded,
+        );
+        instance.eventUnsubscribers.push(off);
+        return () => {
+          off();
+          const index = instance.eventUnsubscribers.indexOf(off);
+          if (index >= 0) instance.eventUnsubscribers.splice(index, 1);
+        };
+      },
     },
 
     log: {

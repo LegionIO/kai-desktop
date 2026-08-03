@@ -8,6 +8,7 @@ import type {
 } from '../agent/hooks/dispatcher.js';
 import type { CompatCheckResult } from './plugin-compat.js';
 import type { PluginSafeConfig } from './safe-config.js';
+import type { KaiTaskMetadata, KaiTaskStatus, TaskExternalLink, TaskFile } from '../../shared/task-types.js';
 
 export type { PluginSafeConfig } from './safe-config.js';
 export type { ActionDescriptor, AutomationEvent, EventDescriptor } from '../automations/types.js';
@@ -39,6 +40,8 @@ export type PluginPermission =
   | 'notifications:send'
   | 'conversations:read'
   | 'conversations:write'
+  | 'tasks:read'
+  | 'tasks:write'
   | 'navigation:open'
   | 'state:publish'
   | 'events:publish'
@@ -72,12 +75,15 @@ export type PluginPermission =
  *                            exposing its unauthenticated, plugin-controlled
  *                            handler to the local network instead of just this
  *                            machine.
+ *   - 'tasks:write'        — create, edit, or archive user tasks, including
+ *                            changing their workflow status.
  */
 export const DANGEROUS_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new Set<PluginPermission>([
   'exec:whitelisted',
   'config:read-secrets',
   'agent:hook',
   'http:listen:network',
+  'tasks:write',
 ]);
 
 export type PluginApprovalRecord = {
@@ -510,6 +516,53 @@ export type PluginConversationAppendMessage = {
   createdAt?: string;
 };
 
+/* ── Task-board integration ── */
+
+/** Fields a plugin may set when creating a task on the Kai board. */
+export type PluginTaskCreateInput = {
+  title: string;
+  description?: string;
+  status?: KaiTaskStatus;
+  metadata?: KaiTaskMetadata;
+  workspaceId?: string;
+  priority?: number;
+};
+
+/**
+ * User-owned task fields a plugin may change. Execution/review audit fields,
+ * agent assignments, timestamps, and external links are host-managed.
+ */
+export type PluginTaskUpdateInput = Partial<PluginTaskCreateInput>;
+
+/** Plugin-owned portion of an external task identity. */
+export type PluginTaskExternalLinkInput = Omit<TaskExternalLink, 'pluginName' | 'syncedAt'>;
+
+export type PluginTaskUpsertExternalInput = {
+  external: PluginTaskExternalLinkInput;
+  task: PluginTaskCreateInput;
+  /** Attach the external identity to an existing local task instead of creating one. */
+  taskId?: string;
+};
+
+/** Correlates an inbound sync write with the change notification it produces. */
+export type PluginTaskMutationOptions = {
+  correlationId?: string;
+};
+
+export type PluginTaskChangeOrigin =
+  | { type: 'app' | 'system' }
+  | { type: 'plugin'; pluginName: string; correlationId?: string };
+
+export type PluginTaskChangeEvent = {
+  type: 'created' | 'updated' | 'archived' | 'unarchived' | 'deleted';
+  taskId: string;
+  task?: TaskFile;
+  previous?: TaskFile;
+  changedFields: Array<keyof TaskFile>;
+  origin: PluginTaskChangeOrigin;
+  timestamp: string;
+};
+
 export type PluginAPI = {
   pluginName: string;
   pluginDir: string;
@@ -640,6 +693,30 @@ export type PluginAPI = {
       message: PluginConversationAppendMessage,
     ) => PluginConversationRecord | null;
     markUnread: (conversationId: string, unread: boolean) => void;
+  };
+
+  /** Permission-gated access to the Kanban / Tasks board. */
+  tasks: {
+    list: (options?: { includeArchived?: boolean }) => Promise<TaskFile[]>;
+    get: (taskId: string) => Promise<TaskFile | null>;
+    create: (task: PluginTaskCreateInput, options?: PluginTaskMutationOptions) => Promise<TaskFile>;
+    update: (taskId: string, updates: PluginTaskUpdateInput, options?: PluginTaskMutationOptions) => Promise<TaskFile>;
+    archive: (taskId: string, options?: PluginTaskMutationOptions) => Promise<TaskFile>;
+    unarchive: (taskId: string, options?: PluginTaskMutationOptions) => Promise<TaskFile>;
+    /**
+     * Create or update a task by the calling plugin's stable external identity.
+     * This is the preferred inbound-sync primitive because retries are
+     * idempotent and cannot overwrite another plugin's external link.
+     */
+    upsertExternal: (
+      input: PluginTaskUpsertExternalInput,
+      options?: PluginTaskMutationOptions,
+    ) => Promise<{ task: TaskFile; created: boolean }>;
+    /**
+     * Subscribe to local task changes. Events include their origin and optional
+     * correlation id so two-way sync plugins can suppress their own echoes.
+     */
+    onChanged: (handler: (event: PluginTaskChangeEvent) => void | Promise<void>) => () => void;
   };
 
   log: {

@@ -334,6 +334,41 @@ export function createUtilityPluginAPI(options: {
       },
     },
 
+    tasks: {
+      list: (taskOptions) => {
+        checkPermission('tasks:read');
+        return asyncCall('tasks.list', [taskOptions]);
+      },
+      get: (taskId) => {
+        checkPermission('tasks:read');
+        return asyncCall('tasks.get', [taskId]);
+      },
+      create: (task, mutationOptions) => {
+        checkPermission('tasks:write');
+        return asyncCall('tasks.create', [task, mutationOptions]);
+      },
+      update: (taskId, updates, mutationOptions) => {
+        checkPermission('tasks:write');
+        return asyncCall('tasks.update', [taskId, updates, mutationOptions]);
+      },
+      archive: (taskId, mutationOptions) => {
+        checkPermission('tasks:write');
+        return asyncCall('tasks.archive', [taskId, mutationOptions]);
+      },
+      unarchive: (taskId, mutationOptions) => {
+        checkPermission('tasks:write');
+        return asyncCall('tasks.unarchive', [taskId, mutationOptions]);
+      },
+      upsertExternal: (input, mutationOptions) => {
+        checkPermission('tasks:write');
+        return asyncCall('tasks.upsertExternal', [input, mutationOptions]);
+      },
+      onChanged: (handler) => {
+        checkPermission('tasks:read');
+        return transport.registerDisposable('tasks.onChanged', [handler]);
+      },
+    },
+
     log: {
       info: (...args) => console.info(...args),
       warn: (...args) => console.warn(...args),

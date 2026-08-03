@@ -17,7 +17,7 @@ import { analyzeCompletion as analyzeCompletionCore } from '../agent/task-comple
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { z } from 'zod';
 import { appendOutput, getBuffer } from '../terminal/output-buffer.js';
-import { listAllTasks } from './tasks.js';
+import { broadcastTaskChange as broadcastTaskBoardChange, listAllTasks } from './tasks.js';
 import { readEffectiveConfig } from './config.js';
 import { DEFAULT_AGENT_ENV_DENYLIST, DEFAULT_AGENT_ARGS_DENYLIST } from '../config/schema.js';
 import { getRegisteredTools } from './agent.js';
@@ -390,12 +390,7 @@ function broadcastAgentChange(appHome: string): void {
 }
 
 function broadcastTaskChange(appHome: string): void {
-  try {
-    const tasks = listAllTasks(appHome);
-    broadcastToAllWindows('tasks:changed', tasks);
-  } catch (err) {
-    console.error('[agents] Failed to broadcast task change:', err);
-  }
+  broadcastTaskBoardChange(appHome, { type: 'system' });
 }
 
 // ── Multi-Reviewer Process ──────────────────────────────────────────────────

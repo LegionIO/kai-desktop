@@ -11,12 +11,13 @@ import { describe, it, expect } from 'vitest';
 import { DANGEROUS_PLUGIN_PERMISSIONS } from '../types.js';
 
 describe('DANGEROUS_PLUGIN_PERMISSIONS', () => {
-  it('contains exactly the code-execution / secret-read / network-exposure capabilities that require consent', () => {
+  it('contains exactly the elevated capabilities that require consent', () => {
     expect([...DANGEROUS_PLUGIN_PERMISSIONS].sort()).toEqual([
       'agent:hook',
       'config:read-secrets',
       'exec:whitelisted',
       'http:listen:network',
+      'tasks:write',
     ]);
   });
 
@@ -25,6 +26,7 @@ describe('DANGEROUS_PLUGIN_PERMISSIONS', () => {
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('config:read-secrets')).toBe(true); // read provider keys/secrets
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('agent:hook')).toBe(true); // MITM the agent loop
     expect(DANGEROUS_PLUGIN_PERMISSIONS.has('http:listen:network')).toBe(true); // expose local server to LAN
+    expect(DANGEROUS_PLUGIN_PERMISSIONS.has('tasks:write')).toBe(true); // mutate the user's task board
   });
 
   it('does NOT flag a benign permission as dangerous', () => {

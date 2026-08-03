@@ -103,5 +103,8 @@ describe('host introspection', () => {
     expect(CAPS.length).toBeGreaterThan(0);
     expect(getHostCapabilities()).not.toBe(getHostCapabilities()); // new array each call
     expect(CAPS).toContain('config:read');
+    expect(CAPS).toContain('tasks:read');
+    expect(CAPS).toContain('tasks:write');
+    expect(CAPS).toContain('tasks:sync');
   });
 });

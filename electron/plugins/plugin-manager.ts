@@ -113,6 +113,8 @@ type PluginListEntry = {
   brandRequired: boolean;
   icon?: { lucide: string } | { svg: string };
   error?: string;
+  permissions: PluginPermission[];
+  capabilities: string[];
 };
 
 /** Compare two semver strings — returns true if catalogVersion is newer than installedVersion. */
@@ -1220,6 +1222,8 @@ export class PluginManager {
       brandRequired: this.brandRequiredPluginNamesSet.has(instance.manifest.name),
       icon: instance.manifest.icon,
       error: instance.error,
+      permissions: [...instance.manifest.permissions],
+      capabilities: [...(instance.manifest.capabilities ?? [])],
     }));
   }
 

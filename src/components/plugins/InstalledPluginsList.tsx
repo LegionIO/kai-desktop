@@ -44,6 +44,8 @@ type PluginListEntry = {
   brandRequired: boolean;
   icon?: { lucide: string } | { svg: string };
   error?: string;
+  permissions: string[];
+  capabilities: string[];
 };
 
 interface InstalledPluginsListProps {

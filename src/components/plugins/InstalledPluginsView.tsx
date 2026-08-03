@@ -13,6 +13,7 @@ import {
   Settings2Icon,
   PowerIcon,
   PlayIcon,
+  SquareKanban,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
 import { cn } from '@/lib/utils';
@@ -46,6 +47,8 @@ type InstalledPlugin = {
   state: string;
   brandRequired: boolean;
   error?: string;
+  permissions: string[];
+  capabilities: string[];
 };
 
 type MarketplaceEntry = {
@@ -386,6 +389,21 @@ export const InstalledPluginsView: FC<InstalledPluginsViewProps> = ({
                             <span className="flex items-center gap-1 rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-semibold text-primary">
                               <ShieldIcon className="h-2.5 w-2.5" />
                               Required
+                            </span>
+                          )}
+                          {(plugin.permissions.includes('tasks:read') ||
+                            plugin.permissions.includes('tasks:write') ||
+                            plugin.capabilities.includes('tasks:sync')) && (
+                            <span className="flex items-center gap-1 rounded-full bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-400">
+                              <SquareKanban className="h-2.5 w-2.5" />
+                              Tasks ·{' '}
+                              {plugin.permissions.includes('tasks:write') && plugin.permissions.includes('tasks:read')
+                                ? 'Read/write'
+                                : plugin.permissions.includes('tasks:write')
+                                  ? 'Write'
+                                  : plugin.permissions.includes('tasks:read')
+                                    ? 'Read'
+                                    : 'Sync'}
                             </span>
                           )}
                         </div>

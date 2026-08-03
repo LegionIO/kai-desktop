@@ -10,6 +10,7 @@ import type {
   TaskConversationMessage,
   TaskStreamEvent,
   TaskReviewNote,
+  TaskExternalLink,
 } from '../../shared/task-types.js';
 import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
@@ -17,6 +18,14 @@ import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
 import { clearBuffer } from '../terminal/output-buffer.js';
+import type {
+  PluginTaskChangeOrigin,
+  PluginTaskCreateInput,
+  PluginTaskMutationOptions,
+  PluginTaskUpsertExternalInput,
+  PluginTaskUpdateInput,
+} from '../plugins/types.js';
+import { publishTaskChanges } from '../tasks/task-sync.js';
 
 export type { TaskStreamEvent } from '../../shared/task-types.js';
 
@@ -28,6 +37,22 @@ const MAX_HISTORY_LENGTH = 200_000;
 const MAX_USER_MESSAGE_LENGTH = 50_000;
 
 const kaiTaskStatusSchema = z.enum(['todo', 'in_progress', 'blocked', 'ai_review', 'human_review', 'done']);
+
+const taskExternalUrlSchema = z
+  .string()
+  .url()
+  .max(4000)
+  .refine((value) => ['http:', 'https:'].includes(new URL(value).protocol), 'External task URL must use HTTP(S)');
+
+const taskExternalLinkSchema = z.object({
+  pluginName: z.string().min(1).max(200),
+  source: z.string().min(1).max(500),
+  externalId: z.string().min(1).max(500),
+  externalKey: z.string().max(500).optional(),
+  url: taskExternalUrlSchema.optional(),
+  revision: z.string().max(500).optional(),
+  syncedAt: z.string().max(64),
+});
 
 const taskCreateSchema = z
   .object({
@@ -49,6 +74,7 @@ const taskCreateSchema = z
     reviewerAgentIds: z.array(z.string().max(100)).max(10).optional(),
     reviewMode: z.enum(['parallel', 'sequential']).optional(),
     priority: z.number().int().min(-100).max(100).optional(),
+    externalLinks: z.array(taskExternalLinkSchema).max(50).optional(),
   })
   .passthrough(); // allow additional fields for forward compat
 
@@ -128,8 +154,45 @@ export const taskUpdateSchema = z
     retryCount: z.number().int().min(0).max(100000).optional(),
     unblockAttempts: z.number().int().min(0).max(100000).optional(),
     runs: z.array(taskRunSchema).max(1000).optional(),
+    externalLinks: z.array(taskExternalLinkSchema).max(50).optional(),
   })
   .passthrough();
+
+const pluginTaskCreateSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH),
+    description: z.string().max(MAX_DESCRIPTION_LENGTH).optional(),
+    status: kaiTaskStatusSchema.optional(),
+    metadata: taskMetadataSchema.optional(),
+    workspaceId: z.string().max(100).optional(),
+    priority: z.number().int().min(-100).max(100).optional(),
+  })
+  .strict();
+
+const pluginTaskUpdateSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH).optional(),
+    description: z.string().max(MAX_DESCRIPTION_LENGTH).optional(),
+    status: kaiTaskStatusSchema.optional(),
+    metadata: taskMetadataSchema.optional(),
+    workspaceId: z.string().max(100).optional(),
+    priority: z.number().int().min(-100).max(100).optional(),
+  })
+  .strict();
+
+const pluginTaskExternalLinkSchema = taskExternalLinkSchema.omit({ pluginName: true, syncedAt: true });
+const pluginTaskUpsertExternalSchema = z
+  .object({
+    external: pluginTaskExternalLinkSchema,
+    task: pluginTaskCreateSchema,
+    taskId: z
+      .string()
+      .regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)
+      .optional(),
+  })
+  .strict();
+
+const pluginTaskMutationOptionsSchema = z.object({ correlationId: z.string().min(1).max(500).optional() }).strict();
 
 const taskOrderSchema = z
   .record(
@@ -195,9 +258,10 @@ function isValidTaskId(id: unknown): id is string {
   return typeof id === 'string' && UUID_RE.test(id);
 }
 
-function broadcastTaskChange(appHome: string): void {
+export function broadcastTaskChange(appHome: string, origin: PluginTaskChangeOrigin = { type: 'app' }): void {
   try {
     const tasks = listAllTasks(appHome);
+    publishTaskChanges(appHome, listTasks(appHome, { includeArchived: true }), origin);
     // broadcastToAllWindows fans out to every desktop window AND web-bridge
     // clients (via broadcastToWebClients), so the web Tasks view gets live
     // updates too — a plain webContents.send loop would skip web clients.
@@ -212,6 +276,10 @@ function broadcastTaskStreamEvent(event: TaskStreamEvent): void {
 }
 
 export function listAllTasks(appHome: string): TaskFile[] {
+  return listTasks(appHome);
+}
+
+export function listTasks(appHome: string, options?: { includeArchived?: boolean }): TaskFile[] {
   const dir = getTasksDir(appHome);
   let files: string[];
   try {
@@ -233,8 +301,295 @@ export function listAllTasks(appHome: string): TaskFile[] {
         return null;
       }
     })
-    .filter((t): t is TaskFile => t !== null && !t.archivedAt)
+    .filter((t): t is TaskFile => t !== null && (options?.includeArchived === true || !t.archivedAt))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export function getTask(appHome: string, id: string): TaskFile | null {
+  if (!isValidTaskId(id)) return null;
+  const filePath = join(getTasksDir(appHome), `${id}.json`);
+  if (!existsSync(filePath)) return null;
+  try {
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+    if (!task.id || !task.title || !task.status) return null;
+    warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
+    return task;
+  } catch {
+    return null;
+  }
+}
+
+type TaskOperationError = { error: string };
+type TaskOperationResult = TaskFile | TaskOperationError;
+
+function isTaskOperationError(result: TaskOperationResult): result is TaskOperationError {
+  return 'error' in result;
+}
+
+export function createTask(
+  appHome: string,
+  taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>,
+  origin: PluginTaskChangeOrigin = { type: 'app' },
+): TaskOperationResult {
+  const parsed = taskCreateSchema.safeParse(taskData);
+  if (!parsed.success) {
+    return { error: `Invalid task data: ${parsed.error.issues[0]?.message ?? 'validation failed'}` };
+  }
+
+  try {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
+    atomicWriteFileSync(join(getTasksDir(appHome), `${id}.json`), JSON.stringify(task, null, 2));
+    broadcastTaskChange(appHome, origin);
+    return task;
+  } catch (error) {
+    console.error('[tasks] Failed to create task:', error);
+    return { error: String(error) };
+  }
+}
+
+export function updateTask(
+  appHome: string,
+  id: string,
+  updates: Partial<TaskFile>,
+  origin: PluginTaskChangeOrigin = { type: 'app' },
+): Promise<TaskOperationResult> {
+  return updateTaskWith(appHome, id, () => updates, origin);
+}
+
+function updateTaskWith(
+  appHome: string,
+  id: string,
+  resolveUpdates: (existing: TaskFile) => Partial<TaskFile>,
+  origin: PluginTaskChangeOrigin,
+): Promise<TaskOperationResult> {
+  if (!isValidTaskId(id)) return Promise.resolve({ error: 'Invalid task ID' });
+  return withTaskLock(id, () => {
+    const filePath = join(getTasksDir(appHome), `${id}.json`);
+    if (!existsSync(filePath)) return { error: `Task ${id} not found` };
+
+    try {
+      const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+      const updates = resolveUpdates(existing);
+      const parsedUpdates = taskUpdateSchema.safeParse(updates);
+      if (!parsedUpdates.success) {
+        return { error: `Invalid task update: ${parsedUpdates.error.issues[0]?.message ?? 'validation failed'}` };
+      }
+
+      if ('status' in updates) {
+        const nextStatus = parsedUpdates.data.status;
+        if (nextStatus === undefined) {
+          return { error: `Invalid task status: ${JSON.stringify(updates.status)}` };
+        }
+        if (existing.status !== nextStatus && !isValidTransition(existing.status, nextStatus)) {
+          return { error: `Invalid transition: ${existing.status} → ${nextStatus}` };
+        }
+      }
+
+      const cleanUpdates = Object.fromEntries(
+        Object.entries(updates).filter(([, value]) => value !== undefined),
+      ) as Partial<TaskFile>;
+      const skipUpdatedAtKeys: Array<keyof TaskFile> = ['terminalSessionId', 'startedAt', 'completedAt', 'archivedAt'];
+      const isMeaningful = Object.keys(cleanUpdates).some((key) => !skipUpdatedAtKeys.includes(key as keyof TaskFile));
+      const updated: TaskFile = {
+        ...existing,
+        ...cleanUpdates,
+        id,
+        ...(isMeaningful && { updatedAt: new Date().toISOString() }),
+      };
+      atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
+      broadcastTaskChange(appHome, origin);
+      return updated;
+    } catch {
+      return { error: `Failed to update task ${id}` };
+    }
+  });
+}
+
+export function unarchiveTask(
+  appHome: string,
+  id: string,
+  origin: PluginTaskChangeOrigin = { type: 'app' },
+): TaskOperationResult {
+  if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+  const filePath = join(getTasksDir(appHome), `${id}.json`);
+  if (!existsSync(filePath)) return { error: `Task ${id} not found` };
+  try {
+    const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+    const { archivedAt: _removed, ...rest } = existing;
+    const updated: TaskFile = { ...rest, updatedAt: new Date().toISOString() };
+    atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
+    broadcastTaskChange(appHome, origin);
+    return updated;
+  } catch (error) {
+    return { error: String(error) };
+  }
+}
+
+function pluginMutationOrigin(pluginName: string, options?: PluginTaskMutationOptions): PluginTaskChangeOrigin {
+  const parsed = pluginTaskMutationOptionsSchema.safeParse(options ?? {});
+  if (!parsed.success) {
+    throw new Error(`Invalid task mutation options: ${parsed.error.issues[0]?.message ?? 'validation failed'}`);
+  }
+  return { type: 'plugin', pluginName, ...parsed.data };
+}
+
+function unwrapTaskOperation(result: TaskOperationResult): TaskFile {
+  if (isTaskOperationError(result)) throw new Error(result.error);
+  return result;
+}
+
+export function createPluginTask(
+  appHome: string,
+  pluginName: string,
+  input: PluginTaskCreateInput,
+  options?: PluginTaskMutationOptions,
+): TaskFile {
+  const parsed = pluginTaskCreateSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new Error(`Invalid plugin task: ${parsed.error.issues[0]?.message ?? 'validation failed'}`);
+  }
+  const status = parsed.data.status ?? 'todo';
+  const now = new Date().toISOString();
+  return unwrapTaskOperation(
+    createTask(
+      appHome,
+      {
+        ...parsed.data,
+        description: parsed.data.description ?? '',
+        status,
+        ...(status === 'in_progress' && { startedAt: now }),
+        ...(status === 'done' && { completedAt: now }),
+      },
+      pluginMutationOrigin(pluginName, options),
+    ),
+  );
+}
+
+export async function updatePluginTask(
+  appHome: string,
+  pluginName: string,
+  id: string,
+  input: PluginTaskUpdateInput,
+  options?: PluginTaskMutationOptions,
+): Promise<TaskFile> {
+  const parsed = pluginTaskUpdateSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new Error(`Invalid plugin task update: ${parsed.error.issues[0]?.message ?? 'validation failed'}`);
+  }
+
+  return unwrapTaskOperation(
+    await updateTaskWith(
+      appHome,
+      id,
+      (existing) => {
+        const now = new Date().toISOString();
+        const updates: Partial<TaskFile> = { ...parsed.data };
+        if (parsed.data.status === 'done' && existing.status !== 'done') updates.completedAt = now;
+        if (parsed.data.status === 'in_progress' && !existing.startedAt) updates.startedAt = now;
+        return updates;
+      },
+      pluginMutationOrigin(pluginName, options),
+    ),
+  );
+}
+
+export async function archivePluginTask(
+  appHome: string,
+  pluginName: string,
+  id: string,
+  options?: PluginTaskMutationOptions,
+): Promise<TaskFile> {
+  return unwrapTaskOperation(
+    await updateTask(appHome, id, { archivedAt: new Date().toISOString() }, pluginMutationOrigin(pluginName, options)),
+  );
+}
+
+export function unarchivePluginTask(
+  appHome: string,
+  pluginName: string,
+  id: string,
+  options?: PluginTaskMutationOptions,
+): TaskFile {
+  return unwrapTaskOperation(unarchiveTask(appHome, id, pluginMutationOrigin(pluginName, options)));
+}
+
+export function upsertExternalPluginTask(
+  appHome: string,
+  pluginName: string,
+  input: PluginTaskUpsertExternalInput,
+  options?: PluginTaskMutationOptions,
+): Promise<{ task: TaskFile; created: boolean }> {
+  const parsed = pluginTaskUpsertExternalSchema.safeParse(input);
+  if (!parsed.success) {
+    return Promise.reject(
+      new Error(`Invalid external task upsert: ${parsed.error.issues[0]?.message ?? 'validation failed'}`),
+    );
+  }
+  const { external, task: taskInput, taskId } = parsed.data;
+  const lockKey = `external:${pluginName}:${external.source}:${external.externalId}`;
+
+  return withTaskLock(lockKey, async () => {
+    const now = new Date().toISOString();
+    const externalLink: TaskExternalLink = { ...external, pluginName, syncedAt: now };
+    const linkedTask = listTasks(appHome, { includeArchived: true }).find((task) =>
+      task.externalLinks?.some(
+        (link) =>
+          link.pluginName === pluginName && link.source === external.source && link.externalId === external.externalId,
+      ),
+    );
+
+    if (linkedTask && taskId && linkedTask.id !== taskId) {
+      throw new Error(
+        `External task ${external.source}:${external.externalId} is already linked to task ${linkedTask.id}`,
+      );
+    }
+    const existing = linkedTask ?? (taskId ? getTask(appHome, taskId) : null);
+    if (taskId && !existing) throw new Error(`Task ${taskId} not found`);
+
+    if (!existing) {
+      const status = taskInput.status ?? 'todo';
+      const created = unwrapTaskOperation(
+        createTask(
+          appHome,
+          {
+            ...taskInput,
+            description: taskInput.description ?? '',
+            status,
+            ...(status === 'in_progress' && { startedAt: now }),
+            ...(status === 'done' && { completedAt: now }),
+            externalLinks: [externalLink],
+          },
+          pluginMutationOrigin(pluginName, options),
+        ),
+      );
+      return { task: created, created: true };
+    }
+
+    const updated = unwrapTaskOperation(
+      await updateTaskWith(
+        appHome,
+        existing.id,
+        (current) => {
+          const links = (current.externalLinks ?? []).filter(
+            (link) =>
+              !(
+                link.pluginName === pluginName &&
+                link.source === external.source &&
+                link.externalId === external.externalId
+              ),
+          );
+          const updates: Partial<TaskFile> = { ...taskInput, externalLinks: [...links, externalLink] };
+          if (taskInput.status === 'done' && current.status !== 'done') updates.completedAt = now;
+          if (taskInput.status === 'in_progress' && !current.startedAt) updates.startedAt = now;
+          return updates;
+        },
+        pluginMutationOrigin(pluginName, options),
+      ),
+    );
+    return { task: updated, created: false };
+  });
 }
 
 // ── Registration ─────────────────────────────────────────────────────────
@@ -258,142 +613,23 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
   });
 
   ipcMain.handle('tasks:list-all', () => {
-    // Returns every task including archived — used by the archived filter view.
-    const dir = getTasksDir(appHome);
-    let files: string[];
-    try {
-      files = readdirSync(dir);
-    } catch {
-      return [];
-    }
-    return files
-      .filter((f) => f.endsWith('.json') && f !== 'order.json')
-      .map((f) => {
-        try {
-          const raw = readFileSync(join(dir, f), 'utf-8');
-          const parsed = JSON.parse(raw) as TaskFile;
-          if (!parsed.id || !parsed.title || !parsed.status) return null;
-          return parsed;
-        } catch {
-          return null;
-        }
-      })
-      .filter((t): t is TaskFile => t !== null)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return listTasks(appHome, { includeArchived: true });
   });
 
   ipcMain.handle('tasks:get', (_e, id: string) => {
-    if (!isValidTaskId(id)) return null;
-    const filePath = join(getTasksDir(appHome), `${id}.json`);
-    if (!existsSync(filePath)) return null;
-    try {
-      const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-
-      // Validate common field naming mistakes
-      warnOnDeprecatedField(task, 'assignedAgent', 'assignedAgentId', 'tasks', 'Task', id);
-
-      return task;
-    } catch {
-      return null;
-    }
+    return getTask(appHome, id);
   });
 
   ipcMain.handle('tasks:create', (_e, taskData: Omit<TaskFile, 'id' | 'createdAt' | 'updatedAt'>) => {
-    const parsed = taskCreateSchema.safeParse(taskData);
-    if (!parsed.success) {
-      return { error: `Invalid task data: ${parsed.error.issues[0]?.message ?? 'validation failed'}` };
-    }
-
-    try {
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      const task: TaskFile = { ...taskData, id, createdAt: now, updatedAt: now };
-      atomicWriteFileSync(join(getTasksDir(appHome), `${id}.json`), JSON.stringify(task, null, 2));
-      broadcastTaskChange(appHome);
-      return task;
-    } catch (err) {
-      console.error('[tasks] Failed to create task:', err);
-      return { error: String(err) };
-    }
+    return createTask(appHome, taskData);
   });
 
   ipcMain.handle('tasks:update', (_e, id: string, updates: Partial<TaskFile>) => {
-    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
-    return withTaskLock(id, () => {
-      const filePath = join(getTasksDir(appHome), `${id}.json`);
-      if (!existsSync(filePath)) {
-        return { error: `Task ${id} not found` };
-      }
-      try {
-        const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-
-        // Validate the whole partial payload — not just `status` — so a caller
-        // can't forge/corrupt runs, reviewResults, timestamps, exit codes, or
-        // blank required fields with wrong types (#100 review MED). Each field
-        // is optional; unknown fields pass through for forward-compat.
-        const parsedUpdates = taskUpdateSchema.safeParse(updates);
-        if (!parsedUpdates.success) {
-          return { error: `Invalid task update: ${parsedUpdates.error.issues[0]?.message ?? 'validation failed'}` };
-        }
-
-        // Validate the status transition whenever the status key is PRESENT.
-        // A truthiness-only check let status: undefined/null/'' slip past the
-        // state machine and then get spread into the persisted task, wiping the
-        // status and dropping the task off the board / out of listAllTasks.
-        if ('status' in updates) {
-          const nextStatus = parsedUpdates.data.status;
-          if (nextStatus === undefined) {
-            return { error: `Invalid task status: ${JSON.stringify(updates.status)}` };
-          }
-          if (existing.status !== nextStatus && !isValidTransition(existing.status, nextStatus)) {
-            return { error: `Invalid transition: ${existing.status} → ${nextStatus}` };
-          }
-        }
-
-        // Strip keys explicitly set to undefined so a `{ field: undefined }`
-        // update can't blank out an existing value on merge.
-        const cleanUpdates = Object.fromEntries(
-          Object.entries(updates).filter(([, v]) => v !== undefined),
-        ) as Partial<TaskFile>;
-
-        // Don't bump updatedAt for operational/bookkeeping-only fields.
-        // Everything else (status, title, description, metadata, assignedAgentId, …) counts as a meaningful change.
-        const SKIP_UPDATED_AT_KEYS: Array<keyof TaskFile> = [
-          'terminalSessionId',
-          'startedAt',
-          'completedAt',
-          'archivedAt',
-        ];
-        const isMeaningful = Object.keys(cleanUpdates).some((k) => !SKIP_UPDATED_AT_KEYS.includes(k as keyof TaskFile));
-        const updated: TaskFile = {
-          ...existing,
-          ...cleanUpdates,
-          id, // prevent ID mutation
-          ...(isMeaningful && { updatedAt: new Date().toISOString() }),
-        };
-        atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
-        broadcastTaskChange(appHome);
-        return updated;
-      } catch {
-        return { error: `Failed to update task ${id}` };
-      }
-    }); // end withTaskLock
+    return updateTask(appHome, id, updates);
   });
 
   ipcMain.handle('tasks:unarchive', (_e, id: string) => {
-    if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
-    const filePath = join(getTasksDir(appHome), `${id}.json`);
-    if (!existsSync(filePath)) return { error: `Task ${id} not found` };
-    try {
-      const existing = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
-      const { archivedAt: _removed, ...rest } = existing as TaskFile & { archivedAt?: string };
-      const updated = { ...rest, updatedAt: new Date().toISOString() };
-      atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
-      broadcastTaskChange(appHome);
-      return updated;
-    } catch (err) {
-      return { error: String(err) };
-    }
+    return unarchiveTask(appHome, id);
   });
 
   ipcMain.handle('tasks:delete', (_e, id: string) => {

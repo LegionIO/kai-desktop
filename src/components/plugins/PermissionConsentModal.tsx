@@ -21,6 +21,7 @@ import {
   Wifi,
   KeyRound,
   PanelLeft,
+  SquareKanban,
 } from 'lucide-react';
 
 type ConsentRequest = {
@@ -61,6 +62,7 @@ const PERMISSION_DESCRIPTIONS: Record<
     icon: Wifi,
     level: 'high',
   },
+  'tasks:write': { label: 'Create, edit, and archive tasks', icon: SquareKanban, level: 'high' },
   'fs:scoped-read': { label: 'Read files within declared directories', icon: Eye, level: 'medium' },
   // ── Medium risk ──
   'messages:hook': { label: 'Intercept messages before/after send', icon: MessageSquare, level: 'medium' },
@@ -71,6 +73,7 @@ const PERMISSION_DESCRIPTIONS: Record<
   'browser:window': { label: 'Open browser windows', icon: MonitorSmartphone, level: 'medium' },
   'conversations:read': { label: 'Read conversation history', icon: MessageSquare, level: 'medium' },
   'conversations:write': { label: 'Modify conversations', icon: MessageSquare, level: 'medium' },
+  'tasks:read': { label: 'Read tasks and subscribe to board changes', icon: SquareKanban, level: 'medium' },
   'agent:generate': { label: 'Generate AI responses', icon: Bot, level: 'medium' },
   'agent:inference-provider': { label: 'Provide custom inference backend', icon: Bot, level: 'medium' },
   // ── Low risk (standard) ──

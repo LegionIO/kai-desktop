@@ -249,6 +249,8 @@ type AppAPI = {
         state: string;
         brandRequired: boolean;
         error?: string;
+        permissions: string[];
+        capabilities: string[];
       }>
     >;
     getConfig: (pluginName: string) => Promise<Record<string, unknown>>;

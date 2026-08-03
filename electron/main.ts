@@ -82,7 +82,7 @@ import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
 import { registerDiagnosticsHandlers } from './ipc/diagnostics.js';
-import { registerTaskHandlers } from './ipc/tasks.js';
+import { broadcastTaskChange, listAllTasks, registerTaskHandlers } from './ipc/tasks.js';
 import {
   registerAgentHandlers as registerAgentEntityHandlers,
   listAllAgents,
@@ -90,7 +90,6 @@ import {
   startAgentRun,
   stopAgentForDeletedTask,
 } from './ipc/agents.js';
-import { listAllTasks } from './ipc/tasks.js';
 import { TaskDispatcher } from './agent/task-dispatcher.js';
 import { terminateTokenizerWorker } from './agent/tokenization.js';
 import { registerOrchestratorHandlers, broadcastOrchestratorState } from './ipc/orchestrator.js';
@@ -1102,7 +1101,6 @@ try {
   /* config unreadable at startup — skip the diagnostic switches, never block boot */
 }
 
-
 if (gotSingleInstanceLock) {
   app.on('second-instance', (_event, argv) => {
     // A second launch arrived. Ignore duplicate BACKEND/CLI launches (e.g. two
@@ -1564,6 +1562,7 @@ if (gotSingleInstanceLock) {
               task.assignedAgentId = undefined;
               task.updatedAt = new Date().toISOString();
               writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+              broadcastTaskChange(APP_HOME, { type: 'system' });
             }
           }
         },
@@ -1591,6 +1590,7 @@ if (gotSingleInstanceLock) {
           task.reviewMode = mode as 'parallel' | 'sequential';
           task.updatedAt = new Date().toISOString();
           writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+          broadcastTaskChange(APP_HOME, { type: 'system' });
           console.info(`[Autopilot] Auto-assigned ${selectedIds.length} reviewers to task "${task.title}"`);
         },
         attemptUnblock: async (taskId: string) => {
@@ -1612,6 +1612,7 @@ if (gotSingleInstanceLock) {
             });
             task.updatedAt = new Date().toISOString();
             writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+            broadcastTaskChange(APP_HOME, { type: 'system' });
             console.info(`[Autopilot] Unblocked task "${task.title}": ${result.resolution}`);
 
             // Auto-restart the assigned agent
@@ -1630,6 +1631,7 @@ if (gotSingleInstanceLock) {
             task.unblockAttempts = (task.unblockAttempts ?? 0) + 1;
             task.updatedAt = new Date().toISOString();
             writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+            broadcastTaskChange(APP_HOME, { type: 'system' });
             console.info(`[Autopilot] Cannot unblock "${task.title}": ${result.reason}`);
             return false;
           }

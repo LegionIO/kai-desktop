@@ -11,6 +11,23 @@ export interface KaiTaskMetadata {
   cwd?: string;
 }
 
+/**
+ * Stable identity for a task mirrored from an external work-tracking system.
+ *
+ * `pluginName` is stamped by Kai (plugins cannot impersonate one another), while
+ * `source` is plugin-defined and should identify the remote account/project
+ * scope, for example `jira:acme` or `github:openai/codex`.
+ */
+export interface TaskExternalLink {
+  pluginName: string;
+  source: string;
+  externalId: string;
+  externalKey?: string;
+  url?: string;
+  revision?: string;
+  syncedAt: string;
+}
+
 /** A message in the task's AI conversation history (for plan generation/refinement). */
 export interface TaskConversationMessage {
   role: 'user' | 'assistant';
@@ -109,6 +126,8 @@ export interface TaskFile {
   unblockAttempts?: number;
   /** Chronological history of all execution and review runs (audit trail). */
   runs?: TaskRun[];
+  /** External work items linked by task-sync plugins. */
+  externalLinks?: TaskExternalLink[];
 }
 
 /** Column ordering state — maps each status to an ordered list of task IDs. */

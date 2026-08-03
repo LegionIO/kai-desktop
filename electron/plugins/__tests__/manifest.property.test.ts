@@ -80,6 +80,8 @@ const KNOWN_PERMISSIONS = [
   'notifications:send',
   'conversations:read',
   'conversations:write',
+  'tasks:read',
+  'tasks:write',
   'navigation:open',
   'state:publish',
   'agent:generate',

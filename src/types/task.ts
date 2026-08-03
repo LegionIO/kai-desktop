@@ -13,6 +13,7 @@ export type {
   TaskStreamEvent,
   TaskReviewNote,
   TaskReviewResult,
+  TaskExternalLink,
 } from '../../shared/task-types';
 export type { KaiTaskStatus } from '../../shared/task-types';
 
