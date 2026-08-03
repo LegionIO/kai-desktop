@@ -1144,8 +1144,20 @@ export const appConfigSchema = z.object({
       memoryDiagnostics: z
         .object({
           enabled: z.boolean().default(false),
+          /**
+           * Cap for window-health.log (the heap-heartbeat sink). The writer
+           * single-rolls to `.1` at this size, so total on-disk is ~2×. Default
+           * 10 MiB so a burst of recovery/display events can't evict the
+           * overnight heap trajectory before a crash. Bounded 1–50 MiB.
+           */
+          windowHealthLogMaxBytes: z
+            .number()
+            .int()
+            .min(1048576)
+            .max(52428800)
+            .default(10485760),
         })
-        .default({ enabled: false }),
+        .default({ enabled: false, windowHealthLogMaxBytes: 10485760 }),
     })
     .default({
       debugTrace: {
@@ -1154,7 +1166,7 @@ export const appConfigSchema = z.object({
         scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
         retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
       },
-      memoryDiagnostics: { enabled: false },
+      memoryDiagnostics: { enabled: false, windowHealthLogMaxBytes: 10485760 },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

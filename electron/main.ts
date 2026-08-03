@@ -734,6 +734,15 @@ const windowHealthMonitor = new WindowHealthMonitor({
       return false;
     }
   },
+  // Live cap for window-health.log, read per write so a Settings change applies
+  // without a relaunch. Undefined/unreadable → the monitor's built-in default.
+  getMaxLogBytes: () => {
+    try {
+      return readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.windowHealthLogMaxBytes ?? 10 * 1024 * 1024;
+    } catch {
+      return 10 * 1024 * 1024;
+    }
+  },
   reviveNativeSurface: async () => {
     if (!IS_MAC) return;
     const win = primaryWindowRef;

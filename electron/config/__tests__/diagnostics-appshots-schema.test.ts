@@ -12,16 +12,28 @@ describe('diagnostics debug trace schema', () => {
     });
   });
 
-  it('defaults in-depth memory & crash diagnostics off', () => {
+  it('defaults in-depth memory & crash diagnostics off with a 10 MiB window-health cap', () => {
     const diagnostics = appConfigSchema.shape.diagnostics.parse(undefined);
-    expect(diagnostics.memoryDiagnostics).toEqual({ enabled: false });
+    expect(diagnostics.memoryDiagnostics).toEqual({ enabled: false, windowHealthLogMaxBytes: 10485760 });
   });
 
   it('accepts memoryDiagnostics enabled', () => {
     const diagnostics = appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { enabled: true } });
     expect(diagnostics.memoryDiagnostics.enabled).toBe(true);
+    // windowHealthLogMaxBytes fills its default when only enabled is provided.
+    expect(diagnostics.memoryDiagnostics.windowHealthLogMaxBytes).toBe(10485760);
     // debugTrace still fills its own defaults independently.
     expect(diagnostics.debugTrace.enabled).toBe(false);
+  });
+
+  it('clamps an out-of-range window-health cap', () => {
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { enabled: true, windowHealthLogMaxBytes: 999 } }),
+    ).toThrow();
+    const ok = appConfigSchema.shape.diagnostics.parse({
+      memoryDiagnostics: { enabled: true, windowHealthLogMaxBytes: 20971520 },
+    });
+    expect(ok.memoryDiagnostics.windowHealthLogMaxBytes).toBe(20971520);
   });
 });
 

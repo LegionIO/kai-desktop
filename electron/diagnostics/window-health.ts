@@ -2,7 +2,7 @@ import type { BrowserWindow, NativeImage, ProcessMetric, WebContents } from 'ele
 import { appendBoundedLog } from './main-diagnostics.js';
 import { traceDiagnostic } from './debug-trace.js';
 
-const HEALTH_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const HEALTH_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 2_500;
 const SURFACE_RETRY_DELAY_MS = 500;
 const ACTIVE_WORK_RETRY_MS = 15_000;
@@ -75,6 +75,11 @@ export interface WindowHealthMonitorOptions {
    * relaunch. When omitted, the heartbeat is always on (used by tests).
    */
   isHeapHeartbeatEnabled?: () => boolean;
+  /**
+   * Live max-bytes for window-health.log, read per write so a GUI change to the
+   * cap takes effect immediately. When omitted, the built-in default is used.
+   */
+  getMaxLogBytes?: () => number;
   now?: () => number;
   probe?: (window: HealthWindow) => Promise<WindowHealthProbeResult>;
   /** Heap-only sampler for the heartbeat (injectable for tests). */
@@ -366,9 +371,23 @@ export class WindowHealthMonitor {
     appendBoundedLog(
       this.options.logPath,
       `[${new Date(this.now()).toISOString()}] [WINDOW_HEALTH] event=${event} data=${JSON.stringify(payload)}\n`,
-      HEALTH_LOG_MAX_BYTES,
+      this.resolveMaxLogBytes(),
     );
     traceDiagnostic({ scope: 'window', event, fields: payload });
+  }
+
+  /**
+   * Resolve the window-health.log cap. Reads the injected `getMaxLogBytes` per
+   * write so a GUI change applies immediately; falls back to the built-in
+   * default and clamps out any non-finite/absurd value so a bad config can
+   * never disable the bound (which would let the log grow without limit).
+   */
+  private resolveMaxLogBytes(): number {
+    const raw = this.options.getMaxLogBytes?.();
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1024 * 1024) {
+      return Math.min(raw, 50 * 1024 * 1024);
+    }
+    return HEALTH_LOG_MAX_BYTES;
   }
 
   logSession(details: Record<string, unknown>): void {

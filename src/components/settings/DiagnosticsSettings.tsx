@@ -50,7 +50,7 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           scopes?: string[];
           retention?: { maxFileBytes?: number; maxFiles?: number; maxAgeDays?: number };
         };
-        memoryDiagnostics?: { enabled?: boolean };
+        memoryDiagnostics?: { enabled?: boolean; windowHealthLogMaxBytes?: number };
       };
     }
   ).diagnostics;
@@ -403,6 +403,29 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             checked={memoryDiagnostics?.enabled ?? false}
             onChange={(value) => void updateConfig('diagnostics.memoryDiagnostics.enabled', value)}
           />
+        </div>
+
+        <div className="mt-4 max-w-xs">
+          <label className="text-[11px] text-muted-foreground">
+            Window-health log max size (MB)
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={Math.round((memoryDiagnostics?.windowHealthLogMaxBytes ?? 10485760) / 1048576)}
+              onChange={(event) =>
+                void updateConfig(
+                  'diagnostics.memoryDiagnostics.windowHealthLogMaxBytes',
+                  Math.min(50, Math.max(1, Number(event.target.value) || 10)) * 1048576,
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground"
+            />
+          </label>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            The log single-rolls to a <span className="font-mono">.1</span> backup at this size, so total on-disk is
+            about double. Higher values keep more history before a crash; 10 MB is the default.
+          </p>
         </div>
 
         {memoryDiagnostics?.enabled && (

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { NativeImage, ProcessMetric, WebContents } from 'electron';
@@ -174,6 +174,7 @@ describe('WindowHealthMonitor recovery policy', () => {
       heapSampler?: (window: HealthWindow) => Promise<RendererHeapSample>;
       heapHeartbeatIntervalMs?: number;
       isHeapHeartbeatEnabled?: () => boolean;
+      getMaxLogBytes?: () => number;
       skipLoad?: boolean;
     } = {},
   ): WindowHealthMonitor {
@@ -186,6 +187,7 @@ describe('WindowHealthMonitor recovery policy', () => {
       probe: options.probe ? async () => options.probe!() : async () => healthyProbe,
       heapSampler: options.heapSampler,
       isHeapHeartbeatEnabled: options.isHeapHeartbeatEnabled,
+      getMaxLogBytes: options.getMaxLogBytes,
       now: options.now,
       // Heartbeat off by default so recovery tests are deterministic; the
       // heartbeat suite opts in with a short interval.
@@ -391,6 +393,40 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     enabled = true; // live toggle — no re-attach
     await vi.waitFor(() => expect(heapSampler).toHaveBeenCalled());
+    monitor.detachWindow();
+  });
+
+  it('rolls window-health.log at the injected max-bytes cap', () => {
+    // Tiny cap + a large per-line payload so a handful of events cross 1 MiB.
+    const monitor = makeMonitor({ getMaxLogBytes: () => 1024 * 1024 });
+    const big = 'x'.repeat(30 * 1024); // ~30 KiB/line → ~35 lines to exceed 1 MiB
+    for (let i = 0; i < 50; i++) monitor.recordLifecycleEvent('display-metrics-changed', { i, big });
+    // appendBoundedLog checks size BEFORE each append, so once the live file
+    // exceeds 1 MiB it renames to `.1`. Assert the roll happened and the live
+    // file was reset below the cap after the roll.
+    expect(existsSync(`${logPath}.1`)).toBe(true);
+    expect(statSync(logPath).size).toBeLessThan(1024 * 1024);
+    monitor.detachWindow();
+  });
+
+  it('reads the cap live, so raising it stops the roll', () => {
+    let cap = 1024 * 1024; // start tiny
+    const monitor = makeMonitor({ getMaxLogBytes: () => cap });
+    cap = 50 * 1024 * 1024; // GUI raises it before any write
+    for (let i = 0; i < 40; i++) monitor.recordLifecycleEvent('display-metrics-changed', { i });
+    // With the raised cap the file never crosses it, so no `.1` roll appears.
+    expect(existsSync(`${logPath}.1`)).toBe(false);
+    monitor.detachWindow();
+  });
+
+  it('falls back to the default cap when getMaxLogBytes returns garbage', () => {
+    // A non-finite / absurdly small value must NOT disable the bound (which would
+    // let the log grow unbounded); the built-in 10 MiB default applies instead.
+    const monitor = makeMonitor({ getMaxLogBytes: () => Number.NaN });
+    for (let i = 0; i < 40; i++) monitor.recordLifecycleEvent('display-metrics-changed', { i });
+    // 40 small lines stay well under 10 MiB → no roll, and the file exists.
+    expect(existsSync(`${logPath}.1`)).toBe(false);
+    expect(statSync(logPath).size).toBeGreaterThan(0);
     monitor.detachWindow();
   });
 });
