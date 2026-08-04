@@ -277,6 +277,11 @@ type TreeNodeLike = {
   role?: unknown;
   parentId?: unknown;
   content?: unknown;
+  /** Explicit orphan-repair hint stamped by the renderer for a background-seeded
+   *  reply that was created with parentId:null (see reconnectActiveBranchRoot).
+   *  Pass 5 honors this LITERALLY — it never guesses an orphan from tree shape —
+   *  and clears it once the edge is restored. */
+  reconnectTo?: unknown;
 };
 
 /** Result of a tree-integrity repair, for optional diagnostics by the caller. */
@@ -288,6 +293,9 @@ export type TreeSanitizeReport = {
   cycleBrokenIds: string[];
   /** true if headId was unreachable and had to be repointed. */
   headRepointed: boolean;
+  /** id of an assistant-rooted active branch that was reconnected to prior history
+   *  (the mid-turn-inject orphan-root repair), or null if none. */
+  orphanBranchReconnected?: string | null;
 };
 
 /**
@@ -330,7 +338,10 @@ export type TreeSanitizeReport = {
 export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
   if (Array.isArray(a) && Array.isArray(b)) {
     const partText = (p: unknown): string | null =>
-      p && typeof p === 'object' && (p as { type?: unknown }).type === 'text' && typeof (p as { text?: unknown }).text === 'string'
+      p &&
+      typeof p === 'object' &&
+      (p as { type?: unknown }).type === 'text' &&
+      typeof (p as { text?: unknown }).text === 'string'
         ? (p as { text: string }).text
         : null;
     const toolId = (p: unknown): string | null =>
@@ -362,7 +373,8 @@ export function mergeSnapshotContent(a: unknown, b: unknown): unknown {
         const stc = toolId(s);
         const ltc = toolId(l);
         // Same tool position that gained a result / more args ⇒ monotonic growth.
-        if (stc !== null && stc === ltc && !(hasResult(s) && !hasResult(l)) && jstr(l).length >= jstr(s).length) continue;
+        if (stc !== null && stc === ltc && !(hasResult(s) && !hasResult(l)) && jstr(l).length >= jstr(s).length)
+          continue;
         return false; // positional mismatch → not a clean growth
       }
       return true;
@@ -401,7 +413,13 @@ export function sanitizeMessageTree(
   rawTree: unknown[],
   headId: string | null | undefined,
 ): { tree: TreeNodeLike[]; headId: string | null; report: TreeSanitizeReport } {
-  const report: TreeSanitizeReport = { changed: false, dedupedIds: [], cycleBrokenIds: [], headRepointed: false };
+  const report: TreeSanitizeReport = {
+    changed: false,
+    dedupedIds: [],
+    cycleBrokenIds: [],
+    headRepointed: false,
+    orphanBranchReconnected: null,
+  };
   // O(1) membership for report de-duplication — a growing-array `.includes()` per
   // repeated id would be O(n²) for a tree of two full duplicate snapshots.
   const dedupedIdSet = new Set<string>();
@@ -613,6 +631,77 @@ export function sanitizeMessageTree(
     report.changed = true;
   }
 
+  // ── Pass 5: honor an EXPLICIT orphan-reconnect hint (mid-turn-inject repair) ──
+  // A background-seeded renderer accumulator (an automation/serverPersisted stream
+  // into a non-active conversation) starts with headId:null, so its first assistant
+  // node — and anything parented on it, e.g. a mid-turn inject — can be persisted
+  // with parentId:null: a detached root that severs prior history (the GUI shows an
+  // "empty/cleared" thread). The RENDERER, which alone knows this provenance and the
+  // authoritative on-disk head, stamps that node with `reconnectTo: <diskHeadId>`.
+  //
+  // This pass reconnects LITERALLY from that hint — it never guesses an orphan from
+  // tree shape (an assistant-rooted tree can be legitimate: a rewound conversation
+  // that gets a realtime greeting, an assistant-first imported/plugin tree, etc.).
+  // Because every persist funnels through writeConversation → here, honoring the
+  // hint closes the renderer per-site gaps (CWD-change, supersede) and the
+  // cross-process `conversations:put` union-merge in one airtight place.
+  //
+  // A node is reconnected only when it is STILL detached (parentId null) and the
+  // hint names a real in-tree node from which the hinted node is NOT already
+  // reachable (LIVE cycle guard — re-checked against current parentIds so two
+  // reciprocal hints a→b / b→a in the same tree can't both apply and forge a cycle
+  // that runs after Pass 3). The hint is cleared on EVERY node that carries the
+  // property (string or not) so a malformed hint can't linger on disk.
+  {
+    let anyHint = false;
+    for (const id of order) {
+      if ('reconnectTo' in byId.get(id)!) {
+        anyHint = true;
+        break;
+      }
+    }
+    if (anyHint) {
+      // Is `target` reachable by walking UP from `from` via current parentIds? Used
+      // as the cycle guard: reparenting `from`→`target` cycles iff `from` is on
+      // `target`'s ancestor chain. Reflects mutations already applied this pass.
+      const reachesUpward = (from: string, target: string): boolean => {
+        let cur: string | null = target;
+        const seenLocal = new Set<string>();
+        while (cur !== null && !seenLocal.has(cur)) {
+          if (cur === from) return true;
+          seenLocal.add(cur);
+          const p: unknown = byId.get(cur)?.parentId;
+          cur = typeof p === 'string' ? p : null;
+        }
+        return false;
+      };
+      for (const id of order) {
+        const node = byId.get(id)!;
+        if (!('reconnectTo' in node)) continue;
+        const targetRaw = node.reconnectTo;
+        const target = typeof targetRaw === 'string' && targetRaw.length > 0 ? targetRaw : null;
+        // Only act on a node that is STILL a detached root; one already parented (the
+        // edge was restored by the renderer or the union-merge) just gets its hint
+        // cleared. Skip a self-hint, a hint to a missing id, or one that would cycle
+        // (target already reaches this node by walking up).
+        if (
+          node.parentId == null &&
+          target !== null &&
+          target !== id &&
+          ids.has(target) &&
+          !reachesUpward(id, target)
+        ) {
+          node.parentId = target;
+          report.orphanBranchReconnected = id;
+          report.changed = true;
+        }
+        // Always clear the hint — string or malformed — so nothing lingers on disk.
+        delete (node as { reconnectTo?: unknown }).reconnectTo;
+        report.changed = true;
+      }
+    }
+  }
+
   return { tree, headId: head, report };
 }
 
@@ -632,11 +721,7 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
   const priorCounts = new Map<string, { tokenCount: number; tokenCountSig: number }>();
   if (Array.isArray(priorTree)) {
     for (const pn of priorTree as Array<{ id?: unknown; tokenCount?: unknown; tokenCountSig?: unknown }>) {
-      if (
-        typeof pn?.id === 'string' &&
-        typeof pn.tokenCount === 'number' &&
-        typeof pn.tokenCountSig === 'number'
-      ) {
+      if (typeof pn?.id === 'string' && typeof pn.tokenCount === 'number' && typeof pn.tokenCountSig === 'number') {
         priorCounts.set(pn.id, { tokenCount: pn.tokenCount, tokenCountSig: pn.tokenCountSig });
       }
     }
@@ -754,6 +839,7 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
         headRepointed: report.headRepointed,
         dedupedIds: report.dedupedIds,
         cycleBrokenIds: report.cycleBrokenIds,
+        orphanBranchReconnected: report.orphanBranchReconnected ?? null,
       },
     });
   }
@@ -770,7 +856,9 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
     const prevMessages = Array.isArray(conv.messages) ? (conv.messages as TreeNodeLike[]) : [];
     const messages = prevMessages.map((m) => {
       const id = typeof m?.id === 'string' ? m.id : null;
-      const repaired = id ? (byId.get(id) as (TreeNodeLike & { tokenCount?: unknown; tokenCountSig?: unknown }) | undefined) : undefined;
+      const repaired = id
+        ? (byId.get(id) as (TreeNodeLike & { tokenCount?: unknown; tokenCountSig?: unknown }) | undefined)
+        : undefined;
       // Carry the backfilled count + signature onto the message-branch copy so the
       // active-branch view agrees with the tree.
       return repaired && typeof repaired.tokenCount === 'number'

@@ -595,6 +595,108 @@ describe('sanitizeMessageTree (tree-integrity invariant)', () => {
     expect(out.messageCount).toBeGreaterThan(0);
     expect((out.messages as Array<{ id: string }>).map((m) => m.id)).toEqual(['u1', 'a1']);
   });
+
+  // ── Pass 5: honor the explicit `reconnectTo` orphan-repair hint ──
+  it('honors a reconnectTo hint on a detached orphan (mid-turn-inject shape) and clears it', () => {
+    // The Matthew shape: real history (u1→a1→story), plus a detached assistant root
+    // "orphanReply" stamped by the renderer with reconnectTo:'story'; head is the inject.
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'hi' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', content: 'hello' },
+      { id: 'story', role: 'user', parentId: 'a1', content: 'send a story' },
+      { id: 'orphanReply', role: 'assistant', parentId: null, reconnectTo: 'story', content: 'partial' },
+      { id: 'inj', role: 'user', parentId: 'orphanReply', content: 'also pig latin' },
+    ];
+    const { tree: out, headId, report } = sanitizeMessageTree(tree, 'inj');
+    expect(report.orphanBranchReconnected).toBe('orphanReply');
+    const orphan = out.find((n) => n.id === 'orphanReply')!;
+    expect(orphan.parentId).toBe('story'); // honored literally
+    expect('reconnectTo' in orphan).toBe(false); // hint cleared
+    expect(out.filter((n) => n.parentId == null).map((n) => n.id)).toEqual(['u1']);
+    const byId = new Map(out.map((n) => [n.id as string, n] as const));
+    let cur: string | null = headId;
+    const walked: string[] = [];
+    while (cur != null) {
+      walked.unshift(cur);
+      cur = (byId.get(cur)?.parentId as string | null) ?? null;
+    }
+    expect(walked).toEqual(['u1', 'a1', 'story', 'orphanReply', 'inj']);
+  });
+
+  it('NEVER guesses: a legit assistant null-root WITHOUT a hint is left alone', () => {
+    // A rewound conversation that gained a realtime assistant greeting as a new root,
+    // or an assistant-first imported tree. No hint → Pass 5 must not touch it.
+    const tree = [
+      { id: 'shelved-u', role: 'user', parentId: null, content: 'old' },
+      { id: 'shelved-a', role: 'assistant', parentId: 'shelved-u', content: 'old reply' },
+      { id: 'greeting', role: 'assistant', parentId: null, content: 'hi again' }, // legit new root, NO hint
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'greeting');
+    expect(report.orphanBranchReconnected).toBeNull();
+    expect(out.find((n) => n.id === 'greeting')!.parentId).toBeNull(); // untouched
+  });
+
+  it('clears a STALE hint without reparenting when the node is already connected', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'q' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', reconnectTo: 'u1', content: 'a' }, // already parented
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'a1');
+    expect(report.orphanBranchReconnected).toBeNull(); // was not detached → no reparent
+    expect(out.find((n) => n.id === 'a1')!.parentId).toBe('u1'); // unchanged
+    expect('reconnectTo' in out.find((n) => n.id === 'a1')!).toBe(false); // stale hint cleared
+  });
+
+  it('ignores a hint pointing at a missing id, and clears it', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'q' },
+      { id: 'orphan', role: 'assistant', parentId: null, reconnectTo: 'ghost', content: 'x' },
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'orphan');
+    expect(report.orphanBranchReconnected).toBeNull();
+    expect(out.find((n) => n.id === 'orphan')!.parentId).toBeNull(); // not reparented to a ghost
+    expect('reconnectTo' in out.find((n) => n.id === 'orphan')!).toBe(false);
+  });
+
+  it('never creates a cycle: a hint pointing into the orphan’s own subtree is ignored', () => {
+    const tree = [
+      { id: 'root', role: 'user', parentId: null, content: 'r' },
+      { id: 'orphan', role: 'assistant', parentId: null, reconnectTo: 'child', content: 'o' },
+      { id: 'child', role: 'user', parentId: 'orphan', content: 'c' }, // inside orphan subtree
+    ];
+    const { tree: out, report } = sanitizeMessageTree(tree, 'child');
+    expect(report.orphanBranchReconnected).toBeNull();
+    expect(out.find((n) => n.id === 'orphan')!.parentId).toBeNull(); // would cycle → skipped
+  });
+
+  it('reciprocal hints a→b / b→a cannot both apply (no forged cycle after Pass 3)', () => {
+    const tree = [
+      { id: 'a', role: 'assistant', parentId: null, reconnectTo: 'b', content: 'a' },
+      { id: 'b', role: 'assistant', parentId: null, reconnectTo: 'a', content: 'b' },
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'a');
+    const A = out.find((n) => n.id === 'a')!;
+    const B = out.find((n) => n.id === 'b')!;
+    // At most one edge applied; the tree must remain acyclic.
+    const parents = [A.parentId, B.parentId];
+    const cyclic = A.parentId === 'b' && B.parentId === 'a';
+    expect(cyclic).toBe(false);
+    // Both hints cleared regardless.
+    expect('reconnectTo' in A).toBe(false);
+    expect('reconnectTo' in B).toBe(false);
+    void parents;
+  });
+
+  it('clears a malformed (non-string / empty) reconnectTo without reparenting', () => {
+    const tree = [
+      { id: 'u1', role: 'user', parentId: null, content: 'q' },
+      { id: 'a1', role: 'assistant', parentId: 'u1', reconnectTo: 42, content: 'x' },
+      { id: 'a2', role: 'assistant', parentId: 'u1', reconnectTo: '', content: 'y' },
+    ];
+    const { tree: out } = sanitizeMessageTree(tree, 'a1');
+    expect('reconnectTo' in out.find((n) => n.id === 'a1')!).toBe(false);
+    expect('reconnectTo' in out.find((n) => n.id === 'a2')!).toBe(false);
+  });
 });
 
 describe('writeConversation repairs a corrupt tree at the write chokepoint', () => {

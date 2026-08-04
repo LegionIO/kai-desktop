@@ -96,6 +96,13 @@ type StoredMessage = ThreadMessageLike & {
   parentId: string | null;
   tokenUsage?: TokenUsageData;
   messageMeta?: Record<string, unknown>;
+  /** Explicit orphan-reconnect hint for the mid-turn-inject repair: when a
+   *  background-seeded reply is reparented off a null-parent, we also stamp the
+   *  authoritative disk head here so the main-side write chokepoint
+   *  (sanitizeMessageTree Pass 5) can restore the edge LITERALLY even if a
+   *  cross-process merge or a persist path that bypassed the renderer repair drops
+   *  it. Cleared by the sanitizer once honored. */
+  reconnectTo?: string;
 };
 
 export type ConversationRecord = {
@@ -175,6 +182,17 @@ type MessageAccumulator = {
    *  The event precedes the assistant reply, so we stash it here and fold it into
    *  the terminal (done/error/awaiting) persist rather than writing mid-turn. */
   pendingCompaction?: ConversationCompaction;
+  /** When this accumulator was seeded synchronously-empty for a background
+   *  (automation/serverPersisted) stream into a NON-active conversation, the
+   *  first assistant node is created with parentId:null (there was no head yet).
+   *  `seededBackground` marks that provenance so the persist chokepoint knows to
+   *  reconnect a detached root against the on-disk head (opt-in — normal persists
+   *  never do, so a legitimate edit-root is untouched). `seededDiskHeadId` caches
+   *  the disk head once the async backfill resolves; the chokepoint falls back to
+   *  reading it from disk when this is still unset (the debounce can beat the
+   *  backfill). Both undefined for normally-seeded accumulators. */
+  seededBackground?: boolean;
+  seededDiskHeadId?: string | null;
 };
 
 type ConversationCompaction = {
@@ -350,6 +368,87 @@ export function resolveLiveInjectedParentId(
   if (!mainOwnsPersistence) return currentHeadId;
   if (persistedParentId === null) return null;
   return messages.some((message) => message.id === persistedParentId) ? persistedParentId : currentHeadId;
+}
+
+/**
+ * Reconnect the ACTIVE branch's detached base created by a background-seeded
+ * accumulator.
+ *
+ * When an automation/serverPersisted stream targets a NON-active conversation,
+ * the accumulator is seeded synchronously-empty (headId:null) so early deltas
+ * aren't dropped, then a best-effort async disk backfill prepends the persisted
+ * prefix. But the debounced persist fires on the very first delta — before that
+ * backfill wins its disk round-trip — so the first assistant (and anything
+ * parented on it, e.g. a mid-turn inject) can reach disk with parentId:null: the
+ * active branch's base is a detached root. getActiveBranch then walks
+ * activeHeadId→root, stops at that null edge, and prior history "disappears".
+ *
+ * This walks activeHeadId → up to the root of the branch the user is actually on,
+ * and reparents ONLY that base root onto `fallbackHeadId`. It deliberately does
+ * NOT touch any other null-root:
+ *  • Inactive edit branches (a prior first-message edit) have their own null roots
+ *    that are NOT ancestors of activeHeadId — reparenting them would corrupt a
+ *    legitimate sibling branch. They're left alone.
+ *  • The reparent is skipped when it would cycle (fallbackHead is a descendant of
+ *    the base, i.e. already reachable from it) or is a no-op (base === fallbackHead,
+ *    or fallbackHead is already on the active chain — the branch isn't detached).
+ *
+ * `fallbackHeadId` may be a disk node not yet present in `messages` (the prefix
+ * hasn't been merged locally). That's intentional: the parent edge points at the
+ * disk head, and `conversations:put`'s union-merge re-adds stored nodes the
+ * incoming tree is missing, healing the edge.
+ *
+ * No-op (returns the SAME array) when there's no usable fallback or the active
+ * branch already reaches a legitimate root, so it's cheap on the hot persist path.
+ * Idempotent.
+ */
+export function reconnectActiveBranchRoot(
+  messages: StoredMessage[],
+  activeHeadId: string | null,
+  fallbackHeadId: string | null,
+): StoredMessage[] {
+  // Nothing to anchor to, or no active branch to repair.
+  if (!fallbackHeadId || !activeHeadId || fallbackHeadId === activeHeadId) return messages;
+
+  const byId = new Map(messages.map((m) => [m.id, m] as const));
+
+  // Walk the ACTIVE branch up to its base root, recording the chain. If we reach
+  // the fallback head along the way, the active branch is already connected to disk
+  // history — nothing detached, no repair.
+  const activeChain = new Set<string>();
+  let base = activeHeadId;
+  let cur: string | null = activeHeadId;
+  while (cur !== null) {
+    if (cur === fallbackHeadId) return messages; // already connected
+    if (activeChain.has(cur)) return messages; // pre-existing cycle — don't touch
+    activeChain.add(cur);
+    base = cur;
+    cur = byId.get(cur)?.parentId ?? null;
+  }
+  // `base` is the root of the active branch. Only repair when it's genuinely a
+  // detached null-root that isn't the fallback head itself.
+  const baseNode = byId.get(base);
+  if (!baseNode || baseNode.parentId !== null || base === fallbackHeadId) return messages;
+
+  // Cycle guard: reparenting base → fallbackHead loops if fallbackHead is a
+  // DESCENDANT of base (base is reachable by walking up from fallbackHead). Walk
+  // fallbackHead's ancestor chain; if it passes through base, skip. (When
+  // fallbackHead isn't in `messages` — a disk-only head — the walk ends quickly
+  // without hitting base, so the reconnect proceeds and the put union-merge heals
+  // the edge.)
+  let fh: string | null = fallbackHeadId;
+  const fhSeen = new Set<string>();
+  while (fh !== null && !fhSeen.has(fh)) {
+    if (fh === base) return messages; // fallbackHead descends from base → would cycle
+    fhSeen.add(fh);
+    fh = byId.get(fh)?.parentId ?? null;
+  }
+
+  // Reparent the detached base onto the disk head, AND stamp an explicit
+  // `reconnectTo` hint so the main-side write chokepoint can restore the edge even
+  // if a cross-process merge (conversations:put union-merge) or a persist path that
+  // bypassed this repair drops it. The hint is cleared by the sanitizer once honored.
+  return messages.map((m) => (m.id === base ? { ...m, parentId: fallbackHeadId, reconnectTo: fallbackHeadId } : m));
 }
 
 /**
@@ -710,10 +809,16 @@ export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: Store
     }
     return { msg: timed, idx };
   }
-  // Create new assistant message
+  // Create new assistant message. When this accumulator was background-seeded
+  // (automation/serverPersisted into a non-active conversation) its headId starts
+  // null, so parent on the known on-disk head instead — otherwise this first
+  // assistant becomes a detached root that severs prior history when persisted
+  // (the mid-turn-inject orphan-root bug). Falls back to acc.headId (the normal
+  // case) when no seeded disk head is known.
+  const parentId = acc.headId ?? acc.seededDiskHeadId ?? null;
   const baseMsg: StoredMessage = {
     id: desiredId ?? msgId(),
-    parentId: acc.headId,
+    parentId,
     role: 'assistant',
     content: [],
     createdAt: new Date(),
@@ -1243,6 +1348,15 @@ async function persistConversation(
   tree: StoredMessage[],
   headId: string | null,
   updates: Partial<ConversationRecord> = {},
+  // Opt-in orphan-root repair. Set ONLY by background-seeded persist paths
+  // (automation/serverPersisted into a non-active conversation). When
+  // `seededBackground` is true, a detached root the background seed produced is
+  // reconnected onto `seededDiskHeadId` — or, if that hasn't resolved yet (the
+  // debounce can beat the async backfill), onto the head read from disk here.
+  // Left undefined for every normal persist (edits, regenerations, active-conv
+  // turns) so a LEGITIMATE second root — e.g. editing the first user message
+  // creates an intentional sibling branch with parentId:null — is never rewritten.
+  seedContext?: { seededBackground?: boolean; seededDiskHeadId?: string | null },
 ): Promise<void> {
   // Bump version BEFORE the async boundary to claim this persist operation.
   // This prevents stale debounced persists from overwriting newer data
@@ -1258,13 +1372,33 @@ async function persistConversation(
     const latestVersion = persistVersions.get(conversationId) ?? 0;
     if (currentVersion < latestVersion) return;
 
-    const branch = getActiveBranch(tree, headId);
+    // INVARIANT (mid-turn-inject orphan-root fix): never persist an active branch
+    // whose base is a DETACHED root produced by a background-seeded accumulator.
+    // Such an accumulator starts with headId:null, so its first assistant — and
+    // anything parented on it, e.g. a mid-turn inject — can carry parentId:null,
+    // making the active branch's base a detached root. Writing that severs prior
+    // history (getActiveBranch stops at the null edge → the GUI shows an
+    // "empty/cleared" thread). Reconnect ONLY the active branch's base onto the
+    // authoritative disk head. This is OPT-IN (only background-seeded paths pass
+    // seedContext) and scoped to the active branch, so legitimate inactive edit
+    // branches (their own null roots) and edit-roots on other persist paths are
+    // never touched. `conversations:put`'s union-merge re-adds any stored node the
+    // incoming tree lacks, healing an edge that points at a disk-only head.
+    let safeTree = tree;
+    if (seedContext?.seededBackground) {
+      const diskTree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredMessage[]) : [];
+      const fallbackHead =
+        seedContext.seededDiskHeadId ?? conv.headId ?? (diskTree.length > 0 ? diskTree[diskTree.length - 1].id : null);
+      safeTree = reconnectActiveBranchRoot(tree, headId, fallbackHead);
+    }
+
+    const branch = getActiveBranch(safeTree, headId);
     const now = nowIso();
 
     await app.conversations.put({
       ...conv,
       messages: branch, // linear view for backward compat
-      messageTree: tree,
+      messageTree: safeTree,
       headId,
       fallbackTitle: conv.fallbackTitle ?? null,
       updatedAt: now,
@@ -1276,6 +1410,15 @@ async function persistConversation(
   } catch (err) {
     console.error('[Runtime] Failed to persist:', err);
   }
+}
+
+/** Seed provenance from an accumulator, for persistConversation's orphan-root
+ *  repair. Returns undefined for a normally-seeded accumulator so no repair runs
+ *  (edits/regenerations/active-conv turns are never rewritten). */
+function seedContextFor(
+  acc: MessageAccumulator | undefined,
+): { seededBackground: boolean; seededDiskHeadId?: string | null } | undefined {
+  return acc?.seededBackground ? { seededBackground: true, seededDiskHeadId: acc.seededDiskHeadId } : undefined;
 }
 
 // --- Title generation logic ---
@@ -1914,7 +2057,14 @@ export function RuntimeProvider({
           if (extra.runStatus === 'running' && !streamAccumulators.has(conversationId)) {
             return;
           }
-          persistConversation(conversationId, t, h, extra);
+          // Carry the accumulator's seed provenance (read fresh at fire time so the
+          // async backfill's seededDiskHeadId is picked up if it resolved) so the
+          // persist chokepoint can reconnect a background-seeded detached root.
+          const acc = streamAccumulators.get(conversationId);
+          const seedContext = acc?.seededBackground
+            ? { seededBackground: true, seededDiskHeadId: acc.seededDiskHeadId }
+            : undefined;
+          persistConversation(conversationId, t, h, extra, seedContext);
         }, 300),
       );
     },
@@ -1929,9 +2079,12 @@ export function RuntimeProvider({
     const convId = activeIdRef.current;
     if (!convId) return;
 
-    await persistConversation(convId, treeRef.current, headIdRef.current, {
-      currentWorkingDirectory: trimmed,
-    });
+    // Persist ONLY the cwd field against the latest on-disk record — never rewrite
+    // messageTree here. A whole-tree persist could write a still-detached background
+    // -seeded render tree during the post-`done` reload window (accumulator already
+    // deleted → no seed provenance to repair it), re-orphaning history. A field-only
+    // patch keeps the authoritative disk tree intact.
+    await patchConversation(convId, { currentWorkingDirectory: trimmed });
   }, []);
 
   // Stable ref for values the stream handler needs without re-subscribing
@@ -2192,7 +2345,7 @@ export function RuntimeProvider({
           // off an async disk fetch to backfill the persisted
           // prefix (e.g. the user prompt turn) without discarding any deltas; the
           // trailing automation `done` reloads the authoritative tree from disk.
-          const seededAcc: MessageAccumulator = { messages: [], headId: null };
+          const seededAcc: MessageAccumulator = { messages: [], headId: null, seededBackground: true };
           streamAccumulators.set(convId, seededAcc);
           if (!automationSeedInProgress.has(convId)) {
             automationSeedInProgress.add(convId);
@@ -2200,16 +2353,23 @@ export function RuntimeProvider({
               .get(convId)
               .then((conv) => {
                 const rec = conv as ConversationRecord | null;
-                // Bail unless the SAME accumulator we seeded is still current and
-                // this conversation is still an automation stream. Otherwise the
-                // original run ended (accumulator deleted) and a new interactive/
-                // retry run may own convId now — mutating it or reparenting to a
-                // stale head would corrupt that unrelated run.
+                // Only touch the SAME accumulator we seeded. If a conversation-switch
+                // (loadConversationState) or a superseding/retry run replaced it, this
+                // stale callback must NOT mutate the new run's accumulator with our
+                // run's disk snapshot — that would corrupt an unrelated turn. The
+                // orphan-root repair does NOT depend on this callback winning: the
+                // persist chokepoint reconnects a detached root using the on-disk head
+                // regardless (a re-seed via loadConversationState already seeds a
+                // non-null head from disk, so it can't produce the orphan shape).
                 if (streamAccumulators.get(convId) !== seededAcc) return;
                 if (!automationStreams.has(convId)) return;
                 if (!rec) return;
                 const { tree, headId } = ensureTree(rec);
-                if (tree.length === 0) return;
+                if (tree.length === 0 || headId === null) return;
+                // Record the authoritative disk head so the debounced persist can
+                // reconnect any null-parent root even before this prefix merge lands
+                // — this is what closes the 300ms debounce race.
+                if (seededAcc.seededDiskHeadId == null) seededAcc.seededDiskHeadId = headId;
                 // Merge the persisted prefix (user prompt / prior history) in
                 // FRONT of whatever live deltas we've already collected, without
                 // dropping them. Skip nodes we already hold, and reparent the
@@ -2409,9 +2569,15 @@ export function RuntimeProvider({
           }
           streamAccumulators.delete(convId);
           forceNewAssistant.add(convId);
-          persistConversation(convId, acc.messages, acc.headId, {
-            lastAssistantUpdateAt: new Date().toISOString(),
-          });
+          persistConversation(
+            convId,
+            acc.messages,
+            acc.headId,
+            {
+              lastAssistantUpdateAt: new Date().toISOString(),
+            },
+            seedContextFor(acc),
+          );
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
@@ -2720,12 +2886,17 @@ export function RuntimeProvider({
           }
           const branch = getActiveBranch(acc.messages, acc.headId);
           const responseMessageId = msgId();
-          persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' });
+          persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' }, seedContextFor(acc));
           streamAccumulators.set(convId, {
             messages: [...acc.messages],
             headId: acc.headId,
             pendingAssistantTiming: createPendingAssistantTiming(),
             pendingAssistantId: responseMessageId,
+            // Carry background-seed provenance forward: the continuation's messages
+            // still contain the (as-yet-unrepaired) branch, so its own persists must
+            // keep reconnecting the active-branch base until the disk prefix lands.
+            seededBackground: acc.seededBackground,
+            seededDiskHeadId: acc.seededDiskHeadId,
           });
           if (isActiveConv) {
             setTree([...acc.messages]);
@@ -2763,12 +2934,18 @@ export function RuntimeProvider({
           persistTimersRef.current.delete(convId);
         }
         streamAccumulators.delete(convId);
-        persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle',
-          lastAssistantUpdateAt: nowIso(),
-          hasUnread: !isActiveConv,
-          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
-        });
+        persistConversation(
+          convId,
+          acc.messages,
+          acc.headId,
+          {
+            runStatus: 'idle',
+            lastAssistantUpdateAt: nowIso(),
+            hasUnread: !isActiveConv,
+            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+          },
+          seedContextFor(acc),
+        );
         if (isActiveConv) {
           setIsRunning(false);
           setTree([...acc.messages]);
@@ -2809,12 +2986,18 @@ export function RuntimeProvider({
           persistTimersRef.current.delete(convId);
         }
         streamAccumulators.delete(convId);
-        persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle',
-          lastAssistantUpdateAt: nowIso(),
-          hasUnread: !isActiveConv,
-          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
-        });
+        persistConversation(
+          convId,
+          acc.messages,
+          acc.headId,
+          {
+            runStatus: 'idle',
+            lastAssistantUpdateAt: nowIso(),
+            hasUnread: !isActiveConv,
+            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+          },
+          seedContextFor(acc),
+        );
         if (isActiveConv) {
           setIsRunning(false);
           setTree([...acc.messages]);
@@ -2875,11 +3058,17 @@ export function RuntimeProvider({
             clearTimeout(_ptAwait);
             persistTimersRef.current.delete(convId);
           }
-          persistConversation(convId, acc.messages, acc.headId, {
-            runStatus: 'awaiting-approval',
-            hasUnread: true,
-            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
-          });
+          persistConversation(
+            convId,
+            acc.messages,
+            acc.headId,
+            {
+              runStatus: 'awaiting-approval',
+              hasUnread: true,
+              ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+            },
+            seedContextFor(acc),
+          );
           return;
         }
         finalizeAssistantResponse(acc);
@@ -2899,12 +3088,18 @@ export function RuntimeProvider({
           persistTimersRef.current.delete(convId);
         }
         streamAccumulators.delete(convId);
-        persistConversation(convId, acc.messages, acc.headId, {
-          runStatus: 'idle',
-          lastAssistantUpdateAt: nowIso(),
-          hasUnread: !isActiveConv,
-          ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
-        });
+        persistConversation(
+          convId,
+          acc.messages,
+          acc.headId,
+          {
+            runStatus: 'idle',
+            lastAssistantUpdateAt: nowIso(),
+            hasUnread: !isActiveConv,
+            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+          },
+          seedContextFor(acc),
+        );
         if (isActiveConv) {
           setTree([...acc.messages]);
           setHeadId(acc.headId);
@@ -2939,9 +3134,17 @@ export function RuntimeProvider({
                   headId: headForStream,
                   pendingAssistantTiming: createPendingAssistantTiming(),
                   pendingAssistantId: responseMessageId,
+                  seededBackground: acc.seededBackground,
+                  seededDiskHeadId: acc.seededDiskHeadId,
                 });
                 setIsRunning(true);
-                persistConversation(convId, treeForStream, headForStream, { runStatus: 'running' });
+                persistConversation(
+                  convId,
+                  treeForStream,
+                  headForStream,
+                  { runStatus: 'running' },
+                  seedContextFor(acc),
+                );
                 const cfg = streamHandlerRef.current;
                 console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
                 app.agent.stream(
@@ -2998,7 +3201,7 @@ export function RuntimeProvider({
           clearTimeout(_pt);
           persistTimersRef.current.delete(convId);
         }
-        persistConversation(convId, acc.messages, acc.headId, persistExtra);
+        persistConversation(convId, acc.messages, acc.headId, persistExtra, seedContextFor(acc));
       } else {
         // Resume running indicator only if not awaiting approval — stale
         // text-delta events may arrive after tool-approval-required.
@@ -3091,6 +3294,11 @@ export function RuntimeProvider({
       const newHead = userMsg.id;
       const pendingAssistantTiming = createPendingAssistantTiming();
       const responseMessageId = msgId();
+      // Capture the SUPERSEDED accumulator's seed provenance before we replace it:
+      // if it was background-seeded, `tree` (and thus newTree) may still carry its
+      // detached orphan base, so this persist must repair it too. Carry the
+      // provenance forward onto the new turn's accumulator as well.
+      const supersededSeed = seedContextFor(streamAccumulators.get(convId));
       setTree(newTree);
       setHeadId(newHead);
       setIsRunning(true);
@@ -3100,10 +3308,12 @@ export function RuntimeProvider({
         headId: newHead,
         pendingAssistantTiming,
         pendingAssistantId: responseMessageId,
+        seededBackground: supersededSeed?.seededBackground,
+        seededDiskHeadId: supersededSeed?.seededDiskHeadId,
       });
       const branch = getActiveBranch(newTree, newHead);
 
-      await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+      await persistConversation(convId, newTree, newHead, { runStatus: 'running' }, supersededSeed);
       void maybeGenerateTitle(convId, branch);
       console.info(
         `[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`,
