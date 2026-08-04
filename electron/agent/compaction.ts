@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { createHash } from 'crypto';
 import {
   countBranchTokensCached,
   countBranchTokensCachedAsync,
@@ -9,9 +10,77 @@ import {
   encodeCappedWithAsync,
   type ConversationTokenizationInfo,
 } from './tokenization.js';
-import type { LLMModelConfig } from './model-catalog.js';
+import type { LLMModelConfig, ModelCatalogEntry } from './model-catalog.js';
 import { auxAgentGenerate } from './generate-fallback.js';
+import {
+  estimateNativeMediaTokens,
+  estimateImageTokensFromBytes,
+  estimateFileTokensFromBytes,
+  isSanitizerRetainableMedia,
+} from './media-fit.js';
 import { COMPACTION_SYSTEM_PROMPT } from './prompts.js';
+
+// Cap on CONCURRENT outstanding summarizer generates. An aborted/timed-out compaction
+// stops AWAITING its generate (Promise.race) but can't force-cancel a provider that
+// ignores abortSignal — the request keeps running with its prompt/agent state alive. Under
+// repeated abort+retry (a flapping provider, tight /compact timeouts) these would otherwise
+// accumulate unbounded (OOM / provider request exhaustion). The slot is held until the
+// generate actually SETTLES (not when the race resolves), so abandoned-but-running requests
+// keep occupying it; a new compaction that can't get a slot bails (returns null → history
+// stays uncompacted, reactive recovery / the next turn retries) rather than piling on.
+const MAX_CONCURRENT_SUMMARIZER_GENERATES = 4;
+let outstandingSummarizerGenerates = 0;
+
+// Canonical BOUNDED content signature for a single message. Detects that a covered
+// message's CONTENT (not just its id) changed between when a compaction was computed
+// and when its record is persisted/reused. Includes tool_calls / tool_call_id so a
+// same-id edit that only rewrites the tool payload is still caught. Returns a fixed-
+// width SHA1 hash, NOT the raw content: covered messages can carry large tool results
+// or retained base64 media, and these signatures are (a) transmitted inside the
+// `compaction` stream event — raw content would blow the 8 MiB local-bridge/CLI frame
+// limit and destroy the socket — and (b) compared on every `conversations:put`, where
+// concatenating raw content for a media-heavy branch would allocate history-sized
+// strings and risk OOMing the main process. Lives here (not stream-persistence) so the
+// agent, conversations, and stream-persistence layers can all import it without a cycle.
+export function messageContentSignature(
+  m: { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown } | null | undefined,
+): string {
+  if (!m) return '';
+  const extra = m as { tool_calls?: unknown; tool_call_id?: unknown };
+  // Sign the MODEL-VISIBLE content: normalize away user-message `file` parts flagged
+  // `displayOnly` (the renderer keeps them for the attachment chip but their content is
+  // already inlined as a sibling text part and they're never sent to the provider). The
+  // compaction PRODUCERS sign the already-displayOnly-stripped in-memory branch, while
+  // the PERSISTENCE consumers recompute from RAW disk — without this normalization those
+  // two hashes disagree for a message carrying a displayOnly part, and a valid compaction
+  // is repeatedly false-rejected (re-summarized + rebilled). Stripping here makes the
+  // signature identical whether the caller passes raw or pre-stripped messages, and a
+  // displayOnly change (which never affects the model) correctly does NOT count as drift.
+  let content = m.content;
+  if (m.role === 'user' && Array.isArray(content)) {
+    const filtered = (content as Array<{ type?: unknown; displayOnly?: unknown } | null | undefined>).filter(
+      (p) => !(p && typeof p === 'object' && p.type === 'file' && p.displayOnly === true),
+    );
+    // Mirror stripDisplayOnlyParts: keep the original if stripping empties the content.
+    if (filtered.length !== (content as unknown[]).length && filtered.length > 0) content = filtered;
+  }
+  let composed: string;
+  try {
+    composed = `${m.role ?? ''}:${JSON.stringify(content) ?? ''}:${
+      extra.tool_calls !== undefined ? JSON.stringify(extra.tool_calls) : ''
+    }:${extra.tool_call_id !== undefined ? String(extra.tool_call_id) : ''}`;
+  } catch {
+    // JSON.stringify can throw on a circular/exotic content object. A stable sentinel
+    // keyed by role/id keeps the signature deterministic (two unserializable-but-equal
+    // messages compare equal) without leaking the raw structure — the callers only need
+    // drift DETECTION, and an unserializable message is treated as "changed if anything
+    // else about it changed" via role + tool_call_id.
+    composed = `unserializable:${m.role ?? ''}:${
+      extra.tool_call_id !== undefined ? String(extra.tool_call_id) : ''
+    }`;
+  }
+  return createHash('sha1').update(composed).digest('hex');
+}
 
 export type ChatMessage = {
   id?: string;
@@ -84,6 +153,13 @@ export function selectProtectedTail(
   messages: ChatMessage[],
   ignoreRecentUser: number,
   ignoreRecentAssistant: number,
+  // LIVE proactive/recovery/reuse compaction must NEVER summarize away the CURRENT turn's
+  // newest user message — otherwise, with both ignoreRecent* set to 0 on a first turn, a
+  // large-attachment user message would be entirely compactable and the media-stripped
+  // summarizer would replace it with a placeholder, so the model never sees the user's
+  // media. When true, the boundary is clamped to at most the newest user message's index.
+  // (Left false for on-demand /compact, which is user-initiated over historical content.)
+  alwaysProtectNewestUser = false,
 ): { boundaryIndex: number; protectedIds: Set<number>; protectedToolCallIds: Set<string> } {
   const protectedIds = new Set<number>();
   const protectedToolCallIds = new Set<string>();
@@ -142,6 +218,18 @@ export function selectProtectedTail(
     boundaryIndex = earliestCall; // keep the call (and everything after) in the suffix
   }
 
+  // Clamp so the newest user message is always in the SUFFIX (protected) for live
+  // proactive/recovery/reuse compaction — never summarize away the current user turn
+  // (which could drop its just-attached media behind a summary placeholder).
+  if (alwaysProtectNewestUser) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        if (i < boundaryIndex) boundaryIndex = i;
+        break;
+      }
+    }
+  }
+
   return { boundaryIndex, protectedIds, protectedToolCallIds };
 }
 
@@ -165,14 +253,20 @@ function shouldCompactGate(
   modelName: string,
   triggerPercent: number,
   contextWindowOverride?: number,
+  extraMediaTokens = 0,
 ):
   | { decided: ShouldCompactResult }
-  | { decided: null; tokenization: ConversationTokenizationInfo; triggerTokens: number } {
+  | { decided: null; tokenization: ConversationTokenizationInfo; triggerTokens: number; extraMediaTokens: number } {
   const tokenization = resolveConversationTokenization(modelName, contextWindowOverride);
   if (!tokenization.encoding || !tokenization.contextWindowTokens) {
     return { decided: { shouldCompact: false, usedTokens: 0, contextWindowTokens: 0 } };
   }
   const triggerTokens = Math.floor(tokenization.contextWindowTokens * triggerPercent);
+  // Native-media tokens added by the caller (see shouldCompactAsync's extraMediaTokens):
+  // when `messages` has had media base64 stripped to its dimension-based native
+  // estimate, that estimate is counted here rather than as raw base64 text. A
+  // non-negative floor guards against a bad caller value.
+  const extra = Math.max(0, extraMediaTokens);
 
   // Cheap pre-check: a tokenizer-SAFE sum over the branch (integer add of cached
   // counts when the target model shares the canonical o200k tokenizer; a
@@ -181,7 +275,7 @@ function shouldCompactGate(
   // fall back to an over-biased estimate. If even this safe sum is below the
   // trigger, the exact count must be too → skip tiktoken entirely (the common,
   // hot-path case). Only when it reaches the trigger do we pay the exact count.
-  const summedTokens = sumBranchTokensForGate(messages, tokenization);
+  const summedTokens = sumBranchTokensForGate(messages, tokenization) + extra;
   if (summedTokens < triggerTokens) {
     return {
       decided: {
@@ -210,7 +304,7 @@ function shouldCompactGate(
     };
   }
 
-  return { decided: null, tokenization, triggerTokens };
+  return { decided: null, tokenization, triggerTokens, extraMediaTokens: extra };
 }
 
 /**
@@ -223,13 +317,14 @@ export function shouldCompact(
   modelName: string,
   triggerPercent: number,
   contextWindowOverride?: number,
+  extraMediaTokens = 0,
 ): ShouldCompactResult {
-  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride);
+  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride, extraMediaTokens);
   if (gate.decided) return gate.decided;
 
-  const { tokenization, triggerTokens } = gate;
+  const { tokenization, triggerTokens, extraMediaTokens: extra } = gate;
   const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
-  const usedTokens = countBranchTokensCached(messages, tokenization, lastMessageId) ?? 0;
+  const usedTokens = (countBranchTokensCached(messages, tokenization, lastMessageId) ?? 0) + extra;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
@@ -245,6 +340,14 @@ export function shouldCompact(
  * (see tokenizer-worker.ts): the main thread's event loop stays live while the
  * CPU-bound encode runs off-thread, and a worker timeout/crash byte-ceilings
  * rather than freezing the send path. Same numeric result as {@link shouldCompact}.
+ *
+ * `extraMediaTokens` is added to the used-token total (and factored into the cheap
+ * pre-check). Callers that pass media-STRIPPED messages (base64 replaced with a
+ * dimension-based native estimate) supply that estimate here so retained media is
+ * charged its real native cost instead of its raw base64 length — the same
+ * projection the final compaction fit + branch-sum gate use. Without it, a
+ * protected-tail image would count as hundreds of thousands of "text" tokens and
+ * re-trigger paid summarization every turn.
  */
 export async function shouldCompactAsync(
   messages: ChatMessage[],
@@ -252,13 +355,15 @@ export async function shouldCompactAsync(
   triggerPercent: number,
   contextWindowOverride?: number,
   signal?: AbortSignal,
+  extraMediaTokens = 0,
 ): Promise<ShouldCompactResult> {
-  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride);
+  const gate = shouldCompactGate(messages, modelName, triggerPercent, contextWindowOverride, extraMediaTokens);
   if (gate.decided) return gate.decided;
 
-  const { tokenization, triggerTokens } = gate;
+  const { tokenization, triggerTokens, extraMediaTokens: extra } = gate;
   const lastMessageId = messages.length > 0 ? messages[messages.length - 1]?.id : undefined;
-  const usedTokens = (await countBranchTokensCachedAsync(messages, tokenization, lastMessageId, signal)) ?? 0;
+  const usedTokens =
+    ((await countBranchTokensCachedAsync(messages, tokenization, lastMessageId, signal)) ?? 0) + extra;
   return {
     shouldCompact: usedTokens >= triggerTokens,
     usedTokens,
@@ -272,6 +377,26 @@ export type CompactionResult = {
   compactionId: string | null;
   compactedMessageIds: string[];
 };
+
+/**
+ * Media-aware {@link shouldCompactAsync}: strips `_modelContent`/native media base64
+ * from the branch (folding its native token estimate in via `extraMediaTokens`)
+ * before gating, so a retained protected-tail image is charged its real (small)
+ * native cost instead of its raw base64 length. Without this a single screenshot
+ * counts as hundreds of thousands of "text" tokens and falsely trips the trigger.
+ * This is the same projection the send-path reuse check applies; exported so the
+ * on-demand `/compact` handler can gate identically.
+ */
+export async function shouldCompactBranchMediaAware(
+  messages: ChatMessage[],
+  modelName: string,
+  triggerPercent: number,
+  contextWindowOverride?: number,
+  signal?: AbortSignal,
+): Promise<ShouldCompactResult> {
+  const { messages: stripped, mediaTokens } = await stripMediaForSerialization(messages, { signal });
+  return shouldCompactAsync(stripped, modelName, triggerPercent, contextWindowOverride, signal, mediaTokens);
+}
 
 /**
  * True if `ids` is an ordered prefix of `branchIds` (same values, same order,
@@ -288,6 +413,161 @@ export function isStrictPrefix(ids: readonly string[], branchIds: readonly strin
   return true;
 }
 
+/**
+ * Split `messages` for compaction token-counting into (a) a COPY whose native
+ * media base64 is removed from the JSON projection (with `_modelContent` TEXT
+ * parts PRESERVED — they're real model context to summarize), and (b) the total
+ * NATIVE token cost of that media. Originals are untouched (callers keep the real
+ * media in their prefix/suffix).
+ *
+ * Media is sent NATIVELY, so serializing its base64 as TEXT over-counts a few-MB
+ * image at ~500k tokens (defeating the fit); counting it as ZERO under-counts (the
+ * final safety re-check could pass while the real request is still over-window).
+ * So the base64 is removed from the serialized text AND its byte-based native
+ * estimate is returned to be ADDED to the token count. Byte-based (not fixed) so a
+ * high-res image is charged proportionally; byte estimate is a safe over-estimate.
+ */
+async function stripMediaForSerialization(
+  messages: ChatMessage[],
+  options: { countMedia?: boolean; signal?: AbortSignal } = {},
+): Promise<{ messages: ChatMessage[]; mediaTokens: number }> {
+  // Collect media payloads to estimate by DIMENSIONS (via estimateNativeMediaTokens
+  // — sharp header probe, cached), not compressed bytes: bytes/2 charges a 1 MiB
+  // image ~524k tokens vs a real native cost of a few thousand, which would wrongly
+  // null-out compaction for a normal recent screenshot.
+  // `countMedia` (default true): when false, only STRIP the media (no sharp probes)
+  // — callers that discard mediaTokens (the summarized prefix, whose media is
+  // dropped entirely) avoid decoding a media-heavy history for a number they throw
+  // away.
+  const countMedia = options.countMedia !== false;
+  const mediaToEstimate: Array<{ data: string; isImage: boolean; mediaType?: string }> = [];
+  const out = messages.map((m) => {
+    if (!m || typeof m !== 'object') return m;
+    const content = (m as { content?: unknown }).content;
+    if (!Array.isArray(content)) return m;
+    let touched = false;
+    const cleaned = content.map((part) => {
+      if (!part || typeof part !== 'object') return part;
+      const p = part as Record<string, unknown>;
+      // Native user image/file content part → drop payload, queue native estimate.
+      // Leave a TEXT placeholder so the summarizer (which never sees the payload)
+      // still KNOWS the media existed and can reference it in the summary — else a
+      // bare image with no accompanying text vanishes silently from future context.
+      if ((p.type === 'image' || p.type === 'file') && typeof (p.data ?? p.image) === 'string') {
+        touched = true;
+        mediaToEstimate.push({ data: (p.data ?? p.image) as string, isImage: p.type === 'image', mediaType: (p.mimeType ?? p.mediaType) as string | undefined });
+        const label = p.type === 'image' ? 'image' : 'file';
+        const name = typeof p.filename === 'string' && p.filename ? ` "${p.filename}"` : '';
+        return { type: 'text', text: `[${label}${name} attachment omitted from summary]` };
+      }
+      // Tool-result `_modelContent`: strip image/file base64 (queue estimates), but
+      // KEEP text parts inline (they're model-visible context to summarize). Stripped
+      // image/file parts leave a short placeholder so the summarizer knows they were
+      // present (a pure-image result would otherwise summarize to nothing).
+      const res = p.result as Record<string, unknown> | undefined;
+      if (res && typeof res === 'object' && !Array.isArray(res) && Array.isArray(res._modelContent)) {
+        touched = true;
+        const keptText: string[] = [];
+        // Mirror extractModelContent's per-result retention (5 MiB per-part, 12 MiB
+        // per-result, 64-part cap, validity) so a media part the sanitizer DROPS isn't
+        // charged native tokens — it becomes an omission note provider-side, not sent.
+        const MC_MAX_PART_BYTES = 5 * 1024 * 1024;
+        const MC_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+        const MC_MAX_PARTS = 64;
+        let mcPartCount = 0;
+        let mcTotalBytes = 0;
+        for (const mc of res._modelContent as unknown[]) {
+          if (mcPartCount >= MC_MAX_PARTS) break;
+          if (!mc || typeof mc !== 'object') continue;
+          const mcp = mc as Record<string, unknown>;
+          if (mcp.type === 'text' && typeof mcp.text === 'string') {
+            mcPartCount += 1;
+            keptText.push(mcp.text);
+          } else if ((mcp.type === 'image' || mcp.type === 'file') && isSanitizerRetainableMedia(mcp)) {
+            // Decoded byte estimate (base64 → ~3/4), strip any data-URL prefix first.
+            const raw = (mcp.data as string).replace(/^data:[^;,]*(?:;[^,]*)?,/, '');
+            const bytes = Math.floor((raw.length * 3) / 4);
+            if (bytes > MC_MAX_PART_BYTES || mcTotalBytes + bytes > MC_MAX_TOTAL_BYTES) {
+              // Sanitizer drops → omission note (not counted here, but the provider
+              // WILL see this note, so its projected length must match the canonical
+              // note the sanitizer emits at tool-model-content.ts:120 exactly (same
+              // label + MB size, no filename) — otherwise the counted length drifts
+              // from what's sent.
+              const label = mcp.type === 'image' ? 'image' : 'file';
+              keptText.push(`[${label} omitted: ${(bytes / (1024 * 1024)).toFixed(1)} MB exceeds the per-result media limit]`);
+              mcPartCount += 1;
+              continue;
+            }
+            mcPartCount += 1;
+            mcTotalBytes += bytes;
+            mediaToEstimate.push({ data: mcp.data as string, isImage: mcp.type === 'image', mediaType: mcp.mediaType as string });
+            const name = typeof mcp.filename === 'string' && mcp.filename ? ` "${mcp.filename}"` : '';
+            keptText.push(`[${mcp.type === 'image' ? 'image' : 'file'}${name} attachment omitted from summary]`);
+          }
+        }
+        const { _modelContent, ...restResult } = res;
+        void _modelContent;
+        // Drop the UI-only originalResult/compaction backup (see below) too.
+        const { originalResult: _or2, compactionMeta: _cm2, compactionPhase: _cp2, ...pNoBackup } = p;
+        void _or2;
+        void _cm2;
+        void _cp2;
+        return {
+          ...pNoBackup,
+          result: keptText.length > 0 ? { ...restResult, _modelContentText: keptText.join('\n') } : restResult,
+        };
+      }
+      // A COMPACTED tool-call part keeps its pre-compaction body in `originalResult`
+      // purely for UI restoration; only `result` is sent to the provider. The
+      // summarizer's prefix/final-fit token checks must NOT count that potentially
+      // huge backup (nor the UI-only compaction metadata) — counting it would reject
+      // otherwise-valid compactions or discard a paid summary while the real model
+      // context would fit. This mirrors the compaction gate's projection (agent.ts).
+      if (Object.hasOwn(p, 'originalResult')) {
+        touched = true;
+        const { originalResult: _or, compactionMeta: _cm, compactionPhase: _cp, ...restPart } = p;
+        void _or;
+        void _cm;
+        void _cp;
+        return restPart;
+      }
+      return part;
+    });
+    if (!touched) return m;
+    // Content was rewritten (media stripped / backups removed) → any cached tokenCount /
+    // tokenCountSig (computed over the ORIGINAL base64-bearing content) is now stale. The
+    // cheap canonical-model gate would otherwise TRUST that inflated count and could reject
+    // an otherwise-valid candidate after already paying the summarizer. Drop both so the
+    // count is recomputed against the stripped content (mirrors stripBranchMediaForCount).
+    const { tokenCount: _tc, tokenCountSig: _ts, ...mNoCache } = m as Record<string, unknown>;
+    void _tc;
+    void _ts;
+    return { ...mNoCache, content: cleaned } as ChatMessage;
+  });
+  // The prefix caller discards mediaTokens (prefix media is summarized away), so
+  // skip the sharp probes entirely for it.
+  if (!countMedia) return { messages: out, mediaTokens: 0 };
+  // Estimate media (dimension-based, bounded concurrency to avoid decoding a
+  // media-heavy branch all at once). A hard cap bounds worst-case work per call
+  // (a pathological media-heavy history could otherwise stall the turn); media
+  // beyond it is charged the cheap byte estimate (never zero). Abort promptly if
+  // the run was cancelled during the probes.
+  let mediaTokens = 0;
+  const CONCURRENCY = 4;
+  const MEDIA_ESTIMATE_MAX = 128;
+  const toProbe = mediaToEstimate.slice(0, MEDIA_ESTIMATE_MAX);
+  for (const item of mediaToEstimate.slice(MEDIA_ESTIMATE_MAX)) {
+    mediaTokens += item.isImage ? estimateImageTokensFromBytes(item.data) : estimateFileTokensFromBytes(item.data, item.mediaType);
+  }
+  for (let i = 0; i < toProbe.length; i += CONCURRENCY) {
+    if (options.signal?.aborted) break;
+    const batch = toProbe.slice(i, i + CONCURRENCY);
+    const ests = await Promise.all(batch.map((x) => estimateNativeMediaTokens(x.data, x.isImage, x.mediaType)));
+    for (const e of ests) mediaTokens += e;
+  }
+  return { messages: out, mediaTokens };
+}
+
 export async function compactConversationPrefix(
   messages: ChatMessage[],
   modelConfig: LLMModelConfig,
@@ -300,6 +580,32 @@ export async function compactConversationPrefix(
     contextWindowTokens?: number;
   },
   signal?: AbortSignal,
+  options?: {
+    /** Suppress the ambient default fallback chain for the summarizer (run the
+     *  given model ONLY). Set when the caller routes through a provider override
+     *  (plugin/enterprise gateway): falling back to the ambient chain would send
+     *  the full transcript to the model's ORIGINAL (e.g. public) provider,
+     *  defeating the override's data-routing guarantee. */
+    disableAmbientFallback?: boolean;
+    /** Override the summarizer's system prompt (defaults to COMPACTION_SYSTEM_PROMPT).
+     *  Set when a UserPromptSubmit DLP/guardrail hook rewrote the compaction prompt
+     *  — the summarizer request must honor that rewrite (parity with a normal turn). */
+    systemPromptOverride?: string;
+    /** Tokens by which the NEXT REAL TURN's static input (chat system prompt +
+     *  tool schemas) exceeds `promptReserveTokens`. The summary must fit BOTH the
+     *  summarizer request (this fn's own prompt excess) AND the next turn's request
+     *  (this value). They are SEPARATE requests, so the window must be reduced by the
+     *  MAXIMUM of the two excesses, not their sum. Callers pass the RAW window here
+     *  and this excess (instead of pre-reducing the window themselves — which would
+     *  double-subtract when both prompts exceed the reserve and reject valid
+     *  compaction). Defaults to 0 (summarizer request is the only constraint). */
+    externalPromptOverReserve?: number;
+    /** LIVE proactive/recovery compaction: never summarize away the CURRENT turn's newest
+     *  user message (clamps the boundary), so a first-turn large attachment can't be
+     *  replaced by a summary placeholder the model never sees behind. Leave false for
+     *  on-demand /compact over historical content. */
+    protectNewestUser?: boolean;
+  },
 ): Promise<CompactionResult> {
   const tokenization = resolveConversationTokenization(
     modelConfig.modelName,
@@ -314,6 +620,7 @@ export async function compactConversationPrefix(
     messages,
     config.ignoreRecentUserMessages,
     config.ignoreRecentAssistantMessages,
+    options?.protectNewestUser ?? false,
   );
 
   const prefix = messages.slice(0, boundaryIndex);
@@ -323,11 +630,41 @@ export async function compactConversationPrefix(
   }
 
   // Budget the compaction prompt input to avoid exceeding the context window.
-  // Mirrors maelstrom-agent: contextWindow - outputMaxTokens - promptReserveTokens
-  const promptInputBudget = Math.floor(
-    tokenization.contextWindowTokens - Math.max(0, config.outputMaxTokens) - Math.max(0, config.promptReserveTokens),
-  );
-  if (promptInputBudget <= 0) {
+  // Mirrors maelstrom-agent: contextWindow - outputMaxTokens - promptReserveTokens.
+  // ALSO subtract the amount the ACTUAL summarizer system prompt exceeds the reserve
+  // — a hook may rewrite COMPACTION_SYSTEM_PROMPT to something large, which the
+  // reserve alone might not cover, otherwise the summarizer request itself overflows.
+  const summarizerPrompt = options?.systemPromptOverride ?? COMPACTION_SYSTEM_PROMPT;
+  // Count with the model's EXACT tokenizer only for a canonical (o200k) model; for a
+  // model unknown to tiktoken (Claude/Gemini/…), `tokenization.encoding` is the GPT
+  // FALLBACK, which can under-count a large hook-rewritten prompt and let the
+  // summarizer request itself overflow. Use the UTF-8 byte ceiling in that case —
+  // the SAME conservative estimator the rest of the compaction budget uses for
+  // fallback-encoding models (conversations.ts / media-fit static budget).
+  const promptTokens =
+    tokenization.encoding && !tokenization.isFallbackEncoding
+      ? encodeCappedWith(summarizerPrompt, tokenization.encoding)
+      : Buffer.byteLength(summarizerPrompt, 'utf8');
+  const promptOverReserve = Math.max(0, promptTokens - Math.max(0, config.promptReserveTokens));
+  // The summarizer USER message wraps the serialized prefix in fixed framing lines
+  // (see `prompt` below) — those tokens are part of the summarizer request, reserve them.
+  const SUMMARIZER_FRAMING = 'Summarize the conversation prefix for future continuation.\nKeep durable constraints, decisions, requirements, unresolved TODOs, IDs, names, and references.\n\nConversation prefix (JSON):\n';
+  const framingTokens =
+    tokenization.encoding && !tokenization.isFallbackEncoding
+      ? encodeCappedWith(SUMMARIZER_FRAMING, tokenization.encoding)
+      : Buffer.byteLength(SUMMARIZER_FRAMING, 'utf8');
+  // TWO DISTINCT budgets for TWO DISTINCT requests (do NOT combine — combining via a
+  // single max can reject a prefix that fits the summarizer, or discard a summary that
+  // fits the next turn):
+  //  (1) SUMMARIZER-INPUT budget — governs the PREFIX we send to the summarizer this
+  //      turn. Reduced by the summarizer's OWN prompt excess + the fixed framing.
+  //  (2) NEXT-TURN budget — governs the compacted SUMMARY's fit in the NEXT real turn.
+  //      Reduced by that turn's static excess (externalPromptOverReserve). No framing
+  //      (the summary is a normal assistant message, not wrapped by the summarizer prompt).
+  const baseBudget = tokenization.contextWindowTokens - Math.max(0, config.outputMaxTokens) - Math.max(0, config.promptReserveTokens);
+  const summarizerInputBudget = Math.floor(baseBudget - promptOverReserve - framingTokens);
+  const nextTurnBudget = Math.floor(baseBudget - Math.max(0, options?.externalPromptOverReserve ?? 0));
+  if (summarizerInputBudget <= 0 || nextTurnBudget <= 0) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
@@ -340,10 +677,32 @@ export async function compactConversationPrefix(
   // serialization + repeated worker encodes, since the shifted result is rejected
   // anyway.)
   const fittedPrefix = prefix;
-  const candidateTokens = await encodeCappedWithAsync(serializeForTokenCounting(fittedPrefix), tokenization, signal);
+  // The summarizer request contains ONLY the serialized (media-stripped) prefix —
+  // no native media rides along, because the prefix's images are being summarized
+  // AWAY (replaced by the text summary), not sent to a model. Each stripped image/
+  // file leaves a short TEXT placeholder (see stripMediaForSerialization) so the
+  // summarizer still knows the attachment existed and can reference it. The
+  // summarizer budget counts the stripped text ONLY; adding the prefix media's
+  // native tokens here would over-charge (~524k for a 1MB image) and wrongly
+  // null-out compaction for exactly the media-heavy histories this most needs to
+  // compact. (The SUFFIX media IS retained + sent to the final model — that's
+  // counted below in the final compactedTokens check.)
+  const { messages: serializablePrefix } = await stripMediaForSerialization(fittedPrefix, {
+    countMedia: false,
+    signal,
+  });
+  // Count the summarizer BODY the same way its prompt is counted: EXACT o200k only for
+  // a canonical model; the UTF-8 BYTE ceiling for a fallback-encoding model (an unknown
+  // alias backed by e.g. cl100k tokenizes denser than o200k — encodeCappedWithAsync
+  // would use o200k and UNDER-count, letting the summarizer request itself overflow).
+  const countBody = async (text: string): Promise<number> =>
+    tokenization.isFallbackEncoding
+      ? Buffer.byteLength(text, 'utf8')
+      : encodeCappedWithAsync(text, tokenization, signal);
+  const candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
   // Cancelled during the (off-thread) encode, or the whole prefix doesn't fit the
-  // budget → null no-op (no message loss, no wasted retries).
-  if (signal?.aborted || candidateTokens > promptInputBudget) {
+  // SUMMARIZER-INPUT budget → null no-op (no message loss, no wasted retries).
+  if (signal?.aborted || candidateTokens > summarizerInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
@@ -359,13 +718,15 @@ export async function compactConversationPrefix(
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
-  const prompt = [
-    'Summarize the conversation prefix for future continuation.',
-    'Keep durable constraints, decisions, requirements, unresolved TODOs, IDs, names, and references.',
-    '',
-    'Conversation prefix (JSON):',
-    serializeForTokenCounting(fittedPrefix),
-  ].join('\n');
+  const prompt = `${SUMMARIZER_FRAMING}${serializeForTokenCounting(serializablePrefix)}`;
+
+  // Refuse to issue another summarizer generate if too many prior ones are still
+  // outstanding (abandoned by aborts but not force-cancellable). Bail as a no-op — the
+  // history stays uncompacted and reactive recovery / the next turn retries once slots free.
+  if (outstandingSummarizerGenerates >= MAX_CONCURRENT_SUMMARIZER_GENERATES) {
+    console.warn('[compaction] too many outstanding summarizer requests — skipping compaction for this turn');
+    return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+  }
 
   // Fail safe if the summarizer LLM call throws (network/API error): compaction
   // is best-effort and runs mid-turn, so an uncaught throw here would fail the
@@ -373,18 +734,59 @@ export async function compactConversationPrefix(
   // let the turn proceed (mirrors aiExtractRelevantInfo's try/catch contract).
   let summaryText: string | null = null;
   try {
-    const gen = await auxAgentGenerate(
+    // Race the summarizer generate against the abort signal so this function stops
+    // AWAITING (and releases the prefix/transcript it holds) promptly on cancel even if
+    // the provider ignores abortSignal — otherwise the abandoned inner stack keeps the
+    // whole transcript alive after the caller's lock/turn released, and repeated hung
+    // requests accumulate transcript copies. The losing promise's late rejection is
+    // swallowed. abortSignal is still forwarded so a well-behaved provider cancels too.
+    const genPromise = auxAgentGenerate(
       (model) =>
         new Agent({
           id: `compaction-${Date.now()}`,
           name: 'compaction-agent',
-          instructions: COMPACTION_SYSTEM_PROMPT,
+          instructions: options?.systemPromptOverride ?? COMPACTION_SYSTEM_PROMPT,
           model: model as AgentConfig['model'],
         }),
       prompt,
-      { maxSteps: 1 },
-      { primaryModelConfig: modelConfig, label: 'compaction' },
+      { maxSteps: 1, abortSignal: signal },
+      options?.disableAmbientFallback
+        ? // Route through the override model ONLY — no ambient fallback that would
+          // leak the transcript to the model's original provider.
+          {
+            chain: [
+              {
+                key: `__compaction_override__:${modelConfig.modelName}`,
+                displayName: modelConfig.modelName,
+                modelConfig,
+              } as ModelCatalogEntry,
+            ],
+            label: 'compaction',
+            abortSignal: signal,
+          }
+        : { primaryModelConfig: modelConfig, label: 'compaction', abortSignal: signal },
     );
+    // Occupy a concurrency slot until the generate actually SETTLES — so an abandoned
+    // (aborted-but-still-running) request keeps its slot, capping accumulation. Decrement
+    // on settle regardless of who wins the race below.
+    outstandingSummarizerGenerates += 1;
+    genPromise.then(
+      () => {
+        outstandingSummarizerGenerates = Math.max(0, outstandingSummarizerGenerates - 1);
+      },
+      () => {
+        outstandingSummarizerGenerates = Math.max(0, outstandingSummarizerGenerates - 1);
+      },
+    );
+    const gen = signal
+      ? await Promise.race([
+          genPromise,
+          new Promise<null>((resolve) => {
+            if (signal.aborted) return resolve(null);
+            signal.addEventListener('abort', () => resolve(null), { once: true });
+          }),
+        ])
+      : await genPromise;
     summaryText = gen ? gen.text.trim() || null : null;
   } catch (err) {
     console.warn('[compaction] Summarizer generate failed — skipping compaction for this turn:', err);
@@ -436,18 +838,16 @@ export async function compactConversationPrefix(
 
   const compactedMessages: ChatMessage[] = [summaryMessage, ...suffix];
 
-  // Final safety: verify the compacted request actually fits the input budget.
-  // Even a bounded summary plus the suffix could exceed promptInputBudget if the
-  // suffix is large; shipping an over-budget request would defeat the point (and
-  // risk a provider hard-limit error). If it still doesn't fit, return the null
-  // no-op — the turn proceeds on the full (uncompacted) context, preserving the
-  // "null ⇒ no message loss" contract.
-  const compactedTokens = await encodeCappedWithAsync(
-    serializeForTokenCounting(compactedMessages),
-    tokenization,
-    signal,
-  );
-  if (compactedTokens > promptInputBudget) {
+  // Final safety: verify the compacted request (summary + retained suffix) fits the
+  // NEXT-TURN budget (reduced by that turn's static excess, not the summarizer's). Even
+  // a bounded summary plus a large suffix could exceed it; shipping an over-budget
+  // request would defeat the point. If it still doesn't fit, return the null no-op —
+  // the turn proceeds on the full (uncompacted) context ("null ⇒ no message loss").
+  const { messages: serializableCompacted, mediaTokens: compactedMediaTokens } =
+    await stripMediaForSerialization(compactedMessages, { signal });
+  const compactedTokens =
+    (await countBody(serializeForTokenCounting(serializableCompacted))) + compactedMediaTokens;
+  if (compactedTokens > nextTurnBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 

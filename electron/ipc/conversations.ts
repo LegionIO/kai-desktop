@@ -4,15 +4,29 @@ import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import type { AppConfig } from '../config/schema.js';
+import type { ExecutionMode } from '../config/schema.js';
+import type { PluginManager } from '../plugins/plugin-manager.js';
 import { eventBus } from '../automations/event-bus.js';
 import { matchConversation } from './conversation-search.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js';
 import { resolveStreamConfig } from '../agent/model-catalog.js';
-import { compactConversationPrefix } from '../agent/compaction.js';
+import { resolveRuntimeForStream } from '../agent/runtime/index.js';
+import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submit-gate.js';
+import { compactConversationPrefix, isStrictPrefix, shouldCompactBranchMediaAware, selectProtectedTail, messageContentSignature } from '../agent/compaction.js';
+import { stripBranchMediaForCount, DEFAULT_MAX_TOTAL_MEDIA_BYTES } from '../agent/media-fit.js';
+import { normalizeAgentCwd, buildAgentInstructions } from '../agent/mastra-agent.js';
+import { withWorkingDirectoryPrompt } from '../agent/instructions.js';
+import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE, serializeToolSchemasForStatic } from '../agent/static-tokens.js';
+import { getRegisteredTools, whenToolsReady } from './agent.js';
+import { resolveHeaderTemplates } from '../agent/header-templates.js';
+import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
+import { markCompacting, clearCompacting, isCompacting } from '../agent/compaction-lock.js';
+import { COMPACTION_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { computeMessageCount } from '../agent/tokenization.js';
+import { resolveConversationTokenization } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
@@ -23,6 +37,7 @@ import {
   clearAllConversations,
   getActiveConversationId,
   setActiveConversationId,
+  nextCompactionRevision,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -57,6 +72,38 @@ function broadcastReset(appHome: string): void {
 }
 export function broadcastActive(appHome: string): void {
   broadcastChange({ kind: 'active', activeConversationId: getActiveConversationId(appHome) });
+}
+
+/**
+ * Pre-flight gate for `/compact`: would summarizing the leading prefix `[0,
+ * boundaryIndex)` of the (post-hook) message list produce a REUSABLE record?
+ *
+ * Compaction summarizes that leading prefix and every prefix message's id becomes
+ * part of compactedMessageIds; the next-turn reuse gate requires those ids to be a
+ * strict prefix of the stored disk branch. So each prefix id MUST be a non-empty
+ * string equal to the disk id at the same index. A pre-send/DLP hook can (a)
+ * strip/reorder an id inside the prefix OR (b) append/insert a message with no id
+ * (or a new id absent from disk) that — with a small/zero protected tail — lands
+ * inside the summarized prefix. A plain `min(msgIds,diskIds)` overlap misses case
+ * (b): a tail append past diskIds.length is never inspected. Bounding the scan by
+ * the real summarizable boundary catches both, so `/compact` can skip BEFORE paying
+ * for a summary that would be discarded as non-reusable.
+ */
+export function summarizablePrefixMatchesDisk(
+  msgIds: readonly unknown[],
+  diskIds: readonly string[],
+  boundaryIndex: number,
+): boolean {
+  if (msgIds.length === 0 || diskIds.length === 0) return false;
+  const prefixLen = Math.max(0, Math.min(boundaryIndex, msgIds.length));
+  if (prefixLen === 0) return false; // nothing summarizable
+  for (let i = 0; i < prefixLen; i++) {
+    const id = msgIds[i];
+    if (typeof id !== 'string' || id.length === 0 || i >= diskIds.length || id !== diskIds[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ── messageTree helpers (main-process append) ──────────────────────────────
@@ -153,6 +200,18 @@ export function appendConversationMessages(
   const conv = readConversation(appHome, conversationId);
   if (!conv) return null;
   if (options.skipIfBusy && (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval')) {
+    return null;
+  }
+  // Treat an in-flight /compact as busy for any append that would START a turn (skipIfBusy
+  // set, or an explicit running/awaiting-approval status — e.g. an automation targeting an
+  // idle-but-compacting conversation). Appending + launching concurrently would make
+  // /compact discard its paid summary as busy/drift; the automation diverts/retries after
+  // unlock (its own busy handling). A stream's own message appends (no such status/flag)
+  // are unaffected — turn admission already can't coexist with /compact.
+  if (
+    isCompacting(conversationId) &&
+    (options.skipIfBusy || options.runStatus === 'running' || options.runStatus === 'awaiting-approval')
+  ) {
     return null;
   }
 
@@ -462,7 +521,18 @@ export function preserveTerminalRunFields(prev: ConversationRecord, next: Conver
   };
 }
 
-export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, getConfig?: () => AppConfig): void {
+export function registerConversationHandlers(
+  ipcMain: IpcMain,
+  appHome: string,
+  getConfig?: () => AppConfig,
+  getPluginManager?: () => PluginManager | null,
+  isTurnActive?: (conversationId: string) => boolean,
+): void {
+  // In-flight guard for on-demand `/compact`: a summarization is an async PAID
+  // model call, and the idle checks (runStatus) don't cover a second concurrent
+  // `/compact` for the same conversation. Without this, two commands both pass the
+  // checks, each bill a summary, and race to persist — wasting money and clobbering.
+  const compactInFlight = new Set<string>();
   ipcMain.handle('conversations:list', () => {
     // Reads only the lightweight index — no message bodies loaded.
     const index = readIndex(appHome);
@@ -514,6 +584,38 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     const prev = readConversation(appHome, conversation.id);
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
+    // A `/compact` is summarizing this conversation right now. Admission for a new turn
+    // (or any tree/head mutation) isn't atomic with the renderer's OPTIMISTIC put — a
+    // send/edit/regenerate/rewind that races the `conversations:compacting` broadcast
+    // would mutate disk under the summarizer and then either be rejected as busy (leaving
+    // an orphaned optimistic change) or force the paid summary's final CAS to fail. So
+    // reject ANY message-tree OR head mutation while compacting: novel ids, dropped ids,
+    // a head change, OR a same-id content edit. Metadata-only puts (rename / settings /
+    // archive — identical tree + head + per-message content) proceed normally. Signal
+    // busy so the renderer rolls back its optimistic change. (The ComposerInput + the
+    // cross-client store already block sends while compacting; this closes the broadcast-
+    // in-flight race authoritatively on the main side.)
+    if (prev && isCompacting(conversation.id)) {
+      const prevTreeArr2 = (prev.messageTree as Array<{ id?: unknown }> | undefined) ?? [];
+      const incomingTreeArr = tree as Array<{ id?: unknown }>;
+      const treeSig = (nodes: Array<{ id?: unknown }>): string =>
+        nodes
+          .map((m) => (typeof m?.id === 'string' ? `${m.id}:${messageContentSignature(m as Parameters<typeof messageContentSignature>[0])}` : ''))
+          .join('|');
+      const headChanged = (conversation.headId ?? null) !== (prev.headId ?? null);
+      const treeChanged = treeSig(prevTreeArr2) !== treeSig(incomingTreeArr);
+      // Also reject a put that STARTS a turn via a runStatus transition to running /
+      // awaiting-approval, even when tree+head are unchanged (e.g. a plan-mode auto-restart
+      // persists the same tree as `running`). Launching that turn would be rejected as busy
+      // and the restart lost; reject the put so the caller retries after compaction.
+      const startsTurn =
+        (conversation.runStatus === 'running' || conversation.runStatus === 'awaiting-approval') &&
+        prev.runStatus !== conversation.runStatus;
+      if (headChanged || treeChanged || startsTurn) {
+        return { ...prev, rejected: 'conversation-busy' as const };
+      }
+    }
+
     // Guard: never allow a write that would lose messages compared to what's on disk.
     // If the stored tree contains message ids the incoming tree lacks, the incoming
     // write is stale or concurrent — union the missing stored messages back in and
@@ -557,30 +659,193 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     if (prev) {
       nextConversation = reconcileConversationActivity(prev, nextConversation);
       nextConversation = preserveTerminalRunFields(prev, nextConversation);
-      // DLP: a UserPromptSubmit modify hook may have redacted a user turn on
-      // disk (flagged redactedByHook). The renderer's stream-done write carries
-      // the same node id with the RAW user text, which the merge above would
-      // otherwise re-persist. Force the stored redacted content back onto any
-      // shared node so the redaction survives.
-      const prevTreeArr = Array.isArray(prev.messageTree) ? (prev.messageTree as StoredTreeMessage[]) : [];
-      const redacted = new Map(
-        prevTreeArr.filter((m) => (m as { redactedByHook?: boolean }).redactedByHook).map((m) => [m.id, m] as const),
-      );
-      if (redacted.size > 0 && Array.isArray(nextConversation.messageTree)) {
-        const nextTree = (nextConversation.messageTree as StoredTreeMessage[]).map((m) => {
-          const r = redacted.get(m.id);
-          // Replacing content invalidates any cached count. Drop count + signature
-          // so the write chokepoint's backfill recomputes both for the redacted
-          // content (and so a mismatched signature can't linger).
-          return r
-            ? { ...m, content: r.content, redactedByHook: true, tokenCount: undefined, tokenCountSig: undefined }
-            : m;
-        });
-        const nextBranch = getConversationBranch(nextTree, nextConversation.headId ?? null);
-        nextConversation = { ...nextConversation, messageTree: nextTree, messages: nextBranch };
+      // DLP: a UserPromptSubmit modify hook may have redacted a user turn on disk
+      // (flagged redactedByHook). The renderer's stream-done write carries the same node
+      // id with the RAW user text. Restore the stored redacted content onto any shared
+      // node NOW — BEFORE the compaction-preservation covered-sig check below — else that
+      // check would compare the raw incoming content against the (redacted) covered sig,
+      // decide "changed", and drop a valid paid summary.
+      {
+        const prevTreeArr0 = Array.isArray(prev.messageTree) ? (prev.messageTree as StoredTreeMessage[]) : [];
+        const redacted0 = new Map(
+          prevTreeArr0.filter((m) => (m as { redactedByHook?: boolean }).redactedByHook).map((m) => [m.id, m] as const),
+        );
+        if (redacted0.size > 0 && Array.isArray(nextConversation.messageTree)) {
+          const nextTree = (nextConversation.messageTree as StoredTreeMessage[]).map((m) => {
+            const r = redacted0.get(m.id);
+            return r
+              ? { ...m, content: r.content, redactedByHook: true, tokenCount: undefined, tokenCountSig: undefined }
+              : m;
+          });
+          const nextBranch = getConversationBranch(nextTree, nextConversation.headId ?? null);
+          nextConversation = { ...nextConversation, messageTree: nextTree, messages: nextBranch };
+        }
+      }
+      // Preserve the NEWER compaction record against a stale concurrent METADATA
+      // write. `/compact` persists conversationCompaction out-of-band (tree untouched);
+      // a rename/settings/archive flow does a separate get-then-put, so its put can
+      // carry a record read BEFORE a newer summary committed — a plain id-equality
+      // guard misses this (incoming A ≠ stored B, so B would be overwritten). On a
+      // tree-UNCHANGED write, keep whichever record has the newer createdAt (real
+      // clears — fork/edit/regenerate — go through commitTreeUpdate, not put, so a
+      // metadata put never legitimately clears the record).
+      {
+        const prevComp = prev.conversationCompaction as
+          | { compactionId?: string; createdAt?: string; compactedMessageIds?: string[] }
+          | null
+          | undefined;
+        const nextComp = nextConversation.conversationCompaction as
+          | { compactionId?: string; createdAt?: string }
+          | null
+          | undefined;
+        // "Tree unchanged" must mean the COVERED (summarized) messages are unchanged,
+        // compared against the FINAL tree that will actually be persisted
+        // (nextConversation.messageTree — which may be the MERGED tree when a stale
+        // shorter incoming write had missing nodes restored above), NOT the raw incoming
+        // `tree`. Using the raw incoming length/content here would skip preservation
+        // after a merge and let a stale/null incoming record overwrite the newer stored
+        // summary. A same-length put that genuinely EDITS a covered message (not a
+        // partial→final restore) still correctly fails this and lets the clear stand.
+        const finalTree = (nextConversation.messageTree ?? tree) as Array<{ id?: unknown }>;
+        const coveredIds = new Set(prevComp?.compactedMessageIds ?? []);
+        const sigOf = (nodes: Array<{ id?: unknown; content?: unknown; role?: unknown }>): string => {
+          const parts: string[] = [];
+          for (const n of nodes) {
+            if (typeof n?.id !== 'string' || !coveredIds.has(n.id)) continue;
+            // Per-message BOUNDED hash (not raw content): a media-heavy covered branch
+            // would otherwise concatenate history-sized base64 strings on every
+            // conversations:put and risk OOMing the main process.
+            parts.push(`${n.id}:${messageContentSignature(n)}`);
+          }
+          return parts.join(' ');
+        };
+        // The stored summary stays valid as long as its COVERED prefix is intact on the
+        // final active branch — SUFFIX growth (a stale client appending one more message)
+        // must NOT invalidate it. So: (a) the covered ids are still an ordered strict
+        // prefix of the final active branch, AND (b) their content signatures are
+        // unchanged. (The old `finalTree.length === prevTreeLen` gate let any suffix
+        // append bypass preservation, dropping a freshly-committed record for a stale one.)
+        const finalActiveBranchIds = getConversationBranch(
+          finalTree as unknown as StoredTreeMessage[],
+          (nextConversation.headId ?? prev.headId) ?? null,
+        ).map((m) => m.id);
+        const coveredPrefixIntact =
+          coveredIds.size === 0 ||
+          (isStrictPrefix(prevComp?.compactedMessageIds ?? [], finalActiveBranchIds) &&
+            sigOf(prev.messageTree as Array<{ id?: unknown }>) === sigOf(finalTree));
+        const coveredUnchanged = coveredPrefixIntact;
+        if (coveredUnchanged && prevComp) {
+          // Freshness must be decided by MAIN-authoritative monotonic revisions, NEVER by
+          // renderer wall-clock `createdAt` (a clock-skewed client could otherwise drop a
+          // genuinely-newer summary). Crucially we must not compare a createdAt against a
+          // revision (different clocks). Rules for a DIFFERENT-id incoming record:
+          //   - both have a revision → newer iff incomingRev >= storedRev
+          //   - incoming has NONE (a fresh GUI/web production main hasn't stamped yet) →
+          //     treat as newer and STAMP it on accept (main becomes authoritative)
+          //   - stored has NONE but incoming HAS one → incoming is main-stamped, newer
+          //   - neither has one (legacy) → fall back to createdAt (same clock domain)
+          const prevRev = (prevComp as { compactionRevision?: number }).compactionRevision;
+          const nextRev = nextComp ? (nextComp as { compactionRevision?: number }).compactionRevision : undefined;
+          const sameRecord = !!nextComp && nextComp.compactionId === prevComp.compactionId;
+          const incomingIsNewer = (() => {
+            if (!nextComp || sameRecord) return false;
+            if (typeof prevRev === 'number' && typeof nextRev === 'number') return nextRev >= prevRev;
+            if (typeof nextRev === 'number') return true; // incoming main-stamped, stored legacy
+            if (typeof prevRev === 'number') {
+              // Incoming is UNSTAMPED but the stored record IS main-stamped. Compaction
+              // events now stamp a revision at emit time, so a legitimate fresh production
+              // arrives stamped — an unstamped incoming is a STALE / non-authoritative write
+              // (e.g. a reconnected web client's Stop persisting an old accumulator). Do NOT
+              // let it overwrite the newer stamped record.
+              return false;
+            }
+            // Neither stamped (legacy): fall back to createdAt (same renderer clock domain).
+            const p = Date.parse(prevComp.createdAt ?? '') || 0;
+            const n = Date.parse((nextComp as { createdAt?: string }).createdAt ?? '') || 0;
+            return n >= p;
+          })();
+          if (!incomingIsNewer) {
+            nextConversation = {
+              ...nextConversation,
+              conversationCompaction: prev.conversationCompaction,
+            };
+          } else if (typeof nextRev !== 'number') {
+            // Accepting a fresh (unstamped) incoming record — stamp a main revision so
+            // FUTURE comparisons are ordering-correct regardless of the renderer's clock.
+            nextConversation = {
+              ...nextConversation,
+              conversationCompaction: {
+                ...(nextConversation.conversationCompaction as object),
+                compactionRevision: nextCompactionRevision(),
+              } as ConversationRecord['conversationCompaction'],
+            };
+          }
+        }
+        // Validate the INCOMING compaction record (whichever one we end up keeping)
+        // against the FINAL merged tree: a full-record writer can commit same-id content
+        // B while this record summarized content A. IDs alone (checked at reuse) can't
+        // catch that. If the kept record carries coveredContentSig, require each covered
+        // id to (a) exist in the final tree and (b) match the recorded signature; drop the
+        // record otherwise so a stale summary can't hide B on the next turn's reuse.
+        {
+          const keptComp = nextConversation.conversationCompaction as
+            | { compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
+            | null
+            | undefined;
+          if (keptComp?.coveredContentSig && Array.isArray(keptComp.compactedMessageIds)) {
+            const finalById = new Map(
+              (nextConversation.messageTree as Array<{ id?: unknown }> | undefined)?.map((n) => [
+                typeof n?.id === 'string' ? n.id : '',
+                n,
+              ]) ?? [],
+            );
+            // The record is only reusable next turn if its covered ids form an ordered
+            // STRICT PREFIX of the final active branch (a hook can insert/replace an id
+            // inside the prefix, breaking that) AND every covered id is signed + matches
+            // (an unsigned covered id is unverifiable → can't trust it). Mirrors the
+            // server-owned recovery/`/compact` persist gate; otherwise next-turn reuse
+            // rejects the record and re-summarizes/rebills every turn.
+            const finalActiveIds = getConversationBranch(
+              (nextConversation.messageTree ?? []) as StoredTreeMessage[],
+              (nextConversation.headId ?? prev.headId) ?? null,
+            ).map((m) => m.id);
+            const prefixOk = isStrictPrefix(keptComp.compactedMessageIds, finalActiveIds);
+            const drifted =
+              !prefixOk ||
+              keptComp.compactedMessageIds.some((id) => {
+                const expected = keptComp.coveredContentSig?.[id];
+                if (expected === undefined) return true; // unsigned covered id → unverifiable, drop
+                const node = finalById.get(id);
+                if (!node) return true; // covered id no longer on disk → stale
+                return messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) !== expected;
+              });
+            if (drifted) {
+              nextConversation = { ...nextConversation, conversationCompaction: null };
+            }
+          }
+        }
       }
     } else {
       nextConversation = reconcileConversationActivity(undefined, nextConversation);
+    }
+
+    // Stamp a main-authoritative compactionRevision on ANY compaction record about to be
+    // written that lacks one — including the FIRST GUI/web compaction (no prevComp, so the
+    // preservation block above never ran). Without this, two successive unstamped records
+    // fall back to renderer createdAt in the freshness compare, where clock skew can drop a
+    // genuinely-newer paid summary. (An already-stamped record — e.g. preserved prev, or a
+    // record main just stamped — is left as-is.)
+    {
+      const comp = nextConversation.conversationCompaction as { compactionRevision?: number } | null | undefined;
+      if (comp && typeof comp.compactionRevision !== 'number') {
+        nextConversation = {
+          ...nextConversation,
+          conversationCompaction: {
+            ...(comp as object),
+            compactionRevision: nextCompactionRevision(),
+          } as ConversationRecord['conversationCompaction'],
+        };
+      }
     }
 
     const written = writeConversation(appHome, nextConversation);
@@ -668,6 +933,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     (_event, conversationId: string, messageId: string, newContent: unknown) => {
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
+      // A tree mutation during /compact would break the summary's final CAS (or leave a
+      // half-applied edit). Reject while compacting; the client retries after it finishes.
+      if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
 
       const { tree } = ensureConversationTree(conv);
       const source = tree.find((m) => m.id === messageId);
@@ -697,6 +965,9 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   ipcMain.handle('conversations:regenerate', (_event, conversationId: string, assistantMessageId: string) => {
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
+    // A head-moving mutation during /compact would break the summary's final CAS or leave
+    // a half-applied regenerate. Reject while compacting (parity with edit/rewind/variant).
+    if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
 
     const { tree, headId } = ensureConversationTree(conv);
     const target = tree.find((m) => m.id === assistantMessageId);
@@ -716,6 +987,7 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   ipcMain.handle('conversations:rewind', (_event, conversationId: string, steps = 1) => {
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
+    if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
     if (conv.conversationCompaction) return { ok: false, error: 'compacted' };
 
     const { tree, headId } = ensureConversationTree(conv);
@@ -743,6 +1015,18 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
   // renderer persists), this writes the record directly.
   ipcMain.handle('conversations:compact', async (_event, conversationId: string) => {
     if (typeof conversationId !== 'string' || !conversationId) return { ok: false, error: 'invalid-id' };
+    // Reject a concurrent `/compact` for the same conversation (avoid a duplicate
+    // paid summarization + persist race). Released in the finally below.
+    if (compactInFlight.has(conversationId)) return { ok: false, error: 'conversation-busy' };
+    compactInFlight.add(conversationId);
+    try {
+      return await runCompact(conversationId);
+    } finally {
+      compactInFlight.delete(conversationId);
+    }
+  });
+
+  const runCompact = async (conversationId: string): Promise<{ ok: boolean; error?: string; summarizedCount?: number }> => {
     const config = getConfig?.();
     if (!config) return { ok: false, error: 'config-unavailable' };
     if (!config.compaction?.conversation?.enabled) return { ok: false, error: 'compaction-disabled' };
@@ -752,27 +1036,794 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     if (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') {
       return { ok: false, error: 'conversation-busy' };
     }
+    // Disk `runStatus` is written AFTER a turn starts streaming, so a turn that just
+    // began (or was submitted and is awaiting toolsReady) still looks idle on disk.
+    // Consult the main-process in-memory turn registry too — otherwise `/compact`
+    // could launch a paid summarizer alongside the live turn, then discard it as busy.
+    if (isTurnActive?.(conversationId)) {
+      return { ok: false, error: 'conversation-busy' };
+    }
 
-    // Resolve the model the same way a turn would (thread model → default),
-    // so token windows + tokenization match what the auto path uses.
+    // Mark the conversation in the shared compaction lock for the DURATION of the
+    // (paid, possibly slow) summarization so a concurrent agent turn (agent:submit
+    // AND agent:stream) is rejected as busy instead of racing and forcing us to
+    // discard the summary. A distinct in-memory marker (NOT runStatus:'running')
+    // so the compactor's own pre-persist checks can't mistake it for a real turn.
+    markCompacting(conversationId);
+    // Server-side timeout so a summarizer request that never settles can't hold the
+    // compaction lock forever (which would reject EVERY future turn until restart).
+    // The client 300s timeout only unblocks the caller — it can't cancel this main-
+    // process handler. The AbortController lets us both (a) cancel the summarizer
+    // request (auxAgentGenerate forwards abortSignal) and (b) guarantee the lock's
+    // finally runs by racing the inner call against the deadline. Must fire BEFORE the
+    // client's 300s deadline (web/CLI use 300_000ms) — otherwise there's a window where
+    // the client has given up and cleared its in-flight state (so the user can send)
+    // but the server still holds isCompacting, rejecting that send as busy. 285s leaves
+    // the lock released with ~15s of headroom before the client stops waiting.
+    const COMPACT_TIMEOUT_MS = 285_000;
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), COMPACT_TIMEOUT_MS);
+    if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref();
+    // Attach a no-op catch to the inner promise so that if the TIMEOUT branch wins the
+    // race and runCompactInner later REJECTS, the rejection is swallowed rather than
+    // surfacing as an unhandledRejection (it already lost the race; its result is moot).
+    const inner = runCompactInner(conversationId, config, conv, abort.signal);
+    inner.catch(() => undefined);
+    try {
+      return await Promise.race([
+        inner,
+        new Promise<{ ok: boolean; error?: string; summarizedCount?: number }>((resolve) => {
+          abort.signal.addEventListener(
+            'abort',
+            () => resolve({ ok: false, error: 'compaction-timeout' }),
+            { once: true },
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      clearCompacting(conversationId);
+    }
+  };
+
+  const runCompactInner = async (
+    conversationId: string,
+    config: AppConfig,
+    conv: ConversationRecord,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; error?: string; summarizedCount?: number }> => {
+    // Stop AWAITING a hook call once the /compact deadline fires. Trusted plugin
+    // pre-send hooks (and the DLP gate) run over a callback protocol we can't force-
+    // cancel here, so a hung hook's underlying promise stays pending — but racing the
+    // await against the abort signal lets runCompactInner's continuation release its
+    // own references (the transcript) instead of pinning them until the hook settles.
+    // Rejects with an Error on abort so the surrounding try/catch treats it as a hook
+    // failure (fail closed). A no-op passthrough when there's no signal.
+    const raceAbort = async <T>(p: Promise<T>): Promise<T> => {
+      if (!signal) return p;
+      if (signal.aborted) throw new Error('compaction-timeout');
+      let onAbort: (() => void) | undefined;
+      const abortP = new Promise<never>((_, reject) => {
+        onAbort = () => reject(new Error('compaction-timeout'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      try {
+        return await Promise.race([p, abortP]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+      }
+    };
+    // Bounded fingerprint of the routing/budget-affecting GLOBAL config sections. The
+    // conversation-level routeFingerprint (below) catches per-conversation changes, but a
+    // GLOBAL runtime/provider/model/compaction change (e.g. switching the default runtime
+    // to an external one) during summarization would also make the persisted record wrong
+    // for the next turn. Captured now, re-fetched + compared at the final CAS.
+    const globalConfigFingerprint = (c: AppConfig | undefined): string => {
+      if (!c) return '';
+      try {
+        const cc = c as unknown as Record<string, unknown>;
+        return createHash('sha1')
+          .update(
+            JSON.stringify({
+              models: c.models,
+              tools: c.tools,
+              compaction: c.compaction,
+              agent: c.agent,
+              // Everything else route/prompt resolution consumes: a profile switch, default
+              // profile change, fallback toggle, or a base system-prompt edit during the
+              // awaited summarizer all change the record's correct budget/route.
+              profiles: cc.profiles ?? null,
+              defaultProfileKey: cc.defaultProfileKey ?? null,
+              fallback: cc.fallback ?? null,
+              systemPrompt: c.systemPrompt ?? null,
+              systemPrompts: c.systemPrompts ?? null,
+            }),
+          )
+          .digest('hex');
+      } catch {
+        return '';
+      }
+    };
+    const validatedGlobalConfigFingerprint = globalConfigFingerprint(config);
+    // Resolve the model the same way a TURN would — including the conversation's
+    // selected profile — so the token window, tokenizer, AND runtime/provider match
+    // what the actual turn uses (a wrong provider is a data-exposure concern; wrong
+    // window mis-sizes the summary or wrongly reports runtime-unsupported).
     const streamConfig = resolveStreamConfig(config, {
       threadModelKey: conv.selectedModelKey ?? null,
-      threadProfileKey: null,
+      threadProfileKey: conv.selectedProfileKey ?? null,
       fallbackEnabled: false,
+      // Mirror a real turn's thread overrides so streamConfig.systemPrompt reflects
+      // any per-conversation systemPromptOverride — the window-reduction below
+      // budgets against the ACTUAL assembled prompt (a large thread-specific prompt
+      // would otherwise be under-counted, and `/compact` could report success while
+      // the next turn still overflows).
+      threadOverrides: {
+        temperature: (conv as { temperature?: number | null }).temperature ?? null,
+        systemPromptOverride: (conv as { systemPromptOverride?: string | null }).systemPromptOverride ?? null,
+        maxSteps: (conv as { maxSteps?: number | null }).maxSteps ?? null,
+        maxRetries: (conv as { maxRetries?: number | null }).maxRetries ?? null,
+        runtimeOverride: (conv as { runtimeOverride?: string | null }).runtimeOverride ?? null,
+      },
     });
-    const modelEntry = streamConfig?.primaryModel;
+    let modelEntry = streamConfig?.primaryModel;
     if (!modelEntry) return { ok: false, error: 'no-model' };
+
+    // True once a provider override has been folded into `modelEntry` — the
+    // summarizer must then run that model ONLY (no ambient fallback that would
+    // route the transcript back to the original provider).
+    let providerOverrideApplied = false;
+    // Only Kai-side (Mastra) compaction consumes the persisted record on the next
+    // turn. External CLI runtimes (Claude/Codex/Pi/OpenCode) manage their own
+    // context and IGNORE it, so persisting a record would silently do nothing —
+    // report `runtime-unsupported` rather than a misleading success. Honor the
+    // conversation's runtimeOverride the way a real turn does (it selects the
+    // effective runtime via config.agent.runtime).
+    try {
+      const runtimeOverride = (conv as { runtimeOverride?: string | null }).runtimeOverride;
+      const agentCfg = (config as { agent?: Record<string, unknown> }).agent ?? {};
+      const configForRuntime = runtimeOverride
+        ? ({ ...config, agent: { ...agentCfg, runtime: runtimeOverride } } as typeof config)
+        : config;
+      const { runtime, resolution } = await resolveRuntimeForStream(configForRuntime, modelEntry);
+      if (!runtime.capabilities.compaction) return { ok: false, error: 'runtime-unsupported' };
+      // A plugin INFERENCE provider (registered via registerInferenceProvider) runs
+      // the turn OUTSIDE Kai's Mastra path and does NOT consume the persisted
+      // compaction record — so persisting one would report success while the next
+      // request ignores it and re-overflows. Detect it the same way agent.ts does
+      // (an inferenceProviderRuntimeId, or a non-built-in resolved runtimeId) and
+      // report unsupported instead of a misleading success.
+      const isBuiltInRuntimeId = (id: string): boolean =>
+        id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
+      const usesPluginInferenceProvider =
+        !!(resolution as { inferenceProviderRuntimeId?: string }).inferenceProviderRuntimeId ||
+        !isBuiltInRuntimeId(resolution.runtimeId);
+      if (usesPluginInferenceProvider) return { ok: false, error: 'runtime-unsupported' };
+      // Provider override: a plugin/gateway runtime was selected for a non-plugin
+      // model. A normal turn re-points the model's provider/endpoint/apiKey through
+      // that provider (agent.ts). The summarizer sends the FULL transcript to a
+      // model, so it MUST honor the same override — otherwise `/compact` would leak
+      // the transcript to the model's original (e.g. public) provider while normal
+      // chat routes through the enterprise gateway. Best-effort: if the override
+      // provider isn't configured, leave the model as-is (matches the turn path).
+      if (resolution.providerOverride) {
+        const overrideProviderConfig = config.models.providers[resolution.providerOverride];
+        if (overrideProviderConfig) {
+          modelEntry = {
+            ...modelEntry,
+            modelConfig: {
+              ...modelEntry.modelConfig,
+              provider: overrideProviderConfig.type as typeof modelEntry.modelConfig.provider,
+              endpoint: overrideProviderConfig.endpoint ?? modelEntry.modelConfig.endpoint,
+              apiKey: overrideProviderConfig.apiKey ?? modelEntry.modelConfig.apiKey,
+              useResponsesApi: overrideProviderConfig.useResponsesApi ?? false,
+            },
+          };
+          providerOverrideApplied = true;
+        }
+      }
+    } catch {
+      // FAIL CLOSED. A normal turn's route (provider override / enterprise gateway)
+      // is decided by this same resolution; if it throws we don't know the correct
+      // provider, and proceeding with the unresolved `modelEntry` could send the
+      // full transcript to the model's ORIGINAL (e.g. public) provider — a data-
+      // egress regression — or persist a record for an unsupported runtime. Abort.
+      return { ok: false, error: 'runtime-resolution-failed' };
+    }
+
+    // Resolve {placeholder} templates in the model's extraHeaders the SAME way a
+    // normal turn does (agent.ts) — a gateway that requires e.g. {conversationId}
+    // in a header would otherwise receive the literal placeholder and reject the
+    // summarizer request. cwd normalized to home (matches the turn path).
+    if (modelEntry.modelConfig?.extraHeaders) {
+      const resolved = resolveHeaderTemplates(modelEntry.modelConfig.extraHeaders, {
+        conversationId,
+        cwd: normalizeAgentCwd((conv as { currentWorkingDirectory?: string | null }).currentWorkingDirectory),
+        modelKey: modelEntry.key ?? '',
+        modelName: modelEntry.modelConfig.modelName ?? '',
+      });
+      if (resolved !== modelEntry.modelConfig.extraHeaders) {
+        modelEntry = { ...modelEntry, modelConfig: { ...modelEntry.modelConfig, extraHeaders: resolved } };
+      }
+    }
 
     const { tree, headId } = ensureConversationTree(conv);
     const branch = getConversationBranch(tree, headId);
-    const messages = branch.map((m) => ({ id: m.id, role: m.role, content: m.content }));
+    // Snapshot each branch node's RAW content signature NOW, before any pre-send/DLP hook
+    // runs — an in-place hook mutation of nested content would also mutate `branch` through
+    // shared references, so re-signing `branch` after hooks for the post-summary disk-drift
+    // check would falsely differ from disk and reject a valid paid compaction. Keyed by id;
+    // the drift check reads the covered ids' PRE-hook sigs from here.
+    const preHookBranchSigById = new Map<string, string>();
+    for (const m of branch as Array<{ id?: unknown }>) {
+      if (typeof m?.id === 'string') {
+        preHookBranchSigById.set(m.id, messageContentSignature(m as Parameters<typeof messageContentSignature>[0]));
+      }
+    }
+    // Fingerprint of the budget/route-affecting conversation fields as of NOW. All
+    // validation below (model window, tokenizer, static input, budgets) is derived from
+    // these; if a concurrent conversations:put changes the selected model/profile/runtime/
+    // execution-mode/cwd/fallback during the awaited summarization, the persisted record
+    // would describe the OLD route (e.g. an external runtime switch makes the record
+    // useless to the new runtime). The final CAS re-reads and compares this — bail if it
+    // drifted so the next turn recomputes against the current route. (Global `config` is a
+    // snapshot for this handler; conversation-level route fields are the mutable surface.)
+    const routeFingerprint = (c: ConversationRecord): string =>
+      JSON.stringify({
+        m: c.selectedModelKey ?? null,
+        p: (c as { selectedProfileKey?: string | null }).selectedProfileKey ?? null,
+        f: (c as { fallbackEnabled?: boolean }).fallbackEnabled ?? false,
+        e: (c as { executionMode?: ExecutionMode | null }).executionMode ?? null,
+        w: (c as { currentWorkingDirectory?: string | null }).currentWorkingDirectory ?? null,
+        r: (c as { runtimeOverride?: string | null }).runtimeOverride ?? null,
+        // Bounded hash of the system-prompt override — it feeds the static-input budget,
+        // so a concurrent enlargement during summarization would leave the record sized
+        // against the old budget. Hash (not raw) to keep the fingerprint small.
+        s: createHash('sha1')
+          .update(String((c as { systemPromptOverride?: string | null }).systemPromptOverride ?? ''))
+          .digest('hex'),
+      });
+    const validatedRouteFingerprint = routeFingerprint(conv);
+    // Full-branch content signature (id → bounded content hash for every message on a
+    // branch). Used by both the stored-summary no-op re-verify and the final CAS to
+    // detect any same-id content edit (covered OR suffix) during an awaited validation.
+    const fullSigOf = (msgs: Array<{ id?: unknown; role?: unknown; content?: unknown }>): string => {
+      const parts: string[] = [];
+      for (const m of msgs) {
+        if (typeof m?.id !== 'string') continue;
+        parts.push(`${m.id}:${messageContentSignature(m as Parameters<typeof messageContentSignature>[0])}`);
+      }
+      return parts.join(' ');
+    };
+    // Preserve the FULL model-bearing projection — id/role/content PLUS tool_calls /
+    // tool_call_id (legacy tool-message shape). Dropping them orphans a protected tool
+    // result and omits large tool arguments from the summarizer + safety validation, so
+    // /compact could persist a summary whose real next request overflows or is
+    // provider-invalid. (displayOnly parts are still stripped.)
+    // Project a branch to the MODEL-BEARING shape the summarizer/validation see: only
+    // id/role/content (+ tool_calls/tool_call_id when present). Raw disk nodes also carry
+    // parentId/createdAt/token caches/renderer metadata that the provider never receives —
+    // counting those (exact serialization) would over-size a near-limit candidate and
+    // reject it after paying. Reread suffixes MUST go through this too, not raw disk nodes.
+    const projectForCompactionCandidate = (
+      nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }>,
+    ): Array<{ id: string; role: string; content: unknown }> =>
+      stripDisplayOnlyParts(
+        nodes.map((m) => {
+          const extra = m as unknown as { tool_calls?: unknown; tool_call_id?: unknown };
+          return {
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            ...(extra.tool_calls !== undefined ? { tool_calls: extra.tool_calls } : {}),
+            ...(extra.tool_call_id !== undefined ? { tool_call_id: extra.tool_call_id } : {}),
+          };
+        }),
+      ) as Array<{ id: string; role: string; content: unknown }>;
+    let messages = projectForCompactionCandidate(branch as Array<{ id?: unknown; role?: unknown; content?: unknown }>);
+
+    // Effective compaction window = base model/override window MINUS the assembled
+    // system prompt's cost beyond the reserve (the same reduction the fresh-compaction
+    // path applies below). Computed here so the reuse short-circuit budgets against
+    // the REAL window a turn would use — not the raw model window — else enlarging
+    // AGENTS.md could make reuse a false no-op that still overflows next turn.
+    // Smallest ELIGIBLE model window (min across primary + fallbacks when fallback
+    // is enabled; config override wins). Shared by the reuse short-circuit AND the
+    // fresh-compaction window below so a stored/new summary is validated against the
+    // window a turn could ACTUALLY run on (a 50K summary fits a 128K primary but can
+    // overflow a 32K fallback).
+    // Collect EVERY eligible model's {modelName, window} so the post-summary
+    // validation (candidateSafeForAllModels) can check the compacted candidate against
+    // EACH model's own tokenizer + window — a config window override makes all windows
+    // equal, but models still tokenize the SAME text to different counts (o200k vs
+    // cl100k), so a candidate safe on one can overflow a denser-tokenizing sibling.
+    const eligibleValidationModels: Array<{ modelName: string; window: number }> = [];
+    {
+      const override = (config.compaction.conversation as { contextWindowTokens?: number }).contextWindowTokens;
+      const hasOverride = typeof override === 'number' && override > 0;
+      // A model's effective window is the config override (applies to all), else its
+      // catalog maxInputTokens OR the window resolveConversationTokenization INFERS from
+      // the model name (an entry with no explicit maxInputTokens must not be skipped, or
+      // a smaller inferred-window fallback would be missed).
+      const windowOf = (m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null): number => {
+        if (!m) return 0;
+        if (hasOverride) return override as number;
+        const explicit = m.modelConfig.maxInputTokens;
+        if (typeof explicit === 'number' && explicit > 0) return explicit;
+        try {
+          return resolveConversationTokenization(m.modelConfig.modelName).contextWindowTokens ?? 0;
+        } catch {
+          return 0;
+        }
+      };
+      const consider = (m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null): void => {
+        if (!m?.modelConfig.modelName) return;
+        const mw = windowOf(m);
+        if (mw > 0) eligibleValidationModels.push({ modelName: m.modelConfig.modelName, window: mw });
+      };
+      consider(modelEntry);
+      if ((conv as { fallbackEnabled?: boolean }).fallbackEnabled) {
+        try {
+          const fb = resolveStreamConfig(config, {
+            threadModelKey: conv.selectedModelKey ?? null,
+            threadProfileKey: conv.selectedProfileKey ?? null,
+            fallbackEnabled: true,
+          });
+          for (const m of [fb?.primaryModel, ...(fb?.fallbackModels ?? [])]) {
+            if (m !== modelEntry) consider(m);
+          }
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    const convConfig = config.compaction.conversation as typeof config.compaction.conversation & {
+      contextWindowTokens?: number;
+    };
+    // STATIC per-request input tokens for the NEXT real turn, per eligible model:
+    // assembled chat system prompt + serialized tool schemas + workspace allowance —
+    // the SAME estimate reactive recovery uses (agent.ts). Counting only the system
+    // prompt (as before) under-budgeted a turn with many MCP tools whose schemas exceed
+    // promptReserveTokens, letting /compact persist a summary that overflows next turn.
+    // Precomputed once (async) so promptOverReserveFor stays synchronous in the loops.
+    // The FULLY-BUILT instruction string the NEXT real turn sends: the override-
+    // respecting resolved prompt (streamConfig.systemPrompt wins, like a turn) wrapped
+    // by buildAgentInstructions (which adds the runtime-capability / plan-mode suffix)
+    // for the conversation's execution mode. Seeding systemPrompts.chat/plan with the
+    // resolved prompt forces resolveModeSystemPrompt to yield it (not the GLOBAL chat
+    // prompt, which would discard a profile/thread override). Budgeting only — never sent.
+    const compactExecMode = (conv as { executionMode?: ExecutionMode | null }).executionMode ?? undefined;
+    const sendPrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
+    const chatBasePrompt = buildAgentInstructions(
+      { ...config, systemPrompt: sendPrompt, systemPrompts: { ...config.systemPrompts, chat: sendPrompt } },
+      compactExecMode,
+    );
+    const chatCwd = normalizeAgentCwd((conv as { currentWorkingDirectory?: string | null }).currentWorkingDirectory);
+    // Wait for tool registration before snapshotting the registry: /compact can be
+    // invoked during early startup (CLI/GUI) before MCP/plugin schemas register, and
+    // estimating the next-turn static input against an EMPTY registry under-counts —
+    // /compact would then persist a summary the first real turn (full schemas) rejects.
+    // Raced against the deadline so a stuck tool init can't hold the lock past timeout.
+    try {
+      await raceAbort(whenToolsReady());
+    } catch {
+      if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+      // Non-abort rejection is not expected (whenToolsReady never rejects) — fall through
+      // and estimate with whatever is registered rather than fail the /compact.
+    }
+    const registeredTools = getRegisteredTools();
+    // Fingerprint the STATIC-input dependencies that feed the budget but aren't captured by
+    // the conversation/global-config fingerprints: the FULLY-ASSEMBLED instructions
+    // (base + system prompt + the EXPANDED cwd project-instruction file CONTENTS via
+    // withWorkingDirectoryPrompt — not just the cwd path) and the registered tool SCHEMAS
+    // (MCP / skills / plugin / CLI tools). A concurrent change to any of these during the
+    // awaited summarizer would size the record against stale costs. Compared at the final CAS.
+    // Snapshot the tool registry ONCE, AFTER whenToolsReady, and use it for BOTH the
+    // fingerprint AND the token estimates below — so validation is internally consistent
+    // (fingerprint registry === estimate registry; a mid-crawl reload can't make them
+    // disagree). Drift SINCE validation is caught by the COMMIT-time fingerprint, which
+    // reads getRegisteredTools() fresh.
+    const staticInputFingerprint = async (
+      baseInstr: string,
+      cwd: string | undefined,
+      tools: typeof registeredTools,
+    ): Promise<string> => {
+      try {
+        // Expand project-instruction files (AGENTS.md/CLAUDE.md/etc.) so a file GROWING
+        // mid-summarize is detected — the cwd PATH alone wouldn't change.
+        const assembled = await withWorkingDirectoryPrompt(baseInstr, cwd);
+        // Serialize schemas the EXACT way the estimator charges them (z.toJSONSchema).
+        const toolSig = serializeToolSchemasForStatic(tools);
+        return createHash('sha1').update(JSON.stringify({ assembled, toolSig })).digest('hex');
+      } catch {
+        return '';
+      }
+    };
+    const validatedStaticInputFingerprint = await raceAbort(
+      staticInputFingerprint(chatBasePrompt, chatCwd, registeredTools),
+    );
+    if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+    const staticTokensByModel = new Map<string, number>();
+    for (const em of eligibleValidationModels) {
+      if (staticTokensByModel.has(em.modelName)) continue;
+      if (signal?.aborted) break; // deadline fired — stop estimating (lock released)
+      try {
+        staticTokensByModel.set(
+          em.modelName,
+          // Race the estimate against the deadline: withWorkingDirectoryPrompt reads the
+          // cwd's project instructions from a possibly network-mounted FS, which can hang;
+          // don't keep awaiting (and retaining the transcript) past the outer timeout.
+          await raceAbort(
+            estimateStaticRequestTokens(
+              chatBasePrompt,
+              chatCwd,
+              registeredTools,
+              WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
+              em.modelName,
+            ),
+          ),
+        );
+      } catch {
+        /* best-effort — a failed/aborted estimate leaves this model out (treated as 0 excess) */
+      }
+    }
+    // Per-model prompt-over-reserve: the amount that model's STATIC input (prompt +
+    // schemas + allowance) exceeds promptReserveTokens. Reduces its effective budget.
+    const promptOverReserveFor = (modelName: string): number => {
+      const staticTokens = staticTokensByModel.get(modelName);
+      if (staticTokens === undefined) return 0;
+      return Math.max(0, staticTokens - Math.max(0, convConfig.promptReserveTokens));
+    };
+    // Shared validation: is `candidate` SAFE on EVERY eligible model? Safe = under the
+    // compaction trigger (triggerPercent × the model's FULL window, its own tokenizer)
+    // AND under the model's hard input budget (window − output − promptReserve − that
+    // model's chat-prompt excess). Used by BOTH the stored-summary reuse short-circuit
+    // and the fresh-candidate post-summary validation so they enforce identical bounds
+    // (a config window override, custom reserves, or a denser-tokenizing equal-window
+    // fallback are all handled the same way). Returns false if it trips on ANY model.
+    const candidateSafeForAllModels = async (
+      candidate: Parameters<typeof shouldCompactBranchMediaAware>[0],
+    ): Promise<boolean> => {
+      if (signal?.aborted) return false;
+      // Model-independent: the compacted candidate's retained media BYTES (its protected
+      // suffix can hold recent images compaction can't remove) must fit the whole-request
+      // media ceiling — else the next real turn's outgoing media gate rejects it and
+      // /compact would report a misleading success. Only when media fitting is enabled
+      // (the gate that enforces the ceiling). Checked ONCE (bytes don't vary by model).
+      if ((config.compaction.media as { enabled?: boolean } | undefined)?.enabled) {
+        try {
+          const { retainedMediaBytes } = await stripBranchMediaForCount(candidate as unknown[], signal);
+          if (retainedMediaBytes > DEFAULT_MAX_TOTAL_MEDIA_BYTES) return false;
+        } catch {
+          /* best-effort — fall through to the per-model token checks */
+        }
+      }
+      for (const em of eligibleValidationModels) {
+        // Stop the per-model loop once the /compact deadline fires — otherwise stale
+        // validation keeps running media probes + tokenizer-worker waits across every
+        // fallback after the lock has already been released to a new turn. Treat an
+        // aborted validation as UNSAFE (don't persist a half-validated record).
+        if (signal?.aborted) return false;
+        try {
+          const check = await shouldCompactBranchMediaAware(
+            candidate,
+            em.modelName,
+            config.compaction.conversation.triggerPercent,
+            em.window, // RAW window: trigger = triggerPercent × window (not pre-reduced)
+            signal,
+          );
+          const inputBudget =
+            em.window -
+            Math.max(0, convConfig.outputMaxTokens) -
+            Math.max(0, convConfig.promptReserveTokens) -
+            promptOverReserveFor(em.modelName);
+          if (check.shouldCompact || check.usedTokens > inputBudget) return false;
+        } catch {
+          /* best-effort — a per-model check failure doesn't veto the others */
+        }
+      }
+      return true;
+    };
+
+    // If a stored compaction record already covers EXACTLY the prefix a fresh
+    // compaction would cover (no new messages have moved out of the protected tail)
+    // AND applying it keeps the branch under the trigger, there's genuinely nothing
+    // new to summarize — return without billing another summary. We compare against
+    // the CURRENT protected-tail boundary (not just "under trigger") so an explicit
+    // /compact still summarizes messages that became eligible since the last one.
+    // The no-op short-circuit budgets with the PRE-HOOK messages/prompt. If an
+    // enforcing UserPromptSubmit hook or a pre-send plugin is configured, it could
+    // inject context / rewrite the prompt on the real turn and change the budget —
+    // so DON'T take the shortcut when such hooks exist; fall through and let the
+    // full path (which runs the hooks) decide. Otherwise the shortcut is safe.
+    const hooksMayAlterBudget =
+      hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit') || (getPluginManager?.()?.hasPreSendHooks() ?? false);
+    if (!hooksMayAlterBudget) {
+      const stored = conv.conversationCompaction as
+        | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
+        | null
+        | undefined;
+      if (
+        stored &&
+        typeof stored.compactionId === 'string' &&
+        typeof stored.summaryText === 'string' &&
+        Array.isArray(stored.compactedMessageIds) &&
+        stored.compactedMessageIds.length > 0
+      ) {
+        const branchIds = messages.map((m) => m.id);
+        const coveredCount = stored.compactedMessageIds.length;
+        // Where would a FRESH compaction of the current branch draw the boundary?
+        const { boundaryIndex } = selectProtectedTail(
+          messages as unknown as Parameters<typeof selectProtectedTail>[0],
+          config.compaction.conversation.ignoreRecentUserMessages,
+          config.compaction.conversation.ignoreRecentAssistantMessages,
+        );
+        // Only a no-op when the stored record covers EXACTLY the fresh boundary
+        // (coveredCount === boundaryIndex) AND it's a strict prefix AND applying it
+        // stays under the trigger. `>` would mean the stored summary already
+        // summarized messages that are NOW protected (e.g. ignoreRecent* was raised)
+        // — recompute so those messages are restored to the protected tail. `<`
+        // means new messages became eligible — recompute to summarize them.
+        if (coveredCount === boundaryIndex && isStrictPrefix(stored.compactedMessageIds, branchIds)) {
+          const candidate = [
+            { id: `compaction-summary-${stored.compactionId}`, role: 'assistant' as const, content: stored.summaryText },
+            ...messages.slice(coveredCount),
+          ];
+          // Reuse the stored summary as a no-op ONLY if it's safe on EVERY eligible
+          // model (same trigger + hard-input-budget checks as a fresh candidate) — a
+          // stored summary under the primary but over a denser fallback's real budget
+          // must recompute, not silently short-circuit into a next-turn overflow.
+          if (await candidateSafeForAllModels(candidate as Parameters<typeof shouldCompactBranchMediaAware>[0])) {
+            // candidateSafeForAllModels awaited the tokenizer; a concurrent edit during
+            // that await could have CLEARED the stored summary or APPENDED newly-eligible
+            // messages, making this "no-op" stale. Re-read and re-verify the same
+            // predicate against fresh disk before claiming success; if anything changed,
+            // fall through to the full recompute path (which re-summarizes correctly).
+            if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+            const reread = readConversation(appHome, conversationId);
+            const rstored = reread?.conversationCompaction as
+              | { compactionId?: string; compactedMessageIds?: string[] }
+              | null
+              | undefined;
+            if (reread && rstored && rstored.compactionId === stored.compactionId) {
+              const { tree: rtree, headId: rhead } = ensureConversationTree(reread);
+              const rBranch = getConversationBranch(rtree, rhead);
+              const rBranchIds = rBranch.map((m) => m.id);
+              const { boundaryIndex: rBoundary } = selectProtectedTail(
+                rBranch as unknown as Parameters<typeof selectProtectedTail>[0],
+                config.compaction.conversation.ignoreRecentUserMessages,
+                config.compaction.conversation.ignoreRecentAssistantMessages,
+              );
+              // Rebuild the reuse candidate from the FRESH branch and re-validate its
+              // budget — a concurrent metadata/full-record put can enlarge the protected
+              // SUFFIX under the same ids while candidateSafeForAllModels awaited, so
+              // `[summary, ...freshSuffix]` may now exceed token/media budgets even though
+              // the compactionId, boundary, and prefix ids are unchanged.
+              const rCandidate = [
+                { id: `compaction-summary-${stored.compactionId}`, role: 'assistant' as const, content: stored.summaryText },
+                ...projectForCompactionCandidate(
+                  rBranch.slice(coveredCount) as Array<{ id?: unknown; role?: unknown; content?: unknown }>,
+                ),
+              ];
+              // Fingerprint the reread state BEFORE the (awaited) budget validation so a
+              // change DURING that await is caught by a final synchronous reread — else
+              // this re-verify just reopens the TOCTOU it was meant to close.
+              const beforeAwaitSig = fullSigOf(rBranch as Array<{ id?: unknown }>);
+              const beforeAwaitRoute = routeFingerprint(reread);
+              // candidateSafeForAllModels validates against the ORIGINAL route's models /
+              // windows / static budgets (eligibleValidationModels captured at handler
+              // start). If a metadata put / set-selection switched the route while we
+              // awaited, validating route A but persisting a record used on route B is
+              // unsafe — bail and recompute against the current route.
+              if (beforeAwaitRoute !== validatedRouteFingerprint) {
+                // Route changed during the reuse validation. Don't fall through to a FRESH
+                // compaction — it would summarize (PAY) against the original stale config
+                // snapshot, then the fresh final CAS would necessarily reject it for the
+                // same route drift. Return nothing-to-compact so the NEXT turn recomputes
+                // against the current route without a wasted paid summarizer call.
+                return { ok: false, error: 'nothing-to-compact' };
+              } else if (
+                coveredCount === rBoundary &&
+                Array.isArray(rstored.compactedMessageIds) &&
+                isStrictPrefix(rstored.compactedMessageIds, rBranchIds) &&
+                (await candidateSafeForAllModels(rCandidate as Parameters<typeof shouldCompactBranchMediaAware>[0]))
+              ) {
+                if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+                // FINAL synchronous reread + CAS: a delete / edit / suffix change / route
+                // change during the budget await must not slip through as a false success.
+                // Do the ASYNC static-input check FIRST (before the reread) so the reread +
+                // all CAS checks are synchronous — an await between them would reopen the
+                // TOCTOU (a delete/selection during it observed against a stale finalConv).
+                const staticStillValid =
+                  (await raceAbort(staticInputFingerprint(chatBasePrompt, chatCwd, getRegisteredTools()))) ===
+                  validatedStaticInputFingerprint;
+                if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+                const finalConv = readConversation(appHome, conversationId);
+                if (!finalConv) return { ok: false, error: 'conversation-not-found' };
+                const fstored = finalConv.conversationCompaction as
+                  | { compactionId?: string; coveredContentSig?: Record<string, string> }
+                  | null
+                  | undefined;
+                const { tree: ftree, headId: fhead } = ensureConversationTree(finalConv);
+                const fBranch = getConversationBranch(ftree, fhead);
+                // The stored summary's COVERED content must still match its recorded
+                // coveredContentSig — a trusted plugin can edit a covered message under the
+                // same id (retaining conversationCompaction), which fullSigOf/route checks
+                // (branch stability during THIS await) wouldn't catch. Reuse only if the
+                // covered content is genuinely unchanged.
+                const coveredContentMatches = (() => {
+                  const sig = stored.coveredContentSig;
+                  if (!sig) return true; // no baseline → id/boundary/prefix checks govern
+                  const byId = new Map(fBranch.map((m) => [m.id, m]));
+                  return (stored.compactedMessageIds ?? []).every((id) => {
+                    const expected = sig[id];
+                    if (expected === undefined) return true;
+                    const node = byId.get(id);
+                    if (!node) return false;
+                    return messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) === expected;
+                  });
+                })();
+                if (
+                  fstored?.compactionId === stored.compactionId &&
+                  fullSigOf(fBranch as Array<{ id?: unknown }>) === beforeAwaitSig &&
+                  routeFingerprint(finalConv) === beforeAwaitRoute &&
+                  coveredContentMatches &&
+                  staticStillValid &&
+                  // Global routing/limit config must also be unchanged since validation —
+                  // a compaction-limits or runtime switch during the budget await would
+                  // otherwise let /compact report a no-op success under stale limits.
+                  (!getConfig || globalConfigFingerprint(getConfig()) === validatedGlobalConfigFingerprint)
+                ) {
+                  return { ok: true, summarizedCount: coveredCount };
+                }
+                // else: changed under us during the budget await — fall through to recompute.
+              }
+            }
+            // else: changed under us — fall through and recompute below.
+          }
+        }
+      }
+    }
+
+    // Inject the conversation's executionMode into the config the hooks see, the
+    // SAME way a normal turn does (agent.ts) — a mode-aware DLP/plugin hook (e.g.
+    // stricter redaction in plan-first mode) must observe the same mode it would on
+    // a real turn, else it can behave differently for the summarizer request.
+    const convExecutionMode = (conv as { executionMode?: ExecutionMode | null }).executionMode;
+    const configForHooks: AppConfig = convExecutionMode
+      ? { ...config, tools: { ...config.tools, executionMode: convExecutionMode } }
+      : config;
+
+    // Run plugin pre-send (`messages:hook`) middleware FIRST, then the enforcing
+    // UserPromptSubmit DLP gate LAST — the SAME order a normal turn uses (agent.ts).
+    // Order matters: a plugin can rewrite/inject content, and the DLP gate must be
+    // the AUTHORITATIVE final check over whatever actually goes to the model (else a
+    // plugin could re-introduce content the gate would have redacted).
+    const pluginManager = getPluginManager?.() ?? null;
+    // The window-reduction below budgets the NEXT real turn, so it tracks the chat
+    // system prompt (which a pre-send plugin may rewrite). But the summarizer
+    // REQUEST that these hooks gate uses COMPACTION_SYSTEM_PROMPT — pass THAT as the
+    // hook `systemPrompt` so a system-prompt-conditioned DLP/redaction hook sees the
+    // prompt actually sent to the summarizer, not the chat prompt.
+    // The prompt actually sent to the summarizer. Starts as COMPACTION_SYSTEM_PROMPT;
+    // a hook may rewrite it — we honor that rewrite in compactConversationPrefix. (The
+    // NEXT turn's chat prompt is sized separately via assembledChatPrompt above.)
+    let compactionSystemPrompt = COMPACTION_SYSTEM_PROMPT;
+    if (pluginManager) {
+      try {
+        const hookResult = await raceAbort(
+          pluginManager.runPreSendHooks({
+            messages: messages as Parameters<typeof pluginManager.runPreSendHooks>[0]['messages'],
+            modelKey: modelEntry.key,
+            config: configForHooks,
+            systemPrompt: compactionSystemPrompt,
+          }),
+        );
+        if (hookResult.abort) return { ok: false, error: 'blocked-by-hook' };
+        if (Array.isArray(hookResult.messages)) {
+          messages = hookResult.messages as typeof messages;
+        }
+        // Honor a plugin rewrite of the COMPACTION prompt (what the summarizer sends).
+        if (typeof hookResult.systemPrompt === 'string') compactionSystemPrompt = hookResult.systemPrompt;
+      } catch {
+        return { ok: false, error: 'hook-error' };
+      }
+    }
+
+    // Enforcing UserPromptSubmit DLP gate LAST — authoritative over the plugin
+    // output. Fails closed: a denying/suppressing hook aborts compaction rather than
+    // leaking to the summarizer.
+    try {
+      const gated = await raceAbort(
+        gateMessagesThroughUserPromptSubmit(
+          messages,
+          configForHooks,
+          conversationId,
+          modelEntry.key,
+          'compaction',
+          compactionSystemPrompt,
+        ),
+      );
+      if (gated.suppressed) return { ok: false, error: 'blocked-by-hook' };
+      messages = gated.messages as typeof messages;
+      // Honor a DLP-gate rewrite of the COMPACTION prompt too.
+      if (typeof gated.systemPrompt === 'string') compactionSystemPrompt = gated.systemPrompt;
+    } catch {
+      return { ok: false, error: 'hook-error' };
+    }
+
+    // BEFORE paying for a summary: verify the (post-hook) messages still carry
+    // internal IDs that form a leading run matching the current disk branch. A
+    // pre-send/DLP hook that reconstructs messages WITHOUT Kai's ids — or drops/
+    // reorders the head — yields a record whose compactedMessageIds can't be a
+    // strict disk-branch prefix, so the send-path reuse would reject it. Detect
+    // that here and skip (report nothing-to-compact) rather than billing a summary
+    // that can never be reused. (The post-summary strict-prefix check below stays as
+    // belt-and-braces.)
+    {
+      const { tree: preTree, headId: preHead } = ensureConversationTree(conv);
+      const diskIds = getConversationBranch(preTree, preHead).map((m) => m.id);
+      const msgIds = messages.map((m) => (m as { id?: unknown }).id);
+      const { boundaryIndex } = selectProtectedTail(
+        messages as unknown as Parameters<typeof selectProtectedTail>[0],
+        config.compaction.conversation.ignoreRecentUserMessages,
+        config.compaction.conversation.ignoreRecentAssistantMessages,
+      );
+      if (!summarizablePrefixMatchesDisk(msgIds, diskIds, boundaryIndex)) {
+        return { ok: false, error: 'nothing-to-compact' };
+      }
+    }
 
     let result;
     try {
+      // The compaction budget is `window - outputMaxTokens - promptReserveTokens`.
+      // A large ASSEMBLED system prompt (base + working-directory / project
+      // instructions) can exceed promptReserveTokens, so a summary that "fits" the
+      // raw window would still overflow the real request — `/compact` would report
+      // success yet the next turn re-overflows. Reduce the effective window by the
+      // amount the assembled system prompt exceeds the reserve. (Tool schemas are
+      // the smaller static term and aren't built in this handler; the reserve
+      // covers them, and reactive recovery — which DOES count schemas — backstops.)
+      // Size the SUMMARIZER request against the SUMMARIZER model's OWN window (the
+      // primary/config-override — the summarizer runs on modelEntry, not a fallback).
+      // Using the fallback-min window here would reject a large prefix the primary
+      // summarizer could handle. The compacted RESULT's fit on every eligible model
+      // (incl. smaller fallbacks) is validated separately by candidateSafeForAllModels.
+      const summarizerWindow =
+        (config.compaction.conversation as { contextWindowTokens?: number }).contextWindowTokens ??
+        modelEntry.modelConfig.maxInputTokens ??
+        // Imported models often omit maxInputTokens but have an INFERRED window; use it
+        // so externalOverReserve (the next-turn static excess) is still subtracted —
+        // otherwise a large static input on such a model isn't budgeted and /compact
+        // bills a summary that post-validation then rejects (repeated waste).
+        (() => {
+          try {
+            return resolveConversationTokenization(modelEntry.modelConfig.modelName).contextWindowTokens ?? undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+      let compactConfig = config.compaction.conversation as Parameters<typeof compactConversationPrefix>[2];
+      // The NEXT real turn's static input beyond the reserve, on the SUMMARIZER model
+      // (its window is what we're reducing) — so the summary leaves room for that turn.
+      let externalOverReserve = 0;
+      if (typeof summarizerWindow === 'number' && summarizerWindow > 0) {
+        externalOverReserve = promptOverReserveFor(modelEntry.modelConfig.modelName);
+        compactConfig = { ...convConfig, contextWindowTokens: summarizerWindow };
+      }
       result = await compactConversationPrefix(
         messages as Parameters<typeof compactConversationPrefix>[0],
         modelEntry.modelConfig,
-        config.compaction.conversation,
+        compactConfig,
+        signal,
+        {
+          disableAmbientFallback: providerOverrideApplied,
+          externalPromptOverReserve: externalOverReserve,
+          // Honor a hook-rewritten compaction prompt (only when it actually changed).
+          ...(compactionSystemPrompt !== COMPACTION_SYSTEM_PROMPT
+            ? { systemPromptOverride: compactionSystemPrompt }
+            : {}),
+        },
       );
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -780,14 +1831,42 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
 
     // A null result means "nothing safe to compact" (prefix empty / would drop a
     // message / summary still over budget) — the auto path treats this the same.
-    if (!result || !result.compactedMessages || !result.summaryText || !result.compactionId) {
+    // ALSO require a non-empty compactedMessageIds: the reuse path (next turn)
+    // needs a stable id prefix, and an empty list (e.g. a modify hook stripped
+    // Kai's internal ids) makes the persisted record non-reusable — reporting
+    // success then would be misleading (the next turn silently ignores it).
+    if (
+      !result ||
+      !result.compactedMessages ||
+      !result.summaryText ||
+      !result.compactionId ||
+      result.compactedMessageIds.length === 0
+    ) {
       return { ok: false, error: 'nothing-to-compact' };
     }
+
+    // The compacted branch may FIT the prompt-input budget yet still be OVER the
+    // compaction TRIGGER (a large protected recent tail), or exceed a denser-tokenizing
+    // fallback's real input budget. The next turn's reuse gate would then reject the
+    // record and re-summarize — so `/compact` would report success but change nothing
+    // (and risk double-billing), or worse persist a record that overflows a fallback.
+    // Validate the candidate against EVERY eligible model (trigger + hard input budget,
+    // each model's own tokenizer) — the SAME check the stored-summary reuse short-circuit
+    // uses. If it's unsafe on any model, report nothing-to-compact rather than persist.
+    if (!(await candidateSafeForAllModels(result.compactedMessages as Parameters<typeof shouldCompactBranchMediaAware>[0]))) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+
 
     // Persist the record only (tree untouched). Re-read to avoid clobbering a
     // concurrent write, then merge just the compaction field.
     const fresh = readConversation(appHome, conversationId);
     if (!fresh) return { ok: false, error: 'conversation-not-found' };
+    // If the deadline already fired, the outer race resolved as `compaction-timeout`
+    // and RELEASED the lock — a normal turn may now own the conversation. A late
+    // persist here could race that turn's writes, so bail without writing. (Best-
+    // effort: the strict-prefix check below would also reject a diverged branch.)
+    if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
     // A turn may have started during the (async) summary generation. If so, skip
     // persisting — that turn will compute its own record, and stamping one now
     // could race its terminal write. (Even if it slipped through, the agent
@@ -795,21 +1874,171 @@ export function registerConversationHandlers(ipcMain: IpcMain, appHome: string, 
     if (fresh.runStatus === 'running' || fresh.runStatus === 'awaiting-approval') {
       return { ok: false, error: 'conversation-busy' };
     }
-    fresh.conversationCompaction = {
+    // The record is only REUSABLE next turn if its ids form an ordered prefix of
+    // the current stored branch. A UserPromptSubmit modify hook can drop/reorder
+    // history so the ids stay real yet aren't a strict prefix — persisting such a
+    // record would report success while next turn's isStrictPrefix rejects it and
+    // re-summarizes. Validate against the freshly-read branch and report
+    // `nothing-to-compact` (the honest "no reusable record") if it won't reuse.
+    let validatedHead: string | null = null;
+    // FULL-branch content signature of what we validated. The final CAS also compares this
+    // so a same-id content edit to a SUFFIX message (e.g. a partial→final finalize that
+    // grows the last assistant) — which keeps the head AND leaves covered ids untouched,
+    // yet can change the reused record's budget — is caught too. Deterministic (no new
+    // await), so it doesn't open a fresh TOCTOU window.
+    let validatedFullSig = '';
+    const coveredIdSet = new Set(result.compactedMessageIds);
+    {
+      const { tree: freshTree, headId: freshHead } = ensureConversationTree(fresh);
+      validatedHead = freshHead ?? null;
+      const freshBranch = getConversationBranch(freshTree, freshHead);
+      const freshBranchIds = freshBranch.map((m) => m.id);
+      if (!isStrictPrefix(result.compactedMessageIds, freshBranchIds)) {
+        return { ok: false, error: 'nothing-to-compact' };
+      }
+      // IDs match, but a concurrent conversations:put may have CHANGED a covered
+      // message's CONTENT under the same id (e.g. a partial→final assistant finalize,
+      // or an edit) while we were summarizing. The summary reflects the INITIAL content;
+      // persisting it would hide the newer content on reuse. Compare covered-message
+      // content signatures between the initial branch (what we summarized) and the
+      // fresh disk read — if any covered message's content changed, the summary is
+      // stale, so report nothing-to-compact rather than persist it.
+      validatedFullSig = fullSigOf(freshBranch as Array<{ id?: unknown }>);
+      // Compare the covered ids' PRE-HOOK raw sigs (captured before any in-place hook
+      // mutation of `branch`) against fresh disk — NOT coveredSigOf(branch), which would
+      // reflect a hook's in-place content mutation and falsely reject a valid compaction.
+      const preHookCoveredSig = [...coveredIdSet]
+        .filter((id) => preHookBranchSigById.has(id))
+        .map((id) => `${id}:${preHookBranchSigById.get(id)}`)
+        .join(' ');
+      const freshCoveredById = new Map(
+        (freshBranch as Array<{ id?: unknown }>).map((m) => [typeof m?.id === 'string' ? m.id : '', m]),
+      );
+      const freshCoveredSig = [...coveredIdSet]
+        .filter((id) => preHookBranchSigById.has(id))
+        .map((id) => {
+          const node = freshCoveredById.get(id);
+          return `${id}:${node ? messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) : 'MISSING'}`;
+        })
+        .join(' ');
+      if (preHookCoveredSig !== freshCoveredSig) {
+        return { ok: false, error: 'nothing-to-compact' };
+      }
+      // The covered PREFIX is unchanged, but a concurrent client may have APPENDED new
+      // messages to the suffix while we summarized. candidateSafeForAllModels (above)
+      // validated `[summary, ...INITIAL suffix]`; the record we're about to persist will
+      // be reused next turn as `[summary, ...FRESH suffix]`, which is larger and may now
+      // bust the trigger / hard-input / media budgets on some eligible model. Re-validate
+      // the RECOMPOSED candidate against fresh disk before writing — else /compact reports
+      // success and stores a record the next turn immediately rejects or recomputes.
+      const coveredCount = result.compactedMessageIds.length;
+      const recomposedCandidate = [
+        { id: `compaction-summary-${result.compactionId}`, role: 'assistant' as const, content: result.summaryText },
+        // Strip displayOnly parts from the fresh suffix, exactly as the initial candidate
+        // was stripped (line ~1067). freshBranch is RAW disk — project it through the same
+        // model-bearing helper (drops displayOnly parts AND storage-only fields like
+        // parentId/createdAt/token caches that exact counting would otherwise over-count).
+        // (Drift checks above still use raw.)
+        ...projectForCompactionCandidate(
+          freshBranch.slice(coveredCount) as Array<{ id?: unknown; role?: unknown; content?: unknown }>,
+        ),
+      ];
+      if (
+        !(await candidateSafeForAllModels(
+          recomposedCandidate as Parameters<typeof shouldCompactBranchMediaAware>[0],
+        ))
+      ) {
+        return { ok: false, error: 'nothing-to-compact' };
+      }
+    }
+    // The recompose re-validation awaited the tokenizer; if the deadline fired during it
+    // the lock was released and a turn may now own the conversation — don't race its write.
+    if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+    // Compute the (ASYNC — reads instruction files) static-input drift check HERE, BEFORE
+    // the final reread, so the reread→checks→write sequence below is fully SYNCHRONOUS.
+    // Doing this await AFTER the reread would reopen the TOCTOU the final reread closes: a
+    // concurrent delete / selection change during the await could be clobbered by the write.
+    const staticInputStillValid =
+      (await raceAbort(staticInputFingerprint(chatBasePrompt, chatCwd, getRegisteredTools()))) === validatedStaticInputFingerprint;
+    if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
+    if (!staticInputStillValid) {
+      // Tool schemas / expanded instructions changed during summarization — the record was
+      // sized against stale static cost; recompute next turn.
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+    // FINAL re-read before writing. Everything above validated against `fresh` (read
+    // before the awaited recompose-revalidation); a concurrent edit / append / metadata
+    // write / DELETION during that await would be lost — or a deleted conversation
+    // resurrected — if we wrote the stale `fresh`. Re-read now, bail if it vanished, and
+    // bail if the branch head moved (our prefix/content/budget validation no longer holds
+    // — report nothing-to-compact so the next turn recomputes). Merge the compaction field
+    // into the LATEST record so we don't clobber a concurrent metadata change. NO awaits
+    // between this reread and the write below.
+    const latest = readConversation(appHome, conversationId);
+    if (!latest) return { ok: false, error: 'conversation-not-found' };
+    const { tree: latestTree, headId: latestHead } = ensureConversationTree(latest);
+    if ((latestHead ?? null) !== validatedHead) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+    // Head-unchanged is NOT sufficient: a concurrent conversations:put can rewrite a
+    // message's content under the same id (partial→final finalize, edit) without moving
+    // the head — a COVERED edit makes the summary stale, a SUFFIX edit can bust the reused
+    // record's budget. Re-compare the FULL-branch content signature against what we
+    // validated; if anything drifted, bail so the next turn recomputes.
+    if (fullSigOf(getConversationBranch(latestTree, latestHead) as Array<{ id?: unknown }>) !== validatedFullSig) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+    // Route/budget fingerprint must also be unchanged: if the selected model/profile/
+    // runtime/execution-mode/cwd/fallback changed during summarization, everything we
+    // validated (window, tokenizer, budgets, and whether the runtime even uses reuse
+    // records) was for the OLD route. Bail so the next turn recomputes for the new one.
+    if (routeFingerprint(latest) !== validatedRouteFingerprint) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+    // Also bail if the GLOBAL routing/budget config changed during summarization (e.g. the
+    // default runtime switched to an external one that ignores reuse records) — the record
+    // we validated is for the old global config; recompute next turn against the new one.
+    if (getConfig && globalConfigFingerprint(getConfig()) !== validatedGlobalConfigFingerprint) {
+      return { ok: false, error: 'nothing-to-compact' };
+    }
+    // (static-input drift was already validated synchronously BEFORE this reread.)
+    // Baseline signatures for the covered ids, from the validated latest branch — so a
+    // LATER reactive overflow recovery that reuses THIS summary then recompacts it can
+    // verify the underlying ids (else its expansion guard finds no baseline and refuses
+    // to persist, causing repeated recovery + rebilling). Parity with the agent-side
+    // pre-stream / recovery emit sites.
+    const latestBranch = getConversationBranch(latestTree, latestHead) as Array<{ id?: unknown }>;
+    const compactCoveredSig: Record<string, string> = {};
+    for (const m of latestBranch) {
+      if (typeof m?.id === 'string' && coveredIdSet.has(m.id)) {
+        compactCoveredSig[m.id] = messageContentSignature(m as Parameters<typeof messageContentSignature>[0]);
+      }
+    }
+    latest.conversationCompaction = {
       compactionId: result.compactionId,
       summaryText: result.summaryText,
       compactedMessageIds: result.compactedMessageIds,
       boundaryHeadId: headId,
       createdAt: new Date().toISOString(),
+      coveredContentSig: compactCoveredSig,
+      compactionRevision: nextCompactionRevision(),
     } as ConversationRecord['conversationCompaction'];
-    fresh.updatedAt = new Date().toISOString();
-    writeConversation(appHome, fresh);
+    latest.updatedAt = new Date().toISOString();
+    writeConversation(appHome, latest);
+    // Broadcast the persisted record so the renderer's cached conversation matches
+    // disk. Without this the renderer still holds the PRE-compaction record; a later
+    // rename/archive/settings write would then send that stale full record through
+    // `conversations:put` — its compactionId differs, so the put-preservation guard
+    // won't retain the fresh one — silently overwriting the paid summary. (The tree
+    // is unchanged; this upsert only refreshes metadata + conversationCompaction.)
+    broadcastUpsert(appHome, latest);
     return { ok: true, summarizedCount: result.compactedMessageIds.length };
-  });
+  };
 
   ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
+    if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
 
     const { tree } = ensureConversationTree(conv);
     if (!tree.some((m) => m.id === variantId)) return { ok: false, error: 'variant-not-found' };

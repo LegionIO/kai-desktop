@@ -17,13 +17,15 @@ import {
   sanitizedMessageDisplayText,
 } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
-import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames } from '../agent/mastra-agent.js';
+import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames, buildAgentInstructions } from '../agent/mastra-agent.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 import type { LLMModelConfig, ResolvedStreamConfig } from '../agent/model-catalog.js';
 import { resolveModelForThread, resolveStreamConfig } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
 import { getSharedMemory } from '../agent/memory.js';
+import { createSubAgentMediaFitter, estimateSubAgentStaticTokens } from '../agent/sub-agent-media-fit.js';
+import { type MediaFitConfig } from '../agent/media-fit.js';
 import { updateSubagentStatus } from '../agent/subagent-status.js';
 
 /** Follow-up message queues keyed by subAgentConversationId */
@@ -196,6 +198,47 @@ async function resumeSubAgent(
     // suppressing to {pending}, so the card is never left permanently hidden.
     const resolvedArgsByTool = new Map<string, unknown[]>();
 
+    // Budget-fit media on RESUMED sub-agent tool results too — the initial run's
+    // fitter isn't wired here, and sub-agents have no reactive overflow recovery,
+    // so a compressed-but-large image kept under the 5 MiB sanitizer limit could
+    // still overflow a small model. Uses the SAME shared fitter as the runner.
+    const resumeMediaConfig = config.compaction?.media as MediaFitConfig | undefined;
+    const RESUME_WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE = 3000;
+    const computeResumeStatic = (mn: string): number =>
+      estimateSubAgentStaticTokens(
+        // Match the ACTUAL sent instructions: resolveModeSystemPrompt over the resume
+        // config (systemPrompts.chat/systemPrompt = resumeSystemPrompt) PLUS the appended
+        // runtime-capability text. resumeSystemPrompt alone omits the capability lines.
+        buildAgentInstructions({ ...config, systemPrompt: resumeSystemPrompt }),
+        tools,
+        (schema) => z.toJSONSchema(schema as Parameters<typeof z.toJSONSchema>[0], { target: 'draft-7' }),
+        RESUME_WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
+        mn,
+      );
+    const resumeStaticInputTokens = computeResumeStatic(modelConfig.modelName);
+    const resumeEligibleModels =
+      streamConfig && streamConfig.fallbackEnabled
+        ? [streamConfig.primaryModel, ...streamConfig.fallbackModels]
+        : [{ modelConfig }];
+    const resumeWindowOverride = (config.compaction?.conversation as { contextWindowTokens?: number } | undefined)
+      ?.contextWindowTokens;
+    // Assistant text streamed before a tool call this turn (charged against the
+    // media budget by the fitter). Hoisted so the fitter can read it via closure;
+    // the stream loop below accumulates into it.
+    let resumeTurnText = '';
+    const resumeMediaFitter = createSubAgentMediaFitter({
+      mediaConfig: resumeMediaConfig,
+      eligibleModels: resumeEligibleModels,
+      windowOverride: resumeWindowOverride,
+      staticInputTokens: resumeStaticInputTokens,
+      computeStaticInputTokens: computeResumeStatic,
+      messages,
+      getAccumulatedText: () => resumeTurnText,
+      signal: localController.signal,
+      conversationId: subAgentConversationId,
+    });
+    const fitResumeMedia = resumeMediaFitter.fit;
+
     const resumeStreamOpts = {
       abortSignal: localController.signal,
       parentProfileKey: profileKey ?? null,
@@ -205,6 +248,8 @@ async function resumeSubAgent(
       },
       // Enforce lifecycle hooks on resume, same as the initial sub-agent run.
       onToolExecutionStart: async (state) => {
+        // Charge RAW args against the media budget before any await/early return.
+        resumeMediaFitter.chargeArgs(state.toolCallId, state.args);
         const rebroadcast = (resolved: unknown): void => {
           rewrittenArgs.set(state.toolCallId, resolved);
           // Prefer a suppressed stream id already rendered under {pending}
@@ -267,6 +312,9 @@ async function resumeSubAgent(
             const target = state.args as Record<string, unknown>;
             for (const k of Object.keys(target)) delete target[k];
             Object.assign(target, nextArgs as Record<string, unknown>);
+            // Re-charge the delta so a hook that ENLARGED the args doesn't leave the
+            // media budget under-counted (recovery is off once a tool has run).
+            resumeMediaFitter.rechargeArgs(state.toolCallId, target);
           } else {
             // Non-object modify replacement can't be applied to by-reference
             // args — fail closed rather than run with unsanitized input.
@@ -290,9 +338,16 @@ async function resumeSubAgent(
           args: postArgs,
           result,
         });
-        if (postTool.denied) return { isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' };
+        if (postTool.denied) {
+          // Route the denial result through the fitter too — its error text is sent
+          // to the model and must be charged against the same-turn budget (else a
+          // long denial reason followed by an image can overflow the next step).
+          return fitResumeMedia({ isError: true, error: postTool.reason ?? 'Blocked by PostToolUse hook.' }, toolCallId, postArgs);
+        }
         const nextResult = (postTool.payload as { result?: unknown } | undefined)?.result;
-        return nextResult !== undefined ? nextResult : result;
+        const resolved = nextResult !== undefined ? nextResult : result;
+        // Budget-fit media AFTER PostToolUse augmentation (parity with the runner).
+        return fitResumeMedia(resolved, toolCallId, postArgs);
       },
     } satisfies Parameters<typeof streamAgentResponse>[6];
 
@@ -318,19 +373,22 @@ async function resumeSubAgent(
             resumeStreamOpts,
           );
 
-    let turnText = '';
+    resumeTurnText = '';
     for await (const event of stream) {
-      if (event.type === 'text-delta' && event.text) turnText += event.text;
+      if (event.type === 'text-delta' && event.text) resumeTurnText += event.text;
       else if (event.type === 'model-fallback') {
         // Mirror the initial runner: drop the failed partial + refresh the
         // provider-tool set for the fallback model (enforcing-hook wrapping).
-        turnText = '';
+        resumeTurnText = '';
         const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
         const nextEntry = toKey
           ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
             (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
           : undefined;
         if (nextEntry) providerToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
+        // Reset the same-turn media budget (fallback restarts from original messages)
+        // + recompute static input under the fallback model's tokenizer.
+        resumeMediaFitter.reset(nextEntry ?? undefined);
       }
       const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
       // Suppress raw tool-call args until the hook resolves; publish rewritten
@@ -371,8 +429,8 @@ async function resumeSubAgent(
       if (event.type === 'done') break;
     }
 
-    if (turnText) {
-      messages.push({ role: 'assistant', content: turnText });
+    if (resumeTurnText) {
+      messages.push({ role: 'assistant', content: resumeTurnText });
     }
 
     // Check for immediate follow-up

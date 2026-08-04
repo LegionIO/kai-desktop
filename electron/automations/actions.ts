@@ -6,6 +6,7 @@ import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent } from '../ipc/agent.js';
 import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
+import { isCompacting } from '../agent/compaction-lock.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
   appendConversationMessages,
@@ -244,11 +245,16 @@ function resolveConversationTarget(
   if (target.type === 'per-invocation') return null;
 
   const isBusy = (c: { id: string; runStatus?: string }) =>
-    c.runStatus === 'running' || c.runStatus === 'awaiting-approval' || inFlightAutomationTargets.has(c.id);
+    c.runStatus === 'running' ||
+    c.runStatus === 'awaiting-approval' ||
+    inFlightAutomationTargets.has(c.id) ||
+    isCompacting(c.id);
   // A busy target injects a mid-turn follow-up (abort+restart) instead of
   // diverting to a new chat, unless the rule opts out (onBusyTarget:'divert')
-  // or no inject helper is bound.
-  const injectOnBusy = canInject && action.onBusyTarget !== 'divert';
+  // or no inject helper is bound. EXCEPTION: a conversation being /compact-ed is
+  // NOT streaming (it's summarizing) — a mid-turn inject can't splice into it and
+  // would race the paid summary, so such a target always DIVERTS, never injects.
+  const injectOnBusy = (cid: string): boolean => canInject && action.onBusyTarget !== 'divert' && !isCompacting(cid);
 
   if (target.type === 'existing') {
     const conv = readConversation(appHome, target.conversationId);
@@ -259,7 +265,7 @@ function resolveConversationTarget(
       return null;
     }
     if (isBusy(conv)) {
-      if (injectOnBusy) {
+      if (injectOnBusy(target.conversationId)) {
         console.info(`[automations] rule "${rule.name}" target ${target.conversationId} busy; injecting mid-turn`);
         return { busyInject: target.conversationId };
       }
@@ -277,7 +283,7 @@ function resolveConversationTarget(
     const meta = conv.metadata as { automationRuleId?: unknown; automationSingleton?: unknown } | undefined;
     if (meta?.automationRuleId === rule.id && meta?.automationSingleton === true) {
       if (isBusy(conv)) {
-        if (injectOnBusy) {
+        if (injectOnBusy(conv.id)) {
           console.info(`[automations] rule "${rule.name}" singleton ${conv.id} busy; injecting mid-turn`);
           return { busyInject: conv.id };
         }

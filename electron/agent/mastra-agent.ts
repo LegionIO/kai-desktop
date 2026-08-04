@@ -24,7 +24,7 @@ import { isCommandAllowed, scrubShellEnv } from '../tools/shell.js';
 import { filterGrepOutput, isPathAllowed } from '../tools/file-access.js';
 import { beginShellSnapshot, trackFileWrite } from '../tools/diff-tracker.js';
 import type { DiffTrackingResultMeta } from '../../shared/diff-types.js';
-import { classifyError, calculateDelay, isSameModelRetryable } from './retry.js';
+import { classifyError, calculateDelay, isSameModelRetryable, isContextOverflowError } from './retry.js';
 import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-sanitizer.js';
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
@@ -87,6 +87,11 @@ export type StreamEvent = {
   };
   errorCategory?: string;
   errorStatusCode?: number;
+  /** Set on a terminal error that was RETAGGED as context-overflow because an earlier
+   *  fallback attempt (typically the primary) overflowed pre-content and a later model
+   *  failed for an unrelated reason. Tells the caller which model actually overflowed so
+   *  reactive recovery compacts + retries THAT model (not the failed fallback). */
+  overflowRecoveryModelKey?: string;
   stepInfo?: {
     currentStep: number;
     maxSteps: number;
@@ -2057,6 +2062,16 @@ export async function* streamWithFallback(
     ...(streamConfig.fallbackEnabled ? streamConfig.fallbackModels : []),
   ];
   let responseMessageId = options?.responseMessageId ?? createResponseMessageId();
+  // True once ANY attempt hit a pre-content CONTEXT-OVERFLOW. streamWithFallback
+  // suppresses a primary pre-content error and tries the next model; if the chain then
+  // fails for an UNRELATED reason (auth/rate-limit), the terminal error would carry
+  // that reason and the caller's reactive recovery (which keys on overflow) never runs
+  // — even though compacting + retrying could recover. So remember an earlier overflow
+  // and tag the terminal error with it, letting the caller attempt compaction.
+  let sawPreContentOverflow = false;
+  // The key of the model whose pre-content overflow we captured (the first one) — the
+  // model reactive recovery should compact + retry, not the failed fallback.
+  let overflowModelKey: string | null = null;
 
   for (let attempt = 0; attempt < modelChain.length; attempt++) {
     if (options?.abortSignal?.aborted) {
@@ -2122,6 +2137,13 @@ export async function* streamWithFallback(
               // Error before any content — classic pre-content fallback: capture
               // and try the next model, don't show the error to the UI.
               lastError = event.error ?? 'Unknown error';
+              // Remember a pre-content overflow so the terminal error can carry it even
+              // if a later model fails for a different reason (see sawPreContentOverflow).
+              const ovCat = (event as { errorCategory?: string }).errorCategory;
+              if (ovCat === 'context-overflow' || (!ovCat && isContextOverflowError(event.error))) {
+                sawPreContentOverflow = true;
+                if (overflowModelKey === null) overflowModelKey = entry.key; // FIRST overflow's model
+              }
               continue;
             }
             // Error AFTER content started. Only fall back for TRANSIENT upstream
@@ -2170,6 +2192,19 @@ export async function* streamWithFallback(
         // Skip inner 'done' if we're about to fallback
         if (event.type === 'done' && lastError && !emittedContent && attempt < modelChain.length - 1) {
           break;
+        }
+
+        // Terminal error on the LAST attempt: if an EARLIER attempt hit a pre-content
+        // overflow and this error isn't already overflow-categorized, tag it so the
+        // caller's reactive recovery attempts compaction (which may let a retry succeed).
+        if (
+          event.type === 'error' &&
+          sawPreContentOverflow &&
+          !emittedContent &&
+          (event as { errorCategory?: string }).errorCategory !== 'context-overflow'
+        ) {
+          yield { ...event, errorCategory: 'context-overflow', overflowRecoveryModelKey: overflowModelKey ?? undefined };
+          continue;
         }
 
         yield event;
@@ -2251,6 +2286,13 @@ export async function* streamWithFallback(
       // A non-transient throw after content stays terminal (yielded below).
       const canFallback = attempt < modelChain.length - 1 && (!emittedContent || outerInfo.isTransient);
       if (canFallback) {
+        // Remember a pre-content THROWN overflow (parity with the error-EVENT path) so
+        // the terminal error can be retagged as overflow if a later model fails for an
+        // unrelated reason — else compact-and-retry is skipped for a recoverable primary.
+        if (!emittedContent && (outerInfo.category === 'context-overflow' || isContextOverflowError(outerError))) {
+          sawPreContentOverflow = true;
+          if (overflowModelKey === null) overflowModelKey = entry.key;
+        }
         const nextEntry = modelChain[attempt + 1];
         yield {
           conversationId,
@@ -2275,12 +2317,23 @@ export async function* streamWithFallback(
 
       // Last model also failed (or a non-transient error after content)
       const lastErrorInfo = classifyError(outerError);
+      // If an earlier attempt hit a pre-content overflow (and no content streamed on
+      // this failing attempt), surface the terminal error AS overflow so the caller's
+      // reactive recovery can compact + retry — the primary's overflow was the real
+      // recoverable cause, not this last model's (e.g. auth) failure.
+      const terminalCategory =
+        sawPreContentOverflow && !emittedContent && lastErrorInfo.category !== 'context-overflow'
+          ? 'context-overflow'
+          : lastErrorInfo.category;
       yield {
         conversationId,
         type: 'error',
         error: getErrorMessage(outerError),
-        errorCategory: lastErrorInfo.category,
+        errorCategory: terminalCategory,
         errorStatusCode: lastErrorInfo.statusCode,
+        ...(terminalCategory === 'context-overflow' && lastErrorInfo.category !== 'context-overflow'
+          ? { overflowRecoveryModelKey: overflowModelKey ?? undefined }
+          : {}),
       };
       yield { conversationId, type: 'done' };
       return;
@@ -2291,7 +2344,7 @@ export async function* streamWithFallback(
   yield { conversationId, type: 'done' };
 }
 
-function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): string {
+export function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): string {
   const prompts = config.systemPrompts;
   const chatPrompt = prompts?.chat?.trim() || config.systemPrompt;
 
@@ -2302,7 +2355,7 @@ function resolveModeSystemPrompt(config: AppConfig, executionMode?: string): str
   return chatPrompt;
 }
 
-function buildAgentInstructions(config: AppConfig, executionMode?: string): string {
+export function buildAgentInstructions(config: AppConfig, executionMode?: string): string {
   const basePrompt = resolveModeSystemPrompt(config, executionMode);
   const lines = [
     basePrompt,

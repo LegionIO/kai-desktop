@@ -331,6 +331,14 @@ export class LocalBridgeClient {
   }
 
   invoke<T = unknown>(channel: string, ...args: unknown[]): Promise<T> {
+    return this.invokeWithTimeout<T>(channel, INVOKE_TIMEOUT_MS, ...args);
+  }
+
+  /** Like {@link invoke} but with a caller-chosen timeout — for long-running
+   *  backend operations (e.g. `/compact` summarization) that legitimately exceed
+   *  the default 60s and must not have the client give up while the backend keeps
+   *  working (and may persist the result). */
+  invokeWithTimeout<T = unknown>(channel: string, timeoutMs: number, ...args: unknown[]): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const socket = this.socket;
       if (!socket || !this.connected) {
@@ -341,7 +349,7 @@ export class LocalBridgeClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`timeout waiting for ${channel}`));
-      }, INVOKE_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       try {
         socket.write(JSON.stringify({ id, type: 'invoke', channel, args }) + '\n');

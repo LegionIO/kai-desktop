@@ -34,7 +34,37 @@ export type ConversationCompaction = {
   compactedMessageIds: string[];
   boundaryHeadId: string | null;
   createdAt: string;
+  // Optional per-covered-id content signature (bounded hash) of the messages this
+  // summary covered, as of when it was produced. Lets a LATER same-turn reactive
+  // recovery that expands this record's synthetic summary re-verify the underlying ids
+  // against fresh disk before persisting over them. Additive/optional — older records
+  // and the renderer put-path simply omit it (composition then falls back to rejecting
+  // an unverifiable expansion).
+  coveredContentSig?: Record<string, string>;
+  // Main-process MONOTONIC revision stamped when this record is written (put / stream-
+  // persistence / /compact). Used INSTEAD of the renderer wall-clock `createdAt` to decide
+  // which of two records is newer — a web client with a skewed clock could otherwise stamp
+  // a genuinely-newer summary with an older createdAt and have it dropped by preservation.
+  compactionRevision?: number;
 } | null;
+
+// Process-monotonic counter for compaction-record freshness. Stamped by every main-side
+// writer of a NEW compaction record so preservation compares main-authoritative ordering
+// instead of renderer wall-clock `createdAt` (which a clock-skewed web client can get
+// wrong). Starts at the current epoch-ms so it stays roughly comparable to any legacy
+// createdAt-derived ordering, and only ever increases within a process.
+let compactionRevisionCounter = Date.now();
+export function nextCompactionRevision(): number {
+  compactionRevisionCounter = Math.max(compactionRevisionCounter + 1, Date.now());
+  return compactionRevisionCounter;
+}
+// Advance the counter's floor past a revision observed on a STORED record. Guards against
+// a process clock rollback / VM restore issuing a revision BELOW a persisted record's —
+// which would make a genuinely-newer summary compare as older and get dropped. Called
+// whenever a stored compaction record is read.
+export function observeCompactionRevision(rev: number | undefined): void {
+  if (typeof rev === 'number' && rev >= compactionRevisionCounter) compactionRevisionCounter = rev;
+}
 
 /** Full persisted conversation, including heavy message data. */
 export type ConversationRecord = {
@@ -248,7 +278,11 @@ export function readConversation(appHome: string, id: string): ConversationRecor
   }
   if (!existsSync(p)) return null;
   try {
-    return JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
+    const rec = JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
+    // Advance the revision floor past any stored compaction revision so a clock rollback /
+    // VM restore can't later issue a lower revision than what's already on disk.
+    observeCompactionRevision((rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision);
+    return rec;
   } catch {
     return null;
   }

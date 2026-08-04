@@ -798,10 +798,49 @@ export function App({
           }
           const noteId = `n-${Date.now()}`;
           pushLoadingNote(noteId, 'compacting conversation…');
-          const res = await client.invoke<{ ok?: boolean; error?: string; summarizedCount?: number }>(
-            'conversations:compact',
-            convIdRef.current,
-          );
+          // Mark busy for the DURATION of the (up to 5-minute) compaction so the input
+          // stays disabled — otherwise a prompt is optimistically rendered then rejected
+          // by the compaction lock as `conversation-busy`, and /new or /resume could
+          // switch chats mid-compaction. Restore idle in the finally.
+          setStatus('running');
+          statusRef.current = 'running';
+          let res: { ok?: boolean; error?: string; summarizedCount?: number } | undefined;
+          let compactTransportFailed = false;
+          try {
+            res = await client.invokeWithTimeout<{ ok?: boolean; error?: string; summarizedCount?: number }>(
+              'conversations:compact',
+              300_000,
+              convIdRef.current,
+            );
+          } catch (err) {
+            // An IPC disconnect / socket error / timeout must NOT become an unhandled
+            // rejection (runCommand's promise is discarded → would crash the CLI). Show
+            // it on the loading note and stop.
+            compactTransportFailed = true;
+            resolveNote(noteId, `compact failed: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          } finally {
+            // Input typed WHILE /compact ran was queued (the input handler queues when
+            // status is 'running'). /compact emits no stream terminal event, so without an
+            // explicit drain here the queue would sit until some unrelated future turn's
+            // `done` flushed it — surprising and out of order. Flush one queued message as
+            // its own turn, else go idle. (queueRef/sendMessageRef are stable refs.)
+            // BUT NOT on a transport failure (bridge disconnected → the submit fails and
+            // recursively drains the rest) NOR on `conversation-busy` (another turn/compaction
+            // still owns the conversation → each queued submit would fail busy and
+            // failTurnAndDrain would consume + lose the rest). In both cases keep the queue
+            // intact + go idle; it drains after the owner finishes on the next successful turn.
+            const compactBusy = res?.error === 'conversation-busy';
+            if (!compactTransportFailed && !compactBusy && queueRef.current.length > 0) {
+              const next = queueRef.current.shift() as string;
+              setStatus('running');
+              statusRef.current = 'running';
+              setTimeout(() => sendMessageRef.current(next), 0);
+            } else {
+              setStatus('idle');
+              statusRef.current = 'idle';
+            }
+          }
           if (res?.ok) {
             resolveNote(noteId, `compacted ${res.summarizedCount ?? 0} message(s) into a summary`);
           } else {
@@ -1295,7 +1334,11 @@ export function App({
       if (!trimmed) return;
       if (trimmed.startsWith('/')) {
         const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
-        void runCommand(cmd, rest.join(' '));
+        // Never let a rejected slash-command (e.g. an IPC disconnect/timeout in an
+        // awaited invoke) become an unhandled rejection — that would crash the CLI.
+        void runCommand(cmd, rest.join(' ')).catch((err) => {
+          pushTurn({ kind: 'note', text: `command failed: ${err instanceof Error ? err.message : String(err)}` });
+        });
         return;
       }
       // A turn is in flight — queue this message instead of aborting it. It's

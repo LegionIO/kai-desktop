@@ -9,7 +9,7 @@
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { z } from 'zod';
-import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames } from './mastra-agent.js';
+import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames, buildAgentInstructions } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import { hookDispatcher } from './hooks/dispatcher.js';
 import type { LLMModelConfig, ResolvedStreamConfig } from './model-catalog.js';
@@ -21,6 +21,8 @@ import {
   summarizeLatestUserRequest,
   summarizeThreadContext,
 } from './tool-observer.js';
+import { type MediaFitConfig } from './media-fit.js';
+import { createSubAgentMediaFitter, estimateSubAgentStaticTokens } from './sub-agent-media-fit.js';
 
 export type SubAgentEvent =
   | (StreamEvent & { subAgentConversationId: string; parentConversationId: string; parentToolCallId: string })
@@ -420,6 +422,46 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         });
       }
 
+      // Budget-fit media on sub-agent tool results (parity with the parent turn).
+      // Shared factory: budget = min over eligible models of (window − branch −
+      // committed − static − reserve), mutex-serialized. Sub-agents have no reactive
+      // overflow recovery, so err toward shrinking. The SAME fitter path is used by
+      // the completed-agent RESUME hook (tools/sub-agent.ts).
+      const subMediaConfig = config.compaction?.media as MediaFitConfig | undefined;
+      const SUB_WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE = 3000;
+      const computeSubStatic = (mn: string): number =>
+        estimateSubAgentStaticTokens(
+          // Estimate against the ACTUAL instructions the runtime sends — resolveModeSystemPrompt
+          // (systemPrompts.chat ?? systemPrompt) PLUS the appended runtime-capability text —
+          // not the bare subAgentConfig.systemPrompt, which under-counts and can retain media
+          // that overflows (sub-agents have no reactive recovery).
+          buildAgentInstructions(subAgentConfig),
+          allTools,
+          (schema) => z.toJSONSchema(schema as Parameters<typeof z.toJSONSchema>[0], { target: 'draft-7' }),
+          SUB_WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
+          mn,
+        );
+      const subStaticInputTokens = computeSubStatic(modelConfig.modelName);
+      // Eligible models for budgeting: primary + fallbacks when fallback enabled.
+      const subEligibleModels =
+        streamConfig && streamConfig.fallbackEnabled
+          ? [streamConfig.primaryModel, ...streamConfig.fallbackModels]
+          : [{ modelConfig } as { modelConfig: LLMModelConfig }];
+      const windowOverride = (config.compaction?.conversation as { contextWindowTokens?: number } | undefined)
+        ?.contextWindowTokens;
+      const subMediaFitter = createSubAgentMediaFitter({
+        mediaConfig: subMediaConfig,
+        eligibleModels: subEligibleModels,
+        windowOverride,
+        staticInputTokens: subStaticInputTokens,
+        computeStaticInputTokens: computeSubStatic,
+        messages,
+        getAccumulatedText: () => turnText,
+        signal: abortSignal,
+        conversationId: subAgentConversationId,
+      });
+      const fitSubAgentMedia = subMediaFitter.fit;
+
       const subStreamOpts = {
         abortSignal,
         // Nested sub_agent inheritance: this sub-agent's own profile/model.
@@ -451,6 +493,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         },
         onToolExecutionStart: async (state) => {
           toolCancels.set(state.toolCallId, state.cancel);
+          // Charge RAW args against the media budget BEFORE the PreToolUse await /
+          // any denial early-return (parallel-safe; idempotent per id).
+          subMediaFitter.chargeArgs(state.toolCallId, state.args);
           // PreToolUse BEFORE the observer so a block/modify hook can deny or
           // sanitize args before the observer model sees them.
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
@@ -521,6 +566,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               const target = state.args as Record<string, unknown>;
               for (const k of Object.keys(target)) delete target[k];
               Object.assign(target, nextArgs as Record<string, unknown>);
+              // Re-charge the delta so a hook that ENLARGED the args doesn't leave the
+              // media budget under-counted (recovery is off once a tool has run).
+              subMediaFitter.rechargeArgs(state.toolCallId, target);
             } else {
               // A modify hook returned a non-object replacement we can't apply
               // to the by-reference args — fail CLOSED rather than run the tool
@@ -561,11 +609,14 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           await subObserver?.waitForLinkedLaunchedTools(toolCallId);
           subObserver?.onToolExecutionResult(toolCallId, toolName, result);
           const augmentation = subObserver?.getToolAugmentation(toolCallId);
-          if (!augmentation) return result;
+          // Budget-fit `_modelContent` media LAST — after PostToolUse + observer
+          // augmentation, which can themselves add/replace media (parity with the
+          // parent turn, and so post-hook media is fit rather than sent raw).
+          if (!augmentation) return await fitSubAgentMedia(result, toolCallId, args);
           if (!result || typeof result !== 'object' || Array.isArray(result)) {
-            return { value: result, ...augmentation };
+            return await fitSubAgentMedia({ value: result, ...augmentation }, toolCallId, args);
           }
-          return { ...(result as Record<string, unknown>), ...augmentation };
+          return await fitSubAgentMedia({ ...(result as Record<string, unknown>), ...augmentation }, toolCallId, args);
         },
       } satisfies Parameters<typeof streamAgentResponse>[6];
 
@@ -602,15 +653,17 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           // concatenation. Only the LOCAL accumulation is reset — the event is
           // still enriched, broadcast, and yielded below like any other.
           turnText = '';
-          // Cross-provider fallback: recompute which tools are provider-defined
-          // for the new model, so enforcing-hook wrapping (below) treats the
-          // fallback provider's native tools correctly (else args stick {pending}).
           const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
           const nextEntry = toKey
             ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
               (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
             : undefined;
           if (nextEntry) subProviderToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
+          // streamWithFallback restarts the next model from the original messages —
+          // reset the same-turn media budget so the discarded attempt's committed
+          // args/text/media don't phantom-charge the fallback's budget, and recompute
+          // the static-input estimate under the fallback model's tokenizer.
+          subMediaFitter.reset(nextEntry ?? undefined);
         }
         const enriched = { ...event, subAgentConversationId, parentConversationId, parentToolCallId } as SubAgentEvent;
         // Suppress raw args on tool-call events until PreToolUse resolves; the

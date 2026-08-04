@@ -1,9 +1,19 @@
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { appendConversationMessages, broadcastUpsert } from '../ipc/conversations.js';
-import { readConversation, writeConversation } from '../ipc/conversation-store.js';
+import {
+  appendConversationMessages,
+  broadcastUpsert,
+  ensureConversationTree,
+  getConversationBranch,
+} from '../ipc/conversations.js';
+import { readConversation, writeConversation, nextCompactionRevision } from '../ipc/conversation-store.js';
 import { getAppHome } from '../local-bridge/paths.js';
+import { isStrictPrefix, messageContentSignature } from './compaction.js';
 import type { StreamEvent } from './mastra-agent.js';
+
+// Re-exported from ./compaction (single canonical home, cycle-free for the agent /
+// conversations / stream-persistence trio). See its definition for why it hashes.
+export { messageContentSignature };
 
 // ---------------------------------------------------------------------------
 // Tree-corruption diagnostics (gated by KAI_DEBUG_STREAM).
@@ -192,6 +202,79 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
         }
       }
       acc.sawContent = true;
+      break;
+    }
+    case 'compaction': {
+      // Persist a conversation-compaction record for CLI/headless (server-owned)
+      // turns. The GUI renderer persists this itself from the `compaction` stream
+      // event; without this case a server-owned turn's successful compaction
+      // (e.g. from reactive overflow recovery) is lost, so the next turn reloads
+      // the original branch and re-overflows / re-summarizes. Written immediately
+      // (not batched to `done`) since the turn may not reach `done`.
+      const data = event.data as
+        | {
+            compactionId?: string;
+            summaryText?: string;
+            compactedMessageIds?: string[];
+            coveredContentSig?: Record<string, string>;
+          }
+        | undefined;
+      if (
+        data?.compactionId &&
+        typeof data.summaryText === 'string' &&
+        Array.isArray(data.compactedMessageIds) &&
+        data.compactedMessageIds.length > 0
+      ) {
+        try {
+          const conv = readConversation(appHome, conversationId);
+          if (conv) {
+            // Validate against the FRESH disk branch before stamping: a concurrent
+            // conversations:put (or a mid-turn edit) may have changed the tree while the
+            // (awaited) summarizer ran. Only persist a record whose covered ids are still
+            // an ordered prefix of the current branch — else next turn's reuse would
+            // reject it anyway, and a diverged branch could reuse a stale summary. (Same
+            // strict-prefix gate the GUI conversations:put + agent.ts recovery apply.)
+            const { tree, headId: freshHead } = ensureConversationTree(conv);
+            const branch = getConversationBranch(tree, freshHead);
+            const branchIds = branch.map((m) => m.id);
+            if (!isStrictPrefix(data.compactedMessageIds, branchIds)) {
+              break; // stale/diverged — skip persisting (reuse fail-safes on mismatch)
+            }
+            // Beyond id-prefix: if the emitter signed the covered ids' CONTENT, verify
+            // that content is unchanged on disk. A concurrent same-id edit (e.g. a
+            // mid-turn rewrite that keeps ids but changes a tool payload) would leave
+            // the id-prefix intact yet make the summary describe stale content.
+            if (data.coveredContentSig) {
+              const byId = new Map(branch.map((m) => [m.id, m]));
+              const drifted = data.compactedMessageIds.some((id) => {
+                const expected = data.coveredContentSig?.[id];
+                if (expected === undefined) return false; // not signed → nothing to check
+                return messageContentSignature(byId.get(id)) !== expected;
+              });
+              if (drifted) break; // covered content changed under us — skip persisting
+            }
+            const headId = conv.headId ?? null;
+            conv.conversationCompaction = {
+              compactionId: data.compactionId,
+              summaryText: data.summaryText,
+              compactedMessageIds: data.compactedMessageIds,
+              boundaryHeadId: headId,
+              createdAt: new Date().toISOString(),
+              // Persist the covered-id baseline signatures so a LATER same-turn recovery
+              // that expands this record's synthetic summary can re-verify the underlying
+              // ids against fresh disk before persisting over them.
+              ...(data.coveredContentSig ? { coveredContentSig: data.coveredContentSig } : {}),
+              // Main-authoritative monotonic freshness (see nextCompactionRevision) so a
+              // clock-skewed client's createdAt can't cause a newer summary to be dropped.
+              compactionRevision: nextCompactionRevision(),
+            } as typeof conv.conversationCompaction;
+            conv.updatedAt = new Date().toISOString();
+            writeConversation(appHome, conv);
+          }
+        } catch {
+          // best-effort — reuse fail-safes on any mismatch
+        }
+      }
       break;
     }
     case 'enrichment': {

@@ -5,6 +5,7 @@ import {
   splitPreservedFields,
   shouldCompact,
   shouldCompactAsync,
+  shouldCompactBranchMediaAware,
   type ChatMessage,
 } from '../compaction';
 import {
@@ -101,6 +102,22 @@ describe('shouldCompact (cheap pre-check gate + exact count)', () => {
     ];
     const res = shouldCompact(msgs, MODEL, 0.85);
     expect(res.shouldCompact).toBe(false);
+  });
+
+  it('adds extraMediaTokens to the used-token total and the cheap gate', () => {
+    // A tiny text branch stays under trigger; a big extraMediaTokens value (the
+    // native estimate for a retained image, counted here instead of as raw base64
+    // text) pushes the reported total over the trigger. Floors negatives to 0.
+    const msgs: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+    const trigger = 0.85;
+    const triggerTokens = Math.floor(window * trigger);
+    const under = shouldCompact(msgs, MODEL, trigger, undefined, 0);
+    expect(under.shouldCompact).toBe(false);
+    const over = shouldCompact(msgs, MODEL, trigger, undefined, triggerTokens + 10);
+    expect(over.shouldCompact).toBe(true);
+    expect(over.usedTokens).toBeGreaterThanOrEqual(triggerTokens);
+    const floored = shouldCompact(msgs, MODEL, trigger, undefined, -5000);
+    expect(floored.usedTokens).toBe(under.usedTokens);
   });
 
   it('trusts cached counts for models on the o200k base — gpt-5, gpt-4o, gpt-4.1, o3, o4-mini', () => {
@@ -375,5 +392,32 @@ describe('shouldCompactAsync (off-thread gate)', () => {
     const sync = shouldCompact(msgs, 'claude-3-5-sonnet', 0.85);
     const asyncRes = await shouldCompactAsync(msgs, 'claude-3-5-sonnet', 0.85);
     expect(asyncRes).toEqual(sync);
+  });
+});
+
+describe('shouldCompactBranchMediaAware (media-stripped gate)', () => {
+  const MODEL = 'gpt-4o';
+
+  it('counts a large _modelContent image far LESS than the raw-base64 gate', async () => {
+    // The media-aware gate strips the base64 to its native estimate; the raw gate
+    // counts the whole base64 as text. The stripped count must be strictly lower —
+    // that lower count is what keeps a short chat + screenshot under the trigger.
+    const bigImage = 'A'.repeat(400_000);
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'summarize this screenshot' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolName: 't',
+            result: { _modelContent: [{ type: 'image', data: bigImage, mediaType: 'image/png' }] },
+          },
+        ],
+      } as unknown as ChatMessage,
+    ];
+    const stripped = await shouldCompactBranchMediaAware(msgs, MODEL, 0.85);
+    const raw = await shouldCompactAsync(msgs, MODEL, 0.85);
+    expect(stripped.usedTokens).toBeLessThan(raw.usedTokens);
   });
 });

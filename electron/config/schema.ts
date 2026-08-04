@@ -148,6 +148,37 @@ const conversationCompactionSchema = z.object({
   contextWindowTokens: z.number().positive().optional(),
 });
 
+/**
+ * How incoming tool-result MEDIA (native `_modelContent` image/file parts) is
+ * handled when it would push the turn over the model's remaining context budget.
+ *
+ * Unlike text tool results (which the tool/conversation compaction paths can
+ * head/tail-truncate or AI-summarize), a base64 image can't be sliced — so when
+ * it doesn't fit we either RE-ENCODE it smaller (`downscale`) or DROP it with a
+ * note (`drop`). `downscale` shrinks toward `minDimension`/`minQuality`; if even
+ * that floor doesn't fit, it fails safe like `drop` — the part is replaced with a
+ * text note to the model and a UI warning suggesting `/compact`.
+ *
+ * `.optional()` with a default so existing configs (written before this section
+ * existed) keep working and pick up the default behavior.
+ */
+const mediaCompactionSchema = z.object({
+  enabled: z.boolean().default(true),
+  strategy: z.enum(['downscale', 'drop']).default('downscale'),
+  /** Smallest longest-edge (px) `downscale` will shrink an image to before it
+   *  gives up and fails safe (drop-with-note). Below this the image is too small
+   *  to be useful anyway. Integer — sharp's resize rejects fractional dimensions. */
+  minDimension: z.number().int().positive().default(256),
+  /** Lowest JPEG/WebP quality (1-100) `downscale` will re-encode at before
+   *  failing safe. Integer — sharp's jpeg quality rejects fractional values. */
+  minQuality: z.number().int().min(1).max(100).default(40),
+  /** Tokens to hold back from the model's context window when computing the
+   *  remaining budget for an incoming media part — leaves headroom for the
+   *  model's own reply + framing so a part that "just fits" doesn't tip the
+   *  next request over. */
+  reserveTokens: z.number().nonnegative().default(4000),
+});
+
 const shellGuardrailsSchema = z.object({
   enabled: z.boolean(),
   timeout: z.number().positive(),
@@ -923,6 +954,13 @@ export const appConfigSchema = z.object({
   compaction: z.object({
     tool: toolCompactionSchema,
     conversation: conversationCompactionSchema,
+    media: mediaCompactionSchema.default({
+      enabled: true,
+      strategy: 'downscale',
+      minDimension: 256,
+      minQuality: 40,
+      reserveTokens: 4000,
+    }),
   }),
   tools: z.object({
     shell: shellGuardrailsSchema,

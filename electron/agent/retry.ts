@@ -17,6 +17,7 @@ export type RetryableErrorInfo = {
     | 'network'
     | 'auth'
     | 'quota'
+    | 'context-overflow'
     | 'client-error'
     | 'unknown';
   message: string;
@@ -75,6 +76,87 @@ export function classifyError(error: unknown): RetryableErrorInfo {
   // gate SAME-MODEL retries on isSameModelRetryable() (which excludes quota).
   if (statusCode === 402) {
     return { statusCode, retryAfterMs, isTransient: true, category: 'quota', message };
+  }
+
+  // Context-window overflow — the request's input exceeds the model's context
+  // length. Providers surface this as a 400 (sometimes 413) with a recognizable
+  // message. Checked BEFORE the generic 4xx branch so it gets its own category
+  // rather than an opaque `client-error`. NOT transient (a same-model retry with
+  // the SAME input can't succeed), but the caller can recover by COMPACTING /
+  // shrinking the history and retrying — see isContextOverflowError.
+  const overflowLower = message.toLowerCase();
+  // Exclude THROTTLING / rate-limit phrasings that also mention "tokens" (e.g.
+  // AWS `ThrottlingException: too many tokens`, "token rate exceeded", "tokens
+  // per minute"). Those are transient rate limits handled by the rate-limit
+  // classifier below — misfiling them as overflow would trigger a pointless
+  // compaction instead of a retry/fallback.
+  const looksLikeThrottle =
+    overflowLower.includes('throttl') ||
+    overflowLower.includes('rate exceeded') ||
+    overflowLower.includes('rate limit') ||
+    overflowLower.includes('per minute') ||
+    overflowLower.includes('per-minute') ||
+    overflowLower.includes('too many requests') ||
+    overflowLower.includes('tpm');
+  // Exclude OUTPUT-token and QUOTA errors that also say "tokens exceeded": compacting
+  // the INPUT context doesn't fix an output cap or an account/billing quota, and
+  // recommending `/compact` would mislead. BUT some providers phrase a genuine INPUT
+  // overflow as "prompt tokens + max_tokens exceed the context length" — so only
+  // treat max_tokens/output phrasing as output-limited when NO input/context
+  // phrasing is present. Quota/billing terms are always non-overflow.
+  const mentionsContext =
+    overflowLower.includes('context length') ||
+    overflowLower.includes('context window') ||
+    overflowLower.includes('maximum context') ||
+    overflowLower.includes('prompt is too long') ||
+    overflowLower.includes('input is too long') ||
+    overflowLower.includes('reduce the length');
+  const looksLikeOutputOrQuota =
+    overflowLower.includes('quota') ||
+    overflowLower.includes('billing') ||
+    overflowLower.includes('credit') ||
+    (!mentionsContext &&
+      (overflowLower.includes('output token') ||
+        overflowLower.includes('max_tokens') ||
+        overflowLower.includes('max tokens') ||
+        // Generation-cap phrasing from custom/OSS endpoints (vLLM/TGI/etc.) —
+        // `max_new_tokens`/`max_output_tokens`/`max_completion_tokens` bound OUTPUT,
+        // so compacting the INPUT can't fix them (and would re-fail on the same cap).
+        overflowLower.includes('max_new_tokens') ||
+        overflowLower.includes('max new tokens') ||
+        overflowLower.includes('max_output_tokens') ||
+        overflowLower.includes('max_completion_tokens') ||
+        overflowLower.includes('generation token') ||
+        overflowLower.includes('completion token')));
+  const looksLikeOverflow =
+    !looksLikeThrottle &&
+    !looksLikeOutputOrQuota &&
+    (overflowLower.includes('context length') ||
+      overflowLower.includes('context window') ||
+      overflowLower.includes('maximum context') ||
+      overflowLower.includes('prompt is too long') ||
+      overflowLower.includes('too many tokens') ||
+      overflowLower.includes('too many total tokens') ||
+      overflowLower.includes('reduce the length') ||
+      overflowLower.includes('input is too long') ||
+      (overflowLower.includes('token') && overflowLower.includes('exceed')));
+  // A canonical HTTP 413 body ("payload too large" / "request entity too large")
+  // WITHOUT any token/context evidence is AMBIGUOUS — it may be a gateway HTTP
+  // body-size limit (e.g. nginx client_max_body_size) hit by a single large
+  // attachment, which COMPACTION CANNOT FIX. Only treat such a 413-phrasing as
+  // overflow when the message ALSO carries token/context evidence; otherwise it
+  // falls through to a generic client-error (no paid summary, no /compact guidance).
+  // Overflow status codes across providers: OpenAI/Anthropic use 400, some
+  // endpoints/proxies use 413 (Payload Too Large), and OpenAI-COMPATIBLE servers
+  // (vLLM, LM Studio, etc.) commonly return 422 (Unprocessable Entity) for "prompt
+  // is too long". A statusless overflow (message-only) also counts. A 413 is treated
+  // as overflow ONLY when its body carries overflow/payload phrasing — a BARE 413
+  // (no recognizable text) may be a gateway HTTP body-size limit hit by a single
+  // large attachment, which compaction can't fix; misrouting that to a paid
+  // summary + `/compact` guidance is worse than a plain client-error. The throttle
+  // guard above still excludes rate-limit phrasing.
+  if (looksLikeOverflow && (statusCode === undefined || statusCode === 400 || statusCode === 413 || statusCode === 422)) {
+    return { statusCode, retryAfterMs, isTransient: false, category: 'context-overflow', message };
   }
 
   // Client errors (4xx except the retryable 402/408/429 handled above) — not transient
@@ -165,6 +247,17 @@ export function classifyError(error: unknown): RetryableErrorInfo {
  */
 export function isSameModelRetryable(info: RetryableErrorInfo): boolean {
   return info.isTransient && info.category !== 'quota';
+}
+
+/**
+ * Whether an error is a context-window overflow — the request's input exceeded
+ * the model's context length. Not retryable as-is (same input, same result), but
+ * RECOVERABLE by compacting/shrinking the history first. The stream loop uses
+ * this to attempt one compact-and-retry before surfacing a `/compact` hint,
+ * instead of hard-failing the turn like any other non-transient client error.
+ */
+export function isContextOverflowError(error: unknown): boolean {
+  return classifyError(error).category === 'context-overflow';
 }
 
 /** Calculate delay for a given attempt using exponential backoff with jitter. */

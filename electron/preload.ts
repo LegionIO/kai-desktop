@@ -147,6 +147,20 @@ const appAPI = {
       ipcRenderer.invoke('conversations:regenerate', conversationId, assistantMessageId),
     switchVariant: (conversationId: string, variantId: string) =>
       ipcRenderer.invoke('conversations:switch-variant', conversationId, variantId),
+    compact: (conversationId: string) =>
+      ipcRenderer.invoke('conversations:compact', conversationId) as Promise<{
+        ok: boolean;
+        summarizedCount?: number;
+        error?: string;
+      }>,
+    // Cross-client /compact busy sync: current compacting set + change subscription.
+    compactingIds: () => ipcRenderer.invoke('conversations:compacting-ids') as Promise<string[]>,
+    onCompactingChanged: (callback: (payload: { conversationId: string; compacting: boolean }) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: { conversationId: string; compacting: boolean }) =>
+        callback(payload);
+      ipcRenderer.on('conversations:compacting', handler);
+      return () => ipcRenderer.removeListener('conversations:compacting', handler);
+    },
   },
 
   alerts: {

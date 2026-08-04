@@ -76,6 +76,13 @@ function getDefaultConfig() {
         outputMaxTokens: 1200,
         promptReserveTokens: 1500,
       },
+      media: {
+        enabled: true,
+        strategy: 'downscale' as const,
+        minDimension: 256,
+        minQuality: 40,
+        reserveTokens: 4000,
+      },
     },
     tools: {
       shell: {

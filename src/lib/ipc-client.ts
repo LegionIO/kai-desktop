@@ -141,6 +141,11 @@ type AppAPI = {
       conversationId: string,
       variantId: string,
     ) => Promise<{ ok: boolean; conversation?: unknown; error?: string }>;
+    compact: (conversationId: string) => Promise<{ ok: boolean; summarizedCount?: number; error?: string }>;
+    compactingIds: () => Promise<string[]>;
+    onCompactingChanged: (
+      callback: (payload: { conversationId: string; compacting: boolean }) => void,
+    ) => () => void;
   };
   alerts: {
     list: (openOnly?: boolean) => Promise<AlertIndexEntry[]>;

@@ -66,6 +66,23 @@ describe('comparePackages — full update required (NOT OTA) when ABI changes', 
     expect(comparePackages(cur, prev).otaEligible).toBe(false);
   });
 
+  it('a native dep moving devDependencies → dependencies (now shipped) → not eligible', () => {
+    // sharp at the SAME version, but previously dev-only (not shipped) and now a
+    // production dependency: OTA carries only out/ and can't install the binary.
+    const prev = pkg({
+      version: '1.1.0',
+      devDependencies: { electron: '32.0.0', esbuild: '0.23.0', sharp: '0.34.5' },
+    });
+    const cur = pkg({
+      version: '1.2.0',
+      devDependencies: { electron: '32.0.0', esbuild: '0.23.0' },
+      dependencies: { ...(pkg().dependencies as Pkg), sharp: '0.34.5' },
+    });
+    const r = comparePackages(cur, prev);
+    expect(r.otaEligible).toBe(false);
+    expect(r.reasons.some((x) => /sharp became a production dependency/.test(x))).toBe(true);
+  });
+
   it('Node engines change → not eligible', () => {
     const prev = pkg({ version: '1.1.0' });
     const cur = pkg({ version: '1.2.0', engines: { node: '>=24' } });

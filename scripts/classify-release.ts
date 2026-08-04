@@ -29,7 +29,7 @@ const root = resolve(__dirname, '..');
 const distDir = resolve(root, 'dist');
 
 // Native dependencies that require full updates when changed
-const NATIVE_DEPS = ['better-sqlite3', 'tiktoken', '@lydell/node-pty', 'libsql', '@libsql/client', 'esbuild'];
+const NATIVE_DEPS = ['better-sqlite3', 'tiktoken', '@lydell/node-pty', 'libsql', '@libsql/client', 'esbuild', 'sharp'];
 
 // Parse command line args
 const args = process.argv.slice(2);
@@ -126,6 +126,15 @@ export function comparePackages(currentPkg: Record<string, unknown>, prevPkg: Re
     const prevVer = prevDeps[dep];
     if (currentVer !== prevVer) {
       reasons.push(`Native dep ${dep} changed: ${prevVer ?? '(none)'} → ${currentVer ?? '(none)'}`);
+    }
+    // A native dep MOVING from devDependencies → dependencies (or newly added to
+    // dependencies) means its binary is now SHIPPED in the packaged app. An OTA
+    // archive carries only `out/`, so it can't add the package to an installed
+    // shell — force a full update even when the merged version is unchanged.
+    const currentIsProd = Boolean((currentPkg.dependencies as Record<string, string>)?.[dep]);
+    const prevIsProd = Boolean((prevPkg.dependencies as Record<string, string>)?.[dep]);
+    if (currentIsProd && !prevIsProd) {
+      reasons.push(`Native dep ${dep} became a production dependency (now shipped) — OTA cannot install it`);
     }
   }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyError, calculateDelay, isSameModelRetryable } from '../retry';
+import { classifyError, calculateDelay, isSameModelRetryable, isContextOverflowError } from '../retry';
 
 describe('classifyError', () => {
   it('treats 408 as transient (retryable) despite being a 4xx', () => {
@@ -16,6 +16,99 @@ describe('classifyError', () => {
     expect(classifyError({ status: 400 }).isTransient).toBe(false);
     expect(classifyError({ status: 404 }).isTransient).toBe(false);
     expect(classifyError({ status: 422 }).isTransient).toBe(false);
+  });
+
+  it('classifies context-overflow errors distinctly (400/413 or statusless message)', () => {
+    for (const msg of [
+      "This model's maximum context length is 200000 tokens",
+      'prompt is too long: 210000 tokens > 200000 maximum',
+      'input is too long for requested model',
+      'too many tokens in the request',
+      'Please reduce the length of the messages',
+      'context window exceeded',
+    ]) {
+      const info = classifyError({ status: 400, message: msg });
+      expect(info.category, msg).toBe('context-overflow');
+      expect(info.isTransient, msg).toBe(false);
+      expect(isContextOverflowError({ status: 400, message: msg }), msg).toBe(true);
+    }
+    // Statusless (mid-stream error string) still classifies.
+    expect(classifyError(new Error('maximum context length exceeded')).category).toBe('context-overflow');
+    // 413 payload-too-large with an overflow message.
+    expect(classifyError({ status: 413, message: 'prompt is too long' }).category).toBe('context-overflow');
+    // 422 Unprocessable Entity — OpenAI-compatible servers (vLLM/LM Studio) use it
+    // for "prompt is too long"; must route to overflow recovery, not client-error.
+    expect(classifyError({ status: 422, message: 'prompt is too long' }).category).toBe('context-overflow');
+    expect(isContextOverflowError({ status: 422, message: 'prompt is too long' })).toBe(true);
+  });
+
+  it('a bare 422 with no overflow phrasing stays a client-error (not misrouted to overflow)', () => {
+    expect(classifyError({ status: 422, message: 'validation failed: field required' }).category).toBe(
+      'client-error',
+    );
+    expect(isContextOverflowError({ status: 422 })).toBe(false);
+  });
+
+  it('classifies 413 payload phrasing as overflow ONLY with token/context evidence', () => {
+    // A canonical 413 body WITHOUT token/context evidence is ambiguous (may be a
+    // gateway body-size limit compaction can't fix) → client-error, not overflow.
+    expect(classifyError({ status: 413, message: 'Payload Too Large' }).category).toBe('client-error');
+    expect(classifyError({ status: 413, message: 'Request Entity Too Large' }).category).toBe('client-error');
+    expect(classifyError(new Error('payload too large')).category).not.toBe('context-overflow');
+    // WITH token/context evidence → overflow (compaction can help).
+    expect(
+      classifyError({ status: 413, message: 'Payload Too Large: prompt is too long' }).category,
+    ).toBe('context-overflow');
+    // A BARE 413 (no phrasing at all) → client-error.
+    expect(classifyError({ status: 413 }).category).toBe('client-error');
+    expect(isContextOverflowError({ status: 413 })).toBe(false);
+  });
+
+  it('does not misclassify a plain 400 (no overflow keywords) as context-overflow', () => {
+    expect(classifyError({ status: 400, message: 'invalid request' }).category).toBe('client-error');
+    expect(isContextOverflowError({ status: 400, message: 'invalid request' })).toBe(false);
+  });
+
+  it('does not treat a rate-limit "too many requests" as context-overflow', () => {
+    expect(classifyError({ status: 429, message: 'too many requests' }).category).toBe('rate-limit');
+  });
+
+  it('does NOT classify OUTPUT-token or QUOTA errors as context-overflow', () => {
+    // Compacting the INPUT context can't fix an output cap or an account quota, so
+    // these must NOT trigger paid compaction / `/compact` guidance.
+    for (const msg of [
+      'output token limit exceeded',
+      'max_tokens exceeded',
+      'completion tokens exceeded the maximum',
+      'token quota exceeded for this month',
+      'billing quota exceeded',
+      // Generation-cap phrasing from custom/OSS endpoints (vLLM/TGI) — bounds OUTPUT,
+      // so compacting the INPUT can't fix it and would re-fail on the same cap.
+      'max_new_tokens must not exceed 4096',
+      'max_output_tokens is greater than the allowed maximum',
+      'max_completion_tokens exceeds the limit',
+    ]) {
+      expect(classifyError({ status: 400, message: msg }).category, msg).not.toBe('context-overflow');
+      expect(isContextOverflowError({ status: 400, message: msg }), msg).toBe(false);
+    }
+  });
+
+  it('DOES classify an input overflow that also mentions max_tokens (context phrasing present)', () => {
+    // Some providers phrase a genuine INPUT overflow as "prompt tokens + max_tokens
+    // exceed the context length" — the max_tokens exclusion must NOT swallow it.
+    const msg = 'prompt tokens + max_tokens exceed the context length of this model';
+    expect(classifyError({ status: 400, message: msg }).category).toBe('context-overflow');
+    expect(isContextOverflowError({ status: 400, message: msg })).toBe(true);
+  });
+
+  it('classifies token-throttling errors as rate-limit, NOT context-overflow', () => {
+    // AWS-style throttle exception with "tokens" → rate-limit (transient), not overflow.
+    expect(classifyError(new Error('ThrottlingException: too many tokens')).category).toBe('rate-limit');
+    expect(isContextOverflowError(new Error('ThrottlingException: too many tokens'))).toBe(false);
+    // Other throttle phrasings mentioning tokens must at least NOT be misfiled as
+    // context-overflow (which would trigger a pointless compaction).
+    expect(isContextOverflowError(new Error('token rate exceeded, retry later'))).toBe(false);
+    expect(isContextOverflowError(new Error('tokens per minute limit exceeded'))).toBe(false);
   });
 
   it('treats 402 as transient (quota/billing) despite being a 4xx', () => {

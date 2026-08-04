@@ -91,6 +91,10 @@ export default defineConfig({
           // Native addons that can't be bundled
           'better-sqlite3',
           'tiktoken',
+          // sharp ships a prebuilt native addon (libvips); bundling its JS entry
+          // breaks the relative path it uses to locate the platform binary. Keep
+          // external so it loads from node_modules like the other native addons.
+          'sharp',
           '@lydell/node-pty',
           // libsql uses platform-specific native binaries
           'libsql',

@@ -201,6 +201,12 @@ type ConversationCompaction = {
   compactedMessageIds: string[];
   boundaryHeadId: string | null;
   createdAt: string;
+  // Opaque per-covered-id baseline signatures (forwarded verbatim from the stream event
+  // and persisted) so a later same-turn recovery can verify an expanded synthetic summary.
+  coveredContentSig?: Record<string, string>;
+  // Main-issued freshness revision (forwarded from the stream event) — the put freshness
+  // compare uses this so a stale reconnected client's older record can't overwrite a newer.
+  compactionRevision?: number;
 } | null;
 
 function nowIso(): string {
@@ -717,6 +723,14 @@ const forceNewAssistant = new Set<string>();
 /** Per-conversation persist version counter — incremented before each persist, checked before writing.
  *  Prevents stale async persists from overwriting newer data. */
 const persistVersions = new Map<string, number>();
+
+// Per-conversation handoff for a paid compaction record that a persist is TRYING to write
+// but hasn't confirmed on disk yet. A terminal (done/error) persist carrying a compaction
+// is fire-and-forget; if a new turn's persist supersedes it (version bump) before it lands,
+// the record would be lost AND the new accumulator can't inherit it (the old one was
+// deleted). Recording it here — cleared only when a persist returns persisted:true for the
+// same compactionId — lets onNew / continuations recover it and durably re-persist.
+const pendingCompactionHandoff = new Map<string, ConversationCompaction>();
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
   return { startedAt };
@@ -1357,20 +1371,26 @@ async function persistConversation(
   // turns) so a LEGITIMATE second root — e.g. editing the first user message
   // creates an intentional sibling branch with parentId:null — is never rewritten.
   seedContext?: { seededBackground?: boolean; seededDiskHeadId?: string | null },
-): Promise<void> {
+): Promise<{ rejected?: string; superseded?: boolean; persisted?: boolean }> {
   // Bump version BEFORE the async boundary to claim this persist operation.
   // This prevents stale debounced persists from overwriting newer data
   // (e.g. done handler's runStatus:'idle' overwritten by a late schedulePersist's 'running').
   const currentVersion = (persistVersions.get(conversationId) ?? 0) + 1;
   persistVersions.set(conversationId, currentVersion);
+  // Register any carried compaction in the handoff map BEFORE the first await — else a
+  // terminal persist that gets superseded during its `conversations.get()` would early-
+  // return (superseded) BEFORE registering, and a racing resubmit would find no handoff
+  // and drop the paid summary. Cleared below only on a confirmed persisted:true.
+  const carriedCompaction = (updates as { conversationCompaction?: ConversationCompaction }).conversationCompaction;
+  if (carriedCompaction?.compactionId) pendingCompactionHandoff.set(conversationId, carriedCompaction);
 
   try {
     const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
-    if (!conv) return;
+    if (!conv) return { superseded: true };
 
     // After the async get(), check if a newer persist started while we were waiting
     const latestVersion = persistVersions.get(conversationId) ?? 0;
-    if (currentVersion < latestVersion) return;
+    if (currentVersion < latestVersion) return { superseded: true };
 
     // INVARIANT (mid-turn-inject orphan-root fix): never persist an active branch
     // whose base is a DETACHED root produced by a background-seeded accumulator.
@@ -1395,7 +1415,7 @@ async function persistConversation(
     const branch = getActiveBranch(safeTree, headId);
     const now = nowIso();
 
-    await app.conversations.put({
+    const res = await app.conversations.put({
       ...conv,
       messages: branch, // linear view for backward compat
       messageTree: safeTree,
@@ -1407,8 +1427,25 @@ async function persistConversation(
       userMessageCount: branch.filter((m) => m.role === 'user').length,
       ...updates,
     });
+    // Main rejects a turn-starting put while the conversation is being /compact-ed
+    // (returns { rejected: 'conversation-busy' } and persists nothing new). Surface it so
+    // the caller can roll back the optimistic turn instead of launching a stream that
+    // would also be rejected.
+    if (res && typeof res === 'object' && (res as { rejected?: unknown }).rejected) {
+      return { rejected: String((res as { rejected?: unknown }).rejected) };
+    }
+    // The write landed. If it carried the handed-off compaction, clear the handoff (it's
+    // now durably on disk — and the main-side put-preservation keeps it against staler
+    // writes). Only clear when it's still the SAME record we recorded (a newer one may
+    // have replaced it meanwhile).
+    if (carriedCompaction?.compactionId) {
+      const held = pendingCompactionHandoff.get(conversationId);
+      if (held?.compactionId === carriedCompaction.compactionId) pendingCompactionHandoff.delete(conversationId);
+    }
+    return { persisted: true };
   } catch (err) {
     console.error('[Runtime] Failed to persist:', err);
+    return {};
   }
 }
 
@@ -1677,7 +1714,7 @@ export function RuntimeProvider({
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
   onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
-  const { consumeAttachments } = useAttachments();
+  const { consumeAttachments, addAttachments } = useAttachments();
 
   // --- Audio adapters (TTS & Voice Recording) ---
   const { config } = useConfig();
@@ -2087,6 +2124,67 @@ export function RuntimeProvider({
     await patchConversation(convId, { currentWorkingDirectory: trimmed });
   }, []);
 
+  // Holds the current stream-event handler so a synthetic event (e.g. a `{busy:true}`
+  // /compact rejection returned by agent.stream, which arrives as a promise value rather
+  // than a stream event — notably on the web bridge, which has no per-client sender to
+  // push error/done) can be fed through the SAME processing path as a real event.
+  const streamEventHandlerRef = useRef<((event: unknown) => void) | null>(null);
+  // Holds the assistant-ui runtime (created below) so an onNew rejection rollback can
+  // restore the composer draft text the composer already cleared on submit.
+  const runtimeRef = useRef<{
+    thread?: { composer?: { setText?: (t: string) => void; getState?: () => { text?: string } } };
+  } | null>(null);
+  // Restore a rolled-back draft into the composer ONLY if the user hasn't already typed a
+  // NEW one during the awaited persist — clobbering newer text would lose their input.
+  const restoreComposerDraft = (text: string): void => {
+    if (!text) return;
+    try {
+      const composer = runtimeRef.current?.thread?.composer;
+      const current = composer?.getState?.().text ?? '';
+      if (current.trim().length === 0) composer?.setText?.(text);
+    } catch {
+      /* composer unavailable — best-effort */
+    }
+  };
+
+  // Launch an agent stream and, if the call resolves `{busy:true}` (the conversation is
+  // being /compact-ed), synthesize the busy error+done locally so the turn settles
+  // instead of leaving the accumulator + runStatus stuck running forever. On the Electron
+  // path main already sends these via event.sender, so the synthetic pair is idempotent
+  // (the accumulator's terminal handling dedups); on the web bridge this is the ONLY
+  // signal the client gets. Takes the exact agent.stream arg list (conversationId first).
+  const launchAgentStream = useCallback((...args: Parameters<NonNullable<typeof window.app>['agent']['stream']>) => {
+    const conversationId = args[0];
+    Promise.resolve(app.agent.stream(...args))
+      .then((res) => {
+        // Busy = the conversation is being /compact-ed. Synthesize the terminal events
+        // ONLY when main did NOT already deliver them via a per-client sender
+        // (delivered=false ⇒ web bridge). On Electron (delivered=true) main already sent
+        // them, so synthesizing again would be redundant.
+        if (
+          res &&
+          typeof res === 'object' &&
+          (res as { busy?: unknown }).busy === true &&
+          (res as { delivered?: unknown }).delivered !== true
+        ) {
+          const h = streamEventHandlerRef.current;
+          if (h) {
+            // ONE terminal event only. The error handler is fully terminal; a trailing
+            // `done` would recreate the accumulator from the pre-error tree and supersede
+            // the error persist (user message left with no visible error).
+            h({
+              conversationId,
+              type: 'error',
+              error: 'Compacting the conversation — wait for it to finish, then retry.',
+            });
+          }
+        }
+      })
+      .catch(() => {
+        /* transport errors surface via the stream-event channel / existing handling */
+      });
+  }, []);
+
   // Stable ref for values the stream handler needs without re-subscribing
   const streamHandlerRef = useRef({
     tree,
@@ -2125,7 +2223,7 @@ export function RuntimeProvider({
 
   // Stream event listener — subscribes ONCE, reads mutable values via refs/globals
   useEffect(() => {
-    const unsubscribe = app.agent.onStreamEvent((event: unknown) => {
+    const handleStreamEvent = (event: unknown) => {
       const e = event as {
         conversationId: string;
         type: string;
@@ -2768,7 +2866,13 @@ export function RuntimeProvider({
         // stash the record and fold it into the terminal persist — a mid-turn
         // write would race the done path.
         const cd = e.data as
-          | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[] }
+          | {
+              compactionId?: string;
+              summaryText?: string;
+              compactedMessageIds?: string[];
+              coveredContentSig?: Record<string, string>;
+              compactionRevision?: number;
+            }
           | undefined;
         if (
           cd &&
@@ -2786,6 +2890,12 @@ export function RuntimeProvider({
             compactedMessageIds: cd.compactedMessageIds,
             boundaryHeadId: acc.headId,
             createdAt: nowIso(),
+            // Forward the baseline signatures so the persisted record can back a later
+            // same-turn recovery's expansion check (opaque pass-through).
+            ...(cd.coveredContentSig ? { coveredContentSig: cd.coveredContentSig } : {}),
+            // Forward the main-issued freshness revision so the put compare is always
+            // revision-vs-revision (a stale reconnected client carries the OLD revision).
+            ...(typeof cd.compactionRevision === 'number' ? { compactionRevision: cd.compactionRevision } : {}),
           };
         }
       } else if (e.type === 'context-usage') {
@@ -2886,12 +2996,23 @@ export function RuntimeProvider({
           }
           const branch = getActiveBranch(acc.messages, acc.headId);
           const responseMessageId = msgId();
-          persistConversation(convId, acc.messages, acc.headId, { runStatus: 'running' }, seedContextFor(acc));
+          // If a compaction succeeded earlier in THIS turn, its record is in
+          // acc.pendingCompaction. Persist it with the running state AND carry it onto the
+          // continuation accumulator — else the auto-continue reloads the raw branch and
+          // re-summarizes (rebills) the same prefix.
+          const continuationPersist = persistConversation(
+            convId,
+            acc.messages,
+            acc.headId,
+            { runStatus: 'running', ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}) },
+            seedContextFor(acc),
+          );
           streamAccumulators.set(convId, {
             messages: [...acc.messages],
             headId: acc.headId,
             pendingAssistantTiming: createPendingAssistantTiming(),
             pendingAssistantId: responseMessageId,
+            pendingCompaction: acc.pendingCompaction,
             // Carry background-seed provenance forward: the continuation's messages
             // still contain the (as-yet-unrepaired) branch, so its own persists must
             // keep reconnecting the active-branch base until the disk prefix lands.
@@ -2903,18 +3024,116 @@ export function RuntimeProvider({
             setHeadId(acc.headId);
           }
           const cfg = streamHandlerRef.current;
-          app.agent.stream(
-            convId,
-            branch,
-            cfg.selectedModelKey ?? undefined,
-            cfg.reasoningEffort ?? 'medium',
-            cfg.selectedProfileKey ?? undefined,
-            cfg.fallbackEnabled ?? false,
-            currentWorkingDirectoryRef.current ?? undefined,
-            cfg.executionMode ?? 'auto',
-            cfg.threadOverrides ?? undefined,
-            responseMessageId,
-          );
+          // Await the compaction-bearing persist BEFORE launching the continuation: the
+          // continuation's pre-stream reuse gate (main) reads the stored compaction record
+          // from disk, so if we launch first it can read BEFORE the record lands and
+          // re-summarize + re-bill the same prefix. (Fire-and-forget only when there's no
+          // pending compaction to protect.)
+          const launchContinuation = () =>
+            launchAgentStream(
+              convId,
+              branch,
+              cfg.selectedModelKey ?? undefined,
+              cfg.reasoningEffort ?? 'medium',
+              cfg.selectedProfileKey ?? undefined,
+              cfg.fallbackEnabled ?? false,
+              currentWorkingDirectoryRef.current ?? undefined,
+              cfg.executionMode ?? 'auto',
+              cfg.threadOverrides ?? undefined,
+              responseMessageId,
+            );
+          // Await a persist that ACTUALLY WROTE the compaction-bearing record before
+          // launching: the continuation's pre-stream reuse gate (main) reads the stored
+          // record from disk, so launching before it lands re-summarizes + re-bills. A
+          // SUPERSEDED persist (a later persist — e.g. the old stream's trailing `done` —
+          // bumped the version) didn't write, so re-persist. A REJECTED persist means a
+          // concurrent /compact holds the conversation — launching would be rejected as
+          // busy and the mandatory continuation lost, so retry the persist until it lands
+          // (bounded to span /compact's ~285s, activeIdRef-guarded). Launch only on a
+          // persisted (record-on-disk) result. (No pending compaction ⇒ nothing to protect.)
+          const repersistContinuation = () =>
+            persistConversation(convId, acc.messages, acc.headId, {
+              runStatus: 'running',
+              ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+            });
+          // This continuation still OWNS the conversation's turn iff the current
+          // accumulator is the one WE created (same pendingAssistantId). A Stop or a
+          // replacement/superseding turn swaps the accumulator; a stale retry/launch would
+          // then revive cancelled work or clobber the new turn. Check ownership before
+          // every retry AND every launch.
+          const stillOwns = () =>
+            activeIdRef.current === convId &&
+            streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+          const ownsAcc = () => streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+          // On ownership loss, if WE still own the accumulator (conversation switched away,
+          // not a replacement turn), drop it + persist idle so no orphan accumulator / disk
+          // runStatus:'running' is left behind. A replacement turn (different pendingAssistantId)
+          // owns cleanup itself.
+          const cleanupIfLost = (): void => {
+            if (ownsAcc()) {
+              streamAccumulators.delete(convId);
+              void persistConversation(convId, acc.messages, acc.headId, { runStatus: 'idle' });
+            }
+          };
+          // Schedule a retry that RE-CHECKS ownership when the timer fires, BEFORE issuing
+          // repersistContinuation() — a Stop during the delay must not trigger a persist
+          // that re-stamps runStatus:'running'. If ownership was lost, clean up instead.
+          const scheduleRetry = (remaining: number): void => {
+            setTimeout(() => {
+              if (!stillOwns()) {
+                cleanupIfLost();
+                return;
+              }
+              launchAfterCompactionPersist(remaining - 1, repersistContinuation());
+            }, 1000);
+          };
+          const launchAfterCompactionPersist = (
+            remaining: number,
+            p: Promise<{ rejected?: string; superseded?: boolean; persisted?: boolean }>,
+          ): void => {
+            void p.then((r) => {
+              if (!stillOwns()) {
+                cleanupIfLost();
+                return;
+              }
+              if (r?.persisted) {
+                launchContinuation();
+              } else if (r?.persisted === undefined && !r?.rejected && !r?.superseded) {
+                // Unknown outcome ({} — an IPC/write failure): the record is NOT on disk, so
+                // launching would reload the raw branch + re-bill. Retry (bounded) or abandon.
+                if (remaining > 0) scheduleRetry(remaining);
+                else {
+                  streamAccumulators.delete(convId);
+                  if (activeIdRef.current === convId) setIsRunning(false);
+                }
+              } else if (r?.rejected) {
+                if (remaining > 0) {
+                  scheduleRetry(remaining);
+                } else {
+                  // Give up cleanly rather than launch into a busy backend: drop the
+                  // accumulator + go idle (the incomplete-task banner stays for a manual retry).
+                  streamAccumulators.delete(convId);
+                  if (activeIdRef.current === convId) setIsRunning(false);
+                }
+              } else if (r?.superseded && remaining > 0) {
+                launchAfterCompactionPersist(remaining - 1, repersistContinuation());
+              } else {
+                // superseded with no budget left — abandon (don't launch without the record).
+                streamAccumulators.delete(convId);
+                if (activeIdRef.current === convId) setIsRunning(false);
+              }
+            }, () => {
+              // persist threw — treat as unknown: retry if still owning + budget, else abandon.
+              if (!stillOwns()) return;
+              if (remaining > 0) scheduleRetry(remaining);
+              else {
+                streamAccumulators.delete(convId);
+                if (activeIdRef.current === convId) setIsRunning(false);
+              }
+            });
+          };
+          if (acc.pendingCompaction) launchAfterCompactionPersist(300, continuationPersist);
+          else launchContinuation();
           return;
         }
 
@@ -3134,31 +3353,117 @@ export function RuntimeProvider({
                   headId: headForStream,
                   pendingAssistantTiming: createPendingAssistantTiming(),
                   pendingAssistantId: responseMessageId,
+                  // Carry a compaction produced earlier this turn onto the continuation
+                  // (mirrors the max_turns auto-continue) — else the plan-mode restart
+                  // reloads the raw branch and re-summarizes the same prefix.
+                  pendingCompaction: acc.pendingCompaction,
                   seededBackground: acc.seededBackground,
                   seededDiskHeadId: acc.seededDiskHeadId,
                 });
                 setIsRunning(true);
-                persistConversation(
+                const planContinuationPersist = persistConversation(
                   convId,
                   treeForStream,
                   headForStream,
-                  { runStatus: 'running' },
+                  { runStatus: 'running', ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}) },
                   seedContextFor(acc),
                 );
                 const cfg = streamHandlerRef.current;
                 console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
-                app.agent.stream(
-                  convId,
-                  branch,
-                  cfg.selectedModelKey ?? undefined,
-                  cfg.reasoningEffort ?? 'medium',
-                  cfg.selectedProfileKey ?? undefined,
-                  cfg.fallbackEnabled ?? false,
-                  currentWorkingDirectoryRef.current ?? undefined,
-                  'plan-first',
-                  cfg.threadOverrides ?? undefined,
-                  responseMessageId,
-                );
+                const launchPlanContinuation = () =>
+                  launchAgentStream(
+                    convId,
+                    branch,
+                    cfg.selectedModelKey ?? undefined,
+                    cfg.reasoningEffort ?? 'medium',
+                    cfg.selectedProfileKey ?? undefined,
+                    cfg.fallbackEnabled ?? false,
+                    currentWorkingDirectoryRef.current ?? undefined,
+                    'plan-first',
+                    cfg.threadOverrides ?? undefined,
+                    responseMessageId,
+                  );
+                // The plan restart is MANDATORY (the prior stream was aborted for it). If a
+                // concurrent /compact rejects the running-status persist as busy, DON'T
+                // launch (it'd be rejected too) — retry the persist+launch until the lock
+                // clears. /compact can legitimately hold the lock for up to ~285s, so the
+                // budget must span that (1s cadence, ~300 attempts) rather than give up in
+                // ~5s and leave the UI falsely running. On genuine abandonment (budget
+                // exhausted, or the user switched away) restore idle state + drop the
+                // accumulator so nothing is left stuck. Await the persist first so the
+                // continuation's reuse gate sees any compaction record on disk.
+                const abandonPlanRestart = (): void => {
+                  streamAccumulators.delete(convId);
+                  if (activeIdRef.current === convId) {
+                    setIsRunning(false);
+                    // Re-surface the plan-restart affordance so the user can retry manually.
+                    setShowIncompleteTaskBanner(true);
+                  }
+                };
+                const attemptPlanRestart = (
+                  remaining: number,
+                  persistPromise: Promise<{ rejected?: string; superseded?: boolean; persisted?: boolean }>,
+                ): void => {
+                  // Ownership: only act if the accumulator is still THIS restart's (a Stop /
+                  // replacement turn swaps pendingAssistantId). A stale retry/launch would
+                  // revive cancelled work or clobber the new turn.
+                  const ownsAccumulator = () =>
+                    streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+                  const stillOwnsPlan = () => activeIdRef.current === convId && ownsAccumulator();
+                  // On ownership loss we must not silently leave an orphan accumulator +
+                  // disk runStatus:'running'. If WE still own the accumulator (the user just
+                  // switched conversations, not a replacement turn), drop it + persist idle.
+                  // If a replacement turn took the accumulator (different pendingAssistantId),
+                  // leave everything to that new owner.
+                  const cleanupIfOwnershipLost = (): void => {
+                    if (ownsAccumulator()) {
+                      streamAccumulators.delete(convId);
+                      void persistConversation(convId, treeForStream, headForStream, { runStatus: 'idle' });
+                    }
+                  };
+                  const repersist = (delayMs: number): void => {
+                    if (remaining > 0 && stillOwnsPlan()) {
+                      setTimeout(() => {
+                        if (!stillOwnsPlan()) {
+                          cleanupIfOwnershipLost();
+                          return;
+                        }
+                        attemptPlanRestart(
+                          remaining - 1,
+                          persistConversation(convId, treeForStream, headForStream, {
+                            runStatus: 'running',
+                            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+                          }),
+                        );
+                      }, delayMs);
+                    } else {
+                      abandonPlanRestart();
+                    }
+                  };
+                  void persistPromise.then(
+                    (res) => {
+                      if (!stillOwnsPlan()) {
+                        cleanupIfOwnershipLost(); // ownership lost — clean up, don't leave running
+                        return;
+                      }
+                      if (res?.rejected) {
+                        repersist(1000);
+                        return;
+                      }
+                      // SUPERSEDED or unknown ({} — IPC/write failure): the record isn't on
+                      // disk, so re-persist before launching (else the reuse gate misses it).
+                      if ((res?.superseded || (!res?.persisted && !res?.rejected)) && acc.pendingCompaction) {
+                        repersist(0);
+                        return;
+                      }
+                      launchPlanContinuation();
+                    },
+                    () => {
+                      if (stillOwnsPlan()) repersist(1000);
+                    },
+                  );
+                };
+                attemptPlanRestart(300, planContinuationPersist);
               }
             }, 100);
           } else {
@@ -3210,7 +3515,9 @@ export function RuntimeProvider({
         }
         streamHandlerRef.current.schedulePersist(convId, acc.messages, acc.headId, persistExtra);
       }
-    });
+    };
+    streamEventHandlerRef.current = handleStreamEvent;
+    const unsubscribe = app.agent.onStreamEvent(handleStreamEvent);
     return unsubscribe;
   }, [bumpSubAgentVersion]);
 
@@ -3220,6 +3527,12 @@ export function RuntimeProvider({
       if (!convId) return;
 
       const pendingAttachments = consumeAttachments();
+      // Capture the submitted text so a /compact-busy rejection (below) can restore the
+      // draft the composer already cleared on submit — otherwise it's permanently lost.
+      const submittedText = message.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('');
       const cwd = currentWorkingDirectoryRef.current;
       const userContent: ContentPart[] = [];
       for (const part of message.content) {
@@ -3299,6 +3612,16 @@ export function RuntimeProvider({
       // detached orphan base, so this persist must repair it too. Carry the
       // provenance forward onto the new turn's accumulator as well.
       const supersededSeed = seedContextFor(streamAccumulators.get(convId));
+      // Carry the SUPERSEDED accumulator's pending compaction forward: if the running turn
+      // it replaces had produced a paid compaction summary that hadn't been persisted yet,
+      // superseding + persisting without it (and suppressing the old stream's terminal
+      // event) would drop the summary, forcing the replacement turn to re-compact/overflow.
+      // Carry a pending compaction from the SUPERSEDED accumulator OR — if a terminal
+      // done/error already deleted that accumulator but its compaction persist hasn't been
+      // confirmed on disk — from the per-conversation handoff map. Otherwise a resubmit
+      // that races the terminal persist would drop the paid summary.
+      const supersededCompaction =
+        streamAccumulators.get(convId)?.pendingCompaction ?? pendingCompactionHandoff.get(convId) ?? undefined;
       setTree(newTree);
       setHeadId(newHead);
       setIsRunning(true);
@@ -3308,32 +3631,92 @@ export function RuntimeProvider({
         headId: newHead,
         pendingAssistantTiming,
         pendingAssistantId: responseMessageId,
+        pendingCompaction: supersededCompaction,
         seededBackground: supersededSeed?.seededBackground,
         seededDiskHeadId: supersededSeed?.seededDiskHeadId,
       });
       const branch = getActiveBranch(newTree, newHead);
 
-      await persistConversation(convId, newTree, newHead, { runStatus: 'running' }, supersededSeed);
-      void maybeGenerateTitle(convId, branch);
-      console.info(
-        `[UI:stream] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')} cwd=${cwd ?? '(none)'} executionMode=${executionMode ?? 'auto'}`,
-      );
-      console.info(
-        '[UI:stream] Last message preview:',
-        branch.length > 0 ? JSON.stringify(branch[branch.length - 1]).slice(0, 500) : '(empty)',
-      );
-      app.agent.stream(
+      const persistRes = await persistConversation(
         convId,
-        branch,
-        selectedModelKey ?? undefined,
-        reasoningEffort ?? 'medium',
-        selectedProfileKey ?? undefined,
-        fallbackEnabled ?? false,
-        cwd ?? undefined,
-        executionMode ?? 'auto',
-        threadOverrides ?? undefined,
-        responseMessageId,
+        newTree,
+        newHead,
+        { runStatus: 'running', ...(supersededCompaction ? { conversationCompaction: supersededCompaction } : {}) },
+        supersededSeed,
       );
+      // Main rejected the optimistic turn because a /compact holds the conversation. Roll
+      // back the optimistic user message + running state and DON'T launch the stream (it
+      // would be rejected too). The user can resend once compaction finishes.
+      if (persistRes?.rejected) {
+        streamAccumulators.delete(convId);
+        // Only touch UI/composer state if THIS conversation is still active — the user may
+        // have switched to another chat during the awaited put, and restoring A's tree/
+        // head/draft onto B would corrupt B (its next send could persist A's branch).
+        if (activeIdRef.current === convId) {
+          setTree(tree);
+          setHeadId(headId);
+          setIsRunning(false);
+          // Restore the draft so it isn't lost: re-add the consumed attachments and put the
+          // submitted text back into the composer (the composer cleared it on submit) —
+          // but only if the user hasn't started a NEW draft during the await.
+          if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
+          restoreComposerDraft(submittedText);
+        }
+        return;
+      }
+      void maybeGenerateTitle(convId, branch);
+      // The old turn's summarizer may have COMPLETED during the awaited persist above,
+      // attaching its compaction event to THIS (replacement) accumulator AFTER we already
+      // issued the persist with the pre-await snapshot. If the accumulator now carries a
+      // compaction the persist didn't include, durably persist it BEFORE launching — else
+      // the replacement stream reads disk without the summary and re-summarizes the same
+      // prefix. Retry superseded/unknown outcomes; only launch once it's on disk (or there's
+      // nothing new to persist). Guard ownership so a Stop/switch abandons the chain.
+      const persistedCompactionId = supersededCompaction?.compactionId;
+      const launchNew = () =>
+        launchAgentStream(
+          convId,
+          branch,
+          selectedModelKey ?? undefined,
+          reasoningEffort ?? 'medium',
+          selectedProfileKey ?? undefined,
+          fallbackEnabled ?? false,
+          cwd ?? undefined,
+          executionMode ?? 'auto',
+          threadOverrides ?? undefined,
+          responseMessageId,
+        );
+      const ownsNew = () =>
+        activeIdRef.current === convId &&
+        streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+      const nowPending = streamAccumulators.get(convId)?.pendingCompaction;
+      if (ownsNew() && nowPending && nowPending.compactionId !== persistedCompactionId) {
+        const durablyPersistThenLaunch = (remaining: number): void => {
+          void persistConversation(convId, newTree, newHead, {
+            runStatus: 'running',
+            conversationCompaction: nowPending,
+          }).then(
+            (r) => {
+              if (!ownsNew()) return;
+              // Launch ONLY once the compaction record is confirmed on disk. A
+              // conversation-busy (brief /compact lock), superseded, or unknown/write-fail
+              // outcome means it did NOT land — retry (bounded) rather than launch against
+              // the raw branch (which would re-summarize/rebill). Abandon after the budget.
+              if (r?.persisted) launchNew();
+              else if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 500);
+              else launchNew(); // budget exhausted — launch anyway (reactive recovery backstops)
+            },
+            () => {
+              if (!ownsNew()) return;
+              if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 500);
+              else launchNew();
+            },
+          );
+        };
+        durablyPersistThenLaunch(20);
+      } else {
+        launchNew();
+      }
     },
     [
       tree,
@@ -3345,6 +3728,7 @@ export function RuntimeProvider({
       fallbackEnabled,
       threadOverrides,
       consumeAttachments,
+      addAttachments,
     ],
   );
 
@@ -3381,11 +3765,22 @@ export function RuntimeProvider({
         pendingAssistantId: responseMessageId,
       });
       const branch = getActiveBranch(newTree, actualParent);
-      persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
+      const reloadPreHead = headIdRef.current;
+      const reloadPersistRes = await persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
+      // /compact holds the conversation — a regenerate is a head-changing op the put-guard
+      // rejects. Roll back head + running state and don't launch (no draft to preserve).
+      if (reloadPersistRes?.rejected) {
+        streamAccumulators.delete(convId);
+        if (activeIdRef.current === convId) {
+          setHeadId(reloadPreHead);
+          setIsRunning(false);
+        }
+        return;
+      }
       console.info(
         `[UI:stream:reload] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`,
       );
-      app.agent.stream(
+      launchAgentStream(
         convId,
         branch,
         selectedModelKey ?? undefined,
@@ -3429,6 +3824,15 @@ export function RuntimeProvider({
       const editParentId = source ? (source.parentId ?? null) : (message.parentId ?? null);
 
       const userContent: ContentPart[] = [];
+      // The user's edited draft text is JUST the text parts of the incoming message —
+      // capture it NOW, before we append preserved source attachments (inline
+      // `--- File: ---` blocks etc.) to userContent. Restoring userContent's text on a
+      // /compact-busy rollback would otherwise re-insert the attachment blocks into the
+      // composer, duplicating them when the user retries.
+      const editedText = message.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('');
       for (const part of message.content) {
         if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
         else if (part.type === 'image') {
@@ -3470,6 +3874,10 @@ export function RuntimeProvider({
       const newHead = editedMsg.id;
       const pendingAssistantTiming = createPendingAssistantTiming();
       const responseMessageId = msgId();
+      // Capture pre-edit state so a /compact-busy rejection can roll back. (editedText is
+      // captured above, from the raw message text, before source attachments were appended.)
+      const preEditTree = tree;
+      const preEditHead = headIdRef.current;
 
       lastRetitleCount.delete(convId);
       setTree(newTree);
@@ -3484,12 +3892,24 @@ export function RuntimeProvider({
       });
       const branch = getActiveBranch(newTree, newHead);
 
-      await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+      const editPersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+      // /compact holds the conversation: roll back the optimistic edit, restore the
+      // composer draft, and don't launch (the stream would be rejected too).
+      if (editPersistRes?.rejected) {
+        streamAccumulators.delete(convId);
+        if (activeIdRef.current === convId) {
+          setTree(preEditTree);
+          setHeadId(preEditHead);
+          setIsRunning(false);
+          restoreComposerDraft(editedText);
+        }
+        return;
+      }
       void maybeGenerateTitle(convId, branch);
       console.info(
         `[UI:stream:edit] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} sourceId=${message.sourceId ?? '(none)'}`,
       );
-      app.agent.stream(
+      launchAgentStream(
         convId,
         branch,
         selectedModelKey ?? undefined,
@@ -3571,7 +3991,13 @@ export function RuntimeProvider({
       } catch {
         /* ignore */
       }
-      persistConversation(convId, newTree, newHead, { runStatus: 'idle' });
+      persistConversation(convId, newTree, newHead, {
+        runStatus: 'idle',
+        // Preserve a summary the reactive-recovery path already paid for this turn
+        // (staged in acc.pendingCompaction). Omitting it on cancel makes the next turn
+        // reload the original branch and re-compact — mirrors the done/error paths.
+        ...(acc?.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+      });
       return;
     }
 
@@ -3584,7 +4010,10 @@ export function RuntimeProvider({
     } catch (err) {
       console.error('[Runtime] Cancel failed:', err);
     }
-    persistConversation(convId, latestTree, latestHead, { runStatus: 'idle' });
+    persistConversation(convId, latestTree, latestHead, {
+      runStatus: 'idle',
+      ...(acc?.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+    });
   }, []);
 
   // Branch navigation
@@ -3835,51 +4264,64 @@ export function RuntimeProvider({
       ...(recordingAdapter ? { dictation: recordingAdapter } : {}),
     },
   });
+  // Expose the runtime to onNew (defined above) via a ref so a /compact-busy rejection
+  // rollback can restore the composer draft text.
+  runtimeRef.current = runtime as unknown as {
+    thread?: { composer?: { setText?: (t: string) => void; getState?: () => { text?: string } } };
+  };
 
   const handleContinueAfterMaxTurns = useCallback(
-    (messageId: string) => {
+    async (messageId: string) => {
       const convId = activeIdRef.current;
       if (!convId || isRunning) return;
 
-      // Update the max-turns-reached part status to 'continued'
-      setTree((prev) => {
-        const updated = prev.map((msg) => {
-          if (msg.id !== messageId) return msg;
-          const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
-          const updatedContent = content.map((p) =>
-            (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
-              ? { ...p, status: 'continued' as const }
-              : p,
-          );
-          return { ...msg, content: toStoredContent(updatedContent) };
-        });
-        // Re-invoke stream with updated tree
-        const cfg = streamHandlerRef.current;
-        const newHead = cfg.headId;
-        const branch = getActiveBranch(updated, newHead);
-        const responseMessageId = msgId();
-        streamAccumulators.set(convId, {
-          messages: [...updated],
-          headId: newHead,
-          pendingAssistantTiming: createPendingAssistantTiming(),
-          pendingAssistantId: responseMessageId,
-        });
-        persistConversation(convId, updated, newHead, { runStatus: 'running' });
-        app.agent.stream(
-          convId,
-          branch,
-          cfg.selectedModelKey ?? undefined,
-          cfg.reasoningEffort ?? 'medium',
-          cfg.selectedProfileKey ?? undefined,
-          cfg.fallbackEnabled ?? false,
-          currentWorkingDirectoryRef.current ?? undefined,
-          executionMode ?? 'auto',
-          cfg.threadOverrides ?? undefined,
-          responseMessageId,
+      // Compute the updated tree PURELY (mark the max-turns part 'continued'), then do the
+      // persist/launch OUTSIDE a setState updater so we can await the persist and roll back
+      // if /compact rejects it as busy (a side-effecting reducer couldn't).
+      const prevTree = treeRef.current;
+      const updated = prevTree.map((msg) => {
+        if (msg.id !== messageId) return msg;
+        const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
+        const updatedContent = content.map((p) =>
+          (p as { type: string }).type === 'max-turns-reached' && (p as { status: string }).status === 'pending'
+            ? { ...p, status: 'continued' as const }
+            : p,
         );
-        return updated;
+        return { ...msg, content: toStoredContent(updatedContent) };
       });
+      const cfg = streamHandlerRef.current;
+      const newHead = cfg.headId;
+      const branch = getActiveBranch(updated, newHead);
+      const responseMessageId = msgId();
+      setTree(updated);
       setIsRunning(true);
+      streamAccumulators.set(convId, {
+        messages: [...updated],
+        headId: newHead,
+        pendingAssistantTiming: createPendingAssistantTiming(),
+        pendingAssistantId: responseMessageId,
+      });
+      const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
+      if (persistRes?.rejected) {
+        streamAccumulators.delete(convId);
+        if (activeIdRef.current === convId) {
+          setTree(prevTree);
+          setIsRunning(false);
+        }
+        return;
+      }
+      launchAgentStream(
+        convId,
+        branch,
+        cfg.selectedModelKey ?? undefined,
+        cfg.reasoningEffort ?? 'medium',
+        cfg.selectedProfileKey ?? undefined,
+        cfg.fallbackEnabled ?? false,
+        currentWorkingDirectoryRef.current ?? undefined,
+        executionMode ?? 'auto',
+        cfg.threadOverrides ?? undefined,
+        responseMessageId,
+      );
     },
     [isRunning, executionMode],
   );
@@ -3901,7 +4343,7 @@ export function RuntimeProvider({
   );
 
   // Step tracking callbacks
-  const handleContinueTask = useCallback(() => {
+  const handleContinueTask = useCallback(async () => {
     const convId = activeIdRef.current;
     if (!convId || isRunning) return;
 
@@ -3935,8 +4377,20 @@ export function RuntimeProvider({
       pendingAssistantId: responseMessageId,
     });
     const branch = getActiveBranch(newTree, newHead);
-    persistConversation(convId, newTree, newHead, { runStatus: 'running' });
-    app.agent.stream(
+    const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
+    // /compact holds the conversation: roll back the optimistic continue turn + running
+    // state and don't launch (the stream would be rejected as busy too).
+    if (continuePersistRes?.rejected) {
+      streamAccumulators.delete(convId);
+      if (activeIdRef.current === convId) {
+        setTree(currentTree);
+        setHeadId(currentHead);
+        setIsRunning(false);
+        setShowIncompleteTaskBanner(true);
+      }
+      return;
+    }
+    launchAgentStream(
       convId,
       branch,
       cfg.selectedModelKey ?? undefined,

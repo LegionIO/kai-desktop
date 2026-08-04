@@ -36,6 +36,7 @@ import {
   ensureConversationTree,
   getConversationBranch,
   registerConversationHandlers,
+  summarizablePrefixMatchesDisk,
 } from '../conversations.js';
 import { sumBranchTokenCounts } from '../../agent/tokenization.js';
 import {
@@ -831,5 +832,56 @@ describe('conversations IPC: rewind', () => {
     expect(res.removed).toBe(2); // treated as steps=1
     const after = await harness.invoke<{ messages: unknown[] }>('conversations:get', FAKE_EVENT, 'rwnan');
     expect(after.messages).toHaveLength(2);
+  });
+});
+
+describe('summarizablePrefixMatchesDisk (/compact pre-flight reuse gate)', () => {
+  it('accepts a clean leading prefix that matches disk', () => {
+    const disk = ['a', 'b', 'c', 'd'];
+    // boundary=2 → summarize [a,b]; both match disk positionally.
+    expect(summarizablePrefixMatchesDisk(['a', 'b', 'c', 'd'], disk, 2)).toBe(true);
+  });
+
+  it('rejects a hook that reordered/altered an id INSIDE the summarized prefix', () => {
+    const disk = ['a', 'b', 'c', 'd'];
+    expect(summarizablePrefixMatchesDisk(['a', 'X', 'c', 'd'], disk, 3)).toBe(false);
+  });
+
+  it('rejects a TAIL-APPENDED id-less message that lands in the prefix (zero protected tail)', () => {
+    // Hook appended one message with no id; disk has 3 real ids. With a zero
+    // protected tail the boundary spans all 4, so the appended (undefined) id at
+    // index 3 must be inspected and rejected — the case a min-overlap scan misses.
+    const disk = ['a', 'b', 'c'];
+    const msgIds = ['a', 'b', 'c', undefined];
+    expect(summarizablePrefixMatchesDisk(msgIds, disk, 4)).toBe(false);
+  });
+
+  it('rejects a TAIL-APPENDED NEW id (present but not on disk) inside the prefix', () => {
+    const disk = ['a', 'b', 'c'];
+    expect(summarizablePrefixMatchesDisk(['a', 'b', 'c', 'new-id'], disk, 4)).toBe(false);
+  });
+
+  it('accepts when the appended message is OUTSIDE the summarized prefix (protected tail)', () => {
+    // Same appended id, but boundary=3 protects it → only [a,b,c] summarized.
+    const disk = ['a', 'b', 'c'];
+    expect(summarizablePrefixMatchesDisk(['a', 'b', 'c', 'new-id'], disk, 3)).toBe(true);
+  });
+
+  it('rejects an empty-string or non-string id in the prefix', () => {
+    const disk = ['a', 'b', 'c'];
+    expect(summarizablePrefixMatchesDisk(['a', '', 'c'], disk, 3)).toBe(false);
+    expect(summarizablePrefixMatchesDisk(['a', 42, 'c'], disk, 3)).toBe(false);
+  });
+
+  it('rejects when there is nothing summarizable (empty inputs or zero boundary)', () => {
+    expect(summarizablePrefixMatchesDisk([], ['a'], 1)).toBe(false);
+    expect(summarizablePrefixMatchesDisk(['a'], [], 1)).toBe(false);
+    expect(summarizablePrefixMatchesDisk(['a', 'b'], ['a', 'b'], 0)).toBe(false);
+  });
+
+  it('clamps a boundary past the message list to the available ids', () => {
+    const disk = ['a', 'b', 'c'];
+    // boundary huge → prefixLen clamps to msgIds.length; all match → true.
+    expect(summarizablePrefixMatchesDisk(['a', 'b'], disk, 999)).toBe(true);
   });
 });

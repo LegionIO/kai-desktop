@@ -327,6 +327,16 @@ export function getBridgeScript(): string {
     };
 
     ws.onclose = function() {
+      // Reject every in-flight invoke so a long-timeout request (e.g. a 300s /compact)
+      // doesn't hang until its timeout after the socket drops — its awaiter (and any UI
+      // state gated on it, like the composer compaction mark) would otherwise stay stuck.
+      // Authoritative polling reconciles the real backend state after reconnect.
+      var ids = Object.keys(pending);
+      for (var i = 0; i < ids.length; i++) {
+        var cb = pending[ids[i]];
+        delete pending[ids[i]];
+        if (cb) cb.reject(new Error('WebSocket disconnected'));
+      }
       setTimeout(connect, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
     };
@@ -334,6 +344,22 @@ export function getBridgeScript(): string {
 
   function invoke(channel) {
     var args = Array.prototype.slice.call(arguments, 1);
+    // Optional trailing timeout wrapper lets a long-running channel (e.g. /compact
+    // summarization) outlive the default 60s. Recognized ONLY when the trailing arg
+    // is an object whose SOLE own key is __timeoutMs (a numeric value) — so a
+    // legitimate payload that merely contains a __timeoutMs field is never dropped.
+    var timeoutMs = 60000;
+    var last = args.length ? args[args.length - 1] : undefined;
+    if (
+      last &&
+      typeof last === 'object' &&
+      !Array.isArray(last) &&
+      typeof last.__timeoutMs === 'number' &&
+      Object.keys(last).length === 1
+    ) {
+      timeoutMs = last.__timeoutMs;
+      args.pop();
+    }
     var id = String(++msgId);
     return new Promise(function(resolve, reject) {
       pending[id] = { resolve: resolve, reject: reject };
@@ -348,7 +374,7 @@ export function getBridgeScript(): string {
           delete pending[id];
           reject(new Error('Timeout waiting for ' + channel));
         }
-      }, 60000);
+      }, timeoutMs);
     });
   }
 
@@ -400,6 +426,9 @@ export function getBridgeScript(): string {
       setActiveId: function(id) { return invoke('conversations:set-active-id', id); },
       fork: function(id, upTo) { return invoke('conversations:fork', id, upTo); },
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
+      compact: function(id) { return invoke('conversations:compact', id, { __timeoutMs: 300000 }); },
+      compactingIds: function() { return invoke('conversations:compacting-ids'); },
+      onCompactingChanged: function(cb) { return on('conversations:compacting', cb); },
       onChanged: function(cb) { return on('conversations:changed', cb); }
     },
     alerts: {

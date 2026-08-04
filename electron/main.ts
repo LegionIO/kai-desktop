@@ -39,6 +39,7 @@ import {
   setWorkspaceToolDefinitions,
   getWorkspaceToolDefinitions,
   hasActiveStreams,
+  isConversationTurnActive,
   getInjectUserTurnAndRestart,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
@@ -131,6 +132,8 @@ import {
 import { localClients } from './local-bridge/local-clients.js';
 import { shouldStepAsideForUpdate, clearUpdateReady } from './local-bridge/update-signal.js';
 import { webClients } from './web-server/web-clients.js';
+import { broadcastToWebClients } from './web-server/web-clients.js';
+import { setCompactionLockNotifier, compactingConversationIds } from './agent/compaction-lock.js';
 import { createPaddedDockIcon, setPaddedMacDockIcon } from './utils/dock-icon.js';
 import { resolveCodePaths } from './ota/bootstrap.js';
 import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './ota/rollback.js';
@@ -1423,7 +1426,32 @@ if (gotSingleInstanceLock) {
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
     const { setConfig } = registerConfigHandlers(ipcMain, APP_HOME, handleConfigChanged);
-    registerConversationHandlers(ipcMain, APP_HOME, getConfig);
+    registerConversationHandlers(ipcMain, APP_HOME, getConfig, () => pluginManagerRef, isConversationTurnActive);
+    // Broadcast on-demand /compact lock changes to EVERY client (windows + web bridge)
+    // so a renderer that didn't start the /compact still blocks a concurrent send before
+    // optimistically persisting a user turn the backend would reject. The renderer's
+    // compaction-ui store listens on 'conversations:compacting'.
+    setCompactionLockNotifier((conversationId, compacting) => {
+      const payload = { conversationId, compacting };
+      // Individually guarded so a single destroyed window mid-iteration can't skip the
+      // remaining windows or the web-client broadcast. (compaction-lock also wraps this
+      // whole callback so a throw can never corrupt the lock, but partial fan-out would
+      // leave some clients with a stale compacting state until their next resync.)
+      for (const win of BrowserWindow.getAllWindows()) {
+        try {
+          win.webContents.send('conversations:compacting', payload);
+        } catch {
+          /* window/webContents gone — skip it */
+        }
+      }
+      try {
+        broadcastToWebClients('conversations:compacting', payload);
+      } catch {
+        /* best-effort */
+      }
+    });
+    // Late-joining / reloaded clients sync their initial compacting set via this query.
+    ipcMain.handle('conversations:compacting-ids', () => compactingConversationIds());
     registerMcpHandlers(ipcMain);
     registerMemoryHandlers(ipcMain, APP_HOME, getConfig);
     registerSkillsHandlers(ipcMain, APP_HOME);
