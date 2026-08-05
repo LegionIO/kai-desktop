@@ -67,6 +67,9 @@ Kai stamps `pluginName` and `syncedAt`; a plugin cannot claim another plugin's
 link. The optional `correlationId` is copied onto the resulting change event for
 logging and finer-grained echo suppression.
 
+Task cards display an external-key badge, and task detail views render each
+validated HTTP(S) external URL as a link to the source tracker.
+
 When a local card is pushed outward for the first time, pass its `taskId` after
 the remote create succeeds. Kai attaches the new external identity to that card
 instead of creating a second one:

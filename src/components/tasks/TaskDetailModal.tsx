@@ -27,6 +27,7 @@ import { ReviewResultsPanel } from './ReviewResultsPanel';
 import { HumanReviewActions } from './HumanReviewActions';
 import { BlockTaskActions } from './BlockTaskActions';
 import { TaskRunTimeline } from './TaskRunTimeline';
+import { ExternalTaskLinks } from './ExternalTaskLinks';
 import { useAgents } from '@/providers/AgentProvider';
 import { useTasks } from '@/providers/TaskProvider';
 import type { TaskFile } from '@/types/task';
@@ -268,6 +269,7 @@ export const TaskDetailModal: FC<TaskDetailModalProps> = ({
                   <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Updated</span>
                   <span className="text-xs text-foreground/80">{fmtDate(task.updatedAt)}</span>
                 </div>
+                <ExternalTaskLinks links={task.externalLinks} labelWidthClass="w-16" />
                 {task.startedAt && (
                   <div className="flex items-center gap-2">
                     <span className="w-16 shrink-0 text-xs text-muted-foreground/70">Started</span>

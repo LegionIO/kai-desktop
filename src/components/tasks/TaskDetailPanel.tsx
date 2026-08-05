@@ -48,6 +48,7 @@ import { ReviewResultsPanel } from './ReviewResultsPanel';
 import { HumanReviewActions } from './HumanReviewActions';
 import { BlockTaskActions } from './BlockTaskActions';
 import { TaskRunTimeline } from './TaskRunTimeline';
+import { ExternalTaskLinks } from './ExternalTaskLinks';
 import type { TaskFile } from '@/types/task';
 
 type TabId = 'overview' | 'plan' | 'execution' | 'review';
@@ -516,6 +517,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                 <span className="w-20 shrink-0 text-xs text-muted-foreground/70">Updated</span>
                 <span className="text-xs text-foreground/80">{fmtDate(task.updatedAt)}</span>
               </div>
+              <ExternalTaskLinks links={task.externalLinks} />
               {task.startedAt && (
                 <div className="flex items-center gap-2">
                   <span className="w-20 shrink-0 text-xs text-muted-foreground/70">Started</span>

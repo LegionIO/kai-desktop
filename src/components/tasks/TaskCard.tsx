@@ -69,6 +69,7 @@ export const TaskCard: FC<TaskCardProps> = memo(
       : null;
 
     const idleAgents = useMemo(() => agentState.agents.filter((a) => a.status === 'idle'), [agentState.agents]);
+    const externalKey = task.externalLinks?.find((link) => link.externalKey)?.externalKey;
 
     return (
       <ContextMenu.Root>
@@ -93,6 +94,12 @@ export const TaskCard: FC<TaskCardProps> = memo(
                 <ClockIcon className="h-3 w-3" />
                 {relativeTime(task.updatedAt)}
               </span>
+
+              {externalKey && (
+                <span className="max-w-16 truncate rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                  {externalKey}
+                </span>
+              )}
 
               {assignedAgent && (
                 <span className="flex items-center gap-1 rounded-full bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">
@@ -237,6 +244,7 @@ export const TaskCard: FC<TaskCardProps> = memo(
     prev.task.sourceConversationId === next.task.sourceConversationId &&
     prev.task.terminalSessionId === next.task.terminalSessionId &&
     prev.task.reviewerAgentIds === next.task.reviewerAgentIds &&
+    prev.task.externalLinks === next.task.externalLinks &&
     prev.isSelected === next.isSelected,
 );
 
