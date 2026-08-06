@@ -44,7 +44,7 @@ import {
   getInjectUserTurnAndRestart,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
-import { resetStaleRunStatus } from './ipc/conversation-store.js';
+import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js';
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
@@ -1793,6 +1793,15 @@ if (gotSingleInstanceLock) {
       resetStaleRunStatus(APP_HOME);
     } catch (err) {
       console.warn(`[${__BRAND_PRODUCT_NAME}] stale runStatus sweep failed (non-fatal):`, err);
+    }
+
+    // One-time index backfill: older index.json files lack precomputed fields
+    // (hasComputerUse/hasMedia) added for the chats-list advanced filters. Rebuild
+    // the summaries once so those filters work on pre-existing conversations.
+    try {
+      reindexIfStale(APP_HOME);
+    } catch (err) {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] conversation reindex failed (non-fatal):`, err);
     }
 
     // Start the local IPC socket EARLY — as soon as the conversation/agent IPC

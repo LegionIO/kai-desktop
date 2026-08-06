@@ -7,6 +7,7 @@ export type SortPreference = { field: SortField; direction: SortDirection };
 export type FilterPreference = {
   hasToolCalls: boolean | null;
   hasComputerUse: boolean | null;
+  hasMedia: boolean | null;
   messageCountMin: number | null;
   messageCountMax: number | null;
   createdAfter: string | null;
@@ -20,6 +21,7 @@ export const DEFAULT_SORT: SortPreference = { field: 'latest-updated', direction
 export const DEFAULT_FILTER: FilterPreference = {
   hasToolCalls: null,
   hasComputerUse: null,
+  hasMedia: null,
   messageCountMin: null,
   messageCountMax: null,
   createdAfter: null,
@@ -55,6 +57,7 @@ export function useConversationPreferences() {
     let count = 0;
     if (filter.hasToolCalls != null) count++;
     if (filter.hasComputerUse != null) count++;
+    if (filter.hasMedia != null) count++;
     if (filter.messageCountMin != null) count++;
     if (filter.messageCountMax != null) count++;
     if (filter.createdAfter) count++;

@@ -147,6 +147,11 @@ export type ConversationRecord = {
   subAgentDepth?: number;
   isSubAgent?: boolean;
   archived?: boolean;
+  /** Precomputed index-summary flags (present on `conversations:list` entries,
+   *  absent on freshly-built in-memory records). Used by the chats-list filters. */
+  hasToolCalls?: boolean;
+  hasComputerUse?: boolean;
+  hasMedia?: boolean;
 };
 
 export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';

@@ -120,6 +120,7 @@ const appAPI = {
     get: (id: string) => ipcRenderer.invoke('conversations:get', id),
     put: (conversation: unknown) => ipcRenderer.invoke('conversations:put', conversation),
     delete: (id: string) => ipcRenderer.invoke('conversations:delete', id),
+    deleteMany: (ids: string[]) => ipcRenderer.invoke('conversations:deleteMany', ids),
     clear: () => ipcRenderer.invoke('conversations:clear'),
     getActiveId: () => ipcRenderer.invoke('conversations:get-active-id'),
     setActiveId: (id: string) => ipcRenderer.invoke('conversations:set-active-id', id),

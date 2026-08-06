@@ -395,6 +395,7 @@ export function getBridgeScript(): string {
       get: function(id) { return invoke('conversations:get', id); },
       put: function(c) { return invoke('conversations:put', c); },
       delete: function(id) { return invoke('conversations:delete', id); },
+      deleteMany: function(ids) { return invoke('conversations:deleteMany', ids); },
       clear: function() { return invoke('conversations:clear'); },
       getActiveId: function() { return invoke('conversations:get-active-id'); },
       setActiveId: function(id) { return invoke('conversations:set-active-id', id); },
