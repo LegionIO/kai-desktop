@@ -14,7 +14,30 @@ describe('diagnostics debug trace schema', () => {
 
   it('defaults in-depth memory & crash diagnostics off with a 10 MiB window-health cap', () => {
     const diagnostics = appConfigSchema.shape.diagnostics.parse(undefined);
-    expect(diagnostics.memoryDiagnostics).toEqual({ enabled: false, windowHealthLogMaxBytes: 10485760 });
+    expect(diagnostics.memoryDiagnostics).toEqual({
+      enabled: false,
+      windowHealthLogMaxBytes: 10485760,
+      heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+    });
+  });
+
+  it('defaults heap-snapshot capture off with keep-3 / 6 GiB retention', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { enabled: true } });
+    expect(diagnostics.memoryDiagnostics.heapSnapshot).toEqual({
+      enabled: false,
+      thresholdPct: 85,
+      maxCount: 3,
+      maxTotalBytes: 6442450944,
+    });
+  });
+
+  it('rejects an out-of-range heap-snapshot threshold', () => {
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { thresholdPct: 40 } } }),
+    ).toThrow();
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { heapSnapshot: { thresholdPct: 100 } } }),
+    ).toThrow();
   });
 
   it('accepts memoryDiagnostics enabled', () => {

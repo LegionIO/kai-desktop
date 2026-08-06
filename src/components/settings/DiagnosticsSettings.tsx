@@ -50,12 +50,22 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
           scopes?: string[];
           retention?: { maxFileBytes?: number; maxFiles?: number; maxAgeDays?: number };
         };
-        memoryDiagnostics?: { enabled?: boolean; windowHealthLogMaxBytes?: number };
+        memoryDiagnostics?: {
+          enabled?: boolean;
+          windowHealthLogMaxBytes?: number;
+          heapSnapshot?: {
+            enabled?: boolean;
+            thresholdPct?: number;
+            maxCount?: number;
+            maxTotalBytes?: number;
+          };
+        };
       };
     }
   ).diagnostics;
   const debugTrace = diagnostics?.debugTrace;
   const memoryDiagnostics = diagnostics?.memoryDiagnostics;
+  const heapSnapshot = memoryDiagnostics?.heapSnapshot;
   const ALL_SCOPES = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const;
   // Optimistic scope selection: rapid checkbox toggles before a config round-trip
   // must merge against the LATEST intended set, not the stale prop, or the second
@@ -437,6 +447,80 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             </span>
           </div>
         )}
+
+        {/* Automatic heap-snapshot capture */}
+        <div className="mt-4 rounded-lg border border-border/60 bg-background/40 p-3">
+          <Toggle
+            id="diagnostics.memoryDiagnostics.heapSnapshot.enabled"
+            label="Auto-capture heap snapshot on high memory"
+            checked={heapSnapshot?.enabled ?? false}
+            onChange={(value) => void updateConfig('diagnostics.memoryDiagnostics.heapSnapshot.enabled', value)}
+          />
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            When the renderer heap crosses the threshold, one <span className="font-mono">.heapsnapshot</span> is written
+            to <span className="font-mono">~/.kai/logs/heap-snapshots/</span> — it names the objects retaining memory,
+            which the size graph alone can’t. Snapshots are large (roughly the size of the heap, often multiple GB) and
+            writing one briefly pauses the app, so it fires at most once per climb.
+          </p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <label className="text-[11px] text-muted-foreground">
+              Trigger at (% of limit)
+              <input
+                type="number"
+                min={50}
+                max={99}
+                disabled={!heapSnapshot?.enabled}
+                value={heapSnapshot?.thresholdPct ?? 85}
+                onChange={(event) =>
+                  void updateConfig(
+                    'diagnostics.memoryDiagnostics.heapSnapshot.thresholdPct',
+                    Math.min(99, Math.max(50, Number(event.target.value) || 85)),
+                  )
+                }
+                className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+              />
+            </label>
+            <label className="text-[11px] text-muted-foreground">
+              Keep latest (count)
+              <input
+                type="number"
+                min={0}
+                max={50}
+                disabled={!heapSnapshot?.enabled}
+                value={heapSnapshot?.maxCount ?? 3}
+                onChange={(event) =>
+                  void updateConfig(
+                    'diagnostics.memoryDiagnostics.heapSnapshot.maxCount',
+                    Math.min(50, Math.max(0, Number(event.target.value) || 0)),
+                  )
+                }
+                className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+              />
+            </label>
+            <label className="text-[11px] text-muted-foreground">
+              Max total (GB)
+              <input
+                type="number"
+                min={0}
+                max={50}
+                step={0.5}
+                disabled={!heapSnapshot?.enabled}
+                value={Math.round(((heapSnapshot?.maxTotalBytes ?? 6442450944) / 1073741824) * 10) / 10}
+                onChange={(event) =>
+                  void updateConfig(
+                    'diagnostics.memoryDiagnostics.heapSnapshot.maxTotalBytes',
+                    Math.round(Math.min(50, Math.max(0, Number(event.target.value) || 0)) * 1073741824),
+                  )
+                }
+                className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+              />
+            </label>
+          </div>
+          <p className="mt-2 text-[10px] text-muted-foreground">
+            Oldest snapshots are evicted first once either limit is exceeded (0 = unlimited). The single newest snapshot
+            is always kept even if it alone exceeds the byte cap.
+          </p>
+        </div>
       </div>
 
 

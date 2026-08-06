@@ -175,6 +175,8 @@ describe('WindowHealthMonitor recovery policy', () => {
       heapHeartbeatIntervalMs?: number;
       isHeapHeartbeatEnabled?: () => boolean;
       getMaxLogBytes?: () => number;
+      getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number } | null;
+      onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
       skipLoad?: boolean;
     } = {},
   ): WindowHealthMonitor {
@@ -188,6 +190,8 @@ describe('WindowHealthMonitor recovery policy', () => {
       heapSampler: options.heapSampler,
       isHeapHeartbeatEnabled: options.isHeapHeartbeatEnabled,
       getMaxLogBytes: options.getMaxLogBytes,
+      getHeapSnapshotPolicy: options.getHeapSnapshotPolicy,
+      onHeapSnapshotTrigger: options.onHeapSnapshotTrigger,
       now: options.now,
       // Heartbeat off by default so recovery tests are deterministic; the
       // heartbeat suite opts in with a short interval.
@@ -427,6 +431,68 @@ describe('WindowHealthMonitor recovery policy', () => {
     // 40 small lines stay well under 10 MiB → no roll, and the file exists.
     expect(existsSync(`${logPath}.1`)).toBe(false);
     expect(statSync(logPath).size).toBeGreaterThan(0);
+    monitor.detachWindow();
+  });
+
+  it('triggers a heap snapshot once when the heap crosses the threshold, then latches', async () => {
+    let pct = 50;
+    const heapSampler = vi.fn(async () => ({
+      jsHeapUsedMB: Math.round(pct * 40),
+      jsHeapLimitMB: 4000,
+      jsHeapUsedPct: pct,
+    }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 85 }),
+      onHeapSnapshotTrigger,
+    });
+
+    // Below threshold → no trigger.
+    await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(1));
+    expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
+
+    // Cross the threshold → exactly one trigger, and it stays latched while pinned.
+    pct = 100;
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 30)); // several more ticks at 100%
+    expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1); // still latched
+    expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-heap-snapshot-triggered');
+    monitor.detachWindow();
+  });
+
+  it('re-arms the snapshot after the heap recovers below the threshold', async () => {
+    let pct = 100;
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: 3600, jsHeapLimitMB: 4000, jsHeapUsedPct: pct }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => ({ enabled: true, thresholdPct: 85 }),
+      onHeapSnapshotTrigger,
+    });
+
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(1));
+    pct = 60; // recover below threshold - hysteresis (85-10=75) → re-arm
+    await new Promise((r) => setTimeout(r, 20));
+    pct = 100; // climb again → second trigger
+    await vi.waitFor(() => expect(onHeapSnapshotTrigger).toHaveBeenCalledTimes(2));
+    monitor.detachWindow();
+  });
+
+  it('does not trigger a snapshot when the policy is disabled', async () => {
+    const heapSampler = vi.fn(async () => ({ jsHeapUsedMB: 3900, jsHeapLimitMB: 4000, jsHeapUsedPct: 98 }));
+    const onHeapSnapshotTrigger = vi.fn();
+    const monitor = makeMonitor({
+      heapSampler,
+      heapHeartbeatIntervalMs: 5,
+      getHeapSnapshotPolicy: () => null, // disabled
+      onHeapSnapshotTrigger,
+    });
+
+    await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(2));
+    expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
     monitor.detachWindow();
   });
 });

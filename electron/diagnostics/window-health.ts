@@ -23,6 +23,10 @@ const HEAP_PRESSURE_USED_PCT = 90;
 // trajectory approaching the next abort is always on disk. 60s balances signal
 // density against the cost of a trivial executeJavaScript round-trip.
 const HEAP_HEARTBEAT_INTERVAL_MS = 60_000;
+// Once a snapshot fires at thresholdPct, the heap must fall this many points
+// below the threshold before another snapshot can fire — prevents re-capturing
+// every tick while the heap sits pinned at/near 100%.
+const SNAPSHOT_REARM_HYSTERESIS_PCT = 10;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -80,6 +84,20 @@ export interface WindowHealthMonitorOptions {
    * cap takes effect immediately. When omitted, the built-in default is used.
    */
   getMaxLogBytes?: () => number;
+  /**
+   * Live heap-snapshot policy for the heartbeat. When `enabled`, the heartbeat
+   * fires `onHeapSnapshotTrigger` once the sampled heap reaches `thresholdPct`
+   * of the limit, then latches until the heap drops back below the threshold
+   * (minus hysteresis) — so a heap wedged at 100% captures ONE snapshot, not one
+   * per tick. Read per tick so the GUI toggle applies without a relaunch.
+   */
+  getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number } | null;
+  /**
+   * Invoked (fire-and-forget) when the heartbeat decides a snapshot is due. The
+   * monitor passes the attached window; main.ts performs the actual capture +
+   * retention. Errors are swallowed by the monitor.
+   */
+  onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
   now?: () => number;
   probe?: (window: HealthWindow) => Promise<WindowHealthProbeResult>;
   /** Heap-only sampler for the heartbeat (injectable for tests). */
@@ -347,6 +365,10 @@ export class WindowHealthMonitor {
   private readonly isHeapHeartbeatEnabled: () => boolean;
   private heapHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heapHeartbeatRunning = false;
+  // Latch so a heap wedged over the threshold captures ONE snapshot, not one per
+  // tick. Armed again only after the heap drops `SNAPSHOT_REARM_HYSTERESIS_PCT`
+  // below the threshold (so oscillation around the line doesn't re-fire).
+  private heapSnapshotArmed = true;
 
   constructor(private readonly options: WindowHealthMonitorOptions) {
     this.now = options.now ?? Date.now;
@@ -427,6 +449,43 @@ export class WindowHealthMonitor {
       },
       true,
     );
+  }
+
+  /**
+   * Decide whether the current heartbeat sample should trigger a heap snapshot.
+   * Latched: fires once when the heap first reaches `thresholdPct`, then won't
+   * fire again until the heap drops `SNAPSHOT_REARM_HYSTERESIS_PCT` below the
+   * threshold. Config is read live so the GUI toggle applies immediately. The
+   * actual capture is delegated to `onHeapSnapshotTrigger` (fire-and-forget).
+   */
+  private maybeTriggerHeapSnapshot(window: HealthWindow, sample: RendererHeapSample): void {
+    const policy = this.options.getHeapSnapshotPolicy?.();
+    const trigger = this.options.onHeapSnapshotTrigger;
+    const pct = sample.jsHeapUsedPct;
+    if (!policy || !policy.enabled || !trigger || pct === undefined) return;
+
+    const rearmBelow = Math.max(0, policy.thresholdPct - SNAPSHOT_REARM_HYSTERESIS_PCT);
+    // Re-arm once the heap has recovered well below the line.
+    if (!this.heapSnapshotArmed && pct <= rearmBelow) {
+      this.heapSnapshotArmed = true;
+    }
+    if (!this.heapSnapshotArmed || pct < policy.thresholdPct) return;
+
+    // Latch immediately so overlapping ticks can't double-fire, then delegate.
+    this.heapSnapshotArmed = false;
+    this.log('renderer-heap-snapshot-triggered', {
+      jsHeapUsedMB: sample.jsHeapUsedMB,
+      jsHeapLimitMB: sample.jsHeapLimitMB,
+      jsHeapUsedPct: pct,
+      thresholdPct: policy.thresholdPct,
+    });
+    try {
+      void Promise.resolve(trigger(window, sample)).catch((error) => {
+        this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+      });
+    } catch (error) {
+      this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+    }
   }
 
   attachWindow(window: HealthWindow): void {
@@ -531,6 +590,7 @@ export class WindowHealthMonitor {
         jsHeapUsedPct: sample.jsHeapUsedPct,
       });
       this.checkHeapPressure('heartbeat', 0, sample);
+      this.maybeTriggerHeapSnapshot(window, sample);
     } catch {
       /* heartbeat is best-effort; never let it throw into the interval */
     } finally {

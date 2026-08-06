@@ -13,6 +13,7 @@ import {
   protocol,
   screen,
   powerMonitor,
+  webContents,
 } from 'electron';
 import { basename, join, sep } from 'path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
@@ -26,6 +27,7 @@ import {
 } from './diagnostics/main-diagnostics.js';
 import { homedir, release as osRelease } from 'os';
 import { WindowHealthMonitor } from './diagnostics/window-health.js';
+import { captureHeapSnapshot } from './diagnostics/heap-snapshot.js';
 import { initDiagnosticTrace, sweepDiagnosticTraceRetention, traceDiagnostic } from './diagnostics/debug-trace.js';
 import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
@@ -742,6 +744,39 @@ const windowHealthMonitor = new WindowHealthMonitor({
       return 10 * 1024 * 1024;
     }
   },
+  // Live heap-snapshot policy (threshold + on/off), read per tick.
+  getHeapSnapshotPolicy: () => {
+    try {
+      const hs = readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.heapSnapshot;
+      if (!hs?.enabled) return null;
+      return { enabled: true, thresholdPct: hs.thresholdPct ?? 85 };
+    } catch {
+      return null;
+    }
+  },
+  // Capture a renderer heap snapshot + enforce retention when the heartbeat
+  // decides one is due. Heavy (multi-GB write + GC pause) but rare (latched).
+  onHeapSnapshotTrigger: async (win) => {
+    const hs = (() => {
+      try {
+        return readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.heapSnapshot ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    const started = Date.now();
+    const result = await captureHeapSnapshot(
+      join(APP_HOME, 'logs'),
+      (filePath) => (win as unknown as { webContents: Electron.WebContents }).webContents.takeHeapSnapshot(filePath),
+      { maxCount: hs?.maxCount ?? 3, maxTotalBytes: hs?.maxTotalBytes ?? 6442450944 },
+    );
+    windowHealthMonitor.recordLifecycleEvent('renderer-heap-snapshot-captured', {
+      path: result.path,
+      bytes: result.bytes,
+      evicted: result.evicted,
+      elapsedMs: Date.now() - started,
+    });
+  },
   reviveNativeSurface: async () => {
     if (!IS_MAC) return;
     const win = primaryWindowRef;
@@ -1091,9 +1126,28 @@ app.commandLine.appendSwitch('enable-speech-dispatcher');
 // the same flag dynamically below and take effect immediately.
 try {
   if (readEffectiveConfig(APP_HOME).diagnostics?.memoryDiagnostics?.enabled) {
+    const chromeDebugLog = join(APP_HOME, 'logs', 'chrome-debug.log');
+    // Chromium appends to --log-file across the session and does NOT honor our
+    // bounded-writer rotation, so it can grow without limit (observed 53 MB).
+    // Bound it at the process boundary: at each launch, if the prior file is
+    // over the cap, single-roll it to `.1` so the live file starts fresh and
+    // total on-disk stays ~2× the cap.
+    try {
+      const CHROME_LOG_MAX_BYTES = 25 * 1024 * 1024;
+      if (existsSync(chromeDebugLog) && statSync(chromeDebugLog).size > CHROME_LOG_MAX_BYTES) {
+        try {
+          writeFileSync(`${chromeDebugLog}.1`, readFileSync(chromeDebugLog));
+        } catch {
+          /* best-effort backup */
+        }
+        writeFileSync(chromeDebugLog, '');
+      }
+    } catch {
+      /* rotation is best-effort; never block boot */
+    }
     app.commandLine.appendSwitch('js-flags', '--trace-gc-nvp');
     app.commandLine.appendSwitch('enable-logging', 'file');
-    app.commandLine.appendSwitch('log-file', join(APP_HOME, 'logs', 'chrome-debug.log'));
+    app.commandLine.appendSwitch('log-file', chromeDebugLog);
     // Include INFO-level so trace-gc-nvp lines (logged at INFO) are not filtered.
     app.commandLine.appendSwitch('log-level', '0');
   }
@@ -1171,6 +1225,40 @@ if (gotSingleInstanceLock) {
           // this session (so a reader knows to also check chrome-debug.log).
           memoryDiagnosticsEnabled,
         };
+        // The process-metric snapshot names the dead PID only as an anonymous
+        // "Tab". Attach a webContents inventory (id → osPid → type → URL) so an
+        // OOM'd Tab pid can be matched to the page it was hosting (e.g. a plugin
+        // browser-window / Azure webview) — the missing link in prior reports.
+        // Host-only URLs (no query/hash) to avoid logging tokens.
+        try {
+          crashContext.deadOsPid = (() => {
+            try {
+              return contents.getOSProcessId();
+            } catch {
+              return null;
+            }
+          })();
+          crashContext.webContentsInventory = webContents
+            .getAllWebContents()
+            .map((wc) => {
+              let pid: number | null = null;
+              let host = '';
+              try {
+                pid = wc.getOSProcessId();
+              } catch {
+                /* destroyed */
+              }
+              try {
+                host = new URL(wc.getURL()).host || '(no-host)';
+              } catch {
+                host = '(unavailable)';
+              }
+              return { id: wc.id, osPid: pid, type: wc.getType(), host };
+            })
+            .slice(0, 50);
+        } catch {
+          /* inventory best-effort */
+        }
       } catch {
         /* best-effort context only */
       }
