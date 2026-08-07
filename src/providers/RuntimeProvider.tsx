@@ -879,6 +879,48 @@ function clearFinalizedBranch(convId: string): void {
 // deleted). Recording it here — cleared only when a persist returns persisted:true for the
 // same compactionId — lets onNew / continuations recover it and durably re-persist.
 const pendingCompactionHandoff = new Map<string, ConversationCompaction>();
+// TTL + global FIFO cap for handoff entries stashed by the LATE-compaction path (a renderer
+// compaction whose accumulator was already deleted, e.g. a Stop, so it never routes through
+// persistConversation's confirmed-persist clear). Without this a dormant conversation that
+// never gets another turn would retain the summary + covered-id array + signature map for the
+// renderer's lifetime. The persistConversation set site (in-flight write) is NOT armed with a
+// TTL — it clears on persisted:true / delete — so only the late path expires here.
+const lateCompactionHandoffTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const LATE_COMPACTION_HANDOFF_TTL_MS = 5 * 60_000; // generous vs a follow-up turn; bounds retention
+const LATE_COMPACTION_HANDOFF_MAX = 64; // cap distinct dormant conversations holding a stash
+function stashLateCompactionHandoff(convId: string, record: ConversationCompaction): void {
+  // Global FIFO cap: evict the oldest stashed conversation (Map preserves insertion order).
+  // Only evict entries we armed a timer for (the late path) so an in-flight persist handoff is
+  // never dropped; re-inserting an existing key below refreshes its recency.
+  pendingCompactionHandoff.delete(convId);
+  const t = lateCompactionHandoffTimers.get(convId);
+  if (t) clearTimeout(t);
+  while (lateCompactionHandoffTimers.size >= LATE_COMPACTION_HANDOFF_MAX) {
+    const oldest = lateCompactionHandoffTimers.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    const ot = lateCompactionHandoffTimers.get(oldest);
+    if (ot) clearTimeout(ot);
+    lateCompactionHandoffTimers.delete(oldest);
+    pendingCompactionHandoff.delete(oldest);
+  }
+  pendingCompactionHandoff.set(convId, record);
+  lateCompactionHandoffTimers.set(
+    convId,
+    setTimeout(() => {
+      pendingCompactionHandoff.delete(convId);
+      lateCompactionHandoffTimers.delete(convId);
+    }, LATE_COMPACTION_HANDOFF_TTL_MS),
+  );
+}
+// Clear a late-handoff TTL timer when the entry is consumed/cleared elsewhere (persist confirm,
+// inherit, delete) so a stale timer can't later delete a NEWER in-flight handoff for the same id.
+function clearLateCompactionHandoffTimer(convId: string): void {
+  const t = lateCompactionHandoffTimers.get(convId);
+  if (t) {
+    clearTimeout(t);
+    lateCompactionHandoffTimers.delete(convId);
+  }
+}
 
 // Per-conversation QUEUE of inputs that a compact-busy rollback could NOT return to the
 // composer at the time — the user had switched to another chat or started a newer draft, so
@@ -1644,7 +1686,12 @@ async function persistConversation(
   // Register in the handoff map BEFORE the first await — else a terminal persist that gets
   // superseded during its `conversations.get()` would early-return BEFORE registering, and
   // a racing resubmit would find no handoff. Cleared below only on a confirmed persisted:true.
-  if (effectiveCompaction?.compactionId) pendingCompactionHandoff.set(conversationId, effectiveCompaction);
+  // This persist now OWNS the handoff (in-flight write), so cancel any LATE-path TTL timer for
+  // it — the persist-confirm/delete clears take over; a stale timer must not delete this entry.
+  if (effectiveCompaction?.compactionId) {
+    clearLateCompactionHandoffTimer(conversationId);
+    pendingCompactionHandoff.set(conversationId, effectiveCompaction);
+  }
   // Fold the inherited handoff into what's actually written (the caller didn't supply it).
   if (effectiveCompaction?.compactionId && !carriedCompaction?.compactionId) {
     updates = { ...updates, conversationCompaction: effectiveCompaction };
@@ -1657,6 +1704,7 @@ async function persistConversation(
       // now worthless; drop it so deleting compacting chats doesn't retain summaries for
       // the renderer's lifetime.
       pendingCompactionHandoff.delete(conversationId);
+      clearLateCompactionHandoffTimer(conversationId);
       return { superseded: true };
     }
 
@@ -1712,7 +1760,10 @@ async function persistConversation(
     // have replaced it meanwhile).
     if (effectiveCompaction?.compactionId) {
       const held = pendingCompactionHandoff.get(conversationId);
-      if (held?.compactionId === effectiveCompaction.compactionId) pendingCompactionHandoff.delete(conversationId);
+      if (held?.compactionId === effectiveCompaction.compactionId) {
+        pendingCompactionHandoff.delete(conversationId);
+        clearLateCompactionHandoffTimer(conversationId);
+      }
     }
     return { persisted: true };
   } catch (err) {
@@ -2393,6 +2444,7 @@ export function RuntimeProvider({
           lastLiveGeneration.delete(deletedId);
           supersededResponseIds.delete(deletedId);
           pendingCompactionHandoff.delete(deletedId);
+          clearLateCompactionHandoffTimer(deletedId);
           rejectedDrafts.delete(deletedId);
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
@@ -2413,6 +2465,8 @@ export function RuntimeProvider({
         lastLiveGeneration.clear();
         supersededResponseIds.clear();
         pendingCompactionHandoff.clear();
+        for (const t of lateCompactionHandoffTimers.values()) clearTimeout(t);
+        lateCompactionHandoffTimers.clear();
         rejectedDrafts.clear();
         persistVersions.clear();
         lastRetitleCount.clear();
@@ -2885,7 +2939,7 @@ export function RuntimeProvider({
           Array.isArray(cd.compactedMessageIds) &&
           cd.compactedMessageIds.every((id) => typeof id === 'string' && id.length > 0)
         ) {
-          pendingCompactionHandoff.set(convId, {
+          stashLateCompactionHandoff(convId, {
             compactionId: cd.compactionId,
             summaryText: cd.summaryText,
             compactedMessageIds: cd.compactedMessageIds,
@@ -3583,7 +3637,12 @@ export function RuntimeProvider({
             executionMode: rc?.executionMode ?? live.executionMode,
             threadOverrides: rc?.threadOverrides ?? live.threadOverrides,
           };
-          const runCwd = rc?.cwd ?? currentWorkingDirectoryRef.current;
+          // When the run captured its config (rc present), use rc.cwd VERBATIM — including an
+          // explicit null (the run launched with no working directory). A `?? live` fallback
+          // would, for a captured cwd:null, inherit the CURRENTLY-active chat's CWD → a
+          // background continuation's relative-path tools could modify the WRONG project. Only
+          // fall back to the live ref when rc is absent (a pre-runConfig-capture run).
+          const runCwd = rc ? rc.cwd : currentWorkingDirectoryRef.current;
           // Await the compaction-bearing persist BEFORE launching the continuation: the
           // continuation's pre-stream reuse gate (main) reads the stored compaction record
           // from disk, so if we launch first it can read BEFORE the record lands and
@@ -3950,7 +4009,11 @@ export function RuntimeProvider({
               fallbackEnabled: acc.runConfig?.fallbackEnabled ?? planLive.fallbackEnabled,
               threadOverrides: acc.runConfig?.threadOverrides ?? planLive.threadOverrides,
             };
-            const planCwdSnapshot = acc.runConfig?.cwd ?? currentWorkingDirectoryRef.current;
+            // Use the captured cwd VERBATIM when runConfig is present (incl. explicit null);
+            // a `?? live` fallback would let a plan-restart of a cwd:null run inherit the
+            // currently-active chat's CWD (relative-path tools → wrong project). Fall back to
+            // the live ref only when runConfig is absent (pre-capture run).
+            const planCwdSnapshot = acc.runConfig ? acc.runConfig.cwd : currentWorkingDirectoryRef.current;
             // The restart launches in plan-first mode, so the continuation's runConfig must
             // record executionMode:'plan-first' — NOT the original acc.runConfig (usually
             // 'auto'). Otherwise a further max_turns continuation of the RESTARTED planning
@@ -4339,16 +4402,26 @@ export function RuntimeProvider({
       // back the optimistic user message + running state and DON'T launch the stream (it
       // would be rejected too). The user can resend once compaction finishes.
       if (persistRes?.rejected) {
+        const rejectedKind = persistRes.rejected;
         // Only tear down if we STILL OWN the accumulator. A /compact-concurrent send can
         // await this persist while a Stop or a superseding turn (run C) replaces the
         // accumulator with a new pendingAssistantId; our stale rejection must not delete
         // C's accumulator (which would strand C's run) nor restore our stale tree/draft.
-        // But our OWN submitted text + attachments were already cleared from the composer at
-        // submit time, so even when we no longer own the accumulator we must ENQUEUE them (a
-        // conversation-keyed FIFO stash that touches neither the accumulator nor the active
-        // tree/UI) — else the rejected submission is permanently lost.
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) {
-          if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+          // Our submitted text + attachments were cleared from the composer at submit time.
+          // Preserve them by enqueueing ONLY when this submission is genuinely lost with
+          // nothing else carrying it forward — i.e. a compaction-BUSY reject (retryable once
+          // compaction ends) AND the accumulator is now ABSENT (a Stop deleted it; the run is
+          // gone). Do NOT enqueue when: (a) the reject is conversation-DELETED (the conv is
+          // gone — a stash under its id retains forever + never restores), or (b) a SUPERSEDING
+          // turn installed a replacement accumulator (present, different id) — that turn is the
+          // user's own newer send, so requeuing this draft would resurface it as a duplicate.
+          const supersededByReplacement = streamAccumulators.has(convId);
+          if (
+            rejectedKind === 'conversation-busy' &&
+            !supersededByReplacement &&
+            (submittedText.trim().length > 0 || pendingAttachments.length > 0)
+          ) {
             enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
           }
           return;
@@ -4378,7 +4451,11 @@ export function RuntimeProvider({
           }
           // Enqueue for later restoration (FIFO) rather than dropping it. The queue keeps a
           // second rejection from overwriting/discarding the first (both survive + restore).
-          enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
+          // Skip for a conversation-DELETED reject — a stash under a dead conv id never
+          // restores (loadConversationState won't run for it) and retains forever.
+          if (rejectedKind !== 'conversation-deleted') {
+            enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
+          }
         }
         return;
       }
@@ -4669,12 +4746,20 @@ export function RuntimeProvider({
       // /compact holds the conversation: roll back the optimistic edit, restore the
       // composer draft, and don't launch (the stream would be rejected too).
       if (editPersistRes?.rejected) {
+        const rejectedKind = editPersistRes.rejected;
         // If a Stop / superseding turn replaced the accumulator during the await we no longer
-        // own it (must not delete it / touch the tree), but the edited text was already
-        // consumed — ENQUEUE it (conversation-keyed FIFO, touches no accumulator/tree) so it
-        // isn't permanently lost.
+        // own it (must not delete it / touch the tree). The edited text was already consumed,
+        // so ENQUEUE it — but ONLY when genuinely lost: a compaction-BUSY reject (retryable)
+        // AND the accumulator is now ABSENT (a Stop deleted it). Skip for conversation-DELETED
+        // (stash under a dead id never restores) and for a SUPERSEDING replacement (present,
+        // different id — the user's newer turn; requeuing would resurface a duplicate draft).
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) {
-          if (editedText.trim().length > 0) {
+          const supersededByReplacement = streamAccumulators.has(convId);
+          if (
+            rejectedKind === 'conversation-busy' &&
+            !supersededByReplacement &&
+            editedText.trim().length > 0
+          ) {
             enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
           }
           return;
@@ -4697,10 +4782,10 @@ export function RuntimeProvider({
         }
         if (canRestoreNow) {
           restoreComposerDraft(editedText);
-        } else if (editedText.trim().length > 0) {
+        } else if (editedText.trim().length > 0 && rejectedKind !== 'conversation-deleted') {
           // The user switched away OR has a newer draft — can't restore into the composer
           // now, so ENQUEUE it (parity with the onNew rollback). The queue keeps a second
-          // rejection from discarding this one.
+          // rejection from discarding this one. Skip for conversation-DELETED (dead id).
           enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
         }
         return;

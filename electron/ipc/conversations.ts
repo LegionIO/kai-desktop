@@ -65,6 +65,14 @@ function broadcastChange(change: ConversationChange): void {
 }
 
 export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {
+  // A suppressed (tombstoned) writeConversation returns the record it was ASKED to write
+  // unchanged — nothing landed on disk. Broadcasting it would make clients recreate a phantom
+  // deleted conversation absent from disk. Guard the single upsert chokepoint: if this id was
+  // recently deleted AND is not in the index (the same condition that suppressed the write),
+  // don't broadcast. A legitimate recreate re-adds the index entry, so this only drops phantoms.
+  if (isRecentlyDeleted(conversation.id) && !readIndex(appHome).conversations[conversation.id]) {
+    return;
+  }
   broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
 }
 function broadcastDelete(appHome: string, id: string): void {
