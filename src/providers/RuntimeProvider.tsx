@@ -832,12 +832,31 @@ const persistVersions = new Map<string, number>();
 // same compactionId — lets onNew / continuations recover it and durably re-persist.
 const pendingCompactionHandoff = new Map<string, ConversationCompaction>();
 
-// Per-conversation input that a compact-busy rollback could NOT return to the composer at
-// the time — the user had switched to another chat or started a newer draft, so restoring
-// then would target the wrong conversation or clobber a live draft. Held here and restored
-// by loadConversationState when the user returns to that conversation (into an empty
-// composer only). Cleared on restore or when the conversation is deleted, so it can't leak.
-const rejectedDrafts = new Map<string, { text: string; attachments: AttachedFile[] }>();
+// Per-conversation QUEUE of inputs that a compact-busy rollback could NOT return to the
+// composer at the time — the user had switched to another chat or started a newer draft, so
+// restoring then would target the wrong conversation or clobber a live draft. A FIFO queue
+// (not a single slot) so that if A is stashed and B is later rejected before A is restored,
+// BOTH survive (a single slot would either overwrite A or discard B). Restored one-at-a-time
+// (oldest first) by loadConversationState + the composer-empty poll (into an empty composer
+// only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
+type RejectedDraft = { text: string; attachments: AttachedFile[] };
+const rejectedDrafts = new Map<string, RejectedDraft[]>();
+const MAX_REJECTED_DRAFTS_PER_CONV = 20;
+function enqueueRejectedDraft(convId: string, draft: RejectedDraft): void {
+  if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
+  const q = rejectedDrafts.get(convId) ?? [];
+  q.push(draft);
+  if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift(); // bound — drop the oldest
+  rejectedDrafts.set(convId, q);
+}
+/** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
+function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
+  const q = rejectedDrafts.get(convId);
+  if (!q || q.length === 0) return undefined;
+  const next = q.shift();
+  if (q.length === 0) rejectedDrafts.delete(convId);
+  return next;
+}
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
   return { startedAt };
@@ -2154,11 +2173,11 @@ export function RuntimeProvider({
     if (rejectedDrafts.has(id)) {
       setTimeout(() => {
         if (activeIdRef.current !== id) return; // user switched again — keep the stash
-        const rejected = rejectedDrafts.get(id);
-        if (!rejected) return;
+        if ((rejectedDrafts.get(id)?.length ?? 0) === 0) return;
         const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
         if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return; // don't clobber
-        rejectedDrafts.delete(id);
+        const rejected = dequeueRejectedDraft(id); // OLDEST first; the poll restores the rest
+        if (!rejected) return;
         if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
         restoreComposerDraft(rejected.text);
       }, 0);
@@ -2289,12 +2308,11 @@ export function RuntimeProvider({
   useEffect(() => {
     const timer = setInterval(() => {
       const id = activeIdRef.current;
-      if (!id || !rejectedDrafts.has(id)) return;
+      if (!id || (rejectedDrafts.get(id)?.length ?? 0) === 0) return;
       const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
       if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return;
-      const rejected = rejectedDrafts.get(id);
+      const rejected = dequeueRejectedDraft(id); // one per tick, oldest first (drains over ticks)
       if (!rejected) return;
-      rejectedDrafts.delete(id);
       if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
       restoreComposerDraft(rejected.text);
     }, 1500);
@@ -2746,6 +2764,23 @@ export function RuntimeProvider({
       // MAIN process; track them in one set so the renderer renders live but
       // never double-persists. `automationStreams` = "main-owned stream here".
       if (e.automation || e.serverPersisted) automationStreams.add(convId);
+
+      // A queued event from a SUPERSEDED run (e.g. a post-Stop delta whose Stop already
+      // deleted the accumulator) must NOT CREATE a fresh accumulator here — that orphan
+      // would make the conversation look perpetually running AND suppress external updates
+      // (the onChanged reload skips a conv with a live accumulator). The generation guard
+      // below only runs once an accumulator EXISTS, so check supersession BEFORE creating.
+      // (compaction events are exempt — their handoff is captured against an existing acc.)
+      if (!streamAccumulators.has(convId) && e.type !== 'compaction') {
+        const evGenPre = (e as { runGeneration?: string }).runGeneration;
+        const evRidPre = (e as { responseMessageId?: string }).responseMessageId;
+        if (
+          (evGenPre && supersededGenerations.get(convId)?.has(evGenPre)) ||
+          (evRidPre && supersededResponseIds.get(convId)?.has(evRidPre))
+        ) {
+          return; // stale superseded event with no accumulator — drop, don't create an orphan
+        }
+      }
 
       if (!streamAccumulators.has(convId)) {
         if (isActiveConv) {
@@ -3921,7 +3956,10 @@ export function RuntimeProvider({
             }, 100);
           } else {
             console.warn(`[StreamEvent] DONE setting isRunning=false for conv=${convId.slice(0, 8)}`);
-            setIsRunning(false);
+            // Gate on active-ness: this block is no longer nested in `if (isActiveConv)` (moved
+            // out in round 107 so background plan-restarts fire), so a BACKGROUND conv's `done`
+            // reaching here must not clear the ACTIVE chat's running indicator.
+            if (isActiveConv) setIsRunning(false);
           }
         }
         return;
@@ -4133,12 +4171,9 @@ export function RuntimeProvider({
             setHeadId(headId);
             setIsRunning(false);
           }
-          if ((submittedText.trim().length > 0 || pendingAttachments.length > 0) && !rejectedDrafts.has(convId)) {
-            // Don't OVERWRITE an existing stash — a second rejection would otherwise lose the
-            // first rejected message. Keep the earliest; the composer-empty restore (or a
-            // reload) surfaces it, then a later rejection can stash again.
-            rejectedDrafts.set(convId, { text: submittedText, attachments: pendingAttachments });
-          }
+          // Enqueue for later restoration (FIFO) rather than dropping it. The queue keeps a
+          // second rejection from overwriting/discarding the first (both survive + restore).
+          enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
         }
         return;
       }
@@ -4420,12 +4455,12 @@ export function RuntimeProvider({
           setHeadId(preEditHead);
           setIsRunning(false);
           restoreComposerDraft(editedText);
-        } else if (editedText.trim().length > 0 && !rejectedDrafts.has(convId)) {
+        } else if (editedText.trim().length > 0) {
           // The user switched away before the /compact rejection returned — can't restore the
-          // edited text into the (now other) composer now, so STASH it for when they return
+          // edited text into the (now other) composer now, so ENQUEUE it for when they return
           // (parity with the onNew rollback; loadConversationState / the composer-empty effect
-          // restore it). Don't overwrite an existing stash (a second rejection would lose it).
-          rejectedDrafts.set(convId, { text: editedText, attachments: [] });
+          // restore it FIFO). The queue keeps a second rejection from discarding this one.
+          enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
         }
         return;
       }

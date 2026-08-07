@@ -161,6 +161,12 @@ export async function captureHeapSnapshot(
 
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
+  // Enforce retention BEFORE capturing: an old (multi-GB) snapshot can fill the disk so that
+  // EVERY new capture fails with ENOSPC before the post-capture retention below ever runs —
+  // a permanent failure loop despite eviction being able to free enough space. Evicting first
+  // frees that space so the capture can succeed. (Retention runs AGAIN after, to enforce the
+  // count/bytes ceiling including the freshly-written snapshot.) Bounded, best-effort.
+  const evictedBefore = enforceHeapSnapshotRetention(dir, retention);
   try {
     await take(path);
   } catch (err) {
@@ -185,5 +191,8 @@ export async function captureHeapSnapshot(
   }
 
   const evicted = enforceHeapSnapshotRetention(dir, retention);
-  return { path, bytes, evicted };
+  // Report everything evicted across BOTH passes (dedup — a file can't be evicted twice, but
+  // guard anyway).
+  const allEvicted = evictedBefore.length > 0 ? [...new Set([...evictedBefore, ...evicted])] : evicted;
+  return { path, bytes, evicted: allEvicted };
 }
