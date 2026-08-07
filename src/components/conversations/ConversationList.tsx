@@ -158,7 +158,14 @@ export const ConversationList: FC<ConversationListProps> = ({
   // IDs of conversations whose MESSAGE CONTENT matches the current search
   // (title matches are handled synchronously below). Populated by a debounced
   // conversations:search call, since content matching requires reading bodies.
-  const [contentMatchIds, setContentMatchIds] = useState<Set<string>>(new Set());
+  // Tagged with the query it belongs to so a STALE result from a previous query
+  // (search "alpha" → "beta" before the alpha search resolved) is NOT applied to the
+  // current view — otherwise "delete filtered" could delete alpha-only chats while the
+  // user sees beta results.
+  const [contentMatch, setContentMatch] = useState<{ query: string; ids: Set<string> }>({
+    query: '',
+    ids: new Set(),
+  });
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<'markdown' | 'json'>('markdown');
@@ -273,7 +280,7 @@ export const ConversationList: FC<ConversationListProps> = ({
   useEffect(() => {
     const q = searchQuery.trim();
     if (!q) {
-      setContentMatchIds((prev) => (prev.size ? new Set() : prev));
+      setContentMatch((prev) => (prev.ids.size || prev.query ? { query: '', ids: new Set() } : prev));
       return;
     }
     let cancelled = false;
@@ -282,9 +289,12 @@ export const ConversationList: FC<ConversationListProps> = ({
         try {
           const hits = (await app.conversations.search(q)) as Array<{ id?: string }>;
           if (cancelled) return;
-          setContentMatchIds(new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')));
+          setContentMatch({
+            query: q,
+            ids: new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')),
+          });
         } catch {
-          if (!cancelled) setContentMatchIds(new Set());
+          if (!cancelled) setContentMatch({ query: q, ids: new Set() });
         }
       })();
     }, 250);
@@ -311,12 +321,16 @@ export const ConversationList: FC<ConversationListProps> = ({
     );
 
     // Text search: match the title (instant, in-memory) OR the message content
-    // (via the debounced conversations:search result set — contentMatchIds).
+    // (via the debounced conversations:search result set). Only apply content hits when
+    // they belong to the CURRENT query — a stale set from a prior query must not widen
+    // (or narrow) the current view (and thus a "delete filtered").
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
+      const contentIds = contentMatch.query === searchQuery.trim() ? contentMatch.ids : null;
       result = result.filter(
         (c) =>
-          getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q) || contentMatchIds.has(c.id),
+          getDisplayTitle(c, sessionsByConversation.get(c.id)).toLowerCase().includes(q) ||
+          (contentIds?.has(c.id) ?? false),
       );
     }
 
@@ -347,7 +361,7 @@ export const ConversationList: FC<ConversationListProps> = ({
     });
 
     return result;
-  }, [conversations, searchQuery, contentMatchIds, sessionsByConversation, workspaceId, filter, activeFilterCount, sort]);
+  }, [conversations, searchQuery, contentMatch, sessionsByConversation, workspaceId, filter, activeFilterCount, sort]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.

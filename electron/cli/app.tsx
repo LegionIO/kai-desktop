@@ -639,6 +639,16 @@ export function App({
         setConnState('reconnected');
         if (connClearRef.current) clearTimeout(connClearRef.current);
         connClearRef.current = setTimeout(() => setConnState('ok'), 2500);
+        // A /compact transport failure (or a crash mid-turn) can leave prompts QUEUED with
+        // the CLI idle — nothing drains them until the user submits again (out of order /
+        // stuck). Now that we're reconnected and idle, drain one queued prompt as its own
+        // turn (its terminal event drains the rest), matching the compacting-unlock drain.
+        if (statusRef.current === 'idle' && queueRef.current.length > 0) {
+          const next = queueRef.current.shift() as string;
+          setStatus('running');
+          statusRef.current = 'running';
+          setTimeout(() => sendMessageRef.current(next), 0);
+        }
       })();
     });
 

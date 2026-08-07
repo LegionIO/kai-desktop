@@ -900,10 +900,12 @@ export function registerConversationHandlers(
   ipcMain.handle('conversations:deleteMany', (_event, ids: unknown) => {
     const list = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
     if (list.length === 0) return { ok: true, deleted: 0 };
-    // Abort any live stream/submit for each id before deleting so no tools keep running
-    // against a deleted record (idempotent + a no-op for idle conversations).
-    for (const id of list) cancelConversationStream(id);
     const removed = deleteConversations(appHome, list);
+    // Abort live streams ONLY for conversations that were ACTUALLY removed. deleteConversations
+    // is synchronous (rmSync) with no await, so no tool can execute between the delete and this
+    // cancel; cancelling before the delete would irreversibly stop a run whose file rm FAILED
+    // (deleteConversations preserves such a conversation) — a surviving chat with a dead run.
+    for (const id of removed) cancelConversationStream(id);
     // Broadcast a delete per removed id so each renderer/web client prunes O(1),
     // matching the single-delete path (there is no batched change kind).
     for (const id of removed) {

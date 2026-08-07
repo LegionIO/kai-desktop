@@ -235,6 +235,23 @@ async function finalizeSubAgentRun(opts: {
     const pending = pendingResumeQueues.get(subAgentConversationId) ?? [];
     pending.push(...strandedFollowUps);
     pendingResumeQueues.set(subAgentConversationId, pending);
+  } else if (strandedFollowUps.length > 0) {
+    // NON-resumable finalize (e.g. an initial run whose prompt gate denied/threw before any
+    // gated snapshot existed) with follow-ups that were accepted (ok:true, composer cleared)
+    // during the run. There is no conversation to deliver them to, so they can't be
+    // retained — surface a diagnostic so the drop is observable rather than silent. (When a
+    // fresh gated snapshot DID persist, remainsResumable is true and they survive above.)
+    traceDiagnostic({
+      scope: 'agent',
+      event: 'sub-agent.stranded-followups-dropped',
+      conversationId: subAgentConversationId,
+      toolName: 'sub_agent',
+      fields: {
+        subAgentConversationId,
+        count: strandedFollowUps.length,
+        outcome: outcome.aborted ? 'aborted' : outcome.failed ? 'failed' : 'other',
+      },
+    });
   }
 
   // 4. DB status write. Re-check ownership AFTER the (awaited) reopen ordering:

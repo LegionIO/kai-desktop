@@ -1891,7 +1891,12 @@ export function RuntimeProvider({
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
   onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
-  const { consumeAttachments, addAttachments } = useAttachments();
+  const { consumeAttachments, addAttachments, attachments } = useAttachments();
+  // Live mirror of the composer's current attachments, for reads inside async rollback
+  // closures (state would be stale). Used to avoid clobbering a NEW draft's attachments
+  // when restoring a rolled-back turn's consumed attachments.
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
 
   // --- Audio adapters (TTS & Voice Recording) ---
   const { config } = useConfig();
@@ -2233,6 +2238,20 @@ export function RuntimeProvider({
   // treeRef.current, so a longer incoming tree reliably signals an external append.
   useEffect(() => {
     return app.conversations.onChanged((change) => {
+      // A conversation was DELETED (from any client). Drop any live accumulator we hold for
+      // it — otherwise a running GUI chat's accumulator (and its media) leaks for the
+      // renderer's lifetime: the backend cancels the stream on delete but emits no terminal
+      // event for a GUI run, and nothing else prunes the module-level map. Supersede first
+      // so a queued late delta from the cancelled run can't recreate it.
+      if (change.kind === 'delete') {
+        const deletedId = change.id;
+        if (deletedId && streamAccumulators.has(deletedId)) {
+          supersedeCurrentGeneration(deletedId);
+          streamAccumulators.delete(deletedId);
+          if (activeIdRef.current === deletedId) setIsRunning(false);
+        }
+        return;
+      }
       const activeId = activeIdRef.current;
       if (!activeId || streamAccumulators.has(activeId)) return;
       // Only an upsert of the ACTIVE conversation can require a reload (an
@@ -3941,8 +3960,12 @@ export function RuntimeProvider({
           setIsRunning(false);
           // Restore the draft so it isn't lost: re-add the consumed attachments and put the
           // submitted text back into the composer (the composer cleared it on submit) —
-          // but only if the user hasn't started a NEW draft during the await.
-          if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
+          // but only if the user hasn't started a NEW draft during the await. Re-adding
+          // unconditionally would MERGE the old attachments into a new draft's attachments
+          // and could send them unintentionally.
+          if (pendingAttachments.length > 0 && attachmentsRef.current.length === 0) {
+            addAttachments(pendingAttachments);
+          }
           restoreComposerDraft(submittedText);
         }
         return;
@@ -4259,6 +4282,10 @@ export function RuntimeProvider({
     const finishedAt = nowIso();
     const pendingStartedAt = acc?.pendingAssistantTiming?.startedAt;
     if (acc) finalizeAssistantResponse(acc, finishedAt);
+    // Blacklist the cancelled run's generation BEFORE deleting the accumulator so a queued
+    // late delta can't recreate the accumulator (2633) and lock it, then schedule a newer
+    // `running` persist that supersedes this cancellation's idle persist (stuck running).
+    supersedeCurrentGeneration(convId);
     streamAccumulators.delete(convId);
     const latestTree = acc ? acc.messages : currentTree;
     const latestHead = acc ? acc.headId : currentHeadId;

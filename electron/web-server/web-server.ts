@@ -397,7 +397,7 @@ export function getBridgeScript(): string {
       onChanged: function(cb) { return on('config:changed', cb); }
     },
     agent: {
-      stream: function(cId, msgs, mk, re, pk, fb, cwd, em) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd, em); },
+      stream: function(cId, msgs, mk, re, pk, fb, cwd, em, to, rid) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd, em, to, rid); },
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
       inFlight: function(cId) { return invoke('agent:in-flight', cId); },
       injectMidTurn: function(cId, text) { return invoke('agent:inject-mid-turn', cId, text); },
