@@ -1024,7 +1024,7 @@ function tombstoneConversation(id: string): void {
     }
   }
 }
-function isRecentlyDeleted(id: string): boolean {
+export function isRecentlyDeleted(id: string): boolean {
   const t = recentlyDeletedConversations.get(id);
   if (t === undefined) return false;
   if (Date.now() - t > DELETED_TOMBSTONE_TTL_MS) {

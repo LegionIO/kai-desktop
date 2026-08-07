@@ -157,8 +157,14 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const [hasLoaded, setHasLoaded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   // IDs whose message CONTENT matches the search (title matches are instant
-  // below); filled by a debounced conversations:search (reads bodies).
-  const [contentMatchIds, setContentMatchIds] = useState<Set<string>>(new Set());
+  // below); filled by a debounced conversations:search (reads bodies). Tagged with the
+  // query it belongs to so a STALE result from a previous query (search "alpha" → "beta"
+  // before alpha's search resolved) is NOT applied to the current view — otherwise
+  // "Delete results" could permanently delete alpha-only chats under the beta view.
+  const [contentMatch, setContentMatch] = useState<{ query: string; ids: Set<string> }>({
+    query: '',
+    ids: new Set(),
+  });
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [sortMode, setSortMode] = useState<SortMode>('newest');
   const [hoveredId, setHoveredId] = useState<string | null>(null);
@@ -245,7 +251,13 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const handleDelete = useCallback(
     async (id: string) => {
       const deletingActive = activeConversationId != null && id === activeConversationId;
-      await app.conversations.delete(id);
+      const res = (await app.conversations.delete(id)) as { ok?: boolean } | undefined;
+      // A filesystem deletion failure preserves the conversation (ok:false); don't prune the
+      // selection, detach the active chat, or treat it as removed in that case.
+      if (res && res.ok === false) {
+        await loadConversations();
+        return;
+      }
       setSelectedIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
@@ -332,7 +344,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   useEffect(() => {
     const q = searchQuery.trim();
     if (!q) {
-      setContentMatchIds((prev) => (prev.size ? new Set() : prev));
+      setContentMatch((prev) => (prev.ids.size || prev.query ? { query: '', ids: new Set() } : prev));
       return;
     }
     let cancelled = false;
@@ -341,9 +353,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
         try {
           const hits = (await app.conversations.search(q)) as Array<{ id?: string }>;
           if (cancelled) return;
-          setContentMatchIds(new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')));
+          setContentMatch({
+            query: q,
+            ids: new Set(hits.map((h) => h.id).filter((id): id is string => typeof id === 'string')),
+          });
         } catch {
-          if (!cancelled) setContentMatchIds(new Set());
+          if (!cancelled) setContentMatch({ query: q, ids: new Set() });
         }
       })();
     }, 250);
@@ -380,10 +395,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       result = result.filter((c) => !c.archived);
     }
 
-    // Search: title (instant, in-memory) OR message content (contentMatchIds).
+    // Search: title (instant, in-memory) OR message content. Apply content hits ONLY when
+    // they belong to the CURRENT query — a stale set must not widen a "Delete results".
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      result = result.filter((c) => getDisplayTitle(c).toLowerCase().includes(q) || contentMatchIds.has(c.id));
+      const contentIds = contentMatch.query === searchQuery.trim() ? contentMatch.ids : null;
+      result = result.filter((c) => getDisplayTitle(c).toLowerCase().includes(q) || (contentIds?.has(c.id) ?? false));
     }
 
     // Advanced filters (FilterPopover): tool calls / autopilot / media, count + dates.
@@ -406,7 +423,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     });
 
     return result;
-  }, [conversations, workspaceId, searchQuery, contentMatchIds, filterMode, sortMode, pinnedIds, filter, activeFilterCount]);
+  }, [conversations, workspaceId, searchQuery, contentMatch, filterMode, sortMode, pinnedIds, filter, activeFilterCount]);
 
   // Delete every conversation currently visible in the list (respects search +
   // filter mode + advanced filters). Powers both "Delete all" and, when a

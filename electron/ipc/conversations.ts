@@ -40,6 +40,7 @@ import {
   getActiveConversationId,
   setActiveConversationId,
   nextCompactionRevision,
+  isRecentlyDeleted,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -585,6 +586,15 @@ export function registerConversationHandlers(
     const tree = Array.isArray(conversation.messageTree) ? conversation.messageTree : [];
     const prev = readConversation(appHome, conversation.id);
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
+
+    // Resurrection guard: this conversation was RECENTLY DELETED and is not on disk (prev
+    // null). A stale in-flight optimistic put must NOT recreate it — writeConversation would
+    // skip the write but still return a record, so broadcasting an upsert + returning ok
+    // here would make the renderer launch an agent run against a deleted chat. Reject so the
+    // renderer rolls back instead (matches the compacting-busy rejection contract).
+    if (!prev && isRecentlyDeleted(conversation.id)) {
+      return { rejected: 'conversation-deleted' as const };
+    }
 
     // A `/compact` is summarizing this conversation right now. Admission for a new turn
     // (or any tree/head mutation) isn't atomic with the renderer's OPTIMISTIC put — a

@@ -398,8 +398,14 @@ export const ConversationList: FC<ConversationListProps> = ({
         setFadingActiveId(id);
       }
 
-      await app.conversations.delete(id);
+      const res = (await app.conversations.delete(id)) as { ok?: boolean } | undefined;
       await loadConversations();
+      // A filesystem deletion failure preserves the conversation (ok:false) — don't clear
+      // the fade highlight-as-removed or navigate away from a chat that's still there.
+      if (res && res.ok === false) {
+        setFadingActiveId(null);
+        return;
+      }
 
       if (wasDeletingActive) {
         // Wait for the 300ms removal animation to finish before switching

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync, utimesSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync, utimesSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -48,6 +48,32 @@ describe('enforceHeapSnapshotRetention', () => {
       'heap-20260101T000002.heapsnapshot',
       'heap-20260101T000003.heapsnapshot',
     ]);
+  });
+
+  it('honors the count ceiling even when an unlink FAILS on an older snapshot', () => {
+    // A failed unlink must not be counted as removed — otherwise (4 files, cap 2) one failed
+    // deletion + one successful one would stop with 3 still on disk. Make the OLDEST snapshot
+    // an un-removable non-empty DIRECTORY (rmSync without recursive throws) to simulate that.
+    const unremovable = join(dir, 'heap-20260101T000000.heapsnapshot');
+    mkdirSync(unremovable);
+    writeFileSync(join(unremovable, 'blocker'), 'x'); // non-empty → rmSync (no recursive) throws
+    const oldT = new Date(2026, 0, 1, 0, 0);
+    utimesSync(unremovable, oldT, oldT);
+    makeSnap('heap-20260101T000001.heapsnapshot', 10, 1);
+    makeSnap('heap-20260101T000002.heapsnapshot', 10, 2);
+    makeSnap('heap-20260101T000003.heapsnapshot', 10, 3);
+
+    enforceHeapSnapshotRetention(dir, { maxCount: 2, maxTotalBytes: 0 });
+
+    // The undeletable dir remains (unlink failed), but the count sweep kept dropping the
+    // NEXT-oldest real files until the on-disk count reached the cap: dir + 1 file = 2.
+    const remaining = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).sort();
+    expect(remaining).toEqual([
+      'heap-20260101T000000.heapsnapshot', // the undeletable dir
+      'heap-20260101T000003.heapsnapshot', // newest real file
+    ]);
+    // cleanup: make the dir removable for afterEach
+    rmSync(unremovable, { recursive: true, force: true });
   });
 
   it('evicts oldest beyond maxTotalBytes', () => {

@@ -439,6 +439,30 @@ export function App({
       );
     };
 
+    // Snapshot whether THIS conversation is already being compacted (by another client)
+    // and, if so, go busy-wait so typed prompts QUEUE instead of submitting into the lock
+    // (→ conversation-busy → failTurnAndDrain losing them). Used at startup AND after
+    // reconnect: the `conversations:compacting` broadcast only reports FUTURE transitions,
+    // so a compaction that began before we attached / while we were disconnected would
+    // otherwise be missed. Returns true iff the active conversation is currently compacting.
+    const syncCompactingState = async (): Promise<boolean> => {
+      if (!convIdRef.current) return false;
+      try {
+        const ids = await client.invoke<string[]>('conversations:compacting-ids');
+        const busy = Array.isArray(ids) && ids.includes(convIdRef.current);
+        if (busy && statusRef.current === 'idle') {
+          compactBusyWaitRef.current = true;
+          setStatus('running');
+          statusRef.current = 'running';
+        }
+        return busy;
+      } catch {
+        return false;
+      }
+    };
+    // Startup: catch a compaction that began before this CLI attached.
+    void syncCompactingState();
+
     const off = client.on('agent:stream-event', (raw) => {
       const e = raw as StreamEvent;
       cliDebugLog(
@@ -639,11 +663,15 @@ export function App({
         setConnState('reconnected');
         if (connClearRef.current) clearTimeout(connClearRef.current);
         connClearRef.current = setTimeout(() => setConnState('ok'), 2500);
+        // A compaction may have STARTED while we were disconnected — snapshot it before
+        // draining so we don't drain a queued prompt into the lock (→ rejected + lost).
+        const compactingNow = await syncCompactingState();
         // A /compact transport failure (or a crash mid-turn) can leave prompts QUEUED with
         // the CLI idle — nothing drains them until the user submits again (out of order /
-        // stuck). Now that we're reconnected and idle, drain one queued prompt as its own
-        // turn (its terminal event drains the rest), matching the compacting-unlock drain.
-        if (statusRef.current === 'idle' && queueRef.current.length > 0) {
+        // stuck). Now that we're reconnected and idle (and NOT compacting), drain one queued
+        // prompt as its own turn (its terminal event drains the rest). If compacting, the
+        // matching `conversations:compacting` false broadcast drains instead.
+        if (!compactingNow && statusRef.current === 'idle' && queueRef.current.length > 0) {
           const next = queueRef.current.shift() as string;
           setStatus('running');
           statusRef.current = 'running';

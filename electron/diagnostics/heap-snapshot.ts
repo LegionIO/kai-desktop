@@ -106,11 +106,17 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
     }
   };
 
-  // Count ceiling.
+  // Count ceiling. A FAILED unlink leaves the file on disk (moved to `failed`), so the
+  // on-disk count is files.length + failed.length — drive the loop on THAT, not files.length
+  // alone. Otherwise a failed unlink followed by a successful one would stop with the cap
+  // still violated (the failed file remains on disk, uncounted). Bounded by guard: once
+  // every remaining `files` entry has failed to unlink, dropFront can't shrink `files`, so
+  // stop rather than spin.
   if (retention.maxCount > 0) {
-    while (files.length > retention.maxCount) {
-      if (files.length === 0) break;
-      dropFront(files);
+    let guard = 0;
+    while (files.length + failed.length > retention.maxCount && files.length > 0 && guard < 1000) {
+      dropFront(files); // always shifts one off `files` (deleted → evicted, or failed → `failed`)
+      guard++;
     }
   }
 
