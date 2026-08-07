@@ -202,12 +202,14 @@ describe('subagent-status helper', () => {
       expect(warnSpy.mock.calls[0][0]).toMatch(/thread sub-missing not found/);
     });
 
-    it('logs and swallows updateThread errors so callers are not blocked', async () => {
+    it('logs and does NOT throw on updateThread errors, but REPORTS failure (returns false)', async () => {
       const { memory } = makeMemoryMock([makeThread('sub-6')]);
       (memory.updateThread as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('storage offline'));
       const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-      await expect(updateSubagentStatus(memory, 'sub-6', { status: 'running' })).resolves.toBeUndefined();
+      // Doesn't throw (callers aren't blocked) but returns false so a caller that must NOT
+      // proceed on a failed status write (e.g. a resume reopen) can detect it.
+      await expect(updateSubagentStatus(memory, 'sub-6', { status: 'running' })).resolves.toBe(false);
       expect(errSpy).toHaveBeenCalled();
     });
   });

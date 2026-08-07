@@ -73,18 +73,18 @@ export async function updateSubagentStatus(
   memory: Memory,
   threadId: string,
   updates: SubagentStatusFields,
-): Promise<void> {
+): Promise<boolean> {
   let existing: Awaited<ReturnType<Memory['getThreadById']>> | null;
   try {
     existing = await memory.getThreadById({ threadId });
   } catch (err) {
     console.error(`[Subagent] Failed to read thread ${threadId}:`, err);
-    return;
+    return false;
   }
 
   if (!existing) {
     console.warn(`[Subagent] Cannot update status — thread ${threadId} not found`);
-    return;
+    return false;
   }
 
   const currentMetadata = (existing.metadata ?? {}) as StoredMetadata;
@@ -95,7 +95,7 @@ export async function updateSubagentStatus(
     const allowed = VALID_TRANSITIONS[currentSub.status] ?? [];
     if (!allowed.includes(updates.status)) {
       console.error(`[Subagent] Illegal status transition for ${threadId}: ${currentSub.status} -> ${updates.status}`);
-      return;
+      return false;
     }
   }
 
@@ -118,8 +118,10 @@ export async function updateSubagentStatus(
       title: existing.title ?? '',
       metadata: nextMetadata,
     });
+    return true;
   } catch (err) {
     console.error(`[Subagent] Failed to update status for ${threadId}:`, err);
+    return false;
   }
 }
 

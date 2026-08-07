@@ -54,9 +54,21 @@ const finalizingSubAgents = new Set<string>();
  * controller) while an older run is still tearing down.
  */
 const subAgentRunGeneration = new Map<string, number>();
+// Bound the generation map: it grows one entry per unique sub-agent id over the process
+// lifetime. A generation only matters while a run/teardown for THAT id is in flight; an id
+// evicted after thousands of newer sub-agents has no such race. Map preserves insertion
+// order → re-insert on bump (recency) + evict the oldest over the cap. (Sub-agent ids are
+// timestamp+random, never reused, so eviction can't collide with a live id.)
+const SUBAGENT_RUN_GENERATION_MAX = 5000;
 function nextRunGeneration(subAgentConversationId: string): number {
   const gen = (subAgentRunGeneration.get(subAgentConversationId) ?? 0) + 1;
+  subAgentRunGeneration.delete(subAgentConversationId); // re-insert at the back (recency)
   subAgentRunGeneration.set(subAgentConversationId, gen);
+  while (subAgentRunGeneration.size > SUBAGENT_RUN_GENERATION_MAX) {
+    const oldest = subAgentRunGeneration.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    subAgentRunGeneration.delete(oldest);
+  }
   return gen;
 }
 /** Map parent toolCallId → subAgentConversationId for observer lookups */
@@ -672,25 +684,25 @@ async function resumeSubAgent(
   // and a late running-write can't overwrite the terminal one. The caller
   // (sendSubAgentFollowUp) intentionally does not await resumeSubAgent, so this
   // only orders the reopen ahead of THIS run's own finalization.
-  try {
-    const memory = getSharedMemory(config, dbPath);
-    if (memory)
-      // Reopen: clear the prior run's terminal metadata too, so a now-running
-      // thread doesn't carry a stale completedAt / exitReason from when it last
-      // finished. The next finalization writes fresh terminal metadata.
-      await updateSubagentStatus(memory, subAgentConversationId, {
+  // Reopen (paused/completed → running), clearing the prior run's terminal metadata so a
+  // now-running thread doesn't carry a stale completedAt/exitReason. updateSubagentStatus
+  // RETURNS false on any failure (read/write error, thread-not-found, or illegal FSM
+  // transition) — it does NOT throw — so check the RESULT, not a catch.
+  const memory = getSharedMemory(config, dbPath);
+  const reopened = memory
+    ? await updateSubagentStatus(memory, subAgentConversationId, {
         status: 'running',
         completedAt: null,
         exitReason: null,
-      });
-  } catch (err) {
-    // The reopen (paused/completed → running) FAILED, so the DB status is still `paused`.
-    // Proceeding would run the turn against that stale status, and its terminal finalization
-    // (running → completed/failed) would be FSM-REJECTED (paused only allows → running/stopped)
-    // → stale `paused` reappears after restart. Instead ABORT the resume cleanly: release the
-    // slot + teardown, leaving the thread cleanly `paused` (resumable — the user can retry the
-    // follow-up). Surface the follow-up back as retained so it isn't lost.
-    console.error('[Subagent] Failed to reopen status on resume — aborting resume (thread stays paused):', err);
+      })
+    : true; // no shared memory (no persistence) → nothing to reopen; proceed
+  if (!reopened) {
+    // The DB status is still `paused`/`completed`. Proceeding would run the turn against
+    // that stale status, and its terminal finalization (running → completed/failed) would be
+    // FSM-REJECTED (paused/completed only allow → running/stopped) → stale status reappears
+    // after restart. ABORT the resume cleanly: release the slot + teardown, retain the
+    // follow-up so it isn't lost, leaving the thread cleanly paused (resumable — user retries).
+    console.error('[Subagent] Failed to reopen status on resume — aborting resume (thread stays paused)');
     cleanupRuntime(subAgentConversationId, resumeGeneration);
     releaseSubAgentSlot();
     retainFollowUpAsPaused(subAgentConversationId, message, 'awaiting-input', {

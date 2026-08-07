@@ -752,6 +752,20 @@ const globalSubAgentAccumulators = new Map<string, MessageAccumulator>();
  * NEW run reuses the id (ids are timestamp+random, so reuse is effectively never).
  */
 const deletedSubAgentIds = new Set<string>();
+// Bound the tombstone set so a long session that deletes many sub-agents can't grow it
+// without limit. A tombstone only needs to outlive the deleted run's in-flight late events
+// (a `stopped` broadcast arriving right after delete); an id deleted thousands of deletions
+// ago has no pending events. Set preserves insertion order → evicting the FIRST drops the
+// OLDEST. Sub-agent ids are timestamp+random (never reused), so eviction is safe.
+const DELETED_SUBAGENT_IDS_MAX = 1000;
+function tombstoneDeletedSubAgent(id: string): void {
+  deletedSubAgentIds.add(id);
+  while (deletedSubAgentIds.size > DELETED_SUBAGENT_IDS_MAX) {
+    const oldest = deletedSubAgentIds.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    deletedSubAgentIds.delete(oldest);
+  }
+}
 let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 
 // --- Stream accumulator functions ---
@@ -3442,7 +3456,13 @@ export function RuntimeProvider({
         // Max turns reached — auto-continue or show interactive continue card
         console.warn(`[StreamEvent] MAX_TURNS conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)}`);
         const agentCfg = (config as Record<string, unknown>)?.agent as Record<string, unknown> | undefined;
-        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true;
+        // NEVER drive the auto-continue from the renderer for a MAIN-OWNED run (automation /
+        // CLI serverPersisted): the renderer only RENDERS those live — main persists + owns
+        // them. A renderer-launched GUI continuation would (a) use the ACTIVE chat's settings
+        // (model/CWD) instead of the run's — relative-path tools in the wrong project — and
+        // (b) double-drive a main-owned turn. main/CLI re-submits to continue its own run.
+        const mainOwned = e.automation || e.serverPersisted || automationStreams.has(convId);
+        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true && !mainOwned;
 
         if (autoContinue) {
           // Auto-continue: finalize current response and immediately restart the stream
@@ -4808,7 +4828,7 @@ export function RuntimeProvider({
       // Tombstone the id BEFORE stopping, so the `stopped` status that stopSubAgent
       // broadcasts asynchronously (and any other late event) can't recreate this
       // just-deleted thread — the event router drops tombstoned ids.
-      deletedSubAgentIds.add(subAgentConversationId);
+      tombstoneDeletedSubAgent(subAgentConversationId);
       // Snapshot the thread so we can RE-INSTATE it if the backend stop fails — otherwise a
       // web transport failure would hide the thread from the UI while the agent keeps
       // executing tools invisibly.
@@ -4850,7 +4870,7 @@ export function RuntimeProvider({
                 !activeIds.includes(subAgentConversationId) &&
                 globalSubAgentThreads.get(subAgentConversationId)?.status === 'running'
               ) {
-                deletedSubAgentIds.add(subAgentConversationId);
+                tombstoneDeletedSubAgent(subAgentConversationId);
                 globalSubAgentThreads.delete(subAgentConversationId);
                 globalSubAgentAccumulators.delete(subAgentConversationId);
                 bumpSubAgentVersion();
