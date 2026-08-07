@@ -13,6 +13,7 @@ import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui
 import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
+import type { AttachedFile } from './AttachmentContext';
 import { useConfig } from './ConfigProvider';
 import {
   createUnifiedSpeechAdapter,
@@ -810,6 +811,13 @@ const persistVersions = new Map<string, number>();
 // deleted). Recording it here — cleared only when a persist returns persisted:true for the
 // same compactionId — lets onNew / continuations recover it and durably re-persist.
 const pendingCompactionHandoff = new Map<string, ConversationCompaction>();
+
+// Per-conversation input that a compact-busy rollback could NOT return to the composer at
+// the time — the user had switched to another chat or started a newer draft, so restoring
+// then would target the wrong conversation or clobber a live draft. Held here and restored
+// by loadConversationState when the user returns to that conversation (into an empty
+// composer only). Cleared on restore or when the conversation is deleted, so it can't leak.
+const rejectedDrafts = new Map<string, { text: string; attachments: AttachedFile[] }>();
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
   return { startedAt };
@@ -2117,6 +2125,18 @@ export function RuntimeProvider({
     currentWorkingDirectoryRef.current = conv.currentWorkingDirectory ?? null;
     setCurrentWorkingDirectoryState(conv.currentWorkingDirectory ?? null);
 
+    // Restore an input that a compact-busy rollback couldn't return to the composer at the
+    // time (the user had switched away or started a newer draft). Only restore into an EMPTY
+    // composer so we never clobber a draft the user is actively typing for this chat.
+    const rejected = rejectedDrafts.get(id);
+    if (rejected) {
+      rejectedDrafts.delete(id);
+      if (rejected.attachments.length > 0 && attachmentsRef.current.length === 0) {
+        addAttachments(rejected.attachments);
+      }
+      restoreComposerDraft(rejected.text);
+    }
+
     // Don't show the running indicator for conversations awaiting user approval —
     // the accumulator is still alive (so hasActiveStream is true) but the model
     // has stopped generating; only user interaction can resume it.
@@ -2245,10 +2265,21 @@ export function RuntimeProvider({
       // so a queued late delta from the cancelled run can't recreate it.
       if (change.kind === 'delete') {
         const deletedId = change.id;
-        if (deletedId && streamAccumulators.has(deletedId)) {
-          supersedeCurrentGeneration(deletedId);
-          streamAccumulators.delete(deletedId);
-          if (activeIdRef.current === deletedId) setIsRunning(false);
+        if (deletedId) {
+          if (streamAccumulators.has(deletedId)) {
+            supersedeCurrentGeneration(deletedId);
+            streamAccumulators.delete(deletedId);
+            if (activeIdRef.current === deletedId) setIsRunning(false);
+          }
+          // Reclaim this conversation's module-level bookkeeping — it's definitively gone,
+          // so no live run can reference these entries again. Bounds long-session growth of
+          // the per-conversation generation/handoff maps. (Sub-agent tombstones are keyed by
+          // sub-agent id, not conversation id, and are handled at sub-agent deletion.)
+          supersededGenerations.delete(deletedId);
+          lastLiveGeneration.delete(deletedId);
+          supersededResponseIds.delete(deletedId);
+          pendingCompactionHandoff.delete(deletedId);
+          rejectedDrafts.delete(deletedId);
         }
         return;
       }
@@ -3344,10 +3375,12 @@ export function RuntimeProvider({
           // accumulator is the one WE created (same pendingAssistantId). A Stop or a
           // replacement/superseding turn swaps the accumulator; a stale retry/launch would
           // then revive cancelled work or clobber the new turn. Check ownership before
-          // every retry AND every launch.
-          const stillOwns = () =>
-            activeIdRef.current === convId &&
-            streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+          // every retry AND every launch. Keyed on ACCUMULATOR OWNERSHIP, NOT active-ness:
+          // the max_turns continuation is MANDATORY and must proceed even if the user has
+          // switched to another chat (a background/CLI run must still continue) — else it's
+          // deleted + persisted idle, silently ending the task. UI updates (setIsRunning)
+          // stay separately active-gated below.
+          const stillOwns = () => streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
           const ownsAcc = () => streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
           // On ownership loss, if WE still own the accumulator (conversation switched away,
           // not a replacement turn), drop it + persist idle so no orphan accumulator / disk
@@ -3628,12 +3661,14 @@ export function RuntimeProvider({
             setTimeout(() => {
               // Ownership check BEFORE replacing the accumulator: the done handler above
               // deleted convId's accumulator, so during this 100ms delay either nothing
-              // took over (still absent) or a replacement turn / chat-switch installed a
-              // NEW accumulator. If one now exists, another run owns convId — don't clobber
-              // it with the stale plan branch. Also require convId to still be the active
-              // chat (the user may have switched away, and reviving `running` + replacing
-              // the accumulator for a background chat would strand it).
-              if (streamAccumulators.has(convId) || activeIdRef.current !== convId) {
+              // took over (still absent) or a replacement turn installed a NEW accumulator.
+              // If one now exists, another run owns convId — don't clobber it with the stale
+              // plan branch. Do NOT bail merely because the user switched chats: the
+              // plan-restart is MANDATORY (the prior stream was aborted for it), and it works
+              // for a background conv (automation/CLI runs are background). The setIsRunning
+              // UI update below stays active-gated so a background restart doesn't show the
+              // wrong chat as running.
+              if (streamAccumulators.has(convId)) {
                 console.info(`[UI:stream] ${label} — abandoned (conversation no longer owned)`);
                 return;
               }
@@ -3656,7 +3691,7 @@ export function RuntimeProvider({
                   seededBackground: acc.seededBackground,
                   seededDiskHeadId: acc.seededDiskHeadId,
                 });
-                setIsRunning(true);
+                if (activeIdRef.current === convId) setIsRunning(true);
                 const planContinuationPersist = persistConversation(
                   convId,
                   treeForStream,
@@ -3705,7 +3740,11 @@ export function RuntimeProvider({
                   // revive cancelled work or clobber the new turn.
                   const ownsAccumulator = () =>
                     streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
-                  const stillOwnsPlan = () => activeIdRef.current === convId && ownsAccumulator();
+                  // Keyed on ACCUMULATOR OWNERSHIP, NOT active-ness — the plan-restart is
+                  // MANDATORY and must proceed even after a chat switch (it works for a
+                  // background conv). A Stop / replacement turn swaps pendingAssistantId and
+                  // correctly abandons it. UI updates below stay active-gated.
+                  const stillOwnsPlan = () => ownsAccumulator();
                   // On ownership loss we must not silently leave an orphan accumulator +
                   // disk runStatus:'running'. If WE still own the accumulator (the user just
                   // switched conversations, not a replacement turn), drop it + persist idle.
@@ -3951,22 +3990,31 @@ export function RuntimeProvider({
         // C's accumulator (which would strand C's run) nor restore our stale tree/draft.
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
-        // Only touch UI/composer state if THIS conversation is still active — the user may
-        // have switched to another chat during the awaited put, and restoring A's tree/
-        // head/draft onto B would corrupt B (its next send could persist A's branch).
-        if (activeIdRef.current === convId) {
+        // Restore the submitted input so it isn't lost. If THIS conversation is active AND
+        // the composer is empty, put it straight back. Otherwise (the user switched to
+        // another chat, or started a newer draft here) we can't restore now without
+        // targeting the wrong conversation / clobbering a live draft — STASH it so
+        // loadConversationState restores it when the user returns to this chat.
+        const composerHasNewDraft =
+          activeIdRef.current === convId && (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
+        const canRestoreNow = activeIdRef.current === convId && attachmentsRef.current.length === 0 && !composerHasNewDraft;
+        if (canRestoreNow) {
           setTree(tree);
           setHeadId(headId);
           setIsRunning(false);
-          // Restore the draft so it isn't lost: re-add the consumed attachments and put the
-          // submitted text back into the composer (the composer cleared it on submit) —
-          // but only if the user hasn't started a NEW draft during the await. Re-adding
-          // unconditionally would MERGE the old attachments into a new draft's attachments
-          // and could send them unintentionally.
-          if (pendingAttachments.length > 0 && attachmentsRef.current.length === 0) {
-            addAttachments(pendingAttachments);
-          }
+          if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
           restoreComposerDraft(submittedText);
+        } else {
+          // Roll back the tree/running state for the active chat if it's this one, but keep
+          // the input for later restoration rather than dropping it.
+          if (activeIdRef.current === convId) {
+            setTree(tree);
+            setHeadId(headId);
+            setIsRunning(false);
+          }
+          if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+            rejectedDrafts.set(convId, { text: submittedText, attachments: pendingAttachments });
+          }
         }
         return;
       }
@@ -3992,9 +4040,12 @@ export function RuntimeProvider({
           threadOverrides ?? undefined,
           responseMessageId,
         );
-      const ownsNew = () =>
-        activeIdRef.current === convId &&
-        streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
+      // Ownership is keyed on the ACCUMULATOR (pendingAssistantId), NOT active-ness — a
+      // legitimately-started turn for THIS conversation must launch + settle even if the
+      // user has since switched to another chat (else A's accumulator + persisted
+      // `running` status are stranded running forever). A Stop or a superseding turn
+      // replaces pendingAssistantId, which correctly abandons this chain.
+      const ownsNew = () => streamAccumulators.get(convId)?.pendingAssistantId === responseMessageId;
       const nowPending = streamAccumulators.get(convId)?.pendingCompaction;
       if (ownsNew() && nowPending && nowPending.compactionId !== persistedCompactionId) {
         const durablyPersistThenLaunch = (remaining: number): void => {
