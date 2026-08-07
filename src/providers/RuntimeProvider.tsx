@@ -751,21 +751,43 @@ const supersededGenerations = new Map<string, Set<string>>();
  *  Without this, superseding that accumulator would record nothing, and a late event from
  *  the superseded run could then LOCK the replacement accumulator to the old generation. */
 const lastLiveGeneration = new Map<string, string>();
+/** Per-conversation set of the SUPERSEDED runs' responseMessageIds. A run whose FIRST
+ *  event is still queued in the IPC channel when it is superseded has neither locked its
+ *  accumulator's generation NOR appeared in lastLiveGeneration — so a generation blacklist
+ *  alone can't catch it, and its queued first event would LOCK the replacement accumulator.
+ *  Every streamed event also carries the run's responseMessageId (mastra-agent yields
+ *  `{...event, responseMessageId}`), which equals the superseded accumulator's
+ *  pendingAssistantId, so recording that id lets the guard drop the queued event before it
+ *  locks. (Main's server-side token check drops all superseded events once the replacement
+ *  registers its token; this only covers the brief pre-registration window in the renderer.) */
+const supersededResponseIds = new Map<string, Set<string>>();
 /** Mark the CURRENT accumulator's run generation superseded before installing a
  *  replacement, so its in-flight late events can't bind/hijack the new accumulator. */
 function supersedeCurrentGeneration(convId: string): void {
+  const acc = streamAccumulators.get(convId);
   // Prefer the accumulator's locked generation; fall back to the last live generation seen
   // for this conversation so an as-yet-unlocked (untagged-external) accumulator is still
   // superseded. Both are recorded to cover the transition window.
-  const locked = streamAccumulators.get(convId)?.runGeneration;
+  const locked = acc?.runGeneration;
   const live = lastLiveGeneration.get(convId);
   const gens = [locked, live].filter((g): g is string => !!g);
-  if (gens.length === 0) return;
-  let set = supersededGenerations.get(convId);
-  if (!set) supersededGenerations.set(convId, (set = new Set()));
-  for (const gen of gens) {
-    set.add(gen);
-    if (set.size > 32) set.delete(set.values().next().value as string); // bound
+  if (gens.length > 0) {
+    let set = supersededGenerations.get(convId);
+    if (!set) supersededGenerations.set(convId, (set = new Set()));
+    for (const gen of gens) {
+      set.add(gen);
+      if (set.size > 32) set.delete(set.values().next().value as string); // bound
+    }
+  }
+  // Also blacklist the outgoing run's responseMessageId to catch a run whose first event
+  // never reached the renderer (so neither generation was recorded) — its queued event
+  // carries this id and must not lock the replacement accumulator.
+  const rid = acc?.pendingAssistantId;
+  if (rid) {
+    let rset = supersededResponseIds.get(convId);
+    if (!rset) supersededResponseIds.set(convId, (rset = new Set()));
+    rset.add(rid);
+    if (rset.size > 32) rset.delete(rset.values().next().value as string); // bound
   }
 }
 /** Conversations whose live accumulator is driven by an automation run (not an
@@ -2669,6 +2691,24 @@ export function RuntimeProvider({
       }
 
       const acc = streamAccumulators.get(convId)!;
+      // Drop an event from a run whose responseMessageId was blacklisted at supersession —
+      // this catches a superseded run whose first event was still queued (so neither its
+      // generation nor a lastLiveGeneration was ever recorded); without this its queued
+      // event would lock the replacement accumulator's generation. Exempt `compaction`
+      // (its paid summary is captured into the handoff below regardless of run) and only
+      // act when it targets a DIFFERENT run than the accumulator now holds (a matching
+      // pendingAssistantId means we ARE that run — don't drop our own events).
+      {
+        const evRid = (e as { responseMessageId?: string }).responseMessageId;
+        if (
+          evRid &&
+          e.type !== 'compaction' &&
+          evRid !== acc.pendingAssistantId &&
+          supersededResponseIds.get(convId)?.has(evRid)
+        ) {
+          return;
+        }
+      }
       // Run-generation guard: main stamps every event of a run with that run's STABLE
       // token (e.runGeneration). An accumulator LOCKS to the first generation it sees; a
       // later event bearing a DIFFERENT generation is from a SUPERSEDED run (the
@@ -3561,6 +3601,17 @@ export function RuntimeProvider({
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
+              // Ownership check BEFORE replacing the accumulator: the done handler above
+              // deleted convId's accumulator, so during this 100ms delay either nothing
+              // took over (still absent) or a replacement turn / chat-switch installed a
+              // NEW accumulator. If one now exists, another run owns convId — don't clobber
+              // it with the stale plan branch. Also require convId to still be the active
+              // chat (the user may have switched away, and reviving `running` + replacing
+              // the accumulator for a background chat would strand it).
+              if (streamAccumulators.has(convId) || activeIdRef.current !== convId) {
+                console.info(`[UI:stream] ${label} — abandoned (conversation no longer owned)`);
+                return;
+              }
               const headForStream = acc.headId;
               if (headForStream) {
                 const treeForStream = [...acc.messages];
@@ -3869,6 +3920,11 @@ export function RuntimeProvider({
       // back the optimistic user message + running state and DON'T launch the stream (it
       // would be rejected too). The user can resend once compaction finishes.
       if (persistRes?.rejected) {
+        // Only tear down if we STILL OWN the accumulator. A /compact-concurrent send can
+        // await this persist while a Stop or a superseding turn (run C) replaces the
+        // accumulator with a new pendingAssistantId; our stale rejection must not delete
+        // C's accumulator (which would strand C's run) nor restore our stale tree/draft.
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
         // Only touch UI/composer state if THIS conversation is still active — the user may
         // have switched to another chat during the awaited put, and restoring A's tree/
@@ -3995,6 +4051,7 @@ export function RuntimeProvider({
       // /compact holds the conversation — a regenerate is a head-changing op the put-guard
       // rejects. Roll back head + running state and don't launch (no draft to preserve).
       if (reloadPersistRes?.rejected) {
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
         if (activeIdRef.current === convId) {
           setHeadId(reloadPreHead);
@@ -4125,6 +4182,7 @@ export function RuntimeProvider({
       // /compact holds the conversation: roll back the optimistic edit, restore the
       // composer draft, and don't launch (the stream would be rejected too).
       if (editPersistRes?.rejected) {
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
         if (activeIdRef.current === convId) {
           setTree(preEditTree);
@@ -4562,6 +4620,7 @@ export function RuntimeProvider({
       });
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
       if (persistRes?.rejected) {
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
         if (activeIdRef.current === convId) {
           setTree(prevTree);
@@ -4644,6 +4703,7 @@ export function RuntimeProvider({
     // /compact holds the conversation: roll back the optimistic continue turn + running
     // state and don't launch (the stream would be rejected as busy too).
     if (continuePersistRes?.rejected) {
+      if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
       streamAccumulators.delete(convId);
       if (activeIdRef.current === convId) {
         setTree(currentTree);

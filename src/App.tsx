@@ -2789,6 +2789,7 @@ function AppShell() {
                         setActiveView(CHAT_VIEW);
                         return handleNewConversation();
                       }}
+                      activeConversationId={activeConversationId}
                       workspaceId={activeWorkspaceId}
                     />
                   ) : activeView === TASKS_VIEW ? (

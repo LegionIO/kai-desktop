@@ -52,6 +52,7 @@ type ConversationSummary = Pick<
 type ChatsListPageProps = {
   onOpenConversation: (id: string) => void;
   onNewConversation: () => Promise<void> | void;
+  activeConversationId?: string | null;
   workspaceId?: string | null;
 };
 
@@ -108,21 +109,36 @@ export type FilterableConversation = {
   hasMedia?: boolean;
 };
 
+/** Format an ISO timestamp as its LOCAL calendar day (yyyy-mm-dd), matching what
+ *  `<input type="date">` produces. Returns '' for a missing/invalid timestamp. Uses the
+ *  local components (not a UTC slice) so day bucketing agrees with the user's clock. */
+export function localCalendarDay(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 /** Apply the advanced FilterPopover criteria to a single summary. Pure — exported
  *  for unit tests. A boolean toggle set to `true` requires the flag be truthy; a
- *  toggle left `null` is ignored. Date bounds compare ISO strings lexically
- *  (safe for the same offset), count bounds are inclusive. */
+ *  toggle left `null` is ignored. Date bounds compare LOCAL calendar days,
+ *  count bounds are inclusive. */
 export function matchesAdvancedFilter(conv: FilterableConversation, filter: FilterPreference): boolean {
   if (filter.hasToolCalls === true && !conv.hasToolCalls) return false;
   if (filter.hasComputerUse === true && !conv.hasComputerUse) return false;
   if (filter.hasMedia === true && !conv.hasMedia) return false;
   if (filter.messageCountMin != null && (conv.messageCount ?? 0) < filter.messageCountMin) return false;
   if (filter.messageCountMax != null && (conv.messageCount ?? 0) > filter.messageCountMax) return false;
-  // Date bounds are yyyy-mm-dd from <input type="date">; compare against the date
-  // portion of the ISO timestamps so a whole-day "before" is inclusive of that day.
-  const createdDay = conv.createdAt?.slice(0, 10) ?? '';
+  // Date bounds are yyyy-mm-dd from <input type="date">, which are LOCAL calendar days.
+  // Derive the local yyyy-mm-dd from each ISO timestamp (NOT its UTC date-slice) so a
+  // conversation near midnight is bucketed under the day the user actually sees — e.g. Aug 5
+  // 8 PM CDT is Aug 5 locally even though its UTC slice reads Aug 6.
+  const createdDay = localCalendarDay(conv.createdAt);
   const updatedSrc = conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt ?? conv.createdAt;
-  const updatedDay = updatedSrc?.slice(0, 10) ?? '';
+  const updatedDay = localCalendarDay(updatedSrc);
   if (filter.createdAfter && createdDay < filter.createdAfter) return false;
   if (filter.createdBefore && createdDay > filter.createdBefore) return false;
   if (filter.updatedAfter && updatedDay < filter.updatedAfter) return false;
@@ -130,7 +146,12 @@ export function matchesAdvancedFilter(conv: FilterableConversation, filter: Filt
   return true;
 }
 
-export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNewConversation, workspaceId }) => {
+export const ChatsListPage: FC<ChatsListPageProps> = ({
+  onOpenConversation,
+  onNewConversation,
+  activeConversationId,
+  workspaceId,
+}) => {
   const fullWidth = useFullWidthContent();
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -223,6 +244,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
 
   const handleDelete = useCallback(
     async (id: string) => {
+      const deletingActive = activeConversationId != null && id === activeConversationId;
       await app.conversations.delete(id);
       setSelectedIds((prev) => {
         const next = new Set(prev);
@@ -230,8 +252,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
         return next;
       });
       await loadConversations();
+      // Deleting the conversation the runtime is currently attached to would leave it
+      // streaming/persisting against a now-missing record — detach by starting a fresh chat
+      // (mirrors the sidebar's active-delete handling).
+      if (deletingActive) await onNewConversation();
     },
-    [loadConversations],
+    [activeConversationId, loadConversations, onNewConversation],
   );
 
   const handleRename = useCallback(
@@ -272,10 +298,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
   }, [selectedIds, filterMode, loadConversations]);
 
   const handleBulkDelete = useCallback(async () => {
+    const deletingActive = activeConversationId != null && selectedIds.has(activeConversationId);
     await app.conversations.deleteMany([...selectedIds]);
     setSelectedIds(new Set());
     await loadConversations();
-  }, [selectedIds, loadConversations]);
+    if (deletingActive) await onNewConversation();
+  }, [activeConversationId, selectedIds, loadConversations, onNewConversation]);
 
   const handleRowContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>, convId: string) => {
     e.preventDefault();
@@ -381,10 +409,12 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
   const handleDeleteView = useCallback(async () => {
     const ids = processed.map((c) => c.id);
     if (ids.length === 0) return;
+    const deletingActive = activeConversationId != null && ids.includes(activeConversationId);
     await app.conversations.deleteMany(ids);
     setSelectedIds(new Set());
     await loadConversations();
-  }, [processed, loadConversations]);
+    if (deletingActive) await onNewConversation();
+  }, [processed, activeConversationId, loadConversations, onNewConversation]);
 
   const isSelecting = selectedIds.size > 0;
   const allSelected = isSelecting && processed.length > 0 && processed.every((c) => selectedIds.has(c.id));

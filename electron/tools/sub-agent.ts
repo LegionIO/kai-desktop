@@ -527,9 +527,22 @@ export function sendSubAgentFollowUp(subAgentConversationId: string, message: st
     return true;
   }
 
-  // If running, push to the active queue.
+  // If running, push to the active queue — but ONLY if the run's controller is still live.
+  // Between a Stop (controller.abort()) and the run's teardown (finalizeSubAgentRun, which
+  // deletes the queue at line ~189 and drops resumable state at ~210), followUpQueues still
+  // holds an entry; pushing here would return success yet the aborting run discards the
+  // queue at finalization → the message is silently lost after the caller cleared its input.
+  // When the controller is aborted (or the run is already finalizing), REJECT (return false)
+  // so the caller keeps the composer text and can resend once the sub-agent settles to a
+  // resumable state — matching finalizeSubAgentRun's abort contract (non-resumable ⇒ ok:false,
+  // text retained). Do NOT fall through to resume here: subAgentState still holds the
+  // about-to-be-deleted snapshot, so a resume would race the teardown.
   const queue = followUpQueues.get(subAgentConversationId);
   if (queue) {
+    const controllerAborted = activeSubAgentControllers.get(subAgentConversationId)?.signal.aborted;
+    if (controllerAborted || finalizingSubAgents.has(subAgentConversationId)) {
+      return false;
+    }
     queue.push(message);
     return true;
   }
