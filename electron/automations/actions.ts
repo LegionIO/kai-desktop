@@ -4,7 +4,7 @@ import { Notification } from 'electron';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
-import { broadcastAgentStreamEvent } from '../ipc/agent.js';
+import { broadcastAgentStreamEvent, isConversationTurnActive } from '../ipc/agent.js';
 import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
 import { isCompacting } from '../agent/compaction-lock.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
@@ -435,7 +435,12 @@ async function runAgentAction(
   // and re-resolve; never inject the ordered turn into a non-existent run.
   if (opts?.orderedExecution && action.conversationTarget?.type === 'existing') {
     const targetId = action.conversationTarget.conversationId;
-    if (!isAutomationRunInFlight(targetId)) {
+    // Clear the disk running/awaiting flag as STALE only when NEITHER an automation run NOR a
+    // GUI/CLI stream is actually in flight. A disk `running` can also be a LIVE interactive
+    // turn (activeStreams / a pending submit) — the raising turn's disk write lands after
+    // streaming begins — so clearing it and launching would race the live turn (duplicate /
+    // conflicting tool side effects). isConversationTurnActive covers both stream sources.
+    if (!isAutomationRunInFlight(targetId) && !isConversationTurnActive(targetId)) {
       const stuck = readConversation(deps.appHome, targetId);
       if (stuck && (stuck.runStatus === 'running' || stuck.runStatus === 'awaiting-approval')) {
         writeConversation(deps.appHome, { ...stuck, runStatus: 'idle' });

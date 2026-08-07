@@ -12,7 +12,7 @@ vi.mock('electron', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
 vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: 'AGENT SAYS HI', modelKey: 'test', toolCalls: [] })),
   // Conversation-mode runs stream; yield a text delta then done carrying modelKey.
@@ -70,7 +70,7 @@ vi.mock('../../ipc/conversations.js', () => ({
   }),
   registerAutomationAborter: vi.fn(),
 }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readIndex: vi.fn(() => ({
     conversations: mockStore.conversations,

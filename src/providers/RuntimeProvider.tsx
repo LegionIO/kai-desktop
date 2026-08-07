@@ -2928,14 +2928,18 @@ export function RuntimeProvider({
       // re-add the marker after a renderer (GUI) turn took over + cleared it (else the GUI
       // replacement is treated as server-persisted → its output is never persisted and
       // vanishes on completion). Skip when: (a) this event's generation was superseded, or
-      // (b) an accumulator exists locked to a DIFFERENT generation (a stale event for a run
-      // that no longer owns the conversation).
+      // (b) an accumulator exists locked to a DIFFERENT generation, or (c) a LOCALLY-ORIGINATED
+      // (GUI) accumulator currently owns the conversation — that turn is renderer-persisted, so
+      // ANY main-owned event reaching here is a stale/foreign run's (the GUI accumulator may not
+      // have LOCKED its generation yet, so the staleVsLock check alone misses this window).
       if (e.automation || e.serverPersisted) {
         const addGen = (e as { runGeneration?: string }).runGeneration;
-        const lockedGen = streamAccumulators.get(convId)?.runGeneration;
+        const ownerAcc = streamAccumulators.get(convId);
+        const lockedGen = ownerAcc?.runGeneration;
         const superseded = !!addGen && supersededGenerations.get(convId)?.has(addGen);
         const staleVsLock = !!addGen && lockedGen != null && lockedGen !== addGen;
-        if (!superseded && !staleVsLock) automationStreams.add(convId);
+        const localOwnerActive = ownerAcc?.locallyOriginated === true;
+        if (!superseded && !staleVsLock && !localOwnerActive) automationStreams.add(convId);
       }
 
       // A queued event from a SUPERSEDED run (e.g. a post-Stop delta whose Stop already
@@ -4293,7 +4297,17 @@ export function RuntimeProvider({
       // The main process writes the authoritative [user, assistant] turns; a
       // debounced renderer persist here could write a partial assistant-only
       // branch before the main write lands, creating duplicate/orphaned nodes.
-      if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
+      // ALSO skip persist for a PASSIVE MIRROR of another client's GUI turn (an accumulator
+      // this client did NOT originate — locallyOriginated !== true — built from broadcast
+      // events): the ORIGINATING client persists it. A mirror persisting here would write a
+      // fabricated pre-reload user node + partial branch and corrupt the tree; it renders live
+      // and reconciles from disk on the terminal event.
+      if (
+        e.automation ||
+        e.serverPersisted ||
+        automationStreams.has(convId) ||
+        (streamAccumulators.get(convId) && acc.locallyOriginated !== true)
+      ) {
         if (isActiveConv && !acc.awaitingApproval) setIsRunning(true);
         return;
       }

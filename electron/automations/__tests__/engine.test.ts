@@ -28,7 +28,7 @@ vi.mock('../../ipc/conversation-store.js', () => ({
   readConversation: () => null,
   writeConversation: () => {},
 }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: () => {} }));
+vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: () => {}, isConversationTurnActive: () => false }));
 
 import type { AutomationRule, AutomationsConfig } from '../../config/schema.js';
 import { AutomationEngine, type EngineDeps } from '../engine.js';
