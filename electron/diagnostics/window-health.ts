@@ -695,8 +695,18 @@ export class WindowHealthMonitor {
     if (this.recoveryRunning) return;
     this.recoveryRunning = true;
     this.pendingTrigger = null;
+    // The captured `window` must remain the CURRENT primary across each await — a
+    // close+recreate during a slow probe would otherwise make reviveNativeSurface/reload
+    // operate on the NEW window, and the finally would clear a fresh recovery's flag. Bail
+    // (without clearing the flag if a new recovery now owns it) when ownership is lost.
+    let window: HealthWindow | null = null;
+    const stillOwnsRecovery = (): boolean =>
+      window !== null &&
+      this.options.getPrimaryWindow() === window &&
+      !window.isDestroyed() &&
+      !window.webContents.isDestroyed();
     try {
-      const window = this.options.getPrimaryWindow();
+      window = this.options.getPrimaryWindow();
       if (!window || window.isDestroyed() || window.webContents.isDestroyed()) {
         this.log('recovery-skipped', { trigger, reason: 'no-primary-window' });
         return;
@@ -712,6 +722,10 @@ export class WindowHealthMonitor {
 
       this.log('recovery-probe-started', { trigger, ...this.windowDetails(window) }, true);
       const firstProbe = await this.probe(window);
+      if (!stillOwnsRecovery()) {
+        this.log('recovery-skipped', { trigger, reason: 'window-replaced-during-probe' });
+        return;
+      }
       this.log('recovery-probe-result', { trigger, attempt: 1, ...firstProbe }, !firstProbe.healthy);
       this.checkHeapPressure(trigger, 1, firstProbe);
       if (firstProbe.healthy) return;
@@ -727,6 +741,10 @@ export class WindowHealthMonitor {
       await new Promise((resolve) => setTimeout(resolve, this.surfaceRetryDelayMs));
 
       const secondProbe = await this.probe(window);
+      if (!stillOwnsRecovery()) {
+        this.log('recovery-skipped', { trigger, reason: 'window-replaced-during-probe' });
+        return;
+      }
       this.log('recovery-probe-result', { trigger, attempt: 2, ...secondProbe }, !secondProbe.healthy);
       this.checkHeapPressure(trigger, 2, secondProbe);
       if (secondProbe.healthy) return;
@@ -750,9 +768,15 @@ export class WindowHealthMonitor {
       this.log('auto-reload', { trigger, reason: 'two-failed-health-probes' }, true);
       window.webContents.reload();
     } finally {
-      this.recoveryRunning = false;
-      const pending = this.pendingTrigger;
-      if (pending && !this.recoveryTimer) this.requestRecovery(pending, 1_000);
+      // Clear the flag ONLY if we still own the recovery — a close+recreate during an await
+      // may have started a NEW recovery for the replacement window; clearing then would let
+      // two recoveries overlap. (The mid-body `recoveryRunning = false` for the deferred path
+      // above is guarded by an immediate return + fresh requestRecovery.)
+      if (window === null || this.options.getPrimaryWindow() === window) {
+        this.recoveryRunning = false;
+        const pending = this.pendingTrigger;
+        if (pending && !this.recoveryTimer) this.requestRecovery(pending, 1_000);
+      }
     }
   }
 

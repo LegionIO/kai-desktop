@@ -925,10 +925,36 @@ export function App({
             // its own turn, else go idle. (queueRef/sendMessageRef are stable refs.)
             const compactBusy = res?.error === 'conversation-busy';
             if (compactTransportFailed) {
-              // Bridge disconnected — the submit would fail and recursively drain the rest.
-              // Keep the queue intact + go idle; it drains after reconnect on the next turn.
+              // The /compact invoke failed. This may be a full disconnect (a reconnect will
+              // drain the queue) OR an individual invoke TIMEOUT while the socket stays
+              // connected — in which case NO reconnect fires and any queued prompt would be
+              // stranded indefinitely. Probe compacting-ids: if this conv isn't actually
+              // compacting, drain the next queued prompt now; if it is (the /compact may have
+              // started before the timeout), busy-wait for the unlock broadcast.
               setStatus('idle');
               statusRef.current = 'idle';
+              if (queueRef.current.length > 0) {
+                const cid = convIdRef.current;
+                void client
+                  .invoke<string[]>('conversations:compacting-ids')
+                  .then((ids) => {
+                    const compacting = Array.isArray(ids) && cid != null && ids.includes(cid);
+                    if (compacting) {
+                      compactBusyWaitRef.current = true;
+                      setStatus('running');
+                      statusRef.current = 'running';
+                    } else if (statusRef.current === 'idle' && queueRef.current.length > 0) {
+                      const next = queueRef.current.shift() as string;
+                      setStatus('running');
+                      statusRef.current = 'running';
+                      setTimeout(() => sendMessageRef.current(next), 0);
+                    }
+                  })
+                  .catch(() => {
+                    // Probe failed too (likely a real disconnect) — leave the queue for the
+                    // reconnect drain.
+                  });
+              }
             } else if (compactBusy && res?.busyKind === 'compaction') {
               // ANOTHER client is compacting this conversation (no stream terminal event
               // will reach us). STAY BUSY so prompts keep QUEUEING, and drain when the

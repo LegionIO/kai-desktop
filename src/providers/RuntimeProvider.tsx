@@ -2280,6 +2280,27 @@ export function RuntimeProvider({
     void loadConversationState(conversationId);
   }, [conversationId, activeConversationId, loadConversationState]);
 
+  // Surface a compact-busy rejected draft while the user REMAINS in the chat: the stash is
+  // normally restored by loadConversationState on switch-back, but if the user stayed (with a
+  // newer draft that blocked immediate restore), that never fires. Poll gently; the moment
+  // the active chat's composer is empty AND a stash exists, restore it (into the empty
+  // composer only — never clobber a draft they're typing). Cheap: only acts when a stash
+  // exists for the active conv.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const id = activeIdRef.current;
+      if (!id || !rejectedDrafts.has(id)) return;
+      const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
+      if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return;
+      const rejected = rejectedDrafts.get(id);
+      if (!rejected) return;
+      rejectedDrafts.delete(id);
+      if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+      restoreComposerDraft(rejected.text);
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [addAttachments]);
+
   // Reload the active conversation when the main process appends to it (e.g. an
   // automation targeting this thread). Our own persists never grow the tree past
   // treeRef.current, so a longer incoming tree reliably signals an external append.
@@ -3454,6 +3475,16 @@ export function RuntimeProvider({
               void persistConversation(convId, acc.messages, acc.headId, { runStatus: 'idle' });
             }
           };
+          // Abandon the mandatory continuation (retry budget exhausted / doomed). MUST persist
+          // runStatus:'idle' — deleting only the accumulator leaves the disk record 'running'
+          // forever (sidebar shows busy + /compact rejects the conversation until another turn
+          // completes or the backend restarts). Only when WE still own the accumulator.
+          const abandonContinuation = (): void => {
+            if (!ownsAcc()) return;
+            streamAccumulators.delete(convId);
+            void persistConversation(convId, acc.messages, acc.headId, { runStatus: 'idle' });
+            if (activeIdRef.current === convId) setIsRunning(false);
+          };
           // Schedule a retry that RE-CHECKS ownership when the timer fires, BEFORE issuing
           // repersistContinuation() — a Stop during the delay must not trigger a persist
           // that re-stamps runStatus:'running'. If ownership was lost, clean up instead.
@@ -3482,32 +3513,29 @@ export function RuntimeProvider({
                 // launching would reload the raw branch + re-bill. Retry (bounded) or abandon.
                 if (remaining > 0) scheduleRetry(remaining);
                 else {
-                  streamAccumulators.delete(convId);
-                  if (activeIdRef.current === convId) setIsRunning(false);
+                  abandonContinuation();
                 }
               } else if (r?.rejected) {
                 if (remaining > 0) {
                   scheduleRetry(remaining);
                 } else {
                   // Give up cleanly rather than launch into a busy backend: drop the
-                  // accumulator + go idle (the incomplete-task banner stays for a manual retry).
-                  streamAccumulators.delete(convId);
-                  if (activeIdRef.current === convId) setIsRunning(false);
+                  // accumulator + persist idle (the incomplete-task banner stays for a manual
+                  // retry). Persisting idle prevents a stuck disk runStatus:'running'.
+                  abandonContinuation();
                 }
               } else if (r?.superseded && remaining > 0) {
                 launchAfterCompactionPersist(remaining - 1, repersistContinuation());
               } else {
                 // superseded with no budget left — abandon (don't launch without the record).
-                streamAccumulators.delete(convId);
-                if (activeIdRef.current === convId) setIsRunning(false);
+                abandonContinuation();
               }
             }, () => {
               // persist threw — treat as unknown: retry if still owning + budget, else abandon.
               if (!stillOwns()) return;
               if (remaining > 0) scheduleRetry(remaining);
               else {
-                streamAccumulators.delete(convId);
-                if (activeIdRef.current === convId) setIsRunning(false);
+                abandonContinuation();
               }
             });
           };
@@ -4100,7 +4128,10 @@ export function RuntimeProvider({
             setHeadId(headId);
             setIsRunning(false);
           }
-          if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+          if ((submittedText.trim().length > 0 || pendingAttachments.length > 0) && !rejectedDrafts.has(convId)) {
+            // Don't OVERWRITE an existing stash — a second rejection would otherwise lose the
+            // first rejected message. Keep the earliest; the composer-empty restore (or a
+            // reload) surfaces it, then a later rejection can stash again.
             rejectedDrafts.set(convId, { text: submittedText, attachments: pendingAttachments });
           }
         }
@@ -4206,12 +4237,26 @@ export function RuntimeProvider({
 
       const newTree = [...tree]; // keep all existing messages (old branches preserved)
       const responseMessageId = msgId();
+      // Capture THIS run's settings + CWD NOW (before any await) so a later continuation —
+      // and the launch below — use A's workspace even if the user switches to B during the
+      // awaited persist (reading currentWorkingDirectoryRef live would pick up B's CWD).
+      const reloadRunCwd = currentWorkingDirectoryRef.current;
+      const reloadRunConfig = {
+        selectedModelKey,
+        reasoningEffort,
+        selectedProfileKey,
+        fallbackEnabled,
+        cwd: reloadRunCwd,
+        executionMode,
+        threadOverrides,
+      };
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
         messages: newTree,
         headId: actualParent,
         pendingAssistantTiming: createPendingAssistantTiming(),
         pendingAssistantId: responseMessageId,
+        runConfig: reloadRunConfig,
       });
       const branch = getActiveBranch(newTree, actualParent);
       const reloadPreHead = headIdRef.current;
@@ -4240,7 +4285,7 @@ export function RuntimeProvider({
         reasoningEffort ?? 'medium',
         selectedProfileKey ?? undefined,
         fallbackEnabled ?? false,
-        currentWorkingDirectoryRef.current ?? undefined,
+        reloadRunCwd ?? undefined,
         executionMode ?? 'auto',
         threadOverrides ?? undefined,
         responseMessageId,
@@ -4338,11 +4383,24 @@ export function RuntimeProvider({
       setIsRunning(true);
 
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
+      // Capture THIS run's settings + CWD before the persist await so the launch + any later
+      // continuation use A's workspace even if the user switches to B during the await.
+      const editRunCwd = currentWorkingDirectoryRef.current;
+      const editRunConfig = {
+        selectedModelKey,
+        reasoningEffort,
+        selectedProfileKey,
+        fallbackEnabled,
+        cwd: editRunCwd,
+        executionMode,
+        threadOverrides,
+      };
       streamAccumulators.set(convId, {
         messages: [...newTree],
         headId: newHead,
         pendingAssistantTiming,
         pendingAssistantId: responseMessageId,
+        runConfig: editRunConfig,
       });
       const branch = getActiveBranch(newTree, newHead);
 
@@ -4357,6 +4415,12 @@ export function RuntimeProvider({
           setHeadId(preEditHead);
           setIsRunning(false);
           restoreComposerDraft(editedText);
+        } else if (editedText.trim().length > 0 && !rejectedDrafts.has(convId)) {
+          // The user switched away before the /compact rejection returned — can't restore the
+          // edited text into the (now other) composer now, so STASH it for when they return
+          // (parity with the onNew rollback; loadConversationState / the composer-empty effect
+          // restore it). Don't overwrite an existing stash (a second rejection would lose it).
+          rejectedDrafts.set(convId, { text: editedText, attachments: [] });
         }
         return;
       }
@@ -4374,7 +4438,7 @@ export function RuntimeProvider({
         reasoningEffort ?? 'medium',
         selectedProfileKey ?? undefined,
         fallbackEnabled ?? false,
-        currentWorkingDirectoryRef.current ?? undefined,
+        editRunCwd ?? undefined,
         executionMode ?? 'auto',
         threadOverrides ?? undefined,
         responseMessageId,
@@ -4796,6 +4860,18 @@ export function RuntimeProvider({
       const newHead = cfg.headId;
       const branch = getActiveBranch(updated, newHead);
       const responseMessageId = msgId();
+      // Capture CWD + settings NOW (cfg is already a synchronous snapshot) so the launch +
+      // any continuation use A's workspace even if the user switches during the persist await.
+      const variantRunCwd = currentWorkingDirectoryRef.current;
+      const variantRunConfig = {
+        selectedModelKey: cfg.selectedModelKey,
+        reasoningEffort: cfg.reasoningEffort,
+        selectedProfileKey: cfg.selectedProfileKey,
+        fallbackEnabled: cfg.fallbackEnabled,
+        cwd: variantRunCwd,
+        executionMode,
+        threadOverrides: cfg.threadOverrides,
+      };
       setTree(updated);
       setIsRunning(true);
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
@@ -4804,6 +4880,7 @@ export function RuntimeProvider({
         headId: newHead,
         pendingAssistantTiming: createPendingAssistantTiming(),
         pendingAssistantId: responseMessageId,
+        runConfig: variantRunConfig,
       });
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
       if (persistRes?.rejected) {
@@ -4825,7 +4902,7 @@ export function RuntimeProvider({
         cfg.reasoningEffort ?? 'medium',
         cfg.selectedProfileKey ?? undefined,
         cfg.fallbackEnabled ?? false,
-        currentWorkingDirectoryRef.current ?? undefined,
+        variantRunCwd ?? undefined,
         executionMode ?? 'auto',
         cfg.threadOverrides ?? undefined,
         responseMessageId,
@@ -4879,11 +4956,22 @@ export function RuntimeProvider({
     setStepInfo(null);
 
     supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
+    const continueRunCwd = currentWorkingDirectoryRef.current;
+    const continueRunConfig = {
+      selectedModelKey: cfg.selectedModelKey,
+      reasoningEffort: cfg.reasoningEffort,
+      selectedProfileKey: cfg.selectedProfileKey,
+      fallbackEnabled: cfg.fallbackEnabled,
+      cwd: continueRunCwd,
+      executionMode,
+      threadOverrides: cfg.threadOverrides,
+    };
     streamAccumulators.set(convId, {
       messages: [...newTree],
       headId: newHead,
       pendingAssistantTiming: createPendingAssistantTiming(),
       pendingAssistantId: responseMessageId,
+      runConfig: continueRunConfig,
     });
     const branch = getActiveBranch(newTree, newHead);
     const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -4910,7 +4998,7 @@ export function RuntimeProvider({
       cfg.reasoningEffort ?? 'medium',
       cfg.selectedProfileKey ?? undefined,
       cfg.fallbackEnabled ?? false,
-      currentWorkingDirectoryRef.current ?? undefined,
+      continueRunCwd ?? undefined,
       executionMode ?? 'auto',
       cfg.threadOverrides ?? undefined,
       responseMessageId,
