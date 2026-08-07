@@ -14,6 +14,8 @@ import {
   SearchIcon,
   XIcon,
   SlidersHorizontalIcon,
+  FilterIcon,
+  ArrowUpDownIcon,
   GitBranchIcon,
   ChevronRightIcon,
   FileTextIcon,
@@ -31,6 +33,10 @@ import type { ComputerSession } from '../../../shared/computer-use';
 import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
 import { ThreadSettingsModal } from './ThreadSettingsModal';
+import { FilterPopover } from './FilterPopover';
+import { SortPopover } from './SortPopover';
+import { useConversationPreferences } from './useConversationPreferences';
+import { matchesAdvancedFilter } from './ChatsListPage';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -50,6 +56,10 @@ type ConversationSummary = Pick<
 > & {
   /** Computed server-side: true if any message contains a tool-call content part */
   hasToolCalls?: boolean;
+  /** Computed server-side: any computer_use* (autopilot) tool call */
+  hasComputerUse?: boolean;
+  /** Computed server-side: any image/file part or tool-result _modelContent */
+  hasMedia?: boolean;
 };
 
 type ConversationListProps = {
@@ -138,6 +148,13 @@ export const ConversationList: FC<ConversationListProps> = ({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
   const [exportSubmenuOpen, setExportSubmenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // Advanced filter + sort, SHARED with the full Chats page via localStorage
+  // (filter) plus the sidebar's own SortPopover state (both from the same hook).
+  const { sort, setSort, filter, setFilter, activeFilterCount, clearFilters } = useConversationPreferences();
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [sortOpen, setSortOpen] = useState(false);
+  const filterAnchorRef = useRef<HTMLButtonElement>(null);
+  const sortAnchorRef = useRef<HTMLButtonElement>(null);
   // IDs of conversations whose MESSAGE CONTENT matches the current search
   // (title matches are handled synchronously below). Populated by a debounced
   // conversations:search call, since content matching requires reading bodies.
@@ -303,19 +320,52 @@ export const ConversationList: FC<ConversationListProps> = ({
       );
     }
 
-    // Default sort: newest-first by last assistant update
+    // Advanced filters (shared FilterPopover): tool calls / autopilot / media,
+    // message-count range, created/updated date ranges.
+    if (activeFilterCount > 0) {
+      result = result.filter((c) => matchesAdvancedFilter(c, filter));
+    }
+
+    // Sort per the shared SortPopover preference.
+    const dir = sort.direction === 'asc' ? 1 : -1;
     result.sort((a, b) => {
+      if (sort.field === 'alphabetical') {
+        return (
+          dir *
+          getDisplayTitle(a, sessionsByConversation.get(a.id)).localeCompare(
+            getDisplayTitle(b, sessionsByConversation.get(b.id)),
+          )
+        );
+      }
+      if (sort.field === 'first-created') {
+        return dir * a.createdAt.localeCompare(b.createdAt);
+      }
+      // latest-updated (default)
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
-      return bAt.localeCompare(aAt);
+      return dir * aAt.localeCompare(bAt);
     });
 
     return result;
-  }, [conversations, searchQuery, contentMatchIds, sessionsByConversation, workspaceId]);
+  }, [conversations, searchQuery, contentMatchIds, sessionsByConversation, workspaceId, filter, activeFilterCount, sort]);
 
   // Tracks a conversation that is fading out but should still look "active"
   // so the highlight doesn't jump to the next item during the removal animation.
   const [fadingActiveId, setFadingActiveId] = useState<string | null>(null);
+
+  // "Delete N filtered" confirmation (only shown when a search/filter narrows the
+  // sidebar view — never a bare delete-all here; that lives on the full Chats page).
+  const [deleteFilteredOpen, setDeleteFilteredOpen] = useState(false);
+  const isFiltering = searchQuery.trim().length > 0 || activeFilterCount > 0;
+
+  const handleDeleteFiltered = useCallback(async () => {
+    const ids = processedConversations.map((c) => c.id);
+    if (ids.length === 0) return;
+    const deletingActive = activeConversationId != null && ids.includes(activeConversationId);
+    await app.conversations.deleteMany(ids);
+    await loadConversations();
+    if (deletingActive) await onNewConversation();
+  }, [processedConversations, activeConversationId, loadConversations, onNewConversation]);
 
   const handleDelete = async (id: string) => {
     setDeletingId(id);
@@ -486,8 +536,49 @@ export const ConversationList: FC<ConversationListProps> = ({
               <XIcon className="h-3 w-3 text-muted-foreground" />
             </button>
           )}
+          {/* Filter + sort — right edge of the search row */}
+          <button
+            ref={filterAnchorRef}
+            type="button"
+            onClick={() => setFilterOpen((o) => !o)}
+            title="Filter chats"
+            className={cn(
+              'relative flex h-5 w-5 shrink-0 items-center justify-center rounded transition-colors',
+              activeFilterCount > 0
+                ? 'text-[var(--brand-accent)]'
+                : 'text-muted-foreground hover:text-sidebar-foreground',
+            )}
+          >
+            <FilterIcon className="h-3.5 w-3.5" />
+            {activeFilterCount > 0 && (
+              <span className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--brand-accent)]" />
+            )}
+          </button>
+          <button
+            ref={sortAnchorRef}
+            type="button"
+            onClick={() => setSortOpen((o) => !o)}
+            title="Sort chats"
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:text-sidebar-foreground"
+          >
+            <ArrowUpDownIcon className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
+
+      {filterOpen && (
+        <FilterPopover
+          filter={filter}
+          onFilterChange={setFilter}
+          activeFilterCount={activeFilterCount}
+          onClear={clearFilters}
+          onClose={() => setFilterOpen(false)}
+          anchorRef={filterAnchorRef}
+        />
+      )}
+      {sortOpen && (
+        <SortPopover sort={sort} onSortChange={setSort} onClose={() => setSortOpen(false)} anchorRef={sortAnchorRef} />
+      )}
       <div className="flex-1 overflow-y-auto px-3 pt-1">
         {(() => {
           const pinned = processedConversations.filter((c) => pinnedIds.has(c.id));
@@ -612,6 +703,63 @@ export const ConversationList: FC<ConversationListProps> = ({
           </div>
         )}
       </div>
+
+      {/* Sticky "delete filtered" bar — pinned to the bottom of the chat column
+          (above the tray/dock icons), shown ONLY while a search/filter narrows the
+          view. A bare "delete all" is intentionally kept to the full Chats page. */}
+      {isFiltering && processedConversations.length > 0 && (
+        <div className="shrink-0 border-t border-sidebar-border/50 px-3 py-2">
+          <button
+            type="button"
+            onClick={() => setDeleteFilteredOpen(true)}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2Icon className="h-3.5 w-3.5" />
+            Delete {processedConversations.length} filtered
+          </button>
+        </div>
+      )}
+
+      {/* Delete-filtered confirmation */}
+      {deleteFilteredOpen &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[10000] flex items-center justify-center"
+            onClick={() => setDeleteFilteredOpen(false)}
+          >
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-sm font-semibold text-foreground">Delete filtered chats</h2>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {`This will permanently delete the ${processedConversations.length} chat${processedConversations.length === 1 ? '' : 's'} currently shown. This cannot be undone.`}
+              </p>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDeleteFilteredOpen(false)}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteFilteredOpen(false);
+                    void handleDeleteFiltered();
+                  }}
+                  className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  <Trash2Icon className="h-3 w-3" />
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
 
       {/* Rename modal */}
       {renameModal && (

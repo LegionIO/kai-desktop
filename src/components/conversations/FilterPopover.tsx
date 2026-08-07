@@ -116,12 +116,20 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
   const rootRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
 
-  // Position the popover relative to the anchor button
+  // Position the popover relative to the anchor button. The filter button sits at
+  // the right edge of the toolbar, so anchor the popover's RIGHT edge to the
+  // button's right edge and clamp within the viewport (an 8px gutter) so a
+  // 280px-wide panel never runs off-screen.
   useLayoutEffect(() => {
     const anchor = anchorRef.current;
     if (!anchor) return;
     const rect = anchor.getBoundingClientRect();
-    setPos({ top: rect.bottom + 8, left: rect.left });
+    const PANEL_WIDTH = 280;
+    const GUTTER = 8;
+    const maxLeft = window.innerWidth - PANEL_WIDTH - GUTTER;
+    const preferredLeft = rect.right - PANEL_WIDTH; // right-align to the button
+    const left = Math.max(GUTTER, Math.min(preferredLeft, maxLeft));
+    setPos({ top: rect.bottom + 8, left });
   }, [anchorRef]);
 
   // Local state for debounced numeric inputs
