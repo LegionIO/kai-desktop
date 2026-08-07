@@ -3927,7 +3927,11 @@ export function RuntimeProvider({
         );
         // Automation-owned stream: main process persists the terminal state and
         // sends its own `done`. Don't persist from here; just reconcile from disk.
-        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
+        // ALSO a PASSIVE MIRROR of another client's GUI turn (locallyOriginated !== true): the
+        // originating client persists; a mirror must not. Render the error + keep the
+        // accumulator so the trailing `done` (the doneMirror branch) reconciles uniformly.
+        const errorMirror = !!streamAccumulators.get(convId) && acc.locallyOriginated !== true;
+        if (e.automation || e.serverPersisted || automationStreams.has(convId) || errorMirror) {
           // Keep the accumulator alive so the trailing automation `done` (which
           // arrives right after) does the final cleanup + reload uniformly.
           if (isActiveConv) {
@@ -3981,7 +3985,13 @@ export function RuntimeProvider({
         // Automation-owned stream: the MAIN process persisted the authoritative
         // [user, assistant] exchange and set runStatus. Don't persist from here
         // (would duplicate). Drop the accumulator + reload from disk to reconcile.
-        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
+        // ALSO covers a PASSIVE MIRROR of another client's GUI turn (accumulator built from
+        // broadcasts, locallyOriginated !== true): the ORIGINATING client persists the
+        // authoritative turn. A mirror persisting here would redirect the shared assistant onto
+        // its own fabricated (attachment-free) user branch and corrupt active history — mirror
+        // the round-132 mid-stream gate on the TERMINAL path too.
+        const doneMirror = !!streamAccumulators.get(convId) && acc.locallyOriginated !== true;
+        if (e.automation || e.serverPersisted || automationStreams.has(convId) || doneMirror) {
           automationStreams.delete(convId);
           const _ptAuto = persistTimersRef.current.get(convId);
           if (_ptAuto) {
