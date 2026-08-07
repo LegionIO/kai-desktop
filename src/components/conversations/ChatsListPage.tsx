@@ -228,9 +228,26 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', JSON.stringify([...next]));
+      const serialized = JSON.stringify([...next]);
+      localStorage.setItem(__BRAND_APP_SLUG + ':pinned-conversations', serialized);
+      // Notify same-window listeners (the sidebar ConversationList) so pin state stays in
+      // sync without a remount — localStorage writes don't fire `storage` in the same window.
+      window.dispatchEvent(new CustomEvent('pinned-conversations-changed', { detail: serialized }));
       return next;
     });
+  }, []);
+
+  // Reflect pin changes made elsewhere (the sidebar / title-bar dropdown) in the same window.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      try {
+        setPinnedIds(new Set(JSON.parse((e as CustomEvent).detail as string)));
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener('pinned-conversations-changed', handler);
+    return () => window.removeEventListener('pinned-conversations-changed', handler);
   }, []);
 
   const handleArchive = useCallback(

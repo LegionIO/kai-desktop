@@ -227,6 +227,11 @@ export function App({
   // this, going idle on busy lets a new prompt submit → reject → failTurnAndDrain consume
   // and lose the queued prompts.
   const compactBusyWaitRef = useRef<boolean>(false);
+  // A submission (with its expanded text + attachments) that was rejected as
+  // conversation-busy and must be RE-SENT verbatim when the lock frees — the plain string
+  // queue can't carry submitText/attachments (e.g. /shot, @image), so those go here instead
+  // of being requeued as bare text (which would resend without the image/expansion).
+  const pendingBusyResendRef = useRef<{ trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> } | null>(null);
   // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
   // an in-flight turn on the right conversation.
   if (runtimeRef) {
@@ -414,6 +419,28 @@ export function App({
       if (text.trim()) setTurns((prev) => [...prev, { kind: 'assistant', text }]);
     };
 
+    // Drain the NEXT pending input as a fresh turn: prefer a busy-rejected rich submission
+    // (full expanded text + attachments) over the plain string queue, so a /shot or @image
+    // that raced /compact resends verbatim. Returns true if it dispatched something.
+    const drainNextInput = (): boolean => {
+      const resend = pendingBusyResendRef.current;
+      if (resend) {
+        pendingBusyResendRef.current = null;
+        setStatus('running');
+        statusRef.current = 'running';
+        setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+        return true;
+      }
+      if (queueRef.current.length > 0) {
+        const next = queueRef.current.shift() as string;
+        setStatus('running');
+        statusRef.current = 'running';
+        setTimeout(() => sendMessageRef.current(next), 0);
+        return true;
+      }
+      return false;
+    };
+
     // Terminal handler for a turn (done OR error). Coalesced via turnSettledRef
     // so an `error`+`done` pair for the same turn drains the queue only once.
     // Flushes the next queued message as the next turn, else goes idle.
@@ -421,12 +448,7 @@ export function App({
       if (turnSettledRef.current) return;
       turnSettledRef.current = true;
       settleEpochRef.current++; // invalidate any in-flight busy-probe that would force 'running'
-      if (queueRef.current.length > 0) {
-        const next = queueRef.current.shift() as string;
-        setTimeout(() => sendMessageRef.current(next), 0);
-      } else {
-        setStatus('idle');
-      }
+      if (!drainNextInput()) setStatus('idle');
     };
 
     // On turn completion, any tool row still marked "running" can't have been
@@ -674,14 +696,11 @@ export function App({
         const compactingNow = await syncCompactingState();
         // A /compact transport failure (or a crash mid-turn) can leave prompts QUEUED with
         // the CLI idle — nothing drains them until the user submits again (out of order /
-        // stuck). Now that we're reconnected and idle (and NOT compacting), drain one queued
-        // prompt as its own turn (its terminal event drains the rest). If compacting, the
-        // matching `conversations:compacting` false broadcast drains instead.
-        if (!compactingNow && statusRef.current === 'idle' && queueRef.current.length > 0) {
-          const next = queueRef.current.shift() as string;
-          setStatus('running');
-          statusRef.current = 'running';
-          setTimeout(() => sendMessageRef.current(next), 0);
+        // stuck). Now that we're reconnected and idle (and NOT compacting), drain the next
+        // pending input as its own turn (its terminal event drains the rest). If compacting,
+        // the matching `conversations:compacting` false broadcast drains instead.
+        if (!compactingNow && statusRef.current === 'idle') {
+          drainNextInput();
         }
       })();
     });
@@ -705,13 +724,9 @@ export function App({
         }
       } else if (p.compacting === false && compactBusyWaitRef.current) {
         compactBusyWaitRef.current = false;
-        // Only drain if no real turn started meanwhile (a stream would drive its own drain).
-        if (queueRef.current.length > 0) {
-          const next = queueRef.current.shift() as string;
-          setStatus('running');
-          statusRef.current = 'running';
-          setTimeout(() => sendMessageRef.current(next), 0);
-        } else {
+        // Drain the next pending input (prefers a busy-rejected rich resend over the string
+        // queue). Only if no real turn started meanwhile (a stream drives its own drain).
+        if (!drainNextInput()) {
           setStatus('idle');
           statusRef.current = 'idle';
         }
@@ -1465,14 +1480,72 @@ export function App({
             //  - compaction → the conversations:compacting=false broadcast drains (busy-wait).
             //  - turn → that turn's own terminal `done` reaches us and settleTurn drains.
             if (submitRes.error === 'conversation-busy') {
-              queueRef.current.unshift(trimmed);
+              // This submission was rejected — the resend will re-push the optimistic user
+              // turn and mint a fresh nonce, so undo THIS attempt's: drop the orphan submit
+              // nonce (it would otherwise linger + could suppress a legit future echo) and
+              // remove the duplicate optimistic user turn we pushed at the top.
+              ownSubmitNoncesRef.current.delete(submitNonce);
+              setTurns((prev) => {
+                const idx = [...prev].reverse().findIndex((t) => t.kind === 'user' && t.text === trimmed);
+                if (idx < 0) return prev;
+                const removeAt = prev.length - 1 - idx;
+                return [...prev.slice(0, removeAt), ...prev.slice(removeAt + 1)];
+              });
+              // Preserve the FULL submission (expanded text + attachments) for a verbatim
+              // re-send when the lock frees — re-enqueuing bare `trimmed` would drop a /shot
+              // or @image submission's image/expansion. Drained by the unlock handlers.
+              pendingBusyResendRef.current = { trimmed, submitText, attachments };
               setStatus('running');
               statusRef.current = 'running';
-              if (submitRes.busyKind === 'compaction') compactBusyWaitRef.current = true;
               setTurns((prev) => [
                 ...prev,
                 { kind: 'error', text: 'Conversation is busy — your message is queued and will send when it frees up.' },
               ]);
+              if (submitRes.busyKind === 'compaction') {
+                compactBusyWaitRef.current = true;
+                // AUTHORITATIVE post-response probe: the busy-wait is installed only NOW, so a
+                // conversations:compacting=false broadcast that fired BEFORE this response
+                // resolved was ignored — leaving the CLI running with no future event to drain
+                // it. Re-query compacting-ids; if this conv is already unlocked, clear the wait
+                // and resend immediately (mirrors the /compact handler's race handling).
+                const cid = convIdRef.current;
+                void client
+                  .invoke<string[]>('conversations:compacting-ids')
+                  .then((ids) => {
+                    if (!compactBusyWaitRef.current) return; // a broadcast already drained it
+                    const stillCompacting = Array.isArray(ids) && cid != null && ids.includes(cid);
+                    if (!stillCompacting) {
+                      compactBusyWaitRef.current = false;
+                      const resend = pendingBusyResendRef.current;
+                      if (resend) {
+                        pendingBusyResendRef.current = null;
+                        setStatus('running');
+                        statusRef.current = 'running';
+                        setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+                      }
+                    }
+                  })
+                  .catch(() => {});
+              } else {
+                // TURN busy: the peer turn's terminal `done` drains via settleTurn. But that
+                // `done` may have arrived BEFORE this response resolved (settleTurn already ran,
+                // found no pending resend). Probe agent:in-flight; if the turn is already gone,
+                // resend now rather than wait for an event that won't come.
+                const cid = convIdRef.current;
+                void client
+                  .invoke<boolean>('agent:in-flight', cid)
+                  .then((inFlight) => {
+                    if (inFlight) return; // its `done` will drain via settleTurn
+                    const resend = pendingBusyResendRef.current;
+                    if (resend) {
+                      pendingBusyResendRef.current = null;
+                      setStatus('running');
+                      statusRef.current = 'running';
+                      setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+                    }
+                  })
+                  .catch(() => {});
+              }
             } else {
               setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${submitRes.error ?? 'unknown'}` }]);
               failTurnAndDrain();

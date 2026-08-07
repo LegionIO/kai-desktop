@@ -211,6 +211,26 @@ type MessageAccumulator = {
    *  backfill). Both undefined for normally-seeded accumulators. */
   seededBackground?: boolean;
   seededDiskHeadId?: string | null;
+  /** The run's OWN stream settings (model/profile/cwd/overrides), captured when the turn
+   *  launched. Continuations (max_turns auto-continue, plan-restart) MUST use these, not the
+   *  live active-chat refs — a background run whose conversation the user has switched away
+   *  from would otherwise restart with the CURRENTLY-active chat's model/profile/working
+   *  directory (High: relative-path tools could then modify the wrong project). */
+  runConfig?: {
+    selectedModelKey?: string | null;
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    selectedProfileKey?: string | null;
+    fallbackEnabled?: boolean;
+    cwd?: string | null;
+    executionMode?: 'auto' | 'plan-first';
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
+  };
 };
 
 type ConversationCompaction = {
@@ -3359,12 +3379,28 @@ export function RuntimeProvider({
             // keep reconnecting the active-branch base until the disk prefix lands.
             seededBackground: acc.seededBackground,
             seededDiskHeadId: acc.seededDiskHeadId,
+            runConfig: acc.runConfig, // carry the run's settings so further continuations stay correct
           });
           if (isActiveConv) {
             setTree([...acc.messages]);
             setHeadId(acc.headId);
           }
-          const cfg = streamHandlerRef.current;
+          // Use the RUN's OWN captured settings (acc.runConfig), NOT the live active-chat
+          // refs — a background max_turns continuation whose conversation the user switched
+          // away from must restart with A's model/profile/cwd/overrides, not B's (else a
+          // relative-path tool could modify the wrong project). Fall back to the live refs
+          // only for a run that predates runConfig capture (e.g. an automation-seeded acc).
+          const rc = acc.runConfig;
+          const live = streamHandlerRef.current;
+          const cfg = {
+            selectedModelKey: rc?.selectedModelKey ?? live.selectedModelKey,
+            reasoningEffort: rc?.reasoningEffort ?? live.reasoningEffort,
+            selectedProfileKey: rc?.selectedProfileKey ?? live.selectedProfileKey,
+            fallbackEnabled: rc?.fallbackEnabled ?? live.fallbackEnabled,
+            executionMode: rc?.executionMode ?? live.executionMode,
+            threadOverrides: rc?.threadOverrides ?? live.threadOverrides,
+          };
+          const runCwd = rc?.cwd ?? currentWorkingDirectoryRef.current;
           // Await the compaction-bearing persist BEFORE launching the continuation: the
           // continuation's pre-stream reuse gate (main) reads the stored compaction record
           // from disk, so if we launch first it can read BEFORE the record lands and
@@ -3378,7 +3414,7 @@ export function RuntimeProvider({
               cfg.reasoningEffort ?? 'medium',
               cfg.selectedProfileKey ?? undefined,
               cfg.fallbackEnabled ?? false,
-              currentWorkingDirectoryRef.current ?? undefined,
+              runCwd ?? undefined,
               cfg.executionMode ?? 'auto',
               cfg.threadOverrides ?? undefined,
               responseMessageId,
@@ -3676,9 +3712,13 @@ export function RuntimeProvider({
           if (resolvedModel) {
             onModelFallbackRef.current?.(resolvedModel);
           }
-
-          // Auto-continue after plan mode entry: the stream was aborted so we can
-          // restart with the correct executionMode, system prompt, and tool set.
+        }
+        {
+          // Auto-continue after plan mode entry / rejection. This MUST run regardless of
+          // active-ness: the prior stream was ABORTED for a mandatory restart, so a `done`
+          // arriving after the user switched chats must still restart the (now background)
+          // conversation — previously this sat inside `if (isActiveConv)` and was silently
+          // skipped. UI updates inside stay active-gated.
           const planModeRestart = (e.data as Record<string, unknown> | undefined)?.planModeRestart;
           // Auto-continue after plan rejection: the user clicked "No, keep planning"
           // so we restart in plan-first mode with a synthetic user message telling the
@@ -3687,6 +3727,19 @@ export function RuntimeProvider({
           if (planModeRestart || planModeRejectRestart) {
             const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
             console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
+            // Snapshot THIS run's settings for the delayed launch. Prefer the run's OWN
+            // captured runConfig (correct even for a background conv the user has switched
+            // away from); fall back to the live refs for a run predating runConfig capture.
+            const planLive = streamHandlerRef.current;
+            const planCfgSnapshot = {
+              selectedModelKey: acc.runConfig?.selectedModelKey ?? planLive.selectedModelKey,
+              reasoningEffort: acc.runConfig?.reasoningEffort ?? planLive.reasoningEffort,
+              selectedProfileKey: acc.runConfig?.selectedProfileKey ?? planLive.selectedProfileKey,
+              fallbackEnabled: acc.runConfig?.fallbackEnabled ?? planLive.fallbackEnabled,
+              threadOverrides: acc.runConfig?.threadOverrides ?? planLive.threadOverrides,
+            };
+            const planCwdSnapshot = acc.runConfig?.cwd ?? currentWorkingDirectoryRef.current;
+            const planRunConfig = acc.runConfig;
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
@@ -3721,6 +3774,7 @@ export function RuntimeProvider({
                   pendingCompaction: acc.pendingCompaction,
                   seededBackground: acc.seededBackground,
                   seededDiskHeadId: acc.seededDiskHeadId,
+                  runConfig: planRunConfig, // keep the run's settings for any further continuation
                 });
                 if (activeIdRef.current === convId) setIsRunning(true);
                 const planContinuationPersist = persistConversation(
@@ -3730,7 +3784,7 @@ export function RuntimeProvider({
                   { runStatus: 'running', ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}) },
                   seedContextFor(acc),
                 );
-                const cfg = streamHandlerRef.current;
+                const cfg = planCfgSnapshot;
                 console.info(`[UI:stream:${label}] Firing agent:stream conv=${convId} executionMode=plan-first`);
                 const launchPlanContinuation = () =>
                   launchAgentStream(
@@ -3740,7 +3794,7 @@ export function RuntimeProvider({
                     cfg.reasoningEffort ?? 'medium',
                     cfg.selectedProfileKey ?? undefined,
                     cfg.fallbackEnabled ?? false,
-                    currentWorkingDirectoryRef.current ?? undefined,
+                    planCwdSnapshot ?? undefined,
                     'plan-first',
                     cfg.threadOverrides ?? undefined,
                     responseMessageId,
@@ -4001,6 +4055,9 @@ export function RuntimeProvider({
         pendingCompaction: supersededCompaction,
         seededBackground: supersededSeed?.seededBackground,
         seededDiskHeadId: supersededSeed?.seededDiskHeadId,
+        // Capture THIS run's settings so a later continuation (max_turns / plan-restart) uses
+        // them even if the user has switched to another chat by then (not the live refs).
+        runConfig: { selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, cwd, executionMode, threadOverrides },
       });
       const branch = getActiveBranch(newTree, newHead);
 
@@ -4619,12 +4676,12 @@ export function RuntimeProvider({
       bumpSubAgentVersion();
       // Tell the BACKEND to stop — for a paused/capacity-deferred child this purges its
       // retained resumable state + pending-resume queue, so a queued follow-up can't execute
-      // (with side effects) after the user deleted it. If the stop FAILS (e.g. web transport
-      // drop), the agent may still be running: un-tombstone + re-instate the thread so it's
-      // visible again rather than executing invisibly, and surface the failure.
+      // (with side effects) after the user deleted it. Only a THROWN transport error means
+      // the stop didn't reach the backend (agent may still run) → re-instate. A resolved
+      // {ok:false} is NORMAL for a cleanly-finished agent (no controller/state to stop) —
+      // that's safe to delete, NOT a failure, so don't re-instate on it.
       try {
-        const res = (await app.agent.stopSubAgent(subAgentConversationId)) as { ok?: boolean } | undefined;
-        if (res?.ok === false) throw new Error('backend reported stop failure');
+        await app.agent.stopSubAgent(subAgentConversationId);
       } catch (err) {
         console.error('[Runtime] Failed to stop sub-agent on delete — re-instating:', err);
         deletedSubAgentIds.delete(subAgentConversationId);

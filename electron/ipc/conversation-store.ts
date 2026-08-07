@@ -201,9 +201,17 @@ function computeHasComputerUse(conv: ConversationRecord): boolean {
 }
 
 /** Any image/file content part (user attachments or model output), or a tool
- *  result carrying native model content (`_modelContent`, e.g. fetched images).
+ *  result carrying native IMAGE/FILE model content (`_modelContent`, e.g. fetched images).
  *  Best-effort — mirrors {@link computeHasToolCalls}. */
 function computeHasMedia(conv: ConversationRecord): boolean {
+  // A _modelContent array can hold TEXT-only entries (e.g. truncation notes) — those are not
+  // media, so require at least one image/file part rather than a merely non-empty array.
+  const hasMediaPart = (arr: unknown): boolean =>
+    Array.isArray(arr) &&
+    arr.some((p) => {
+      const t = (p as { type?: unknown } | null | undefined)?.type;
+      return t === 'image' || t === 'file' || t === 'image-data' || t === 'file-data';
+    });
   return (
     Array.isArray(conv.messages) &&
     conv.messages.some((msg: unknown) => {
@@ -213,12 +221,12 @@ function computeHasMedia(conv: ConversationRecord): boolean {
         if (part?.type === 'image' || part?.type === 'file') return true;
         // A tool result's native model content lives at part.result._modelContent (the
         // persisted tool-result part is { type:'tool-result', result: {...} }). Check the
-        // nested result first; keep the direct part._modelContent as a fallback.
+        // nested result first; keep the direct part._modelContent as a fallback. Count it
+        // only when it actually carries an image/file part (not a text-only note array).
         const resultObj = (part as { result?: unknown })?.result;
         const nested = (resultObj as { _modelContent?: unknown } | null | undefined)?._modelContent;
-        if (Array.isArray(nested) && nested.length > 0) return true;
-        const modelContent = (part as { _modelContent?: unknown })?._modelContent;
-        return Array.isArray(modelContent) && modelContent.length > 0;
+        if (hasMediaPart(nested)) return true;
+        return hasMediaPart((part as { _modelContent?: unknown })?._modelContent);
       });
     })
   );
