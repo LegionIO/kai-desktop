@@ -4133,6 +4133,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             committedMediaBytes = 0;
             committedNonMediaTokens = 0;
             committedToolCallArgIds.clear();
+            // The fallback restarts from the ORIGINAL messages: the failed primary's partial
+            // text + any tool calls are NOT in the new model's context and were discarded
+            // above. Reset sawToolOrTextThisTurn too — otherwise a content-filtered primary
+            // that emitted some text would leave it TRUE, gating off the overflow
+            // compact-and-retry on a fallback that immediately overflows with NO retained
+            // output + no tool executed (a safe, recoverable overflow wrongly hard-failed).
+            sawToolOrTextThisTurn = false;
             // Invalidate the static-input memo so it recomputes under the FALLBACK
             // model's tokenizer (a cross-provider fallback can tokenize the same
             // system prompt / schemas very differently).

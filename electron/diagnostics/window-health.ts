@@ -513,6 +513,12 @@ export class WindowHealthMonitor {
   attachWindow(window: HealthWindow): void {
     this.detachWindow();
     this.attachedWindow = window;
+    // Re-arm the heap-snapshot latch for the NEW renderer: it was disarmed after capturing
+    // the OLD renderer (armed re-only when the heap dips below the re-arm boundary). A
+    // replacement renderer that starts ABOVE the threshold would otherwise never trigger its
+    // own snapshot until its heap first fell below hysteresis.
+    this.heapSnapshotArmed = true;
+    this.heapSnapshotRetryAfter = 0;
     const contents = window.webContents;
 
     const onWindow = (event: string, listener: (...args: never[]) => void): void => {

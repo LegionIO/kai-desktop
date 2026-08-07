@@ -33,6 +33,17 @@ const SNAPSHOT_EXT = '.heapsnapshot';
 // touched by the retention sweep.
 const SNAPSHOT_RE = /^heap-\d{8}T\d{6}(?:-\d+)?\.heapsnapshot$/;
 
+/** Whether a capture error looks DISK-SPACE related (worth evicting old snapshots + retrying).
+ *  A non-space error (renderer destroyed, snapshotting unsupported, permission) is NOT helped
+ *  by eviction — evicting then would pointlessly delete valid diagnostics. Best-effort match
+ *  on the common ENOSPC/quota signals (code or message). */
+function isDiskSpaceError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  if (code === 'ENOSPC' || code === 'EDQUOT') return true;
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return /ENOSPC|EDQUOT|no space|disk (is )?full|quota exceeded/i.test(msg);
+}
+
 /** `~/.kai/logs/heap-snapshots` — colocated with the other diagnostic logs. */
 export function heapSnapshotDir(logsDir: string): string {
   return join(logsDir, 'heap-snapshots');
@@ -172,21 +183,29 @@ export async function captureHeapSnapshot(
   // with that last snapshot preserved.
   const evictedForRetry: string[] = [];
   let captured = false;
+  let firstErr: unknown;
   try {
     await take(path);
     captured = true;
-  } catch {
-    /* fall through to incremental-evict retry */
+  } catch (err) {
+    firstErr = err;
   }
   if (!captured) {
+    // Remove the failed attempt's partial.
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    // ONLY evict-and-retry for a DISK-SPACE failure — eviction can't help a destroyed
+    // renderer / unsupported-snapshot / permission error, and would pointlessly delete valid
+    // diagnostics. Surface a non-space error immediately (the old snapshots are preserved).
+    if (!isDiskSpaceError(firstErr)) {
+      throw firstErr;
+    }
     let guard = 0;
     while (!captured && guard < 64) {
       guard++;
-      try {
-        rmSync(path, { force: true }); // drop any partial from the failed attempt
-      } catch {
-        /* best-effort */
-      }
       // Evict the OLDEST snapshot to free space — but stop before the last one (keep ≥1).
       const existing = listSnapshots(dir); // oldest-first
       if (existing.length <= 1) break; // don't delete the sole remaining valid snapshot
@@ -200,8 +219,16 @@ export async function captureHeapSnapshot(
       try {
         await take(path);
         captured = true;
-      } catch {
-        /* keep freeing the next-oldest */
+      } catch (retryErr) {
+        try {
+          rmSync(path, { force: true }); // drop this retry's partial before the next evict
+        } catch {
+          /* best-effort */
+        }
+        // If the retry now fails for a NON-space reason, stop evicting — more eviction won't help.
+        if (!isDiskSpaceError(retryErr)) {
+          throw retryErr;
+        }
       }
     }
     if (!captured) {

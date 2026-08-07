@@ -55,19 +55,36 @@ const finalizingSubAgents = new Set<string>();
  */
 const subAgentRunGeneration = new Map<string, number>();
 // Bound the generation map: it grows one entry per unique sub-agent id over the process
-// lifetime. A generation only matters while a run/teardown for THAT id is in flight; an id
-// evicted after thousands of newer sub-agents has no such race. Map preserves insertion
-// order → re-insert on bump (recency) + evict the oldest over the cap. (Sub-agent ids are
-// timestamp+random, never reused, so eviction can't collide with a live id.)
+// lifetime. Map preserves insertion order → re-insert on bump (recency) + evict the oldest
+// over the cap. Never evict an id whose child is STILL LIVE (active controller, retained
+// resumable state, or a pending-resume queue) — evicting a live generation would make its
+// finalization's isCurrent() read undefined → rejected as stale → queued follow-ups
+// discarded + status stuck `running`. Scan past live ids to the oldest DEAD one.
 const SUBAGENT_RUN_GENERATION_MAX = 5000;
+function isSubAgentGenerationEvictable(id: string): boolean {
+  return (
+    !activeSubAgentControllers.has(id) &&
+    !subAgentState.has(id) &&
+    !pendingResumeQueues.has(id) &&
+    !followUpQueues.has(id)
+  );
+}
 function nextRunGeneration(subAgentConversationId: string): number {
   const gen = (subAgentRunGeneration.get(subAgentConversationId) ?? 0) + 1;
   subAgentRunGeneration.delete(subAgentConversationId); // re-insert at the back (recency)
   subAgentRunGeneration.set(subAgentConversationId, gen);
-  while (subAgentRunGeneration.size > SUBAGENT_RUN_GENERATION_MAX) {
-    const oldest = subAgentRunGeneration.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    subAgentRunGeneration.delete(oldest);
+  if (subAgentRunGeneration.size > SUBAGENT_RUN_GENERATION_MAX) {
+    // Evict the oldest DEAD entries (skip still-live ids). Bounded scan; if every entry is
+    // live (pathological — thousands of concurrent children), leave the map as-is.
+    let removed = 0;
+    for (const key of subAgentRunGeneration.keys()) {
+      if (subAgentRunGeneration.size - removed <= SUBAGENT_RUN_GENERATION_MAX) break;
+      if (key === subAgentConversationId) continue; // never evict the one we just bumped
+      if (isSubAgentGenerationEvictable(key)) {
+        subAgentRunGeneration.delete(key);
+        removed++;
+      }
+    }
   }
   return gen;
 }
@@ -697,18 +714,46 @@ async function resumeSubAgent(
       })
     : true; // no shared memory (no persistence) → nothing to reopen; proceed
   if (!reopened) {
-    // The DB status is still `paused`/`completed`. Proceeding would run the turn against
-    // that stale status, and its terminal finalization (running → completed/failed) would be
-    // FSM-REJECTED (paused/completed only allow → running/stopped) → stale status reappears
-    // after restart. ABORT the resume cleanly: release the slot + teardown, retain the
-    // follow-up so it isn't lost, leaving the thread cleanly paused (resumable — user retries).
+    // The DB status is still `paused`/`completed`. Proceeding would run the turn against that
+    // stale status, and its terminal finalization (running → completed/failed) would be
+    // FSM-REJECTED → stale status reappears. Abort the resume — but handle two hazards the
+    // naive "retain the one message" path missed:
+    //  (1) FOLLOW-UP LOSS: another message (B) may have been accepted into followUpQueues
+    //      while this reopen awaited; cleanupRuntime deletes that queue. Capture ALL queued
+    //      follow-ups (this run's `message` FIRST, then the queued ones in order) so none
+    //      are lost, and RETAIN them for a later drain (retryPendingSubAgentResumes) — not
+    //      just the first, and with an actual drain scheduled.
+    //  (2) STOP RACE: if a Stop aborted this run during the awaited reopen, the user
+    //      cancelled it — do NOT retain (that would auto-resume a stopped instruction). Drop.
     console.error('[Subagent] Failed to reopen status on resume — aborting resume (thread stays paused)');
+    const queuedFollowUps = followUpQueues.get(subAgentConversationId) ?? [];
+    const allPending = [message, ...queuedFollowUps];
     cleanupRuntime(subAgentConversationId, resumeGeneration);
     releaseSubAgentSlot();
-    retainFollowUpAsPaused(subAgentConversationId, message, 'awaiting-input', {
+    if (localController.signal.aborted) {
+      // Stopped mid-reopen — discard the follow-ups (don't resurrect a cancelled instruction)
+      // and drop any retained resumable state so nothing auto-resumes.
+      pendingResumeQueues.delete(subAgentConversationId);
+      return;
+    }
+    // Retain ALL follow-ups (FIFO) for a later admission-gated drain. Do NOT drain NOW —
+    // an immediate retry would re-enter the same failing reopen (tight loop on a persistent
+    // DB error). The retained queue drains on the next natural trigger (a capacity-free
+    // drainAdmissiblePendingResumes, or the user resending); the `paused` broadcast makes the
+    // state visible meanwhile.
+    const pending = pendingResumeQueues.get(subAgentConversationId) ?? [];
+    pending.unshift(...allPending); // preserve order at the front
+    pendingResumeQueues.set(subAgentConversationId, pending);
+    broadcastEvent({
+      subAgentConversationId,
       parentConversationId: parentThreadId ?? subAgentConversationId,
       parentToolCallId,
-    });
+      conversationId: subAgentConversationId,
+      type: 'sub-agent-status',
+      status: 'paused',
+      summary: 'Paused — could not reopen; retry to resume.',
+      pausedReason: 'capacity',
+    } as SubAgentEvent);
     return;
   }
 
