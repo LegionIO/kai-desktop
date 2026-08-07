@@ -521,8 +521,16 @@ export function sendSubAgentFollowUp(subAgentConversationId: string, message: st
   // (the deferred drain will start a single resume with the whole ordered list).
   // Prevents a message arriving in the close→drain gap from starting its own
   // out-of-order resume ahead of already-stranded messages.
+  // BUT if the run's controller is ABORTED, the abort cleanup (cleanupAbortedRun ~476,
+  // or the non-resumable deferred drain) DELETES pendingResumeQueues — appending here
+  // would return success yet lose the message after the caller cleared its input. Reject
+  // on abort (keep composer text; resend once it settles). A NORMAL finalize is fine: its
+  // handoff is drained, so accepting into `pending` is correct.
   const pending = pendingResumeQueues.get(subAgentConversationId);
   if (pending) {
+    if (activeSubAgentControllers.get(subAgentConversationId)?.signal.aborted) {
+      return false;
+    }
     pending.push(message);
     return true;
   }

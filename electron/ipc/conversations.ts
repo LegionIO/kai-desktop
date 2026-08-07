@@ -20,7 +20,7 @@ import { stripBranchMediaForCount, DEFAULT_MAX_TOTAL_MEDIA_BYTES } from '../agen
 import { normalizeAgentCwd, buildAgentInstructions } from '../agent/mastra-agent.js';
 import { withWorkingDirectoryPrompt } from '../agent/instructions.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE, serializeToolSchemasForStatic } from '../agent/static-tokens.js';
-import { getRegisteredTools, whenToolsReady } from './agent.js';
+import { getRegisteredTools, whenToolsReady, cancelConversationStream } from './agent.js';
 import { resolveHeaderTemplates } from '../agent/header-templates.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import { markCompacting, clearCompacting, isCompacting } from '../agent/compaction-lock.js';
@@ -877,6 +877,9 @@ export function registerConversationHandlers(
   });
 
   ipcMain.handle('conversations:delete', (_event, id: string) => {
+    // Abort any live stream/submit for this conversation FIRST — otherwise its tools and
+    // side effects keep running after the record is deleted.
+    cancelConversationStream(id);
     deleteConversation(appHome, id);
     broadcastDelete(appHome, id);
     clearConversationDiffs(id);
@@ -897,6 +900,9 @@ export function registerConversationHandlers(
   ipcMain.handle('conversations:deleteMany', (_event, ids: unknown) => {
     const list = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
     if (list.length === 0) return { ok: true, deleted: 0 };
+    // Abort any live stream/submit for each id before deleting so no tools keep running
+    // against a deleted record (idempotent + a no-op for idle conversations).
+    for (const id of list) cancelConversationStream(id);
     const removed = deleteConversations(appHome, list);
     // Broadcast a delete per removed id so each renderer/web client prunes O(1),
     // matching the single-delete path (there is no batched change kind).
@@ -904,11 +910,14 @@ export function registerConversationHandlers(
       broadcastDelete(appHome, id);
       clearConversationDiffs(id);
     }
-    // Clean up associated computer-use sessions for every requested id.
+    // Clean up associated computer-use sessions ONLY for conversations that were actually
+    // removed (deleteConversations returns the successfully-deleted ids). Using the full
+    // requested `list` would destroy sessions for a conversation whose file rm FAILED —
+    // leaving the conversation intact but its sessions gone.
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
-        for (const id of list) manager.removeSessionsByConversation(id);
+        for (const id of removed) manager.removeSessionsByConversation(id);
       } catch {
         // Computer-use module may not be initialized yet — safe to ignore
       }

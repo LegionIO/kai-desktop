@@ -352,6 +352,14 @@ export function isConversationTurnActive(conversationId: string): boolean {
   const pending = currentPendingSubmit.get(conversationId);
   return typeof pending === 'number' && !cancelledSubmits.has(pending);
 }
+// Abort an active stream/submit for a conversation without going through the IPC handler —
+// set during registerAgentHandlers (needs the appHome closure). Deleting a conversation
+// with a live run must abort it, else its tools + side effects keep running after the
+// record is gone. Callable from other IPC modules (see conversations:delete/deleteMany).
+let cancelConversationStreamImpl: ((conversationId: string) => void) | null = null;
+export function cancelConversationStream(conversationId: string): void {
+  cancelConversationStreamImpl?.(conversationId);
+}
 // The conversation head captured at submit time (the just-appended user turn),
 // keyed by conversationId. streamHandler binds it to the run's token so the
 // assistant reply is persisted as a child of the turn it actually answered —
@@ -3509,7 +3517,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 error: `This request carries more than ${mb} MB of attached media, which exceeds what can be sent in one request. Remove or shrink recent image/file attachments and retry.`,
                 errorCategory: 'client-error',
               });
-              emit({ conversationId, type: 'done' });
+              // Only a serverPersisted (CLI/automation) turn needs a trailing `done` (its
+              // renderer error handler keeps the accumulator + relies on `done` for cleanup).
+              // For a GUI turn the `error` is fully terminal; a following `done` would
+              // recreate the accumulator from stale React state and supersede the error
+              // write — the media error would flash then vanish from UI and disk (round-76).
+              if (serverPersistedRun) {
+                emit({ conversationId, type: 'done' });
+              }
               return;
             }
           } catch {
@@ -4437,7 +4452,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               : baseMsg,
             ...(overflow ? { errorCategory: 'context-overflow' } : {}),
           });
-          emit({ conversationId, type: 'done' });
+          // Only a serverPersisted (CLI/automation) turn needs a trailing `done`: its
+          // renderer error handler KEEPS the accumulator alive and relies on the terminal
+          // `done` for cleanup+reload. For a GUI turn the `error` is fully terminal (the
+          // handler deletes the accumulator + persists idle); a following `done` would
+          // recreate it from stale React state and supersede the error write, making the
+          // error flash then vanish (round-76 pattern).
+          if (serverPersistedRun) {
+            emit({ conversationId, type: 'done' });
+          }
         }
       } finally {
         ipcDebugLog(`[LOOP-FINALLY] conv=${conversationId} cleaning up`);
@@ -4929,6 +4952,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
+    cancelConversationStreamInner(conversationId);
+    return { ok: true };
+  });
+  // Shared cancel body — used by the IPC handler above AND cancelConversationStream (called
+  // when a conversation is deleted). Idempotent + race-guarded (deleteStreamIfOwned).
+  function cancelConversationStreamInner(conversationId: string): void {
     // Cancel a submit still waiting on toolsReady (no activeStreams entry yet)
     // so it bails after the await instead of starting a run for a gone client.
     const pendingSubmitId = currentPendingSubmit.get(conversationId);
@@ -4988,8 +5017,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // path (the token is already cleared, so the auto-tagger wouldn't).
       broadcastStreamEventRaw({ conversationId, type: 'done', serverPersisted: true, data: { cancelled: true } });
     }
-    return { ok: true };
-  });
+  }
+  cancelConversationStreamImpl = cancelConversationStreamInner;
 
   ipcMain.handle('agent:approve-tool', (_event, toolCallId: string) => {
     const pending = pendingToolApprovals.get(toolCallId);

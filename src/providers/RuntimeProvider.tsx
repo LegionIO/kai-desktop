@@ -1557,7 +1557,13 @@ async function persistConversation(
 
   try {
     const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
-    if (!conv) return { superseded: true };
+    if (!conv) {
+      // Conversation was deleted — its pending compaction handoff (registered above) is
+      // now worthless; drop it so deleting compacting chats doesn't retain summaries for
+      // the renderer's lifetime.
+      pendingCompactionHandoff.delete(conversationId);
+      return { superseded: true };
+    }
 
     // After the async get(), check if a newer persist started while we were waiting
     const latestVersion = persistVersions.get(conversationId) ?? 0;

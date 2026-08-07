@@ -594,6 +594,14 @@ export class WindowHealthMonitor {
     this.heapHeartbeatRunning = true;
     try {
       const sample = await this.heapSampler(window);
+      // The await can span a detach (+ reattach of a NEW window): stopHeapHeartbeat cleared
+      // the flag and attachWindow may have installed a fresh sample cycle. If this captured
+      // window is no longer the attached one (or was destroyed), DROP this stale sample —
+      // acting on it would snapshot a detached/destroyed window and its finally would clear
+      // the NEW cycle's running flag, causing overlapping heartbeat work.
+      if (this.attachedWindow !== window || window.isDestroyed() || window.webContents.isDestroyed()) {
+        return;
+      }
       if (sample.error) {
         // Heap stats unavailable or renderer unreachable — record it (an
         // unreachable renderer just before an abort is itself a useful signal),
@@ -616,7 +624,10 @@ export class WindowHealthMonitor {
     } catch {
       /* heartbeat is best-effort; never let it throw into the interval */
     } finally {
-      this.heapHeartbeatRunning = false;
+      // Only clear the flag if we still own the attachment. If a detach (+ reattach)
+      // happened during the await, a NEW cycle owns heapHeartbeatRunning now — clearing it
+      // here would let two heartbeats run concurrently.
+      if (this.attachedWindow === window) this.heapHeartbeatRunning = false;
     }
   }
 
