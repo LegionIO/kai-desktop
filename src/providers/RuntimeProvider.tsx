@@ -2875,7 +2875,12 @@ export function RuntimeProvider({
       ) {
         return;
       }
-      if (e.responseMessageId) acc.pendingAssistantId = e.responseMessageId;
+      // A `compaction` event is exempt from the stale-run drops above (its paid summary is
+      // captured into the handoff regardless of run) — but it must NOT mutate ownership. A
+      // stale run A's compaction arriving after run B installed its accumulator would else
+      // overwrite acc.pendingAssistantId with A's id, failing B's ownership checks so B's
+      // stream never launches (stuck running). Only a real run's events set ownership.
+      if (e.responseMessageId && e.type !== 'compaction') acc.pendingAssistantId = e.responseMessageId;
 
       if (e.type === 'user-message') {
         // A user turn submitted into THIS conversation by ANOTHER client (the
@@ -4752,6 +4757,32 @@ export function RuntimeProvider({
         if (snapshot) globalSubAgentThreads.set(subAgentConversationId, snapshot);
         if (accSnapshot) globalSubAgentAccumulators.set(subAgentConversationId, accSnapshot);
         bumpSubAgentVersion();
+        // The tombstone above dropped any `stopped` event the backend emitted DURING the
+        // awaited stop — so a re-instated snapshot that was RUNNING may be stuck running even
+        // though the child actually stopped. Reconcile against the backend's authoritative
+        // ACTIVE-id list, but ONLY for a snapshot that was non-terminal (running): if such a
+        // child is no longer active, it stopped → remove it (delete effectively succeeded). A
+        // paused/completed snapshot is a legitimate re-instate target (and wouldn't be in the
+        // active list anyway), so leave it untouched.
+        if (snapshot?.status === 'running') {
+          void app.agent
+            .listSubAgents()
+            .then((list) => {
+              const activeIds = (list as { ids?: string[] } | undefined)?.ids ?? [];
+              if (
+                !activeIds.includes(subAgentConversationId) &&
+                globalSubAgentThreads.get(subAgentConversationId)?.status === 'running'
+              ) {
+                deletedSubAgentIds.add(subAgentConversationId);
+                globalSubAgentThreads.delete(subAgentConversationId);
+                globalSubAgentAccumulators.delete(subAgentConversationId);
+                bumpSubAgentVersion();
+              }
+            })
+            .catch(() => {
+              /* backend unreachable — leave the re-instated snapshot; a later refresh reconciles */
+            });
+        }
       }
     },
     [bumpSubAgentVersion, activeSubAgentView],

@@ -697,25 +697,45 @@ export async function compactConversationPrefix(
   // prefix.length probes, and only when the whole prefix is over budget (the common case
   // encodes ONCE and fits).
   const MIN_SUMMARIZED = 2;
-  let fittedPrefix = prefix;
-  let serializablePrefix = (await stripMediaForSerialization(fittedPrefix, { countMedia: false, signal })).messages;
-  let candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
-  while (
-    !signal?.aborted &&
-    candidateTokens > summarizerInputBudget &&
-    fittedPrefix.length > MIN_SUMMARIZED
-  ) {
-    fittedPrefix = fittedPrefix.slice(0, -1); // drop the NEWEST prefix message (keep it in-branch)
-    serializablePrefix = (await stripMediaForSerialization(fittedPrefix, { countMedia: false, signal })).messages;
-    candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
+  // Count the summarizer BODY for the oldest `k` prefix messages (strip media → serialize →
+  // tokenize once per probe). Aborts short-circuit to Infinity so the search bails.
+  const countForLength = async (k: number): Promise<number> => {
+    if (signal?.aborted) return Number.POSITIVE_INFINITY;
+    const stripped = (await stripMediaForSerialization(prefix.slice(0, k), { countMedia: false, signal })).messages;
+    return countBody(serializeForTokenCounting(stripped));
+  };
+  // Fast path: the WHOLE prefix usually fits — one probe, no search.
+  let fittedLen = prefix.length;
+  let candidateTokens = await countForLength(fittedLen);
+  if (!signal?.aborted && candidateTokens > summarizerInputBudget) {
+    // BINARY SEARCH for the largest k in [MIN_SUMMARIZED, prefix.length] that fits — O(log n)
+    // probes, not O(n). (The linear one-at-a-time shrink re-tokenized the whole remaining
+    // prefix each step → quadratic → could exhaust /compact's 285s window on a long history.)
+    // Monotonic: a shorter oldest-prefix is never larger, so binary search is valid.
+    let lo = MIN_SUMMARIZED;
+    let hi = prefix.length - 1;
+    fittedLen = 0; // nothing fits unless a probe proves otherwise
+    candidateTokens = Number.POSITIVE_INFINITY;
+    while (lo <= hi && !signal?.aborted) {
+      const mid = (lo + hi) >> 1;
+      const t = await countForLength(mid);
+      if (t <= summarizerInputBudget) {
+        fittedLen = mid;
+        candidateTokens = t;
+        lo = mid + 1; // try to summarize MORE of the oldest prefix
+      } else {
+        hi = mid - 1;
+      }
+    }
   }
+  const fittedPrefix = fittedLen >= MIN_SUMMARIZED ? prefix.slice(0, fittedLen) : [];
   // The prefix's images are summarized AWAY (replaced by the text summary), not sent — so the
   // summarizer budget counts only the stripped-text placeholders (see stripMediaForSerialization),
   // NOT the prefix media's native tokens (adding those would over-charge ~524k for a 1MB image
   // and wrongly null-out compaction for exactly the media-heavy histories this most needs).
   // Cancelled during an (off-thread) encode, or even the oldest MIN_SUMMARIZED messages don't
   // fit the SUMMARIZER-INPUT budget → null no-op (no message loss, no wasted retries).
-  if (signal?.aborted || candidateTokens > summarizerInputBudget) {
+  if (signal?.aborted || fittedPrefix.length < MIN_SUMMARIZED || candidateTokens > summarizerInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
   // Messages shifted out of fittedPrefix to fit the budget are NOT summarized — keep them
@@ -734,6 +754,15 @@ export async function compactConversationPrefix(
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
 
+  // Media-strip the FINAL fittedPrefix for the summarizer prompt body (the binary search
+  // above tokenized candidate lengths but didn't retain the stripped messages).
+  const { messages: serializablePrefix } = await stripMediaForSerialization(fittedPrefix, {
+    countMedia: false,
+    signal,
+  });
+  if (signal?.aborted) {
+    return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
+  }
   const prompt = `${SUMMARIZER_FRAMING}${serializeForTokenCounting(serializablePrefix)}`;
 
   // Refuse to issue another summarizer generate if too many prior ones are still
