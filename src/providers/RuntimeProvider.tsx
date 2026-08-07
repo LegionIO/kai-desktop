@@ -231,6 +231,14 @@ type MessageAccumulator = {
       runtimeOverride?: string | null;
     };
   };
+  /** True ONLY for an accumulator created by a LOCAL submit on THIS client (onNew/onEdit/
+   *  onReload). A mirroring client (a second GUI window / web client viewing the same
+   *  conversation) builds its accumulator from broadcast stream events and leaves this false.
+   *  Renderer-driven auto-continue (max_turns) and plan-restart must fire ONLY on a locally
+   *  originated accumulator — otherwise EVERY mirror independently continues/restarts the same
+   *  run (duplicate model calls, supersession races, continuations using another client's
+   *  model/CWD). The originating client drives the single continuation; mirrors just render it. */
+  locallyOriginated?: boolean;
 };
 
 type ConversationCompaction = {
@@ -3607,7 +3615,11 @@ export function RuntimeProvider({
         // (model/CWD) instead of the run's — relative-path tools in the wrong project — and
         // (b) double-drive a main-owned turn. main/CLI re-submits to continue its own run.
         const mainOwned = e.automation || e.serverPersisted || automationStreams.has(convId);
-        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true && !mainOwned;
+        // Only the ORIGINATING client drives the auto-continue — a mirroring client (2nd GUI
+        // window / web client) has a locallyOriginated:false accumulator built from broadcasts;
+        // if it also continued, every mirror would independently restart the run (duplicate
+        // model calls, supersession races, another client's model/CWD). Mirrors just render.
+        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true && !mainOwned && acc.locallyOriginated === true;
 
         if (autoContinue) {
           // Auto-continue: finalize current response and immediately restart the stream
@@ -3643,6 +3655,7 @@ export function RuntimeProvider({
             seededBackground: acc.seededBackground,
             seededDiskHeadId: acc.seededDiskHeadId,
             runConfig: acc.runConfig, // carry the run's settings so further continuations stay correct
+            locallyOriginated: acc.locallyOriginated, // a continuation of a local turn stays locally driven
           });
           if (isActiveConv) {
             setTree([...acc.messages]);
@@ -3814,6 +3827,26 @@ export function RuntimeProvider({
           const _ptMt = persistTimersRef.current.get(convId);
           if (_ptMt) {
             clearTimeout(_ptMt);
+            persistTimersRef.current.delete(convId);
+          }
+          streamAccumulators.delete(convId);
+          if (isActiveConv) {
+            setIsRunning(false);
+            void loadConversationState(convId);
+          }
+          return;
+        }
+
+        // MIRROR of a GUI turn this client did NOT start (locallyOriginated:false): the
+        // ORIGINATING client owns the auto-continue / manual-continue decision + persistence.
+        // A mirror must NOT finalize+persist idle or show its own continue card (that races the
+        // originator's continuation + could persist a terminal state the originator will
+        // overwrite). Drop the live accumulator, render the terminal state, reconcile from disk
+        // when the originator's next turn lands — same as the mainOwned reconcile above.
+        if (!acc.locallyOriginated) {
+          const _ptMirror = persistTimersRef.current.get(convId);
+          if (_ptMirror) {
+            clearTimeout(_ptMirror);
             persistTimersRef.current.delete(convId);
           }
           streamAccumulators.delete(convId);
@@ -4030,7 +4063,10 @@ export function RuntimeProvider({
           // so we restart in plan-first mode with a synthetic user message telling the
           // agent to continue refining the plan.
           const planModeRejectRestart = (e.data as Record<string, unknown> | undefined)?.planModeRejectRestart;
-          if (planModeRestart || planModeRejectRestart) {
+          // Only the ORIGINATING client restarts (mirrors have locallyOriginated:false) — else
+          // every mirror independently restarts the plan turn (duplicate runs / races / wrong
+          // client settings). A mirror still renders the restarted run via broadcasts.
+          if ((planModeRestart || planModeRejectRestart) && acc.locallyOriginated === true) {
             const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
             console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
             // Snapshot THIS run's settings for the delayed launch. Prefer the run's OWN
@@ -4098,6 +4134,7 @@ export function RuntimeProvider({
                   seededBackground: acc.seededBackground,
                   seededDiskHeadId: acc.seededDiskHeadId,
                   runConfig: planRunConfig, // keep the run's settings for any further continuation
+                  locallyOriginated: acc.locallyOriginated, // plan-restart of a local turn stays locally driven
                 });
                 if (activeIdRef.current === convId) setIsRunning(true);
                 const planContinuationPersist = persistConversation(
@@ -4199,8 +4236,14 @@ export function RuntimeProvider({
                         return;
                       }
                       // SUPERSEDED or unknown ({} — IPC/write failure): the record isn't on
-                      // disk, so re-persist before launching (else the reuse gate misses it).
-                      if ((res?.superseded || (!res?.persisted && !res?.rejected)) && acc.pendingCompaction) {
+                      // disk, so re-persist before launching (else the reuse gate misses a
+                      // pending compaction — AND, more importantly, `superseded` can mean the
+                      // conversation was DELETED during the 100ms restart delay: launching then
+                      // would revive deleted work + waste model/tool execution). Re-persist
+                      // regardless of a pending compaction; the re-persist re-checks existence
+                      // (a deleted conv keeps returning superseded → the bounded budget abandons
+                      // via abandonPlanRestart, which persists idle and never launches).
+                      if (res?.superseded || (!res?.persisted && !res?.rejected)) {
                         repersist(0);
                         return;
                       }
@@ -4438,6 +4481,7 @@ export function RuntimeProvider({
         // Capture THIS run's settings so a later continuation (max_turns / plan-restart) uses
         // them even if the user has switched to another chat by then (not the live refs).
         runConfig: { selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, cwd, executionMode, threadOverrides },
+        locallyOriginated: true, // this client started the turn → it drives any auto-continue/restart
       });
       const branch = getActiveBranch(newTree, newHead);
 
@@ -4678,6 +4722,7 @@ export function RuntimeProvider({
         pendingAssistantTiming: createPendingAssistantTiming(),
         pendingAssistantId: responseMessageId,
         runConfig: reloadRunConfig,
+        locallyOriginated: true, // this client started the reload → it drives any auto-continue/restart
       });
       const branch = getActiveBranch(newTree, actualParent);
       const reloadPreHead = headIdRef.current;
@@ -4825,6 +4870,7 @@ export function RuntimeProvider({
         pendingAssistantTiming,
         pendingAssistantId: responseMessageId,
         runConfig: editRunConfig,
+        locallyOriginated: true, // this client started the edit → it drives any auto-continue/restart
       });
       const branch = getActiveBranch(newTree, newHead);
 
