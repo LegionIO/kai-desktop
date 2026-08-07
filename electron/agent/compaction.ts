@@ -728,7 +728,48 @@ export async function compactConversationPrefix(
       }
     }
   }
-  const fittedPrefix = fittedLen >= MIN_SUMMARIZED ? prefix.slice(0, fittedLen) : [];
+  let fittedPrefix = fittedLen >= MIN_SUMMARIZED ? prefix.slice(0, fittedLen) : [];
+  // Boundary safety: the summary REPLACES the covered messages, so a tool CALL inside the
+  // covered prefix whose paired RESULT lands OUTSIDE it (in the uncovered prefix tail or the
+  // protected suffix) would be orphaned — a result with no preceding call, which providers
+  // reject. The binary search fits on token budget alone and can split such a pair. Shrink the
+  // covered prefix (drop whole messages from its tail) until no covered call has an uncovered
+  // result. Dropping only ever REDUCES tokens, so the budget still holds; if it falls below
+  // MIN_SUMMARIZED the no-op guard below returns null (nothing lost — the pair stays intact in
+  // the branch for a future turn).
+  if (fittedPrefix.length >= MIN_SUMMARIZED) {
+    // Result ids present anywhere OUTSIDE the covered prefix (uncovered prefix tail + suffix).
+    const collectResultIds = (msgs: ChatMessage[]): Set<string> => {
+      const s = new Set<string>();
+      for (const m of msgs) for (const id of extractResultIds(m)) s.add(id);
+      return s;
+    };
+    let outsideResultIds = new Set<string>([
+      ...collectResultIds(prefix.slice(fittedPrefix.length)),
+      ...collectResultIds(suffix),
+    ]);
+    const coveredCallHasOutsideResult = (): boolean => {
+      for (const m of fittedPrefix) {
+        for (const cid of extractCallIds(m)) if (outsideResultIds.has(cid)) return true;
+      }
+      return false;
+    };
+    while (fittedPrefix.length >= MIN_SUMMARIZED && coveredCallHasOutsideResult()) {
+      fittedPrefix = fittedPrefix.slice(0, fittedPrefix.length - 1);
+      // The dropped message re-enters the uncovered region → its result ids (and any it carries)
+      // must now count as "outside". Recompute from the new boundary.
+      outsideResultIds = new Set<string>([
+        ...collectResultIds(prefix.slice(fittedPrefix.length)),
+        ...collectResultIds(suffix),
+      ]);
+    }
+    // Re-tokenize the (possibly shrunk) covered prefix so the no-op guard below compares the
+    // ACTUAL covered token count against the budget.
+    if (fittedPrefix.length !== fittedLen) {
+      fittedLen = fittedPrefix.length;
+      candidateTokens = fittedPrefix.length >= MIN_SUMMARIZED ? await countForLength(fittedLen) : Number.POSITIVE_INFINITY;
+    }
+  }
   // The prefix's images are summarized AWAY (replaced by the text summary), not sent — so the
   // summarizer budget counts only the stripped-text placeholders (see stripMediaForSerialization),
   // NOT the prefix media's native tokens (adding those would over-charge ~524k for a 1MB image

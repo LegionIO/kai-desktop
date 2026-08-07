@@ -2031,7 +2031,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           };
           const creditable = isCanonical(compactModelName) && isCanonical(sendModelName);
-          return creditable ? Math.min(rawBytes, outputMaxTokens * 4) : rawBytes;
+          // truncateToTokenBudget TARGETS outputMaxTokens but is NOT guaranteed to reach it: it
+          // can exhaust its 12 proportional-shrink iterations (or hit its char floors) and return
+          // a body still ABOVE the budget. Crediting a flat outputMaxTokens*4 would then
+          // UNDER-count the sent body → media wrongly retained → post-tool overflow (recovery off
+          // once a tool ran). Apply a safety margin so the predicted compacted size stays a
+          // conservative UPPER estimate even when truncation overshoots the target, still clamped
+          // to rawBytes (compaction never grows the body).
+          const COMPACTION_OVERSHOOT_MARGIN = 1.5;
+          return creditable
+            ? Math.min(rawBytes, Math.ceil(outputMaxTokens * 4 * COMPACTION_OVERSHOOT_MARGIN))
+            : rawBytes;
         };
         const predictCommittedNonMediaBytes = (r: unknown): number => {
           const toolCfg = config.compaction?.tool as ToolCompactionConfig | undefined;
