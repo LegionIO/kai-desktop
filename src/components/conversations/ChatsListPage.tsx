@@ -94,11 +94,25 @@ function getDisplayTitle(conv: ConversationSummary): string {
   return conv.title?.trim() || conv.fallbackTitle?.trim() || '';
 }
 
+/** Minimal shape the advanced-filter predicate reads. Both the full Chats page
+ *  and the sidebar `ConversationList` have their own `ConversationSummary` Picks;
+ *  this structural type lets `matchesAdvancedFilter` accept either. */
+export type FilterableConversation = {
+  createdAt: string;
+  updatedAt: string;
+  lastMessageAt: string | null;
+  lastAssistantUpdateAt: string | null;
+  messageCount: number;
+  hasToolCalls?: boolean;
+  hasComputerUse?: boolean;
+  hasMedia?: boolean;
+};
+
 /** Apply the advanced FilterPopover criteria to a single summary. Pure — exported
  *  for unit tests. A boolean toggle set to `true` requires the flag be truthy; a
  *  toggle left `null` is ignored. Date bounds compare ISO strings lexically
  *  (safe for the same offset), count bounds are inclusive. */
-export function matchesAdvancedFilter(conv: ConversationSummary, filter: FilterPreference): boolean {
+export function matchesAdvancedFilter(conv: FilterableConversation, filter: FilterPreference): boolean {
   if (filter.hasToolCalls === true && !conv.hasToolCalls) return false;
   if (filter.hasComputerUse === true && !conv.hasComputerUse) return false;
   if (filter.hasMedia === true && !conv.hasMedia) return false;
