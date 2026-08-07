@@ -3651,23 +3651,32 @@ export function RuntimeProvider({
           // Use the RUN's OWN captured settings (acc.runConfig), NOT the live active-chat
           // refs — a background max_turns continuation whose conversation the user switched
           // away from must restart with A's model/profile/cwd/overrides, not B's (else a
-          // relative-path tool could modify the wrong project). Fall back to the live refs
-          // only for a run that predates runConfig capture (e.g. an automation-seeded acc).
+          // relative-path tool could modify the wrong project, or it runs on the wrong model).
+          // When runConfig is present use ITS fields VERBATIM (incl. a captured null/undefined —
+          // e.g. a null model/profile means "the run used the global default"; a `?? live`
+          // fallback would wrongly inherit the CURRENTLY-active chat's model/profile). Fall back
+          // to the live refs for the WHOLE object only when runConfig is absent (a pre-capture,
+          // e.g. automation-seeded, accumulator).
           const rc = acc.runConfig;
           const live = streamHandlerRef.current;
-          const cfg = {
-            selectedModelKey: rc?.selectedModelKey ?? live.selectedModelKey,
-            reasoningEffort: rc?.reasoningEffort ?? live.reasoningEffort,
-            selectedProfileKey: rc?.selectedProfileKey ?? live.selectedProfileKey,
-            fallbackEnabled: rc?.fallbackEnabled ?? live.fallbackEnabled,
-            executionMode: rc?.executionMode ?? live.executionMode,
-            threadOverrides: rc?.threadOverrides ?? live.threadOverrides,
-          };
-          // When the run captured its config (rc present), use rc.cwd VERBATIM — including an
-          // explicit null (the run launched with no working directory). A `?? live` fallback
-          // would, for a captured cwd:null, inherit the CURRENTLY-active chat's CWD → a
-          // background continuation's relative-path tools could modify the WRONG project. Only
-          // fall back to the live ref when rc is absent (a pre-runConfig-capture run).
+          const cfg = rc
+            ? {
+                selectedModelKey: rc.selectedModelKey,
+                reasoningEffort: rc.reasoningEffort,
+                selectedProfileKey: rc.selectedProfileKey,
+                fallbackEnabled: rc.fallbackEnabled,
+                executionMode: rc.executionMode,
+                threadOverrides: rc.threadOverrides,
+              }
+            : {
+                selectedModelKey: live.selectedModelKey,
+                reasoningEffort: live.reasoningEffort,
+                selectedProfileKey: live.selectedProfileKey,
+                fallbackEnabled: live.fallbackEnabled,
+                executionMode: live.executionMode,
+                threadOverrides: live.threadOverrides,
+              };
+          // cwd follows the same rule: captured VERBATIM (incl. explicit null) when rc present.
           const runCwd = rc ? rc.cwd : currentWorkingDirectoryRef.current;
           // Await the compaction-bearing persist BEFORE launching the continuation: the
           // continuation's pre-stream reuse gate (main) reads the stored compaction record
@@ -4027,19 +4036,27 @@ export function RuntimeProvider({
             // Snapshot THIS run's settings for the delayed launch. Prefer the run's OWN
             // captured runConfig (correct even for a background conv the user has switched
             // away from); fall back to the live refs for a run predating runConfig capture.
+            // When runConfig is present use ITS fields VERBATIM (incl. captured null/undefined —
+            // a `?? live` fallback would wrongly inherit the active chat's model/profile).
             const planLive = streamHandlerRef.current;
-            const planCfgSnapshot = {
-              selectedModelKey: acc.runConfig?.selectedModelKey ?? planLive.selectedModelKey,
-              reasoningEffort: acc.runConfig?.reasoningEffort ?? planLive.reasoningEffort,
-              selectedProfileKey: acc.runConfig?.selectedProfileKey ?? planLive.selectedProfileKey,
-              fallbackEnabled: acc.runConfig?.fallbackEnabled ?? planLive.fallbackEnabled,
-              threadOverrides: acc.runConfig?.threadOverrides ?? planLive.threadOverrides,
-            };
-            // Use the captured cwd VERBATIM when runConfig is present (incl. explicit null);
-            // a `?? live` fallback would let a plan-restart of a cwd:null run inherit the
-            // currently-active chat's CWD (relative-path tools → wrong project). Fall back to
-            // the live ref only when runConfig is absent (pre-capture run).
-            const planCwdSnapshot = acc.runConfig ? acc.runConfig.cwd : currentWorkingDirectoryRef.current;
+            const planRc = acc.runConfig;
+            const planCfgSnapshot = planRc
+              ? {
+                  selectedModelKey: planRc.selectedModelKey,
+                  reasoningEffort: planRc.reasoningEffort,
+                  selectedProfileKey: planRc.selectedProfileKey,
+                  fallbackEnabled: planRc.fallbackEnabled,
+                  threadOverrides: planRc.threadOverrides,
+                }
+              : {
+                  selectedModelKey: planLive.selectedModelKey,
+                  reasoningEffort: planLive.reasoningEffort,
+                  selectedProfileKey: planLive.selectedProfileKey,
+                  fallbackEnabled: planLive.fallbackEnabled,
+                  threadOverrides: planLive.threadOverrides,
+                };
+            // cwd follows the same rule: captured VERBATIM (incl. explicit null) when rc present.
+            const planCwdSnapshot = planRc ? planRc.cwd : currentWorkingDirectoryRef.current;
             // The restart launches in plan-first mode, so the continuation's runConfig must
             // record executionMode:'plan-first' — NOT the original acc.runConfig (usually
             // 'auto'). Otherwise a further max_turns continuation of the RESTARTED planning

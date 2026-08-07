@@ -487,6 +487,18 @@ export function App({
           compactBusyWaitRef.current = true;
           setStatus('running');
           statusRef.current = 'running';
+        } else if (!busy && compactBusyWaitRef.current) {
+          // Authoritative snapshot says NOT compacting, but we're still busy-waiting — the
+          // `compacting=false` unlock broadcast was MISSED (a disconnect between the true and
+          // false broadcasts). Reconcile: clear the stale busy-wait and drain now. Without this
+          // the ref stays stale-true, so a LATER unlock broadcast AND a later /compact's finally
+          // could BOTH drain (two prompts launched concurrently → the single pendingBusyResendRef
+          // is overwritten by concurrent busy rejections → one prompt silently lost).
+          compactBusyWaitRef.current = false;
+          if (!drainNextInput()) {
+            setStatus('idle');
+            statusRef.current = 'idle';
+          }
         }
         return busy;
       } catch {
