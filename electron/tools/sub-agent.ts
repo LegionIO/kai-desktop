@@ -465,9 +465,10 @@ function retainFollowUpAsPaused(
  * before each (so a single freed slot doesn't over-admit). Deferred a macrotask
  * so it runs after the releasing run's own teardown.
  */
-function drainAdmissiblePendingResumes(): void {
+function drainAdmissiblePendingResumes(skipId?: string): void {
   setImmediate(() => {
     for (const [saId, queued] of [...pendingResumeQueues]) {
+      if (saId === skipId) continue; // caller asked to exclude this conversation (avoid re-driving its own failed reopen)
       if (!queued || queued.length === 0) {
         pendingResumeQueues.delete(saId);
         continue;
@@ -578,6 +579,14 @@ export function sendSubAgentFollowUp(subAgentConversationId: string, message: st
       return false;
     }
     pending.push(message);
+    // If NO run is currently active for this conversation, nothing will drain the pending
+    // queue on its own (a resume-reopen failure retains messages here WITHOUT scheduling a
+    // drain, to avoid auto-retry-looping a persistent DB failure). A fresh follow-up is an
+    // EXPLICIT retry intent, so kick a deferred drain now — it re-attempts the reopen/resume
+    // (and if the reopen fails again, retains without re-draining, so no tight loop).
+    if (!activeSubAgentControllers.has(subAgentConversationId)) {
+      queueMicrotask(() => drainAdmissiblePendingResumes());
+    }
     return true;
   }
 
@@ -746,6 +755,9 @@ async function resumeSubAgent(
         status: 'stopped',
         summary: 'Stopped.',
       } as SubAgentEvent);
+      // We released a concurrency slot above; another paused agent may now be admissible.
+      // This conv is fully removed from pending, so the drain won't re-hit our failed reopen.
+      queueMicrotask(() => drainAdmissiblePendingResumes());
       return;
     }
     // Retain ALL follow-ups (FIFO) for a later admission-gated drain. Do NOT drain NOW —
@@ -766,6 +778,11 @@ async function resumeSubAgent(
       summary: 'Paused — could not reopen; retry to resume.',
       pausedReason: 'capacity',
     } as SubAgentEvent);
+    // We released a concurrency slot above; drain OTHER paused agents that were waiting on
+    // capacity — but do NOT re-drive THIS conv (its pending was just retained; re-attempting
+    // its reopen now would tight-loop on a persistent failure — see round 115). Drain the
+    // others directly, skipping this conversation.
+    queueMicrotask(() => drainAdmissiblePendingResumes(subAgentConversationId));
     return;
   }
 
@@ -989,16 +1006,27 @@ export function stopSubAgent(subAgentConversationId: string): boolean {
     status: 'stopped',
     summary: 'Stopped.',
   } as SubAgentEvent);
-  // Best-effort terminal DB write (paused/completed → stopped is FSM-legal), using
-  // the config/dbPath captured in the retained state.
+  // Best-effort terminal DB write (paused/completed → stopped is FSM-legal), using the
+  // config/dbPath captured in the retained state. updateSubagentStatus RETURNS false on
+  // failure (it swallows internally). The in-memory resumable state was already dropped
+  // above, so if this write fails the thread would reappear on disk as `paused` yet no
+  // longer be resumable — retry (bounded) to close that window rather than fire-and-forget.
   if (retainedState) {
     const memory = getSharedMemory(retainedState.config, retainedState.dbPath);
     if (memory) {
-      void updateSubagentStatus(memory, subAgentConversationId, {
-        status: 'stopped',
-        completedAt: new Date().toISOString(),
-        exitReason: 'user_aborted',
-      }).catch((err) => console.error('[Subagent] Failed to record stop of paused sub-agent:', err));
+      const writeStopped = async (remaining: number): Promise<void> => {
+        const ok = await updateSubagentStatus(memory, subAgentConversationId, {
+          status: 'stopped',
+          completedAt: new Date().toISOString(),
+          exitReason: 'user_aborted',
+        });
+        if (!ok && remaining > 0) {
+          setTimeout(() => void writeStopped(remaining - 1), 500);
+        } else if (!ok) {
+          console.error(`[Subagent] Failed to persist stopped status for ${subAgentConversationId} after retries`);
+        }
+      };
+      void writeStopped(5).catch((err) => console.error('[Subagent] Failed to record stop of paused sub-agent:', err));
     }
   }
   return true;

@@ -3646,6 +3646,25 @@ export function RuntimeProvider({
           return;
         }
 
+        // MAIN-OWNED (automation / CLI serverPersisted) max_turns: main persists the
+        // authoritative terminal state. The renderer must NOT finalize + persist here (that
+        // races main's write → duplicate/sibling terminal nodes or overwrites the branch).
+        // Drop the accumulator + reconcile from disk, mirroring the mainOwned `done` handler.
+        if (mainOwned) {
+          automationStreams.delete(convId);
+          const _ptMt = persistTimersRef.current.get(convId);
+          if (_ptMt) {
+            clearTimeout(_ptMt);
+            persistTimersRef.current.delete(convId);
+          }
+          streamAccumulators.delete(convId);
+          if (isActiveConv) {
+            setIsRunning(false);
+            void loadConversationState(convId);
+          }
+          return;
+        }
+
         // Manual continue: show interactive card
         const { msg: mtMsg, idx: mtIdx } = getOrCreateAssistantInAcc(acc);
         const mtContent = (Array.isArray(mtMsg.content) ? [...mtMsg.content] : []) as ContentPart[];
@@ -4132,6 +4151,7 @@ export function RuntimeProvider({
       // fall through to a normal turn (which supersedes). If the main process says
       // the active run isn't cooperatively injectable (a CLI runtime), also fall
       // through to the normal supersede path.
+      const wasRunningAtEntry = isRunningRef.current;
       if (isRunningRef.current) {
         const onlyText = userContent.length > 0 && userContent.every((p) => p.type === 'text');
         if (onlyText) {
@@ -4152,13 +4172,30 @@ export function RuntimeProvider({
         }
       }
 
-      // Base the new turn on the LIVE accumulator (it may have streamed more during an
-      // awaited injectMidTurn above), falling back to the closure tree/headId when there's
-      // no live accumulator. Using the stale closure tree would overwrite final same-id
-      // content with a stale partial + branch the user message before recent results.
+      // Base the new turn on the freshest tree available. If the running turn is still live,
+      // use its accumulator (it may have streamed more during an awaited injectMidTurn). If
+      // its accumulator is GONE, the run FINALIZED during that await and wrote its final tree
+      // to DISK — re-read it (the closure tree/headId is stale, missing the finalized
+      // assistant message; using it would overwrite the finalized content + mis-branch the
+      // new user turn). Only re-read when we actually awaited an inject (isRunningRef at
+      // entry) AND have no live accumulator; otherwise the closure tree is current.
       const liveAcc = streamAccumulators.get(convId);
-      const baseTree = liveAcc ? liveAcc.messages : tree;
-      const baseHead = liveAcc ? liveAcc.headId : headId;
+      let baseTree: StoredMessage[] = liveAcc ? liveAcc.messages : tree;
+      let baseHead: string | null = liveAcc ? liveAcc.headId : headId;
+      if (!liveAcc && wasRunningAtEntry) {
+        try {
+          const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
+          if (fresh) {
+            const { tree: ft, headId: fh } = ensureTree(fresh);
+            if (ft.length >= baseTree.length) {
+              baseTree = ft;
+              baseHead = fh;
+            }
+          }
+        } catch {
+          /* disk read failed — fall back to the closure tree (best-effort) */
+        }
+      }
       const userMsg: StoredMessage = {
         id: msgId(),
         parentId: baseHead,

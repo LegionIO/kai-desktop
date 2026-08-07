@@ -31,7 +31,10 @@ export interface SubagentStatusFields {
  */
 const VALID_TRANSITIONS: Record<SubagentStatus, SubagentStatus[]> = {
   pending: ['running', 'failed', 'abandoned', 'stopped'],
-  running: ['completed', 'failed', 'abandoned', 'stopped', 'paused'],
+  // `running` includes a self-transition (running → running) so an idempotent REOPEN
+  // succeeds when a prior terminal write FAILED and left the DB stuck at `running`: a resume
+  // would otherwise hit an illegal running → running and never be able to reopen the thread.
+  running: ['running', 'completed', 'failed', 'abandoned', 'stopped', 'paused'],
   // A resumable terminal (completed/paused) can be REOPENED (→ running) or, if the
   // user stops it before/around a resume, moved to the truly-terminal `stopped`.
   completed: ['running', 'stopped'],
