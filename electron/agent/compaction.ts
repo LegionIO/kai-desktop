@@ -64,22 +64,54 @@ export function messageContentSignature(
     // Mirror stripDisplayOnlyParts: keep the original if stripping empties the content.
     if (filtered.length !== (content as unknown[]).length && filtered.length > 0) content = filtered;
   }
-  let composed: string;
+  const hash = createHash('sha1');
   try {
-    composed = `${m.role ?? ''}:${JSON.stringify(content) ?? ''}:${
-      extra.tool_calls !== undefined ? JSON.stringify(extra.tool_calls) : ''
-    }:${extra.tool_call_id !== undefined ? String(extra.tool_call_id) : ''}`;
+    // Feed a stable serialization to the hash INCREMENTALLY rather than building one giant
+    // JSON.stringify string first: a media-bearing message can carry many MB of base64, and
+    // materializing a history-sized intermediate string on the main process (this runs on
+    // every conversations:put) risks a stall/OOM. Walking the structure and update()-ing the
+    // hash with each primitive reads the existing strings in place (no second full-size copy).
+    // Deterministic object key order so two equal messages hash equal.
+    const feed = (v: unknown): void => {
+      if (v === null || v === undefined) {
+        hash.update(' n');
+      } else if (typeof v === 'string') {
+        hash.update(' s');
+        hash.update(v); // reads the existing string in place; no giant new allocation
+      } else if (typeof v === 'number' || typeof v === 'boolean') {
+        hash.update(' p');
+        hash.update(String(v));
+      } else if (Array.isArray(v)) {
+        hash.update(' [');
+        for (const item of v) feed(item);
+        hash.update(' ]');
+      } else if (typeof v === 'object') {
+        hash.update(' {');
+        for (const key of Object.keys(v as Record<string, unknown>).sort()) {
+          hash.update(' k');
+          hash.update(key);
+          feed((v as Record<string, unknown>)[key]);
+        }
+        hash.update(' }');
+      } else {
+        hash.update(' ?');
+        hash.update(String(v));
+      }
+    };
+    feed(m.role ?? '');
+    feed(content);
+    feed(extra.tool_calls !== undefined ? extra.tool_calls : null);
+    feed(extra.tool_call_id !== undefined ? String(extra.tool_call_id) : null);
+    return hash.digest('hex');
   } catch {
-    // JSON.stringify can throw on a circular/exotic content object. A stable sentinel
-    // keyed by role/id keeps the signature deterministic (two unserializable-but-equal
-    // messages compare equal) without leaking the raw structure — the callers only need
-    // drift DETECTION, and an unserializable message is treated as "changed if anything
-    // else about it changed" via role + tool_call_id.
-    composed = `unserializable:${m.role ?? ''}:${
+    // A getter/proxy in the content can throw during traversal. Fall back to a stable sentinel
+    // keyed by role/id (two unserializable-but-equal messages compare equal) — the callers only
+    // need drift DETECTION. A fresh hash so a partial traversal doesn't taint the result.
+    const composed = `unserializable:${m.role ?? ''}:${
       extra.tool_call_id !== undefined ? String(extra.tool_call_id) : ''
     }`;
+    return createHash('sha1').update(composed).digest('hex');
   }
-  return createHash('sha1').update(composed).digest('hex');
 }
 
 export type ChatMessage = {

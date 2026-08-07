@@ -94,6 +94,21 @@ function abortAutomationForConversation(id: string): void {
     /* best-effort */
   }
 }
+// Active /compact summarizer AbortControllers, keyed by conversation. A running /compact holds
+// its own AbortController (deadline timeout) but is NOT in activeStreams or the automation
+// registry, so deleting the conversation mid-summarization would otherwise let the summarizer
+// keep billing until its ~285s deadline. Deleting aborts it immediately.
+const activeCompactAborters = new Map<string, AbortController>();
+function abortActiveCompact(id: string): void {
+  const ac = activeCompactAborters.get(id);
+  if (ac) {
+    try {
+      ac.abort();
+    } catch {
+      /* best-effort */
+    }
+  }
+}
 function broadcastReset(appHome: string): void {
   broadcastChange({ kind: 'reset', activeConversationId: getActiveConversationId(appHome) });
 }
@@ -920,6 +935,7 @@ export function registerConversationHandlers(
     // side effects don't keep running. No await between delete and cancel, so no tool runs.
     cancelConversationStream(id);
     abortAutomationForConversation(id); // standalone automations use a separate abort registry
+    abortActiveCompact(id); // stop a running /compact summarizer (not in activeStreams)
     broadcastDelete(appHome, id);
     clearConversationDiffs(id);
 
@@ -947,6 +963,7 @@ export function registerConversationHandlers(
     for (const id of removed) {
       cancelConversationStream(id);
       abortAutomationForConversation(id);
+      abortActiveCompact(id);
     }
     // Broadcast a delete per removed id so each renderer/web client prunes O(1),
     // matching the single-delete path (there is no batched change kind).
@@ -976,6 +993,7 @@ export function registerConversationHandlers(
     for (const conversationId of Object.keys(readIndex(appHome).conversations)) {
       cancelConversationStream(conversationId);
       abortAutomationForConversation(conversationId);
+      abortActiveCompact(conversationId);
     }
     // Clean up all computer-use sessions
     if (getConfig) {
@@ -1160,6 +1178,9 @@ export function registerConversationHandlers(
     // the lock released with ~15s of headroom before the client stops waiting.
     const COMPACT_TIMEOUT_MS = 285_000;
     const abort = new AbortController();
+    // Register so deleting the conversation mid-summarization aborts the summarizer + stops
+    // provider billing immediately (a delete otherwise wouldn't reach this controller).
+    activeCompactAborters.set(conversationId, abort);
     const timer = setTimeout(() => abort.abort(), COMPACT_TIMEOUT_MS);
     if (typeof (timer as { unref?: () => void }).unref === 'function') (timer as { unref: () => void }).unref();
     // Attach a no-op catch to the inner promise so that if the TIMEOUT branch wins the
@@ -1180,6 +1201,9 @@ export function registerConversationHandlers(
       ]);
     } finally {
       clearTimeout(timer);
+      // Only clear the registry slot if it's still OURS (a later /compact for the same
+      // conversation would have replaced it; don't drop the newer controller).
+      if (activeCompactAborters.get(conversationId) === abort) activeCompactAborters.delete(conversationId);
       clearCompacting(conversationId);
     }
   };

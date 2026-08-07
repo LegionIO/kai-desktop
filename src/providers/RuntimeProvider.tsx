@@ -937,32 +937,40 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // BOTH survive (a single slot would either overwrite A or discard B). Restored one-at-a-time
 // (oldest first) by loadConversationState + the composer-empty poll (into an empty composer
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
-type RejectedDraft = { text: string; attachments: AttachedFile[] };
+type RejectedDraft = { text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
-const MAX_REJECTED_DRAFTS_PER_CONV = 20;
-// Global cap on the number of DISTINCT conversations holding a rejected-draft queue. Without
-// it, a user who accumulates compact-busy rejections across many dormant chats retains their
-// attachment data URLs (potentially large base64) in renderer memory indefinitely. When a new
-// conversation would exceed the cap, evict the OLDEST conversation's queue (Map preserves
-// insertion order) — its drafts are only a convenience restore, not durable state.
-const MAX_REJECTED_DRAFT_CONVERSATIONS = 64;
-function enqueueRejectedDraft(convId: string, draft: RejectedDraft): void {
-  if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
-  const q = rejectedDrafts.get(convId) ?? [];
-  q.push(draft);
-  if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift(); // bound — drop the oldest
-  // Enforce the global conversation cap only when adding a NEW conversation key.
-  if (!rejectedDrafts.has(convId)) {
-    while (rejectedDrafts.size >= MAX_REJECTED_DRAFT_CONVERSATIONS) {
-      const oldest = rejectedDrafts.keys().next().value as string | undefined;
-      if (oldest === undefined || oldest === convId) break;
-      rejectedDrafts.delete(oldest);
-    }
+// Memory bound WITHOUT silently dropping still-relevant user input: a rejected draft is stashed
+// only for the TRANSIENT /compact-busy window (compaction finishes in seconds to ~285s) and is
+// restored when the user next returns to that chat. Bound by TTL, not by count-eviction — a
+// count cap would drop a FRESH draft the user is about to get back (data loss). Dormant drafts
+// (chat never revisited) expire after the TTL; an actively-bounced-between chat restores well
+// within it. A very high per-conversation cap remains only as a pathological safety valve.
+const REJECTED_DRAFT_TTL_MS = 30 * 60_000; // 30 min — far longer than any /compact window
+const MAX_REJECTED_DRAFTS_PER_CONV = 200; // safety valve only; the TTL is the real bound
+// Drop drafts older than the TTL across all conversations. Cheap (small map) and idempotent;
+// called opportunistically on every enqueue/dequeue so dormant entries can't accumulate.
+function pruneExpiredRejectedDrafts(): void {
+  const cutoff = Date.now() - REJECTED_DRAFT_TTL_MS;
+  for (const [cid, q] of rejectedDrafts) {
+    const kept = q.filter((d) => d.stashedAt >= cutoff);
+    if (kept.length === 0) rejectedDrafts.delete(cid);
+    else if (kept.length !== q.length) rejectedDrafts.set(cid, kept);
   }
+}
+function enqueueRejectedDraft(convId: string, draft: { text: string; attachments: AttachedFile[] }): void {
+  if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
+  pruneExpiredRejectedDrafts();
+  const q = rejectedDrafts.get(convId) ?? [];
+  q.push({ ...draft, stashedAt: Date.now() });
+  // Pathological safety valve only (a real user can't stash 200 unsent drafts in one chat
+  // within the TTL). If ever hit, drop the OLDEST — the TTL sweep is the primary bound and
+  // will have already expired anything genuinely stale.
+  if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift();
   rejectedDrafts.set(convId, q);
 }
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
 function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
+  pruneExpiredRejectedDrafts();
   const q = rejectedDrafts.get(convId);
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
