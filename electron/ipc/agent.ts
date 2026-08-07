@@ -2501,6 +2501,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // Declared here (before the observer-launch fn) so an observer-launched tool,
       // which emits OUTSIDE the main stream loop, can also flip it.
       let sawToolOrTextThisTurn = false;
+      // Distinct from the above: TRUE once a TOOL actually EXECUTED this turn (a committed
+      // side effect), NOT merely text streamed. A model-fallback discards the primary's
+      // partial TEXT (not in the new context) so sawToolOrTextThisTurn can reset for a
+      // text-only primary — but a tool's SIDE EFFECT already happened, so if one executed we
+      // must NOT reset (else overflow compact-and-retry on the fallback could replay the
+      // mutation). Set at the SAME tool sites, never on text-delta.
+      let executedToolThisTurn = false;
       // True once the in-place overflow retry has been used for this turn — caps
       // it at a single attempt (the model-stream is re-run in the overflowAttempt
       // loop below; this replaces the old cross-invocation overflowRetry guard).
@@ -2713,6 +2720,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // loop) → mark the turn as having side effects so overflow recovery won't
         // auto-retry and replay it.
         sawToolOrTextThisTurn = true;
+        executedToolThisTurn = true;
         return { ok: true, launchedToolCallId: toolCallId, details: 'Observer-launched tool started.' };
       };
 
@@ -3627,6 +3635,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // executes via this path first, risking a replay of destructive side
             // effects on retry.
             sawToolOrTextThisTurn = true;
+            executedToolThisTurn = true;
             // Charge this call's RAW args against the media budget IMMEDIATELY —
             // before the PreToolUse await and before any denial early-return — so a
             // slow or denied large-argument call can't stay uncounted while a
@@ -4010,6 +4019,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // /compact guidance instead of silently re-running.
           if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'text-delta') {
             sawToolOrTextThisTurn = true;
+            if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
           }
           // After a plan-related done event has been sent and the stream aborted,
           // ignore any trailing events (especially the generator's final plain done).
@@ -4134,12 +4144,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             committedNonMediaTokens = 0;
             committedToolCallArgIds.clear();
             // The fallback restarts from the ORIGINAL messages: the failed primary's partial
-            // text + any tool calls are NOT in the new model's context and were discarded
-            // above. Reset sawToolOrTextThisTurn too — otherwise a content-filtered primary
-            // that emitted some text would leave it TRUE, gating off the overflow
-            // compact-and-retry on a fallback that immediately overflows with NO retained
-            // output + no tool executed (a safe, recoverable overflow wrongly hard-failed).
-            sawToolOrTextThisTurn = false;
+            // TEXT is discarded (not in the new model's context), so a text-only primary can
+            // reset sawToolOrTextThisTurn — otherwise a content-filtered primary that emitted
+            // text would leave it TRUE, gating off the overflow compact-and-retry on a
+            // fallback that immediately overflows with NO retained output (safe overflow
+            // wrongly hard-failed). BUT if a TOOL actually EXECUTED, its SIDE EFFECT already
+            // happened — do NOT reset (a compact-and-retry could replay the mutation). Only
+            // reset when no tool executed.
+            if (!executedToolThisTurn) sawToolOrTextThisTurn = false;
             // Invalidate the static-input memo so it recomputes under the FALLBACK
             // model's tokenizer (a cross-provider fallback can tokenize the same
             // system prompt / schemas very differently).

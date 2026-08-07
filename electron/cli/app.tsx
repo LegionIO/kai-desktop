@@ -200,6 +200,11 @@ export function App({
   const sendMessageRef = useRef<
     (text: string, submitText?: string, attachments?: Array<{ image: string; mimeType?: string }>) => void
   >(() => {});
+  // Send a QUEUED prompt string, applying @mention expansion first (image mentions →
+  // attachments, @file → inlined content) exactly as the interactive input path does. Queue
+  // entries are the RAW typed text (mentions unexpanded), so a drain must re-expand — sending
+  // the raw string would reach the model with literal `@file`/`@image` tokens, no content.
+  const sendExpandedRef = useRef<(text: string) => void>((text) => sendMessageRef.current(text));
   // Guards double-draining the queue: the backend can emit `error` THEN `done`
   // for the same turn. Only the first terminal event of a turn drains one
   // queued message. Reset when a new turn starts (sendMessage).
@@ -435,7 +440,7 @@ export function App({
         const next = queueRef.current.shift() as string;
         setStatus('running');
         statusRef.current = 'running';
-        setTimeout(() => sendMessageRef.current(next), 0);
+        setTimeout(() => sendExpandedRef.current(next), 0);
         return true;
       }
       return false;
@@ -947,7 +952,7 @@ export function App({
                       const next = queueRef.current.shift() as string;
                       setStatus('running');
                       statusRef.current = 'running';
-                      setTimeout(() => sendMessageRef.current(next), 0);
+                      setTimeout(() => sendExpandedRef.current(next), 0);
                     }
                   })
                   .catch(() => {
@@ -977,7 +982,7 @@ export function App({
                       const next = queueRef.current.shift() as string;
                       setStatus('running');
                       statusRef.current = 'running';
-                      setTimeout(() => sendMessageRef.current(next), 0);
+                      setTimeout(() => sendExpandedRef.current(next), 0);
                     } else {
                       setStatus('idle');
                       statusRef.current = 'idle';
@@ -1006,7 +1011,7 @@ export function App({
                     const next = queueRef.current.shift() as string;
                     setStatus('running');
                     statusRef.current = 'running';
-                    setTimeout(() => sendMessageRef.current(next), 0);
+                    setTimeout(() => sendExpandedRef.current(next), 0);
                   } else {
                     setStatus('idle');
                     statusRef.current = 'idle';
@@ -1023,7 +1028,7 @@ export function App({
               const next = queueRef.current.shift() as string;
               setStatus('running');
               statusRef.current = 'running';
-              setTimeout(() => sendMessageRef.current(next), 0);
+              setTimeout(() => sendExpandedRef.current(next), 0);
             } else {
               setStatus('idle');
               statusRef.current = 'idle';
@@ -1456,7 +1461,7 @@ export function App({
     turnSettledRef.current = true;
     if (queueRef.current.length > 0) {
       const next = queueRef.current.shift() as string;
-      setTimeout(() => sendMessageRef.current(next), 0);
+      setTimeout(() => sendExpandedRef.current(next), 0);
     } else {
       setStatus('idle');
     }
@@ -1592,6 +1597,30 @@ export function App({
   // can flush the queue on `done` without re-subscribing.
   sendMessageRef.current = sendMessage;
 
+  // Expand @mentions in a prompt and send it. Shared by the interactive input path AND the
+  // queue-drain paths (a queued prompt is the raw text — mentions must be re-expanded on
+  // drain, not sent literally).
+  const sendExpanded = useCallback(
+    (trimmed: string) => {
+      if (/(^|\s)@/.test(trimmed)) {
+        const img = extractImageMentions(trimmed, CWD);
+        for (const note of img.notes) pushTurn({ kind: 'note', text: note });
+        const file = expandFileMentions(img.text, CWD);
+        for (const note of file.notes) pushTurn({ kind: 'note', text: note });
+        const attachments = img.attachments;
+        const submitText = file.text !== trimmed ? file.text : undefined;
+        if (submitText !== undefined || attachments.length > 0) {
+          sendMessage(trimmed, submitText, attachments.length > 0 ? attachments : undefined);
+          return;
+        }
+      }
+      sendMessage(trimmed);
+    },
+    [pushTurn, sendMessage],
+  );
+  // Keep the ref current so the stream-event effect's queue-drains expand mentions.
+  sendExpandedRef.current = sendExpanded;
+
   const submit = useCallback(
     (input: string) => {
       const trimmed = input.trim();
@@ -1612,25 +1641,10 @@ export function App({
         pushTurn({ kind: 'note', text: `queued: ${trimmed}` });
         return;
       }
-      // Handle @mentions. Image mentions (@foo.png) become real image
-      // attachments (agent:submit accepts image parts) and are stripped from the
-      // prompt text; remaining @file mentions inline their contents as text.
-      if (/(^|\s)@/.test(trimmed)) {
-        const img = extractImageMentions(trimmed, CWD);
-        for (const note of img.notes) pushTurn({ kind: 'note', text: note });
-        // Run text @file expansion on whatever text remains after image tokens.
-        const file = expandFileMentions(img.text, CWD);
-        for (const note of file.notes) pushTurn({ kind: 'note', text: note });
-        const attachments = img.attachments;
-        const submitText = file.text !== trimmed ? file.text : undefined;
-        if (submitText !== undefined || attachments.length > 0) {
-          sendMessage(trimmed, submitText, attachments.length > 0 ? attachments : undefined);
-          return;
-        }
-      }
-      sendMessage(trimmed);
+      // Handle @mentions + send (shared with the queue-drain path).
+      sendExpanded(trimmed);
     },
-    [status, runCommand, pushTurn, sendMessage],
+    [status, runCommand, pushTurn, sendExpanded],
   );
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────────

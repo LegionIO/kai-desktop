@@ -4144,19 +4144,29 @@ export function RuntimeProvider({
             const res = await app.agent.injectMidTurn(convId, text);
             if (res.ok && res.cooperative) return; // spliced into the running turn
             // Not cooperatively injectable (CLI runtime / race) — fall through to a
-            // normal new turn, which supersedes the running one.
+            // normal new turn, which supersedes the running one. NOTE: everything below
+            // must use the LIVE accumulator / activeIdRef, not the closure tree/headId
+            // captured at entry — the await above let the running turn stream more AND may
+            // have let the user switch conversations.
           }
         }
       }
 
+      // Base the new turn on the LIVE accumulator (it may have streamed more during an
+      // awaited injectMidTurn above), falling back to the closure tree/headId when there's
+      // no live accumulator. Using the stale closure tree would overwrite final same-id
+      // content with a stale partial + branch the user message before recent results.
+      const liveAcc = streamAccumulators.get(convId);
+      const baseTree = liveAcc ? liveAcc.messages : tree;
+      const baseHead = liveAcc ? liveAcc.headId : headId;
       const userMsg: StoredMessage = {
         id: msgId(),
-        parentId: headId,
+        parentId: baseHead,
         role: 'user',
         content: toStoredContent(userContent),
         createdAt: new Date(),
       };
-      const newTree = [...tree, userMsg];
+      const newTree = [...baseTree, userMsg];
       const newHead = userMsg.id;
       const pendingAssistantTiming = createPendingAssistantTiming();
       const responseMessageId = msgId();
@@ -4175,9 +4185,14 @@ export function RuntimeProvider({
       // that races the terminal persist would drop the paid summary.
       const supersededCompaction =
         streamAccumulators.get(convId)?.pendingCompaction ?? pendingCompactionHandoff.get(convId) ?? undefined;
-      setTree(newTree);
-      setHeadId(newHead);
-      setIsRunning(true);
+      // Update the UI ONLY if this conversation is still active — an awaited injectMidTurn
+      // above may have let the user switch to another chat, and setTree/setHeadId/setIsRunning
+      // would otherwise replace THAT chat's displayed state with this one's.
+      if (activeIdRef.current === convId) {
+        setTree(newTree);
+        setHeadId(newHead);
+        setIsRunning(true);
+      }
 
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
@@ -4293,10 +4308,21 @@ export function RuntimeProvider({
         };
         durablyPersistThenLaunch(20);
       } else if (ownsNew()) {
-        // No late compaction to durably persist. Still verify WE own the accumulator — a
-        // Stop (or a superseding turn) during the awaited turn-start persist may have
-        // deleted/replaced it; launching then would start a cancelled/superseded run.
-        launchNew();
+        // No late compaction was seen at the sample above. Re-check RIGHT before launching —
+        // a stale-run compaction event can land on the accumulator in the window since the
+        // sample. If one appeared, durably persist it first (else the launched stream's reuse
+        // gate reads disk without it and re-compacts/re-bills the same prefix).
+        const lateComp = streamAccumulators.get(convId)?.pendingCompaction;
+        if (lateComp && lateComp.compactionId !== persistedCompactionId) {
+          void persistConversation(convId, newTree, newHead, {
+            runStatus: 'running',
+            conversationCompaction: lateComp,
+          }).finally(() => {
+            if (ownsNew()) launchNew();
+          });
+        } else {
+          launchNew();
+        }
       }
     },
     [

@@ -731,9 +731,21 @@ async function resumeSubAgent(
     cleanupRuntime(subAgentConversationId, resumeGeneration);
     releaseSubAgentSlot();
     if (localController.signal.aborted) {
-      // Stopped mid-reopen — discard the follow-ups (don't resurrect a cancelled instruction)
-      // and drop any retained resumable state so nothing auto-resumes.
+      // Stopped mid-reopen — the user cancelled. Make the thread definitively non-resumable:
+      // drop the pending queue AND the retained resumable snapshot (cleanupRuntime preserves
+      // subAgentState, so a later follow-up would otherwise restart the stopped work), and
+      // broadcast `stopped` so the UI reflects it.
       pendingResumeQueues.delete(subAgentConversationId);
+      subAgentState.delete(subAgentConversationId);
+      broadcastEvent({
+        subAgentConversationId,
+        parentConversationId: parentThreadId ?? subAgentConversationId,
+        parentToolCallId,
+        conversationId: subAgentConversationId,
+        type: 'sub-agent-status',
+        status: 'stopped',
+        summary: 'Stopped.',
+      } as SubAgentEvent);
       return;
     }
     // Retain ALL follow-ups (FIFO) for a later admission-gated drain. Do NOT drain NOW —
