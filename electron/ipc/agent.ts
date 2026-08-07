@@ -4386,6 +4386,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               error: `${event.error ?? 'Context window exceeded.'}${overflowGuidance(!compacted && !recoveryGatedOffLast)}`,
               errorCategory: 'context-overflow',
             });
+            // This terminal error is fully terminal for a GUI turn (the renderer's error
+            // handler deletes the accumulator + persists idle). Suppress the FAILED stream's
+            // trailing `done` (via overflowRecoveryTookOver) so it can't recreate the
+            // accumulator from stale tree state and overwrite the persisted overflow error
+            // (round-100/108 pattern). A serverPersisted (CLI/automation) turn KEEPS its
+            // accumulator on error and needs the trailing `done`, so leave it flowing there.
+            if (!serverPersistedRun) overflowRecoveryTookOver = true;
             continue;
           }
           emit(event);

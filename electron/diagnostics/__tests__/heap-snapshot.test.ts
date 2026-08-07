@@ -147,6 +147,34 @@ describe('captureHeapSnapshot', () => {
     expect(existsSync(result.path)).toBe(true);
   });
 
+  it('reserves a slot: evicts down to maxCount-1 BEFORE writing so a full-count dir makes room', async () => {
+    // Pre-populate exactly maxCount (2) snapshots within any byte cap.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    const older = join(dir, 'heap-20260806T000000.heapsnapshot');
+    const newer = join(dir, 'heap-20260806T000100.heapsnapshot');
+    writeFileSync(older, Buffer.alloc(10, 1));
+    writeFileSync(newer, Buffer.alloc(10, 1));
+    utimesSync(older, new Date(2026, 7, 6, 0, 0), new Date(2026, 7, 6, 0, 0));
+    utimesSync(newer, new Date(2026, 7, 6, 0, 1), new Date(2026, 7, 6, 0, 1));
+
+    // At the moment `take` runs, the preflight must already have evicted the oldest so the
+    // on-disk count is maxCount-1 (1) — proving space was reserved for the incoming capture
+    // rather than only trimming AFTER the write (which would momentarily need maxCount+1).
+    let countAtCapture = -1;
+    const take = vi.fn(async (filePath: string) => {
+      countAtCapture = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length;
+      writeFileSync(filePath, Buffer.alloc(2048, 7));
+    });
+
+    const result = await captureHeapSnapshot(logsDir, take, { maxCount: 2, maxTotalBytes: 0 });
+
+    expect(countAtCapture).toBe(1); // oldest evicted BEFORE the write reserved the slot
+    expect(result.evicted).toContain('heap-20260806T000000.heapsnapshot');
+    // After the write, retention holds the ceiling: newest pre-existing + the new one = 2.
+    expect(readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length).toBe(2);
+  });
+
   it('propagates a capture failure (caller re-arms)', async () => {
     const take = vi.fn(async () => {
       throw new Error('takeHeapSnapshot failed');

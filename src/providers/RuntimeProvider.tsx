@@ -2643,6 +2643,15 @@ export function RuntimeProvider({
             });
           }
           bumpSubAgentVersion();
+          // Release the live message accumulator on a TERMINAL status. The initial-run path
+          // suppresses the underlying stream's `done` (to avoid a double-terminal), so the
+          // `done`-only release below never fires for a normally-completed initial sub-agent,
+          // leaking its message array. A terminal STATUS is the reliable end signal here.
+          // `paused` is NOT terminal (resumable → may stream again), so keep its accumulator.
+          const terminalRelease = ['completed', 'failed', 'stopped', 'error'];
+          if (typeof e.status === 'string' && terminalRelease.includes(e.status)) {
+            globalSubAgentAccumulators.delete(saId);
+          }
           return;
         }
 
