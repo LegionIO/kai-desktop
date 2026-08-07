@@ -12,6 +12,7 @@ import {
   clampHeadTail,
   oneLineCapped,
   toResultSummary,
+  shouldSkipSubAgentNudge,
 } from '../tool-observer.js';
 
 describe('summarizeLatestUserRequest', () => {
@@ -176,5 +177,49 @@ describe('toResultSummary', () => {
     expect(toResultSummary('just a string').summary).toBe('just a string');
     expect(toResultSummary(42).summary).toBe('[result captured]');
     expect(toResultSummary(null).summary).toBe('[result captured]');
+  });
+});
+
+describe('shouldSkipSubAgentNudge', () => {
+  it('proceeds (null) for a running sub_agent that has not declared completion', () => {
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent' })).toBeNull();
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', subAgentSignal: 'continue' })).toBeNull();
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', subAgentSignal: 'awaiting_response' })).toBeNull();
+  });
+
+  it('skips when the target is missing or not a sub_agent', () => {
+    expect(shouldSkipSubAgentNudge(undefined)).toBe('not a running sub_agent');
+    expect(shouldSkipSubAgentNudge({ toolName: 'bash' })).toBe('not a running sub_agent');
+  });
+
+  it('skips a sub_agent that is no longer running (e.g. cancelled earlier in the same decision)', () => {
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', running: false })).toBe(
+      'sub-agent is no longer running',
+    );
+    // running true/undefined does not trigger this skip on its own.
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', running: true })).toBeNull();
+  });
+
+  it('skips a sub-agent that has DECLARED completion (breaks the nag→re-complete loop)', () => {
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', declaredComplete: true, subAgentSignal: 'complete' })).toBe(
+      'sub-agent already declared complete',
+    );
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', declaredComplete: true, subAgentSignal: 'failed' })).toBe(
+      'sub-agent already declared failed',
+    );
+  });
+
+  it('falls back to "complete" wording when the latch is set without a specific signal', () => {
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', declaredComplete: true })).toBe(
+      'sub-agent already declared complete',
+    );
+  });
+
+  it('skips a STOPPED (cancelled) sub-agent — stopped is terminal and must latch', () => {
+    // A cancelled sub-agent is done; the observer must not message it during
+    // finalization (that would report success before the message is dropped).
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', declaredComplete: true, subAgentSignal: 'stopped' })).toBe(
+      'sub-agent already declared stopped',
+    );
   });
 });

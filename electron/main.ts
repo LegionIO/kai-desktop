@@ -48,6 +48,7 @@ import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
+import { retryPendingSubAgentResumes } from './tools/sub-agent.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
@@ -1348,6 +1349,7 @@ if (gotSingleInstanceLock) {
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
     let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
     let lastAutopilotFingerprint = JSON.stringify(getConfig().autopilot ?? {});
+    let lastSubAgentCapsFingerprint = JSON.stringify(getConfig().tools?.subAgents ?? {});
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
@@ -1395,6 +1397,16 @@ if (gotSingleInstanceLock) {
           .catch((err) => {
             console.error(`[${__BRAND_PRODUCT_NAME}] CLI tools hot-reload failed:`, err);
           });
+      }
+
+      // Sub-agent concurrency-cap change: retry any resume held back because a cap
+      // was full. Raising maxConcurrent/maxPerParent frees admission for retained
+      // follow-ups that would otherwise never re-check (no slot-release fires while
+      // the blocking run stays active).
+      const newSubAgentCapsFp = JSON.stringify(config.tools?.subAgents ?? {});
+      if (newSubAgentCapsFp !== lastSubAgentCapsFingerprint) {
+        lastSubAgentCapsFingerprint = newSubAgentCapsFp;
+        retryPendingSubAgentResumes();
       }
 
       // Display list change detection — auto-update maxDimension when allowed displays change

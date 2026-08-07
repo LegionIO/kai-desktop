@@ -123,21 +123,52 @@ describe('subagent-status helper', () => {
       });
     });
 
-    it('rejects illegal status transitions (completed -> running)', async () => {
+    it('allows resuming a completed sub-agent (legal completed -> running)', async () => {
+      // A completed sub-agent is RESUMABLE: a follow-up reopens it as running.
       const { memory, updateThread } = makeMemoryMock([
         makeThread('sub-4', { [__internal.METADATA_KEY]: { status: 'completed' } }),
       ]);
-      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
       await updateSubagentStatus(memory, 'sub-4', { status: 'running' });
 
-      expect(updateThread).not.toHaveBeenCalled();
-      expect(errSpy).toHaveBeenCalled();
-      expect(errSpy.mock.calls[0][0]).toMatch(/Illegal status transition/);
+      expect(updateThread).toHaveBeenCalled();
     });
 
-    it('rejects illegal status transitions from every terminal state', async () => {
-      const terminals = ['completed', 'failed', 'abandoned', 'stopped'] as const;
+    it('allows resuming a paused sub-agent (legal paused -> running)', async () => {
+      const { memory, updateThread } = makeMemoryMock([
+        makeThread('sub-4b', { [__internal.METADATA_KEY]: { status: 'paused' } }),
+      ]);
+
+      await updateSubagentStatus(memory, 'sub-4b', { status: 'running' });
+
+      expect(updateThread).toHaveBeenCalled();
+    });
+
+    it('allows pausing a running sub-agent (legal running -> paused)', async () => {
+      const { memory, updateThread } = makeMemoryMock([
+        makeThread('sub-4c', { [__internal.METADATA_KEY]: { status: 'running' } }),
+      ]);
+
+      await updateSubagentStatus(memory, 'sub-4c', { status: 'paused' });
+
+      expect(updateThread).toHaveBeenCalled();
+    });
+
+    it('allows stopping a resumable terminal (completed/paused -> stopped)', async () => {
+      // A user stop landing on a just-finalized resumable run moves it to the
+      // truly-terminal `stopped`, so this transition must be legal.
+      for (const start of ['completed', 'paused'] as const) {
+        const { memory, updateThread } = makeMemoryMock([
+          makeThread(`sub-stop-${start}`, { [__internal.METADATA_KEY]: { status: start } }),
+        ]);
+        await updateSubagentStatus(memory, `sub-stop-${start}`, { status: 'stopped' });
+        expect(updateThread).toHaveBeenCalled();
+      }
+    });
+
+    it('rejects illegal status transitions from truly-terminal states (failed/abandoned/stopped)', async () => {
+      // completed & paused are RESUMABLE (→ running); only these are terminal.
+      const terminals = ['failed', 'abandoned', 'stopped'] as const;
       for (const start of terminals) {
         const { memory, updateThread } = makeMemoryMock([
           makeThread(`sub-${start}`, { [__internal.METADATA_KEY]: { status: start } }),

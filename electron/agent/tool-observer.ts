@@ -24,6 +24,7 @@ export type ToolProgressEnvelope = {
     bytesSeen?: number;
     truncated?: boolean;
     stopped?: boolean;
+    subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
   };
 };
 
@@ -64,6 +65,13 @@ type ObservedToolState = {
   stopped: boolean;
   lastDelta: string;
   observerMessageCount: number;
+  /** For a sub_agent tool: the sub-agent's latest lifecycle signal, set from
+   *  tool-progress. `declaredComplete` latches once the sub-agent signals a
+   *  TERMINAL state (complete/failed/stopped) so the observer won't keep nudging
+   *  a finished sub-agent — it resets only on a non-terminal running/continue or
+   *  awaiting_response signal (e.g. an intentional resume). */
+  subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
+  declaredComplete?: boolean;
 };
 
 type ToolAugmentationState = {
@@ -281,6 +289,30 @@ export function toResultSummary(result: unknown): { isError: boolean; summary: s
   return { isError: false, summary: '[result captured]' };
 }
 
+/**
+ * Whether the observer should SKIP sending a mid-turn "message_sub_agent" nudge
+ * to a sub-agent tool. Returns a reason string to skip, or null to proceed.
+ *
+ * The critical case: a sub-agent that has DECLARED completion (its control tool
+ * signaled complete/failed) must not be nudged to "finish up" — the nudge is
+ * delivered as a follow-up that reopens the finished turn, and on the observer's
+ * next tick it fires again, starving completion in a loop. Pure + exported so
+ * this policy is unit-tested independently of the LLM eval loop.
+ */
+export function shouldSkipSubAgentNudge(tool: {
+  toolName: string;
+  running?: boolean;
+  declaredComplete?: boolean;
+  subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
+} | undefined): string | null {
+  if (!tool || tool.toolName !== 'sub_agent') return 'not a running sub_agent';
+  // Not running (e.g. cancelled synchronously earlier in this same observer
+  // decision) → don't message it; the run is torn down and the message drops.
+  if (tool.running === false) return 'sub-agent is no longer running';
+  if (tool.declaredComplete) return `sub-agent already declared ${tool.subAgentSignal ?? 'complete'}`;
+  return null;
+}
+
 export class ToolObserverManager {
   private readonly conversationId: string;
   private readonly modelConfig: LLMModelConfig;
@@ -376,6 +408,20 @@ export class ToolObserverManager {
     }
     state.truncated = Boolean(state.truncated || event.data?.truncated);
     state.stopped = Boolean(state.stopped || event.data?.stopped);
+    if (event.data?.subAgentSignal) {
+      const sig = event.data.subAgentSignal;
+      state.subAgentSignal = sig;
+      // Latch on any TERMINAL signal (complete/failed/stopped/paused): the
+      // sub-agent is done or paused and must not be nudged to "finish up" — that
+      // would starve completion, message a cancelled agent, or unintentionally
+      // resume a paused one. Only a genuinely-active non-terminal signal
+      // (running/continue/awaiting_response) clears the latch.
+      if (sig === 'complete' || sig === 'failed' || sig === 'stopped' || sig === 'paused') {
+        state.declaredComplete = true;
+      } else {
+        state.declaredComplete = false;
+      }
+    }
     this.scheduleEvaluation();
   }
 
@@ -517,7 +563,14 @@ export class ToolObserverManager {
   }
 
   private getRunningTools(): ObservedToolState[] {
-    return Array.from(this.tools.values()).filter((t) => t.running && !t.awaitingApproval);
+    // A sub-agent that has DECLARED completion (complete/failed/stopped) is
+    // effectively done: exclude it so no observer action (message/cancel/launch)
+    // targets it — an evaluation started before completion must not later cancel
+    // a completed sub-agent (turning an explicit completion into `stopped`) or
+    // nudge it. The runner still owns its actual lifecycle finalization.
+    return Array.from(this.tools.values()).filter(
+      (t) => t.running && !t.awaitingApproval && !(t.toolName === 'sub_agent' && t.declaredComplete),
+    );
   }
 
   private addLinkedLaunchedTool(parentToolCallId: string, launchedToolCallId: string): void {
@@ -586,7 +639,10 @@ export class ToolObserverManager {
     const runningLines = runningTools.map((tool) => {
       const out = tool.stdout || tool.stderr || '';
       const excerpt = out ? clampHeadTail(out, 280) : '[no output yet]';
-      return `${tool.toolName} (${tool.toolCallId}) running, bytes=${tool.bytesSeen}, truncated=${tool.truncated}, stopped=${tool.stopped}\n${excerpt}`;
+      const declared = tool.declaredComplete
+        ? ` DECLARED_${(tool.subAgentSignal ?? 'complete').toUpperCase()} (do not send finish-up messages)`
+        : '';
+      return `${tool.toolName} (${tool.toolCallId}) running, bytes=${tool.bytesSeen}, truncated=${tool.truncated}, stopped=${tool.stopped}${declared}\n${excerpt}`;
     });
 
     const observerLines = this.observerJournal.slice(-32);
@@ -611,6 +667,9 @@ export class ToolObserverManager {
       truncated: tool.truncated,
       stopped: tool.stopped,
       observerInitiated: tool.observerInitiated,
+      ...(tool.toolName === 'sub_agent'
+        ? { subAgentSignal: tool.subAgentSignal, declaredComplete: Boolean(tool.declaredComplete) }
+        : {}),
       output: {
         lastDelta: clampHeadTail(tool.lastDelta, 600),
         stdout: clampHeadTail(tool.stdout, this.config.maxSnapshotChars),
@@ -734,6 +793,18 @@ export class ToolObserverManager {
         return;
       }
 
+      // Mark the cancelled tool non-running SYNCHRONOUSLY. A successful cancel is
+      // terminal for observer purposes; without this, later actions applied in
+      // the SAME observer decision (this applyAction loop) could still message or
+      // launch tools against the just-cancelled target (getRunningTools would
+      // still include it until the async result lands). finishedAt mirrors the
+      // real result path.
+      const cancelledState = this.tools.get(action.toolCallId);
+      if (cancelledState) {
+        cancelledState.running = false;
+        cancelledState.finishedAt = new Date().toISOString();
+      }
+
       const reason = action.reason ? ` Reason: ${oneLine(action.reason).slice(0, 240)}` : '';
       const message = action.message
         ? oneLine(action.message).slice(0, 220)
@@ -755,6 +826,31 @@ export class ToolObserverManager {
 
     if (action.type === 'message_sub_agent') {
       await this.applyMessageSubAgent(action);
+      return;
+    }
+
+    // launch_tool from a STALE evaluation. Skip when the world it was decided
+    // against is gone: either NO tools are still running at all, OR the action
+    // named an EXPLICIT target that is no longer among the running tools (e.g. it
+    // targeted sub-agent A which declared complete, while unrelated tool B is
+    // still active — launching and linking to B would run a side-effecting tool
+    // against the wrong call).
+    const runningIds = new Set(this.getRunningTools().map((t) => t.toolCallId));
+    const explicitTargetGone = Boolean(action.toolCallId) && !runningIds.has(action.toolCallId as string);
+    if (runningIds.size === 0 || explicitTargetGone) {
+      this.recordEvent(
+        action.toolCallId ? [action.toolCallId] : [],
+        {
+          at: new Date().toISOString(),
+          type: 'launch_tool',
+          targetToolCallId: action.toolCallId,
+          details: explicitTargetGone
+            ? 'Launch skipped: explicit target no longer running (stale evaluation).'
+            : 'Launch skipped: no tools still running (stale evaluation).',
+          outcome: 'skipped',
+        },
+        '[observer-action] launch_tool skipped (no running tools — stale evaluation)',
+      );
       return;
     }
 
@@ -830,10 +926,26 @@ export class ToolObserverManager {
     rationale?: string;
   }): Promise<void> {
     const tool = this.tools.get(action.toolCallId);
-    if (!tool || tool.toolName !== 'sub_agent') {
-      this.appendJournal(
-        `[observer-action] message_sub_agent skipped: ${action.toolCallId} is not a running sub_agent`,
-      );
+    const skipReason = shouldSkipSubAgentNudge(tool);
+    if (skipReason) {
+      // Record a declared-completion skip as a structured event (so the observer
+      // sees it in its journal next tick and won't retry), and a plain
+      // not-a-sub-agent skip as a lightweight journal note.
+      if (tool && tool.toolName === 'sub_agent') {
+        this.recordEvent(
+          [action.toolCallId],
+          {
+            at: new Date().toISOString(),
+            type: 'send_message',
+            targetToolCallId: action.toolCallId,
+            details: `message_sub_agent skipped: ${skipReason}`,
+            outcome: 'skipped',
+          },
+          `[observer-action] message_sub_agent skipped (${skipReason}) for ${action.toolCallId}`,
+        );
+      } else {
+        this.appendJournal(`[observer-action] message_sub_agent skipped: ${action.toolCallId} is ${skipReason}`);
+      }
       return;
     }
 

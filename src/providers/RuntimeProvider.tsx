@@ -161,10 +161,18 @@ export type SubAgentThreadState = {
   parentConversationId: string;
   parentToolCallId: string;
   task: string;
-  status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'error';
+  status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'error' | 'failed' | 'paused';
   messages: StoredMessage[];
   headId: string | null;
   depth: number;
+  /** Set once the thread has been RESUMED (a terminal thread transitioned back to
+   *  running). After a resume, the parent tool-call's frozen `result`/`isError`
+   *  is stale — the card must trust the live thread status, not the frozen prop. */
+  hasResumed?: boolean;
+  /** For `status: 'paused'`, WHY it paused — so the card shows "Awaiting input"
+   *  only when the agent actually requested input, and a generic "Paused" for
+   *  turn-limit / capacity pauses. */
+  pausedReason?: 'awaiting-input' | 'turn-limit' | 'capacity';
 };
 
 type PendingAssistantTiming = {
@@ -557,8 +565,8 @@ export function deepestLatestDescendant(tree: StoredMessage[], startId: string):
 // Sub-agent context
 type SubAgentActions = {
   threads: Map<string, SubAgentThreadState>;
-  sendMessage: (subAgentConversationId: string, text: string) => Promise<void>;
-  stop: (subAgentConversationId: string) => Promise<void>;
+  sendMessage: (subAgentConversationId: string, text: string) => Promise<boolean>;
+  stop: (subAgentConversationId: string) => Promise<boolean>;
   deleteThread: (subAgentConversationId: string) => void;
   navigateTo: (subAgentConversationId: string) => void;
   activeSubAgentView: string | null;
@@ -567,8 +575,8 @@ type SubAgentActions = {
 
 const SubAgentContext = createCtx<SubAgentActions>({
   threads: new Map(),
-  sendMessage: async () => {},
-  stop: async () => {},
+  sendMessage: async () => false,
+  stop: async () => false,
   deleteThread: () => {},
   navigateTo: () => {},
   activeSubAgentView: null,
@@ -705,6 +713,14 @@ export function useRuntimeConversationId(): string | null {
 
 const globalSubAgentThreads = new Map<string, SubAgentThreadState>();
 const globalSubAgentAccumulators = new Map<string, MessageAccumulator>();
+/**
+ * Tombstones for sub-agent ids the user explicitly DELETED. A delete stops the
+ * backend, which broadcasts a `stopped` status asynchronously; without a tombstone
+ * that late event would recreate the just-deleted thread (forcing a double-delete).
+ * The status/done handlers drop events for tombstoned ids. Cleared if a genuinely
+ * NEW run reuses the id (ids are timestamp+random, so reuse is effectively never).
+ */
+const deletedSubAgentIds = new Set<string>();
 let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 
 // --- Stream accumulator functions ---
@@ -919,28 +935,95 @@ function applyToolProgress(
       output?: string;
       truncated?: boolean;
       stopped?: boolean;
+      subAgentConversationId?: string;
     };
   },
 ): void {
   const { msg, idx } = getOrCreateAssistantInAcc(acc);
   const content = (Array.isArray(msg.content) ? [...msg.content] : []) as ContentPart[];
   let tcIdx = -1;
-  let matchMode: 'exact' | 'fallback' | 'orphan' = 'orphan';
-  if (e.toolCallId) {
-    tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
-    if (tcIdx >= 0) matchMode = 'exact';
+  let matchMode: 'exact' | 'sub-agent' | 'fallback' | 'orphan' = 'orphan';
+  // PRIMARY for sub-agent progress: bind by subAgentConversationId. A sub-agent
+  // is uniquely identified by its conversation id (namespace-independent, unique
+  // per child), so once a tool-call part is bound to a child, ALL its later
+  // progress attaches to that exact part — robust to parallel sub-agents and to
+  // any execute/stream tool-call id divergence (which the id-exact match below
+  // is NOT). The first progress for a child (before binding) falls through to
+  // the id/most-recent match, which then sets the binding via mergeLiveOutput.
+  const subAgentConvId = e.data?.subAgentConversationId;
+  if (subAgentConvId) {
+    tcIdx = content.findIndex(
+      (p) => p.type === 'tool-call' && p.liveOutput?.subAgentConversationId === subAgentConvId,
+    );
+    if (tcIdx >= 0) matchMode = 'sub-agent';
+  }
+  if (tcIdx < 0 && e.toolCallId) {
+    const exactIdx = content.findIndex((p) => p.type === 'tool-call' && p.toolCallId === e.toolCallId);
+    if (exactIdx >= 0) {
+      const exactPart = content[exactIdx] as ContentPart & { type: 'tool-call' };
+      // Conflict guard on the exact-id path too: never attach a child's progress
+      // to a part already bound to a DIFFERENT child (would mis-route). In the
+      // identity case (exec id === stream id, the norm) this never triggers; it
+      // only guards a pathological id collision.
+      const boundToOther =
+        subAgentConvId &&
+        exactPart.liveOutput?.subAgentConversationId &&
+        exactPart.liveOutput.subAgentConversationId !== subAgentConvId;
+      if (!boundToOther) {
+        tcIdx = exactIdx;
+        matchMode = 'exact';
+      }
+    }
   }
   if (tcIdx < 0) {
-    // Some runtimes emit progress before call metadata or without call id.
-    // In that case attach to the most recent unresolved tool call.
-    for (let i = content.length - 1; i >= 0; i--) {
-      const part = content[i];
-      if (part.type !== 'tool-call') continue;
-      if (part.result !== undefined) continue;
-      if (e.toolName && part.toolName !== e.toolName) continue;
-      tcIdx = i;
-      matchMode = 'fallback';
-      break;
+    // Some runtimes emit progress before call metadata or without call id, so
+    // attach to the most recent unresolved tool call.
+    //
+    // AMBIGUITY GUARD for sub-agent progress: the first progress for a child
+    // (before its conversation-id binding exists) has no exact/conversation
+    // match. The reverse scan below would pick the newest unbound card — but with
+    // PARALLEL sub_agent calls whose execute ids differ from stream ids, that can
+    // be the WRONG child, and the binding would then permanently mis-route it. So
+    // when this progress names a child, only bind via the fallback if there is
+    // exactly ONE eligible unbound sub_agent candidate; if several are unbound,
+    // leave it unattached this tick (the common case is exec id === stream id, so
+    // the id-exact match above resolves it; a genuinely-diverged parallel first
+    // progress waits rather than mis-binds).
+    //
+    // ACCEPTED LIMITATION: if TWO parallel sub_agent calls BOTH had execute ids
+    // differing from their stream ids, each first-progress would see two unbound
+    // candidates and stay orphaned until one completes (binding only via result).
+    // We accept this rather than reintroduce server-side exec↔stream pairing
+    // (removed as unsound): Mastra's tool execution context types toolCallId as a
+    // required string, so execute id === stream id in practice and the id-exact
+    // path above binds each card deterministically — this ambiguous-divergence
+    // case does not occur with the Mastra runtime.
+    if (subAgentConvId) {
+      const unboundSubAgents = content.filter(
+        (p) =>
+          p.type === 'tool-call' &&
+          p.result === undefined &&
+          // STRICTLY sub_agent tool calls — never a generic tool (e.g. a lone
+          // `bash` card) even when this progress carries no toolName, so a child's
+          // conversation id/output can't bind onto an unrelated tool.
+          p.toolName === 'sub_agent' &&
+          !p.liveOutput?.subAgentConversationId,
+      );
+      if (unboundSubAgents.length === 1) {
+        tcIdx = content.indexOf(unboundSubAgents[0]);
+        matchMode = 'fallback';
+      }
+      // else: ambiguous or none — do not guess (falls through to orphan handling).
+    } else {
+      for (let i = content.length - 1; i >= 0; i--) {
+        const part = content[i];
+        if (part.type !== 'tool-call') continue;
+        if (part.result !== undefined) continue;
+        if (e.toolName && part.toolName !== e.toolName) continue;
+        tcIdx = i;
+        matchMode = 'fallback';
+        break;
+      }
     }
   }
   if (tcIdx < 0) {
@@ -979,17 +1062,28 @@ function applyToolProgress(
 function mergeLiveOutput(
   existing: ContentPart & { type: 'tool-call' },
   e: {
+    toolName?: string;
     data?: { stream?: 'stdout' | 'stderr'; output?: string; truncated?: boolean; stopped?: boolean };
   },
 ): NonNullable<(ContentPart & { type: 'tool-call' })['liveOutput']> {
+  // Bind `subAgentConversationId` into liveOutput ONLY from TRUSTED sub-agent
+  // progress: the part is already a sub_agent tool-call, OR this progress event's
+  // backend toolName is `sub_agent`. `ToolProgressEvent` is supplied by tool
+  // implementations, so a non-sub_agent tool could otherwise emit a child's id in
+  // its progress and get its card promoted to a sub-agent (exposing that child's
+  // navigate/message/stop controls). Once bound, keep the existing id.
+  const progressIsSubAgent = existing.toolName === 'sub_agent' || e.toolName === 'sub_agent';
+  const boundSubAgentId =
+    existing.liveOutput?.subAgentConversationId ??
+    (progressIsSubAgent
+      ? (e.data as { subAgentConversationId?: string } | undefined)?.subAgentConversationId
+      : undefined);
   const liveOutput = {
     stdout: existing.liveOutput?.stdout ?? '',
     stderr: existing.liveOutput?.stderr ?? '',
     truncated: existing.liveOutput?.truncated ?? false,
     stopped: existing.liveOutput?.stopped ?? false,
-    subAgentConversationId:
-      existing.liveOutput?.subAgentConversationId ??
-      (e.data as { subAgentConversationId?: string } | undefined)?.subAgentConversationId,
+    subAgentConversationId: boundSubAgentId,
   };
   if (e.data?.stream === 'stdout') liveOutput.stdout = e.data.output ?? liveOutput.stdout;
   if (e.data?.stream === 'stderr') liveOutput.stderr = e.data.output ?? liveOutput.stderr;
@@ -2159,6 +2253,7 @@ export function RuntimeProvider({
         parentToolCallId?: string;
         status?: string;
         summary?: string;
+        pausedReason?: 'awaiting-input' | 'turn-limit' | 'capacity';
         // Step tracking fields
         stepInfo?: {
           currentStep: number;
@@ -2187,14 +2282,19 @@ export function RuntimeProvider({
                   ? `error msg=${(e.error ?? '').slice(0, 100)}`
                   : e.type;
       const isActive = e.conversationId === activeIdRef.current;
-      const hasAccumulator = streamAccumulators.has(e.conversationId);
+      const hasAccumulator = e.conversationId ? streamAccumulators.has(e.conversationId) : false;
       console.warn(
-        `[StreamEvent] conv=${e.conversationId.slice(0, 8)} ${debugSummary} isActive=${isActive} hasAccumulator=${hasAccumulator}`,
+        `[StreamEvent] conv=${e.conversationId?.slice(0, 8) ?? `sub:${e.subAgentConversationId?.slice(0, 8) ?? 'n/a'}`} ${debugSummary} isActive=${isActive} hasAccumulator=${hasAccumulator}`,
       );
 
       // Route sub-agent events to global sub-agent state
       if (e.subAgentConversationId) {
         const saId = e.subAgentConversationId;
+
+        // Drop events for a thread the user explicitly DELETED — otherwise a late
+        // async `stopped`/`done` (e.g. from the stop the delete triggered) would
+        // recreate the just-removed thread, forcing a confusing double-delete.
+        if (deletedSubAgentIds.has(saId)) return;
 
         if (e.type === 'sub-agent-status') {
           const existing = globalSubAgentThreads.get(saId);
@@ -2203,10 +2303,19 @@ export function RuntimeProvider({
             ? rawSummary.slice('Starting task: '.length)
             : rawSummary;
           if (existing) {
+            const nextStatus = (e.status as SubAgentThreadState['status']) ?? existing.status;
+            // A terminal thread transitioning back to `running` IS a resume — mark
+            // it so the card stops trusting the parent tool-call's frozen isError.
+            const terminal = ['completed', 'failed', 'stopped', 'paused', 'error'];
+            const isResumeTransition = nextStatus === 'running' && terminal.includes(existing.status);
             globalSubAgentThreads.set(saId, {
               ...existing,
-              status: (e.status as SubAgentThreadState['status']) ?? existing.status,
+              status: nextStatus,
               task: existing.task || cleanTask,
+              hasResumed: existing.hasResumed || isResumeTransition,
+              // Track the pause cause on a `paused` status; clear it otherwise so a
+              // later running/completed doesn't keep a stale reason.
+              pausedReason: nextStatus === 'paused' ? (e.pausedReason ?? existing.pausedReason) : undefined,
             });
           } else {
             globalSubAgentThreads.set(saId, {
@@ -2218,6 +2327,7 @@ export function RuntimeProvider({
               messages: [],
               headId: null,
               depth: 0,
+              pausedReason: e.status === 'paused' ? e.pausedReason : undefined,
             });
           }
           bumpSubAgentVersion();
@@ -2312,15 +2422,24 @@ export function RuntimeProvider({
         const existing = globalSubAgentThreads.get(saId);
         const msgs = finalMessages.length > 0 ? finalMessages : (existing?.messages ?? []);
         const head = finalMessages.length > 0 ? finalHeadId : (existing?.headId ?? null);
+        // On `done`, do NOT clobber an already-terminal status the runner set via
+        // a preceding sub-agent-status event (paused/failed/stopped) — `done` is
+        // just the stream terminator, not a completion signal. Only default to
+        // `completed` when the current status is non-terminal (e.g. still running).
+        const terminalStatuses = ['completed', 'failed', 'stopped', 'paused', 'error'];
+        const doneStatus =
+          existing && terminalStatuses.includes(existing.status) ? existing.status : 'completed';
         globalSubAgentThreads.set(saId, {
           conversationId: saId,
           parentConversationId: e.parentConversationId ?? existing?.parentConversationId ?? '',
           parentToolCallId: e.parentToolCallId ?? existing?.parentToolCallId ?? '',
           task: existing?.task ?? '',
-          status: isDone ? 'completed' : (existing?.status ?? 'running'),
+          status: isDone ? doneStatus : (existing?.status ?? 'running'),
           messages: msgs,
           headId: head,
           depth: existing?.depth ?? 0,
+          hasResumed: existing?.hasResumed,
+          pausedReason: existing?.pausedReason,
         });
         bumpSubAgentVersion();
         return;
@@ -3724,7 +3843,7 @@ export function RuntimeProvider({
   );
 
   // Sub-agent actions
-  const sendSubAgentMessage = useCallback(async (subAgentConversationId: string, text: string) => {
+  const sendSubAgentMessage = useCallback(async (subAgentConversationId: string, text: string): Promise<boolean> => {
     // Do NOT optimistically insert the raw follow-up. The backend runner gates
     // every follow-up through UserPromptSubmit and then broadcasts a
     // sub-agent-user-message with the (possibly redacted) text — for both
@@ -3733,24 +3852,39 @@ export function RuntimeProvider({
     // renderer only dedupes identical text, so a redacted broadcast appends a
     // second message rather than replacing the raw one). The gated broadcast is
     // the single source of truth.
+    //
+    // Returns whether the backend ACCEPTED the message. It returns ok:false when
+    // no live queue/resumable state exists for this id (e.g. after a main-process
+    // restart the in-memory subAgentState is gone even though the persisted status
+    // is `paused`). The caller must NOT clear its input on a false result — that
+    // would silently discard the user's message.
     try {
-      await app.agent.sendSubAgentMessage(subAgentConversationId, text);
+      const res = (await app.agent.sendSubAgentMessage(subAgentConversationId, text)) as
+        | { ok?: boolean }
+        | undefined;
+      return res?.ok !== false;
     } catch (err) {
       console.error('[Runtime] Sub-agent message failed:', err);
+      return false;
     }
   }, []);
 
   const stopSubAgentAction = useCallback(
-    async (subAgentConversationId: string) => {
+    async (subAgentConversationId: string): Promise<boolean> => {
       try {
-        await app.agent.stopSubAgent(subAgentConversationId);
-        const existing = globalSubAgentThreads.get(subAgentConversationId);
-        if (existing) {
-          globalSubAgentThreads.set(subAgentConversationId, { ...existing, status: 'stopped' });
+        const res = (await app.agent.stopSubAgent(subAgentConversationId)) as { ok?: boolean } | undefined;
+        const ok = res?.ok !== false;
+        if (ok) {
+          const existing = globalSubAgentThreads.get(subAgentConversationId);
+          if (existing) {
+            globalSubAgentThreads.set(subAgentConversationId, { ...existing, status: 'stopped' });
+          }
+          bumpSubAgentVersion();
         }
-        bumpSubAgentVersion();
+        return ok;
       } catch (err) {
         console.error('[Runtime] Sub-agent stop failed:', err);
+        return false;
       }
     },
     [bumpSubAgentVersion],
@@ -3758,6 +3892,17 @@ export function RuntimeProvider({
 
   const deleteSubAgentThread = useCallback(
     (subAgentConversationId: string) => {
+      // Tombstone the id BEFORE stopping, so the `stopped` status that stopSubAgent
+      // broadcasts asynchronously (and any other late event) can't recreate this
+      // just-deleted thread — the event router drops tombstoned ids.
+      deletedSubAgentIds.add(subAgentConversationId);
+      // Tell the BACKEND to stop — for a paused/capacity-deferred child this purges
+      // its retained resumable state + pending-resume queue, so a queued follow-up
+      // can't execute (with side effects) after the user deleted it. Deleting only
+      // renderer state would leave that backend work armed.
+      void app.agent.stopSubAgent(subAgentConversationId).catch((err) => {
+        console.error('[Runtime] Failed to stop sub-agent on delete:', err);
+      });
       globalSubAgentThreads.delete(subAgentConversationId);
       globalSubAgentAccumulators.delete(subAgentConversationId);
       if (activeSubAgentView === subAgentConversationId) setActiveSubAgentView(null);

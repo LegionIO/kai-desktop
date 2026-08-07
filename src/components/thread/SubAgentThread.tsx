@@ -20,6 +20,7 @@ type SubAgentThreadProps = {
 
 export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId, onBack }) => {
   const [messageInput, setMessageInput] = useState('');
+  const [sendError, setSendError] = useState<string | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const { threads, sendMessage, stop } = useSubAgents();
 
@@ -48,8 +49,17 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
 
   const handleSend = useCallback(async () => {
     if (!messageInput.trim()) return;
-    await sendMessage(subAgentConversationId, messageInput.trim());
-    setMessageInput('');
+    const text = messageInput.trim();
+    // Only clear on acceptance — a false result means the sub-agent's live/
+    // resumable state is gone (e.g. after a main-process restart), so keep the
+    // text and surface an error rather than silently discarding the message.
+    const ok = await sendMessage(subAgentConversationId, text);
+    if (ok) {
+      setMessageInput('');
+      setSendError(null);
+    } else {
+      setSendError('This sub-agent is no longer resumable (its session ended). Start a new sub-agent to continue.');
+    }
   }, [subAgentConversationId, messageInput, sendMessage]);
 
   const handleStop = useCallback(async () => {
@@ -106,6 +116,7 @@ export const SubAgentThread: FC<SubAgentThreadProps> = ({ subAgentConversationId
 
       {/* Composer — always visible so user can resume conversation after completion */}
       <div className="border-t p-4">
+        {sendError && <div className="mb-2 text-xs text-destructive">{sendError}</div>}
         <div className="flex items-end gap-2 rounded-2xl border bg-card px-3 py-2 shadow-sm">
           <RichChatInput
             value={messageInput}
