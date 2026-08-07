@@ -68,6 +68,7 @@ vi.mock('../../ipc/conversations.js', () => ({
     conv.headId = (tree[tree.length - 1] as { id?: string })?.id ?? null;
     return conv;
   }),
+  registerAutomationAborter: vi.fn(),
 }));
 vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn() }));
 vi.mock('../../ipc/conversation-store.js', () => ({

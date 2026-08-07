@@ -70,6 +70,22 @@ export function broadcastUpsert(appHome: string, conversation: ConversationRecor
 function broadcastDelete(appHome: string, id: string): void {
   broadcastChange({ kind: 'delete', id, activeConversationId: getActiveConversationId(appHome) });
 }
+
+// Standalone automations run their agent turns via a SEPARATE registry (automations/actions.ts
+// abortAutomationRun) — not the agent:stream activeStreams that cancelConversationStream aborts.
+// actions.ts imports THIS module, so it registers its aborter here (avoiding an import cycle);
+// the delete handlers call it so deleting a conversation mid-automation stops its tools too.
+let automationAborter: ((conversationId: string) => boolean) | null = null;
+export function registerAutomationAborter(fn: (conversationId: string) => boolean): void {
+  automationAborter = fn;
+}
+function abortAutomationForConversation(id: string): void {
+  try {
+    automationAborter?.(id);
+  } catch {
+    /* best-effort */
+  }
+}
 function broadcastReset(appHome: string): void {
   broadcastChange({ kind: 'reset', activeConversationId: getActiveConversationId(appHome) });
 }
@@ -895,6 +911,7 @@ export function registerConversationHandlers(
     // Abort any live stream/submit for the (now-deleted) conversation so its tools and
     // side effects don't keep running. No await between delete and cancel, so no tool runs.
     cancelConversationStream(id);
+    abortAutomationForConversation(id); // standalone automations use a separate abort registry
     broadcastDelete(appHome, id);
     clearConversationDiffs(id);
 
@@ -919,7 +936,10 @@ export function registerConversationHandlers(
     // is synchronous (rmSync) with no await, so no tool can execute between the delete and this
     // cancel; cancelling before the delete would irreversibly stop a run whose file rm FAILED
     // (deleteConversations preserves such a conversation) — a surviving chat with a dead run.
-    for (const id of removed) cancelConversationStream(id);
+    for (const id of removed) {
+      cancelConversationStream(id);
+      abortAutomationForConversation(id);
+    }
     // Broadcast a delete per removed id so each renderer/web client prunes O(1),
     // matching the single-delete path (there is no batched change kind).
     for (const id of removed) {
@@ -942,6 +962,13 @@ export function registerConversationHandlers(
   });
 
   ipcMain.handle('conversations:clear', () => {
+    // Abort any live agent stream AND standalone automation run for EVERY conversation before
+    // wiping — otherwise their tools keep executing invisibly after the records are gone
+    // (same hazard as delete/deleteMany, but for the wipe-all path).
+    for (const conversationId of Object.keys(readIndex(appHome).conversations)) {
+      cancelConversationStream(conversationId);
+      abortAutomationForConversation(conversationId);
+    }
     // Clean up all computer-use sessions
     if (getConfig) {
       try {

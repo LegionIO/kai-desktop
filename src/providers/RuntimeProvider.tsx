@@ -2360,6 +2360,8 @@ export function RuntimeProvider({
           supersededResponseIds.delete(deletedId);
           pendingCompactionHandoff.delete(deletedId);
           rejectedDrafts.delete(deletedId);
+          persistVersions.delete(deletedId);
+          lastRetitleCount.delete(deletedId);
         }
         return;
       }

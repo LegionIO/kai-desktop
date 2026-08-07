@@ -19,6 +19,9 @@ vi.mock('../../ipc/conversations.js', () => ({
     headId: c.headId ?? null,
   }),
   getConversationBranch: (tree: unknown[]) => tree,
+  dropConversationMessages: () => null,
+  insertConversationMessageBefore: () => null,
+  registerAutomationAborter: () => {},
 }));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readIndex: () => ({ conversations: {}, activeConversationId: null, settings: {} }),

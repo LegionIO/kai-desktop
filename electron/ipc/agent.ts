@@ -2021,7 +2021,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (!name) return false;
             try {
               const tk = resolveConversationTokenization(name);
-              return !!tk?.encoding && !tk.isFallbackEncoding;
+              // The outputMaxTokens*4 credit assumes ≤4 bytes/token, which holds for the
+              // MODERN o200k base (GPT-4o/4.1/5/o-series). A RECOGNIZED cl100k model
+              // (GPT-4-turbo/3.5) is NOT fallback but tokenizes DENSER on non-Latin scripts
+              // (Georgian etc.) — >4 B/tok — so crediting it under-charges. Require o200k_base.
+              return !!tk?.encoding && !tk.isFallbackEncoding && tk.encodingBaseName === 'o200k_base';
             } catch {
               return false; // unknown → treat as fallback (no credit)
             }

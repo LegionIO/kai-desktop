@@ -15,6 +15,7 @@ import {
   insertConversationMessageBefore,
   ensureConversationTree,
   getConversationBranch,
+  registerAutomationAborter,
 } from '../ipc/conversations.js';
 import { readIndex, readConversation, writeConversation } from '../ipc/conversation-store.js';
 import type { ConversationRecord } from '../ipc/conversation-store.js';
@@ -85,6 +86,10 @@ export function abortAutomationRun(conversationId: string): boolean {
   controller.abort();
   return true;
 }
+// Let conversations:delete/deleteMany abort a standalone automation streaming into a
+// conversation being deleted (its runs use THIS registry, not agent:stream's activeStreams).
+// Registered here (actions.ts imports conversations.ts, not vice versa) to avoid a cycle.
+registerAutomationAborter(abortAutomationRun);
 
 /**
  * Wait (bounded) until no automation run is in flight for this conversation — its
