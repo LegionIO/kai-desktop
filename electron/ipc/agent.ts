@@ -2001,17 +2001,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // UNDER-count the compacted body and let media be retained that then overflows
         // (and after a tool runs, reactive recovery is off). So credit the shrink ONLY
         // for canonical models; otherwise charge the raw bytes (conservative, never under).
-        const activeModelForCompactEst = (activeModelEntryForRecovery ?? modelEntry)?.modelConfig.modelName;
+        // The tool-output compaction (maybeCompactToolOutput → compactToolResult) shrinks the
+        // body to ~outputMaxTokens using the PRIMARY model's tokenizer, but the resulting
+        // bytes are then RE-TOKENIZED by whatever model actually SENDS the request (the
+        // fallback after a mid-stream fallback). The `outputMaxTokens * 4` credit assumes
+        // ≤4 B/tok — SAFE only if BOTH are canonical (o200k). If EITHER the compaction model
+        // OR the active/send model is a fallback/unknown (denser, >4 B/tok possible), grant NO
+        // credit and charge raw bytes (conservative — never under-count → media never wrongly
+        // retained → no post-tool overflow with recovery off).
+        const compactModelName = modelEntry?.modelConfig.modelName; // model that actually compacts
+        const sendModelName = (activeModelEntryForRecovery ?? modelEntry)?.modelConfig.modelName; // model that sends
         const compactedBodyBytes = (rawBytes: number, outputMaxTokens: number): number => {
           if (outputMaxTokens <= 0) return rawBytes;
-          let isFallback = true;
-          try {
-            const tk = activeModelForCompactEst ? resolveConversationTokenization(activeModelForCompactEst) : undefined;
-            isFallback = !tk?.encoding || tk.isFallbackEncoding;
-          } catch {
-            /* treat unknown as fallback (no shrink credit) */
-          }
-          return isFallback ? rawBytes : Math.min(rawBytes, outputMaxTokens * 4);
+          const isCanonical = (name: string | undefined): boolean => {
+            if (!name) return false;
+            try {
+              const tk = resolveConversationTokenization(name);
+              return !!tk?.encoding && !tk.isFallbackEncoding;
+            } catch {
+              return false; // unknown → treat as fallback (no credit)
+            }
+          };
+          const creditable = isCanonical(compactModelName) && isCanonical(sendModelName);
+          return creditable ? Math.min(rawBytes, outputMaxTokens * 4) : rawBytes;
         };
         const predictCommittedNonMediaBytes = (r: unknown): number => {
           const toolCfg = config.compaction?.tool as ToolCompactionConfig | undefined;

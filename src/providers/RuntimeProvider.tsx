@@ -3914,7 +3914,12 @@ export function RuntimeProvider({
                 // accumulator so nothing is left stuck. Await the persist first so the
                 // continuation's reuse gate sees any compaction record on disk.
                 const abandonPlanRestart = (): void => {
+                  // Only if WE still own the accumulator (a replacement turn owns its own
+                  // cleanup). MUST persist runStatus:'idle' — deleting the accumulator alone
+                  // leaves the disk record 'running' (blocks /compact + shows stale busy).
+                  if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
                   streamAccumulators.delete(convId);
+                  void persistConversation(convId, treeForStream, headForStream, { runStatus: 'idle' });
                   if (activeIdRef.current === convId) {
                     setIsRunning(false);
                     // Re-surface the plan-restart affordance so the user can retry manually.

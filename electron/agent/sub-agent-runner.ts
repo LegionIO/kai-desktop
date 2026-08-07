@@ -329,7 +329,12 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       ? [...(resumeMessages ?? []), { role: 'user', content: resumeFollowUp ?? '' }]
       : [{ role: 'user', content: buildSubAgentTaskMessage(task, context) }];
 
-    let subAgentConfig: AppConfig = { ...config, systemPrompt };
+    // Override the system prompt with the sub-agent wrapper. buildAgentInstructions ->
+    // resolveModeSystemPrompt PREFERS systemPrompts.chat/.plan over config.systemPrompt, so
+    // leaving those set would SHADOW the wrapper with the user's generic chat/plan prompt
+    // (losing the sub_agent_control lifecycle guidance + a resume's gated prompt). Clear the
+    // per-mode overrides so resolveModeSystemPrompt falls back to our systemPrompt.
+    let subAgentConfig: AppConfig = { ...config, systemPrompt, systemPrompts: undefined };
 
     // Control signal shared with the control tool
     const controlSignal: { current: ControlSignal | null } = { current: null };

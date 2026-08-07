@@ -174,29 +174,43 @@ export async function captureHeapSnapshot(
 
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
-  // Enforce retention BEFORE capturing, RESERVING A SLOT for the snapshot we're about to
-  // write: an old (multi-GB) snapshot can fill the disk so that EVERY new capture fails with
-  // ENOSPC before the post-capture retention below ever runs — a permanent failure loop.
-  // Plain retention (to maxCount) removes NOTHING when exactly maxCount snapshots already
-  // exist within the byte cap, so the incoming (maxCount+1)-th still hits a full disk.
-  // reserveSlots:1 evicts down to maxCount-1 first (and, crucially, at maxCount:1 evicts ALL
-  // — a reserved ceiling of 0 means "clear", NOT "unlimited"). Retention runs AGAIN after to
-  // enforce the true ceiling incl. the new one. maxCount 0 = unlimited → no reservation.
-  const evictedBefore = enforceHeapSnapshotRetention(dir, retention, 1);
+
+  // Capture FIRST, evict-and-retry-once on failure — do NOT pre-delete existing snapshots.
+  // Pre-eviction was two-sided-wrong: (a) it can't reserve BYTE headroom for the unknown
+  // incoming size (a 5.5 GiB snapshot under a 6 GiB cap still leaves no room for the next
+  // ~5.5 GiB), and (b) deleting the sole existing snapshot BEFORE a capture that then
+  // transiently FAILS destroys the only good one, leaving none. Instead: try the capture
+  // with the old snapshots intact (they're the fallback); only if it fails do we evict ALL
+  // existing snapshots (freeing their space + count) and retry ONCE — resolving the ENOSPC
+  // loop (an old disk-filler is cleared) without risking a good snapshot on a transient error.
+  let evictedForRetry: string[] = [];
   try {
     await take(path);
-  } catch (err) {
-    // take() can fail AFTER writing a partial file (e.g. ENOSPC, or a renderer teardown
-    // mid-write). Retention below never runs on the throw path, so that partial would
-    // linger — and the caller's retry cooldown would then create ANOTHER partial every
-    // minute, accumulating multi-GB and re-consuming any freed space. Remove the partial
-    // before rethrowing so a failed capture leaves no residue.
+  } catch {
+    // Remove any partial from the failed attempt so it doesn't linger / re-consume space.
     try {
       rmSync(path, { force: true });
     } catch {
-      /* best-effort cleanup */
+      /* best-effort */
     }
-    throw err;
+    // Free space by evicting EVERYTHING currently retained (count ceiling 0 via reserveSlots
+    // = maxCount), then retry the capture once. If maxCount is 0 (unlimited) there's no count
+    // to reduce — still evict the OLDEST to free bytes for the retry.
+    evictedForRetry = enforceHeapSnapshotRetention(
+      dir,
+      retention.maxCount > 0 ? retention : { ...retention, maxCount: 1 },
+      retention.maxCount > 0 ? retention.maxCount : 1,
+    );
+    try {
+      await take(path);
+    } catch (secondErr) {
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        /* best-effort */
+      }
+      throw secondErr; // still failing after freeing space — surface it (caller re-arms)
+    }
   }
 
   let bytes = 0;
@@ -207,8 +221,8 @@ export async function captureHeapSnapshot(
   }
 
   const evicted = enforceHeapSnapshotRetention(dir, retention);
-  // Report everything evicted across BOTH passes (dedup — a file can't be evicted twice, but
-  // guard anyway).
-  const allEvicted = evictedBefore.length > 0 ? [...new Set([...evictedBefore, ...evicted])] : evicted;
+  // Report everything evicted across the retry + final passes (dedup).
+  const allEvicted =
+    evictedForRetry.length > 0 ? [...new Set([...evictedForRetry, ...evicted])] : evicted;
   return { path, bytes, evicted: allEvicted };
 }
