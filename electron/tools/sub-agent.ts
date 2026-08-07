@@ -815,7 +815,11 @@ async function resumeSubAgent(
   try {
     const stream = runSubAgent({
       subAgentConversationId,
-      parentConversationId,
+      // Real parent CONVERSATION id for lifecycle-event routing (parentThreadId), so the CLI
+      // reducer sees resumed-run notes too. parentToolCallId stays the tool-call id (GUI match).
+      // (The resumable STATE's parentConversationId field intentionally holds the tool-call id
+      // per the resume-routing convention — that's separate from these live event params.)
+      parentConversationId: parentThreadId ?? parentConversationId,
       parentToolCallId,
       task,
       depth,
@@ -1292,7 +1296,12 @@ export function createSubAgentTool(
         // onFinalMessages / onFinalSystemPrompt below.
         const stream = runSubAgent({
           subAgentConversationId,
-          parentConversationId: ctx.toolCallId,
+          // parentConversationId = the REAL parent CONVERSATION id (ctx.conversationId), so
+          // parent-scoped consumers (the CLI reducer's formatSubAgentStatusNote filters on the
+          // parent conv id) see normal running/completed/failed lifecycle notes. The GUI matches
+          // sub-agents by parentToolCallId (SubAgentInline), so keep that = ctx.toolCallId.
+          // (Was ctx.toolCallId for BOTH, which hid the CLI lifecycle notes.)
+          parentConversationId: ctx.conversationId ?? ctx.toolCallId,
           parentToolCallId: ctx.toolCallId,
           task,
           context,

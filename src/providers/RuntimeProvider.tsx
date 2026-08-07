@@ -838,6 +838,18 @@ const forceNewAssistant = new Set<string>();
  *  Prevents stale async persists from overwriting newer data. */
 const persistVersions = new Map<string, number>();
 
+// Per-conversation snapshot of the tree/head a terminal handler FINALIZED just before it
+// deleted the accumulator. Its terminal persist is fire-and-forget, so there's a window where
+// the accumulator is gone but the finalized content isn't on disk yet. onNew (after an awaited
+// injectMidTurn that falls back) reads this to base the new turn on the AUTHORITATIVE finalized
+// content — a plain disk reread in that window could return the pre-finalization PARTIAL tree
+// (possibly equal length), and the new turn would then overwrite the terminal write. Cleared
+// when the finalizing persist confirms on disk, or when the conversation is deleted. Bounded.
+const lastFinalizedBranch = new Map<string, { messages: StoredMessage[]; headId: string | null }>();
+function recordFinalizedBranch(convId: string, messages: StoredMessage[], headId: string | null): void {
+  lastFinalizedBranch.set(convId, { messages: [...messages], headId });
+}
+
 // Per-conversation handoff for a paid compaction record that a persist is TRYING to write
 // but hasn't confirmed on disk yet. A terminal (done/error) persist carrying a compaction
 // is fire-and-forget; if a new turn's persist supersedes it (version bump) before it lands,
@@ -2362,6 +2374,7 @@ export function RuntimeProvider({
           rejectedDrafts.delete(deletedId);
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
+          lastFinalizedBranch.delete(deletedId);
         }
         return;
       }
@@ -3682,6 +3695,7 @@ export function RuntimeProvider({
           clearTimeout(_ptMaxTurns);
           persistTimersRef.current.delete(convId);
         }
+        recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
         streamAccumulators.delete(convId);
         persistConversation(
           convId,
@@ -3734,6 +3748,7 @@ export function RuntimeProvider({
           clearTimeout(_ptErr);
           persistTimersRef.current.delete(convId);
         }
+        recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
         streamAccumulators.delete(convId);
         persistConversation(
           convId,
@@ -3836,6 +3851,7 @@ export function RuntimeProvider({
           clearTimeout(_ptDone);
           persistTimersRef.current.delete(convId);
         }
+        recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
         streamAccumulators.delete(convId);
         persistConversation(
           convId,
@@ -4181,28 +4197,37 @@ export function RuntimeProvider({
 
       // Base the new turn on the freshest tree available. If the running turn is still live,
       // use its accumulator (it may have streamed more during an awaited injectMidTurn). If
-      // its accumulator is GONE, the run FINALIZED during that await and wrote its final tree
-      // to DISK — re-read it (the closure tree/headId is stale, missing the finalized
-      // assistant message; using it would overwrite the finalized content + mis-branch the
-      // new user turn). Only re-read when we actually awaited an inject (isRunningRef at
-      // entry) AND have no live accumulator; otherwise the closure tree is current.
+      // its accumulator is GONE, the run FINALIZED during that await — prefer the FINALIZED
+      // snapshot the terminal handler recorded (lastFinalizedBranch): its persist is
+      // fire-and-forget, so a plain disk reread here could hit the pre-finalization PARTIAL
+      // tree (possibly equal length) and the new turn would overwrite the terminal write.
+      // Fall back to a disk reread, then the (stale) closure tree.
       const liveAcc = streamAccumulators.get(convId);
       let baseTree: StoredMessage[] = liveAcc ? liveAcc.messages : tree;
       let baseHead: string | null = liveAcc ? liveAcc.headId : headId;
       if (!liveAcc && wasRunningAtEntry) {
-        try {
-          const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
-          if (fresh) {
-            const { tree: ft, headId: fh } = ensureTree(fresh);
-            if (ft.length >= baseTree.length) {
-              baseTree = ft;
-              baseHead = fh;
+        const finalized = lastFinalizedBranch.get(convId);
+        if (finalized && finalized.messages.length >= baseTree.length) {
+          baseTree = finalized.messages;
+          baseHead = finalized.headId;
+        } else {
+          try {
+            const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
+            if (fresh) {
+              const { tree: ft, headId: fh } = ensureTree(fresh);
+              if (ft.length >= baseTree.length) {
+                baseTree = ft;
+                baseHead = fh;
+              }
             }
+          } catch {
+            /* disk read failed — fall back to the closure tree (best-effort) */
           }
-        } catch {
-          /* disk read failed — fall back to the closure tree (best-effort) */
         }
       }
+      // The finalized snapshot has served its purpose (base for THIS new turn); drop it so it
+      // can't stale-base a much-later turn after further edits.
+      lastFinalizedBranch.delete(convId);
       const userMsg: StoredMessage = {
         id: msgId(),
         parentId: baseHead,

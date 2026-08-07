@@ -4543,7 +4543,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // an answer. On explicit abort/stop, preserve the user message but respect
         // the stop (no automatic restart). A superseding run owns its own queue,
         // so only the still-current token may drain.
-        if (stillOwnsRun && serverPersistedRun && hasInjects(conversationId)) {
+        // A cooperative inject that arrived AFTER the final prepareStep boundary must be
+        // drained regardless of run type — a GUI-injected message is just as stranded as a
+        // CLI one and would otherwise leak (re-spliced) into an unrelated future turn. The
+        // continuation below is marked serverPersisted, so the GUI renderer takes its
+        // render-only path (no double-persist). Only the still-current token may drain.
+        if (stillOwnsRun && hasInjects(conversationId)) {
           const stranded = drainInjects(conversationId);
           let lastInjectedHead: string | null = null;
           let lastInjectedText = '';
