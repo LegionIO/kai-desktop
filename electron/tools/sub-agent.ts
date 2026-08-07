@@ -684,7 +684,20 @@ async function resumeSubAgent(
         exitReason: null,
       });
   } catch (err) {
-    console.error('[Subagent] Failed to reopen status on resume:', err);
+    // The reopen (paused/completed → running) FAILED, so the DB status is still `paused`.
+    // Proceeding would run the turn against that stale status, and its terminal finalization
+    // (running → completed/failed) would be FSM-REJECTED (paused only allows → running/stopped)
+    // → stale `paused` reappears after restart. Instead ABORT the resume cleanly: release the
+    // slot + teardown, leaving the thread cleanly `paused` (resumable — the user can retry the
+    // follow-up). Surface the follow-up back as retained so it isn't lost.
+    console.error('[Subagent] Failed to reopen status on resume — aborting resume (thread stays paused):', err);
+    cleanupRuntime(subAgentConversationId, resumeGeneration);
+    releaseSubAgentSlot();
+    retainFollowUpAsPaused(subAgentConversationId, message, 'awaiting-input', {
+      parentConversationId: parentThreadId ?? subAgentConversationId,
+      parentToolCallId,
+    });
+    return;
   }
 
   // Terminal classification, mirroring the wrapper. Resumable state is built

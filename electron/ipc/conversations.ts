@@ -1716,11 +1716,14 @@ export function registerConversationHandlers(
                 // covered content is genuinely unchanged.
                 const coveredContentMatches = (() => {
                   const sig = stored.coveredContentSig;
-                  if (!sig) return true; // no baseline → id/boundary/prefix checks govern
+                  // Unsigned record (pre-upgrade / preserved without a baseline) can't be
+                  // verified — a same-id content rewrite is undetectable, so don't reuse its
+                  // summary as a no-op; recompute. Likewise a partially-signed covered id.
+                  if (!sig) return false;
                   const byId = new Map(fBranch.map((m) => [m.id, m]));
                   return (stored.compactedMessageIds ?? []).every((id) => {
                     const expected = sig[id];
-                    if (expected === undefined) return true;
+                    if (expected === undefined) return false;
                     const node = byId.get(id);
                     if (!node) return false;
                     return messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) === expected;

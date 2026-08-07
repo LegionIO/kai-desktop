@@ -82,24 +82,10 @@ function listSnapshots(dir: string): SnapshotFile[] {
  * Pure w.r.t. policy; deletes files as a side effect. Returns evicted names.
  * Best-effort: a failed unlink is skipped (its bytes still count, so the sweep
  * can't spin) rather than throwing.
- *
- * `reserveSlots` (default 0) shrinks the effective count ceiling to
- * `maxCount - reserveSlots` to make room for that many INCOMING snapshots BEFORE a capture.
- * Unlike passing a reduced maxCount, a reserved ceiling of 0 means "evict ALL" (a full slot
- * reserved for the one incoming), NOT "unlimited" — so reserving the sole slot at maxCount:1
- * actually clears the directory. reserveSlots is ignored when maxCount is 0 (unlimited).
  */
-export function enforceHeapSnapshotRetention(
-  dir: string,
-  retention: HeapSnapshotRetention,
-  reserveSlots = 0,
-): string[] {
+export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapshotRetention): string[] {
   const files = listSnapshots(dir);
   const evicted: string[] = [];
-  // Effective count ceiling: 0 (unlimited) stays unlimited; otherwise subtract the reserved
-  // slots, clamped at 0 — and a reserved-to-0 ceiling means EVICT ALL (distinct from unlimited).
-  const reservedCeiling = retention.maxCount > 0 ? Math.max(0, retention.maxCount - reserveSlots) : 0;
-  const evictAllForReserve = retention.maxCount > 0 && reservedCeiling === 0;
   // Victims whose unlink FAILED — set aside so the byte loop neither retries them forever
   // nor mis-accounts their bytes as freed. Their bytes stay counted against the cap.
   const failed: SnapshotFile[] = [];
@@ -120,14 +106,14 @@ export function enforceHeapSnapshotRetention(
     }
   };
 
-  // Count ceiling (using the reserved ceiling — see reserveSlots). A FAILED unlink leaves the
-  // file on disk (moved to `failed`), so the on-disk count is files.length + failed.length —
-  // drive the loop on THAT, not files.length alone. Otherwise a failed unlink followed by a
-  // successful one would stop with the cap still violated. Bounded by guard: once every
-  // remaining `files` entry has failed to unlink, dropFront can't shrink `files`, so stop.
-  if (retention.maxCount > 0 || evictAllForReserve) {
+  // Count ceiling. A FAILED unlink leaves the file on disk (moved to `failed`), so the
+  // on-disk count is files.length + failed.length — drive the loop on THAT, not files.length
+  // alone. Otherwise a failed unlink followed by a successful one would stop with the cap
+  // still violated. Bounded by guard: once every remaining `files` entry has failed to
+  // unlink, dropFront can't shrink `files`, so stop.
+  if (retention.maxCount > 0) {
     let guard = 0;
-    while (files.length + failed.length > reservedCeiling && files.length > 0 && guard < 1000) {
+    while (files.length + failed.length > retention.maxCount && files.length > 0 && guard < 1000) {
       dropFront(files); // always shifts one off `files` (deleted → evicted, or failed → `failed`)
       guard++;
     }
@@ -175,41 +161,56 @@ export async function captureHeapSnapshot(
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
 
-  // Capture FIRST, evict-and-retry-once on failure — do NOT pre-delete existing snapshots.
-  // Pre-eviction was two-sided-wrong: (a) it can't reserve BYTE headroom for the unknown
-  // incoming size (a 5.5 GiB snapshot under a 6 GiB cap still leaves no room for the next
-  // ~5.5 GiB), and (b) deleting the sole existing snapshot BEFORE a capture that then
-  // transiently FAILS destroys the only good one, leaving none. Instead: try the capture
-  // with the old snapshots intact (they're the fallback); only if it fails do we evict ALL
-  // existing snapshots (freeing their space + count) and retry ONCE — resolving the ENOSPC
-  // loop (an old disk-filler is cleared) without risking a good snapshot on a transient error.
-  let evictedForRetry: string[] = [];
+  // Capture FIRST, then free space INCREMENTALLY on failure — do NOT pre-delete existing
+  // snapshots. Pre-eviction was two-sided-wrong: it can't reserve BYTE headroom for the
+  // unknown incoming size, and deleting a good snapshot before a capture that then FAILS
+  // loses it. And evicting EVERYTHING before a retry destroys ALL diagnostics when the
+  // retry also fails (a doubly-failing destroyed renderer). Instead: try with the old
+  // snapshots intact (the fallback); on failure evict the OLDEST ONE and retry, repeating —
+  // but NEVER delete the LAST remaining valid snapshot (always keep ≥1 good diagnostic). If
+  // freeing everything-but-one still doesn't let the capture succeed, surface the failure
+  // with that last snapshot preserved.
+  const evictedForRetry: string[] = [];
+  let captured = false;
   try {
     await take(path);
+    captured = true;
   } catch {
-    // Remove any partial from the failed attempt so it doesn't linger / re-consume space.
-    try {
-      rmSync(path, { force: true });
-    } catch {
-      /* best-effort */
+    /* fall through to incremental-evict retry */
+  }
+  if (!captured) {
+    let guard = 0;
+    while (!captured && guard < 64) {
+      guard++;
+      try {
+        rmSync(path, { force: true }); // drop any partial from the failed attempt
+      } catch {
+        /* best-effort */
+      }
+      // Evict the OLDEST snapshot to free space — but stop before the last one (keep ≥1).
+      const existing = listSnapshots(dir); // oldest-first
+      if (existing.length <= 1) break; // don't delete the sole remaining valid snapshot
+      const victim = existing[0];
+      try {
+        rmSync(victim.path, { force: true });
+        evictedForRetry.push(victim.name);
+      } catch {
+        break; // can't free the oldest (e.g. permission) — stop rather than spin
+      }
+      try {
+        await take(path);
+        captured = true;
+      } catch {
+        /* keep freeing the next-oldest */
+      }
     }
-    // Free space by evicting EVERYTHING currently retained (count ceiling 0 via reserveSlots
-    // = maxCount), then retry the capture once. If maxCount is 0 (unlimited) there's no count
-    // to reduce — still evict the OLDEST to free bytes for the retry.
-    evictedForRetry = enforceHeapSnapshotRetention(
-      dir,
-      retention.maxCount > 0 ? retention : { ...retention, maxCount: 1 },
-      retention.maxCount > 0 ? retention.maxCount : 1,
-    );
-    try {
-      await take(path);
-    } catch (secondErr) {
+    if (!captured) {
       try {
         rmSync(path, { force: true });
       } catch {
         /* best-effort */
       }
-      throw secondErr; // still failing after freeing space — surface it (caller re-arms)
+      throw new Error('heap snapshot capture failed (out of space after evicting all but the last snapshot)');
     }
   }
 

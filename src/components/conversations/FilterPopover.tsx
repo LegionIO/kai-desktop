@@ -174,13 +174,17 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
 
   useEffect(() => {
     const handlePointerDown = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) {
+      const target = e.target as Node;
+      // Ignore clicks on the popover itself AND on its trigger button — a pointerdown on the
+      // trigger would otherwise close the popover here, then the trigger's click handler would
+      // immediately reopen it (the open button couldn't dismiss it).
+      if (!rootRef.current?.contains(target) && !anchorRef.current?.contains(target)) {
         onClose();
       }
     };
     window.addEventListener('pointerdown', handlePointerDown);
     return () => window.removeEventListener('pointerdown', handlePointerDown);
-  }, [onClose]);
+  }, [onClose, anchorRef]);
 
   const update = (partial: Partial<FilterPreference>) => {
     onFilterChange({ ...filter, ...partial });

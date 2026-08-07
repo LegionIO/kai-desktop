@@ -30,13 +30,16 @@ export const SortPopover: FC<SortPopoverProps> = ({ sort, onSortChange, onClose,
 
   useEffect(() => {
     const handlePointerDown = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) {
+      const target = e.target as Node;
+      // Ignore clicks on the popover AND its trigger button — otherwise a pointerdown on the
+      // trigger closes here and the trigger's click reopens (open button can't dismiss it).
+      if (!rootRef.current?.contains(target) && !anchorRef.current?.contains(target)) {
         onClose();
       }
     };
     window.addEventListener('pointerdown', handlePointerDown);
     return () => window.removeEventListener('pointerdown', handlePointerDown);
-  }, [onClose]);
+  }, [onClose, anchorRef]);
 
   const handleSelect = (option: (typeof SORT_OPTIONS)[number]) => {
     if (sort.field === option.field) {

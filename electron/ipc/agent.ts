@@ -3165,13 +3165,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // content to still match it; else don't reuse (recompute over current content).
             const coveredContentUnchanged = (() => {
               const sig = storedCompaction.coveredContentSig;
-              if (!sig) return true; // older record without a baseline — id/prefix checks govern
+              // An UNSIGNED record (pre-upgrade, or a direct writer that preserved the record
+              // without a baseline) can't be verified against current content — a same-id
+              // content rewrite would be undetectable, so reusing its summary could hide the
+              // edit. Don't trust it: recompute over current content (a one-time cost after
+              // upgrade). Likewise a partially-signed record with an unsigned covered id.
+              if (!sig) return false;
               const byId = new Map(
                 (chatMessages as Array<{ id?: unknown }>).map((m) => [typeof m?.id === 'string' ? m.id : '', m]),
               );
               return (storedCompaction.compactedMessageIds ?? []).every((id) => {
                 const expected = sig[id];
-                if (expected === undefined) return true; // unsigned id — nothing to compare
+                if (expected === undefined) return false; // unsigned covered id — can't verify → recompute
                 const node = byId.get(id);
                 if (!node) return false; // covered id vanished → stale
                 return messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) === expected;

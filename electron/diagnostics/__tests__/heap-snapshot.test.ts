@@ -173,17 +173,18 @@ describe('captureHeapSnapshot', () => {
     expect(readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length).toBe(2); // ceiling held
   });
 
-  it('a TRANSIENT capture failure does NOT destroy the sole existing snapshot (maxCount:1)', async () => {
-    // Capture-first means the sole existing snapshot is intact when the FIRST attempt fails.
-    // On failure we evict-and-retry; if the retry ALSO fails, the pre-existing snapshot is
-    // gone (we deliberately freed space) — but a TRANSIENT failure (first fails, retry
-    // succeeds) preserves a valid snapshot throughout. Here the first attempt throws, the
-    // second succeeds → the old one is evicted to free space + the new one lands.
+  it('frees space incrementally on failure (evicts oldest, retries) and keeps the newer one', async () => {
+    // Capture-first; on failure evict the OLDEST snapshot and retry. Two existing snapshots:
+    // first attempt fails, we evict the oldest to free space, the retry succeeds → the newer
+    // pre-existing snapshot is preserved through the transient failure + the new one lands.
     const dir = heapSnapshotDir(logsDir);
     mkdirSync(dir, { recursive: true });
-    const old = join(dir, 'heap-20260806T000000.heapsnapshot');
-    writeFileSync(old, Buffer.alloc(10, 1));
-    utimesSync(old, new Date(2026, 7, 6, 0, 0), new Date(2026, 7, 6, 0, 0));
+    const older = join(dir, 'heap-20260806T000000.heapsnapshot');
+    const newer = join(dir, 'heap-20260806T000100.heapsnapshot');
+    writeFileSync(older, Buffer.alloc(10, 1));
+    writeFileSync(newer, Buffer.alloc(10, 1));
+    utimesSync(older, new Date(2026, 7, 6, 0, 0), new Date(2026, 7, 6, 0, 0));
+    utimesSync(newer, new Date(2026, 7, 6, 0, 1), new Date(2026, 7, 6, 0, 1));
 
     let attempt = 0;
     const take = vi.fn(async (filePath: string) => {
@@ -192,24 +193,29 @@ describe('captureHeapSnapshot', () => {
       writeFileSync(filePath, Buffer.alloc(2048, 7));
     });
 
-    const result = await captureHeapSnapshot(logsDir, take, { maxCount: 1, maxTotalBytes: 0 });
+    const result = await captureHeapSnapshot(logsDir, take, { maxCount: 2, maxTotalBytes: 0 });
 
-    expect(attempt).toBe(2); // evicted + retried
-    expect(result.evicted).toContain('heap-20260806T000000.heapsnapshot');
+    expect(attempt).toBe(2); // evicted the oldest + retried
+    expect(result.evicted).toContain('heap-20260806T000000.heapsnapshot'); // OLDEST evicted
     expect(existsSync(result.path)).toBe(true);
-    expect(readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length).toBe(1); // only the new one
+    expect(existsSync(newer)).toBe(true); // the NEWER pre-existing snapshot preserved
   });
 
-  it('a persistent capture failure surfaces after the evict-and-retry (caller re-arms)', async () => {
+  it('a persistently-failing capture NEVER deletes the last valid snapshot (keeps >=1)', async () => {
+    // With one existing snapshot and a capture that always fails, the incremental evict loop
+    // must NOT delete that sole snapshot (never leave zero diagnostics). It gives up + throws,
+    // and the pre-existing snapshot survives.
     const dir = heapSnapshotDir(logsDir);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'heap-20260806T000000.heapsnapshot'), Buffer.alloc(10, 1));
+    const sole = join(dir, 'heap-20260806T000000.heapsnapshot');
+    writeFileSync(sole, Buffer.alloc(10, 1));
     const take = vi.fn(async () => {
       throw new Error('takeHeapSnapshot failed');
     });
     await expect(
       captureHeapSnapshot(logsDir, take, { maxCount: 1, maxTotalBytes: 0 }),
-    ).rejects.toThrow('takeHeapSnapshot failed');
-    expect(take).toHaveBeenCalledTimes(2); // first + one evict-and-retry
+    ).rejects.toThrow(/out of space|takeHeapSnapshot failed/);
+    expect(take).toHaveBeenCalledTimes(1); // only 1 existing → never evicted → no retry
+    expect(existsSync(sole)).toBe(true); // the sole valid snapshot is preserved
   });
 });
