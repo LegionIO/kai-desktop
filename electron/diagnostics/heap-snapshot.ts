@@ -86,34 +86,51 @@ function listSnapshots(dir: string): SnapshotFile[] {
 export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapshotRetention): string[] {
   const files = listSnapshots(dir);
   const evicted: string[] = [];
+  // Victims whose unlink FAILED — set aside so the byte loop neither retries them forever
+  // nor mis-accounts their bytes as freed. Their bytes stay counted against the cap.
+  const failed: SnapshotFile[] = [];
 
-  const dropFront = (list: SnapshotFile[]): void => {
+  // Delete the front (oldest) file. Returns the victim IFF it was actually removed (so the
+  // caller subtracts its bytes only then); a failed unlink is moved to `failed` and returns
+  // null — the file stays on disk and its bytes still count, so the sweep can't spin on it.
+  const dropFront = (list: SnapshotFile[]): SnapshotFile | null => {
     const victim = list.shift();
-    if (!victim) return;
+    if (!victim) return null;
     try {
       rmSync(victim.path, { force: true });
       evicted.push(victim.name);
+      return victim;
     } catch {
-      /* leave it; its bytes still count so we don't loop on it */
+      failed.push(victim);
+      return null;
     }
   };
 
   // Count ceiling.
   if (retention.maxCount > 0) {
-    while (files.length > retention.maxCount) dropFront(files);
+    while (files.length > retention.maxCount) {
+      if (files.length === 0) break;
+      dropFront(files);
+    }
   }
 
-  // Byte ceiling — recompute from the surviving set.
+  // Byte ceiling — recompute from the surviving set PLUS any file whose unlink failed
+  // during the count sweep (still on disk, so its bytes still count against the cap).
   if (retention.maxTotalBytes > 0) {
-    let total = files.reduce((sum, f) => sum + f.bytes, 0);
+    let total = files.reduce((sum, f) => sum + f.bytes, 0) + failed.reduce((sum, f) => sum + f.bytes, 0);
     // Never evict the sole newest snapshot to satisfy bytes — a single snapshot
     // larger than the cap is kept (it's the one the user needs), matching the
     // "keep latest" intent. Stop when one file remains.
     let guard = 0;
     while (total > retention.maxTotalBytes && files.length > 1 && guard < 1000) {
-      const victimBytes = files[0]?.bytes ?? 0;
-      dropFront(files);
-      total -= victimBytes;
+      const before = files.length;
+      const removedVictim = dropFront(files);
+      // Subtract bytes ONLY when the file was actually deleted — else an oversized file
+      // that couldn't be removed would be counted as freed and the loop would falsely
+      // report the cap satisfied while the file remains on disk.
+      if (removedVictim) total -= removedVictim.bytes;
+      // If dropFront made no progress (list unchanged), bail to avoid spinning.
+      if (files.length === before) break;
       guard++;
     }
   }
@@ -138,7 +155,21 @@ export async function captureHeapSnapshot(
 
   // Disambiguate same-second captures with a short random suffix.
   const path = join(dir, snapshotFileName(now, `-${Math.floor(Math.random() * 1000)}`));
-  await take(path);
+  try {
+    await take(path);
+  } catch (err) {
+    // take() can fail AFTER writing a partial file (e.g. ENOSPC, or a renderer teardown
+    // mid-write). Retention below never runs on the throw path, so that partial would
+    // linger — and the caller's retry cooldown would then create ANOTHER partial every
+    // minute, accumulating multi-GB and re-consuming any freed space. Remove the partial
+    // before rethrowing so a failed capture leaves no residue.
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
 
   let bytes = 0;
   try {

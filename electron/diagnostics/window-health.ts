@@ -27,6 +27,9 @@ const HEAP_HEARTBEAT_INTERVAL_MS = 60_000;
 // below the threshold before another snapshot can fire — prevents re-capturing
 // every tick while the heap sits pinned at/near 100%.
 const SNAPSHOT_REARM_HYSTERESIS_PCT = 10;
+/** Cooldown before re-arming a heap snapshot after a FAILED capture, so a persistently
+ *  high heap gets retried (not latched off) without spamming attempts every heartbeat. */
+const SNAPSHOT_RETRY_COOLDOWN_MS = 60_000;
 
 export type HealthWindow = Pick<
   BrowserWindow,
@@ -369,6 +372,10 @@ export class WindowHealthMonitor {
   // tick. Armed again only after the heap drops `SNAPSHOT_REARM_HYSTERESIS_PCT`
   // below the threshold (so oscillation around the line doesn't re-fire).
   private heapSnapshotArmed = true;
+  // When a capture FAILED (transient), the timestamp after which we re-arm so a retry can
+  // fire while the heap is still over threshold — otherwise a failed capture would latch
+  // off until the heap recovered below the hysteresis line and no snapshot is ever taken.
+  private heapSnapshotRetryAfter = 0;
 
   constructor(private readonly options: WindowHealthMonitorOptions) {
     this.now = options.now ?? Date.now;
@@ -469,22 +476,37 @@ export class WindowHealthMonitor {
     if (!this.heapSnapshotArmed && pct <= rearmBelow) {
       this.heapSnapshotArmed = true;
     }
+    // Re-arm after a FAILED capture's cooldown even if the heap is STILL over threshold —
+    // otherwise a transient failure would latch us off until the heap recovered (below the
+    // hysteresis line), so a persistently-high heap would never get a snapshot.
+    if (!this.heapSnapshotArmed && this.heapSnapshotRetryAfter > 0 && Date.now() >= this.heapSnapshotRetryAfter) {
+      this.heapSnapshotArmed = true;
+      this.heapSnapshotRetryAfter = 0;
+    }
     if (!this.heapSnapshotArmed || pct < policy.thresholdPct) return;
 
     // Latch immediately so overlapping ticks can't double-fire, then delegate.
     this.heapSnapshotArmed = false;
+    this.heapSnapshotRetryAfter = 0;
     this.log('renderer-heap-snapshot-triggered', {
       jsHeapUsedMB: sample.jsHeapUsedMB,
       jsHeapLimitMB: sample.jsHeapLimitMB,
       jsHeapUsedPct: pct,
       thresholdPct: policy.thresholdPct,
     });
+    // Arm a retry window: if the capture rejects/throws, re-arm after this cooldown so a
+    // still-high heap gets another attempt rather than being latched off indefinitely.
+    const armRetry = (): void => {
+      this.heapSnapshotRetryAfter = Date.now() + SNAPSHOT_RETRY_COOLDOWN_MS;
+    };
     try {
       void Promise.resolve(trigger(window, sample)).catch((error) => {
         this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+        armRetry();
       });
     } catch (error) {
       this.log('renderer-heap-snapshot-failed', { error: errorMessage(error) });
+      armRetry();
     }
   }
 

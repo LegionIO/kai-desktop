@@ -16,7 +16,7 @@ import {
   webContents,
 } from 'electron';
 import { basename, join, sep } from 'path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync } from 'fs';
 import {
   appendBoundedLog,
   enterErrorHandler,
@@ -1139,12 +1139,16 @@ try {
     try {
       const CHROME_LOG_MAX_BYTES = 25 * 1024 * 1024;
       if (existsSync(chromeDebugLog) && statSync(chromeDebugLog).size > CHROME_LOG_MAX_BYTES) {
+        // Rotate with an atomic RENAME (not read-all-into-memory + write): renameSync
+        // avoids a startup memory spike on a 25+ MB file AND is atomic, so the crash log
+        // is never truncated-without-a-backup. Only if the rename SUCCEEDS is the live
+        // path now absent (Chromium recreates it fresh); if it fails, leave the file as-is
+        // rather than blow away the only crash log.
         try {
-          writeFileSync(`${chromeDebugLog}.1`, readFileSync(chromeDebugLog));
+          renameSync(chromeDebugLog, `${chromeDebugLog}.1`);
         } catch {
-          /* best-effort backup */
+          /* rotation failed — keep the existing log intact rather than truncate it */
         }
-        writeFileSync(chromeDebugLog, '');
       }
     } catch {
       /* rotation is best-effort; never block boot */

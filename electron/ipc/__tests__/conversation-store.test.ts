@@ -121,7 +121,9 @@ describe('per-file read/write', () => {
       messages: [{ role: 'user', content: [{ type: 'image', image: 'data:...' }] }],
     });
     const withModelContent = makeConv('m2', {
-      messages: [{ role: 'tool', content: [{ type: 'tool-result', _modelContent: [{ type: 'image' }] }] }],
+      // Live persisted shape: _modelContent lives on the tool RESULT object, i.e.
+      // { type:'tool-result', result: { _modelContent: [...] } } — NOT directly on the part.
+      messages: [{ role: 'tool', content: [{ type: 'tool-result', result: { _modelContent: [{ type: 'image' }] } }] }],
     });
     const textOnly = makeConv('m3', {
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],

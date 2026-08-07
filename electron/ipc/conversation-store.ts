@@ -211,6 +211,12 @@ function computeHasMedia(conv: ConversationRecord): boolean {
       if (!Array.isArray(m.content)) return false;
       return (m.content as Array<Record<string, unknown>>).some((part) => {
         if (part?.type === 'image' || part?.type === 'file') return true;
+        // A tool result's native model content lives at part.result._modelContent (the
+        // persisted tool-result part is { type:'tool-result', result: {...} }). Check the
+        // nested result first; keep the direct part._modelContent as a fallback.
+        const resultObj = (part as { result?: unknown })?.result;
+        const nested = (resultObj as { _modelContent?: unknown } | null | undefined)?._modelContent;
+        if (Array.isArray(nested) && nested.length > 0) return true;
         const modelContent = (part as { _modelContent?: unknown })?._modelContent;
         return Array.isArray(modelContent) && modelContent.length > 0;
       });
@@ -1055,13 +1061,19 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   const index = readIndex(appHome);
   const removed: string[] = [];
   for (const id of ids) {
+    // Only drop the index entry once the data file is GONE (removed now, or already
+    // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
+    // would orphan that data AND make the conversation invisible — so keep the entry and
+    // skip this id (the caller can retry).
+    let fileGone = false;
     try {
       const p = conversationPath(appHome, id);
       if (existsSync(p)) rmSync(p);
+      fileGone = true;
     } catch {
-      /* ignore file-level failure (incl. invalid id); still drop any index entry below */
+      fileGone = false; // removal failed — retain the index entry
     }
-    if (index.conversations[id]) {
+    if (fileGone && index.conversations[id]) {
       delete index.conversations[id];
       if (index.activeConversationId === id) index.activeConversationId = null;
       removed.push(id);

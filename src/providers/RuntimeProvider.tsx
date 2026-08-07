@@ -743,15 +743,30 @@ const streamAccumulators = new Map<string, MessageAccumulator>();
 // Recording the outgoing accumulator's generation here lets the guard drop those stale
 // events and refuse to lock to a known-superseded generation. Bounded per conversation.
 const supersededGenerations = new Map<string, Set<string>>();
+/** Per-conversation generation of the run whose events are CURRENTLY streaming into it,
+ *  recorded the moment we see any tagged event — independent of whether the accumulator
+ *  has locked (`acc.runGeneration`) yet. The accumulator can be created by an UNTAGGED
+ *  external `user-message` (a peer/CLI turn broadcasts the user turn without a
+ *  runGeneration), leaving `acc.runGeneration` null even though a real tagged run is live.
+ *  Without this, superseding that accumulator would record nothing, and a late event from
+ *  the superseded run could then LOCK the replacement accumulator to the old generation. */
+const lastLiveGeneration = new Map<string, string>();
 /** Mark the CURRENT accumulator's run generation superseded before installing a
  *  replacement, so its in-flight late events can't bind/hijack the new accumulator. */
 function supersedeCurrentGeneration(convId: string): void {
-  const gen = streamAccumulators.get(convId)?.runGeneration;
-  if (!gen) return;
+  // Prefer the accumulator's locked generation; fall back to the last live generation seen
+  // for this conversation so an as-yet-unlocked (untagged-external) accumulator is still
+  // superseded. Both are recorded to cover the transition window.
+  const locked = streamAccumulators.get(convId)?.runGeneration;
+  const live = lastLiveGeneration.get(convId);
+  const gens = [locked, live].filter((g): g is string => !!g);
+  if (gens.length === 0) return;
   let set = supersededGenerations.get(convId);
   if (!set) supersededGenerations.set(convId, (set = new Set()));
-  set.add(gen);
-  if (set.size > 32) set.delete(set.values().next().value as string); // bound
+  for (const gen of gens) {
+    set.add(gen);
+    if (set.size > 32) set.delete(set.values().next().value as string); // bound
+  }
 }
 /** Conversations whose live accumulator is driven by an automation run (not an
  *  interactive send). Gates automation-specific behavior: background accumulation,
@@ -2673,6 +2688,11 @@ export function RuntimeProvider({
         if (supersededGenerations.get(convId)?.has(evGen) && e.type !== 'compaction') {
           return;
         }
+        // Record the generation of the run currently streaming into this conversation
+        // (compaction events belong to whatever run is active, so they count too). This is
+        // what lets supersedeCurrentGeneration blacklist a still-unlocked accumulator
+        // seeded by an untagged external user-message.
+        lastLiveGeneration.set(convId, evGen);
         if (acc.runGeneration == null) {
           if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
         } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
@@ -3915,7 +3935,10 @@ export function RuntimeProvider({
           );
         };
         durablyPersistThenLaunch(20);
-      } else {
+      } else if (ownsNew()) {
+        // No late compaction to durably persist. Still verify WE own the accumulator — a
+        // Stop (or a superseding turn) during the awaited turn-start persist may have
+        // deleted/replaced it; launching then would start a cancelled/superseded run.
         launchNew();
       }
     },
@@ -3982,6 +4005,9 @@ export function RuntimeProvider({
       console.info(
         `[UI:stream:reload] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} roles=${branch.map((m) => m.role).join(',')}`,
       );
+      // A Stop / superseding turn during the awaited persist may have replaced this
+      // accumulator (a superseded persist, not `rejected`); don't launch a cancelled run.
+      if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
       launchAgentStream(
         convId,
         branch,
@@ -4112,6 +4138,9 @@ export function RuntimeProvider({
       console.info(
         `[UI:stream:edit] Firing agent:stream conv=${convId} model=${selectedModelKey ?? 'default'} reasoning=${reasoningEffort ?? 'medium'} messageCount=${branch.length} sourceId=${message.sourceId ?? '(none)'}`,
       );
+      // Stop / superseding turn during the awaited persist may have replaced the
+      // accumulator (superseded, not rejected) — don't launch a cancelled run.
+      if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
       launchAgentStream(
         convId,
         branch,
@@ -4540,6 +4569,9 @@ export function RuntimeProvider({
         }
         return;
       }
+      // Stop / superseding turn during the awaited persist may have replaced the
+      // accumulator (superseded, not rejected) — don't launch a cancelled run.
+      if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
       launchAgentStream(
         convId,
         branch,
@@ -4621,6 +4653,9 @@ export function RuntimeProvider({
       }
       return;
     }
+    // Stop / superseding turn during the awaited persist may have replaced the accumulator
+    // (superseded, not rejected) — don't launch a cancelled run.
+    if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
     launchAgentStream(
       convId,
       branch,

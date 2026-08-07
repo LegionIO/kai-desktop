@@ -142,17 +142,29 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
     setLocalMaxCount(filter.messageCountMax);
   }, [filter.messageCountMin, filter.messageCountMax]);
 
-  // Debounce numeric inputs
+  // Debounce numeric inputs. Both bounds share one timer AND the delayed write merges
+  // into the LATEST filter (via filterRef), not the filter captured when the timer armed:
+  // - one timer for the whole range so entering min then max within 300ms doesn't cancel
+  //   the min write (previously only the last field survived);
+  // - merging the freshest numeric locals into the latest filter so a concurrent toggle
+  //   ("Has media") isn't undone by a stale `{ ...filter }` spread from the delayed callback.
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+  const localMinRef = useRef(localMinCount);
+  localMinRef.current = localMinCount;
+  const localMaxRef = useRef(localMaxCount);
+  localMaxRef.current = localMaxCount;
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const debouncedUpdate = useCallback(
-    (field: 'messageCountMin' | 'messageCountMax', value: number | null) => {
-      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = setTimeout(() => {
-        onFilterChange({ ...filter, [field]: value });
-      }, 300);
-    },
-    [filter, onFilterChange],
-  );
+  const scheduleRangeUpdate = useCallback(() => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      onFilterChange({
+        ...filterRef.current,
+        messageCountMin: localMinRef.current,
+        messageCountMax: localMaxRef.current,
+      });
+    }, 300);
+  }, [onFilterChange]);
 
   useEffect(() => {
     return () => {
@@ -222,11 +234,13 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
         max={localMaxCount}
         onMinChange={(v) => {
           setLocalMinCount(v);
-          debouncedUpdate('messageCountMin', v);
+          localMinRef.current = v;
+          scheduleRangeUpdate();
         }}
         onMaxChange={(v) => {
           setLocalMaxCount(v);
-          debouncedUpdate('messageCountMax', v);
+          localMaxRef.current = v;
+          scheduleRangeUpdate();
         }}
       />
 
