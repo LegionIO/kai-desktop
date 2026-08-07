@@ -116,6 +116,7 @@ type AppAPI = {
     get: (id: string) => Promise<unknown>;
     put: (conversation: unknown) => Promise<unknown>;
     delete: (id: string) => Promise<unknown>;
+    deleteMany: (ids: string[]) => Promise<{ ok: boolean; deleted?: number }>;
     clear: () => Promise<unknown>;
     getActiveId: () => Promise<string | null>;
     setActiveId: (id: string) => Promise<unknown>;

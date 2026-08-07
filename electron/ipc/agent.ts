@@ -1644,16 +1644,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         map.set(toolName, queue);
       };
 
-      const shiftByToolName = (map: Map<string, string[]>, toolName: string): string | null => {
-        const queue = map.get(toolName);
-        if (!queue || queue.length === 0) return null;
-        const value = queue.shift() ?? null;
-        if (queue.length === 0) {
-          map.delete(toolName);
-        }
-        return value;
-      };
-
       const queueOrBroadcastToolCompaction = (
         executeToolCallId: string,
         toolName: string,
@@ -1745,13 +1735,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       };
 
       const pairExecuteAndStreamToolCallIds = (toolName: string): string | null => {
-        const executeToolCallId = shiftByToolName(pendingExecIdsByToolName, toolName);
-        const streamToolCallId = shiftByToolName(pendingStreamIdsByToolName, toolName);
-        if (!executeToolCallId || !streamToolCallId) {
-          if (executeToolCallId) enqueueByToolName(pendingExecIdsByToolName, toolName, executeToolCallId);
-          if (streamToolCallId) enqueueByToolName(pendingStreamIdsByToolName, toolName, streamToolCallId);
+        const execQ = pendingExecIdsByToolName.get(toolName);
+        const streamQ = pendingStreamIdsByToolName.get(toolName);
+        if (!execQ || execQ.length === 0 || !streamQ || streamQ.length === 0) {
           return null;
         }
+        // Pair STRICTLY by id-identity: the execute wrapper reads the tool-call
+        // id from Mastra's execution context (top-level OR nested agent context),
+        // so execute and stream ids are the SAME id — the correct, order-
+        // independent, cross-wire-proof pairing is by id equality. We do NOT pair
+        // non-matching ids even when momentarily singleton: under parallel calls,
+        // exec(A) then stream(B) arriving before their counterparts would each be
+        // "singleton" and get wrongly cross-wired A↔B. A non-matching id waits for
+        // its identical counterpart.
+        const shared = execQ.find((id) => streamQ.includes(id));
+        if (shared === undefined) return null;
+        const executeToolCallId = shared;
+        const streamToolCallId = shared;
+        pendingExecIdsByToolName.set(
+          toolName,
+          execQ.filter((id) => id !== executeToolCallId),
+        );
+        pendingStreamIdsByToolName.set(
+          toolName,
+          streamQ.filter((id) => id !== streamToolCallId),
+        );
+        if (pendingExecIdsByToolName.get(toolName)?.length === 0) pendingExecIdsByToolName.delete(toolName);
+        if (pendingStreamIdsByToolName.get(toolName)?.length === 0) pendingStreamIdsByToolName.delete(toolName);
 
         streamToolCallIdByExecId.set(executeToolCallId, streamToolCallId);
         execToolCallIdByStreamId.set(streamToolCallId, executeToolCallId);
@@ -1762,6 +1772,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           streamToolCallId,
         });
         flushPendingToolCompaction(executeToolCallId);
+        // Drain any OTHER already-matchable shared ids now, so a pair that became
+        // unambiguous doesn't linger unpaired until some future event happens to
+        // re-invoke this function (or never does). Each is a definitive identity
+        // match; pairing them here is safe and order-independent.
+        for (;;) {
+          const nextExecQ = pendingExecIdsByToolName.get(toolName);
+          const nextStreamQ = pendingStreamIdsByToolName.get(toolName);
+          if (!nextExecQ || !nextStreamQ) break;
+          const nextShared = nextExecQ.find((id) => nextStreamQ.includes(id));
+          if (nextShared === undefined) break;
+          pendingExecIdsByToolName.set(toolName, nextExecQ.filter((id) => id !== nextShared));
+          pendingStreamIdsByToolName.set(toolName, nextStreamQ.filter((id) => id !== nextShared));
+          if (pendingExecIdsByToolName.get(toolName)?.length === 0) pendingExecIdsByToolName.delete(toolName);
+          if (pendingStreamIdsByToolName.get(toolName)?.length === 0) pendingStreamIdsByToolName.delete(toolName);
+          streamToolCallIdByExecId.set(nextShared, nextShared);
+          execToolCallIdByStreamId.set(nextShared, nextShared);
+          flushPendingToolCompaction(nextShared);
+        }
         return executeToolCallId;
       };
 

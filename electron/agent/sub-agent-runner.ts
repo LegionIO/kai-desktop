@@ -30,9 +30,20 @@ export type SubAgentEvent =
       subAgentConversationId: string;
       parentConversationId: string;
       parentToolCallId: string;
+      // The sub-agent's own conversation id, mirrored here because the renderer's
+      // top-level stream listener reads `conversationId` on EVERY event (for its
+      // debug log / active-conversation check) before routing by
+      // subAgentConversationId. Omitting it made that read throw and drop the
+      // status transition. Always equals subAgentConversationId for these events.
+      conversationId: string;
       type: 'sub-agent-status';
-      status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed';
+      status: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed' | 'paused';
       summary?: string;
+      /** For `status: 'paused'`, WHY it paused — so the UI/persistence can tell an
+       *  agent that REQUESTED input ('awaiting-input') apart from a non-input pause
+       *  (turn-budget exhaustion, or concurrency-cap deferral). Absent for other
+       *  statuses. */
+      pausedReason?: 'awaiting-input' | 'turn-limit' | 'capacity';
     }
   | {
       subAgentConversationId: string;
@@ -68,6 +79,18 @@ export type SubAgentRunOptions = {
   abortSignal?: AbortSignal;
   /** Called between agent turns to check for pending follow-up messages. */
   getFollowUp: () => Promise<string | null>;
+  /** Non-destructively report whether a follow-up is currently queued (does NOT
+   *  consume). Used at the turn-budget boundary to distinguish "a follow-up is
+   *  waiting but no turn remains" (→ paused/resumable, leave it queued) from
+   *  "queue empty" (→ normal completion). */
+  peekFollowUp?: () => boolean;
+  /**
+   * Called the MOMENT the sub-agent runs its control tool, before the turn loop
+   * emits sub-agent-status. The caller forwards it to the parent turn's
+   * tool-progress so a watching parent observer sees a declared completion
+   * immediately and stops nudging.
+   */
+  onControlSignal?: (action: 'complete' | 'failed' | 'awaiting_response' | 'continue', message?: string) => void;
   /**
    * Called with the runner's final (gated + accumulated) message history so the
    * caller can persist SANITIZED history for resume — rather than rebuilding it
@@ -75,6 +98,33 @@ export type SubAgentRunOptions = {
    * hook is disabled) send the unredacted content to the model.
    */
   onFinalMessages?: (messages: Array<{ role: string; content: unknown }>) => void;
+  /**
+   * RESUME seeding. When present, the run starts from this ALREADY-GATED message
+   * history (persisted from a prior run) instead of building an initial task
+   * message from `task`/`context`. `resumeFollowUp` is the NEW user message to
+   * append and gate (only it is gated — the prior history is not re-gated). This
+   * routes a resume through the same hardened turn loop / terminal handling as an
+   * initial run, so the two share one lifecycle engine.
+   */
+  resumeMessages?: Array<{ role: string; content: unknown }>;
+  resumeFollowUp?: string;
+  /**
+   * RESUME seeding for the SYSTEM PROMPT. When present, the resumed run uses this
+   * ALREADY-GATED system prompt (persisted from the prior run) as its base rather
+   * than rebuilding from `config` — so a context-dependent guardrail a
+   * UserPromptSubmit hook applied on the original run is preserved across resume,
+   * instead of silently reverting to the ungated config prompt. The new follow-up
+   * is still gated (and may further modify the prompt).
+   */
+  resumeSystemPrompt?: string;
+  /** Called with the run's FINAL (gated) system prompt so the caller can persist
+   *  it for resume (paired with onFinalMessages). Reflects any UserPromptSubmit
+   *  hook modification. */
+  onFinalSystemPrompt?: (systemPrompt: string) => void;
+  /** When true, the caller already reserved a concurrency slot (reserveSubAgentSlot)
+   *  and owns releasing it — runSubAgent skips its own increment/decrement AND its
+   *  cap check. Used by resume to hold the slot across its awaited DB reopen. */
+  slotPreReserved?: boolean;
 };
 
 /** Global counter for enforcing maxConcurrent limit */
@@ -82,6 +132,17 @@ let activeSubAgentCount = 0;
 
 export function getActiveSubAgentCount(): number {
   return activeSubAgentCount;
+}
+
+/** Synchronously reserve a concurrency slot (used by resume, which must hold the
+ *  slot across its awaited DB reopen before runSubAgent starts — otherwise
+ *  concurrent resumes could all pass admission during that await). Paired with
+ *  releaseSubAgentSlot. runSubAgent skips its own inc/dec when slotPreReserved. */
+export function reserveSubAgentSlot(): void {
+  activeSubAgentCount++;
+}
+export function releaseSubAgentSlot(): void {
+  if (activeSubAgentCount > 0) activeSubAgentCount--;
 }
 
 function broadcastSubAgentEvent(event: SubAgentEvent): void {
@@ -98,7 +159,10 @@ type ControlSignal = {
 };
 
 /** Create the virtual control tool that the sub-agent uses to signal state */
-function createControlTool(signalRef: { current: ControlSignal | null }): ToolDefinition {
+function createControlTool(
+  signalRef: { current: ControlSignal | null },
+  onSignal?: (action: ControlSignal['action'], message?: string) => void,
+): ToolDefinition {
   return {
     name: 'sub_agent_control',
     description: [
@@ -118,7 +182,14 @@ function createControlTool(signalRef: { current: ControlSignal | null }): ToolDe
     }),
     execute: async (input: unknown, _ctx: ToolExecutionContext): Promise<unknown> => {
       const { action, message } = input as { action: string; message?: string };
-      signalRef.current = { action: action as ControlSignal['action'], message };
+      const typedAction = action as ControlSignal['action'];
+      signalRef.current = { action: typedAction, message };
+      // Surface the signal IMMEDIATELY (at control-tool execute time), so a
+      // watching parent observer sees a complete/failed declaration the moment it
+      // happens — before the turn loop later emits sub-agent-status — and stops
+      // nudging in that window. Observer-only; no lifecycle status is published
+      // here (the turn loop owns that after follow-up arbitration).
+      onSignal?.(typedAction, message);
       return { acknowledged: true, action, message: message ?? '' };
     },
   };
@@ -194,11 +265,22 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     dbPath,
     abortSignal,
     getFollowUp,
+    peekFollowUp,
+    onControlSignal,
     onFinalMessages,
+    resumeMessages,
+    resumeFollowUp,
+    resumeSystemPrompt,
+    onFinalSystemPrompt,
+    slotPreReserved,
   } = opts;
 
+  const isResume = Array.isArray(resumeMessages);
   const maxConcurrent = config.tools?.subAgents?.maxConcurrent ?? 4;
-  if (activeSubAgentCount >= maxConcurrent) {
+  // When the caller pre-reserved a slot (resume), it already performed admission
+  // synchronously and owns the slot — skip both the cap check AND the inc/dec
+  // here. Otherwise (initial run) enforce the cap and manage the counter.
+  if (!slotPreReserved && activeSubAgentCount >= maxConcurrent) {
     yield {
       subAgentConversationId,
       parentConversationId,
@@ -217,20 +299,43 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     return;
   }
 
-  activeSubAgentCount++;
+  if (!slotPreReserved) activeSubAgentCount++;
+
+  // Declared in the FUNCTION scope (not the try) so the finally can dispose it on
+  // ANY exit — throw, early generator-return, or normal completion — without the
+  // "not defined in finally" scope error.
+  let subObserver: ToolObserverManager | null = null;
+  // Latest GATED message history + system prompt, tracked in function scope so the
+  // finally can surface them to the caller even when the run throws AFTER the
+  // prompt was gated/broadcast but BEFORE the normal onFinalMessages call. Without
+  // this, an early throw (e.g. workspace/model setup) would leave the caller with
+  // no gated snapshot, dropping the visible follow-up from resume context.
+  let latestGatedMessages: Array<{ role: string; content: unknown }> | null = null;
+  let latestGatedSystemPrompt: string | undefined;
+  let finalMessagesEmitted = false;
 
   try {
-    const basePrompt = config.systemPrompts?.chat?.trim() || config.systemPrompt;
-    const systemPrompt = buildSubAgentSystemPrompt(basePrompt, depth);
-    const messages: Array<{ role: string; content: unknown }> = [
-      { role: 'user', content: buildSubAgentTaskMessage(task, context) },
-    ];
+    // Resume: reuse the persisted, ALREADY-GATED+built system prompt verbatim so
+    // a hook's context-dependent guardrail survives (do NOT re-wrap or rebuild
+    // from config, which would revert it). Initial run: build from config.
+    const systemPrompt =
+      isResume && typeof resumeSystemPrompt === 'string'
+        ? resumeSystemPrompt
+        : buildSubAgentSystemPrompt(config.systemPrompts?.chat?.trim() || config.systemPrompt, depth);
+    // Initial run: seed with the task message (gated below). Resume: start from
+    // the persisted ALREADY-GATED history and append the new follow-up, which is
+    // the only message gated (see gateUserPrompt scoping).
+    const messages: Array<{ role: string; content: unknown }> = isResume
+      ? [...(resumeMessages ?? []), { role: 'user', content: resumeFollowUp ?? '' }]
+      : [{ role: 'user', content: buildSubAgentTaskMessage(task, context) }];
 
     let subAgentConfig: AppConfig = { ...config, systemPrompt };
 
     // Control signal shared with the control tool
     const controlSignal: { current: ControlSignal | null } = { current: null };
-    const controlTool = createControlTool(controlSignal);
+    const controlTool = createControlTool(controlSignal, (action, message) => {
+      onControlSignal?.(action, message);
+    });
 
     // Inject the control tool into the sub-agent's toolset
     const allTools = [...tools.filter((t) => t.name !== 'sub_agent_control'), controlTool];
@@ -242,16 +347,19 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // Emit initial status
     const emitStatus = (
       _status: never,
-      st: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed',
+      st: 'running' | 'awaiting-input' | 'completed' | 'stopped' | 'failed' | 'paused',
       summary?: string,
+      pausedReason?: 'awaiting-input' | 'turn-limit' | 'capacity',
     ) => {
       const evt: SubAgentEvent = {
         subAgentConversationId,
         parentConversationId,
         parentToolCallId,
+        conversationId: subAgentConversationId,
         type: 'sub-agent-status',
         status: st,
         summary,
+        ...(pausedReason ? { pausedReason } : {}),
       };
       broadcastSubAgentEvent(evt);
       return evt;
@@ -266,10 +374,61 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // task to clients, so a DLP block/modify hook can deny/redact it and the raw
     // task never reaches the renderer/web. Enforcement-only (suppressObserve) so
     // a sub-agent turn doesn't re-fire the parent's UserPromptSubmit automations.
-    // Returns false when the run should stop (denied). On modify, `messages` and
-    // subAgentConfig.systemPrompt are rewritten in place.
-    const gateUserPrompt = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
-      if (!hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) return { ok: true };
+    //
+    // The hook sees the FULL model-bound history every turn — because that whole
+    // history is what gets retransmitted to the model, so a context-dependent or
+    // newly-enabled DLP hook MUST be able to block/redact ANY of it (not just the
+    // newly-appended message). `gateFromIdx` is used only to pick which message's
+    // display text to broadcast (the just-appended one) — NOT to scope the gate.
+    const newMessagesStartIdx = isResume ? messages.length - 1 : 0;
+    // Identify the NEWLY-submitted user turn for DISPLAY robustly across ANY trusted
+    // UserPromptSubmit hook transform. Two independent signals, so a hook that
+    // returns a fresh `messages` array (documented to preserve only role/content,
+    // dropping our marker) still resolves:
+    //  1. An enumerable marker on the new-turn object — survives pass-through,
+    //     spreads, and JSON round-trips; unambiguous when present.
+    //  2. POSITION fallback tracked OUTSIDE the hook payload: the caller passes the
+    //     new turn's index; if the gated array is the SAME LENGTH (a pure redaction
+    //     preserves order and count), the new turn is at that same index. If the
+    //     length changed (the hook added/removed messages) we can't safely locate
+    //     it, so display nothing rather than risk showing an unrelated turn.
+    // The marker is stripped from every message after reading, so it never reaches
+    // the model or persisted history.
+    const NEW_TURN_MARKER = '__kaiNewTurn';
+    type Marked = { role: string; content: unknown; [NEW_TURN_MARKER]?: boolean };
+    const clearMarkers = (): void => {
+      for (const m of messages as Marked[]) {
+        if (m && NEW_TURN_MARKER in m) delete m[NEW_TURN_MARKER];
+      }
+    };
+    const markNewTurn = (msg: { role: string; content: unknown }): void => {
+      // Clear any prior turn's marker first — only the NEWEST turn carries it.
+      clearMarkers();
+      (msg as Marked)[NEW_TURN_MARKER] = true;
+    };
+    const gateUserPrompt = async (
+      newTurnIndex: number,
+    ): Promise<{ ok: true; displayText: string } | { ok: false; reason: string }> => {
+      const preGateLength = messages.length;
+      // The marked message's gated content is the display text; else, if the hook
+      // returned a same-length (order-preserving) array, the new turn is at its
+      // original index; else empty (hook restructured — can't safely identify it).
+      const displayFrom = (): string => {
+        const marked = (messages as Marked[]).find((m) => m?.[NEW_TURN_MARKER]);
+        if (marked) return sanitizedMessageDisplayText(marked.content);
+        if (messages.length === preGateLength && newTurnIndex >= 0 && newTurnIndex < messages.length) {
+          return sanitizedMessageDisplayText(messages[newTurnIndex]?.content);
+        }
+        return '';
+      };
+      if (!hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit')) {
+        const text = displayFrom();
+        clearMarkers(); // never let the marker reach the model / persistence
+        return { ok: true, displayText: text };
+      }
+      // Send the COMPLETE message history for enforcement. A denial blocks the
+      // whole turn; a modify replaces the ENTIRE array with the returned (redacted)
+      // messages, so redactions to historical content take effect before streaming.
       const gate = await hookDispatcher.dispatch(
         'UserPromptSubmit',
         {
@@ -278,49 +437,67 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           messages,
           systemPrompt: subAgentConfig.systemPrompt,
           modelKey: modelConfig.modelName,
-          purpose: 'sub-agent',
+          purpose: isResume ? 'sub-agent-resume' : 'sub-agent',
         },
         { suppressObserve: true },
       );
-      if (gate.denied) return { ok: false, reason: gate.reason ?? 'Blocked by a UserPromptSubmit hook.' };
+      if (gate.denied) {
+        clearMarkers(); // don't leave the marker on the (to-be-rolled-back) messages
+        return { ok: false, reason: gate.reason ?? 'Blocked by a UserPromptSubmit hook.' };
+      }
       const gated = gate.payload as { messages?: unknown[]; systemPrompt?: string };
       if (Array.isArray(gated?.messages)) {
+        // Replace the WHOLE history with the gated (possibly redacted) version so
+        // the model receives exactly what the hook approved.
         messages.length = 0;
         messages.push(...(gated.messages as Array<{ role: string; content: unknown }>));
       }
       if (typeof gated?.systemPrompt === 'string') {
         subAgentConfig = { ...subAgentConfig, systemPrompt: gated.systemPrompt };
       }
-      return { ok: true };
+      // Read the new-turn's gated display text, THEN strip the marker from every
+      // message so it never reaches the model or persisted history.
+      const text = displayFrom();
+      clearMarkers();
+      return { ok: true, displayText: text };
     };
 
-    const initialGate = await gateUserPrompt();
+    // Mark the newly-submitted turn (the task for an initial run, or the appended
+    // follow-up for a resume) so its gated text can be found for display; also pass
+    // its index as the position fallback (used if a hook drops the marker).
+    const initialNewTurn = messages[newMessagesStartIdx];
+    if (initialNewTurn) markNewTurn(initialNewTurn);
+    const initialGate = await gateUserPrompt(newMessagesStartIdx);
     if (!initialGate.ok) {
       yield emitStatus(undefined as never, 'failed', initialGate.reason);
       return;
     }
+    // Capture the gated snapshot NOW so an early throw after this point (e.g. in
+    // model/workspace setup) still surfaces the gated prompt to the caller via the
+    // finally — the visible follow-up isn't dropped from resume context.
+    latestGatedMessages = [...messages];
+    latestGatedSystemPrompt = subAgentConfig.systemPrompt;
 
-    // Broadcast the (possibly sanitized) task text — read from the gated first
-    // user message so a DLP redaction is reflected in what clients see, rather
-    // than the raw `task`.
-    const gatedTaskText = sanitizedMessageDisplayText(messages[0]?.content);
+    // Display text of the newly-gated prompt (empty if a DLP hook removed it),
+    // returned by the gate so we never re-read prior gated history.
+    const gatedPromptText = initialGate.displayText;
 
-    // Emit initial task as user message
+    // Emit the prompt as a user message — sourced as the task (initial) or a
+    // user follow-up (resume).
     const taskMsgEvent: SubAgentEvent = {
       subAgentConversationId,
       parentConversationId,
       parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'sub-agent-user-message',
-      text: gatedTaskText,
-      source: 'task',
+      text: gatedPromptText,
+      source: isResume ? 'user' : 'task',
     };
     yield taskMsgEvent;
     broadcastSubAgentEvent(taskMsgEvent);
 
     // Create observer for the sub-agent's tool executions
     const observerConfig = resolveToolObserverConfig(config);
-    let subObserver: ToolObserverManager | null = null;
     const toolCancels = new Map<string, () => void>();
     // Suppress raw tool-call args in the sub-agent stream until PreToolUse
     // resolves, matching the main-agent path, so a DLP block/modify hook can't
@@ -354,8 +531,14 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       source: 'user' | 'parent' | 'task' = 'parent',
     ): Promise<{ event: SubAgentEvent } | { deniedReason: string }> => {
       const beforeFollowUp = [...messages];
-      messages.push({ role: 'user', content: text });
-      const gate = await gateUserPrompt();
+      // Append + mark the new follow-up so the display logic can find its gated
+      // text directly (surviving a modify hook that reorders/redacts history).
+      const newTurn = { role: 'user', content: text };
+      markNewTurn(newTurn);
+      messages.push(newTurn);
+      const newTurnIndex = messages.length - 1;
+      // Gate the full history (the hook enforces on everything the model will see).
+      const gate = await gateUserPrompt(newTurnIndex);
       if (!gate.ok) {
         // Roll the raw denied follow-up back out so it isn't surfaced via
         // onFinalMessages / persisted for resume. Return the reason so the caller
@@ -366,9 +549,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         messages.push(...beforeFollowUp);
         return { deniedReason: gate.reason };
       }
-      // Broadcast the (possibly sanitized) text from the gated last message.
-      const last = messages[messages.length - 1];
-      const gatedText = sanitizedMessageDisplayText(last?.content);
+      // Broadcast the gated display text (empty if the hook removed the message).
+      const gatedText = gate.displayText;
       const evt: SubAgentEvent = {
         subAgentConversationId,
         parentConversationId,
@@ -379,8 +561,58 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         source,
       };
       broadcastSubAgentEvent(evt);
+      // Refresh the gated snapshot so a later throw surfaces this follow-up too.
+      latestGatedMessages = [...messages];
+      latestGatedSystemPrompt = subAgentConfig.systemPrompt;
       return { event: evt };
     };
+
+    // Whether another agent turn is available. `turnCount` has already been
+    // incremented for the CURRENT turn when the branches below run, so a next
+    // turn exists iff turnCount < maxTurns.
+    const hasTurnForFollowUp = (): boolean => turnCount < maxTurns;
+
+    // Consume + gate a follow-up for processing in another turn. Returns a
+    // discriminated outcome the caller yields/acts on:
+    //  - 'none'       : no follow-up was pending.
+    //  - 'no-turn'    : a follow-up was pending but NO turn remains to process it.
+    //                   The caller surfaces a CONTENT-FREE terminal failure (the
+    //                   raw text is NOT returned — it never passed the DLP
+    //                   UserPromptSubmit gate, so it must not be interpolated into
+    //                   a broadcast status). Resurrecting it via resume is racy
+    //                   (see the removed drain); the honest outcome is an explicit
+    //                   failure that a follow-up went unprocessed.
+    //  - 'denied'     : the follow-up was denied by a hook (already rolled back).
+    //  - 'processing' : consumed + gated; caller yields `event` then re-loops.
+    const consumeFollowUpForNextTurn = async (): Promise<
+      | { kind: 'none' }
+      | { kind: 'no-turn' }
+      | { kind: 'denied'; reason: string }
+      | { kind: 'processing'; event: SubAgentEvent }
+    > => {
+      // Check the turn budget BEFORE consuming: getFollowUp() is destructive
+      // (shifts the queue), so if no turn remains we must NOT consume — a queued
+      // message stays queued so it survives to resume rather than being
+      // acknowledged-then-discarded. Distinguish (via non-destructive peek) an
+      // actually-queued follow-up ('no-turn' → paused) from an empty queue
+      // ('none' → the caller finalizes normally, e.g. a clean final-turn answer
+      // must NOT be misclassified as paused).
+      if (!hasTurnForFollowUp()) {
+        return peekFollowUp?.() ? { kind: 'no-turn' } : { kind: 'none' };
+      }
+      const followUp = await getFollowUp();
+      if (followUp === null) return { kind: 'none' };
+      const fu = await addFollowUpMessage(followUp);
+      if ('deniedReason' in fu) return { kind: 'denied', reason: fu.deniedReason };
+      return { kind: 'processing', event: fu.event };
+    };
+
+    // Explicit terminal outcome, set by whichever branch reaches a real terminal
+    // state. `completed`/`failed` are final; `awaiting-timeout` is PAUSED —
+    // terminal-but-resumable (awaiting-input timeout, or maxTurns reached
+    // mid-work). Left null until a branch sets it; a null at loop exit (maxTurns
+    // hit while `continue`-ing) is finalized as paused/resumable below.
+    let terminalOutcome: 'completed' | 'failed' | 'awaiting-timeout' | null = null;
 
     while (turnCount < maxTurns) {
       if (abortSignal?.aborted) break;
@@ -391,6 +623,9 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       // addFollowUpMessage before it's added/broadcast. So no per-turn gate here.
 
       let turnText = '';
+      // Set if the model stream emits an `error` event this turn — a terminal
+      // failure that must NOT fall through to a `completed` classification.
+      let turnError: string | null = null;
 
       // Create/re-create observer each turn with updated context
       subObserver?.dispose();
@@ -646,6 +881,10 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       for await (const event of stream) {
         if (event.type === 'text-delta' && event.text) {
           turnText += event.text;
+        } else if (event.type === 'error') {
+          // Model/stream error this turn — terminal failure. Capture the reason;
+          // handled after the loop so it can't be classified as `completed`.
+          turnError = ('error' in event && event.error ? String(event.error) : '') || 'Sub-agent stream error.';
         } else if (event.type === 'model-fallback') {
           // A mid-stream fallback restarts the response on the next model. Drop
           // this turn's accumulated partial text so the persisted assistant
@@ -714,34 +953,69 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
       if (abortSignal?.aborted) break;
 
+      // A stream error this turn is terminal — fail explicitly rather than
+      // falling through to signal arbitration (which could reach the no-signal
+      // `completed` branch or start another turn).
+      if (turnError) {
+        terminalOutcome = 'failed';
+        yield emitStatus(undefined as never, 'failed', turnError);
+        break;
+      }
+
       // Check what the sub-agent signaled via the control tool
       const signal = controlSignal.current as ControlSignal | null;
 
       if (signal?.action === 'complete' || signal?.action === 'failed') {
-        // Before finalizing, check if a message arrived during this turn
-        const pendingFollowUp = await getFollowUp();
-        if (pendingFollowUp) {
-          const fu = await addFollowUpMessage(pendingFollowUp);
-          if ('deniedReason' in fu) {
-            yield emitStatus(undefined as never, 'failed', fu.deniedReason);
-            break;
-          }
-          yield fu.event;
+        // The sub-agent DECLARED completion. If a turn remains, drain a pending
+        // follow-up ("one more thing") into another turn. If no turn remains,
+        // FINALIZE with the declared status — any still-queued follow-up is left
+        // in the queue (not destructively consumed) and survives to the resume
+        // path (a completed run is resumable). This is the sub-agent's own
+        // declared outcome, not a turn-limit failure.
+        const outcome = await consumeFollowUpForNextTurn();
+        if (outcome.kind === 'denied') {
+          terminalOutcome = 'failed';
+          yield emitStatus(undefined as never, 'failed', outcome.reason);
+          break;
+        }
+        if (outcome.kind === 'processing') {
+          yield outcome.event;
           yield emitStatus(undefined as never, 'running', 'Processing follow-up');
           continue;
         }
+        // 'none' or 'no-turn' → finalize with the declared status.
         const finalSt = signal.action === 'complete' ? ('completed' as const) : ('failed' as const);
+        terminalOutcome = finalSt;
         yield emitStatus(undefined as never, finalSt, signal.message ?? fullResponseText.slice(0, 500));
         break;
       }
       if (signal?.action === 'awaiting_response') {
         yield emitStatus(undefined as never, 'awaiting-input', signal.message ?? 'Waiting for input');
 
+        // Only wait for input if a turn remains to process it. If the turn budget
+        // is exhausted while awaiting input, the sub-agent is PAUSED (resumable) —
+        // emit `paused`, not a hard failure, so a later user response can resume.
+        if (!hasTurnForFollowUp()) {
+          terminalOutcome = 'awaiting-timeout';
+          yield emitStatus(undefined as never, 'paused', 'Paused — awaiting a response.', 'awaiting-input');
+          break;
+        }
         const followUp = await waitForFollowUp(getFollowUp, abortSignal, 300000);
-        if (!followUp || abortSignal?.aborted) break;
+        if (abortSignal?.aborted) break; // aborted → classified 'stopped' below
+        if (!followUp) {
+          // Timed out waiting for input. This is NOT a failure — the sub-agent is
+          // legitimately PAUSED awaiting a response the user may still provide via
+          // the composer. Emit the terminal 'paused' status (resumable; the
+          // wrapper persists resumable state and the observer latches on it so it
+          // won't nudge/resume the paused agent during teardown).
+          terminalOutcome = 'awaiting-timeout';
+          yield emitStatus(undefined as never, 'paused', 'Paused — awaiting a response.', 'awaiting-input');
+          break;
+        }
 
         const fu = await addFollowUpMessage(followUp);
         if ('deniedReason' in fu) {
+          terminalOutcome = 'failed';
           yield emitStatus(undefined as never, 'failed', fu.deniedReason);
           break;
         }
@@ -750,25 +1024,46 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         continue;
       }
 
-      // signal === 'continue' or no signal — check for opportunistic follow-ups
-      const followUp = await getFollowUp();
-      if (followUp) {
-        const fu = await addFollowUpMessage(followUp);
-        if ('deniedReason' in fu) {
-          yield emitStatus(undefined as never, 'failed', fu.deniedReason);
+      // signal === 'continue' or no signal — check for opportunistic follow-ups.
+      {
+        const outcome = await consumeFollowUpForNextTurn();
+        if (outcome.kind === 'denied') {
+          terminalOutcome = 'failed';
+          yield emitStatus(undefined as never, 'failed', outcome.reason);
           break;
         }
-        yield fu.event;
-        yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
-        continue;
+        if (outcome.kind === 'processing') {
+          yield outcome.event;
+          yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
+          continue;
+        }
+        if (outcome.kind === 'no-turn') {
+          // Turn budget exhausted while the sub-agent was still working (or had a
+          // queued follow-up). Terminal-but-RESUMABLE: emit `paused` (not a hard
+          // failure) so resumable state is persisted and any queued follow-up —
+          // left intact, never destructively consumed — survives to the resume
+          // path. The user can continue the sub-agent from where it stopped.
+          terminalOutcome = 'awaiting-timeout';
+          yield emitStatus(
+            undefined as never,
+            'paused',
+            `Paused — reached the turn limit (${maxTurns}).`,
+            'turn-limit',
+          );
+          break;
+        }
       }
 
-      // No control signal and no follow-up — brief window then auto-complete
+      // No control signal and no follow-up — brief window then auto-complete.
       if (!signal) {
-        const lateFollowUp = await waitForFollowUp(getFollowUp, abortSignal, 5000);
+        // Only wait if a turn remains to process anything that arrives.
+        const lateFollowUp = hasTurnForFollowUp()
+          ? await waitForFollowUp(getFollowUp, abortSignal, 5000)
+          : null;
         if (lateFollowUp) {
           const fu = await addFollowUpMessage(lateFollowUp);
           if ('deniedReason' in fu) {
+            terminalOutcome = 'failed';
             yield emitStatus(undefined as never, 'failed', fu.deniedReason);
             break;
           }
@@ -776,33 +1071,66 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           yield emitStatus(undefined as never, 'running', `Processing follow-up (turn ${turnCount + 1})`);
           continue;
         }
+        // No signal and nothing pending: the sub-agent produced its turn without
+        // signaling continue/complete — treat as a normal completion.
+        terminalOutcome = 'completed';
         yield emitStatus(undefined as never, 'completed', fullResponseText.slice(0, 500));
         break;
       }
 
-      // signal === 'continue' — keep going
+      // signal === 'continue' — keep going (loop re-evaluates turnCount<maxTurns).
       yield emitStatus(undefined as never, 'running', `Continuing (turn ${turnCount + 1})`);
     }
 
-    const finalStatus = abortSignal?.aborted
-      ? 'stopped'
-      : controlSignal.current?.action === 'failed'
-        ? 'failed'
-        : 'completed';
-    if (finalStatus !== 'completed' && finalStatus !== 'failed') {
-      yield emitStatus(undefined as never, finalStatus as 'stopped', fullResponseText.slice(0, 500));
+    // Finalize. Branches that reached a real terminal state already emitted their
+    // status and broke. The one remaining case is the loop hitting maxTurns while
+    // the sub-agent was still `continue`-ing (terminalOutcome === null, no abort):
+    // that is PAUSED (resumable) — the sub-agent ran out of turns mid-work and can
+    // be resumed — NOT a hard failure.
+    if (abortSignal?.aborted) {
+      // Aborted (parent stop or observer cancel): emit the terminal `stopped`
+      // status so renderer/web clients mark the child stopped (not left running/
+      // awaiting) and the observer latches. The wrapper independently returns a
+      // stopped result from localController.signal.
+      yield emitStatus(undefined as never, 'stopped', fullResponseText.slice(0, 500));
+    } else if (terminalOutcome === null) {
+      terminalOutcome = 'awaiting-timeout';
+      yield emitStatus(
+        undefined as never,
+        'paused',
+        `Paused — reached the turn limit (${maxTurns}).`,
+        'turn-limit',
+      );
     }
 
-    // Hand the caller the final GATED message history so it can persist
-    // sanitized resume state (never the raw task/context).
-    onFinalMessages?.([...messages]);
-
-    // Dispose observer before exiting (inside try to avoid bundler scope issue with finally)
+    // Refresh the final GATED snapshot (message history + system prompt). The
+    // actual onFinalMessages/onFinalSystemPrompt emit happens in the finally so it
+    // ALSO fires when the run throws — surfacing whatever was gated so far (the
+    // visible follow-up) rather than nothing.
+    latestGatedMessages = [...messages];
+    latestGatedSystemPrompt = subAgentConfig.systemPrompt ?? systemPrompt;
+  } finally {
+    // Dispose the observer HERE (not only on the normal path) so a throw — or the
+    // consumer breaking out of the generator early — can't leave the observer's
+    // evaluation timer / in-flight model request running against a finished run.
+    // dispose() is idempotent. `subObserver` is declared in the enclosing scope,
+    // so it's visible here regardless of how the try exited.
     subObserver?.dispose();
     subObserver = null;
-  } finally {
-    // subObserver already disposed above; only decrement counter here
-    activeSubAgentCount--;
+    // Hand the caller the final GATED message history + system prompt so it can
+    // persist sanitized resume state (never the raw task/context). Emitted HERE so
+    // an early throw still surfaces the gated-so-far snapshot (the visible
+    // follow-up); guarded to emit at most once. Only emit if we actually gated
+    // something (latestGatedMessages set after the initial gate) — a pre-gate
+    // throw (e.g. cap rejection) legitimately has no gated history.
+    if (!finalMessagesEmitted && latestGatedMessages !== null) {
+      finalMessagesEmitted = true;
+      onFinalMessages?.([...latestGatedMessages]);
+      if (latestGatedSystemPrompt !== undefined) onFinalSystemPrompt?.(latestGatedSystemPrompt);
+    }
+    // Only decrement the counter here. Skip when the slot was pre-reserved — the
+    // caller (resume) owns releasing it.
+    if (!slotPreReserved) activeSubAgentCount--;
   }
 }
 

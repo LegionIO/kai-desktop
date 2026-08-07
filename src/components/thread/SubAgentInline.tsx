@@ -14,6 +14,7 @@ import {
   InfoIcon,
 } from 'lucide-react';
 import { useSubAgents, type SubAgentThreadState } from '@/providers/RuntimeProvider';
+import { app } from '@/lib/ipc-client';
 import { MarkdownText } from './MarkdownText';
 import { ToolCallDisplay } from './ToolGroup';
 import { RichChatInput } from './RichChatInput';
@@ -36,6 +37,7 @@ type SubAgentInlineProps = {
 export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, result, isError, liveOutput }) => {
   const [expanded, setExpanded] = useState(true);
   const [messageInput, setMessageInput] = useState('');
+  const [sendError, setSendError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const { threads, sendMessage, stop, navigateTo } = useSubAgents();
 
@@ -46,15 +48,72 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
   const contextArg = taskArgs?.context;
 
   const resultData = result as { subAgentConversationId?: string; response?: string; status?: string; toolsUsed?: string[] } | undefined;
-  const subAgentId = resultData?.subAgentConversationId
-    ?? liveOutput?.subAgentConversationId
-    ?? findSubAgentByToolCall(threads, toolCallId);
+  // Resolve the child id from TRUSTED sources first: the backend-bound liveOutput
+  // (set onto THIS tool-call's progress), then the renderer's tool-call→child
+  // binding. Only fall back to the tool RESULT content last — a result is
+  // tool-produced, so for an unknown-named call promoted via liveOutput, honoring
+  // result.subAgentConversationId could bind this card (navigate/message/stop) to
+  // an UNRELATED child id an arbitrary tool emitted. Trusted sources win.
+  const subAgentId = liveOutput?.subAgentConversationId
+    ?? findSubAgentByToolCall(threads, toolCallId)
+    ?? resultData?.subAgentConversationId;
   const thread = subAgentId ? threads.get(subAgentId) : null;
 
   const hasResult = result !== undefined;
-  const isRunning = !hasResult && (thread?.status === 'running' || thread?.status === 'awaiting-input');
-  const isStopped = resultData?.status === 'stopped' || thread?.status === 'stopped';
-  const hasError = isError || resultData?.status === 'error' || thread?.status === 'error';
+  // Live thread status is AUTHORITATIVE when a thread exists — the initial tool
+  // `result` is frozen at first completion and would otherwise force "Completed"
+  // forever, hiding a later resume's running/paused/failed state. Fall back to
+  // the result status only when there is no live thread.
+  const liveStatus = thread?.status;
+  const effectiveStatus = liveStatus ?? resultData?.status;
+  const isRunning = effectiveStatus === 'running';
+  // 'awaiting-input' = actively waiting for input (a LIVE run, still stoppable).
+  // 'paused' = terminal-but-resumable. A pause can mean the agent REQUESTED input
+  // (pausedReason 'awaiting-input') OR it exhausted its turn budget / was deferred
+  // by a capacity cap (turn-limit / capacity) — the latter did NOT ask for input,
+  // so the card must not claim "Awaiting input" for it.
+  const isActivelyAwaiting = effectiveStatus === 'awaiting-input';
+  const isPaused = effectiveStatus === 'paused';
+  const pausedReason = thread?.pausedReason;
+  // Treat as "awaiting input" (label) only when the agent actually requested it:
+  // a live awaiting-input, or a pause whose reason is awaiting-input.
+  const awaitingInput = isActivelyAwaiting || (isPaused && pausedReason === 'awaiting-input');
+  // The composer is offered for ANY resumable state (running / awaiting / paused).
+  const isResumable = isActivelyAwaiting || isPaused;
+  // A live, still-running (stoppable) sub-agent: running or actively awaiting
+  // input — but NOT a terminal paused/completed/failed/stopped.
+  const isActive = isRunning || isActivelyAwaiting;
+  const isStopped = effectiveStatus === 'stopped';
+  // Whether the frozen parent tool-call `result`/`isError` is still CURRENT. It is
+  // stale once the thread moved past that result — an actively-live run (running /
+  // awaiting-input), a thread that was RESUMED (hasResumed), OR a CAPACITY pause: a
+  // capacity pause means the user's follow-up was ACCEPTED + queued (the backend
+  // goes straight to paused without a `running` event, so hasResumed stays false),
+  // so the frozen error is superseded — show the queued/paused state, not Error. A
+  // NON-resumed awaiting-input / turn-limit pause is NOT "moved past": e.g. an
+  // initial pause whose parent tool-result a PostToolUse hook blocked must still
+  // surface that current error.
+  const liveMovedPastResult =
+    liveStatus === 'running' ||
+    liveStatus === 'awaiting-input' ||
+    Boolean(thread?.hasResumed) ||
+    (isPaused && pausedReason === 'capacity');
+  const hasError =
+    // Explicit live error/failed status wins. A bare frozen isError prop applies
+    // only when the live thread has NOT moved past that result AND it isn't a
+    // stopped one (a stopped sub-agent result carries isError:true but should read
+    // as "Stopped"). Honored on a NON-resumed live `completed` thread so a
+    // PostToolUse-blocked completed result reads as an error, not green Completed;
+    // suppressed once a resume/retry has moved past the frozen error.
+    effectiveStatus === 'error' ||
+    effectiveStatus === 'failed' ||
+    (isError && !liveMovedPastResult && effectiveStatus !== 'stopped');
+  // "Completed" only when the effective status is a clean completion (or, with no
+  // status at all, a result is present) AND there is no current error — a live
+  // `completed` thread whose parent tool-result was policy-blocked reads as an
+  // error, not green Completed.
+  const isCompleted =
+    !hasError && (effectiveStatus === 'completed' || (effectiveStatus === undefined && hasResult));
 
   // Auto-scroll to bottom of inline thread
   useEffect(() => {
@@ -63,15 +122,60 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
     }
   }, [expanded, thread?.messages.length]);
 
+  // Diagnostic: record whether this card resolved its live sub-agent thread.
+  // Surfaced under the "agent" scope in the Diagnostics trace so parallel
+  // sub-agent card resolution can be inspected when tracing is enabled. Depend
+  // on the resolved id + a STABLE hasThread boolean (not the `thread` object,
+  // which RuntimeProvider replaces on every stream delta — depending on it would
+  // fire a renderer→main IPC per delta).
+  const hasThread = Boolean(thread);
+  const resolvedVia = liveOutput?.subAgentConversationId
+    ? 'liveOutput'
+    : findSubAgentByToolCall(threads, toolCallId)
+      ? 'byToolCall'
+      : resultData?.subAgentConversationId
+        ? 'result'
+        : 'unresolved';
+  useEffect(() => {
+    app.debug?.trace?.({
+      event: 'sub-agent.inline-resolve',
+      scope: 'agent',
+      fields: {
+        parentToolCallId: toolCallId,
+        resolvedSubAgentId: subAgentId ?? null,
+        via: resolvedVia,
+        hasThread,
+        threadCount: threads.size,
+      },
+    });
+  }, [toolCallId, subAgentId, hasThread, resolvedVia, threads.size]);
+
   const handleSendMessage = useCallback(async () => {
     if (!subAgentId || !messageInput.trim()) return;
-    await sendMessage(subAgentId, messageInput.trim());
-    setMessageInput('');
+    const text = messageInput.trim();
+    // Only clear the input if the backend ACCEPTED the message. It returns false
+    // when the sub-agent's live/resumable state is gone (e.g. after a main-process
+    // restart the persisted status is `paused` but in-memory state was cleared) —
+    // clearing then would silently discard the user's message. Keep it + surface
+    // an error so the user can retry (a re-run/re-open rehydrates state).
+    const ok = await sendMessage(subAgentId, text);
+    if (ok) {
+      setMessageInput('');
+      setSendError(null);
+    } else {
+      setSendError('This sub-agent is no longer resumable (its session ended). Start a new sub-agent to continue.');
+    }
   }, [subAgentId, messageInput, sendMessage]);
 
   const handleStop = useCallback(async () => {
     if (!subAgentId) return;
-    await stop(subAgentId);
+    const ok = await stop(subAgentId);
+    if (!ok) {
+      // Backend had no live/resumable state to stop (e.g. after a restart the
+      // in-memory state is gone though the persisted status is paused). Surface it
+      // rather than silently doing nothing.
+      setSendError('This sub-agent is no longer active (its session ended); nothing to stop.');
+    }
   }, [subAgentId, stop]);
 
   const handleNavigate = useCallback(() => {
@@ -79,10 +183,37 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
     navigateTo(subAgentId);
   }, [subAgentId, navigateTo]);
 
-  // Status display
-  const StatusIcon = hasError ? AlertCircleIcon : isStopped ? StopCircleIcon : hasResult ? CheckCircle2Icon : LoaderIcon;
-  const statusColor = hasError ? 'text-destructive' : isStopped ? 'text-orange-400' : hasResult ? 'text-green-500' : 'text-blue-400';
-  const statusLabel = hasError ? 'Error' : isStopped ? 'Stopped' : hasResult ? 'Completed' : thread?.status === 'awaiting-input' ? 'Awaiting input' : 'Running';
+  // Status display, derived from the authoritative flags above (live thread
+  // status wins over the frozen initial result).
+  const StatusIcon = hasError
+    ? AlertCircleIcon
+    : isStopped
+      ? StopCircleIcon
+      : isResumable
+        ? UserIcon
+        : isCompleted
+          ? CheckCircle2Icon
+          : LoaderIcon;
+  const statusColor = hasError
+    ? 'text-destructive'
+    : isStopped
+      ? 'text-orange-400'
+      : isResumable
+        ? 'text-amber-400'
+        : isCompleted
+          ? 'text-green-500'
+          : 'text-blue-400';
+  const statusLabel = hasError
+    ? 'Error'
+    : isStopped
+      ? 'Stopped'
+      : awaitingInput
+        ? 'Awaiting input'
+        : isPaused
+          ? 'Paused'
+          : isCompleted
+            ? 'Completed'
+            : 'Running';
 
   return (
     <div className="rounded-lg border-l-4 border-l-blue-500/60 border border-border bg-card text-sm overflow-hidden">
@@ -104,8 +235,12 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
         <StatusIcon className={`h-3.5 w-3.5 shrink-0 ${statusColor} ${isRunning ? 'animate-spin' : ''}`} />
         <span className={`text-[10px] shrink-0 ${statusColor}`}>{statusLabel}</span>
 
-        {isRunning && subAgentId && (
-          <button type="button" onClick={(e) => { e.stopPropagation(); handleStop(); }} className="p-1 rounded hover:bg-destructive/10 shrink-0" title="Stop">
+        {/* Stop/cancel: for a live active run, or a paused agent that still has a
+            LIVE thread (in-memory resumable state). A paused card reconstructed
+            only from the persisted tool result (no live thread — e.g. after an app
+            restart) has nothing the backend can stop, so we don't offer it. */}
+        {(isActive || (isPaused && Boolean(thread))) && subAgentId && (
+          <button type="button" onClick={(e) => { e.stopPropagation(); handleStop(); }} className="p-1 rounded hover:bg-destructive/10 shrink-0" title={isPaused && !isActive ? 'Cancel (stop resuming)' : 'Stop'}>
             <StopCircleIcon className="h-3.5 w-3.5 text-destructive" />
           </button>
         )}
@@ -182,8 +317,11 @@ export const SubAgentInline: FC<SubAgentInlineProps> = ({ toolCallId, args, resu
           </div>
 
           {/* Inline composer — visible when running or awaiting input */}
-          {(isRunning || thread?.status === 'awaiting-input') && subAgentId && (
+          {(isRunning || isResumable) && subAgentId && (
             <div className="border-t px-3 py-2">
+              {sendError && (
+                <div className="mb-1.5 text-[10px] text-destructive">{sendError}</div>
+              )}
               <div className="flex items-center gap-1.5 rounded-lg border bg-background px-2 py-1.5">
                 <RichChatInput
                   value={messageInput}

@@ -31,6 +31,7 @@ import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
 import { buildMastraPrepareStep, drainInjectConsumedMarkers, clearInjectConsumedMarkers } from './prepare-step-inject.js';
 import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -135,6 +136,8 @@ type JsonStandardSchemaInput = Parameters<typeof toJsonStandardSchema>[0];
 type MastraToolExecutionOptions = {
   toolCallId?: string;
   abortSignal?: AbortSignal;
+  // Mastra's AgentToolExecutionContext nests the tool-call id here.
+  agent?: { toolCallId?: string };
 };
 
 function sleep(ms: number): Promise<void> {
@@ -278,10 +281,19 @@ function toMastraTools(
       inputSchema: toMastraInputSchema(tool.inputSchema),
       execute: async (input, options) => {
         const mastraOptions = options as MastraToolExecutionOptions | undefined;
-        const toolCallId =
+        // Mastra's adapter can surface the tool-call id EITHER at the top level
+        // (AI-SDK ToolExecutionOptions.toolCallId) OR nested under `agent`
+        // (Mastra's AgentToolExecutionContext.toolCallId). Read both before
+        // synthesizing — otherwise the execute-side id would differ from the
+        // stream-side id for local tools, breaking exec↔stream pairing (hook arg
+        // rebroadcasts, compaction metadata, approvals, sub-agent progress).
+        const providedToolCallId =
           typeof mastraOptions?.toolCallId === 'string'
             ? mastraOptions.toolCallId
-            : `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            : typeof mastraOptions?.agent?.toolCallId === 'string'
+              ? mastraOptions.agent.toolCallId
+              : undefined;
+        const toolCallId = providedToolCallId ?? `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const localAbortController = new AbortController();
         const cancel = (): void => {
           if (!localAbortController.signal.aborted) {
@@ -913,8 +925,14 @@ function applyWorkspaceToolGuards(
     const originalExecute = candidate.execute.bind(tool);
     candidate.execute = async (input, context) => {
       const normalized = normalizeWorkspaceToolInput(toolName, input, cwd);
+      // Mastra surfaces the tool-call id EITHER at the top level OR nested under
+      // `agent` (AgentToolExecutionContext). Read BOTH before synthesizing —
+      // otherwise this execute-side id diverges from the stream-side id, leaving
+      // enforcing-hook cards stuck `{pending:true}` and dropping tool-compaction
+      // metadata (same divergence the toMastraTools wrapper guards against).
       const toolCallId =
         (context as { toolCallId?: string } | undefined)?.toolCallId ??
+        (context as { agent?: { toolCallId?: string } } | undefined)?.agent?.toolCallId ??
         `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
       // Local abort controller so observer/user cancellation can actually stop
@@ -1686,6 +1704,13 @@ async function* streamWithRealEvents(
             const toolCallId = (payload?.toolCallId as string) ?? `tc-${Date.now()}`;
             const toolName = (payload?.toolName as string) ?? 'unknown';
             const startedAt = new Date().toISOString();
+            traceDiagnostic({
+              scope: 'agent',
+              event: 'stream.tool-call',
+              conversationId,
+              toolName,
+              fields: { toolCallId, rawToolName: payload?.toolName ?? null },
+            });
             toolStartByCallId.set(toolCallId, { startedAt, toolName });
             yield {
               conversationId,

@@ -13,7 +13,10 @@ import {
   readAllConversations,
   writeConversation,
   deleteConversation,
+  deleteConversations,
   clearAllConversations,
+  reindexIfStale,
+  writeIndex,
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
@@ -99,6 +102,75 @@ describe('per-file read/write', () => {
     });
     expect(toIndexEntry(withTool).hasToolCalls).toBe(true);
     expect(toIndexEntry(makeConv('c3')).hasToolCalls).toBe(false);
+  });
+
+  it('derives hasComputerUse from computer_use* tool calls', () => {
+    const autopilot = makeConv('cu1', {
+      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+    });
+    const plainTool = makeConv('cu2', {
+      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'read_file' }] }],
+    });
+    expect(toIndexEntry(autopilot).hasComputerUse).toBe(true);
+    expect(toIndexEntry(plainTool).hasComputerUse).toBe(false);
+    expect(toIndexEntry(makeConv('cu3')).hasComputerUse).toBe(false);
+  });
+
+  it('derives hasMedia from image/file parts and _modelContent', () => {
+    const withImage = makeConv('m1', {
+      messages: [{ role: 'user', content: [{ type: 'image', image: 'data:...' }] }],
+    });
+    const withModelContent = makeConv('m2', {
+      messages: [{ role: 'tool', content: [{ type: 'tool-result', _modelContent: [{ type: 'image' }] }] }],
+    });
+    const textOnly = makeConv('m3', {
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    });
+    expect(toIndexEntry(withImage).hasMedia).toBe(true);
+    expect(toIndexEntry(withModelContent).hasMedia).toBe(true);
+    expect(toIndexEntry(textOnly).hasMedia).toBe(false);
+  });
+
+  it('deleteConversations batch-removes files + index entries and returns removed ids', () => {
+    writeConversation(appHome, makeConv('b1'));
+    writeConversation(appHome, makeConv('b2'));
+    writeConversation(appHome, makeConv('b3'));
+    const removed = deleteConversations(appHome, ['b1', 'b3', 'missing']);
+    expect(removed.sort()).toEqual(['b1', 'b3']);
+    expect(readConversation(appHome, 'b1')).toBeNull();
+    expect(readConversation(appHome, 'b3')).toBeNull();
+    expect(readConversation(appHome, 'b2')?.id).toBe('b2');
+    expect(Object.keys(readIndex(appHome).conversations)).toEqual(['b2']);
+  });
+
+  it('deleteConversations clears activeConversationId when the active chat is deleted', () => {
+    writeConversation(appHome, makeConv('a1'));
+    const idx = readIndex(appHome);
+    writeIndex(appHome, { ...idx, activeConversationId: 'a1' });
+    deleteConversations(appHome, ['a1']);
+    expect(readIndex(appHome).activeConversationId).toBeNull();
+  });
+
+  it('reindexIfStale backfills new precomputed flags once, then no-ops', () => {
+    // Seed a chat and hand-write a stale index missing the new flags + version.
+    const conv = makeConv('r1', {
+      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+    });
+    writeConversation(appHome, conv);
+    const stale = readIndex(appHome);
+    delete (stale.conversations.r1 as Record<string, unknown>).hasComputerUse;
+    delete (stale.conversations.r1 as Record<string, unknown>).hasMedia;
+    stale.settings = {}; // no indexSchemaVersion
+    writeIndex(appHome, stale);
+
+    const count = reindexIfStale(appHome);
+    expect(count).toBe(1);
+    const rebuilt = readIndex(appHome);
+    expect(rebuilt.conversations.r1.hasComputerUse).toBe(true);
+    expect(rebuilt.settings.indexSchemaVersion).toBeTypeOf('number');
+
+    // Second call is a no-op (version now current).
+    expect(reindexIfStale(appHome)).toBe(0);
   });
 
   it('deleteConversation removes the file and index entry', () => {

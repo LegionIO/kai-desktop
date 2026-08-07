@@ -7,6 +7,7 @@ import {
   CheckIcon,
   DownloadIcon,
   EllipsisVerticalIcon,
+  FilterIcon,
   MessageSquareIcon,
   MinusIcon,
   PencilIcon,
@@ -25,6 +26,8 @@ import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
+import { FilterPopover } from './FilterPopover';
+import { useConversationPreferences, type FilterPreference } from './useConversationPreferences';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -41,6 +44,9 @@ type ConversationSummary = Pick<
   | 'lastAssistantUpdateAt'
   | 'archived'
   | 'workspaceId'
+  | 'hasToolCalls'
+  | 'hasComputerUse'
+  | 'hasMedia'
 >;
 
 type ChatsListPageProps = {
@@ -88,6 +94,28 @@ function getDisplayTitle(conv: ConversationSummary): string {
   return conv.title?.trim() || conv.fallbackTitle?.trim() || '';
 }
 
+/** Apply the advanced FilterPopover criteria to a single summary. Pure — exported
+ *  for unit tests. A boolean toggle set to `true` requires the flag be truthy; a
+ *  toggle left `null` is ignored. Date bounds compare ISO strings lexically
+ *  (safe for the same offset), count bounds are inclusive. */
+export function matchesAdvancedFilter(conv: ConversationSummary, filter: FilterPreference): boolean {
+  if (filter.hasToolCalls === true && !conv.hasToolCalls) return false;
+  if (filter.hasComputerUse === true && !conv.hasComputerUse) return false;
+  if (filter.hasMedia === true && !conv.hasMedia) return false;
+  if (filter.messageCountMin != null && (conv.messageCount ?? 0) < filter.messageCountMin) return false;
+  if (filter.messageCountMax != null && (conv.messageCount ?? 0) > filter.messageCountMax) return false;
+  // Date bounds are yyyy-mm-dd from <input type="date">; compare against the date
+  // portion of the ISO timestamps so a whole-day "before" is inclusive of that day.
+  const createdDay = conv.createdAt?.slice(0, 10) ?? '';
+  const updatedSrc = conv.lastAssistantUpdateAt ?? conv.lastMessageAt ?? conv.updatedAt ?? conv.createdAt;
+  const updatedDay = updatedSrc?.slice(0, 10) ?? '';
+  if (filter.createdAfter && createdDay < filter.createdAfter) return false;
+  if (filter.createdBefore && createdDay > filter.createdBefore) return false;
+  if (filter.updatedAfter && updatedDay < filter.updatedAfter) return false;
+  if (filter.updatedBefore && updatedDay > filter.updatedBefore) return false;
+  return true;
+}
+
 export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNewConversation, workspaceId }) => {
   const fullWidth = useFullWidthContent();
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -101,6 +129,13 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  // "Delete all" / "Delete filtered results" confirmation (operates on the whole
+  // visible view, not the checkbox selection).
+  const [deleteViewOpen, setDeleteViewOpen] = useState(false);
+  // Advanced FilterPopover (has tool calls / autopilot / media, count + date ranges).
+  const { filter, setFilter, activeFilterCount, clearFilters } = useConversationPreferences();
+  const [advancedFilterOpen, setAdvancedFilterOpen] = useState(false);
+  const advancedFilterAnchorRef = useRef<HTMLButtonElement>(null);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -223,9 +258,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
   }, [selectedIds, filterMode, loadConversations]);
 
   const handleBulkDelete = useCallback(async () => {
-    for (const id of selectedIds) {
-      await app.conversations.delete(id);
-    }
+    await app.conversations.deleteMany([...selectedIds]);
     setSelectedIds(new Set());
     await loadConversations();
   }, [selectedIds, loadConversations]);
@@ -306,6 +339,11 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
       result = result.filter((c) => getDisplayTitle(c).toLowerCase().includes(q) || contentMatchIds.has(c.id));
     }
 
+    // Advanced filters (FilterPopover): tool calls / autopilot / media, count + dates.
+    if (activeFilterCount > 0) {
+      result = result.filter((c) => matchesAdvancedFilter(c, filter));
+    }
+
     // Sort
     result.sort((a, b) => {
       if (sortMode === 'alphabetical') {
@@ -321,7 +359,18 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
     });
 
     return result;
-  }, [conversations, workspaceId, searchQuery, contentMatchIds, filterMode, sortMode, pinnedIds]);
+  }, [conversations, workspaceId, searchQuery, contentMatchIds, filterMode, sortMode, pinnedIds, filter, activeFilterCount]);
+
+  // Delete every conversation currently visible in the list (respects search +
+  // filter mode + advanced filters). Powers both "Delete all" and, when a
+  // search/filter narrows the view, "Delete N results".
+  const handleDeleteView = useCallback(async () => {
+    const ids = processed.map((c) => c.id);
+    if (ids.length === 0) return;
+    await app.conversations.deleteMany(ids);
+    setSelectedIds(new Set());
+    await loadConversations();
+  }, [processed, loadConversations]);
 
   const isSelecting = selectedIds.size > 0;
   const allSelected = isSelecting && processed.length > 0 && processed.every((c) => selectedIds.has(c.id));
@@ -502,14 +551,68 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
+
+            {/* Advanced filters (has tool calls / autopilot / media, count + dates) */}
+            <Tooltip content="Advanced filters" side="bottom">
+              <button
+                ref={advancedFilterAnchorRef}
+                type="button"
+                onClick={() => setAdvancedFilterOpen((o) => !o)}
+                className={cn(
+                  'relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
+                  activeFilterCount > 0
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                )}
+              >
+                <FilterIcon className="h-4 w-4" />
+                {activeFilterCount > 0 && (
+                  <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground">
+                    {activeFilterCount}
+                  </span>
+                )}
+              </button>
+            </Tooltip>
           </div>
         </div>
       </div>
+
+      {advancedFilterOpen && (
+        <FilterPopover
+          filter={filter}
+          onFilterChange={setFilter}
+          activeFilterCount={activeFilterCount}
+          onClear={clearFilters}
+          onClose={() => setAdvancedFilterOpen(false)}
+          anchorRef={advancedFilterAnchorRef}
+        />
+      )}
 
       {/* Scrollable content with fade + floating selection bar */}
       <div className="relative flex-1 min-h-0">
         {/* Fade starts right below the search bar */}
         <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-10 bg-gradient-to-b from-background to-transparent" />
+
+        {/* Delete-all / delete-filtered affordance (only when not multi-selecting) */}
+        {!isSelecting && hasLoaded && processed.length > 0 && (
+          <div
+            className={cn(
+              'absolute inset-x-0 top-0 z-20 mx-auto flex w-full items-center justify-end px-4 h-8',
+              !fullWidth && 'max-w-3xl',
+            )}
+          >
+            <button
+              type="button"
+              onClick={() => setDeleteViewOpen(true)}
+              className="flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2Icon className="h-3.5 w-3.5" />
+              {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all'
+                ? `Delete ${processed.length} result${processed.length === 1 ? '' : 's'}`
+                : 'Delete all'}
+            </button>
+          </div>
+        )}
 
         {/* Selection bar floats above the list */}
         {isSelecting && (
@@ -720,6 +823,48 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({ onOpenConversation, onNe
                   onClick={() => {
                     setBulkDeleteOpen(false);
                     void handleBulkDelete();
+                  }}
+                  className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                >
+                  <Trash2Icon className="h-3 w-3" />
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+
+      {/* Delete-all / delete-filtered confirmation modal */}
+      {deleteViewOpen &&
+        createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setDeleteViewOpen(false)}>
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+            <div
+              className="relative w-full max-w-sm rounded-xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-sm font-semibold text-foreground">
+                {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all' ? 'Delete results' : 'Delete all chats'}
+              </h2>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all'
+                  ? `This will permanently delete the ${processed.length} chat${processed.length === 1 ? '' : 's'} currently shown. This cannot be undone.`
+                  : `This will permanently delete all ${processed.length} chat${processed.length === 1 ? '' : 's'}. This cannot be undone.`}
+              </p>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setDeleteViewOpen(false)}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteViewOpen(false);
+                    void handleDeleteView();
                   }}
                   className="flex items-center gap-1.5 rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
                 >

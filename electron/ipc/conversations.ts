@@ -34,6 +34,7 @@ import {
   readConversation,
   writeConversation,
   deleteConversation,
+  deleteConversations,
   clearAllConversations,
   getActiveConversationId,
   setActiveConversationId,
@@ -876,6 +877,28 @@ export function registerConversationHandlers(
     }
 
     return { ok: true };
+  });
+
+  ipcMain.handle('conversations:deleteMany', (_event, ids: unknown) => {
+    const list = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+    if (list.length === 0) return { ok: true, deleted: 0 };
+    const removed = deleteConversations(appHome, list);
+    // Broadcast a delete per removed id so each renderer/web client prunes O(1),
+    // matching the single-delete path (there is no batched change kind).
+    for (const id of removed) {
+      broadcastDelete(appHome, id);
+      clearConversationDiffs(id);
+    }
+    // Clean up associated computer-use sessions for every requested id.
+    if (getConfig) {
+      try {
+        const manager = getComputerUseManager(appHome, getConfig);
+        for (const id of list) manager.removeSessionsByConversation(id);
+      } catch {
+        // Computer-use module may not be initialized yet — safe to ignore
+      }
+    }
+    return { ok: true, deleted: removed.length };
   });
 
   ipcMain.handle('conversations:clear', () => {

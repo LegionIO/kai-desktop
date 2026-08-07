@@ -121,6 +121,11 @@ export type ConversationIndexEntry = {
   archived?: boolean;
   /** Precomputed so `list` never has to scan message bodies. */
   hasToolCalls: boolean;
+  /** Precomputed: any tool call to a `computer_use*` (autopilot) tool. */
+  hasComputerUse: boolean;
+  /** Precomputed: any image/file content part, or a tool result carrying
+   *  native model content (`_modelContent`, e.g. fetched images). */
+  hasMedia: boolean;
   metadata?: Record<string, unknown>;
 };
 
@@ -176,6 +181,43 @@ function computeHasToolCalls(conv: ConversationRecord): boolean {
   );
 }
 
+/** Any tool call whose target tool name begins with `computer_use` (the autopilot
+ *  session/control/info tools). Best-effort — mirrors {@link computeHasToolCalls}. */
+function computeHasComputerUse(conv: ConversationRecord): boolean {
+  return (
+    Array.isArray(conv.messages) &&
+    conv.messages.some((msg: unknown) => {
+      const m = msg as Record<string, unknown>;
+      return (
+        Array.isArray(m.content) &&
+        (m.content as Array<Record<string, unknown>>).some((part) => {
+          if (part?.type !== 'tool-call') return false;
+          const name = (part.toolName ?? part.name) as unknown;
+          return typeof name === 'string' && name.startsWith('computer_use');
+        })
+      );
+    })
+  );
+}
+
+/** Any image/file content part (user attachments or model output), or a tool
+ *  result carrying native model content (`_modelContent`, e.g. fetched images).
+ *  Best-effort — mirrors {@link computeHasToolCalls}. */
+function computeHasMedia(conv: ConversationRecord): boolean {
+  return (
+    Array.isArray(conv.messages) &&
+    conv.messages.some((msg: unknown) => {
+      const m = msg as Record<string, unknown>;
+      if (!Array.isArray(m.content)) return false;
+      return (m.content as Array<Record<string, unknown>>).some((part) => {
+        if (part?.type === 'image' || part?.type === 'file') return true;
+        const modelContent = (part as { _modelContent?: unknown })?._modelContent;
+        return Array.isArray(modelContent) && modelContent.length > 0;
+      });
+    })
+  );
+}
+
 /** Single source of truth for turning a full record into its index summary. */
 export function toIndexEntry(conv: ConversationRecord): ConversationIndexEntry {
   return {
@@ -200,6 +242,8 @@ export function toIndexEntry(conv: ConversationRecord): ConversationIndexEntry {
     workspaceId: conv.workspaceId,
     archived: conv.archived,
     hasToolCalls: computeHasToolCalls(conv),
+    hasComputerUse: computeHasComputerUse(conv),
+    hasMedia: computeHasMedia(conv),
     metadata: conv.metadata,
   };
 }
@@ -259,6 +303,33 @@ function rebuildIndexFromConversationFiles(appHome: string): ConversationIndex |
   if (recovered === 0) return null;
   console.warn(`[conversation-store] rebuilt index from ${recovered} conversation file(s) (index was missing/corrupt)`);
   return index;
+}
+
+/** Bumped whenever {@link toIndexEntry} gains a precomputed field that existing
+ *  index.json files won't have. {@link reindexIfStale} rebuilds once per bump. */
+const INDEX_SCHEMA_VERSION = 2;
+
+/** One-time backfill: if the stored index predates the current
+ *  {@link INDEX_SCHEMA_VERSION}, rebuild every summary from the per-file records
+ *  (so newly-added precomputed fields like `hasComputerUse`/`hasMedia` populate for
+ *  existing chats) and stamp the version. Cheap no-op on every subsequent boot.
+ *  Skipped while a monolith migration is pending (a write then would strand it). */
+export function reindexIfStale(appHome: string): number {
+  if (monolithMigrationPending(appHome)) return 0;
+  const index = readIndex(appHome);
+  const stored = typeof index.settings?.indexSchemaVersion === 'number' ? index.settings.indexSchemaVersion : 0;
+  if (stored >= INDEX_SCHEMA_VERSION) return 0;
+
+  const rebuilt = rebuildIndexFromConversationFiles(appHome);
+  const conversations = rebuilt?.conversations ?? index.conversations;
+  const count = Object.keys(conversations).length;
+  writeIndex(appHome, {
+    conversations,
+    activeConversationId: index.activeConversationId,
+    settings: { ...index.settings, indexSchemaVersion: INDEX_SCHEMA_VERSION },
+  });
+  console.info(`[conversation-store] reindexed ${count} conversation(s) to schema v${INDEX_SCHEMA_VERSION}`);
+  return count;
 }
 
 export function writeIndex(appHome: string, index: ConversationIndex): void {
@@ -974,6 +1045,30 @@ export function deleteConversation(appHome: string, id: string): void {
     if (index.activeConversationId === id) index.activeConversationId = null;
     writeIndex(appHome, index);
   }
+}
+
+/** Batch delete: removes each conversation file and its index entry with a SINGLE
+ *  index write at the end (vs. one per id via {@link deleteConversation}). Returns
+ *  the ids that had an index entry removed. */
+export function deleteConversations(appHome: string, ids: string[]): string[] {
+  assertMigratedBeforeWrite(appHome);
+  const index = readIndex(appHome);
+  const removed: string[] = [];
+  for (const id of ids) {
+    try {
+      const p = conversationPath(appHome, id);
+      if (existsSync(p)) rmSync(p);
+    } catch {
+      /* ignore file-level failure (incl. invalid id); still drop any index entry below */
+    }
+    if (index.conversations[id]) {
+      delete index.conversations[id];
+      if (index.activeConversationId === id) index.activeConversationId = null;
+      removed.push(id);
+    }
+  }
+  if (removed.length > 0) writeIndex(appHome, index);
+  return removed;
 }
 
 export function clearAllConversations(appHome: string): void {

@@ -10,6 +10,12 @@ export type ToolProgressEvent = {
   truncated: boolean;
   stopped: boolean;
   subAgentConversationId?: string;
+  /** For sub_agent tool progress: the sub-agent's most recent lifecycle signal.
+   *  `complete`/`failed`/`stopped` are TERMINAL (the sub-agent is done — a
+   *  watching parent observer must stop nudging it); `awaiting_response` and
+   *  `continue` are non-terminal. Lets the observer gate on declared completion
+   *  without parsing status text out of stdout. */
+  subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
 };
 
 export type ToolExecutionContext = {

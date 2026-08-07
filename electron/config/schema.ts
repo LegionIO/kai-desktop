@@ -1194,8 +1194,36 @@ export const appConfigSchema = z.object({
             .min(1048576)
             .max(52428800)
             .default(10485760),
+          /**
+           * Auto-capture a V8 heap snapshot (.heapsnapshot) of the renderer when
+           * its heap crosses `thresholdPct` of the limit — so a slow leak that
+           * OOM-aborts overnight self-captures the retaining objects (the MB
+           * trajectory shows the climb; only a snapshot names the culprit). A
+           * snapshot is heavy (multi-GB write + GC pause) and gated behind a
+           * cooldown + one-shot-until-heap-recovers latch, so it fires rarely.
+           */
+          heapSnapshot: z
+            .object({
+              enabled: z.boolean().default(false),
+              /** Fire once the renderer heap is at/above this % of the V8 limit. */
+              thresholdPct: z.number().int().min(50).max(99).default(85),
+              /** Retain the newest N snapshots (evict oldest first). 0 = unlimited. */
+              maxCount: z.number().int().min(0).max(50).default(3),
+              /** Cap total snapshot bytes on disk (evict oldest first). 0 = unlimited. */
+              maxTotalBytes: z
+                .number()
+                .int()
+                .min(0)
+                .max(53687091200) // 50 GiB hard ceiling
+                .default(6442450944), // 6 GiB
+            })
+            .default({ enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 }),
         })
-        .default({ enabled: false, windowHealthLogMaxBytes: 10485760 }),
+        .default({
+          enabled: false,
+          windowHealthLogMaxBytes: 10485760,
+          heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+        }),
     })
     .default({
       debugTrace: {
@@ -1204,7 +1232,11 @@ export const appConfigSchema = z.object({
         scopes: ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'],
         retention: { maxFileBytes: 10485760, maxFiles: 3, maxAgeDays: 7 },
       },
-      memoryDiagnostics: { enabled: false, windowHealthLogMaxBytes: 10485760 },
+      memoryDiagnostics: {
+        enabled: false,
+        windowHealthLogMaxBytes: 10485760,
+        heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
+      },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),

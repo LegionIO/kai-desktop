@@ -202,6 +202,7 @@ export const FilterPopover: FC<FilterPopoverProps> = ({
         checked={filter.hasComputerUse}
         onChange={(v) => update({ hasComputerUse: v })}
       />
+      <FilterToggle label="Has media" checked={filter.hasMedia} onChange={(v) => update({ hasMedia: v })} />
 
       {/* Divider */}
       <div className="mx-2 my-1 border-t border-border/30" />

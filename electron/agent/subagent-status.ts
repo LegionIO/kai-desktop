@@ -11,7 +11,7 @@
 
 import type { Memory } from '@mastra/memory';
 
-export type SubagentStatus = 'pending' | 'running' | 'completed' | 'failed' | 'abandoned' | 'stopped';
+export type SubagentStatus = 'pending' | 'running' | 'completed' | 'failed' | 'abandoned' | 'stopped' | 'paused';
 
 /** Fields tracked under `metadata.subagent` for sub-agent threads. */
 export interface SubagentStatusFields {
@@ -22,13 +22,20 @@ export interface SubagentStatusFields {
 }
 
 /**
- * Valid status transitions. Terminal states (completed/failed/abandoned/stopped)
- * have no outgoing edges — once a sub-agent is done it stays done.
+ * Valid status transitions.
+ * - `paused` is terminal FOR THE CURRENT RUN but RESUMABLE: a later user/observer
+ *   follow-up reopens it (`paused → running`).
+ * - `completed` is also resumable (`completed → running`) — the sub-agent's
+ *   result stands, but a follow-up can reopen the conversation for more work.
+ * - `failed`/`abandoned`/`stopped` are truly terminal (no resume).
  */
 const VALID_TRANSITIONS: Record<SubagentStatus, SubagentStatus[]> = {
   pending: ['running', 'failed', 'abandoned', 'stopped'],
-  running: ['completed', 'failed', 'abandoned', 'stopped'],
-  completed: [],
+  running: ['completed', 'failed', 'abandoned', 'stopped', 'paused'],
+  // A resumable terminal (completed/paused) can be REOPENED (→ running) or, if the
+  // user stops it before/around a resume, moved to the truly-terminal `stopped`.
+  completed: ['running', 'stopped'],
+  paused: ['running', 'stopped'],
   failed: [],
   abandoned: [],
   stopped: [],

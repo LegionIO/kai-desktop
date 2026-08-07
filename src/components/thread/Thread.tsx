@@ -66,6 +66,7 @@ import { UserCodeMarkdown } from './UserCodeMarkdown';
 import { SplashBackground } from '@/components/SplashBackground';
 import { ToolCallDisplay } from './ToolGroup';
 import { SubAgentInline } from './SubAgentInline';
+import { isSubAgentToolCall } from './sub-agent-routing';
 import { MessageContentErrorBoundary } from './MessageContentErrorBoundary';
 import { MaxTurnsContinueCard } from './MaxTurnsContinueCard';
 import { PipelineInsights } from './PipelineInsights';
@@ -1011,6 +1012,21 @@ const ToolFallback: FC<{
         ? 'bg-red-500'
         : 'bg-emerald-500';
 
+  // A sub-agent tool call may reach the renderer with its toolName briefly
+  // missing/unknown (a streamed tool-call event whose name lands after the first
+  // render) — especially under parallel sub-agent spawns. Route to the
+  // specialized card when the toolName says sub_agent, OR a TRUSTED backend
+  // binding marks this call as a sub-agent. The trusted source is `liveOutput`,
+  // which the renderer's progress binding (applyToolProgress) sets onto THIS
+  // call from backend tool-progress. We deliberately do NOT trust
+  // `result.subAgentConversationId`: a tool RESULT is arbitrary tool-produced
+  // content, so honoring it would let an unrelated tool emit a child's id and
+  // hijack that child's navigate/message/stop controls. SubAgentInline resolves
+  // the live thread by the same trusted id.
+  const resolvedSubAgentId =
+    (props.liveOutput as { subAgentConversationId?: string } | undefined)?.subAgentConversationId ?? null;
+  const isSubAgentTool = isSubAgentToolCall(props.toolName, resolvedSubAgentId);
+
   // Bridge: create task queue entry when a plan is approved
   const taskCtx = useTasksOptional();
   const handlePlanApproved = useCallback(
@@ -1038,7 +1054,7 @@ const ToolFallback: FC<{
   );
 
   // Render sub-agent tool calls with the specialized component
-  if (props.toolName === 'sub_agent') {
+  if (isSubAgentTool) {
     return (
       <div className="timeline-item my-1">
         <span className={`timeline-dot timeline-dot-tool ${dotColor}`} />
@@ -1046,7 +1062,7 @@ const ToolFallback: FC<{
           toolCallId={props.toolCallId}
           args={props.args}
           result={props.result}
-          isError={props.isError}
+          isError={Boolean(isError)}
           liveOutput={props.liveOutput}
         />
       </div>
