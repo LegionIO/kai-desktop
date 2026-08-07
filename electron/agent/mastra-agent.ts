@@ -41,6 +41,10 @@ export type StreamEvent = {
    * this is also the id persisted in Mastra memory, allowing Kai and Mastra to
    * refer to the same logical response across later turns. */
   responseMessageId?: string;
+  /** STABLE per-RUN token (the server's streamToken), stamped on every broadcast event so
+   *  the renderer can drop a superseded run's late events. Stable across mid-stream
+   *  fallback (which changes responseMessageId per successful variant). */
+  runGeneration?: string;
   type:
     | 'text-delta'
     | 'observer-message'

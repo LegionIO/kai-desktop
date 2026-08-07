@@ -186,6 +186,10 @@ type MessageAccumulator = {
   /** Assistant id preallocated for the current inference response. Mastra uses
    * the same id for its persisted output row and echoes it on stream events. */
   pendingAssistantId?: string | null;
+  /** STABLE run generation (the server's streamToken) this accumulator is locked to —
+   *  set from the first event bearing runGeneration; later events from a DIFFERENT
+   *  generation are a superseded run's and dropped (except compaction). */
+  runGeneration?: string;
   /** Deferred tool approvals keyed by toolName — handles race where
    *  tool-approval-required arrives before the stream-side tool-call event. */
   deferredApprovals?: Map<string, { toolCallId: string; args?: unknown }>;
@@ -732,6 +736,23 @@ let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 // --- Stream accumulator functions ---
 
 const streamAccumulators = new Map<string, MessageAccumulator>();
+// Per-conversation run generations (streamTokens) of SUPERSEDED runs. A turn-launcher
+// replaces the accumulator BEFORE the old stream is invalidated on the main side, so an
+// old delta can arrive while the fresh accumulator has no runGeneration yet and would
+// otherwise LOCK it to the superseded run (dropping the real replacement run's events).
+// Recording the outgoing accumulator's generation here lets the guard drop those stale
+// events and refuse to lock to a known-superseded generation. Bounded per conversation.
+const supersededGenerations = new Map<string, Set<string>>();
+/** Mark the CURRENT accumulator's run generation superseded before installing a
+ *  replacement, so its in-flight late events can't bind/hijack the new accumulator. */
+function supersedeCurrentGeneration(convId: string): void {
+  const gen = streamAccumulators.get(convId)?.runGeneration;
+  if (!gen) return;
+  let set = supersededGenerations.get(convId);
+  if (!set) supersededGenerations.set(convId, (set = new Set()));
+  set.add(gen);
+  if (set.size > 32) set.delete(set.values().next().value as string); // bound
+}
 /** Conversations whose live accumulator is driven by an automation run (not an
  *  interactive send). Gates automation-specific behavior: background accumulation,
  *  open-mid-run seeding, and deferring persistence to the main process. */
@@ -1476,12 +1497,26 @@ async function persistConversation(
   // (e.g. done handler's runStatus:'idle' overwritten by a late schedulePersist's 'running').
   const currentVersion = (persistVersions.get(conversationId) ?? 0) + 1;
   persistVersions.set(conversationId, currentVersion);
-  // Register any carried compaction in the handoff map BEFORE the first await — else a
-  // terminal persist that gets superseded during its `conversations.get()` would early-
-  // return (superseded) BEFORE registering, and a racing resubmit would find no handoff
-  // and drop the paid summary. Cleared below only on a confirmed persisted:true.
+  // A compaction record this persist should durably write. Prefer one the caller
+  // explicitly carries; otherwise, for a TURN-STARTING persist (runStatus:'running'/
+  // 'awaiting-approval'), INHERIT any pending handoff — a terminal done/error's
+  // fire-and-forget compaction persist may have been superseded before it landed, and
+  // EVERY turn-launching path (onNew/onEdit/onReload/Continue/ContinueTask/branch-switch),
+  // not just onNew, must carry that paid summary forward so the next stream reuses it.
   const carriedCompaction = (updates as { conversationCompaction?: ConversationCompaction }).conversationCompaction;
-  if (carriedCompaction?.compactionId) pendingCompactionHandoff.set(conversationId, carriedCompaction);
+  const startsTurn =
+    (updates as { runStatus?: string }).runStatus === 'running' ||
+    (updates as { runStatus?: string }).runStatus === 'awaiting-approval';
+  const effectiveCompaction =
+    carriedCompaction?.compactionId ? carriedCompaction : startsTurn ? pendingCompactionHandoff.get(conversationId) : undefined;
+  // Register in the handoff map BEFORE the first await — else a terminal persist that gets
+  // superseded during its `conversations.get()` would early-return BEFORE registering, and
+  // a racing resubmit would find no handoff. Cleared below only on a confirmed persisted:true.
+  if (effectiveCompaction?.compactionId) pendingCompactionHandoff.set(conversationId, effectiveCompaction);
+  // Fold the inherited handoff into what's actually written (the caller didn't supply it).
+  if (effectiveCompaction?.compactionId && !carriedCompaction?.compactionId) {
+    updates = { ...updates, conversationCompaction: effectiveCompaction };
+  }
 
   try {
     const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
@@ -1537,9 +1572,9 @@ async function persistConversation(
     // now durably on disk — and the main-side put-preservation keeps it against staler
     // writes). Only clear when it's still the SAME record we recorded (a newer one may
     // have replaced it meanwhile).
-    if (carriedCompaction?.compactionId) {
+    if (effectiveCompaction?.compactionId) {
       const held = pendingCompactionHandoff.get(conversationId);
-      if (held?.compactionId === carriedCompaction.compactionId) pendingCompactionHandoff.delete(conversationId);
+      if (held?.compactionId === effectiveCompaction.compactionId) pendingCompactionHandoff.delete(conversationId);
     }
     return { persisted: true };
   } catch (err) {
@@ -2254,12 +2289,12 @@ export function RuntimeProvider({
   // signal the client gets. Takes the exact agent.stream arg list (conversationId first).
   const launchAgentStream = useCallback((...args: Parameters<NonNullable<typeof window.app>['agent']['stream']>) => {
     const conversationId = args[0];
+    // responseMessageId is the LAST positional arg of agent.stream (see AppAPI). Stamp it
+    // on the synthesized busy error so the run-generation guard can drop it if this run was
+    // superseded before the busy result resolved.
+    const responseMessageId = args[args.length - 1];
     Promise.resolve(app.agent.stream(...args))
       .then((res) => {
-        // Busy = the conversation is being /compact-ed. Synthesize the terminal events
-        // ONLY when main did NOT already deliver them via a per-client sender
-        // (delivered=false ⇒ web bridge). On Electron (delivered=true) main already sent
-        // them, so synthesizing again would be redundant.
         if (
           res &&
           typeof res === 'object' &&
@@ -2275,6 +2310,7 @@ export function RuntimeProvider({
               conversationId,
               type: 'error',
               error: 'Compacting the conversation — wait for it to finish, then retry.',
+              ...(typeof responseMessageId === 'string' ? { responseMessageId } : {}),
             });
           }
         }
@@ -2618,6 +2654,44 @@ export function RuntimeProvider({
       }
 
       const acc = streamAccumulators.get(convId)!;
+      // Run-generation guard: main stamps every event of a run with that run's STABLE
+      // token (e.runGeneration). An accumulator LOCKS to the first generation it sees; a
+      // later event bearing a DIFFERENT generation is from a SUPERSEDED run (the
+      // replacement turn got its OWN fresh accumulator via onNew), whose late events must
+      // NOT mutate this accumulator (they'd hijack pendingAssistantId / persist stale
+      // output under the new prompt). Drop them — EXCEPT a `compaction` event, whose paid
+      // summary we still capture into the pendingCompaction handoff regardless of run.
+      // NOTE: keyed on runGeneration (stable per run), NOT responseMessageId, which a
+      // mid-stream fallback intentionally changes per successful variant within one run.
+      const evGen = (e as { runGeneration?: string }).runGeneration;
+      if (evGen) {
+        // A generation explicitly marked superseded (its accumulator was replaced by a
+        // newer turn) is a stale run — drop its events regardless of the accumulator's
+        // current lock, and never let one become the fresh accumulator's first lock (the
+        // race where an old delta arrives before the replacement run's first event). The
+        // compaction handoff is still captured below.
+        if (supersededGenerations.get(convId)?.has(evGen) && e.type !== 'compaction') {
+          return;
+        }
+        if (acc.runGeneration == null) {
+          if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
+        } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
+          return; // superseded run's late event — drop
+        }
+      } else if (
+        // No runGeneration → a pre-stream busy rejection (sent directly / synthesized, not
+        // via the run's emit). It carries the rejected turn's responseMessageId; if that
+        // turn was superseded (the accumulator now holds a DIFFERENT pendingAssistantId),
+        // this stale busy error must not terminate/persist against the replacement turn.
+        // (Safe to key on responseMessageId here: a pre-stream rejection never fell back,
+        // so its id is stable.)
+        e.type === 'error' &&
+        e.responseMessageId &&
+        acc.pendingAssistantId != null &&
+        e.responseMessageId !== acc.pendingAssistantId
+      ) {
+        return;
+      }
       if (e.responseMessageId) acc.pendingAssistantId = e.responseMessageId;
 
       if (e.type === 'user-message') {
@@ -3131,6 +3205,7 @@ export function RuntimeProvider({
             { runStatus: 'running', ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}) },
             seedContextFor(acc),
           );
+          supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
           streamAccumulators.set(convId, {
             messages: [...acc.messages],
             headId: acc.headId,
@@ -3472,6 +3547,7 @@ export function RuntimeProvider({
 
                 const branch = getActiveBranch(treeForStream, headForStream);
                 const responseMessageId = msgId();
+                supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
                 streamAccumulators.set(convId, {
                   messages: [...treeForStream],
                   headId: headForStream,
@@ -3750,6 +3826,7 @@ export function RuntimeProvider({
       setHeadId(newHead);
       setIsRunning(true);
 
+      supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
         messages: [...newTree],
         headId: newHead,
@@ -3882,6 +3959,7 @@ export function RuntimeProvider({
 
       const newTree = [...tree]; // keep all existing messages (old branches preserved)
       const responseMessageId = msgId();
+      supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
         messages: newTree,
         headId: actualParent,
@@ -4008,6 +4086,7 @@ export function RuntimeProvider({
       setHeadId(newHead);
       setIsRunning(true);
 
+      supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
         messages: [...newTree],
         headId: newHead,
@@ -4445,6 +4524,7 @@ export function RuntimeProvider({
       const responseMessageId = msgId();
       setTree(updated);
       setIsRunning(true);
+      supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
       streamAccumulators.set(convId, {
         messages: [...updated],
         headId: newHead,
@@ -4520,6 +4600,7 @@ export function RuntimeProvider({
     setShowIncompleteTaskBanner(false);
     setStepInfo(null);
 
+    supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
     streamAccumulators.set(convId, {
       messages: [...newTree],
       headId: newHead,

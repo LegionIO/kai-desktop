@@ -216,6 +216,12 @@ export function App({
   // every status change (runCommand). Kept in sync below.
   const statusRef = useRef<'idle' | 'running' | 'awaiting-approval'>('idle');
   statusRef.current = status;
+  // True while /compact returned conversation-busy and we're holding the CLI 'running'
+  // until the authoritative `conversations:compacting` broadcast reports the owning
+  // /compact (another client) has unlocked — then we drain the queue / go idle. Without
+  // this, going idle on busy lets a new prompt submit → reject → failTurnAndDrain consume
+  // and lose the queued prompts.
+  const compactBusyWaitRef = useRef<boolean>(false);
   // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
   // an in-flight turn on the right conversation.
   if (runtimeRef) {
@@ -636,8 +642,41 @@ export function App({
       })();
     });
 
+    // When a /compact (possibly another client's) unlocks THIS conversation, resume: if we
+    // were holding the CLI 'running' on a busy /compact, drain one queued prompt (or go
+    // idle). Mirrored to CLI clients via the local bridge (conversations:compacting is not
+    // in CLI_EXCLUDED_BROADCAST_CHANNELS).
+    const offCompacting = client.on('conversations:compacting', (raw) => {
+      const p = raw as { conversationId?: string; compacting?: boolean } | undefined;
+      if (!p || p.conversationId !== convIdRef.current) return;
+      if (p.compacting === true) {
+        // Another client STARTED compacting THIS conversation. Proactively go busy so a
+        // prompt typed now QUEUES (status 'running') instead of submitting → conversation-
+        // busy → failTurnAndDrain losing it. Only when we're otherwise idle (an in-flight
+        // turn/awaiting-approval owns the status already). The matching `false` drains.
+        if (statusRef.current === 'idle') {
+          compactBusyWaitRef.current = true;
+          setStatus('running');
+          statusRef.current = 'running';
+        }
+      } else if (p.compacting === false && compactBusyWaitRef.current) {
+        compactBusyWaitRef.current = false;
+        // Only drain if no real turn started meanwhile (a stream would drive its own drain).
+        if (queueRef.current.length > 0) {
+          const next = queueRef.current.shift() as string;
+          setStatus('running');
+          statusRef.current = 'running';
+          setTimeout(() => sendMessageRef.current(next), 0);
+        } else {
+          setStatus('idle');
+          statusRef.current = 'idle';
+        }
+      }
+    });
+
     return () => {
       off();
+      offCompacting();
       offDisc();
     };
   }, [client, recover, exit, promptAskUser]);
@@ -804,7 +843,7 @@ export function App({
           // switch chats mid-compaction. Restore idle in the finally.
           setStatus('running');
           statusRef.current = 'running';
-          let res: { ok?: boolean; error?: string; summarizedCount?: number } | undefined;
+          let res: { ok?: boolean; error?: string; summarizedCount?: number; busyKind?: string } | undefined;
           let compactTransportFailed = false;
           try {
             res = await client.invokeWithTimeout<{ ok?: boolean; error?: string; summarizedCount?: number }>(
@@ -825,13 +864,49 @@ export function App({
             // explicit drain here the queue would sit until some unrelated future turn's
             // `done` flushed it — surprising and out of order. Flush one queued message as
             // its own turn, else go idle. (queueRef/sendMessageRef are stable refs.)
-            // BUT NOT on a transport failure (bridge disconnected → the submit fails and
-            // recursively drains the rest) NOR on `conversation-busy` (another turn/compaction
-            // still owns the conversation → each queued submit would fail busy and
-            // failTurnAndDrain would consume + lose the rest). In both cases keep the queue
-            // intact + go idle; it drains after the owner finishes on the next successful turn.
             const compactBusy = res?.error === 'conversation-busy';
-            if (!compactTransportFailed && !compactBusy && queueRef.current.length > 0) {
+            if (compactTransportFailed) {
+              // Bridge disconnected — the submit would fail and recursively drain the rest.
+              // Keep the queue intact + go idle; it drains after reconnect on the next turn.
+              setStatus('idle');
+              statusRef.current = 'idle';
+            } else if (compactBusy && res?.busyKind === 'compaction') {
+              // ANOTHER client is compacting this conversation (no stream terminal event
+              // will reach us). STAY BUSY so prompts keep QUEUEING, and drain when the
+              // `conversations:compacting` false broadcast fires. RACE: the compaction may
+              // have finished before we set the ref, so also query compacting-ids now and
+              // drain immediately if it's already unlocked.
+              compactBusyWaitRef.current = true;
+              setStatus('running');
+              statusRef.current = 'running';
+              void client
+                .invoke<string[]>('conversations:compacting-ids')
+                .then((ids) => {
+                  if (
+                    compactBusyWaitRef.current &&
+                    convIdRef.current &&
+                    !(Array.isArray(ids) && ids.includes(convIdRef.current))
+                  ) {
+                    compactBusyWaitRef.current = false;
+                    if (queueRef.current.length > 0) {
+                      const next = queueRef.current.shift() as string;
+                      setStatus('running');
+                      statusRef.current = 'running';
+                      setTimeout(() => sendMessageRef.current(next), 0);
+                    } else {
+                      setStatus('idle');
+                      statusRef.current = 'idle';
+                    }
+                  }
+                })
+                .catch(() => {});
+            } else if (compactBusy) {
+              // busyKind 'turn' (or unspecified): an active TURN owns the conversation. Its
+              // terminal `done` reaches us and settleTurn drains the queue — so keep the
+              // queue + stay 'running'; do NOT wait on the compacting broadcast (none comes).
+              setStatus('running');
+              statusRef.current = 'running';
+            } else if (queueRef.current.length > 0) {
               const next = queueRef.current.shift() as string;
               setStatus('running');
               statusRef.current = 'running';

@@ -538,6 +538,14 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     }
   }
 
+  // Stamp the emitting run's STABLE token as a renderer-visible run generation so the
+  // renderer can drop a superseded run's late events that slip through the server-side
+  // supersession check above during the window before the replacement run registers its
+  // activeStreams token. Stable across mid-stream fallback (unlike responseMessageId).
+  if (emittingToken !== undefined && !(eventToBroadcast as { runGeneration?: string }).runGeneration) {
+    eventToBroadcast = { ...eventToBroadcast, runGeneration: emittingToken } as StreamEvent;
+  }
+
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
@@ -955,6 +963,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             conversationId,
             type: 'error',
             error: 'Compacting the conversation — wait for it to finish, then retry.',
+            // Stamp the run's responseMessageId so the renderer's run-generation guard can
+            // drop this busy error if THIS run was superseded before the (possibly delayed)
+            // error arrived — else it would terminate/persist against the replacement run.
+            ...(responseMessageId ? { responseMessageId } : {}),
           });
           delivered = true;
         } catch {
@@ -1024,8 +1036,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
     activeObserverSessions.set(conversationId, observerSessionId);
 
-    // All broadcasts from THIS run carry its stream token so broadcastStreamEvent
-    // can reject persistence-side effects from a superseded run's late events.
+    // All broadcasts from THIS run carry its stream token so broadcastStreamEvent can
+    // reject persistence-side effects from a superseded run's late events — AND so the
+    // RENDERER can attribute each event to its run (the token is stamped as `runGeneration`
+    // on the broadcast, see broadcastStreamEvent) and drop a SUPERSEDED run's late events
+    // that would otherwise hijack a replacement turn's accumulator. The token is STABLE for
+    // the whole run — unlike responseMessageId, which a mid-stream fallback intentionally
+    // changes per successful variant, so it must NOT be used for supersession.
     const emit = (e: StreamEvent): void => broadcastStreamEvent(e, streamToken);
 
     let config: AppConfig;

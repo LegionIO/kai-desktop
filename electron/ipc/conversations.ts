@@ -33,6 +33,7 @@ import {
   readIndex,
   readConversation,
   writeConversation,
+  sanitizeMessageTree,
   deleteConversation,
   deleteConversations,
   clearAllConversations,
@@ -789,6 +790,20 @@ export function registerConversationHandlers(
         // id to (a) exist in the final tree and (b) match the recorded signature; drop the
         // record otherwise so a stale summary can't hide B on the next turn's reuse.
         {
+          // Sanitize the tree/head NOW — the SAME dedup/merge/parent-repair/head-repoint
+          // writeConversation will apply — BEFORE validating the compaction record against
+          // it. Otherwise validation runs on the pre-sanitize tree while the DIFFERENT
+          // sanitized tree is written, so the stored coveredContentSig could describe
+          // content that wasn't persisted (reuse then rejects + re-compacts). Idempotent
+          // (writeConversation sanitizes again harmlessly).
+          if (Array.isArray(nextConversation.messageTree)) {
+            const s = sanitizeMessageTree(
+              nextConversation.messageTree as Parameters<typeof sanitizeMessageTree>[0],
+              nextConversation.headId ?? null,
+            );
+            const sBranch = getConversationBranch(s.tree as StoredTreeMessage[], s.headId ?? null);
+            nextConversation = { ...nextConversation, messageTree: s.tree, headId: s.headId, messages: sBranch };
+          }
           const keptComp = nextConversation.conversationCompaction as
             | { compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
             | null
@@ -1040,7 +1055,7 @@ export function registerConversationHandlers(
     if (typeof conversationId !== 'string' || !conversationId) return { ok: false, error: 'invalid-id' };
     // Reject a concurrent `/compact` for the same conversation (avoid a duplicate
     // paid summarization + persist race). Released in the finally below.
-    if (compactInFlight.has(conversationId)) return { ok: false, error: 'conversation-busy' };
+    if (compactInFlight.has(conversationId)) return { ok: false, error: 'conversation-busy', busyKind: 'compaction' as const };
     compactInFlight.add(conversationId);
     try {
       return await runCompact(conversationId);
@@ -1049,7 +1064,7 @@ export function registerConversationHandlers(
     }
   });
 
-  const runCompact = async (conversationId: string): Promise<{ ok: boolean; error?: string; summarizedCount?: number }> => {
+  const runCompact = async (conversationId: string): Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }> => {
     const config = getConfig?.();
     if (!config) return { ok: false, error: 'config-unavailable' };
     if (!config.compaction?.conversation?.enabled) return { ok: false, error: 'compaction-disabled' };
@@ -1057,14 +1072,14 @@ export function registerConversationHandlers(
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
     if (conv.runStatus === 'running' || conv.runStatus === 'awaiting-approval') {
-      return { ok: false, error: 'conversation-busy' };
+      return { ok: false, error: 'conversation-busy', busyKind: 'turn' as const };
     }
     // Disk `runStatus` is written AFTER a turn starts streaming, so a turn that just
     // began (or was submitted and is awaiting toolsReady) still looks idle on disk.
     // Consult the main-process in-memory turn registry too — otherwise `/compact`
     // could launch a paid summarizer alongside the live turn, then discard it as busy.
     if (isTurnActive?.(conversationId)) {
-      return { ok: false, error: 'conversation-busy' };
+      return { ok: false, error: 'conversation-busy', busyKind: 'turn' as const };
     }
 
     // Mark the conversation in the shared compaction lock for the DURATION of the
@@ -1095,7 +1110,7 @@ export function registerConversationHandlers(
     try {
       return await Promise.race([
         inner,
-        new Promise<{ ok: boolean; error?: string; summarizedCount?: number }>((resolve) => {
+        new Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }>((resolve) => {
           abort.signal.addEventListener(
             'abort',
             () => resolve({ ok: false, error: 'compaction-timeout' }),
@@ -1114,7 +1129,7 @@ export function registerConversationHandlers(
     config: AppConfig,
     conv: ConversationRecord,
     signal?: AbortSignal,
-  ): Promise<{ ok: boolean; error?: string; summarizedCount?: number }> => {
+  ): Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }> => {
     // Stop AWAITING a hook call once the /compact deadline fires. Trusted plugin
     // pre-send hooks (and the DLP gate) run over a callback protocol we can't force-
     // cancel here, so a hung hook's underlying promise stays pending — but racing the
