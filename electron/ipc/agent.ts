@@ -2015,33 +2015,55 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // retained → no post-tool overflow with recovery off).
         const compactModelName = modelEntry?.modelConfig.modelName; // model that actually compacts
         const sendModelName = (activeModelEntryForRecovery ?? modelEntry)?.modelConfig.modelName; // model that sends
-        const compactedBodyBytes = (rawBytes: number, outputMaxTokens: number): number => {
-          if (outputMaxTokens <= 0) return rawBytes;
-          const isCanonical = (name: string | undefined): boolean => {
-            if (!name) return false;
-            try {
-              const tk = resolveConversationTokenization(name);
-              // The outputMaxTokens*4 credit assumes ≤4 bytes/token, which holds for the
-              // MODERN o200k base (GPT-4o/4.1/5/o-series). A RECOGNIZED cl100k model
-              // (GPT-4-turbo/3.5) is NOT fallback but tokenizes DENSER on non-Latin scripts
-              // (Georgian etc.) — >4 B/tok — so crediting it under-charges. Require o200k_base.
-              return !!tk?.encoding && !tk.isFallbackEncoding && tk.encodingBaseName === 'o200k_base';
-            } catch {
-              return false; // unknown → treat as fallback (no credit)
-            }
-          };
-          const creditable = isCanonical(compactModelName) && isCanonical(sendModelName);
-          // truncateToTokenBudget TARGETS outputMaxTokens but is NOT guaranteed to reach it: it
-          // can exhaust its 12 proportional-shrink iterations (or hit its char floors) and return
-          // a body still ABOVE the budget. Crediting a flat outputMaxTokens*4 would then
-          // UNDER-count the sent body → media wrongly retained → post-tool overflow (recovery off
-          // once a tool ran). Apply a safety margin so the predicted compacted size stays a
-          // conservative UPPER estimate even when truncation overshoots the target, still clamped
-          // to rawBytes (compaction never grows the body).
-          const COMPACTION_OVERSHOOT_MARGIN = 1.5;
-          return creditable
-            ? Math.min(rawBytes, Math.ceil(outputMaxTokens * 4 * COMPACTION_OVERSHOOT_MARGIN))
-            : rawBytes;
+        const isCanonicalModel = (name: string | undefined): boolean => {
+          if (!name) return false;
+          try {
+            const tk = resolveConversationTokenization(name);
+            // The outputMaxTokens*4 credit assumes ≤4 bytes/token, which holds for the MODERN
+            // o200k base (GPT-4o/4.1/5/o-series). A RECOGNIZED cl100k model (GPT-4-turbo/3.5)
+            // is NOT fallback but tokenizes DENSER on non-Latin scripts (>4 B/tok) — so a
+            // token-based credit under-charges. Require o200k_base.
+            return !!tk?.encoding && !tk.isFallbackEncoding && tk.encodingBaseName === 'o200k_base';
+          } catch {
+            return false; // unknown → treat as fallback (no credit)
+          }
+        };
+        // The truncation marker inserted by truncateToTokenBudget (must match compaction.ts).
+        const TRUNCATE_MARKER = '\n\n...[tool output truncated for size]...\n\n';
+        // A GUARANTEED byte upper bound on the compacted body. truncateToTokenBudget TARGETS
+        // outputMaxTokens but is NOT guaranteed to reach it (12 proportional-shrink iterations
+        // that ignore the char floors, or a first pass that already fits) — so a flat
+        // outputMaxTokens*N credit is not a real upper bound and could UNDER-count → media
+        // wrongly retained → post-tool overflow (recovery off after a tool ran). Instead compute
+        // the DETERMINISTIC first-pass output size head+marker+tail (the shrink loop only ever
+        // REDUCES it), which is a true upper bound regardless of token density. Only when BOTH
+        // the compacting and sending models are canonical (o200k) do we also cap by
+        // outputMaxTokens*4 (safe ≤4 B/tok); otherwise the first-pass bound alone (clamped to
+        // rawBytes) is the conservative estimate.
+        const compactedBodyBytesUpperBound = (bodyText: string, rawBytes: number, totalTokens: number): number => {
+          const toolCfg = config.compaction?.tool as ToolCompactionConfig | undefined;
+          const maxTokens = toolCfg?.outputMaxTokens ?? 0;
+          if (maxTokens <= 0 || totalTokens <= maxTokens) return rawBytes;
+          const minChars = Math.max(0, toolCfg?.truncateMinChars ?? 200);
+          const headRatio = toolCfg?.truncateHeadRatio ?? 0.7;
+          const minTailChars = Math.max(0, toolCfg?.truncateMinTailChars ?? 200);
+          const ratio = Math.max(0.05, maxTokens / totalTokens);
+          const keepChars = Math.max(minChars, Math.floor(bodyText.length * ratio));
+          const headChars = Math.floor(keepChars * headRatio);
+          const tailChars = Math.max(minTailChars, keepChars - headChars);
+          // Exact first-pass output = content.slice(0,head) + marker + content.slice(-tail); its
+          // byte size is a true upper bound on the returned (only-shrinking) result.
+          const head = Math.min(headChars, bodyText.length);
+          const tail = Math.min(tailChars, bodyText.length);
+          const firstPassBytes =
+            Buffer.byteLength(bodyText.slice(0, head), 'utf8') +
+            Buffer.byteLength(TRUNCATE_MARKER, 'utf8') +
+            (tail > 0 ? Buffer.byteLength(bodyText.slice(-tail), 'utf8') : 0);
+          let bound = firstPassBytes;
+          if (isCanonicalModel(compactModelName) && isCanonicalModel(sendModelName)) {
+            bound = Math.min(bound, maxTokens * 4);
+          }
+          return Math.min(rawBytes, bound);
         };
         const predictCommittedNonMediaBytes = (r: unknown): number => {
           const toolCfg = config.compaction?.tool as ToolCompactionConfig | undefined;
@@ -2065,12 +2087,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 diffBytes = Buffer.byteLength(JSON.stringify({ _diffTracking: dt }) ?? '', 'utf8');
               }
             }
+            const bodyTotalTokens = estimateToolTokens(bodyText, modelEntry.modelConfig.modelName);
             const willCompact =
               compactionApplies &&
               !!toolCfg?.enabled &&
               toolCfg.outputMaxTokens > 0 &&
-              estimateToolTokens(bodyText, modelEntry.modelConfig.modelName) > toolCfg.triggerTokens;
-            return (willCompact ? compactedBodyBytes(rawBytes, toolCfg!.outputMaxTokens) : rawBytes) + diffBytes;
+              bodyTotalTokens > toolCfg.triggerTokens;
+            return (willCompact ? compactedBodyBytesUpperBound(bodyText, rawBytes, bodyTotalTokens) : rawBytes) + diffBytes;
           } catch {
             return 0;
           }
@@ -2291,15 +2314,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // maybeCompactToolOutput, so their body is sent RAW — don't predict shrinkage.
         const toolCompactionApplies =
           compactionSupported && toolName !== 'create_artifact' && toolName !== 'update_artifact';
+        const compactableTextTotalTokens = estimateToolTokens(compactableText, modelEntry.modelConfig.modelName);
         const willToolCompact =
           toolCompactionApplies &&
           !!toolCompactionCfg?.enabled &&
           toolCompactionCfg.outputMaxTokens > 0 &&
-          estimateToolTokens(compactableText, modelEntry.modelConfig.modelName) > toolCompactionCfg.triggerTokens;
+          compactableTextTotalTokens > toolCompactionCfg.triggerTokens;
         const compactableTextRaw = Buffer.byteLength(compactableText, 'utf8');
         const cleanedTextTokens =
-          (willToolCompact ? compactedBodyBytes(compactableTextRaw, toolCompactionCfg!.outputMaxTokens) : compactableTextRaw) +
-          diffBytes;
+          (willToolCompact
+            ? compactedBodyBytesUpperBound(compactableText, compactableTextRaw, compactableTextTotalTokens)
+            : compactableTextRaw) + diffBytes;
         // Static per-request input (system prompt + tool schemas), computed once.
         if (staticInputTokensMemo < 0) {
           // The static per-request input (assembled system prompt + tool schemas +

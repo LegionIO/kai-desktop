@@ -732,41 +732,42 @@ export async function compactConversationPrefix(
   // Boundary safety: the summary REPLACES the covered messages, so a tool CALL inside the
   // covered prefix whose paired RESULT lands OUTSIDE it (in the uncovered prefix tail or the
   // protected suffix) would be orphaned — a result with no preceding call, which providers
-  // reject. The binary search fits on token budget alone and can split such a pair. Shrink the
-  // covered prefix (drop whole messages from its tail) until no covered call has an uncovered
-  // result. Dropping only ever REDUCES tokens, so the budget still holds; if it falls below
-  // MIN_SUMMARIZED the no-op guard below returns null (nothing lost — the pair stays intact in
-  // the branch for a future turn).
+  // reject. The binary search fits on token budget alone and can split such a pair. Move the
+  // boundary back to before the EARLIEST covered call whose result is outside. Dropping messages
+  // only ever REDUCES tokens, so the budget still holds; if it falls below MIN_SUMMARIZED the
+  // no-op guard below returns null (nothing lost — the pair stays intact for a future turn).
+  // Computed in a SINGLE pass (a per-drop rescan/copy was O(n²) — a distant pair on a long
+  // history would block the main process).
   if (fittedPrefix.length >= MIN_SUMMARIZED) {
-    // Result ids present anywhere OUTSIDE the covered prefix (uncovered prefix tail + suffix).
-    const collectResultIds = (msgs: ChatMessage[]): Set<string> => {
-      const s = new Set<string>();
-      for (const m of msgs) for (const id of extractResultIds(m)) s.add(id);
-      return s;
-    };
-    let outsideResultIds = new Set<string>([
-      ...collectResultIds(prefix.slice(fittedPrefix.length)),
-      ...collectResultIds(suffix),
-    ]);
-    const coveredCallHasOutsideResult = (): boolean => {
-      for (const m of fittedPrefix) {
-        for (const cid of extractCallIds(m)) if (outsideResultIds.has(cid)) return true;
+    // First occurrence index of each result id across the WHOLE branch (prefix ++ suffix), so a
+    // covered call can locate where its result lives. Suffix results map to an index ≥ prefix.length
+    // (always "outside" the covered prefix). Single O(n) build.
+    const resultFirstIndex = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      for (const rid of extractResultIds(messages[i])) {
+        if (!resultFirstIndex.has(rid)) resultFirstIndex.set(rid, i);
       }
-      return false;
-    };
-    while (fittedPrefix.length >= MIN_SUMMARIZED && coveredCallHasOutsideResult()) {
-      fittedPrefix = fittedPrefix.slice(0, fittedPrefix.length - 1);
-      // The dropped message re-enters the uncovered region → its result ids (and any it carries)
-      // must now count as "outside". Recompute from the new boundary.
-      outsideResultIds = new Set<string>([
-        ...collectResultIds(prefix.slice(fittedPrefix.length)),
-        ...collectResultIds(suffix),
-      ]);
     }
-    // Re-tokenize the (possibly shrunk) covered prefix so the no-op guard below compares the
-    // ACTUAL covered token count against the budget.
-    if (fittedPrefix.length !== fittedLen) {
+    // The safe boundary must not leave any covered call's result outside. Walk the covered
+    // prefix once; for each call whose result index is ≥ current boundary, clamp the boundary to
+    // that call's index (drop the call + everything after). Iterating left-to-right with a
+    // shrinking boundary converges in one pass: a call at index i with result at ≥boundary forces
+    // boundary=i, and any later call is then already outside the (smaller) covered region.
+    let safeLen = fittedPrefix.length;
+    for (let i = 0; i < safeLen; i++) {
+      for (const cid of extractCallIds(prefix[i])) {
+        const ridx = resultFirstIndex.get(cid);
+        if (ridx !== undefined && ridx >= safeLen) {
+          safeLen = i; // drop this call and everything after it (its result is outside)
+          break;
+        }
+      }
+    }
+    if (safeLen !== fittedPrefix.length) {
+      fittedPrefix = safeLen >= MIN_SUMMARIZED ? prefix.slice(0, safeLen) : [];
       fittedLen = fittedPrefix.length;
+      // Re-tokenize the shrunk covered prefix so the no-op guard below compares the ACTUAL
+      // covered token count against the budget.
       candidateTokens = fittedPrefix.length >= MIN_SUMMARIZED ? await countForLength(fittedLen) : Number.POSITIVE_INFINITY;
     }
   }
