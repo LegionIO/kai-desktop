@@ -4420,21 +4420,26 @@ export function RuntimeProvider({
         };
         durablyPersistThenLaunch(20);
       } else if (ownsNew()) {
-        // No late compaction was seen at the sample above. Re-check RIGHT before launching —
-        // a stale-run compaction event can land on the accumulator in the window since the
-        // sample. If one appeared, durably persist it first (else the launched stream's reuse
-        // gate reads disk without it and re-compacts/re-bills the same prefix).
-        const lateComp = streamAccumulators.get(convId)?.pendingCompaction;
-        if (lateComp && lateComp.compactionId !== persistedCompactionId) {
-          void persistConversation(convId, newTree, newHead, {
-            runStatus: 'running',
-            conversationCompaction: lateComp,
-          }).finally(() => {
-            if (ownsNew()) launchNew();
-          });
-        } else {
-          launchNew();
-        }
+        // No late compaction was seen at the sample above. Yield one macrotask so any
+        // compaction event already queued on the IPC channel (from a stale run) can land on
+        // the accumulator, THEN re-check right before launching — the two synchronous samples
+        // above cannot observe such an event, so without this yield the recheck is dead. If one
+        // appeared, durably persist it first (else the launched stream's reuse gate reads disk
+        // without it and re-compacts/re-bills the same prefix).
+        setTimeout(() => {
+          if (!ownsNew()) return;
+          const lateComp = streamAccumulators.get(convId)?.pendingCompaction;
+          if (lateComp && lateComp.compactionId !== persistedCompactionId) {
+            void persistConversation(convId, newTree, newHead, {
+              runStatus: 'running',
+              conversationCompaction: lateComp,
+            }).finally(() => {
+              if (ownsNew()) launchNew();
+            });
+          } else {
+            launchNew();
+          }
+        }, 0);
       }
     },
     [

@@ -3988,6 +3988,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         do {
           retryAfterOverflow = false;
           fellBackThisStream = false;
+          // Per-stream: set when we forward a terminal `error` for a GUI turn, so the stream's
+          // OWN trailing `done` (mastra-agent yields error THEN done) isn't forwarded after it
+          // — a GUI error is terminal (renderer deletes the accumulator); a following `done`
+          // would recreate it from stale state + supersede the error write (error vanishes).
+          let sawTerminalStreamError = false;
           const stream = runtime.stream({
             conversationId,
             messages,
@@ -4439,6 +4444,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             if (!serverPersistedRun) overflowRecoveryTookOver = true;
             continue;
           }
+          // The stream yields a terminal `error` and THEN an unconditional `done`
+          // (mastra-agent). For a GUI turn the error is fully terminal (renderer deletes the
+          // accumulator); forwarding the trailing `done` would recreate it from stale state +
+          // supersede the error write (a provider failure would flash then vanish). Track the
+          // error and drop the following `done` for GUI turns. serverPersisted keeps its
+          // accumulator on error and needs the `done`.
+          if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
+          if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
           emit(event);
         }
         // If the just-drained stream was an overflow that we compacted, reset the
@@ -4575,28 +4588,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
           }
           if (lastInjectedHead && !controller.signal.aborted) {
-            const updated = readConversation(appHome, conversationId);
-            if (updated) {
-              const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
-              const continuationBranch = getConversationBranch(continuationTree, continuationHead);
+            const injectedHead = lastInjectedHead;
+            const injectedText = lastInjectedText;
+            // Launch the automatic continuation on `branch`, marking this conversation
+            // server-persist so the renderer takes its render-only path (no double-persist).
+            const launchContinuation = (branch: unknown[]): void => {
+              if (controller.signal.aborted) return;
+              // A superseding turn (new GUI/CLI submit) installs a new activeStreams token
+              // for this conversation; it owns its own continuation queue, so a stale
+              // continuation must not launch. This run's OWN token is already removed by the
+              // finally-block cleanup above (an absent entry means a clean finish, we still own
+              // the continuation); a present entry with a DIFFERENT token means superseded.
+              const owner = activeStreams.get(conversationId)?.token;
+              if (owner !== undefined && owner !== streamToken) return;
               pendingServerPersist.add(conversationId);
-              pendingServerPersistParent.set(conversationId, lastInjectedHead);
-              // The prior run already broadcast `done`, settling CLI/GUI clients.
-              // Re-arm them before the automatic continuation. Mark it as a
-              // continuation so CLI clients set running without rendering a
-              // duplicate user turn; renderer dedup handles the same stable id.
-              broadcastStreamEventRaw({
-                conversationId,
-                type: 'user-message',
-                text: lastInjectedText,
-                serverPersisted: true,
-                data: { messageId: lastInjectedHead, continuation: true },
-              });
+              pendingServerPersistParent.set(conversationId, injectedHead);
               queueMicrotask(() => {
                 void streamHandler(
                   null,
                   conversationId,
-                  continuationBranch,
+                  branch,
                   modelKey,
                   reasoningEffort,
                   profileKey,
@@ -4606,6 +4617,63 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   threadOverrides,
                 );
               });
+            };
+            if (serverPersistedRun) {
+              // Main owns persistence for this turn: the assistant reply + the injected user
+              // are already on disk here, so an immediate reread yields the complete branch.
+              // Re-arm CLI clients (the prior run broadcast `done`, settling them) with a
+              // continuation-tagged user-message before launching — CLI sets running without
+              // re-rendering the turn; renderer dedup handles the same stable id.
+              const updated = readConversation(appHome, conversationId);
+              if (updated) {
+                const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
+                broadcastStreamEventRaw({
+                  conversationId,
+                  type: 'user-message',
+                  text: injectedText,
+                  serverPersisted: true,
+                  data: { messageId: injectedHead, continuation: true },
+                });
+                launchContinuation(getConversationBranch(continuationTree, continuationHead));
+              }
+            } else {
+              // GUI turn: the renderer OWNS persistence + rendering. The injected user was
+              // persisted + rendered at injection time, and the just-finished assistant reply
+              // is written by the renderer ASYNCHRONOUSLY (after its `done` handler finalizes).
+              // Two things follow:
+              //  (1) Do NOT rebroadcast the user-message — the renderer already rendered it; a
+              //      rebroadcast can double-insert the same id when a text delta made the branch
+              //      tail an assistant (dedup only checks the last USER turn).
+              //  (2) Do NOT reread disk immediately — that races the renderer's assistant write,
+              //      launching the continuation without the just-produced reply in context. Poll
+              //      until disk reflects the finalized turn (the injected user is the branch tail,
+              //      i.e. the assistant reply landed and the renderer re-appended the user turn),
+              //      then launch on that confirmed branch. Bounded; fall back after the budget.
+              const pollForFinalizedBranch = (remaining: number): void => {
+                if (controller.signal.aborted) return;
+                // Bail if a superseding run took over (present entry, different token). Our own
+                // token is already cleaned up (absent) by finally — absent means we still own it.
+                const owner = activeStreams.get(conversationId)?.token;
+                if (owner !== undefined && owner !== streamToken) return;
+                const updated = readConversation(appHome, conversationId);
+                if (updated) {
+                  const { tree: continuationTree, headId: continuationHead } =
+                    ensureConversationTree(updated);
+                  const continuationBranch = getConversationBranch(continuationTree, continuationHead);
+                  const tail = continuationBranch[continuationBranch.length - 1] as
+                    | { id?: unknown }
+                    | undefined;
+                  if (tail?.id === injectedHead || remaining <= 0) {
+                    // Tail is the injected user (renderer finalized) — or budget exhausted, in
+                    // which case launch on the best available branch (reactive recovery + the
+                    // renderer's own reconciliation backstop any residual gap).
+                    launchContinuation(continuationBranch);
+                    return;
+                  }
+                }
+                setTimeout(() => pollForFinalizedBranch(remaining - 1), 100);
+              };
+              pollForFinalizedBranch(20);
             }
           }
         }
