@@ -3883,7 +3883,12 @@ export function RuntimeProvider({
               threadOverrides: acc.runConfig?.threadOverrides ?? planLive.threadOverrides,
             };
             const planCwdSnapshot = acc.runConfig?.cwd ?? currentWorkingDirectoryRef.current;
-            const planRunConfig = acc.runConfig;
+            // The restart launches in plan-first mode, so the continuation's runConfig must
+            // record executionMode:'plan-first' — NOT the original acc.runConfig (usually
+            // 'auto'). Otherwise a further max_turns continuation of the RESTARTED planning
+            // run would resume in 'auto', silently restoring mutating tools the user expects
+            // to be gated during planning.
+            const planRunConfig = { ...(acc.runConfig ?? {}), executionMode: 'plan-first' as const };
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(() => {
@@ -4272,8 +4277,8 @@ export function RuntimeProvider({
           activeIdRef.current === convId && (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
         const canRestoreNow = activeIdRef.current === convId && attachmentsRef.current.length === 0 && !composerHasNewDraft;
         if (canRestoreNow) {
-          setTree(tree);
-          setHeadId(headId);
+          setTree(baseTree);
+          setHeadId(baseHead);
           setIsRunning(false);
           if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
           restoreComposerDraft(submittedText);
@@ -4281,8 +4286,8 @@ export function RuntimeProvider({
           // Roll back the tree/running state for the active chat if it's this one, but keep
           // the input for later restoration rather than dropping it.
           if (activeIdRef.current === convId) {
-            setTree(tree);
-            setHeadId(headId);
+            setTree(baseTree);
+            setHeadId(baseHead);
             setIsRunning(false);
           }
           // Enqueue for later restoration (FIFO) rather than dropping it. The queue keeps a

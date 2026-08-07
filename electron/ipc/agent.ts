@@ -1062,7 +1062,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         type: 'error',
         error: 'Failed to load config: ' + (error instanceof Error ? error.message : String(error)),
       });
-      emit({ conversationId, type: 'done' });
+      // Trailing `done` ONLY for a serverPersisted (CLI/automation) turn — a GUI error is
+      // fully terminal (the renderer deletes the accumulator + persists idle); a following
+      // `done` would recreate it from stale React state + supersede the error write (the
+      // config error would flash then vanish). serverPersisted keeps its accumulator on error.
+      if (serverPersistedRun) emit({ conversationId, type: 'done' });
       // Clean up the activeStreams entry set above — otherwise this conversation
       // stays "busy" forever and later agent:submit calls return conversation-busy.
       cleanupStreamIfOwned(conversationId, streamToken);
@@ -1119,7 +1123,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             type: 'error',
             error: hookResult.abortReason ?? 'A plugin blocked this message before it was sent.',
           });
-          emit({ conversationId, type: 'done' });
+          if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         }
         cleanupStreamIfOwned(conversationId, streamToken);
@@ -1171,7 +1175,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             type: 'error',
             error: promptDispatch.reason ?? 'A hook blocked this message before it was sent.',
           });
-          emit({ conversationId, type: 'done' });
+          if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
         }
         cleanupStreamIfOwned(conversationId, streamToken);

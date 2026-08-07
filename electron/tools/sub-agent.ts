@@ -195,6 +195,9 @@ async function finalizeSubAgentRun(opts: {
   ownerGeneration: number;
   dbPath: string;
   config: AppConfig;
+  /** Parent routing for user-visible broadcasts (e.g. surfacing stranded follow-ups on a
+   *  non-resumable finalize). Optional — omitted callers just skip that broadcast. */
+  routing?: { parentConversationId: string; parentToolCallId: string };
 }): Promise<void> {
   const { subAgentConversationId, outcome, resumableState, ownerGeneration, dbPath, config } = opts;
   const isCurrent = (): boolean => subAgentRunGeneration.get(subAgentConversationId) === ownerGeneration;
@@ -267,9 +270,9 @@ async function finalizeSubAgentRun(opts: {
   } else if (strandedFollowUps.length > 0) {
     // NON-resumable finalize (e.g. an initial run whose prompt gate denied/threw before any
     // gated snapshot existed) with follow-ups that were accepted (ok:true, composer cleared)
-    // during the run. There is no conversation to deliver them to, so they can't be
-    // retained — surface a diagnostic so the drop is observable rather than silent. (When a
-    // fresh gated snapshot DID persist, remainsResumable is true and they survive above.)
+    // during the run. There is no resumable conversation to deliver them to — but the input
+    // was the user's, so do NOT drop it SILENTLY. Emit a user-visible note (routed to the
+    // parent) listing the undelivered messages so the user can resubmit, plus the diagnostic.
     traceDiagnostic({
       scope: 'agent',
       event: 'sub-agent.stranded-followups-dropped',
@@ -281,6 +284,20 @@ async function finalizeSubAgentRun(opts: {
         outcome: outcome.aborted ? 'aborted' : outcome.failed ? 'failed' : 'other',
       },
     });
+    // A user STOP is deliberate — don't nag about discarded follow-ups. Only surface when the
+    // run ended by gate-denial/failure (not abort) and we have routing to reach the parent.
+    if (!outcome.aborted && opts.routing) {
+      const preview = strandedFollowUps.map((m) => (m.length > 80 ? `${m.slice(0, 80)}…` : m)).join(' | ');
+      broadcastEvent({
+        subAgentConversationId,
+        parentConversationId: opts.routing.parentConversationId,
+        parentToolCallId: opts.routing.parentToolCallId,
+        conversationId: subAgentConversationId,
+        type: 'sub-agent-status',
+        status: 'failed',
+        summary: `Sub-agent ended before delivering ${strandedFollowUps.length} follow-up message(s) — please resend: ${preview}`,
+      } as SubAgentEvent);
+    }
   }
 
   // 4. DB status write. Re-check ownership AFTER the (awaited) reopen ordering:
@@ -924,6 +941,7 @@ async function resumeSubAgent(
       ownerGeneration: resumeGeneration,
       dbPath,
       config,
+      routing: { parentConversationId, parentToolCallId },
     });
 
     // Generation-aware teardown: only clears runtime if THIS resume is still the
@@ -1468,6 +1486,10 @@ export function createSubAgentTool(
           ownerGeneration: runGeneration,
           dbPath,
           config,
+          routing: {
+            parentConversationId: ctx.conversationId ?? subAgentConversationId,
+            parentToolCallId: ctx.toolCallId ?? subAgentConversationId,
+          },
         });
 
         // Re-check abort AFTER finalization: the user/parent may have stopped this
@@ -1599,6 +1621,10 @@ export function createSubAgentTool(
           ownerGeneration: runGeneration,
           dbPath,
           config,
+          routing: {
+            parentConversationId: ctx.conversationId ?? subAgentConversationId,
+            parentToolCallId: ctx.toolCallId ?? subAgentConversationId,
+          },
         });
 
         // Re-check abort AFTER finalization (the `aborted` above was snapshotted

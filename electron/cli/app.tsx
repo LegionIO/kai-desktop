@@ -1578,11 +1578,17 @@ export function App({
                   .catch(() => {});
               }
             } else {
+              // Non-busy terminal failure (not-found / cancelled / persistence). No stream
+              // started, so the backend will never echo this nonce to clear it — drop it now
+              // (else ownSubmitNoncesRef grows for the session).
+              ownSubmitNoncesRef.current.delete(submitNonce);
               setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${submitRes.error ?? 'unknown'}` }]);
               failTurnAndDrain();
             }
           }
         } catch (err) {
+          // Transport failure — no stream, no echo to clear the nonce; drop it.
+          ownSubmitNoncesRef.current.delete(submitNonce);
           setTurns((prev) => [
             ...prev,
             { kind: 'error', text: `submit failed: ${(err as { message?: string })?.message ?? err}` },
