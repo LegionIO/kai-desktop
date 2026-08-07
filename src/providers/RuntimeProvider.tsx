@@ -932,11 +932,25 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 type RejectedDraft = { text: string; attachments: AttachedFile[] };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
 const MAX_REJECTED_DRAFTS_PER_CONV = 20;
+// Global cap on the number of DISTINCT conversations holding a rejected-draft queue. Without
+// it, a user who accumulates compact-busy rejections across many dormant chats retains their
+// attachment data URLs (potentially large base64) in renderer memory indefinitely. When a new
+// conversation would exceed the cap, evict the OLDEST conversation's queue (Map preserves
+// insertion order) — its drafts are only a convenience restore, not durable state.
+const MAX_REJECTED_DRAFT_CONVERSATIONS = 64;
 function enqueueRejectedDraft(convId: string, draft: RejectedDraft): void {
   if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
   const q = rejectedDrafts.get(convId) ?? [];
   q.push(draft);
   if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift(); // bound — drop the oldest
+  // Enforce the global conversation cap only when adding a NEW conversation key.
+  if (!rejectedDrafts.has(convId)) {
+    while (rejectedDrafts.size >= MAX_REJECTED_DRAFT_CONVERSATIONS) {
+      const oldest = rejectedDrafts.keys().next().value as string | undefined;
+      if (oldest === undefined || oldest === convId) break;
+      rejectedDrafts.delete(oldest);
+    }
+  }
   rejectedDrafts.set(convId, q);
 }
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
@@ -1686,11 +1700,11 @@ async function persistConversation(
   // Register in the handoff map BEFORE the first await — else a terminal persist that gets
   // superseded during its `conversations.get()` would early-return BEFORE registering, and
   // a racing resubmit would find no handoff. Cleared below only on a confirmed persisted:true.
-  // This persist now OWNS the handoff (in-flight write), so cancel any LATE-path TTL timer for
-  // it — the persist-confirm/delete clears take over; a stale timer must not delete this entry.
+  // Arm the TTL+cap (via stashLateCompactionHandoff) so a persist that never confirms — REJECTED
+  // (busy), SUPERSEDED, or a write ERROR — doesn't leak the record forever; the confirmed-persist
+  // clear below cancels the TTL for a write that DID land.
   if (effectiveCompaction?.compactionId) {
-    clearLateCompactionHandoffTimer(conversationId);
-    pendingCompactionHandoff.set(conversationId, effectiveCompaction);
+    stashLateCompactionHandoff(conversationId, effectiveCompaction);
   }
   // Fold the inherited handoff into what's actually written (the caller didn't supply it).
   if (effectiveCompaction?.compactionId && !carriedCompaction?.compactionId) {
@@ -2898,7 +2912,19 @@ export function RuntimeProvider({
       // Both automation runs and CLI (agent:submit) turns are persisted by the
       // MAIN process; track them in one set so the renderer renders live but
       // never double-persists. `automationStreams` = "main-owned stream here".
-      if (e.automation || e.serverPersisted) automationStreams.add(convId);
+      // GATE the add on run-generation so a SUPERSEDED run's late main-owned event can't
+      // re-add the marker after a renderer (GUI) turn took over + cleared it (else the GUI
+      // replacement is treated as server-persisted → its output is never persisted and
+      // vanishes on completion). Skip when: (a) this event's generation was superseded, or
+      // (b) an accumulator exists locked to a DIFFERENT generation (a stale event for a run
+      // that no longer owns the conversation).
+      if (e.automation || e.serverPersisted) {
+        const addGen = (e as { runGeneration?: string }).runGeneration;
+        const lockedGen = streamAccumulators.get(convId)?.runGeneration;
+        const superseded = !!addGen && supersededGenerations.get(convId)?.has(addGen);
+        const staleVsLock = !!addGen && lockedGen != null && lockedGen !== addGen;
+        if (!superseded && !staleVsLock) automationStreams.add(convId);
+      }
 
       // A queued event from a SUPERSEDED run (e.g. a post-Stop delta whose Stop already
       // deleted the accumulator) must NOT CREATE a fresh accumulator here — that orphan
@@ -4377,6 +4403,13 @@ export function RuntimeProvider({
       }
 
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
+      // A renderer-initiated (GUI) turn is RENDERER-owned — it persists its own output. If it
+      // supersedes a prior CLI/automation (main-owned) turn, clear that conversation's
+      // main-owned marker; otherwise the mainOwned/mainOwnsPersistence checks would treat this
+      // GUI turn's events as server-persisted and never persist its assistant output (it would
+      // disappear on completion). A late event from the superseded run must not re-add it (the
+      // add site is generation-guarded).
+      automationStreams.delete(convId);
       streamAccumulators.set(convId, {
         messages: [...newTree],
         headId: newHead,
@@ -4398,6 +4431,10 @@ export function RuntimeProvider({
         { runStatus: 'running', ...(supersededCompaction ? { conversationCompaction: supersededCompaction } : {}) },
         supersededSeed,
       );
+      // Did the initial persist CONFIRM landing on disk? Unknown ({} from a caught write error)
+      // or superseded means the supersededCompaction it carried may NOT be on disk — the launch
+      // below must then confirm it before running (else the stream re-summarizes the raw branch).
+      const initialPersistConfirmed = persistRes?.persisted === true;
       // Main rejected the optimistic turn because a /compact holds the conversation. Roll
       // back the optimistic user message + running state and DON'T launch the stream (it
       // would be rejected too). The user can resend once compaction finishes.
@@ -4522,13 +4559,39 @@ export function RuntimeProvider({
         setTimeout(() => {
           if (!ownsNew()) return;
           const lateComp = streamAccumulators.get(convId)?.pendingCompaction;
-          if (lateComp && lateComp.compactionId !== persistedCompactionId) {
-            void persistConversation(convId, newTree, newHead, {
-              runStatus: 'running',
-              conversationCompaction: lateComp,
-            }).finally(() => {
-              if (ownsNew()) launchNew();
-            });
+          // The compaction that MUST be on disk before launching is the late one if newer,
+          // else the supersededCompaction the FIRST persist tried to write. That first persist
+          // can return UNKNOWN (catch → {}) or fail WITHOUT a rejected flag, in which case its
+          // compaction never landed — launching then reads the raw branch and re-summarizes.
+          // So confirm-then-launch whenever there is ANY intended compaction that the initial
+          // persist did not CONFIRM (persisted:true).
+          const intended =
+            lateComp && lateComp.compactionId !== persistedCompactionId
+              ? lateComp
+              : !initialPersistConfirmed && supersededCompaction
+                ? supersededCompaction
+                : undefined;
+          if (intended) {
+            const confirmThenLaunch = (remaining: number): void => {
+              if (!ownsNew()) return;
+              void persistConversation(convId, newTree, newHead, {
+                runStatus: 'running',
+                conversationCompaction: intended,
+              }).then(
+                (r) => {
+                  if (!ownsNew()) return;
+                  if (r?.persisted) launchNew();
+                  else if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 500);
+                  else launchNew(); // budget exhausted — launch anyway (reactive recovery backstops)
+                },
+                () => {
+                  if (!ownsNew()) return;
+                  if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 500);
+                  else launchNew();
+                },
+              );
+            };
+            confirmThenLaunch(20);
           } else {
             launchNew();
           }
@@ -4589,6 +4652,9 @@ export function RuntimeProvider({
         threadOverrides,
       };
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
+      // Renderer-owned GUI reload (regenerate) — clear any stale main-owned marker so its
+      // output persists (see onNew).
+      automationStreams.delete(convId);
       streamAccumulators.set(convId, {
         messages: newTree,
         headId: actualParent,
@@ -4721,6 +4787,9 @@ export function RuntimeProvider({
       setIsRunning(true);
 
       supersedeCurrentGeneration(convId); // stale run's late events must not bind the replacement accumulator
+      // Renderer-owned GUI edit — clear any stale main-owned marker so its output persists
+      // (see onNew).
+      automationStreams.delete(convId);
       // Capture THIS run's settings + CWD before the persist await so the launch + any later
       // continuation use A's workspace even if the user switches to B during the await.
       const editRunCwd = currentWorkingDirectoryRef.current;
