@@ -1023,13 +1023,31 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
 const recentlyDeletedConversations = new Map<string, number>();
 // 10 minutes: comfortably outlasts any single in-flight persist/turn (a stream that was mid
 // -flight at delete time, or a slow write) so a late persist can't resurrect a deleted
-// conversation after the tombstone expired. Still bounded + count-pruned (>256).
+// conversation after the tombstone expired.
 const DELETED_TOMBSTONE_TTL_MS = 600_000;
+// Hard cap on the tombstone map. Map preserves insertion order, so evicting the FRONT drops
+// the OLDEST tombstone — an O(1) bound that holds even when a bulk-delete of thousands of
+// chats within the TTL means NOTHING is expiry-eligible. (5000 tombstones ≈ minutes of the
+// most aggressive bulk delete; older ones are the least likely to still have an in-flight
+// persist racing them.) Throttle the expiry sweep so it isn't O(n) on EVERY insert.
+const DELETED_TOMBSTONE_MAX = 5000;
+let lastTombstoneSweep = 0;
 function tombstoneConversation(id: string): void {
   const now = Date.now();
+  recentlyDeletedConversations.delete(id); // re-insert at the back so ordering reflects recency
   recentlyDeletedConversations.set(id, now);
-  // Opportunistic prune so the map can't grow unbounded across a long session.
-  if (recentlyDeletedConversations.size > 256) {
+  // O(1) hard cap: drop the oldest (front) entries. Bounds memory + keeps the map small
+  // during a bulk delete without an O(n) scan per insert.
+  while (recentlyDeletedConversations.size > DELETED_TOMBSTONE_MAX) {
+    const oldest = recentlyDeletedConversations.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    recentlyDeletedConversations.delete(oldest);
+  }
+  // Expiry sweep at most once per minute (not per insert) — a full O(n) scan on every insert
+  // is quadratic under a bulk delete. Between sweeps, isRecentlyDeleted still lazily drops an
+  // expired entry it reads, and the hard cap bounds growth.
+  if (now - lastTombstoneSweep > 60_000) {
+    lastTombstoneSweep = now;
     for (const [k, t] of recentlyDeletedConversations) {
       if (now - t > DELETED_TOMBSTONE_TTL_MS) recentlyDeletedConversations.delete(k);
     }

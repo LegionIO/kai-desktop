@@ -175,6 +175,28 @@ describe('captureHeapSnapshot', () => {
     expect(readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length).toBe(2);
   });
 
+  it('reserves the sole slot at maxCount:1 (evicts ALL before capture, not "unlimited")', async () => {
+    // maxCount-1 = 0, which as a maxCount would mean UNLIMITED — the regression this guards:
+    // reserveSlots:1 must instead clear the directory so the one incoming snapshot has room.
+    const dir = heapSnapshotDir(logsDir);
+    mkdirSync(dir, { recursive: true });
+    const old = join(dir, 'heap-20260806T000000.heapsnapshot');
+    writeFileSync(old, Buffer.alloc(10, 1));
+    utimesSync(old, new Date(2026, 7, 6, 0, 0), new Date(2026, 7, 6, 0, 0));
+
+    let countAtCapture = -1;
+    const take = vi.fn(async (filePath: string) => {
+      countAtCapture = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length;
+      writeFileSync(filePath, Buffer.alloc(2048, 7));
+    });
+
+    const result = await captureHeapSnapshot(logsDir, take, { maxCount: 1, maxTotalBytes: 0 });
+
+    expect(countAtCapture).toBe(0); // ALL evicted before the write (not left unlimited)
+    expect(result.evicted).toContain('heap-20260806T000000.heapsnapshot');
+    expect(readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).length).toBe(1); // only the new one
+  });
+
   it('propagates a capture failure (caller re-arms)', async () => {
     const take = vi.fn(async () => {
       throw new Error('takeHeapSnapshot failed');

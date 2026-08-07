@@ -82,10 +82,24 @@ function listSnapshots(dir: string): SnapshotFile[] {
  * Pure w.r.t. policy; deletes files as a side effect. Returns evicted names.
  * Best-effort: a failed unlink is skipped (its bytes still count, so the sweep
  * can't spin) rather than throwing.
+ *
+ * `reserveSlots` (default 0) shrinks the effective count ceiling to
+ * `maxCount - reserveSlots` to make room for that many INCOMING snapshots BEFORE a capture.
+ * Unlike passing a reduced maxCount, a reserved ceiling of 0 means "evict ALL" (a full slot
+ * reserved for the one incoming), NOT "unlimited" — so reserving the sole slot at maxCount:1
+ * actually clears the directory. reserveSlots is ignored when maxCount is 0 (unlimited).
  */
-export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapshotRetention): string[] {
+export function enforceHeapSnapshotRetention(
+  dir: string,
+  retention: HeapSnapshotRetention,
+  reserveSlots = 0,
+): string[] {
   const files = listSnapshots(dir);
   const evicted: string[] = [];
+  // Effective count ceiling: 0 (unlimited) stays unlimited; otherwise subtract the reserved
+  // slots, clamped at 0 — and a reserved-to-0 ceiling means EVICT ALL (distinct from unlimited).
+  const reservedCeiling = retention.maxCount > 0 ? Math.max(0, retention.maxCount - reserveSlots) : 0;
+  const evictAllForReserve = retention.maxCount > 0 && reservedCeiling === 0;
   // Victims whose unlink FAILED — set aside so the byte loop neither retries them forever
   // nor mis-accounts their bytes as freed. Their bytes stay counted against the cap.
   const failed: SnapshotFile[] = [];
@@ -106,15 +120,14 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
     }
   };
 
-  // Count ceiling. A FAILED unlink leaves the file on disk (moved to `failed`), so the
-  // on-disk count is files.length + failed.length — drive the loop on THAT, not files.length
-  // alone. Otherwise a failed unlink followed by a successful one would stop with the cap
-  // still violated (the failed file remains on disk, uncounted). Bounded by guard: once
-  // every remaining `files` entry has failed to unlink, dropFront can't shrink `files`, so
-  // stop rather than spin.
-  if (retention.maxCount > 0) {
+  // Count ceiling (using the reserved ceiling — see reserveSlots). A FAILED unlink leaves the
+  // file on disk (moved to `failed`), so the on-disk count is files.length + failed.length —
+  // drive the loop on THAT, not files.length alone. Otherwise a failed unlink followed by a
+  // successful one would stop with the cap still violated. Bounded by guard: once every
+  // remaining `files` entry has failed to unlink, dropFront can't shrink `files`, so stop.
+  if (retention.maxCount > 0 || evictAllForReserve) {
     let guard = 0;
-    while (files.length + failed.length > retention.maxCount && files.length > 0 && guard < 1000) {
+    while (files.length + failed.length > reservedCeiling && files.length > 0 && guard < 1000) {
       dropFront(files); // always shifts one off `files` (deleted → evicted, or failed → `failed`)
       guard++;
     }
@@ -165,13 +178,11 @@ export async function captureHeapSnapshot(
   // write: an old (multi-GB) snapshot can fill the disk so that EVERY new capture fails with
   // ENOSPC before the post-capture retention below ever runs — a permanent failure loop.
   // Plain retention (to maxCount) removes NOTHING when exactly maxCount snapshots already
-  // exist within the byte cap, so the incoming (maxCount+1)-th still hits a full disk. Evict
-  // as if the new one already counts (count ceiling maxCount-1) so a full-count set makes
-  // room first. (Retention runs AGAIN after, to enforce the true ceiling incl. the new one.)
-  // maxCount 0 = unlimited → leave it unlimited (no reservation needed). Bounded, best-effort.
-  const preRetention: HeapSnapshotRetention =
-    retention.maxCount > 0 ? { ...retention, maxCount: retention.maxCount - 1 } : retention;
-  const evictedBefore = enforceHeapSnapshotRetention(dir, preRetention);
+  // exist within the byte cap, so the incoming (maxCount+1)-th still hits a full disk.
+  // reserveSlots:1 evicts down to maxCount-1 first (and, crucially, at maxCount:1 evicts ALL
+  // — a reserved ceiling of 0 means "clear", NOT "unlimited"). Retention runs AGAIN after to
+  // enforce the true ceiling incl. the new one. maxCount 0 = unlimited → no reservation.
+  const evictedBefore = enforceHeapSnapshotRetention(dir, retention, 1);
   try {
     await take(path);
   } catch (err) {

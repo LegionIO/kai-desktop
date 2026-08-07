@@ -2779,7 +2779,6 @@ export function RuntimeProvider({
       // would make the conversation look perpetually running AND suppress external updates
       // (the onChanged reload skips a conv with a live accumulator). The generation guard
       // below only runs once an accumulator EXISTS, so check supersession BEFORE creating.
-      // (compaction events are exempt — their handoff is captured against an existing acc.)
       if (!streamAccumulators.has(convId) && e.type !== 'compaction') {
         const evGenPre = (e as { runGeneration?: string }).runGeneration;
         const evRidPre = (e as { responseMessageId?: string }).responseMessageId;
@@ -2789,6 +2788,35 @@ export function RuntimeProvider({
         ) {
           return; // stale superseded event with no accumulator — drop, don't create an orphan
         }
+      }
+
+      // A late `compaction` event whose turn's accumulator is already GONE (Stop deleted it,
+      // or the turn ended) must NOT create/rebuild one — that would resurrect a stopped turn
+      // from stale tree/head + schedule a `running` persist (losing the cancellation head and
+      // suppressing external reloads). But the paid summary is still worth keeping: stash it
+      // in the survives-deletion handoff map so a FUTURE turn can reuse it. Then stop.
+      if (!streamAccumulators.has(convId) && e.type === 'compaction') {
+        const cd = e.data as
+          | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string>; compactionRevision?: number }
+          | undefined;
+        if (
+          cd &&
+          typeof cd.compactionId === 'string' &&
+          typeof cd.summaryText === 'string' &&
+          Array.isArray(cd.compactedMessageIds) &&
+          cd.compactedMessageIds.every((id) => typeof id === 'string' && id.length > 0)
+        ) {
+          pendingCompactionHandoff.set(convId, {
+            compactionId: cd.compactionId,
+            summaryText: cd.summaryText,
+            compactedMessageIds: cd.compactedMessageIds,
+            boundaryHeadId: null,
+            createdAt: nowIso(),
+            ...(cd.coveredContentSig ? { coveredContentSig: cd.coveredContentSig } : {}),
+            ...(typeof cd.compactionRevision === 'number' ? { compactionRevision: cd.compactionRevision } : {}),
+          });
+        }
+        return;
       }
 
       if (!streamAccumulators.has(convId)) {
