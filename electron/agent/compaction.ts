@@ -676,21 +676,6 @@ export async function compactConversationPrefix(
   // it's over budget. (Looping-then-shifting would be pure wasted O(n²)
   // serialization + repeated worker encodes, since the shifted result is rejected
   // anyway.)
-  const fittedPrefix = prefix;
-  // The summarizer request contains ONLY the serialized (media-stripped) prefix —
-  // no native media rides along, because the prefix's images are being summarized
-  // AWAY (replaced by the text summary), not sent to a model. Each stripped image/
-  // file leaves a short TEXT placeholder (see stripMediaForSerialization) so the
-  // summarizer still knows the attachment existed and can reference it. The
-  // summarizer budget counts the stripped text ONLY; adding the prefix media's
-  // native tokens here would over-charge (~524k for a 1MB image) and wrongly
-  // null-out compaction for exactly the media-heavy histories this most needs to
-  // compact. (The SUFFIX media IS retained + sent to the final model — that's
-  // counted below in the final compactedTokens check.)
-  const { messages: serializablePrefix } = await stripMediaForSerialization(fittedPrefix, {
-    countMedia: false,
-    signal,
-  });
   // Count the summarizer BODY the same way its prompt is counted: EXACT o200k only for
   // a canonical model; the UTF-8 BYTE ceiling for a fallback-encoding model (an unknown
   // alias backed by e.g. cl100k tokenizes denser than o200k — encodeCappedWithAsync
@@ -699,12 +684,43 @@ export async function compactConversationPrefix(
     tokenization.isFallbackEncoding
       ? Buffer.byteLength(text, 'utf8')
       : encodeCappedWithAsync(text, tokenization, signal);
-  const candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
-  // Cancelled during the (off-thread) encode, or the whole prefix doesn't fit the
-  // SUMMARIZER-INPUT budget → null no-op (no message loss, no wasted retries).
+
+  // Fit the prefix to the SUMMARIZER-INPUT budget. We NEVER DROP a message (dropping would
+  // silently lose it — neither summarized nor kept). But an eligible prefix LARGER than the
+  // summarizer budget (e.g. a 140K history on a 128K model) must not be all-or-nothing
+  // rejected — that leaves the conversation permanently unrecoverable. Instead summarize the
+  // OLDEST FITTING SUBSET (prefix[0..k)); the newer, still-uncovered prefix messages
+  // (prefix[k..]) STAY in the branch (placed after the summary, before the suffix) to be
+  // compacted on a future turn. Shrink from the TAIL of the prefix (drop the newest prefix
+  // message toward the boundary) until it fits, requiring at least 2 messages summarized
+  // (a 1-message "summary" isn't worth a paid call + placeholder). Bounded: at most
+  // prefix.length probes, and only when the whole prefix is over budget (the common case
+  // encodes ONCE and fits).
+  const MIN_SUMMARIZED = 2;
+  let fittedPrefix = prefix;
+  let serializablePrefix = (await stripMediaForSerialization(fittedPrefix, { countMedia: false, signal })).messages;
+  let candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
+  while (
+    !signal?.aborted &&
+    candidateTokens > summarizerInputBudget &&
+    fittedPrefix.length > MIN_SUMMARIZED
+  ) {
+    fittedPrefix = fittedPrefix.slice(0, -1); // drop the NEWEST prefix message (keep it in-branch)
+    serializablePrefix = (await stripMediaForSerialization(fittedPrefix, { countMedia: false, signal })).messages;
+    candidateTokens = await countBody(serializeForTokenCounting(serializablePrefix));
+  }
+  // The prefix's images are summarized AWAY (replaced by the text summary), not sent — so the
+  // summarizer budget counts only the stripped-text placeholders (see stripMediaForSerialization),
+  // NOT the prefix media's native tokens (adding those would over-charge ~524k for a 1MB image
+  // and wrongly null-out compaction for exactly the media-heavy histories this most needs).
+  // Cancelled during an (off-thread) encode, or even the oldest MIN_SUMMARIZED messages don't
+  // fit the SUMMARIZER-INPUT budget → null no-op (no message loss, no wasted retries).
   if (signal?.aborted || candidateTokens > summarizerInputBudget) {
     return { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
   }
+  // Messages shifted out of fittedPrefix to fit the budget are NOT summarized — keep them
+  // in the branch (after the summary) so they're neither lost nor mislabeled as compacted.
+  const uncoveredPrefix = prefix.slice(fittedPrefix.length);
 
   // Generate summary
   const { Agent } = await import('@mastra/core/agent');
@@ -836,7 +852,11 @@ export async function compactConversationPrefix(
     .filter((id): id is string => typeof id === 'string' && id.length > 0);
   const compactedMessageIds = fittedPrefixIds.length === fittedPrefix.length ? fittedPrefixIds : [];
 
-  const compactedMessages: ChatMessage[] = [summaryMessage, ...suffix];
+  // The summary represents fittedPrefix (the OLDEST k messages). Any prefix messages shifted
+  // out to fit the budget (uncoveredPrefix, the NEWER prefix) stay in the branch AFTER the
+  // summary and BEFORE the suffix — neither lost nor double-counted. When the whole prefix
+  // fit, uncoveredPrefix is empty and this is the usual [summary, ...suffix].
+  const compactedMessages: ChatMessage[] = [summaryMessage, ...uncoveredPrefix, ...suffix];
 
   // Final safety: verify the compacted request (summary + retained suffix) fits the
   // NEXT-TURN budget (reduced by that turn's static excess, not the summarizer's). Even

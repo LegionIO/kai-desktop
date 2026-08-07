@@ -578,7 +578,7 @@ type SubAgentActions = {
   threads: Map<string, SubAgentThreadState>;
   sendMessage: (subAgentConversationId: string, text: string) => Promise<boolean>;
   stop: (subAgentConversationId: string) => Promise<boolean>;
-  deleteThread: (subAgentConversationId: string) => void;
+  deleteThread: (subAgentConversationId: string) => void | Promise<void>;
   navigateTo: (subAgentConversationId: string) => void;
   activeSubAgentView: string | null;
   setActiveSubAgentView: (id: string | null) => void;
@@ -2126,15 +2126,22 @@ export function RuntimeProvider({
     setCurrentWorkingDirectoryState(conv.currentWorkingDirectory ?? null);
 
     // Restore an input that a compact-busy rollback couldn't return to the composer at the
-    // time (the user had switched away or started a newer draft). Only restore into an EMPTY
-    // composer so we never clobber a draft the user is actively typing for this chat.
-    const rejected = rejectedDrafts.get(id);
-    if (rejected) {
-      rejectedDrafts.delete(id);
-      if (rejected.attachments.length > 0 && attachmentsRef.current.length === 0) {
-        addAttachments(rejected.attachments);
-      }
-      restoreComposerDraft(rejected.text);
+    // time (the user had switched away or started a newer draft). DEFER past this tick: the
+    // setActiveConversationId above hasn't committed yet, so activeIdRef + the composer still
+    // point at the PREVIOUS chat — restoring now would misroute. After the commit, re-verify
+    // this conversation is still the active one AND the composer is empty (never clobber a
+    // live draft), and only THEN consume the stash so a failed/misrouted restore keeps it.
+    if (rejectedDrafts.has(id)) {
+      setTimeout(() => {
+        if (activeIdRef.current !== id) return; // user switched again — keep the stash
+        const rejected = rejectedDrafts.get(id);
+        if (!rejected) return;
+        const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
+        if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return; // don't clobber
+        rejectedDrafts.delete(id);
+        if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+        restoreComposerDraft(rejected.text);
+      }, 0);
     }
 
     // Don't show the running indicator for conversations awaiting user approval —
@@ -2409,7 +2416,26 @@ export function RuntimeProvider({
         }
       })
       .catch(() => {
-        /* transport errors surface via the stream-event channel / existing handling */
+        // The agent:stream INVOKE itself rejected — e.g. a web-socket disconnect before the
+        // request reached main, so NO stream events (not even a terminal one) will arrive.
+        // Without a synthesized terminal the accumulator + persisted runStatus:'running' are
+        // stuck forever. Synthesize an error ONLY if we still own the accumulator for this
+        // run (a real run whose events already settled/superseded it has a different
+        // pendingAssistantId, so we won't double-terminate it).
+        if (
+          typeof responseMessageId === 'string' &&
+          streamAccumulators.get(conversationId)?.pendingAssistantId === responseMessageId
+        ) {
+          const h = streamEventHandlerRef.current;
+          if (h) {
+            h({
+              conversationId,
+              type: 'error',
+              error: 'The connection dropped before the request could start. Please retry.',
+              responseMessageId,
+            });
+          }
+        }
       });
   }, []);
 
@@ -3449,8 +3475,13 @@ export function RuntimeProvider({
               }
             });
           };
-          if (acc.pendingCompaction) launchAfterCompactionPersist(300, continuationPersist);
-          else launchContinuation();
+          // Always gate the launch on the START persist's outcome — even with NO compaction
+          // record. A concurrent /compact rejects the running-status persist as busy; the
+          // continuation is MANDATORY (the run hit max_turns), so launching regardless would
+          // hit a busy backend and terminate the work. launchAfterCompactionPersist handles
+          // all outcomes (persisted → launch; rejected/unknown/superseded → retry-or-abandon)
+          // and is compaction-agnostic.
+          launchAfterCompactionPersist(300, continuationPersist);
           return;
         }
 
@@ -4570,22 +4601,37 @@ export function RuntimeProvider({
   );
 
   const deleteSubAgentThread = useCallback(
-    (subAgentConversationId: string) => {
+    async (subAgentConversationId: string) => {
       // Tombstone the id BEFORE stopping, so the `stopped` status that stopSubAgent
       // broadcasts asynchronously (and any other late event) can't recreate this
       // just-deleted thread — the event router drops tombstoned ids.
       deletedSubAgentIds.add(subAgentConversationId);
-      // Tell the BACKEND to stop — for a paused/capacity-deferred child this purges
-      // its retained resumable state + pending-resume queue, so a queued follow-up
-      // can't execute (with side effects) after the user deleted it. Deleting only
-      // renderer state would leave that backend work armed.
-      void app.agent.stopSubAgent(subAgentConversationId).catch((err) => {
-        console.error('[Runtime] Failed to stop sub-agent on delete:', err);
-      });
+      // Snapshot the thread so we can RE-INSTATE it if the backend stop fails — otherwise a
+      // web transport failure would hide the thread from the UI while the agent keeps
+      // executing tools invisibly.
+      const snapshot = globalSubAgentThreads.get(subAgentConversationId);
+      const accSnapshot = globalSubAgentAccumulators.get(subAgentConversationId);
+      const wasActiveView = activeSubAgentView === subAgentConversationId;
+      // Optimistically remove from the UI (responsive), then confirm the backend stop.
       globalSubAgentThreads.delete(subAgentConversationId);
       globalSubAgentAccumulators.delete(subAgentConversationId);
-      if (activeSubAgentView === subAgentConversationId) setActiveSubAgentView(null);
+      if (wasActiveView) setActiveSubAgentView(null);
       bumpSubAgentVersion();
+      // Tell the BACKEND to stop — for a paused/capacity-deferred child this purges its
+      // retained resumable state + pending-resume queue, so a queued follow-up can't execute
+      // (with side effects) after the user deleted it. If the stop FAILS (e.g. web transport
+      // drop), the agent may still be running: un-tombstone + re-instate the thread so it's
+      // visible again rather than executing invisibly, and surface the failure.
+      try {
+        const res = (await app.agent.stopSubAgent(subAgentConversationId)) as { ok?: boolean } | undefined;
+        if (res?.ok === false) throw new Error('backend reported stop failure');
+      } catch (err) {
+        console.error('[Runtime] Failed to stop sub-agent on delete — re-instating:', err);
+        deletedSubAgentIds.delete(subAgentConversationId);
+        if (snapshot) globalSubAgentThreads.set(subAgentConversationId, snapshot);
+        if (accSnapshot) globalSubAgentAccumulators.set(subAgentConversationId, accSnapshot);
+        bumpSubAgentVersion();
+      }
     },
     [bumpSubAgentVersion, activeSubAgentView],
   );

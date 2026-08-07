@@ -204,6 +204,11 @@ export function App({
   // for the same turn. Only the first terminal event of a turn drains one
   // queued message. Reset when a new turn starts (sendMessage).
   const turnSettledRef = useRef<boolean>(false);
+  // Monotonic epoch bumped whenever a turn settles (done/error → settleTurn) or the session
+  // otherwise goes idle. An async busy-probe (agent:in-flight) snapshots this before its
+  // await and only applies its `running` result if the epoch is UNCHANGED — otherwise a
+  // `done` that settled the turn during the probe would be clobbered back to 'running'.
+  const settleEpochRef = useRef<number>(0);
   // Submit nonces this CLI originated. The backend echoes the nonce in the
   // broadcast `user-message` event; we skip rendering our OWN echo (we already
   // showed the turn optimistically), but render turns submitted elsewhere (GUI).
@@ -415,6 +420,7 @@ export function App({
     const settleTurn = (): void => {
       if (turnSettledRef.current) return;
       turnSettledRef.current = true;
+      settleEpochRef.current++; // invalidate any in-flight busy-probe that would force 'running'
       if (queueRef.current.length > 0) {
         const next = queueRef.current.shift() as string;
         setTimeout(() => sendMessageRef.current(next), 0);
@@ -945,9 +951,13 @@ export function App({
               // /compact and this busy response resolving; forcing 'running' then would strand
               // the CLI permanently running with queued prompts. Confirm the turn is still
               // in-flight; if not, drain one queued prompt (or go idle) instead.
+              const probeEpoch = settleEpochRef.current;
               void client
                 .invoke<boolean>('agent:in-flight', convIdRef.current)
                 .then((inFlight) => {
+                  // A `done` that settled the turn during the probe bumped the epoch — its
+                  // idle/drain is authoritative; don't clobber it back to 'running'.
+                  if (settleEpochRef.current !== probeEpoch) return;
                   if (inFlight) {
                     setStatus('running');
                     statusRef.current = 'running';
@@ -964,6 +974,7 @@ export function App({
                 .catch(() => {
                   // Can't confirm — fall back to the prior behavior (stay running; the
                   // turn's `done` or a reconnect drain will reconcile).
+                  if (settleEpochRef.current !== probeEpoch) return;
                   setStatus('running');
                   statusRef.current = 'running';
                 });
@@ -1435,7 +1446,7 @@ export function App({
           // agent:submit RESOLVES with { ok:false } (doesn't throw) when the
           // conversation is gone — treat that as a terminal error so the turn
           // doesn't sit 'running' forever with no stream event to settle it.
-          const res = await client.invoke<{ ok?: boolean; error?: string }>(
+          const res = await client.invoke<{ ok?: boolean; error?: string; busyKind?: string }>(
             'agent:submit',
             convIdRef.current,
             toSubmit,
@@ -1445,9 +1456,27 @@ export function App({
               ...(attachments && attachments.length > 0 ? { attachments } : {}),
             },
           );
-          if (res && res.ok === false) {
-            setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${res.error ?? 'unknown'}` }]);
-            failTurnAndDrain();
+          const submitRes = res;
+          if (submitRes && submitRes.ok === false) {
+            // conversation-busy = a cross-client /compact OR an active turn holds the lock.
+            // Do NOT failTurnAndDrain: draining would submit the NEXT queued prompt into the
+            // SAME lock → reject → recursively drain + DISCARD every queued prompt. Instead
+            // re-enqueue this prompt at the FRONT and wait for the right unlock:
+            //  - compaction → the conversations:compacting=false broadcast drains (busy-wait).
+            //  - turn → that turn's own terminal `done` reaches us and settleTurn drains.
+            if (submitRes.error === 'conversation-busy') {
+              queueRef.current.unshift(trimmed);
+              setStatus('running');
+              statusRef.current = 'running';
+              if (submitRes.busyKind === 'compaction') compactBusyWaitRef.current = true;
+              setTurns((prev) => [
+                ...prev,
+                { kind: 'error', text: 'Conversation is busy — your message is queued and will send when it frees up.' },
+              ]);
+            } else {
+              setTurns((prev) => [...prev, { kind: 'error', text: `submit failed: ${submitRes.error ?? 'unknown'}` }]);
+              failTurnAndDrain();
+            }
           }
         } catch (err) {
           setTurns((prev) => [

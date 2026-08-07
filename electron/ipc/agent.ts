@@ -4838,7 +4838,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         activeStreams.has(conversationId) ||
         isCompacting(conversationId)
       ) {
-        return { ok: false, error: 'conversation-busy' };
+        // Distinguish a COMPACTION lock (drains on the conversations:compacting broadcast)
+        // from an active TURN (drains on that turn's own terminal `done`) so a client can
+        // wait on the RIGHT unlock signal instead of draining a queued prompt into the lock.
+        const busyKind = isCompacting(conversationId) ? 'compaction' : 'turn';
+        return { ok: false, error: 'conversation-busy', busyKind };
       }
 
       // Build the user message content: the text part plus any validated image

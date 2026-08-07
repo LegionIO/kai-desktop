@@ -1013,7 +1013,10 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
  * NEW conversation is never tombstoned.
  */
 const recentlyDeletedConversations = new Map<string, number>();
-const DELETED_TOMBSTONE_TTL_MS = 60_000;
+// 10 minutes: comfortably outlasts any single in-flight persist/turn (a stream that was mid
+// -flight at delete time, or a slow write) so a late persist can't resurrect a deleted
+// conversation after the tombstone expired. Still bounded + count-pruned (>256).
+const DELETED_TOMBSTONE_TTL_MS = 600_000;
 function tombstoneConversation(id: string): void {
   const now = Date.now();
   recentlyDeletedConversations.set(id, now);
@@ -1139,6 +1142,10 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
 export function clearAllConversations(appHome: string): void {
   // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
   assertMigratedBeforeWrite(appHome);
+  // Tombstone every id being cleared so a stale in-flight persist (a running stream, or a
+  // trusted client that read a record before the clear) can't resurrect a wiped conversation.
+  const priorIndex = readIndex(appHome);
+  for (const id of Object.keys(priorIndex.conversations)) tombstoneConversation(id);
   const dir = conversationsDir(appHome);
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
@@ -1151,7 +1158,7 @@ export function clearAllConversations(appHome: string): void {
       }
     }
   }
-  writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: readIndex(appHome).settings });
+  writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: priorIndex.settings });
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────
