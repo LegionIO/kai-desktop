@@ -877,10 +877,14 @@ export function registerConversationHandlers(
   });
 
   ipcMain.handle('conversations:delete', (_event, id: string) => {
-    // Abort any live stream/submit for this conversation FIRST — otherwise its tools and
-    // side effects keep running after the record is deleted.
+    // Delete FIRST (synchronous), then act on the result. deleteConversation now preserves
+    // the conversation if its file rm fails — cancelling/broadcasting before confirming
+    // would abort a valid run + broadcast a deletion for a conversation still on disk.
+    const removed = deleteConversation(appHome, id);
+    if (!removed) return { ok: false, error: 'delete-failed' };
+    // Abort any live stream/submit for the (now-deleted) conversation so its tools and
+    // side effects don't keep running. No await between delete and cancel, so no tool runs.
     cancelConversationStream(id);
-    deleteConversation(appHome, id);
     broadcastDelete(appHome, id);
     clearConversationDiffs(id);
 
@@ -924,7 +928,7 @@ export function registerConversationHandlers(
         // Computer-use module may not be initialized yet — safe to ignore
       }
     }
-    return { ok: true, deleted: removed.length };
+    return { ok: true, deleted: removed.length, removedIds: removed };
   });
 
   ipcMain.handle('conversations:clear', () => {

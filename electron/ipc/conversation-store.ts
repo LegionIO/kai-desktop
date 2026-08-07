@@ -1004,6 +1004,37 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
 }
 
 /**
+ * Recently-deleted conversation ids with the wall-clock time of deletion. A persist can
+ * read a conversation, another client can DELETE it, and then the stale write recreates it
+ * ("resurrection") — writeConversation would treat the now-absent id as a fresh creation.
+ * A short-lived tombstone lets writeConversation SKIP a write that would resurrect a
+ * just-deleted conversation. TTL bounds the set AND allows the (never-actually-happening)
+ * case of an id being legitimately reused later. Ids are unique per creation, so a genuine
+ * NEW conversation is never tombstoned.
+ */
+const recentlyDeletedConversations = new Map<string, number>();
+const DELETED_TOMBSTONE_TTL_MS = 60_000;
+function tombstoneConversation(id: string): void {
+  const now = Date.now();
+  recentlyDeletedConversations.set(id, now);
+  // Opportunistic prune so the map can't grow unbounded across a long session.
+  if (recentlyDeletedConversations.size > 256) {
+    for (const [k, t] of recentlyDeletedConversations) {
+      if (now - t > DELETED_TOMBSTONE_TTL_MS) recentlyDeletedConversations.delete(k);
+    }
+  }
+}
+function isRecentlyDeleted(id: string): boolean {
+  const t = recentlyDeletedConversations.get(id);
+  if (t === undefined) return false;
+  if (Date.now() - t > DELETED_TOMBSTONE_TTL_MS) {
+    recentlyDeletedConversations.delete(id);
+    return false;
+  }
+  return true;
+}
+
+/**
  * Write one conversation file and update its index entry (single-file cost).
  * Returns the record actually written — which may be a SANITIZED/backfilled copy
  * (dedup, cycle-break, head repoint, tokenCount backfill) differing from the
@@ -1028,6 +1059,15 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
     /* best-effort — fall back to fresh backfill */
   }
   const sanitized = sanitizeConversationTree(conv, priorTree);
+  // Resurrection guard: if this id was RECENTLY DELETED and is not currently in the index,
+  // a stale in-flight persist is trying to recreate it. SKIP the write (return the record
+  // to the caller unchanged) rather than resurrect a deleted conversation with stale
+  // messages + run state. A conversation still present in the index (a normal update, or a
+  // legitimate recreate before the tombstone was set) writes normally.
+  if (isRecentlyDeleted(sanitized.id)) {
+    const idx = readIndex(appHome);
+    if (!idx.conversations[sanitized.id]) return sanitized;
+  }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   const index = readIndex(appHome);
   index.conversations[sanitized.id] = toIndexEntry(sanitized);
@@ -1035,22 +1075,33 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   return sanitized;
 }
 
-export function deleteConversation(appHome: string, id: string): void {
+/** Delete a single conversation. Returns true iff the data file is GONE (removed now, or
+ *  already absent) and the index entry was dropped — mirrors {@link deleteConversations}'
+ *  preserve-on-rm-failure semantics so a failed rm keeps the conversation intact (and the
+ *  caller can avoid cancelling/broadcasting for a delete that didn't happen). */
+export function deleteConversation(appHome: string, id: string): boolean {
   // Migrate first (and refuse if migration is pending) so a subsequent
   // readIndex() can't recreate the file we delete or strand old chats.
   assertMigratedBeforeWrite(appHome);
+  let fileGone = false;
   try {
     const p = conversationPath(appHome, id);
     if (existsSync(p)) rmSync(p);
+    fileGone = true;
   } catch {
-    /* ignore */
+    fileGone = false; // removal failed — retain the conversation (index entry + file)
   }
+  if (!fileGone) return false;
+  // Tombstone only once the file is actually gone, so a stale in-flight persist can't
+  // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
+  tombstoneConversation(id);
   const index = readIndex(appHome);
   if (index.conversations[id]) {
     delete index.conversations[id];
     if (index.activeConversationId === id) index.activeConversationId = null;
     writeIndex(appHome, index);
   }
+  return true;
 }
 
 /** Batch delete: removes each conversation file and its index entry with a SINGLE
@@ -1076,6 +1127,8 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     if (fileGone && index.conversations[id]) {
       delete index.conversations[id];
       if (index.activeConversationId === id) index.activeConversationId = null;
+      // Tombstone so a stale in-flight persist can't resurrect this just-deleted id.
+      tombstoneConversation(id);
       removed.push(id);
     }
   }

@@ -455,7 +455,14 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             label="Auto-capture heap snapshot on high memory"
             checked={heapSnapshot?.enabled ?? false}
             onChange={(value) => void updateConfig('diagnostics.memoryDiagnostics.heapSnapshot.enabled', value)}
+            disabled={!memoryDiagnostics?.enabled}
           />
+          {!memoryDiagnostics?.enabled && (
+            <p className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">
+              Requires memory diagnostics (the heap heartbeat) to be enabled above — snapshot capture is driven by the
+              heartbeat, so it never fires while that is off.
+            </p>
+          )}
           <p className="mt-1 text-[10px] text-muted-foreground">
             When the renderer heap crosses the threshold, one <span className="font-mono">.heapsnapshot</span> is written
             to <span className="font-mono">~/.kai/logs/heap-snapshots/</span> — it names the objects retaining memory,

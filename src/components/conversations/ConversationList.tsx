@@ -375,10 +375,14 @@ export const ConversationList: FC<ConversationListProps> = ({
   const handleDeleteFiltered = useCallback(async () => {
     const ids = processedConversations.map((c) => c.id);
     if (ids.length === 0) return;
-    const deletingActive = activeConversationId != null && ids.includes(activeConversationId);
-    await app.conversations.deleteMany(ids);
+    const res = await app.conversations.deleteMany(ids);
     await loadConversations();
-    if (deletingActive) await onNewConversation();
+    // Start a new chat only if the ACTIVE conversation was actually removed (a partial
+    // failure can retain it) — use removedIds, falling back to the requested set.
+    const removed = res?.removedIds ?? ids;
+    if (activeConversationId != null && removed.includes(activeConversationId)) {
+      await onNewConversation();
+    }
   }, [processedConversations, activeConversationId, loadConversations, onNewConversation]);
 
   const handleDelete = async (id: string) => {

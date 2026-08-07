@@ -912,10 +912,33 @@ export function App({
                 .catch(() => {});
             } else if (compactBusy) {
               // busyKind 'turn' (or unspecified): an active TURN owns the conversation. Its
-              // terminal `done` reaches us and settleTurn drains the queue — so keep the
-              // queue + stay 'running'; do NOT wait on the compacting broadcast (none comes).
-              setStatus('running');
-              statusRef.current = 'running';
+              // terminal `done` reaches us and settleTurn drains the queue — so stay 'running'.
+              // BUT the turn may have ALREADY settled (its `done` arrived) between issuing
+              // /compact and this busy response resolving; forcing 'running' then would strand
+              // the CLI permanently running with queued prompts. Confirm the turn is still
+              // in-flight; if not, drain one queued prompt (or go idle) instead.
+              void client
+                .invoke<boolean>('agent:in-flight', convIdRef.current)
+                .then((inFlight) => {
+                  if (inFlight) {
+                    setStatus('running');
+                    statusRef.current = 'running';
+                  } else if (queueRef.current.length > 0) {
+                    const next = queueRef.current.shift() as string;
+                    setStatus('running');
+                    statusRef.current = 'running';
+                    setTimeout(() => sendMessageRef.current(next), 0);
+                  } else {
+                    setStatus('idle');
+                    statusRef.current = 'idle';
+                  }
+                })
+                .catch(() => {
+                  // Can't confirm — fall back to the prior behavior (stay running; the
+                  // turn's `done` or a reconnect drain will reconcile).
+                  setStatus('running');
+                  statusRef.current = 'running';
+                });
             } else if (queueRef.current.length > 0) {
               const next = queueRef.current.shift() as string;
               setStatus('running');

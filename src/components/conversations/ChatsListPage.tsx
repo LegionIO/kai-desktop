@@ -298,11 +298,16 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   }, [selectedIds, filterMode, loadConversations]);
 
   const handleBulkDelete = useCallback(async () => {
-    const deletingActive = activeConversationId != null && selectedIds.has(activeConversationId);
-    await app.conversations.deleteMany([...selectedIds]);
+    const res = await app.conversations.deleteMany([...selectedIds]);
     setSelectedIds(new Set());
     await loadConversations();
-    if (deletingActive) await onNewConversation();
+    // Detach the UI only if the ACTIVE conversation was actually removed (a partial-failure
+    // delete can retain it — removedIds reflects what truly went away). Fall back to the
+    // requested set when the backend didn't report removedIds.
+    const removed = res?.removedIds ?? [...selectedIds];
+    if (activeConversationId != null && removed.includes(activeConversationId)) {
+      await onNewConversation();
+    }
   }, [activeConversationId, selectedIds, loadConversations, onNewConversation]);
 
   const handleRowContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>, convId: string) => {
@@ -409,11 +414,15 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const handleDeleteView = useCallback(async () => {
     const ids = processed.map((c) => c.id);
     if (ids.length === 0) return;
-    const deletingActive = activeConversationId != null && ids.includes(activeConversationId);
-    await app.conversations.deleteMany(ids);
+    const res = await app.conversations.deleteMany(ids);
     setSelectedIds(new Set());
     await loadConversations();
-    if (deletingActive) await onNewConversation();
+    // Detach only if the ACTIVE conversation was actually removed (partial failure can
+    // retain it) — use removedIds, falling back to the requested set if unavailable.
+    const removed = res?.removedIds ?? ids;
+    if (activeConversationId != null && removed.includes(activeConversationId)) {
+      await onNewConversation();
+    }
   }, [processed, activeConversationId, loadConversations, onNewConversation]);
 
   const isSelecting = selectedIds.size > 0;
