@@ -2868,6 +2868,13 @@ export function RuntimeProvider({
       // suppressing external reloads). But the paid summary is still worth keeping: stash it
       // in the survives-deletion handoff map so a FUTURE turn can reuse it. Then stop.
       if (!streamAccumulators.has(convId) && e.type === 'compaction') {
+        // A MAIN-OWNED compaction (automation / CLI / background turn) is already persisted to
+        // disk by main, so the renderer must NOT stash it in the handoff map: that stash is
+        // only ever cleared by a renderer-driven persistConversation returning persisted:true
+        // (or a future turn / delete), so for main-owned turns it would leak for the renderer's
+        // lifetime across every inactive conversation. A future renderer turn reads the
+        // compaction from disk anyway (main already wrote it), so the stash serves no purpose.
+        if (e.automation || e.serverPersisted) return;
         const cd = e.data as
           | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string>; compactionRevision?: number }
           | undefined;
@@ -4336,7 +4343,16 @@ export function RuntimeProvider({
         // await this persist while a Stop or a superseding turn (run C) replaces the
         // accumulator with a new pendingAssistantId; our stale rejection must not delete
         // C's accumulator (which would strand C's run) nor restore our stale tree/draft.
-        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
+        // But our OWN submitted text + attachments were already cleared from the composer at
+        // submit time, so even when we no longer own the accumulator we must ENQUEUE them (a
+        // conversation-keyed FIFO stash that touches neither the accumulator nor the active
+        // tree/UI) — else the rejected submission is permanently lost.
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) {
+          if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+            enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
+          }
+          return;
+        }
         streamAccumulators.delete(convId);
         // Restore the submitted input so it isn't lost. If THIS conversation is active AND
         // the composer is empty, put it straight back. Otherwise (the user switched to
@@ -4653,7 +4669,16 @@ export function RuntimeProvider({
       // /compact holds the conversation: roll back the optimistic edit, restore the
       // composer draft, and don't launch (the stream would be rejected too).
       if (editPersistRes?.rejected) {
-        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
+        // If a Stop / superseding turn replaced the accumulator during the await we no longer
+        // own it (must not delete it / touch the tree), but the edited text was already
+        // consumed — ENQUEUE it (conversation-keyed FIFO, touches no accumulator/tree) so it
+        // isn't permanently lost.
+        if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) {
+          if (editedText.trim().length > 0) {
+            enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
+          }
+          return;
+        }
         streamAccumulators.delete(convId);
         // Roll back the optimistic edit + restore the edited text so it isn't lost. Mirror
         // onNew: only put the text straight back if THIS chat is active AND the composer is
