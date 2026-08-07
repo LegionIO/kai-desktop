@@ -5093,15 +5093,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       );
       if (!promptWrite) return { ok: false, error: 'conversation-busy' };
 
+      // The authoritative user-message id (the just-appended node = the new head) + its parent,
+      // read from the write result, so the broadcast carries the SAME id the disk holds.
+      const promptTree = Array.isArray(promptWrite.messageTree) ? promptWrite.messageTree : [];
+      const promptUserId = promptWrite.headId ?? null;
+      const promptUserParent =
+        (promptTree.find((m) => (m as { id?: unknown }).id === promptUserId) as { parentId?: string | null } | undefined)
+          ?.parentId ?? null;
+
       // Broadcast the user turn so OTHER attached clients (e.g. the `kai` CLI
       // when this submit came from the GUI) render the prompt, not just the
       // streamed reply. The originating client passes a submitNonce and skips
-      // its own echo (it already showed the turn optimistically).
+      // its own echo (it already showed the turn optimistically). Tag serverPersisted:true +
+      // the authoritative messageId/parentId — the user turn is ALREADY persisted (appended
+      // above) and this whole turn is server-persist owned (bound just below), so a receiving
+      // renderer must insert it with the DISK id and NOT persist a fabricated duplicate node.
       broadcastStreamEvent({
         conversationId,
         type: 'user-message',
         text: userText,
-        data: opts?.submitNonce ? { submitNonce: opts.submitNonce } : undefined,
+        serverPersisted: true,
+        data: {
+          ...(opts?.submitNonce ? { submitNonce: opts.submitNonce } : {}),
+          ...(promptUserId ? { messageId: promptUserId } : {}),
+          parentId: promptUserParent,
+        },
       });
 
       const updated = readConversation(appHome, conversationId);

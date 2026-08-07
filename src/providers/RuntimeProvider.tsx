@@ -2795,8 +2795,12 @@ export function RuntimeProvider({
           // suppresses the underlying stream's `done` (to avoid a double-terminal), so the
           // `done`-only release below never fires for a normally-completed initial sub-agent,
           // leaking its message array. A terminal STATUS is the reliable end signal here.
-          // `paused` is NOT terminal (resumable → may stream again), so keep its accumulator.
-          const terminalRelease = ['completed', 'failed', 'stopped', 'error'];
+          // Also release on `paused`: it's not terminal (resumable), but the accumulator is a
+          // REDUNDANT copy of the thread's messages (it re-initializes from existingThread.messages
+          // when the sub-agent next streams — see below), and pause stops streaming, so keeping it
+          // just leaks a full message array for a never-resumed paused sub-agent. The thread
+          // itself retains the messages either way.
+          const terminalRelease = ['completed', 'failed', 'stopped', 'error', 'paused'];
           if (typeof e.status === 'string' && terminalRelease.includes(e.status)) {
             globalSubAgentAccumulators.delete(saId);
           }
@@ -3096,6 +3100,19 @@ export function RuntimeProvider({
         // seeded by an untagged external user-message.
         lastLiveGeneration.set(convId, evGen);
         if (acc.runGeneration == null) {
+          // Lock to the first REAL-run event — BUT if this accumulator already knows its run
+          // (pendingAssistantId set by a local onNew/onEdit/onReload) and this event belongs to
+          // a DIFFERENT run (its responseMessageId doesn't match), do NOT let it lock. That
+          // guards the window where a superseded CLI/mirror run (whose responseMessageId was
+          // never blacklisted — its old accumulator had no pendingAssistantId to record) has a
+          // queued event arriving after a GUI turn replaced the accumulator; locking to the CLI
+          // generation would then drop the GUI run's own events (GUI response stranded).
+          const evRidForLock = (e as { responseMessageId?: string }).responseMessageId;
+          const foreignRun =
+            acc.pendingAssistantId != null && evRidForLock != null && evRidForLock !== acc.pendingAssistantId;
+          if (e.type !== 'compaction' && foreignRun) {
+            return; // event from a different (superseded) run — don't lock, don't mutate
+          }
           if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
         } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
           return; // superseded run's late event — drop
@@ -5405,6 +5422,7 @@ export function RuntimeProvider({
         pendingAssistantTiming: createPendingAssistantTiming(),
         pendingAssistantId: responseMessageId,
         runConfig: variantRunConfig,
+        locallyOriginated: true, // user-initiated continue-after-max-turns → this client drives it
       });
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
       if (persistRes?.rejected) {
@@ -5496,6 +5514,7 @@ export function RuntimeProvider({
       pendingAssistantTiming: createPendingAssistantTiming(),
       pendingAssistantId: responseMessageId,
       runConfig: continueRunConfig,
+      locallyOriginated: true, // user-initiated continue-task → this client drives any further continuation
     });
     const branch = getActiveBranch(newTree, newHead);
     const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
