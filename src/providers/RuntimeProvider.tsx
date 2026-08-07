@@ -843,11 +843,33 @@ const persistVersions = new Map<string, number>();
 // the accumulator is gone but the finalized content isn't on disk yet. onNew (after an awaited
 // injectMidTurn that falls back) reads this to base the new turn on the AUTHORITATIVE finalized
 // content — a plain disk reread in that window could return the pre-finalization PARTIAL tree
-// (possibly equal length), and the new turn would then overwrite the terminal write. Cleared
-// when the finalizing persist confirms on disk, or when the conversation is deleted. Bounded.
+// (possibly equal length), and the new turn would then overwrite the terminal write.
+// This is a TRANSIENT bridge: it's only needed from the terminal-delete until the fire-and-
+// forget persist lands (well under a second). It holds the FULL tree (incl. base64 media), so
+// it MUST NOT be retained indefinitely — a self-expiring timer clears it shortly after the
+// persist can't still be in flight. Also cleared on consume (next onNew) + conversation delete.
 const lastFinalizedBranch = new Map<string, { messages: StoredMessage[]; headId: string | null }>();
+const lastFinalizedBranchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const FINALIZED_BRANCH_TTL_MS = 15_000; // far longer than any persist round-trip; bounds media retention
 function recordFinalizedBranch(convId: string, messages: StoredMessage[], headId: string | null): void {
   lastFinalizedBranch.set(convId, { messages: [...messages], headId });
+  const prevTimer = lastFinalizedBranchTimers.get(convId);
+  if (prevTimer) clearTimeout(prevTimer);
+  lastFinalizedBranchTimers.set(
+    convId,
+    setTimeout(() => {
+      lastFinalizedBranch.delete(convId);
+      lastFinalizedBranchTimers.delete(convId);
+    }, FINALIZED_BRANCH_TTL_MS),
+  );
+}
+function clearFinalizedBranch(convId: string): void {
+  lastFinalizedBranch.delete(convId);
+  const t = lastFinalizedBranchTimers.get(convId);
+  if (t) {
+    clearTimeout(t);
+    lastFinalizedBranchTimers.delete(convId);
+  }
 }
 
 // Per-conversation handoff for a paid compaction record that a persist is TRYING to write
@@ -2374,8 +2396,29 @@ export function RuntimeProvider({
           rejectedDrafts.delete(deletedId);
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
-          lastFinalizedBranch.delete(deletedId);
+          clearFinalizedBranch(deletedId);
         }
+        return;
+      }
+      if (change.kind === 'reset') {
+        // conversations:clear wiped ALL records (+ aborted their runs server-side, but a GUI
+        // stream emits no terminal event on abort). Clear every live accumulator + all
+        // per-conversation bookkeeping so no orphan accumulator/tree/running-state lingers and
+        // no map grows unbounded. Stop the running indicator too.
+        for (const id of [...streamAccumulators.keys()]) {
+          supersedeCurrentGeneration(id);
+          streamAccumulators.delete(id);
+        }
+        supersededGenerations.clear();
+        lastLiveGeneration.clear();
+        supersededResponseIds.clear();
+        pendingCompactionHandoff.clear();
+        rejectedDrafts.clear();
+        persistVersions.clear();
+        lastRetitleCount.clear();
+        for (const id of [...lastFinalizedBranch.keys()]) clearFinalizedBranch(id);
+        automationStreams.clear();
+        setIsRunning(false);
         return;
       }
       const activeId = activeIdRef.current;
@@ -4227,7 +4270,7 @@ export function RuntimeProvider({
       }
       // The finalized snapshot has served its purpose (base for THIS new turn); drop it so it
       // can't stale-base a much-later turn after further edits.
-      lastFinalizedBranch.delete(convId);
+      clearFinalizedBranch(convId);
       const userMsg: StoredMessage = {
         id: msgId(),
         parentId: baseHead,

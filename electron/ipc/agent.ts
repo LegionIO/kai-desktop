@@ -4549,13 +4549,28 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // continuation below is marked serverPersisted, so the GUI renderer takes its
         // render-only path (no double-persist). Only the still-current token may drain.
         if (stillOwnsRun && hasInjects(conversationId)) {
+          // Drain (dequeue) the stranded injects so they don't re-splice into a future turn.
+          // PERSISTENCE differs by run type:
+          //  - server-owned turn: the inject was only QUEUED (not written at injection time),
+          //    so persist it now via persistCooperativeInjectedUserTurn.
+          //  - GUI turn: the inject was ALREADY persisted at injection (appendConversationMessages,
+          //    the !serverOwnsPersistence branch), so re-persisting here would DUPLICATE it
+          //    (the helper re-appends the occupied id → a replacement id, but returns the
+          //    original) → the continuation gets the prompt twice + a mis-parented response.
+          //    Just take its already-persisted id as the continuation head.
           const stranded = drainInjects(conversationId);
           let lastInjectedHead: string | null = null;
           let lastInjectedText = '';
           for (const entry of stranded) {
-            const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
-            if (persisted) {
-              lastInjectedHead = persisted.messageId;
+            if (serverPersistedRun) {
+              const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+              if (persisted) {
+                lastInjectedHead = persisted.messageId;
+                lastInjectedText = entry.text;
+              }
+            } else {
+              // Already on disk at injection — use its own id as the head.
+              lastInjectedHead = entry.id;
               lastInjectedText = entry.text;
             }
           }
