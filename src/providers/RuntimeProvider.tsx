@@ -4655,16 +4655,27 @@ export function RuntimeProvider({
       if (editPersistRes?.rejected) {
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
         streamAccumulators.delete(convId);
+        // Roll back the optimistic edit + restore the edited text so it isn't lost. Mirror
+        // onNew: only put the text straight back if THIS chat is active AND the composer is
+        // empty; if the user switched away OR already started a NEWER draft here,
+        // restoreComposerDraft would silently no-op (it won't clobber a live draft) and the
+        // edit would be LOST — so ENQUEUE it for FIFO restoration when the composer next
+        // empties / the user returns (loadConversationState + the composer-empty effect).
+        const composerHasNewDraft =
+          activeIdRef.current === convId &&
+          (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
+        const canRestoreNow = activeIdRef.current === convId && !composerHasNewDraft;
         if (activeIdRef.current === convId) {
           setTree(preEditTree);
           setHeadId(preEditHead);
           setIsRunning(false);
+        }
+        if (canRestoreNow) {
           restoreComposerDraft(editedText);
         } else if (editedText.trim().length > 0) {
-          // The user switched away before the /compact rejection returned — can't restore the
-          // edited text into the (now other) composer now, so ENQUEUE it for when they return
-          // (parity with the onNew rollback; loadConversationState / the composer-empty effect
-          // restore it FIFO). The queue keeps a second rejection from discarding this one.
+          // The user switched away OR has a newer draft — can't restore into the composer
+          // now, so ENQUEUE it (parity with the onNew rollback). The queue keeps a second
+          // rejection from discarding this one.
           enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
         }
         return;

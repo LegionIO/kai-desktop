@@ -4604,18 +4604,32 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               pendingServerPersist.add(conversationId);
               pendingServerPersistParent.set(conversationId, injectedHead);
               queueMicrotask(() => {
-                void streamHandler(
-                  null,
-                  conversationId,
-                  branch,
-                  modelKey,
-                  reasoningEffort,
-                  profileKey,
-                  fallbackEnabled,
-                  effectiveCwd ?? undefined,
-                  effectiveExecutionMode,
-                  threadOverrides,
-                );
+                void (async () => {
+                  const res = await streamHandler(
+                    null,
+                    conversationId,
+                    branch,
+                    modelKey,
+                    reasoningEffort,
+                    profileKey,
+                    fallbackEnabled,
+                    effectiveCwd ?? undefined,
+                    effectiveExecutionMode,
+                    threadOverrides,
+                  );
+                  // streamHandler consumes pendingServerPersist at its top on the NORMAL path.
+                  // If it rejected EARLY (compaction lock held → `{busy}`) it did NOT consume,
+                  // so the marker we set above would leak and mis-flag the NEXT GUI turn as
+                  // server-persisted (its reply persisted server-side under injectedHead →
+                  // corrupt branch). Clear our marker on a busy rejection — but only if it is
+                  // still OURS (a superseding turn may have installed its own since).
+                  if (res && (res as { busy?: boolean }).busy) {
+                    if (pendingServerPersistParent.get(conversationId) === injectedHead) {
+                      pendingServerPersist.delete(conversationId);
+                      pendingServerPersistParent.delete(conversationId);
+                    }
+                  }
+                })();
               });
             };
             if (serverPersistedRun) {
