@@ -986,20 +986,17 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   return next;
 }
 // Persist the current in-memory rejected-draft queue for a conversation into its record's
-// `pendingDrafts` field (or clear it when the queue is empty). A metadata-only put — it leaves
-// tree/head/runStatus untouched, so it passes the compacting-busy guard (drafts are stashed
-// exactly while /compact holds the conversation). Best-effort + fire-and-forget: the in-memory
-// queue is authoritative within a session; this is the crash/reload-survival copy.
+// `pendingDrafts` field (or clear it when the queue is empty), via a FIELD-ONLY main-side update
+// (conversations:setPendingDrafts) — NOT a renderer get-then-put-whole-record, which would
+// clobber concurrent streamed/final assistant content, settings, or runStatus with the stale
+// snapshot. Best-effort + fire-and-forget: the in-memory queue is authoritative within a
+// session; this is the crash/reload-survival copy. Passes the TTL cutoff so main also drops
+// disk entries older than it (no lingering base64).
 async function persistRejectedDraftsToDisk(convId: string): Promise<void> {
   try {
-    const conv = (await app.conversations.get(convId)) as ConversationRecord | null;
-    if (!conv) return;
     const q = rejectedDrafts.get(convId) ?? [];
-    const pendingDrafts = q.map((d) => ({ text: d.text, attachments: d.attachments, stashedAt: d.stashedAt }));
-    // No change → skip the write (avoid churn when nothing was stashed here).
-    const existing = (conv as { pendingDrafts?: unknown }).pendingDrafts;
-    if ((pendingDrafts.length === 0 && (existing === undefined || (Array.isArray(existing) && existing.length === 0)))) return;
-    await app.conversations.put({ ...conv, pendingDrafts });
+    const drafts = q.map((d) => ({ text: d.text, attachments: d.attachments as unknown[], stashedAt: d.stashedAt }));
+    await app.conversations.setPendingDrafts?.(convId, drafts, Date.now() - REJECTED_DRAFT_TTL_MS);
   } catch {
     /* best-effort — the in-memory queue still restores within the session */
   }

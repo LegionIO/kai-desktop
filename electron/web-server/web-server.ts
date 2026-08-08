@@ -428,6 +428,7 @@ export function getBridgeScript(): string {
       fork: function(id, upTo) { return invoke('conversations:fork', id, upTo); },
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       compact: function(id) { return invoke('conversations:compact', id, { __timeoutMs: 300000 }); },
+      setPendingDrafts: function(id, drafts, ttlCutoff) { return invoke('conversations:set-pending-drafts', id, drafts, ttlCutoff); },
       compactingIds: function() { return invoke('conversations:compacting-ids'); },
       onCompactingChanged: function(cb) { return on('conversations:compacting', cb); },
       onChanged: function(cb) { return on('conversations:changed', cb); }
