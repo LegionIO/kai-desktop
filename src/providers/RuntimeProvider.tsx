@@ -2382,19 +2382,21 @@ export function RuntimeProvider({
       if (!isCurrent()) return true;
       const agentStreamInFlight = agentInFlight.inFlight;
       if (autoInFlight || agentStreamInFlight) {
-        // An automation OR a SERVER-PERSISTED (CLI) in-flight turn is MAIN-owned — main persists
-        // its terminal output, so mark automationStreams (render live, never persist here). But a
-        // GUI-started in-flight turn is RENDERER-owned — after a reload NO renderer is persisting
-        // it; the reconnecting renderer must ADOPT it (locallyOriginated) so it persists the
-        // terminal output + compaction, else the reply is lost and the conv stays stuck running.
+        // Seed a background accumulator so opening this conversation mid-run shows streamed-so-far
+        // content + a running indicator. Ownership:
+        //  - automation / SERVER-PERSISTED (CLI) turn → MAIN-owned: mark automationStreams (render
+        //    live, never persist here — main writes the authoritative terminal state).
+        //  - GUI-started turn → seed a passive MIRROR accumulator (NO locallyOriginated, NOT in
+        //    automationStreams). We CANNOT tell "this renderer reloaded (original owner gone)" from
+        //    "I'm a 2nd viewer (original owner alive)" from a bare in-flight probe, so we must NOT
+        //    ADOPT it: adopting from a PARTIAL disk snapshot could overwrite the owner's full reply
+        //    or double-restart the turn (a real multi-client corruption). A mirror renders live and
+        //    reconciles from disk on the terminal event; if the true owner crashed, the reply is
+        //    lost (inherent to renderer-owned persistence) and startup resetStaleRunStatus clears
+        //    the stuck runStatus — strictly safer than corrupting a live turn.
         const mainOwned = autoInFlight || agentInFlight.serverPersisted;
-        if (mainOwned) {
-          automationStreams.add(id);
-          streamAccumulators.set(id, { messages: [...t], headId: h });
-        } else {
-          // Adopt the orphaned GUI stream: this reloaded renderer now owns its persistence.
-          streamAccumulators.set(id, { messages: [...t], headId: h, locallyOriginated: true });
-        }
+        if (mainOwned) automationStreams.add(id);
+        streamAccumulators.set(id, { messages: [...t], headId: h });
         setIsRunning(true);
       } else {
         setIsRunning(false);

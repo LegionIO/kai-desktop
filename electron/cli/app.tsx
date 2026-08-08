@@ -1496,6 +1496,17 @@ export function App({
   const failTurnAndDrain = useCallback(() => {
     if (turnSettledRef.current) return;
     turnSettledRef.current = true;
+    // Prefer a busy-rejected rich resend (full expanded text + attachments) over the plain
+    // string queue — same precedence as drainNextInput. Ignoring pendingBusyResendRef here would
+    // strand a queued busy-resend; a later completed turn + conversation switch could then resend
+    // that stale prompt/attachments into the WRONG conversation.
+    const resend = pendingBusyResendRef.current.shift();
+    if (resend) {
+      setStatus('running');
+      statusRef.current = 'running';
+      setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+      return;
+    }
     if (queueRef.current.length > 0) {
       const next = queueRef.current.shift() as string;
       setTimeout(() => sendExpandedRef.current(next), 0);
