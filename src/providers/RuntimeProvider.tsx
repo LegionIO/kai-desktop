@@ -1777,7 +1777,10 @@ async function persistConversation(
       // the renderer's lifetime.
       pendingCompactionHandoff.delete(conversationId);
       clearLateCompactionHandoffTimer(conversationId);
-      return { superseded: true };
+      // REJECTED (deleted), NOT superseded: a launcher treats `superseded` as retry-then-launch
+      // (it would eventually start model/tool execution against a GONE conversation whose I/O
+      // can't be persisted); `rejected:'conversation-deleted'` makes it roll back + not launch.
+      return { rejected: 'conversation-deleted' };
     }
 
     // After the async get(), check if a newer persist started while we were waiting

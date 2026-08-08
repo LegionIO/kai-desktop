@@ -99,6 +99,13 @@ function abortAutomationForConversation(id: string): void {
 // registry, so deleting the conversation mid-summarization would otherwise let the summarizer
 // keep billing until its ~285s deadline. Deleting aborts it immediately.
 const activeCompactAborters = new Map<string, AbortController>();
+// Count of /compact hook awaits that were ABANDONED on the deadline (raceAbort won, but the
+// underlying trusted-plugin callback promise stays pending and pins its transcript — we can't
+// force-cancel a callback protocol). Bounded so repeated /compacts against hung hooks can't
+// accumulate transcripts and exhaust memory: over the cap, runCompactInner bails (no compaction)
+// rather than start another abandonable hook. Decremented when each raced promise finally settles.
+let outstandingAbandonedCompactionHooks = 0;
+const MAX_ABANDONED_COMPACTION_HOOKS = 8;
 function abortActiveCompact(id: string): void {
   const ac = activeCompactAborters.get(id);
   if (ac) {
@@ -1231,6 +1238,13 @@ export function registerConversationHandlers(
     if (isTurnActive?.(conversationId)) {
       return { ok: false, error: 'conversation-busy', busyKind: 'turn' as const };
     }
+    // Memory backstop: too many prior /compact hook awaits are ABANDONED-but-pending (hung
+    // trusted-plugin callbacks we can't force-cancel, each pinning a transcript). Don't start
+    // another abandonable run — bail without compacting (the turn proceeds on full context; a
+    // null-op is the compaction contract). Frees as the hung hooks eventually settle.
+    if (outstandingAbandonedCompactionHooks >= MAX_ABANDONED_COMPACTION_HOOKS) {
+      return { ok: false, error: 'compaction-hook-backlog' };
+    }
 
     // Mark the conversation in the shared compaction lock for the DURATION of the
     // (paid, possibly slow) summarization so a concurrent agent turn (agent:submit
@@ -1297,14 +1311,33 @@ export function registerConversationHandlers(
       if (!signal) return p;
       if (signal.aborted) throw new Error('compaction-timeout');
       let onAbort: (() => void) | undefined;
+      let aborted = false;
       const abortP = new Promise<never>((_, reject) => {
-        onAbort = () => reject(new Error('compaction-timeout'));
+        onAbort = () => {
+          aborted = true;
+          reject(new Error('compaction-timeout'));
+        };
         signal.addEventListener('abort', onAbort, { once: true });
       });
       try {
         return await Promise.race([p, abortP]);
       } finally {
         if (onAbort) signal.removeEventListener('abort', onAbort);
+        // If the deadline won the race, the underlying hook promise `p` is now ABANDONED but
+        // still pending (it pins its transcript). Count it so repeated /compacts against hung
+        // hooks can't accumulate unboundedly; decrement when `p` eventually settles (freeing its
+        // references). A hook that settled normally (not aborted) isn't counted.
+        if (aborted) {
+          outstandingAbandonedCompactionHooks++;
+          void p.then(
+            () => {
+              outstandingAbandonedCompactionHooks = Math.max(0, outstandingAbandonedCompactionHooks - 1);
+            },
+            () => {
+              outstandingAbandonedCompactionHooks = Math.max(0, outstandingAbandonedCompactionHooks - 1);
+            },
+          );
+        }
       }
     };
     // Bounded fingerprint of the routing/budget-affecting GLOBAL config sections. The
