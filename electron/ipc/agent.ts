@@ -374,6 +374,61 @@ const serverPersistParents = new Map<string, string | null>();
 const guiFallbackParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
 
+// Finalize the GUI-turn persistence FALLBACK for a run that just ended. The renderer normally
+// persists its own reply (on a ~300ms debounce); we poll briefly and, if it never lands (the sole
+// renderer reloaded/crashed → runStatus stays 'running'), persist main's accumulated copy so the
+// reply isn't lost. ONLY when this run still owns the conversation (a superseding replacement run
+// owns the shared accumulator — leave it). Called from BOTH the main stream loop's finally AND the
+// plugin-provider return path (which bypasses the loop). No-op if this run kept no GUI fallback.
+function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string): void {
+  if (!serverPersistAppHome || !guiFallbackParents.has(conversationId)) return;
+  const fbOwner = activeStreams.get(conversationId)?.token;
+  if (fbOwner !== undefined && fbOwner !== streamToken) return; // replacement owns it — leave alone
+  const fbAppHome = serverPersistAppHome;
+  const fbToken = streamToken;
+  guiFallbackParents.delete(conversationId);
+  const pollGuiFallback = (remaining: number): void => {
+    const owner = activeStreams.get(conversationId)?.token;
+    if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator
+    if (isRecentlyDeleted(conversationId)) {
+      discardPersistenceAccumulator(conversationId);
+      return;
+    }
+    let rendererPersisted = false;
+    try {
+      const conv = readConversation(fbAppHome, conversationId);
+      if (conv && conv.runStatus !== 'running') rendererPersisted = true; // its terminal persist wrote idle
+    } catch {
+      /* best-effort — treat as not-yet-persisted, keep polling */
+    }
+    if (rendererPersisted) {
+      discardPersistenceAccumulator(conversationId); // renderer owns the write — no double-persist
+      return;
+    }
+    if (remaining <= 0) {
+      // Budget exhausted, runStatus still 'running' → the renderer reloaded/crashed. Persist
+      // main's accumulated reply, reset runStatus, settle. finalizeInterruptedTurn no-ops if empty.
+      try {
+        finalizeInterruptedTurn(fbAppHome, conversationId);
+      } catch {
+        discardPersistenceAccumulator(conversationId);
+      }
+      try {
+        const conv = readConversation(fbAppHome, conversationId);
+        if (conv && conv.runStatus === 'running') {
+          conv.runStatus = 'idle';
+          broadcastUpsert(fbAppHome, writeConversation(fbAppHome, conv));
+        }
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+    setTimeout(() => pollGuiFallback(remaining - 1), 100);
+  };
+  pollGuiFallback(80); // ~8s: ample for the renderer's debounced persist; then fall back
+}
+
 /**
  * Inject a user turn into a conversation and (re)start the stream — the shared
  * mechanism behind the GUI/CLI "mid-turn follow-up" behavior. When the target
@@ -1555,7 +1610,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             aborted: controller.signal.aborted,
           });
 
-          // Provider handled the request — clean up and exit
+          // Provider handled the request — clean up and exit. This path bypasses the main stream
+          // loop's finally, so run the GUI-turn persistence fallback here too (finalize main's
+          // accumulated reply if the renderer never persisted — sole-reload/crash — else discard).
+          finalizeGuiFallbackIfOwned(conversationId, streamToken);
           cleanupStreamIfOwned(conversationId, streamToken);
           return;
         } catch (providerError) {
@@ -4867,66 +4925,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // the reply on its ~300ms debounce; normally we just DISCARD main's copy. But if the SOLE
         // renderer reloaded/crashed mid-stream, NO renderer will persist it — so poll disk briefly
         // and, if the reply never lands (runStatus stays 'running'), FINALIZE main's accumulator as
-        // the fallback (guarded against double-write). ONLY when THIS run still owns the
-        // conversation: a SUPERSEDED run (a replacement GUI turn took over — different activeStreams
-        // token) must NOT touch guiFallbackParents or the shared accumulator, which now belong to
-        // the replacement run (deleting/discarding them would drop the replacement's output +
-        // crash-recovery copy). An ABSENT token = this run finished cleanly + still owns it.
-        {
-          const fbOwner = activeStreams.get(conversationId)?.token;
-          const stillOwnFallback = fbOwner === undefined || fbOwner === streamToken;
-          if (serverPersistAppHome && guiFallbackParents.has(conversationId) && stillOwnFallback) {
-          const fbAppHome = serverPersistAppHome;
-          const fbToken = streamToken;
-          guiFallbackParents.delete(conversationId);
-          const pollGuiFallback = (remaining: number): void => {
-            // Superseded by a REPLACEMENT run (different token) → that run now owns the shared
-            // accumulator + will handle its own fallback; do NOT discard (it's accumulating into
-            // it). Deleted → the delete cleanup released it. Either way, just stop.
-            const owner = activeStreams.get(conversationId)?.token;
-            if (owner !== undefined && owner !== fbToken) return; // replacement owns it — leave it alone
-            if (isRecentlyDeleted(conversationId)) {
-              discardPersistenceAccumulator(conversationId); // gone — release our copy
-              return;
-            }
-            let rendererPersisted = false;
-            try {
-              const conv = readConversation(fbAppHome, conversationId);
-              // The renderer's terminal persist writes runStatus:'idle'. That is the reliable
-              // "the renderer finished + wrote" signal (it was 'running' throughout the turn).
-              if (conv && conv.runStatus !== 'running') rendererPersisted = true;
-            } catch {
-              /* best-effort — treat as not-yet-persisted, keep polling */
-            }
-            if (rendererPersisted) {
-              discardPersistenceAccumulator(conversationId); // renderer owns the write — no double-persist
-              return;
-            }
-            if (remaining <= 0) {
-              // Budget exhausted with runStatus still 'running' → the renderer almost certainly
-              // reloaded/crashed. Persist main's accumulated reply so it isn't lost, then reset
-              // runStatus + settle clients. finalizeInterruptedTurn no-ops if there's no content.
-              try {
-                finalizeInterruptedTurn(fbAppHome, conversationId);
-              } catch {
-                discardPersistenceAccumulator(conversationId);
-              }
-              try {
-                const conv = readConversation(fbAppHome, conversationId);
-                if (conv && conv.runStatus === 'running') {
-                  conv.runStatus = 'idle';
-                  broadcastUpsert(fbAppHome, writeConversation(fbAppHome, conv));
-                }
-              } catch {
-                /* best-effort */
-              }
-              return;
-            }
-            setTimeout(() => pollGuiFallback(remaining - 1), 100);
-          };
-          pollGuiFallback(80); // ~8s: ample for the renderer's debounced persist; then fall back
-          }
-        }
+        // the fallback (guarded against double-write). Token-gated: a SUPERSEDED run must not touch
+        // the replacement's shared accumulator. (Shared helper — also called on the plugin-provider
+        // return path, which bypasses this loop.)
+        finalizeGuiFallbackIfOwned(conversationId, streamToken);
       }
     })();
 

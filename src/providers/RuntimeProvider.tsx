@@ -4990,6 +4990,23 @@ export function RuntimeProvider({
         .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
         .map((p) => p.text)
         .join('');
+      // The edit's OWN image attachments (added via the edit composer — distinct from the source
+      // turn's preserved attachments below). Captured as AttachedFile[] so a /compact-busy rollback
+      // can restore them too (restoring only editedText would silently DROP a newly-attached image).
+      const editedAttachments: AttachedFile[] = [];
+      for (const part of message.content) {
+        if (part.type === 'image') {
+          const imagePart = part as { image: string; mimeType?: string };
+          const mime = imagePart.mimeType ?? 'image/png';
+          editedAttachments.push({
+            name: `image.${(mime.split('/')[1] ?? 'png').split('+')[0]}`,
+            mime,
+            isImage: true,
+            size: Math.floor((imagePart.image.length * 3) / 4), // approx bytes from base64/dataURL length
+            dataUrl: imagePart.image,
+          });
+        }
+      }
       for (const part of message.content) {
         if (part.type === 'text') userContent.push({ type: 'text', text: part.text });
         else if (part.type === 'image') {
@@ -5083,9 +5100,9 @@ export function RuntimeProvider({
           if (
             rejectedKind === 'conversation-busy' &&
             !supersededByReplacement &&
-            editedText.trim().length > 0
+            (editedText.trim().length > 0 || editedAttachments.length > 0)
           ) {
-            enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
+            enqueueRejectedDraft(convId, { text: editedText, attachments: editedAttachments });
           }
           return;
         }
@@ -5099,19 +5116,20 @@ export function RuntimeProvider({
         const composerHasNewDraft =
           activeIdRef.current === convId &&
           (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
-        const canRestoreNow = activeIdRef.current === convId && !composerHasNewDraft;
+        const canRestoreNow = activeIdRef.current === convId && !composerHasNewDraft && attachmentsRef.current.length === 0;
         if (activeIdRef.current === convId) {
           setTree(preEditTree);
           setHeadId(preEditHead);
           setIsRunning(false);
         }
         if (canRestoreNow) {
+          if (editedAttachments.length > 0) addAttachments(editedAttachments);
           restoreComposerDraft(editedText);
-        } else if (editedText.trim().length > 0 && rejectedKind !== 'conversation-deleted') {
-          // The user switched away OR has a newer draft — can't restore into the composer
-          // now, so ENQUEUE it (parity with the onNew rollback). The queue keeps a second
-          // rejection from discarding this one. Skip for conversation-DELETED (dead id).
-          enqueueRejectedDraft(convId, { text: editedText, attachments: [] });
+        } else if ((editedText.trim().length > 0 || editedAttachments.length > 0) && rejectedKind !== 'conversation-deleted') {
+          // The user switched away OR has a newer draft/attachments — can't restore into the
+          // composer now, so ENQUEUE text + the edit's own attachments (parity with onNew). The
+          // queue keeps a second rejection from discarding this one. Skip for DELETED (dead id).
+          enqueueRejectedDraft(convId, { text: editedText, attachments: editedAttachments });
         }
         return;
       }
