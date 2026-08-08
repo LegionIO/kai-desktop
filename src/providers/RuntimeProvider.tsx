@@ -939,45 +939,28 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
 type RejectedDraft = { text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
-// Memory bound WITHOUT silently dropping still-relevant user input: a rejected draft is stashed
-// only for the TRANSIENT /compact-busy window (compaction finishes in seconds to ~285s) and is
-// restored when the user next returns to that chat. Bound by TTL, not by count-eviction — a
-// count cap would drop a FRESH draft the user is about to get back (data loss). Dormant drafts
-// (chat never revisited) expire after the TTL; an actively-bounced-between chat restores well
-// within it. A very high per-conversation cap remains only as a pathological safety valve.
-const REJECTED_DRAFT_TTL_MS = 30 * 60_000; // 30 min — far longer than any /compact window
-const MAX_REJECTED_DRAFTS_PER_CONV = 200; // safety valve only; the TTL is the real bound
-// Drop drafts older than the TTL across all conversations. Cheap (small map) and idempotent;
-// called opportunistically on every enqueue/dequeue so dormant entries can't accumulate.
-function pruneExpiredRejectedDrafts(): void {
-  const cutoff = Date.now() - REJECTED_DRAFT_TTL_MS;
-  for (const [cid, q] of rejectedDrafts) {
-    const kept = q.filter((d) => d.stashedAt >= cutoff);
-    if (kept.length === 0) rejectedDrafts.delete(cid);
-    else if (kept.length !== q.length) rejectedDrafts.set(cid, kept);
-  }
-}
+// Rejected drafts are DURABLE USER INPUT (the user's unsent text/attachments), NOT a cache —
+// per the durably-persist decision they are cleared ONLY on restore into the composer or when
+// the conversation is deleted, NEVER by a time-based TTL or count-eviction (both silently lose
+// input the user still expects to get back). The in-memory queue is a fast-restore mirror
+// hydrated from disk on load, so its size is bounded by conversations touched this session, not
+// unbounded; the durable disk copy is one small `pendingDrafts` per conversation, cleared on
+// restore. A very high per-conversation cap remains only as a pathological safety valve.
+const MAX_REJECTED_DRAFTS_PER_CONV = 200; // pathological safety valve only
 function enqueueRejectedDraft(convId: string, draft: { text: string; attachments: AttachedFile[] }): void {
   if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
-  pruneExpiredRejectedDrafts();
   const q = rejectedDrafts.get(convId) ?? [];
   q.push({ ...draft, stashedAt: Date.now() });
-  // Pathological safety valve only (a real user can't stash 200 unsent drafts in one chat
-  // within the TTL). If ever hit, drop the OLDEST — the TTL sweep is the primary bound and
-  // will have already expired anything genuinely stale.
+  // Pathological safety valve only. If ever hit, drop the OLDEST (least likely still wanted).
   if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift();
   rejectedDrafts.set(convId, q);
-  // DURABLE copy (defense-in-depth): the in-memory queue is a fast-restore mirror, but a
-  // reload/close/crash before restore would silently lose this unsent input. Persist the queue
-  // into the conversation record (a metadata-only put — passes even while /compact holds the
-  // conversation, since it changes neither tree/head/runStatus). loadConversationState hydrates
-  // from it; restore/dequeue clears it. Fire-and-forget; the in-memory copy is authoritative
-  // within the session.
+  // DURABLE copy: the in-memory queue is the fast-restore mirror, but a reload/close/crash before
+  // restore would silently lose this unsent input. Persist the queue into the conversation record
+  // via a FIELD-ONLY main update. loadConversationState hydrates from it; restore clears it.
   void persistRejectedDraftsToDisk(convId);
 }
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
 function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
-  pruneExpiredRejectedDrafts();
   const q = rejectedDrafts.get(convId);
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
@@ -990,32 +973,30 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
 // (conversations:setPendingDrafts) — NOT a renderer get-then-put-whole-record, which would
 // clobber concurrent streamed/final assistant content, settings, or runStatus with the stale
 // snapshot. Best-effort + fire-and-forget: the in-memory queue is authoritative within a
-// session; this is the crash/reload-survival copy. Passes the TTL cutoff so main also drops
-// disk entries older than it (no lingering base64).
+// session; this is the crash/reload-survival copy. No TTL cutoff — rejected drafts are durable
+// user input, cleared only on restore / conversation delete (main writes exactly the queue).
 async function persistRejectedDraftsToDisk(convId: string): Promise<void> {
   try {
     const q = rejectedDrafts.get(convId) ?? [];
     const drafts = q.map((d) => ({ text: d.text, attachments: d.attachments as unknown[], stashedAt: d.stashedAt }));
-    await app.conversations.setPendingDrafts?.(convId, drafts, Date.now() - REJECTED_DRAFT_TTL_MS);
+    await app.conversations.setPendingDrafts?.(convId, drafts);
   } catch {
     /* best-effort — the in-memory queue still restores within the session */
   }
 }
 // Hydrate the in-memory queue from a conversation record's persisted `pendingDrafts` (a reload
 // or a client that never stashed them in memory). Only fills an EMPTY in-memory slot so a live
-// in-session queue is never clobbered; applies the same TTL prune (a durable draft older than
-// the TTL is genuinely stale). Returns true if anything was hydrated.
+// in-session queue is never clobbered. No TTL: rejected drafts are durable user input, cleared
+// only on restore / conversation delete. Returns true if anything was hydrated.
 function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: unknown } | null): boolean {
   if (!conv || rejectedDrafts.has(convId)) return false;
   const raw = conv.pendingDrafts;
   if (!Array.isArray(raw) || raw.length === 0) return false;
-  const cutoff = Date.now() - REJECTED_DRAFT_TTL_MS;
   const restored: RejectedDraft[] = [];
   for (const d of raw as Array<{ text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
     const text = typeof d?.text === 'string' ? d.text : '';
     const attachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
     const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
-    if (stashedAt < cutoff) continue; // genuinely stale
     if (text.trim().length === 0 && attachments.length === 0) continue;
     restored.push({ text, attachments, stashedAt });
   }
@@ -3976,18 +3957,35 @@ export function RuntimeProvider({
           `[StreamEvent] ERROR conv=${convId.slice(0, 8)} error=${(e.error ?? '').slice(0, 200)} accMsgCount=${acc.messages.length}`,
         );
         // Automation-owned stream: main process persists the terminal state and
-        // sends its own `done`. Don't persist from here; just reconcile from disk.
-        // ALSO a PASSIVE MIRROR of another client's GUI turn (locallyOriginated !== true): the
-        // originating client persists; a mirror must not. Render the error + keep the
-        // accumulator so the trailing `done` (the doneMirror branch) reconciles uniformly.
-        const errorMirror = !!streamAccumulators.get(convId) && acc.locallyOriginated !== true;
-        if (e.automation || e.serverPersisted || automationStreams.has(convId) || errorMirror) {
+        // sends its own trailing `done` → keep the accumulator so that `done` does the
+        // uniform cleanup + reload.
+        if (e.automation || e.serverPersisted || automationStreams.has(convId)) {
           // Keep the accumulator alive so the trailing automation `done` (which
           // arrives right after) does the final cleanup + reload uniformly.
           if (isActiveConv) {
             applyError(acc, formatStreamError(e.error ?? 'Unknown error', e.errorCategory, e.errorStatusCode));
             setTree([...acc.messages]);
             setHeadId(acc.headId);
+          }
+          return;
+        }
+        // PASSIVE MIRROR of another client's GUI turn (locallyOriginated !== true): the
+        // originating client persists the terminal state. A mirror must NOT persist. Unlike the
+        // automation case above, a GUI-turn error has NO trailing `done` — main SUPPRESSES the
+        // stream's own `done` after a GUI error (see agent.ts sawTerminalStreamError), so keeping
+        // the accumulator "for the trailing done" would strand it (permanently running + retained
+        // tree/media). Treat the error as terminal HERE: render it, drop the accumulator, and
+        // reconcile from disk (the originator's authoritative terminal state).
+        if (!!streamAccumulators.get(convId) && acc.locallyOriginated !== true) {
+          const _ptErrMirror = persistTimersRef.current.get(convId);
+          if (_ptErrMirror) {
+            clearTimeout(_ptErrMirror);
+            persistTimersRef.current.delete(convId);
+          }
+          streamAccumulators.delete(convId);
+          if (isActiveConv) {
+            setIsRunning(false);
+            void loadConversationState(convId);
           }
           return;
         }
