@@ -23,6 +23,12 @@ const localCounts = new Map<string, number>();
 const authoritativeIds = new Set<string>();
 const listeners = new Set<() => void>();
 let snapshot: ReadonlySet<string> = new Set();
+// Monotonic version bumped on EVERY authoritative mutation (per-event add/delete OR a resync
+// replace). A resync fetch is async; a per-event `compacting:true/false` that lands DURING that
+// fetch would be overwritten by the now-stale wholesale snapshot (leaving the composer wrong
+// until the next poll). The resync captures this version before its await and only applies its
+// result if no newer authoritative mutation happened meanwhile.
+let authoritativeVersion = 0;
 
 function currentUnion(): Set<string> {
   const u = new Set<string>(authoritativeIds);
@@ -62,6 +68,7 @@ export function isConversationCompacting(id: string | null | undefined): boolean
 function setAuthoritativeIds(ids: Iterable<string>): void {
   authoritativeIds.clear();
   for (const id of ids) authoritativeIds.add(id);
+  authoritativeVersion++;
   emit();
 }
 
@@ -89,8 +96,14 @@ function resyncAuthoritative(conv: CompactingBridge): Promise<boolean> {
   // true on a successful snapshot, false on failure (so callers can retry).
   const p = conv.compactingIds?.();
   if (!p) return Promise.resolve(false);
+  // Capture the version BEFORE the async fetch. If a per-event add/delete (or another resync)
+  // mutates the authoritative set while this fetch is in flight, this snapshot is stale — DROP
+  // it rather than overwrite the fresher state (the next poll/resync reconciles). Still resolve
+  // true so the first-snapshot backstop stops retrying (we did observe a valid snapshot).
+  const issuedAt = authoritativeVersion;
   return p.then(
     (ids) => {
+      if (authoritativeVersion !== issuedAt) return true; // superseded by a newer mutation
       setAuthoritativeIds(Array.isArray(ids) ? ids : []);
       return true;
     },
@@ -108,6 +121,7 @@ function ensureCrossClientSync(): void {
     conv.onCompactingChanged?.((p) => {
       if (p.compacting) authoritativeIds.add(p.conversationId);
       else authoritativeIds.delete(p.conversationId);
+      authoritativeVersion++; // so an in-flight resync detects this newer mutation + drops its stale snapshot
       emit();
     });
     // Initial snapshot for a late-joining / reloaded client.

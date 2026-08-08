@@ -967,6 +967,13 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
   // will have already expired anything genuinely stale.
   if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift();
   rejectedDrafts.set(convId, q);
+  // DURABLE copy (defense-in-depth): the in-memory queue is a fast-restore mirror, but a
+  // reload/close/crash before restore would silently lose this unsent input. Persist the queue
+  // into the conversation record (a metadata-only put — passes even while /compact holds the
+  // conversation, since it changes neither tree/head/runStatus). loadConversationState hydrates
+  // from it; restore/dequeue clears it. Fire-and-forget; the in-memory copy is authoritative
+  // within the session.
+  void persistRejectedDraftsToDisk(convId);
 }
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
 function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
@@ -975,7 +982,49 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
   if (q.length === 0) rejectedDrafts.delete(convId);
+  void persistRejectedDraftsToDisk(convId); // keep the durable copy in sync after consuming one
   return next;
+}
+// Persist the current in-memory rejected-draft queue for a conversation into its record's
+// `pendingDrafts` field (or clear it when the queue is empty). A metadata-only put — it leaves
+// tree/head/runStatus untouched, so it passes the compacting-busy guard (drafts are stashed
+// exactly while /compact holds the conversation). Best-effort + fire-and-forget: the in-memory
+// queue is authoritative within a session; this is the crash/reload-survival copy.
+async function persistRejectedDraftsToDisk(convId: string): Promise<void> {
+  try {
+    const conv = (await app.conversations.get(convId)) as ConversationRecord | null;
+    if (!conv) return;
+    const q = rejectedDrafts.get(convId) ?? [];
+    const pendingDrafts = q.map((d) => ({ text: d.text, attachments: d.attachments, stashedAt: d.stashedAt }));
+    // No change → skip the write (avoid churn when nothing was stashed here).
+    const existing = (conv as { pendingDrafts?: unknown }).pendingDrafts;
+    if ((pendingDrafts.length === 0 && (existing === undefined || (Array.isArray(existing) && existing.length === 0)))) return;
+    await app.conversations.put({ ...conv, pendingDrafts });
+  } catch {
+    /* best-effort — the in-memory queue still restores within the session */
+  }
+}
+// Hydrate the in-memory queue from a conversation record's persisted `pendingDrafts` (a reload
+// or a client that never stashed them in memory). Only fills an EMPTY in-memory slot so a live
+// in-session queue is never clobbered; applies the same TTL prune (a durable draft older than
+// the TTL is genuinely stale). Returns true if anything was hydrated.
+function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: unknown } | null): boolean {
+  if (!conv || rejectedDrafts.has(convId)) return false;
+  const raw = conv.pendingDrafts;
+  if (!Array.isArray(raw) || raw.length === 0) return false;
+  const cutoff = Date.now() - REJECTED_DRAFT_TTL_MS;
+  const restored: RejectedDraft[] = [];
+  for (const d of raw as Array<{ text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
+    const text = typeof d?.text === 'string' ? d.text : '';
+    const attachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
+    const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
+    if (stashedAt < cutoff) continue; // genuinely stale
+    if (text.trim().length === 0 && attachments.length === 0) continue;
+    restored.push({ text, attachments, stashedAt });
+  }
+  if (restored.length === 0) return false;
+  rejectedDrafts.set(convId, restored);
+  return true;
 }
 
 function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTiming {
@@ -2299,6 +2348,10 @@ export function RuntimeProvider({
     // point at the PREVIOUS chat — restoring now would misroute. After the commit, re-verify
     // this conversation is still the active one AND the composer is empty (never clobber a
     // live draft), and only THEN consume the stash so a failed/misrouted restore keeps it.
+    // First HYDRATE the in-memory queue from the durable copy on disk (survives a reload/crash
+    // that dropped the volatile mirror) — only fills an empty slot, so a live in-session queue
+    // is untouched.
+    hydrateRejectedDraftsFromDisk(id, conv as { pendingDrafts?: unknown });
     if (rejectedDrafts.has(id)) {
       setTimeout(() => {
         if (activeIdRef.current !== id) return; // user switched again — keep the stash

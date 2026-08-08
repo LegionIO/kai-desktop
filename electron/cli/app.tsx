@@ -232,6 +232,12 @@ export function App({
   // this, going idle on busy lets a new prompt submit → reject → failTurnAndDrain consume
   // and lose the queued prompts.
   const compactBusyWaitRef = useRef<boolean>(false);
+  // Monotonic epoch bumped on EVERY compactBusyWaitRef mutation (the `conversations:compacting`
+  // broadcast handler AND syncCompactingState). syncCompactingState's snapshot is async; a
+  // broadcast landing DURING its fetch would otherwise be clobbered by the now-stale snapshot
+  // (stranding queued prompts or falsely clearing busy). It captures this epoch before the await
+  // and skips its reconcile if a newer mutation happened meanwhile.
+  const compactLockEpochRef = useRef<number>(0);
   // A submission (with its expanded text + attachments) that was rejected as
   // conversation-busy and must be RE-SENT verbatim when the lock frees — the plain string
   // queue can't carry submitText/attachments (e.g. /shot, @image), so those go here instead
@@ -480,11 +486,17 @@ export function App({
     // otherwise be missed. Returns true iff the active conversation is currently compacting.
     const syncCompactingState = async (): Promise<boolean> => {
       if (!convIdRef.current) return false;
+      const issuedEpoch = compactLockEpochRef.current;
       try {
         const ids = await client.invoke<string[]>('conversations:compacting-ids');
+        // A `conversations:compacting` broadcast that landed DURING the fetch already set the
+        // authoritative busy state; this snapshot is now stale — don't let it clobber the
+        // fresher broadcast state (which could strand queued prompts or falsely clear busy).
+        if (compactLockEpochRef.current !== issuedEpoch) return compactBusyWaitRef.current;
         const busy = Array.isArray(ids) && ids.includes(convIdRef.current);
         if (busy && statusRef.current === 'idle') {
           compactBusyWaitRef.current = true;
+          compactLockEpochRef.current++;
           setStatus('running');
           statusRef.current = 'running';
         } else if (!busy && compactBusyWaitRef.current) {
@@ -495,6 +507,7 @@ export function App({
           // could BOTH drain (two prompts launched concurrently → the single pendingBusyResendRef
           // is overwritten by concurrent busy rejections → one prompt silently lost).
           compactBusyWaitRef.current = false;
+          compactLockEpochRef.current++;
           if (!drainNextInput()) {
             setStatus('idle');
             statusRef.current = 'idle';
@@ -736,11 +749,13 @@ export function App({
         // turn/awaiting-approval owns the status already). The matching `false` drains.
         if (statusRef.current === 'idle') {
           compactBusyWaitRef.current = true;
+          compactLockEpochRef.current++; // supersede any in-flight syncCompactingState snapshot
           setStatus('running');
           statusRef.current = 'running';
         }
       } else if (p.compacting === false && compactBusyWaitRef.current) {
         compactBusyWaitRef.current = false;
+        compactLockEpochRef.current++;
         // Drain the next pending input (prefers a busy-rejected rich resend over the string
         // queue). Only if no real turn started meanwhile (a stream drives its own drain).
         if (!drainNextInput()) {

@@ -4709,20 +4709,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   const { tree: continuationTree, headId: continuationHead } =
                     ensureConversationTree(updated);
                   const continuationBranch = getConversationBranch(continuationTree, continuationHead);
-                  const tail = continuationBranch[continuationBranch.length - 1] as
-                    | { id?: unknown }
-                    | undefined;
-                  if (tail?.id === injectedHead || remaining <= 0) {
-                    // Tail is the injected user (renderer finalized) — or budget exhausted, in
-                    // which case launch on the best available branch (reactive recovery + the
-                    // renderer's own reconciliation backstop any residual gap).
+                  // Wait for the RENDERER to have finished persisting THIS turn's assistant reply
+                  // before launching — else the continuation reads a branch missing the just-
+                  // produced reply (stale context → the model repeats tool calls). The reliable
+                  // signal is the renderer's terminal persist writing runStatus:'idle' (it was
+                  // 'running' throughout the turn AND at mid-turn injection); the injected user
+                  // being the branch tail is NOT a valid signal (it's the tail from the moment of
+                  // injection, before the reply lands). Launch once idle, or after the budget
+                  // (reactive recovery + the renderer's reconciliation backstop any residual gap).
+                  if (updated.runStatus === 'idle' || remaining <= 0) {
                     launchContinuation(continuationBranch);
                     return;
                   }
                 }
                 setTimeout(() => pollForFinalizedBranch(remaining - 1), 100);
               };
-              pollForFinalizedBranch(20);
+              pollForFinalizedBranch(30);
             }
           }
         }

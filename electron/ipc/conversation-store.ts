@@ -94,6 +94,11 @@ export type ConversationRecord = {
   workspaceId?: string;
   archived?: boolean;
   metadata?: Record<string, unknown>;
+  /** Durable copy of un-restorable inputs stashed by a /compact-busy rollback (the user's
+   *  unsent text + attachments). Held in volatile renderer memory for fast in-session restore,
+   *  but ALSO persisted here so a reload/close/crash doesn't silently lose the input. Restored
+   *  when the user next opens the chat, then cleared. Small + rare; cleared on restore. */
+  pendingDrafts?: Array<{ text: string; attachments: unknown[]; stashedAt: number }>;
 };
 
 /** Lightweight per-conversation summary — everything the list view + singleton /
