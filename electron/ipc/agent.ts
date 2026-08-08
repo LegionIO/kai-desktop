@@ -138,6 +138,12 @@ function deleteStreamIfOwned(conversationId: string, token: string): void {
  */
 function cleanupStreamIfOwned(conversationId: string, token: string): void {
   if (activeStreams.get(conversationId)?.token !== token) return;
+  // Finalize the GUI persistence fallback BEFORE dropping ownership: EVERY terminal path that
+  // cleans up an owned stream — the main finally AND every early-exit (config error, hook denial,
+  // provider return, etc.) — must run it, else a renderer reload loses the partial output and the
+  // fallback accumulator/marker leak. Idempotent (no-op if this run kept no GUI fallback, or it
+  // already ran), so calling it here + at explicit sites is safe.
+  finalizeGuiFallbackIfOwned(conversationId, token);
   activeStreams.delete(conversationId);
   activeStreamModelKeys.delete(conversationId);
   activeStreamRuntime.delete(conversationId);
@@ -1617,10 +1623,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             aborted: controller.signal.aborted,
           });
 
-          // Provider handled the request — clean up and exit. This path bypasses the main stream
-          // loop's finally, so run the GUI-turn persistence fallback here too (finalize main's
-          // accumulated reply if the renderer never persisted — sole-reload/crash — else discard).
-          finalizeGuiFallbackIfOwned(conversationId, streamToken);
+          // Provider handled the request — clean up and exit. cleanupStreamIfOwned runs the
+          // GUI-turn persistence fallback (finalize main's accumulated reply if the renderer never
+          // persisted — sole-reload/crash — else discard), so this early exit is covered too.
           cleanupStreamIfOwned(conversationId, streamToken);
           return;
         } catch (providerError) {
@@ -4950,14 +4955,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
           emit({ conversationId, type: 'done' }); // settle clients (CLI/GUI) — no `done` came from the stream
         }
-        // GUI (renderer-persisted) turn: main kept a FALLBACK accumulator. The renderer persists
-        // the reply on its ~300ms debounce; normally we just DISCARD main's copy. But if the SOLE
-        // renderer reloaded/crashed mid-stream, NO renderer will persist it — so poll disk briefly
-        // and, if the reply never lands (runStatus stays 'running'), FINALIZE main's accumulator as
-        // the fallback (guarded against double-write). Token-gated: a SUPERSEDED run must not touch
-        // the replacement's shared accumulator. (Shared helper — also called on the plugin-provider
-        // return path, which bypasses this loop.)
-        finalizeGuiFallbackIfOwned(conversationId, streamToken);
+        // NOTE: the GUI-turn persistence fallback (finalizeGuiFallbackIfOwned) is invoked by
+        // cleanupStreamIfOwned at the TOP of this finally (and on every early-exit path), so it
+        // is NOT re-invoked here — it's idempotent, but the single cleanup call covers all paths.
       }
     })();
 
