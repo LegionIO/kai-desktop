@@ -5173,9 +5173,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // uses this to avoid clearing a `running` conversation it doesn't have a local
   // accumulator for (a headless CLI run it just connected to). Complements
   // automations.inFlight (automation runs). Does NOT cover automation runs — the
-  // renderer checks both.
-  ipcMain.handle('agent:in-flight', (_event, conversationId: string): boolean => {
-    return activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
+  // renderer checks both. Returns whether a stream is in flight AND whether it is
+  // SERVER-PERSISTED (a CLI/automation turn main persists) vs a GUI turn (renderer-persisted).
+  // A renderer that reloaded mid-turn needs this: a server-persisted in-flight turn is main-owned
+  // (mark automationStreams, don't persist), but a GUI in-flight turn has NO renderer persisting
+  // it after the reload — the reconnecting renderer must ADOPT it (own its persistence), not
+  // treat it as main-owned (which would discard its terminal output + leave it stuck running).
+  ipcMain.handle('agent:in-flight', (_event, conversationId: string): { inFlight: boolean; serverPersisted: boolean } => {
+    const inFlight = activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
+    const serverPersisted = serverPersistTokens.has(conversationId) || pendingServerPersist.has(conversationId);
+    return { inFlight, serverPersisted };
   });
 
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {

@@ -53,7 +53,7 @@ const appAPI = {
         responseMessageId,
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
-    inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<boolean>,
+    inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<{ inFlight: boolean; serverPersisted: boolean }>,
     /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
      *  running turn (spliced at its next step boundary) instead of a new turn. */
     injectMidTurn: (conversationId: string, userText: string) =>

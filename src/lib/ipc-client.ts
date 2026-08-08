@@ -76,7 +76,7 @@ type AppAPI = {
       responseMessageId?: string,
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
-    inFlight: (conversationId: string) => Promise<boolean>;
+    inFlight: (conversationId: string) => Promise<{ inFlight: boolean; serverPersisted: boolean }>;
     injectMidTurn: (
       conversationId: string,
       userText: string,

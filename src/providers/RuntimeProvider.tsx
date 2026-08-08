@@ -2375,14 +2375,26 @@ export function RuntimeProvider({
       // clobber a run whose first event simply hasn't reached us yet.
       const [autoInFlight, agentInFlight] = await Promise.all([
         app.automations.inFlight(id).catch(() => false),
-        app.agent.inFlight(id).catch(() => false),
+        app.agent.inFlight(id).catch(() => ({ inFlight: false, serverPersisted: false })),
       ]);
       // A switch may have happened during the in-flight probe — don't seed an
       // accumulator or flip isRunning for a conversation that's no longer active.
       if (!isCurrent()) return true;
-      if (autoInFlight || agentInFlight) {
-        automationStreams.add(id);
-        streamAccumulators.set(id, { messages: [...t], headId: h });
+      const agentStreamInFlight = agentInFlight.inFlight;
+      if (autoInFlight || agentStreamInFlight) {
+        // An automation OR a SERVER-PERSISTED (CLI) in-flight turn is MAIN-owned — main persists
+        // its terminal output, so mark automationStreams (render live, never persist here). But a
+        // GUI-started in-flight turn is RENDERER-owned — after a reload NO renderer is persisting
+        // it; the reconnecting renderer must ADOPT it (locallyOriginated) so it persists the
+        // terminal output + compaction, else the reply is lost and the conv stays stuck running.
+        const mainOwned = autoInFlight || agentInFlight.serverPersisted;
+        if (mainOwned) {
+          automationStreams.add(id);
+          streamAccumulators.set(id, { messages: [...t], headId: h });
+        } else {
+          // Adopt the orphaned GUI stream: this reloaded renderer now owns its persistence.
+          streamAccumulators.set(id, { messages: [...t], headId: h, locallyOriginated: true });
+        }
         setIsRunning(true);
       } else {
         setIsRunning(false);
