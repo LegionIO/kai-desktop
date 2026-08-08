@@ -910,6 +910,25 @@ export function App({
                 await client.invoke('conversations:set-active-id', id);
                 await reloadTranscript(id, `resumed ${id.slice(0, 8)}`);
                 await refreshBanner();
+                // Drain any inputs that were QUEUED for THIS conversation while it was not the
+                // active chat (round-145/146 scoping RETAINS out-of-focus entries rather than
+                // dropping them). Without this they'd stay stranded until exit. Only when idle +
+                // not compacting: a busy-wait / active turn drives its own drain.
+                if (statusRef.current === 'idle' && !compactBusyWaitRef.current) {
+                  const resend = takeResendForActiveConv();
+                  if (resend) {
+                    setStatus('running');
+                    statusRef.current = 'running';
+                    setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+                  } else {
+                    const next = takePlainForActiveConv();
+                    if (next !== undefined) {
+                      setStatus('running');
+                      statusRef.current = 'running';
+                      setTimeout(() => sendExpandedRef.current(next), 0);
+                    }
+                  }
+                }
               })();
             },
           });
