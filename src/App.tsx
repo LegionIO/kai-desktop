@@ -948,7 +948,16 @@ function AppShell() {
       if (remaining.length > 0) {
         await app.conversations.setActiveId(remaining[0].id);
       }
-      await app.conversations.delete(id);
+      const delRes = (await app.conversations.delete(id)) as { ok?: boolean; error?: string } | undefined;
+      if (delRes && delRes.ok === false) {
+        // The delete did NOT happen (e.g. file removal failed — the store preserves the
+        // conversation on rm failure). Do NOT navigate away / present the surviving chat as
+        // deleted: the target is still on disk. Restore the active selection to the target and
+        // surface the failure rather than silently misrepresenting the state.
+        if (remaining.length > 0) await app.conversations.setActiveId(id).catch(() => {});
+        console.error(`[App] delete conversation ${id.slice(0, 8)} failed: ${delRes.error ?? 'unknown'}`);
+        return;
+      }
       if (remaining.length > 0) {
         setActiveConversationId(remaining[0].id);
         setActiveConversationTitle(

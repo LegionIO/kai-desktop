@@ -1029,8 +1029,9 @@ export function App({
               // in-flight; if not, drain one queued prompt (or go idle) instead.
               const probeEpoch = settleEpochRef.current;
               void client
-                .invoke<boolean>('agent:in-flight', convIdRef.current)
-                .then((inFlight) => {
+                .invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', convIdRef.current)
+                .then((res) => {
+                  const inFlight = res?.inFlight === true;
                   // A `done` that settled the turn during the probe bumped the epoch — its
                   // idle/drain is authoritative; don't clobber it back to 'running'.
                   if (settleEpochRef.current !== probeEpoch) return;
@@ -1599,8 +1600,9 @@ export function App({
                 // resend now rather than wait for an event that won't come.
                 const cid = convIdRef.current;
                 void client
-                  .invoke<boolean>('agent:in-flight', cid)
-                  .then((inFlight) => {
+                  .invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', cid)
+                  .then((res) => {
+                    const inFlight = res?.inFlight === true;
                     if (inFlight) {
                       // The peer turn's `done` will drain the resend via settleTurn — but
                       // settleTurn no-ops if turnSettledRef is stale-TRUE (we may have missed the

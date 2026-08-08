@@ -387,7 +387,7 @@ async function waitForPersistedReply(client: LocalBridgeClient, conversationId: 
   for (;;) {
     let running = false;
     try {
-      running = (await client.invoke<boolean>('agent:in-flight', conversationId)) === true;
+      running = (await client.invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', conversationId))?.inFlight === true;
     } catch {
       // A drop while polling — the outer recover loop owns reconnection; treat as
       // not-running so we fall through to read whatever was persisted.
