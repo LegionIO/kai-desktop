@@ -780,22 +780,26 @@ export async function compactConversationPrefix(
         if (!resultFirstIndex.has(rid)) resultFirstIndex.set(rid, i);
       }
     }
-    // The safe boundary must not leave any covered call's result outside. Walk the covered
-    // prefix once; for each call whose result index is ≥ current boundary, clamp the boundary to
-    // that call's index (drop the call + everything after). Iterating left-to-right with a
-    // shrinking boundary converges in one pass: a call at index i with result at ≥boundary forces
-    // boundary=i, and any later call is then already outside the (smaller) covered region.
-    let safeLen = fittedPrefix.length;
-    for (let i = 0; i < safeLen; i++) {
+    // The safe boundary must not fall strictly INSIDE any call→result span: a covered call whose
+    // result is outside the covered region orphans that result. The largest safe covered length
+    // ≤ fittedLen is the largest b where every call in [0,b) has its result index < b (the prefix
+    // is "self-contained"). Single left-to-right pass tracking `reach` = the max result index of
+    // any call seen so far: whenever reach ≤ i (all calls up to i resolve within [0,i]), the
+    // prefix [0,i+1) is self-contained → a valid boundary. Take the LARGEST such ≤ fittedLen.
+    // (The prior "shrink safeLen when a call's result is outside" was WRONG: shrinking could
+    // newly-expose an EARLIER call whose result now lands outside the smaller region, and the
+    // left-to-right scan had already passed it — leaving an orphan.)
+    const fittedLenInit = fittedPrefix.length;
+    let reach = -1;
+    let safeLen = 0; // no non-empty prefix is provably self-contained until reach ≤ i
+    for (let i = 0; i < fittedLenInit; i++) {
       for (const cid of extractCallIds(prefix[i])) {
         const ridx = resultFirstIndex.get(cid);
-        if (ridx !== undefined && ridx >= safeLen) {
-          safeLen = i; // drop this call and everything after it (its result is outside)
-          break;
-        }
+        if (ridx !== undefined && ridx > reach) reach = ridx;
       }
+      if (reach <= i) safeLen = i + 1; // [0,i+1) is self-contained
     }
-    if (safeLen !== fittedPrefix.length) {
+    if (safeLen !== fittedLenInit) {
       fittedPrefix = safeLen >= MIN_SUMMARIZED ? prefix.slice(0, safeLen) : [];
       fittedLen = fittedPrefix.length;
       // Re-tokenize the shrunk covered prefix so the no-op guard below compares the ACTUAL

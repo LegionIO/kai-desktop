@@ -2070,6 +2070,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const toolCfg = config.compaction?.tool as ToolCompactionConfig | undefined;
           const maxTokens = toolCfg?.outputMaxTokens ?? 0;
           if (maxTokens <= 0 || totalTokens <= maxTokens) return rawBytes;
+          const canonical = isCanonicalModel(compactModelName) && isCanonicalModel(sendModelName);
+          // AI compaction (useAI) REPLACES the body with an AI summary, then truncates THAT to
+          // outputMaxTokens — so the bound can NOT be derived from the ORIGINAL body's char
+          // slices (the summary is arbitrary text). For a CANONICAL tokenizer the truncated
+          // summary is ≤ outputMaxTokens*4 bytes (≤4 B/tok); for a FALLBACK/unknown tokenizer the
+          // bytes-per-token is uncertain, so no shrink credit is safe → charge rawBytes (AI
+          // summarization + truncation won't GROW past the original in practice, and this can't
+          // under-count → no wrongly-retained media → no post-tool overflow).
+          if (toolCfg?.useAI) {
+            return canonical ? Math.min(rawBytes, Math.max(maxTokens * 4, Buffer.byteLength(TRUNCATE_MARKER, 'utf8'))) : rawBytes;
+          }
           const minChars = Math.max(0, toolCfg?.truncateMinChars ?? 200);
           const headRatio = toolCfg?.truncateHeadRatio ?? 0.7;
           const minTailChars = Math.max(0, toolCfg?.truncateMinTailChars ?? 200);
@@ -2086,7 +2097,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             Buffer.byteLength(TRUNCATE_MARKER, 'utf8') +
             (tail > 0 ? Buffer.byteLength(bodyText.slice(-tail), 'utf8') : 0);
           let bound = firstPassBytes;
-          if (isCanonicalModel(compactModelName) && isCanonicalModel(sendModelName)) {
+          if (canonical) {
             // Cap by the token budget (≤4 B/tok on o200k) — but NEVER below the truncation
             // marker's own byte size: truncateToTokenBudget always emits the marker (its shrink
             // loop reduces head/tail toward 0 but keeps the marker), so a tiny outputMaxTokens
@@ -4855,18 +4866,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // GUI (renderer-persisted) turn: main kept a FALLBACK accumulator. The renderer persists
         // the reply on its ~300ms debounce; normally we just DISCARD main's copy. But if the SOLE
         // renderer reloaded/crashed mid-stream, NO renderer will persist it — so poll disk briefly
-        // and, if the reply never lands (runStatus stays 'running' / the assistant id is absent),
-        // FINALIZE main's accumulator as the fallback (guarded against double-write). Only when
-        // this run still owns the conversation (not superseded by a newer turn's token).
-        if (serverPersistAppHome && guiFallbackParents.has(conversationId)) {
+        // and, if the reply never lands (runStatus stays 'running'), FINALIZE main's accumulator as
+        // the fallback (guarded against double-write). ONLY when THIS run still owns the
+        // conversation: a SUPERSEDED run (a replacement GUI turn took over — different activeStreams
+        // token) must NOT touch guiFallbackParents or the shared accumulator, which now belong to
+        // the replacement run (deleting/discarding them would drop the replacement's output +
+        // crash-recovery copy). An ABSENT token = this run finished cleanly + still owns it.
+        {
+          const fbOwner = activeStreams.get(conversationId)?.token;
+          const stillOwnFallback = fbOwner === undefined || fbOwner === streamToken;
+          if (serverPersistAppHome && guiFallbackParents.has(conversationId) && stillOwnFallback) {
           const fbAppHome = serverPersistAppHome;
           const fbToken = streamToken;
           guiFallbackParents.delete(conversationId);
           const pollGuiFallback = (remaining: number): void => {
-            // Superseded / deleted → the newer owner (or nothing) handles it; drop our copy.
+            // Superseded by a REPLACEMENT run (different token) → that run now owns the shared
+            // accumulator + will handle its own fallback; do NOT discard (it's accumulating into
+            // it). Deleted → the delete cleanup released it. Either way, just stop.
             const owner = activeStreams.get(conversationId)?.token;
-            if ((owner !== undefined && owner !== fbToken) || isRecentlyDeleted(conversationId)) {
-              discardPersistenceAccumulator(conversationId);
+            if (owner !== undefined && owner !== fbToken) return; // replacement owns it — leave it alone
+            if (isRecentlyDeleted(conversationId)) {
+              discardPersistenceAccumulator(conversationId); // gone — release our copy
               return;
             }
             let rendererPersisted = false;
@@ -4905,6 +4925,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             setTimeout(() => pollGuiFallback(remaining - 1), 100);
           };
           pollGuiFallback(80); // ~8s: ample for the renderer's debounced persist; then fall back
+          }
         }
       }
     })();
