@@ -1032,6 +1032,12 @@ export function App({
                   // idle/drain is authoritative; don't clobber it back to 'running'.
                   if (settleEpochRef.current !== probeEpoch) return;
                   if (inFlight) {
+                    // The peer turn's terminal `done` will settleTurn + drain the queue — but
+                    // settleTurn no-ops if turnSettledRef is still TRUE from a PRIOR settle (we
+                    // may have MISSED this peer turn's `user-message`, which is what arms the
+                    // guard). ARM it here so the peer `done` actually settles instead of being
+                    // ignored (which would leave the CLI stuck running with queued prompts).
+                    turnSettledRef.current = false;
                     setStatus('running');
                     statusRef.current = 'running';
                   } else if (queueRef.current.length > 0) {
@@ -1593,7 +1599,13 @@ export function App({
                 void client
                   .invoke<boolean>('agent:in-flight', cid)
                   .then((inFlight) => {
-                    if (inFlight) return; // its `done` will drain via settleTurn
+                    if (inFlight) {
+                      // The peer turn's `done` will drain the resend via settleTurn — but
+                      // settleTurn no-ops if turnSettledRef is stale-TRUE (we may have missed the
+                      // peer's user-message that arms it). Arm it so the peer `done` settles.
+                      turnSettledRef.current = false;
+                      return;
+                    }
                     const resend = pendingBusyResendRef.current;
                     if (resend) {
                       pendingBusyResendRef.current = null;

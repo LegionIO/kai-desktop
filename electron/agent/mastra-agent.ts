@@ -2216,6 +2216,26 @@ export async function* streamWithFallback(
             discardPartialAssistant = emittedContent;
             break;
           }
+          // LAST attempt content-filtered (no further fallback) AFTER an earlier attempt hit a
+          // pre-content overflow, with no content produced: a bare `done` here would let the
+          // caller treat the turn as complete and NEVER attempt reactive compaction — masking a
+          // recoverable overflow. Surface it as a terminal context-overflow error instead so the
+          // caller's recovery compacts + retries (which may fit the request + get a real reply).
+          if (
+            terminalFinishReason === 'content-filter' &&
+            sawPreContentOverflow &&
+            !emittedContent &&
+            attempt >= modelChain.length - 1
+          ) {
+            yield {
+              conversationId,
+              type: 'error',
+              error: lastError ?? 'Context window exceeded before content could be generated.',
+              errorCategory: 'context-overflow',
+              overflowRecoveryModelKey: overflowModelKey ?? undefined,
+            } as StreamEvent;
+            continue;
+          }
         }
 
         // Skip inner 'done' if we're about to fallback

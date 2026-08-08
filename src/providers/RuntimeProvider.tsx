@@ -2543,9 +2543,33 @@ export function RuntimeProvider({
       // persists never grow the tree past treeRef.current, so a longer incoming
       // tree reliably signals an external write.
       if (change.kind !== 'upsert' || change.conversation.id !== activeId) return;
-      const conv = change.conversation as { messageTree?: unknown[]; messages?: unknown[] };
-      const incomingLen = (conv.messageTree ?? conv.messages ?? []).length;
-      if (incomingLen > treeRef.current.length) {
+      const conv = change.conversation as { messageTree?: unknown[]; messages?: unknown[]; headId?: string | null };
+      const incomingTree = (conv.messageTree ?? conv.messages ?? []) as Array<{ id?: unknown; content?: unknown }>;
+      const incomingLen = incomingTree.length;
+      const currentTree = treeRef.current as unknown as Array<{ id?: unknown; content?: unknown }>;
+      // A longer incoming tree signals an external append (our own persists never grow past
+      // treeRef). But a SAME-LENGTH upsert can also be authoritative: a passive-mirror view that
+      // reloaded a PARTIAL snapshot, then the owner's terminal persist FINALIZED the assistant
+      // in place (same node count, changed content) — a length-only gate would ignore that and
+      // leave the view permanently truncated. Also reload when the head moved OR the tail node's
+      // id/content differs (cheap: only the tail, only for the active conv with no accumulator).
+      let needsReload = incomingLen > currentTree.length;
+      if (!needsReload && incomingLen > 0 && incomingLen === currentTree.length) {
+        const inHead = conv.headId ?? null;
+        const curHead = headIdRef.current ?? null;
+        const inTail = incomingTree[incomingLen - 1];
+        const curTail = currentTree[currentTree.length - 1];
+        const idDiffers = (inTail?.id ?? null) !== (curTail?.id ?? null);
+        const contentDiffers = (() => {
+          try {
+            return JSON.stringify(inTail?.content) !== JSON.stringify(curTail?.content);
+          } catch {
+            return inTail?.content !== curTail?.content;
+          }
+        })();
+        needsReload = inHead !== curHead || idDiffers || contentDiffers;
+      }
+      if (needsReload) {
         void loadConversationState(activeId);
       }
     });
