@@ -772,6 +772,22 @@ async function resumeSubAgent(
         status: 'stopped',
         summary: 'Stopped.',
       } as SubAgentEvent);
+      // Persist the DURABLE `stopped` status too — the broadcast above is UI-only; without this
+      // the on-disk metadata stays at its pre-reopen value (paused/completed), so the thread
+      // reappears resumable/incorrect after a restart. paused/completed → stopped is FSM-legal.
+      // Best-effort with a bounded retry (updateSubagentStatus returns false on failure, swallows
+      // internally), mirroring stopSubAgent's terminal write.
+      if (memory) {
+        const writeStopped = async (remaining: number): Promise<void> => {
+          const ok = await updateSubagentStatus(memory, subAgentConversationId, {
+            status: 'stopped',
+            completedAt: new Date().toISOString(),
+            exitReason: 'stopped',
+          });
+          if (!ok && remaining > 0) setTimeout(() => void writeStopped(remaining - 1), 500);
+        };
+        void writeStopped(5);
+      }
       // We released a concurrency slot above; another paused agent may now be admissible.
       // This conv is fully removed from pending, so the drain won't re-hit our failed reopen.
       queueMicrotask(() => drainAdmissiblePendingResumes());

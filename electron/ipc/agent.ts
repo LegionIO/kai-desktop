@@ -21,7 +21,7 @@ import {
   getConversationBranch,
   appendConversationMessages,
 } from './conversations.js';
-import { readConversation, writeConversation, nextCompactionRevision } from './conversation-store.js';
+import { readConversation, writeConversation, nextCompactionRevision, isRecentlyDeleted } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
@@ -4653,8 +4653,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const injectedText = lastInjectedText;
             // Launch the automatic continuation on `branch`, marking this conversation
             // server-persist so the renderer takes its render-only path (no double-persist).
-            const launchContinuation = (branch: unknown[], busyRetries = 20): void => {
+            const launchContinuation = (branch: unknown[], busyRetries = 300): void => {
               if (controller.signal.aborted) return;
+              // The delayed continuation timers fire AFTER this run's finally cleaned up
+              // activeStreams, so a conversation DELETE (which aborts via activeStreams) can no
+              // longer reach this controller. Guard the launch on the conversation still existing
+              // + not tombstoned — else the timer would start a stream against a DELETED chat and
+              // run tools invisibly.
+              if (!readConversation(appHome, conversationId) || isRecentlyDeleted(conversationId)) return;
               // A superseding turn (new GUI/CLI submit) installs a new activeStreams token
               // for this conversation; it owns its own continuation queue, so a stale
               // continuation must not launch. This run's OWN token is already removed by the
@@ -4690,13 +4696,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       pendingServerPersist.delete(conversationId);
                       pendingServerPersistParent.delete(conversationId);
                     }
-                    // A /compact holds the conversation — transient (secs to ~285s). RETRY the
-                    // continuation (bounded) rather than abandoning, else the accepted injected
-                    // message is left PERMANENTLY unanswered. Only if still ours + not superseded.
+                    // A /compact holds the conversation — transient but up to ~285s. RETRY the
+                    // continuation (bounded to SPAN that window) rather than abandoning, else the
+                    // accepted injected message is left PERMANENTLY unanswered. 1s cadence ×
+                    // budget covers /compact's max hold. Only if still ours + not superseded.
                     if (stillOurs && busyRetries > 0 && !controller.signal.aborted) {
                       const o = activeStreams.get(conversationId)?.token;
                       if (o === undefined || o === streamToken) {
-                        setTimeout(() => launchContinuation(branch, busyRetries - 1), 500);
+                        setTimeout(() => launchContinuation(branch, busyRetries - 1), 1000);
                       }
                     }
                   }
@@ -4736,6 +4743,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               //      then launch on that confirmed branch. Bounded; fall back after the budget.
               const pollForFinalizedBranch = (remaining: number): void => {
                 if (controller.signal.aborted) return;
+                // Conversation deleted/tombstoned during the poll → stop (don't keep polling or
+                // launch a continuation against a gone chat).
+                if (isRecentlyDeleted(conversationId)) return;
                 // Bail if a superseding run took over (present entry, different token). Our own
                 // token is already cleaned up (absent) by finally — absent means we still own it.
                 const owner = activeStreams.get(conversationId)?.token;
