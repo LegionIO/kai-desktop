@@ -358,15 +358,27 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
         }
       })();
     });
-    void client.invoke('agent:submit', id, prompt.trim(), submitOpts).catch((err) => {
-      // A submit that fails because the socket dropped is handled by the
-      // disconnect path (recover). Only treat it as terminal here if we're not
-      // already recovering.
-      if (recovering || settled) return;
-      errored = err?.message ?? String(err);
-      if (!json) process.stderr.write(`\n[submit failed: ${errored}]\n`);
-      finish();
-    });
+    void client
+      .invoke<{ ok?: boolean; error?: string; busyKind?: string } | undefined>('agent:submit', id, prompt.trim(), submitOpts)
+      .then((res) => {
+        // A submit that RESOLVES { ok:false } (conversation busy from a cross-client compaction,
+        // or the conversation was deleted) starts NO stream — so no `done` ever arrives and the
+        // one-shot headless run would wait forever. Treat it as terminal here.
+        if (res && res.ok === false && !recovering && !settled) {
+          errored = errored ?? (res.error ? `submit rejected: ${res.error}` : 'submit rejected');
+          if (!json) process.stderr.write(`\n[${errored}]\n`);
+          finish();
+        }
+      })
+      .catch((err) => {
+        // A submit that fails because the socket dropped is handled by the
+        // disconnect path (recover). Only treat it as terminal here if we're not
+        // already recovering.
+        if (recovering || settled) return;
+        errored = err?.message ?? String(err);
+        if (!json) process.stderr.write(`\n[submit failed: ${errored}]\n`);
+        finish();
+      });
   });
 
   if (json) {

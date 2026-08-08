@@ -373,6 +373,13 @@ const serverPersistParents = new Map<string, string | null>();
 // reloaded/crashed), finalizes main's accumulator so the reply isn't lost. Cleared at terminal.
 const guiFallbackParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
+// Reactive-recovery compaction hook awaits ABANDONED on turn-cancel (raceRecoveryAbort won, but
+// the underlying trusted-plugin callback promise stays pending, pinning its transcript — we can't
+// force-cancel a callback protocol). Bounded so repeated cancel→retry cycles against hung hooks
+// can't accumulate transcripts + exhaust memory: over the cap, recovery bails (surfaces overflow)
+// rather than start another abandonable hook. Decremented when each abandoned promise settles.
+let outstandingAbandonedRecoveryHooks = 0;
+const MAX_ABANDONED_RECOVERY_HOOKS = 8;
 
 // Finalize the GUI-turn persistence FALLBACK for a run that just ended. The renderer normally
 // persists its own reply (on a ~300ms debounce); we poll briefly and, if it never lands (the sole
@@ -2963,6 +2970,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           !compactionSupported ||
           !config.compaction?.conversation?.enabled ||
           !modelEntry ||
+          // Memory backstop: too many prior recovery hook awaits are ABANDONED-but-pending (hung
+          // trusted-plugin callbacks pinning transcripts). Don't start another abandonable run —
+          // surface the overflow instead; frees as the hung hooks eventually settle.
+          outstandingAbandonedRecoveryHooks >= MAX_ABANDONED_RECOVERY_HOOKS ||
           !isOverflow;
         if (recoveryGatedOffLast) {
           return null;
@@ -3020,14 +3031,32 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const raceRecoveryAbort = async <T>(p: Promise<T>): Promise<T> => {
             if (controller.signal.aborted) throw new Error('recovery-aborted');
             let onAbort: (() => void) | undefined;
+            let aborted = false;
             const abortP = new Promise<never>((_, reject) => {
-              onAbort = () => reject(new Error('recovery-aborted'));
+              onAbort = () => {
+                aborted = true;
+                reject(new Error('recovery-aborted'));
+              };
               controller.signal.addEventListener('abort', onAbort, { once: true });
             });
             try {
               return await Promise.race([p, abortP]);
             } finally {
               if (onAbort) controller.signal.removeEventListener('abort', onAbort);
+              // Deadline/cancel won → `p` (the hook) is ABANDONED but still pending, pinning its
+              // transcript. Count it (decrement when it eventually settles) so repeated
+              // cancel-retry cycles against hung hooks can't accumulate unboundedly.
+              if (aborted) {
+                outstandingAbandonedRecoveryHooks++;
+                void p.then(
+                  () => {
+                    outstandingAbandonedRecoveryHooks = Math.max(0, outstandingAbandonedRecoveryHooks - 1);
+                  },
+                  () => {
+                    outstandingAbandonedRecoveryHooks = Math.max(0, outstandingAbandonedRecoveryHooks - 1);
+                  },
+                );
+              }
             }
           };
           // Gate the branch through the UserPromptSubmit DLP hooks with the
