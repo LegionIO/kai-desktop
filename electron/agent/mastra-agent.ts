@@ -2217,10 +2217,14 @@ export async function* streamWithFallback(
             break;
           }
           // LAST attempt content-filtered (no further fallback) AFTER an earlier attempt hit a
-          // pre-content overflow, with no content produced: a bare `done` here would let the
-          // caller treat the turn as complete and NEVER attempt reactive compaction — masking a
-          // recoverable overflow. Surface it as a terminal context-overflow error instead so the
-          // caller's recovery compacts + retries (which may fit the request + get a real reply).
+          // pre-content overflow, with no content produced: a bare `done` would let the caller
+          // treat the turn as complete and NEVER attempt reactive compaction — masking a
+          // recoverable overflow. Emit a terminal context-overflow ERROR (so the caller's
+          // recovery compacts + retries) BUT still let the `done` flow below — the consumer
+          // (agent.ts) gates the trailing `done` per run type: a serverPersisted (CLI/headless)
+          // turn NEEDS it to finalize + reset runStatus (else its output is discarded + it's
+          // stuck running), while a GUI turn's `done` is suppressed after the error
+          // (sawTerminalStreamError). Do NOT `continue` — that skipped the required `done`.
           if (
             terminalFinishReason === 'content-filter' &&
             sawPreContentOverflow &&
@@ -2234,7 +2238,7 @@ export async function* streamWithFallback(
               errorCategory: 'context-overflow',
               overflowRecoveryModelKey: overflowModelKey ?? undefined,
             } as StreamEvent;
-            continue;
+            // fall through to `yield event` (the done) — the consumer gates it per run type.
           }
         }
 

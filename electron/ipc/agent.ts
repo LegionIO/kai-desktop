@@ -4022,6 +4022,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // loop) do NOT re-fire. Capped at one retry via `overflowRecoveryUsed`.
         // `retryAfterOverflow` is set inside the event loop and consumed here.
         let retryAfterOverflow = false;
+        // The response id passed to each stream attempt. Starts as the caller's id; an OVERFLOW
+        // RETRY refreshes it to a FRESH id (undefined → mastra-agent mints one) so the retry's
+        // assistant node can't collide with a FAILED SIBLING the prior attempt preserved under
+        // the original id (a transient fallback preserves the partial as a sibling, then the
+        // fallback can overflow before content — reusing the original id here would merge the
+        // successful retry into that failed sibling, mixing failed+successful replies). This
+        // mirrors how a mid-stream fallback already changes the response id per variant.
+        let currentResponseMessageId = responseMessageId;
         // Whether a mid-stream model-fallback occurred on the CURRENT stream attempt.
         // If overflow recovery then retries at the primary, we emit a restoration
         // event so the renderer's model selector un-pins from the fallback.
@@ -4037,7 +4045,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const stream = runtime.stream({
             conversationId,
             messages,
-            responseMessageId,
+            responseMessageId: currentResponseMessageId,
             config: configWithExecutionMode,
           tools: activeCustomTools,
           appHome,
@@ -4535,6 +4543,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             ? getProviderDefinedToolNames(modelEntry.modelConfig)
             : new Set<string>();
           activeModelEntryForRecovery = modelEntry;
+          // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
+          // reply can't collide with a failed sibling preserved under the prior attempt's id.
+          currentResponseMessageId = undefined;
         }
         } while (retryAfterOverflow);
       } catch (error) {
