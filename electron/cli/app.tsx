@@ -1679,17 +1679,48 @@ export function App({
                 // TURN busy: the peer turn's terminal `done` drains via settleTurn. But that
                 // `done` may have arrived BEFORE this response resolved (settleTurn already ran,
                 // found no pending resend). Probe agent:in-flight; if the turn is already gone,
-                // resend now rather than wait for an event that won't come.
+                // resend now rather than wait for an event that won't come. ALSO probe
+                // automations:in-flight — a STANDALONE AUTOMATION run holds the conversation but
+                // emits NO agent:in-flight and NO terminal event the CLI drains on, so resending
+                // immediately would tight-loop (busy → resend → busy…) with unbounded error rows.
                 const cid = convIdRef.current;
-                void client
-                  .invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', cid)
-                  .then((res) => {
+                void Promise.all([
+                  client.invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', cid),
+                  client.invoke<boolean>('automations:in-flight', cid).catch(() => false),
+                ])
+                  .then(([res, autoInFlight]) => {
                     const inFlight = res?.inFlight === true;
                     if (inFlight) {
                       // The peer turn's `done` will drain the resend via settleTurn — but
                       // settleTurn no-ops if turnSettledRef is stale-TRUE (we may have missed the
                       // peer's user-message that arms it). Arm it so the peer `done` settles.
                       turnSettledRef.current = false;
+                      return;
+                    }
+                    if (autoInFlight === true) {
+                      // A standalone automation holds the conversation. No agent `done` will
+                      // drain us. Keep the resend queued + poll again shortly (avoid the tight
+                      // resend loop). Stay 'running' so typed input keeps queuing meanwhile.
+                      setTimeout(() => {
+                        if (convIdRef.current !== cid) return; // switched away — the resend stays scoped/queued
+                        client
+                          .invoke<boolean>('automations:in-flight', cid)
+                          .then((still) => {
+                            if (convIdRef.current !== cid) return;
+                            if (still === true) {
+                              // still running — the reconnect/next-terminal drain will pick it up;
+                              // leave the resend queued rather than re-poll forever.
+                              return;
+                            }
+                            const r = takeResendForActiveConv();
+                            if (r) {
+                              setStatus('running');
+                              statusRef.current = 'running';
+                              setTimeout(() => sendMessageRef.current(r.trimmed, r.submitText, r.attachments), 0);
+                            }
+                          })
+                          .catch(() => {});
+                      }, 2000);
                       return;
                     }
                     const resend = takeResendForActiveConv();

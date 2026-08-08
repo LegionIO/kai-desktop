@@ -2263,7 +2263,7 @@ export function RuntimeProvider({
     return branchPoints.get(lastAssistant.id) ?? null;
   }, [branchPoints, tree, headId, isRunning]);
 
-  const loadConversationState = useCallback(async (id: string) => {
+  const loadConversationState = useCallback(async (id: string, opts?: { skipInFlightSeed?: boolean }) => {
     // Monotonic guard: if the user switches conversations while an earlier load
     // is still awaiting IPC, the earlier (now-stale) load must not apply its
     // results over the newer selection. Capture a token; only commit state when
@@ -2364,7 +2364,7 @@ export function RuntimeProvider({
     const accAwait = hasActiveStream && streamAccumulators.get(id)?.awaitingApproval;
     if (hasActiveStream) {
       setIsRunning(!accAwait);
-    } else if (conv.runStatus === 'running') {
+    } else if (conv.runStatus === 'running' && !opts?.skipInFlightSeed) {
       // Persisted as running but we have no local accumulator. Either a run is
       // streaming into it right now (automation OR a CLI/server-persisted submit
       // on the headless backend) and we opened mid-run, or it's a genuinely stale
@@ -3960,7 +3960,11 @@ export function RuntimeProvider({
           streamAccumulators.delete(convId);
           if (isActiveConv) {
             setIsRunning(false);
-            void loadConversationState(convId);
+            // POST-TERMINAL reload — the turn ended. Skip loadConversationState's in-flight
+            // seeding: the disk may still show 'running' (owner/backend persist not yet landed)
+            // and agent.inFlight true for a beat, which would seed a stuck accumulator that
+            // SUPPRESSES the authoritative upsert (onChanged skips a conv with a live accumulator).
+            void loadConversationState(convId, { skipInFlightSeed: true });
           }
           return;
         }
@@ -3980,7 +3984,11 @@ export function RuntimeProvider({
           streamAccumulators.delete(convId);
           if (isActiveConv) {
             setIsRunning(false);
-            void loadConversationState(convId);
+            // POST-TERMINAL reload — the turn ended. Skip loadConversationState's in-flight
+            // seeding: the disk may still show 'running' (owner/backend persist not yet landed)
+            // and agent.inFlight true for a beat, which would seed a stuck accumulator that
+            // SUPPRESSES the authoritative upsert (onChanged skips a conv with a live accumulator).
+            void loadConversationState(convId, { skipInFlightSeed: true });
           }
           return;
         }
@@ -4053,7 +4061,11 @@ export function RuntimeProvider({
           streamAccumulators.delete(convId);
           if (isActiveConv) {
             setIsRunning(false);
-            void loadConversationState(convId);
+            // POST-TERMINAL reload — the turn ended. Skip loadConversationState's in-flight
+            // seeding: the disk may still show 'running' (owner/backend persist not yet landed)
+            // and agent.inFlight true for a beat, which would seed a stuck accumulator that
+            // SUPPRESSES the authoritative upsert (onChanged skips a conv with a live accumulator).
+            void loadConversationState(convId, { skipInFlightSeed: true });
           }
           return;
         }
@@ -4123,7 +4135,11 @@ export function RuntimeProvider({
           });
           if (isActiveConv) {
             setIsRunning(false);
-            void loadConversationState(convId);
+            // POST-TERMINAL reload — the turn ended. Skip loadConversationState's in-flight
+            // seeding: the disk may still show 'running' (owner/backend persist not yet landed)
+            // and agent.inFlight true for a beat, which would seed a stuck accumulator that
+            // SUPPRESSES the authoritative upsert (onChanged skips a conv with a live accumulator).
+            void loadConversationState(convId, { skipInFlightSeed: true });
           }
           return;
         }
