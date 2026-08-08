@@ -3181,6 +3181,15 @@ export function RuntimeProvider({
       // stream never launches (stuck running). Only a real run's events set ownership.
       if (e.responseMessageId && e.type !== 'compaction') acc.pendingAssistantId = e.responseMessageId;
 
+      // A realtime (voice-call) turn is a RENDERER-owned, single-client, active-conversation
+      // turn — it has no other persister and no `locallyOriginated`-setting submit path (its
+      // accumulator is created generically from the first event). Mark it owned so the terminal
+      // done/error handlers + persist gate DON'T misclassify it as a passive mirror and discard
+      // its output (mirrors are a MULTI-client GUI concept; realtime is single-client).
+      if (e.type === 'realtime-user-transcript' || e.type === 'realtime-interrupt' || e.type === 'realtime-status') {
+        acc.locallyOriginated = true;
+      }
+
       if (e.type === 'user-message') {
         // A user turn submitted into THIS conversation by ANOTHER client (the
         // `kai` CLI via agent:submit, or a second GUI window). Insert it into the

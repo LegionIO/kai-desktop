@@ -2061,7 +2061,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             (tail > 0 ? Buffer.byteLength(bodyText.slice(-tail), 'utf8') : 0);
           let bound = firstPassBytes;
           if (isCanonicalModel(compactModelName) && isCanonicalModel(sendModelName)) {
-            bound = Math.min(bound, maxTokens * 4);
+            // Cap by the token budget (≤4 B/tok on o200k) — but NEVER below the truncation
+            // marker's own byte size: truncateToTokenBudget always emits the marker (its shrink
+            // loop reduces head/tail toward 0 but keeps the marker), so a tiny outputMaxTokens
+            // (e.g. 1 → 4 bytes) must not cap below the ~44-byte marker, which would under-count
+            // the real output and retain media past the true remaining context.
+            const markerBytes = Buffer.byteLength(TRUNCATE_MARKER, 'utf8');
+            bound = Math.min(bound, Math.max(maxTokens * 4, markerBytes));
           }
           return Math.min(rawBytes, bound);
         };
