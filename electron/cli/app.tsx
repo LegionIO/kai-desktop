@@ -1712,15 +1712,21 @@ export function App({
                             if (still === true) {
                               if (remaining > 0) {
                                 setTimeout(() => pollAutomationFree(remaining - 1), 2000);
+                                return;
                               }
-                              // Budget exhausted (a very long automation) — leave the resend
-                              // queued for the reconnect / next-terminal drain rather than poll
-                              // forever, but drop the stuck 'running' indicator to idle so the CLI
-                              // isn't wedged (the queued resend still drains when the user returns).
-                              else if (statusRef.current === 'running') {
+                              // Budget exhausted (a very long automation). Stop polling, drop the
+                              // stuck 'running' indicator to idle, and SURFACE a note so the queued
+                              // message isn't silently stranded: it stays in the (scoped) queue and
+                              // drains on the next drain trigger (a later send, /resume back, or
+                              // reconnect). The user can act instead of assuming it sent.
+                              if (statusRef.current === 'running') {
                                 setStatus('idle');
                                 statusRef.current = 'idle';
                               }
+                              pushTurn({
+                                kind: 'note',
+                                text: 'still busy with an automation — your message is queued and will send when it frees (or resend it).',
+                              });
                               return;
                             }
                             const r = takeResendForActiveConv();

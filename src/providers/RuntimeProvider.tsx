@@ -4791,6 +4791,11 @@ export function RuntimeProvider({
           }).then(
             (r) => {
               if (!ownsNew()) return;
+              // A conversation-DELETED rejection is PERMANENT — abandon (don't retry, don't
+              // launch): retrying is futile and launching would run model/tool work against a
+              // gone chat (unpersisted output + invisible side effects). launchAgentStream's
+              // deleted-reject + the main-side guards backstop, but stop here cleanly.
+              if (r?.rejected === 'conversation-deleted') return;
               // Launch ONLY once the compaction record is confirmed on disk. A
               // conversation-busy (/compact lock — up to ~285s), superseded, or unknown/write-
               // fail outcome means it did NOT land — retry (bounded to SPAN /compact's window at
@@ -4845,6 +4850,7 @@ export function RuntimeProvider({
               }).then(
                 (r) => {
                   if (!ownsNew()) return;
+                  if (r?.rejected === 'conversation-deleted') return; // permanent — abandon (don't launch a gone chat)
                   if (r?.persisted) launchNew();
                   else if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 1000);
                   else launchNew(); // budget exhausted — last resort (reactive recovery backstops)
