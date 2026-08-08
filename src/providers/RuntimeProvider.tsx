@@ -4769,28 +4769,35 @@ export function RuntimeProvider({
       const nowPending = streamAccumulators.get(convId)?.pendingCompaction;
       if (ownsNew() && nowPending && nowPending.compactionId !== persistedCompactionId) {
         const durablyPersistThenLaunch = (remaining: number): void => {
+          if (!ownsNew()) return;
+          // Re-read the LATEST pending compaction each attempt: a NEWER reactive compaction can
+          // land on the accumulator during the retry wait, and launching with the stale one
+          // would trigger avoidable overflow recovery / duplicate paid compaction.
+          const latestPending = streamAccumulators.get(convId)?.pendingCompaction ?? nowPending;
           void persistConversation(convId, newTree, newHead, {
             runStatus: 'running',
-            conversationCompaction: nowPending,
+            conversationCompaction: latestPending,
           }).then(
             (r) => {
               if (!ownsNew()) return;
               // Launch ONLY once the compaction record is confirmed on disk. A
-              // conversation-busy (brief /compact lock), superseded, or unknown/write-fail
-              // outcome means it did NOT land — retry (bounded) rather than launch against
-              // the raw branch (which would re-summarize/rebill). Abandon after the budget.
+              // conversation-busy (/compact lock — up to ~285s), superseded, or unknown/write-
+              // fail outcome means it did NOT land — retry (bounded to SPAN /compact's window at
+              // 1s cadence) rather than launch against the raw branch (which would re-summarize/
+              // rebill OR be rejected busy, losing the optimistic prompt). Launch after the
+              // budget only as a last resort (reactive recovery backstops).
               if (r?.persisted) launchNew();
-              else if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 500);
-              else launchNew(); // budget exhausted — launch anyway (reactive recovery backstops)
+              else if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 1000);
+              else launchNew();
             },
             () => {
               if (!ownsNew()) return;
-              if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 500);
+              if (remaining > 0) setTimeout(() => durablyPersistThenLaunch(remaining - 1), 1000);
               else launchNew();
             },
           );
         };
-        durablyPersistThenLaunch(20);
+        durablyPersistThenLaunch(300); // ~300s: spans /compact's max hold
       } else if (ownsNew()) {
         // No late compaction was seen at the sample above. Yield one macrotask so any
         // compaction event already queued on the IPC channel (from a stale run) can land on
@@ -4816,24 +4823,29 @@ export function RuntimeProvider({
           if (intended) {
             const confirmThenLaunch = (remaining: number): void => {
               if (!ownsNew()) return;
+              // Re-read the latest pending compaction each attempt (a newer reactive compaction
+              // may have landed) — prefer it over the initially-captured `intended`.
+              const latest = streamAccumulators.get(convId)?.pendingCompaction;
+              const toPersist =
+                latest && latest.compactionId !== persistedCompactionId ? latest : intended;
               void persistConversation(convId, newTree, newHead, {
                 runStatus: 'running',
-                conversationCompaction: intended,
+                conversationCompaction: toPersist,
               }).then(
                 (r) => {
                   if (!ownsNew()) return;
                   if (r?.persisted) launchNew();
-                  else if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 500);
-                  else launchNew(); // budget exhausted — launch anyway (reactive recovery backstops)
+                  else if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 1000);
+                  else launchNew(); // budget exhausted — last resort (reactive recovery backstops)
                 },
                 () => {
                   if (!ownsNew()) return;
-                  if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 500);
+                  if (remaining > 0) setTimeout(() => confirmThenLaunch(remaining - 1), 1000);
                   else launchNew();
                 },
               );
             };
-            confirmThenLaunch(20);
+            confirmThenLaunch(300); // ~300s: spans /compact's max hold
           } else {
             launchNew();
           }
