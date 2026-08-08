@@ -649,7 +649,11 @@ export async function fitImagePart(
     if (signal?.aborted) return abortedUnchanged();
     targetEdge = Math.floor(targetEdge / 2);
     if (targetEdge <= config.minDimension) {
-      targetEdge = config.minDimension;
+      // Clamp the floor to at most the ORIGINAL longest edge — never UPSCALE. A misconfigured
+      // minDimension larger than the image would otherwise make sharp.resize target a bigger
+      // dimension than the source (wasted work / potential large-allocation), and shrinking
+      // toward a floor above the source is meaningless.
+      targetEdge = Math.min(config.minDimension, longestEdge);
       atFloor = true; // this is the last iteration — the floor attempt
     }
 

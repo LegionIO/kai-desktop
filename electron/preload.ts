@@ -154,14 +154,13 @@ const appAPI = {
         summarizedCount?: number;
         error?: string;
       }>,
-    // Durable per-conversation stash of un-restorable /compact-busy rollback input. Field-only
-    // update on main (no whole-record clobber). ttlCutoff drops disk entries older than it.
+    // Durable per-conversation stash of un-restorable /compact-busy rollback input. DELTA update
+    // on main (add/remove by id; merges concurrent clients; no whole-record clobber).
     setPendingDrafts: (
       conversationId: string,
-      drafts: Array<{ text: string; attachments: unknown[]; stashedAt: number }>,
-      ttlCutoff?: number,
+      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
     ) =>
-      ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, drafts, ttlCutoff) as Promise<{
+      ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
         ok: boolean;
       }>,
     // Cross-client /compact busy sync: current compacting set + change subscription.

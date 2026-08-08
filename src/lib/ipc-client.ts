@@ -145,8 +145,7 @@ type AppAPI = {
     compact: (conversationId: string) => Promise<{ ok: boolean; summarizedCount?: number; error?: string }>;
     setPendingDrafts: (
       conversationId: string,
-      drafts: Array<{ text: string; attachments: unknown[]; stashedAt: number }>,
-      ttlCutoff?: number,
+      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
     ) => Promise<{ ok: boolean }>;
     compactingIds: () => Promise<string[]>;
     onCompactingChanged: (

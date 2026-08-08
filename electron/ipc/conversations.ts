@@ -1123,41 +1123,54 @@ export function registerConversationHandlers(
     return { ok: true, removed, conversation: commitTreeUpdate(conv, tree, nextHead) };
   });
 
-  // Persist ONLY the `pendingDrafts` field (durable copy of a /compact-busy rollback's unsent
-  // input). Read-modify-write on the CURRENT disk record here on main — NOT a renderer
-  // get-then-put-whole-record, which would clobber concurrent streamed/final assistant content,
-  // settings, or runStatus with the renderer's stale snapshot. Field-only: everything else on
-  // the record is preserved as-is. Also drops disk entries older than the caller-supplied TTL
-  // cutoff so expired drafts' attachment base64 doesn't linger on disk.
+  // Apply a DELTA to the `pendingDrafts` field (durable copy of a /compact-busy rollback's
+  // unsent input): ADD these drafts, REMOVE these ids. A DELTA (not a wholesale replace of one
+  // client's local queue) so two clients concurrently stashing/restoring drafts for the SAME
+  // conversation MERGE instead of last-writer-wins-erasing each other. Read-modify-write on the
+  // CURRENT disk record here on main — NOT a renderer get-then-put-whole-record, which would
+  // clobber concurrent streamed/final assistant content / settings / runStatus with the stale
+  // snapshot. Field-only: everything else on the record is preserved as-is.
   ipcMain.handle(
     'conversations:set-pending-drafts',
     (
       _event,
       conversationId: string,
-      drafts: Array<{ text: string; attachments: unknown[]; stashedAt: number }>,
-      ttlCutoff?: number,
+      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
     ) => {
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false };
-      const cutoff = typeof ttlCutoff === 'number' ? ttlCutoff : 0;
-      const next = Array.isArray(drafts)
-        ? drafts.filter((d) => {
-            if (!d || typeof d.stashedAt !== 'number' || d.stashedAt < cutoff) return false;
-            const hasText = typeof d.text === 'string' && d.text.trim().length > 0;
-            const hasAttachments = Array.isArray(d.attachments) && d.attachments.length > 0;
-            return hasText || hasAttachments;
-          })
-        : [];
-      const existing = (conv as { pendingDrafts?: unknown }).pendingDrafts;
-      const existingLen = Array.isArray(existing) ? existing.length : 0;
-      // No-op write avoidance: nothing to persist and nothing stored.
-      if (next.length === 0 && existingLen === 0) return { ok: true };
+      const isValid = (d: { id?: unknown; text?: unknown; attachments?: unknown; stashedAt?: unknown }): boolean => {
+        if (!d || typeof d.id !== 'string' || d.id.length === 0 || typeof d.stashedAt !== 'number') return false;
+        const hasText = typeof d.text === 'string' && d.text.trim().length > 0;
+        const hasAttachments = Array.isArray(d.attachments) && d.attachments.length > 0;
+        return hasText || hasAttachments;
+      };
+      const existing = ((conv as { pendingDrafts?: unknown }).pendingDrafts ?? []) as Array<{
+        id?: unknown;
+        text?: unknown;
+        attachments?: unknown;
+        stashedAt?: unknown;
+      }>;
+      const removeIds = new Set(Array.isArray(delta?.removeIds) ? delta.removeIds : []);
+      const addList = (Array.isArray(delta?.add) ? delta.add : []).filter(isValid);
+      const addIds = new Set(addList.map((d) => d.id));
+      // Keep existing entries that are (a) still valid, (b) not removed, (c) not superseded by an
+      // add with the same id (an add replaces its own id); then append the adds. Bound to the
+      // per-conversation cap (oldest first) as a pathological safety valve.
+      const kept = existing.filter(
+        (d) => isValid(d) && !removeIds.has(String(d.id)) && !addIds.has(String(d.id)),
+      );
+      let merged = [...kept, ...addList] as Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
+      const CAP = 200;
+      if (merged.length > CAP) merged = merged.slice(merged.length - CAP);
+      const existingLen = existing.length;
+      // No-op write avoidance: nothing changed (empty delta, nothing stored).
+      if (merged.length === 0 && existingLen === 0) return { ok: true };
       const updated: ConversationRecord = { ...conv };
-      if (next.length === 0) delete (updated as { pendingDrafts?: unknown }).pendingDrafts;
-      else (updated as { pendingDrafts?: unknown }).pendingDrafts = next;
-      // writeConversation is a metadata-only change here (tree/head/runStatus untouched); its
-      // resurrection + tree-preservation guards still apply. Not broadcast — this is a private
-      // draft cache, not conversation content the list view shows.
+      if (merged.length === 0) delete (updated as { pendingDrafts?: unknown }).pendingDrafts;
+      else (updated as { pendingDrafts?: unknown }).pendingDrafts = merged;
+      // Metadata-only change (tree/head/runStatus untouched) — its resurrection + tree-
+      // preservation guards still apply. Not broadcast — this is a private draft cache.
       writeConversation(appHome, updated);
       return { ok: true };
     },

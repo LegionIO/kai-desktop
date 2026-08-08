@@ -937,7 +937,7 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // BOTH survive (a single slot would either overwrite A or discard B). Restored one-at-a-time
 // (oldest first) by loadConversationState + the composer-empty poll (into an empty composer
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
-type RejectedDraft = { text: string; attachments: AttachedFile[]; stashedAt: number };
+type RejectedDraft = { id: string; text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
 // Rejected drafts are DURABLE USER INPUT (the user's unsent text/attachments), NOT a cache —
 // per the durably-persist decision they are cleared ONLY on restore into the composer or when
@@ -945,19 +945,25 @@ const rejectedDrafts = new Map<string, RejectedDraft[]>();
 // input the user still expects to get back). The in-memory queue is a fast-restore mirror
 // hydrated from disk on load, so its size is bounded by conversations touched this session, not
 // unbounded; the durable disk copy is one small `pendingDrafts` per conversation, cleared on
-// restore. A very high per-conversation cap remains only as a pathological safety valve.
+// restore. Each draft carries a UNIQUE id so the durable store is updated by ADD/REMOVE DELTA
+// (never a wholesale replace) — otherwise two clients concurrently stashing/restoring drafts for
+// the SAME conversation would erase each other's entries (last-writer-wins). A very high
+// per-conversation cap remains only as a pathological safety valve.
 const MAX_REJECTED_DRAFTS_PER_CONV = 200; // pathological safety valve only
 function enqueueRejectedDraft(convId: string, draft: { text: string; attachments: AttachedFile[] }): void {
   if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
   const q = rejectedDrafts.get(convId) ?? [];
-  q.push({ ...draft, stashedAt: Date.now() });
-  // Pathological safety valve only. If ever hit, drop the OLDEST (least likely still wanted).
-  if (q.length > MAX_REJECTED_DRAFTS_PER_CONV) q.shift();
+  const entry: RejectedDraft = { id: msgId(), ...draft, stashedAt: Date.now() };
+  q.push(entry);
+  // Pathological safety valve only. If ever hit, drop the OLDEST (least likely still wanted) —
+  // and remove it from the durable store by id so the delta stays consistent.
+  const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.shift() : undefined;
   rejectedDrafts.set(convId, q);
   // DURABLE copy: the in-memory queue is the fast-restore mirror, but a reload/close/crash before
-  // restore would silently lose this unsent input. Persist the queue into the conversation record
-  // via a FIELD-ONLY main update. loadConversationState hydrates from it; restore clears it.
-  void persistRejectedDraftsToDisk(convId);
+  // restore would silently lose this unsent input. ADD this draft to the conversation record's
+  // pendingDrafts via a FIELD-ONLY DELTA update on main (merges with any concurrent client's
+  // drafts; never wholesale-replaces). loadConversationState hydrates from it; restore removes it.
+  void applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
 }
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
 function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
@@ -965,21 +971,29 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
   if (q.length === 0) rejectedDrafts.delete(convId);
-  void persistRejectedDraftsToDisk(convId); // keep the durable copy in sync after consuming one
+  if (next) void applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
   return next;
 }
-// Persist the current in-memory rejected-draft queue for a conversation into its record's
-// `pendingDrafts` field (or clear it when the queue is empty), via a FIELD-ONLY main-side update
-// (conversations:setPendingDrafts) — NOT a renderer get-then-put-whole-record, which would
-// clobber concurrent streamed/final assistant content, settings, or runStatus with the stale
-// snapshot. Best-effort + fire-and-forget: the in-memory queue is authoritative within a
-// session; this is the crash/reload-survival copy. No TTL cutoff — rejected drafts are durable
-// user input, cleared only on restore / conversation delete (main writes exactly the queue).
-async function persistRejectedDraftsToDisk(convId: string): Promise<void> {
+// Apply a DELTA to a conversation record's durable `pendingDrafts` — add these drafts, remove
+// these ids — via a FIELD-ONLY main-side update (conversations:setPendingDrafts). A DELTA (not a
+// wholesale replace of this client's local queue) is essential: two clients concurrently
+// stashing/restoring drafts for the SAME conversation must MERGE, not last-writer-wins-erase.
+// Main read-modify-writes the CURRENT disk pendingDrafts (never a stale whole-record put).
+// Best-effort + fire-and-forget: the in-memory queue is authoritative within a session; this is
+// the crash/reload-survival copy.
+async function applyPendingDraftsDelta(
+  convId: string,
+  add: RejectedDraft[],
+  removeIds: string[],
+): Promise<void> {
   try {
-    const q = rejectedDrafts.get(convId) ?? [];
-    const drafts = q.map((d) => ({ text: d.text, attachments: d.attachments as unknown[], stashedAt: d.stashedAt }));
-    await app.conversations.setPendingDrafts?.(convId, drafts);
+    const addPayload = add.map((d) => ({
+      id: d.id,
+      text: d.text,
+      attachments: d.attachments as unknown[],
+      stashedAt: d.stashedAt,
+    }));
+    await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
   } catch {
     /* best-effort — the in-memory queue still restores within the session */
   }
@@ -993,12 +1007,13 @@ function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: u
   const raw = conv.pendingDrafts;
   if (!Array.isArray(raw) || raw.length === 0) return false;
   const restored: RejectedDraft[] = [];
-  for (const d of raw as Array<{ text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
+  for (const d of raw as Array<{ id?: unknown; text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
     const text = typeof d?.text === 'string' ? d.text : '';
     const attachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
     const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
+    const id = typeof d?.id === 'string' && d.id.length > 0 ? d.id : msgId();
     if (text.trim().length === 0 && attachments.length === 0) continue;
-    restored.push({ text, attachments, stashedAt });
+    restored.push({ id, text, attachments, stashedAt });
   }
   if (restored.length === 0) return false;
   rejectedDrafts.set(convId, restored);

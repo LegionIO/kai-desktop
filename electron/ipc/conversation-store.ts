@@ -98,7 +98,7 @@ export type ConversationRecord = {
    *  unsent text + attachments). Held in volatile renderer memory for fast in-session restore,
    *  but ALSO persisted here so a reload/close/crash doesn't silently lose the input. Restored
    *  when the user next opens the chat, then cleared. Small + rare; cleared on restore. */
-  pendingDrafts?: Array<{ text: string; attachments: unknown[]; stashedAt: number }>;
+  pendingDrafts?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
 };
 
 /** Lightweight per-conversation summary — everything the list view + singleton /

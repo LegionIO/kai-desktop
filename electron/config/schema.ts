@@ -167,8 +167,12 @@ const mediaCompactionSchema = z.object({
   strategy: z.enum(['downscale', 'drop']).default('downscale'),
   /** Smallest longest-edge (px) `downscale` will shrink an image to before it
    *  gives up and fails safe (drop-with-note). Below this the image is too small
-   *  to be useful anyway. Integer — sharp's resize rejects fractional dimensions. */
-  minDimension: z.number().int().positive().default(256),
+   *  to be useful anyway. Integer — sharp's resize rejects fractional dimensions.
+   *  Upper-bounded: this is a shrink FLOOR, so a huge value is nonsensical AND
+   *  dangerous — an out-of-range config value reaching sharp.resize as a target
+   *  could request a massive upscale and OOM the main process. 4096 is well above
+   *  any useful floor. */
+  minDimension: z.number().int().positive().max(4096).default(256),
   /** Lowest JPEG/WebP quality (1-100) `downscale` will re-encode at before
    *  failing safe. Integer — sharp's jpeg quality rejects fractional values. */
   minQuality: z.number().int().min(1).max(100).default(40),
@@ -868,7 +872,7 @@ export function getRuleTriggers(rule: {
   const seen = new Set<string>();
   const out: Array<{ source: string; event: string }> = [];
   for (const t of all) {
-    const key = `${t.source} ${t.event}`;
+    const key = `${t.source}${t.event}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(t);

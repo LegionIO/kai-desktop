@@ -242,7 +242,11 @@ export function App({
   // conversation-busy and must be RE-SENT verbatim when the lock frees — the plain string
   // queue can't carry submitText/attachments (e.g. /shot, @image), so those go here instead
   // of being requeued as bare text (which would resend without the image/expansion).
-  const pendingBusyResendRef = useRef<{ trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> } | null>(null);
+  // FIFO QUEUE (not a single slot) of busy-rejected submissions awaiting a verbatim re-send when
+  // the conversation frees. A single slot would be OVERWRITTEN when a SECOND submission is
+  // busy-rejected before the first drained — silently losing the first / reordering. Each entry
+  // preserves the FULL submission (expanded text + attachments). Drained oldest-first.
+  const pendingBusyResendRef = useRef<Array<{ trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> }>>([]);
   // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
   // an in-flight turn on the right conversation.
   if (runtimeRef) {
@@ -434,9 +438,8 @@ export function App({
     // (full expanded text + attachments) over the plain string queue, so a /shot or @image
     // that raced /compact resends verbatim. Returns true if it dispatched something.
     const drainNextInput = (): boolean => {
-      const resend = pendingBusyResendRef.current;
+      const resend = pendingBusyResendRef.current.shift(); // oldest busy-rejected submission first
       if (resend) {
-        pendingBusyResendRef.current = null;
         setStatus('running');
         statusRef.current = 'running';
         setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
@@ -1558,7 +1561,7 @@ export function App({
               // Preserve the FULL submission (expanded text + attachments) for a verbatim
               // re-send when the lock frees — re-enqueuing bare `trimmed` would drop a /shot
               // or @image submission's image/expansion. Drained by the unlock handlers.
-              pendingBusyResendRef.current = { trimmed, submitText, attachments };
+              pendingBusyResendRef.current.push({ trimmed, submitText, attachments });
               setStatus('running');
               statusRef.current = 'running';
               setTurns((prev) => [
@@ -1580,9 +1583,8 @@ export function App({
                     const stillCompacting = Array.isArray(ids) && cid != null && ids.includes(cid);
                     if (!stillCompacting) {
                       compactBusyWaitRef.current = false;
-                      const resend = pendingBusyResendRef.current;
+                      const resend = pendingBusyResendRef.current.shift();
                       if (resend) {
-                        pendingBusyResendRef.current = null;
                         setStatus('running');
                         statusRef.current = 'running';
                         setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
@@ -1606,9 +1608,8 @@ export function App({
                       turnSettledRef.current = false;
                       return;
                     }
-                    const resend = pendingBusyResendRef.current;
+                    const resend = pendingBusyResendRef.current.shift();
                     if (resend) {
-                      pendingBusyResendRef.current = null;
                       setStatus('running');
                       statusRef.current = 'running';
                       setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
