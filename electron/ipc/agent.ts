@@ -5119,7 +5119,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         [{ role: 'user', content: userContent }],
         { skipIfBusy: true, runStatus: 'running' },
       );
-      if (!promptWrite) return { ok: false, error: 'conversation-busy' };
+      if (!promptWrite) {
+        // Lost the admission race: a turn started OR a /compact acquired the lock between the
+        // check above and this append (appendConversationMessages rejects both). Report the RIGHT
+        // busyKind — a compaction lock drains on the conversations:compacting broadcast, so the
+        // CLI must busy-WAIT for it; without this it treats a compaction as a turn-busy and
+        // RESUBMITS in a tight loop until the lock clears.
+        const busyKind = isCompacting(conversationId) ? 'compaction' : 'turn';
+        return { ok: false, error: 'conversation-busy', busyKind };
+      }
 
       // The authoritative user-message id (the just-appended node = the new head) + its parent,
       // read from the write result, so the broadcast carries the SAME id the disk holds.
