@@ -57,11 +57,56 @@ export type ConversationChange =
   | { kind: 'reset'; activeConversationId: string | null }
   | { kind: 'active'; activeConversationId: string | null };
 
-function broadcastChange(change: ConversationChange): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('conversations:changed', change);
+// Strip heavy base64 media (image/file data URLs, _modelContent parts) from an upsert-broadcast
+// conversation, replacing each with a tiny placeholder that keeps the part's TYPE + the message
+// ids/structure. An upsert only SIGNALS "changed" + carries metadata + a tree the client uses to
+// DECIDE whether to reload (length + tail id/content) — every client re-fetches the full content
+// via conversations:get on demand. Sending the raw media tree (retained media up to ~20 MiB)
+// over the frame-capped remote transports (web WS 4 MiB, CLI local-bridge 8 MiB) DISCONNECTS the
+// socket on media-heavy conversations; /compact can't help (it leaves the raw tree). Cheap
+// synchronous structural strip — NOT the async token-aware stripMediaForSerialization.
+function stripBase64FromPart(part: unknown): unknown {
+  if (!part || typeof part !== 'object') return part;
+  const p = part as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...p };
+  // Data-URL / base64 image + file parts (renderer content-part shapes + provider shapes).
+  for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
+    const v = out[k];
+    if (typeof v === 'string' && v.length > 256) out[k] = '[omitted-in-broadcast]';
   }
-  broadcastToWebClients('conversations:changed', change);
+  // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
+  if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
+  return out;
+}
+function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
+  const stripTree = (nodes: unknown): unknown =>
+    Array.isArray(nodes)
+      ? nodes.map((n) => {
+          if (!n || typeof n !== 'object') return n;
+          const m = n as Record<string, unknown>;
+          if (!Array.isArray(m.content)) return n;
+          return { ...m, content: (m.content as unknown[]).map(stripBase64FromPart) };
+        })
+      : nodes;
+  return {
+    ...conv,
+    ...(conv.messageTree !== undefined ? { messageTree: stripTree(conv.messageTree) as unknown[] } : {}),
+    ...(Array.isArray(conv.messages) ? { messages: stripTree(conv.messages) as unknown[] } : {}),
+  };
+}
+
+function broadcastChange(change: ConversationChange): void {
+  // Strip heavy base64 media from an upsert payload before sending: remote transports are
+  // frame-capped (web WS 4 MiB / CLI 8 MiB) and a media-heavy raw tree would disconnect them;
+  // every client re-fetches full content via conversations:get on demand, so the broadcast only
+  // needs metadata + a media-light tree for the reload decision. (Electron windows have no frame
+  // cap but also re-fetch, so stripping uniformly is safe + simplest.)
+  const outgoing: ConversationChange =
+    change.kind === 'upsert' ? { ...change, conversation: stripBroadcastMedia(change.conversation) } : change;
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('conversations:changed', outgoing);
+  }
+  broadcastToWebClients('conversations:changed', outgoing);
 }
 
 export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {

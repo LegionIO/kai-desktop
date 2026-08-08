@@ -1645,6 +1645,10 @@ export function App({
               // re-send when the lock frees — re-enqueuing bare `trimmed` would drop a /shot
               // or @image submission's image/expansion. Drained by the unlock handlers.
               pendingBusyResendRef.current.push({ convId: convIdRef.current, trimmed, submitText, attachments });
+              // Cap the resend FIFO — entries can carry full base64 attachments; an unbounded
+              // queue (many busy-rejected sends across conversations without draining) would grow
+              // the heap. Drop the OLDEST when over the cap (least likely still wanted).
+              if (pendingBusyResendRef.current.length > 50) pendingBusyResendRef.current.shift();
               setStatus('running');
               statusRef.current = 'running';
               setTurns((prev) => [
@@ -1714,18 +1718,24 @@ export function App({
                                 setTimeout(() => pollAutomationFree(remaining - 1), 2000);
                                 return;
                               }
-                              // Budget exhausted (a very long automation). Stop polling, drop the
-                              // stuck 'running' indicator to idle, and SURFACE a note so the queued
-                              // message isn't silently stranded: it stays in the (scoped) queue and
-                              // drains on the next drain trigger (a later send, /resume back, or
-                              // reconnect). The user can act instead of assuming it sent.
+                              // Budget exhausted (a very long automation). Stop polling and go
+                              // idle — but DEQUEUE this stranded resend rather than leaving it in
+                              // the FIFO: an idle CLI lets the user type a NEW prompt that (sending
+                              // immediately) would OVERTAKE the still-queued older resend, breaking
+                              // order. Surface the un-sent text in a note so it isn't silently lost
+                              // (the user can resend); the conversation is still busy with the
+                              // automation.
                               if (statusRef.current === 'running') {
                                 setStatus('idle');
                                 statusRef.current = 'idle';
                               }
+                              const stranded = takeResendForActiveConv();
+                              const unsent = stranded?.trimmed ?? '';
                               pushTurn({
                                 kind: 'note',
-                                text: 'still busy with an automation — your message is queued and will send when it frees (or resend it).',
+                                text: unsent
+                                  ? `still busy with an automation — could not send: "${unsent.slice(0, 200)}" (resend when it frees).`
+                                  : 'still busy with an automation — your queued message could not send (resend when it frees).',
                               });
                               return;
                             }

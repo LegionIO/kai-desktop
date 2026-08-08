@@ -986,16 +986,25 @@ async function applyPendingDraftsDelta(
   add: RejectedDraft[],
   removeIds: string[],
 ): Promise<void> {
-  try {
-    const addPayload = add.map((d) => ({
-      id: d.id,
-      text: d.text,
-      attachments: d.attachments as unknown[],
-      stashedAt: d.stashedAt,
-    }));
-    await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
-  } catch {
-    /* best-effort — the in-memory queue still restores within the session */
+  const addPayload = add.map((d) => ({
+    id: d.id,
+    text: d.text,
+    attachments: d.attachments as unknown[],
+    stashedAt: d.stashedAt,
+  }));
+  // Bounded retry: the in-memory queue is authoritative within a session, but the DURABLE copy
+  // matters across restart — a dropped ADD loses the stash if the process exits, and a dropped
+  // REMOVE resurrects an already-restored draft on the next launch. A field-only main write
+  // rarely fails; a few spaced retries turn a transient IPC/disk blip into an eventual success
+  // without blocking the caller (still fire-and-forget from the call sites).
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
+      return;
+    } catch {
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      /* else: exhausted — the in-memory queue still restores within the session */
+    }
   }
 }
 // Hydrate the in-memory queue from a conversation record's persisted `pendingDrafts` (a reload
@@ -2704,23 +2713,25 @@ export function RuntimeProvider({
           (res as { delivered?: unknown }).delivered !== true
         ) {
           const h = streamEventHandlerRef.current;
-          if (h) {
+          // A `{busy}` result means the stream was REJECTED before it started — so NO events (and
+          // no fallback/overflow retry) happened: the accumulator's pendingAssistantId is still
+          // the ORIGINALLY-launched responseMessageId. Synthesize the terminal error ONLY if we
+          // STILL OWN that accumulator (a superseding newer run would have a DIFFERENT
+          // pendingAssistantId — stamping the current id then would wrongly TERMINATE the newer
+          // run). Stamp the original id so the run-generation guard attributes it to THIS run.
+          if (
+            h &&
+            typeof responseMessageId === 'string' &&
+            streamAccumulators.get(conversationId)?.pendingAssistantId === responseMessageId
+          ) {
             // ONE terminal event only. The error handler is fully terminal; a trailing
             // `done` would recreate the accumulator from the pre-error tree and supersede
-            // the error persist (user message left with no visible error). Stamp the
-            // accumulator's CURRENT pendingAssistantId (a mid-stream fallback/overflow retry may
-            // have replaced the originally-launched responseMessageId — using the stale original
-            // would make the run-generation guard DROP this terminal, leaving the acc stuck).
-            const curId = streamAccumulators.get(conversationId)?.pendingAssistantId;
+            // the error persist (user message left with no visible error).
             h({
               conversationId,
               type: 'error',
               error: 'Compacting the conversation — wait for it to finish, then retry.',
-              ...(typeof curId === 'string'
-                ? { responseMessageId: curId }
-                : typeof responseMessageId === 'string'
-                  ? { responseMessageId }
-                  : {}),
+              responseMessageId,
             });
           }
         }
@@ -5274,10 +5285,21 @@ export function RuntimeProvider({
       // Walk from this sibling down to the deepest descendant on the "latest"
       // path (cycle-guarded — see deepestLatestDescendant).
       const newHead = deepestLatestDescendant(tree, siblingId);
+      const prevHead = headIdRef.current;
       setHeadId(newHead);
-      // Persist
+      // Persist the head change. If it's REJECTED (a /compact holds the conversation — a
+      // head-only mutation is rejected while compacting), the switch did NOT save; REVERT the
+      // optimistic setHeadId so the UI doesn't show a branch that disagrees with disk (which a
+      // later compaction upsert/reload would abruptly revert anyway). Only revert if the active
+      // conv is still this one and the head is still our optimistic value (no newer nav/turn).
       const convId = activeIdRef.current;
-      if (convId) persistConversation(convId, tree, newHead);
+      if (convId) {
+        void persistConversation(convId, tree, newHead).then((r) => {
+          if (r?.rejected && activeIdRef.current === convId && headIdRef.current === newHead) {
+            setHeadId(prevHead);
+          }
+        });
+      }
     },
     [tree],
   );
