@@ -4653,7 +4653,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const injectedText = lastInjectedText;
             // Launch the automatic continuation on `branch`, marking this conversation
             // server-persist so the renderer takes its render-only path (no double-persist).
-            const launchContinuation = (branch: unknown[]): void => {
+            const launchContinuation = (branch: unknown[], busyRetries = 20): void => {
               if (controller.signal.aborted) return;
               // A superseding turn (new GUI/CLI submit) installs a new activeStreams token
               // for this conversation; it owns its own continuation queue, so a stale
@@ -4685,9 +4685,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // corrupt branch). Clear our marker on a busy rejection — but only if it is
                   // still OURS (a superseding turn may have installed its own since).
                   if (res && (res as { busy?: boolean }).busy) {
-                    if (pendingServerPersistParent.get(conversationId) === injectedHead) {
+                    const stillOurs = pendingServerPersistParent.get(conversationId) === injectedHead;
+                    if (stillOurs) {
                       pendingServerPersist.delete(conversationId);
                       pendingServerPersistParent.delete(conversationId);
+                    }
+                    // A /compact holds the conversation — transient (secs to ~285s). RETRY the
+                    // continuation (bounded) rather than abandoning, else the accepted injected
+                    // message is left PERMANENTLY unanswered. Only if still ours + not superseded.
+                    if (stillOurs && busyRetries > 0 && !controller.signal.aborted) {
+                      const o = activeStreams.get(conversationId)?.token;
+                      if (o === undefined || o === streamToken) {
+                        setTimeout(() => launchContinuation(branch, busyRetries - 1), 500);
+                      }
                     }
                   }
                 })();
@@ -4743,14 +4753,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // being the branch tail is NOT a valid signal (it's the tail from the moment of
                   // injection, before the reply lands). Launch once idle, or after the budget
                   // (reactive recovery + the renderer's reconciliation backstop any residual gap).
-                  if (updated.runStatus === 'idle' || remaining <= 0) {
+                  // Launch the continuation ONLY once the renderer confirmed it persisted this
+                  // turn (runStatus:'idle'). On budget exhaustion do NOT launch on the still-
+                  // 'running' (partial) branch: retrying from stale history could REPEAT mutating
+                  // tool calls AND race the eventual terminal write. The injected user turn stays
+                  // persisted-but-unanswered (the user sees it + can resend; reactive recovery /
+                  // the renderer's own reconciliation backstop it) — strictly safer than a
+                  // stale-context re-run. A renderer that never writes idle in the budget almost
+                  // certainly crashed/reloaded (its runStatus is startup-swept).
+                  if (updated.runStatus === 'idle') {
                     launchContinuation(continuationBranch);
                     return;
                   }
+                  if (remaining <= 0) return; // budget exhausted, still running → abandon (don't re-run stale)
                 }
                 setTimeout(() => pollForFinalizedBranch(remaining - 1), 100);
               };
-              pollForFinalizedBranch(30);
+              pollForFinalizedBranch(80); // ~8s: generous for a slow renderer persist; then abandon
             }
           }
         }
@@ -4759,12 +4778,30 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
         // If this run still owns server-persist here, the stream ended WITHOUT a
         // `done` (abnormal termination — a producer that didn't emit the closing
-        // event). `done` deletes the token + the accumulator; its absence would
-        // otherwise leak the persistence accumulator forever. Release both.
+        // event). `done` normally persists the accumulated reply, deletes the token +
+        // accumulator, resets runStatus, and emits the terminal event. Its absence would
+        // otherwise DISCARD the accumulated partial reply AND leave runStatus stuck 'running'
+        // (wedged until restart) with no terminal event for clients. So do the terminal work
+        // here: FINALIZE (persist) the accumulated partial, reset runStatus→idle, and emit a
+        // terminal `done` so clients settle.
         if (serverPersistAppHome && serverPersistTokens.get(conversationId) === streamToken) {
           serverPersistTokens.delete(conversationId);
           serverPersistParents.delete(conversationId);
-          discardPersistenceAccumulator(conversationId);
+          try {
+            finalizeInterruptedTurn(serverPersistAppHome, conversationId); // persists the partial (if any) + deletes the accumulator
+          } catch {
+            discardPersistenceAccumulator(conversationId); // fall back to release if finalize throws
+          }
+          try {
+            const conv = readConversation(serverPersistAppHome, conversationId);
+            if (conv && conv.runStatus === 'running') {
+              conv.runStatus = 'idle';
+              broadcastUpsert(serverPersistAppHome, writeConversation(serverPersistAppHome, conv));
+            }
+          } catch {
+            /* best-effort */
+          }
+          emit({ conversationId, type: 'done' }); // settle clients (CLI/GUI) — no `done` came from the stream
         }
       }
     })();
