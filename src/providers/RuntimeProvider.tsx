@@ -3685,13 +3685,19 @@ export function RuntimeProvider({
           }
         }
       } else if (e.type === 'retry') {
-        // Retry events are informational — show as observer message
+        // Retry events are informational — show as observer message (attached to the CURRENT
+        // assistant via applyObserverMessage, NOT keyed by responseMessageId, so it stays
+        // correctly attributed across an overflow-recovery retry that mints a fresh id).
         const retryData = e.data as
-          | { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string }
+          | { attempt?: number; maxRetries?: number; delayMs?: number; reason?: string; category?: string; text?: string }
           | undefined;
         if (retryData) {
-          const delaySec = Math.round((retryData.delayMs ?? 0) / 1000);
-          const retryText = `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${delaySec}s — ${retryData.category ?? 'transient error'}`;
+          // A raw `text` (e.g. the overflow-recovery "compacted and retrying" note) is rendered
+          // verbatim; otherwise format the transient-retry attempt line.
+          const retryText =
+            typeof retryData.text === 'string' && retryData.text.trim().length > 0
+              ? retryData.text
+              : `Retrying (${retryData.attempt}/${retryData.maxRetries}) in ${Math.round((retryData.delayMs ?? 0) / 1000)}s — ${retryData.category ?? 'transient error'}`;
           applyObserverMessage(acc, retryText);
           if (isActiveConv) {
             setTree([...acc.messages]);

@@ -196,7 +196,12 @@ export function App({
   // Messages typed while a turn is in flight are queued (FIFO) and flushed one
   // at a time after each `done`, instead of aborting the live turn. A ref (not
   // state) so the stream-event effect can read/flush without re-subscribing.
-  const queueRef = useRef<string[]>([]);
+  // Queued plain-text inputs (typed while a turn was running), each SCOPED to the conversation
+  // it was submitted for. Scoping matters because a drain (esp. after reconnect, or after a
+  // `/new` / `/resume` switch) targets the CURRENTLY-active conversation — an unscoped entry
+  // would misroute a prior chat's prompt into the new one. Drains skip/drop entries for other
+  // conversations (their chat is gone from this CLI's focus; re-typing is the recovery).
+  const queueRef = useRef<Array<{ convId: string | null; text: string }>>([]);
   const sendMessageRef = useRef<
     (text: string, submitText?: string, attachments?: Array<{ image: string; mimeType?: string }>) => void
   >(() => {});
@@ -246,7 +251,7 @@ export function App({
   // the conversation frees. A single slot would be OVERWRITTEN when a SECOND submission is
   // busy-rejected before the first drained — silently losing the first / reordering. Each entry
   // preserves the FULL submission (expanded text + attachments). Drained oldest-first.
-  const pendingBusyResendRef = useRef<Array<{ trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> }>>([]);
+  const pendingBusyResendRef = useRef<Array<{ convId: string | null; trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> }>>([]);
   // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
   // an in-flight turn on the right conversation.
   if (runtimeRef) {
@@ -379,6 +384,30 @@ export function App({
     void refreshBanner({ selectedModelKey: null, selectedProfileKey: null });
   }, [refreshBanner]);
 
+  // Scoped dequeue helpers: return the oldest queued entry FOR THE CURRENTLY-ACTIVE conversation,
+  // DROPPING any leading entries that belong to a different conversation (their chat is no longer
+  // this CLI's focus — draining them into the active chat would misroute a prior chat's prompt).
+  // A null-convId entry (queued before a conversation was resolved) matches any active conv.
+  const takeResendForActiveConv = useCallback(() => {
+    const active = convIdRef.current;
+    const q = pendingBusyResendRef.current;
+    while (q.length > 0) {
+      const head = q.shift()!;
+      if (head.convId == null || head.convId === active) return head;
+      // else: belongs to another conversation — drop it (out of focus).
+    }
+    return undefined;
+  }, []);
+  const takePlainForActiveConv = useCallback(() => {
+    const active = convIdRef.current;
+    const q = queueRef.current;
+    while (q.length > 0) {
+      const head = q.shift()!;
+      if (head.convId == null || head.convId === active) return head.text;
+    }
+    return undefined;
+  }, []);
+
   useEffect(() => {
     void createNew();
   }, []);
@@ -438,15 +467,15 @@ export function App({
     // (full expanded text + attachments) over the plain string queue, so a /shot or @image
     // that raced /compact resends verbatim. Returns true if it dispatched something.
     const drainNextInput = (): boolean => {
-      const resend = pendingBusyResendRef.current.shift(); // oldest busy-rejected submission first
+      const resend = takeResendForActiveConv(); // oldest busy-rejected submission for THIS conv
       if (resend) {
         setStatus('running');
         statusRef.current = 'running';
         setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
         return true;
       }
-      if (queueRef.current.length > 0) {
-        const next = queueRef.current.shift() as string;
+      const next = takePlainForActiveConv();
+      if (next !== undefined) {
         setStatus('running');
         statusRef.current = 'running';
         setTimeout(() => sendExpandedRef.current(next), 0);
@@ -679,6 +708,19 @@ export function App({
           // transient fallback sets preserveErroredVariant, not discard).
           streamingRef.current = '';
           setTurns((prev) => [...prev]);
+          break;
+        }
+        case 'retry': {
+          // Informational recovery note (e.g. overflow-recovery "compacting + retrying"). Show
+          // its raw text as a dim note; otherwise a formatted transient-retry line.
+          const rd = e.data as { text?: string; attempt?: number; maxRetries?: number; category?: string } | undefined;
+          const note =
+            rd && typeof rd.text === 'string' && rd.text.trim().length > 0
+              ? rd.text.replace(/^>\s*/, '').trim()
+              : rd
+                ? `retrying (${rd.attempt}/${rd.maxRetries}) — ${rd.category ?? 'transient error'}`
+                : '';
+          if (note) pushTurn({ kind: 'note', text: note });
           break;
         }
         case 'error':
@@ -978,11 +1020,13 @@ export function App({
                       compactBusyWaitRef.current = true;
                       setStatus('running');
                       statusRef.current = 'running';
-                    } else if (statusRef.current === 'idle' && queueRef.current.length > 0) {
-                      const next = queueRef.current.shift() as string;
-                      setStatus('running');
-                      statusRef.current = 'running';
-                      setTimeout(() => sendExpandedRef.current(next), 0);
+                    } else if (statusRef.current === 'idle') {
+                      const next = takePlainForActiveConv();
+                      if (next !== undefined) {
+                        setStatus('running');
+                        statusRef.current = 'running';
+                        setTimeout(() => sendExpandedRef.current(next), 0);
+                      }
                     }
                   })
                   .catch(() => {
@@ -1008,14 +1052,16 @@ export function App({
                     !(Array.isArray(ids) && ids.includes(convIdRef.current))
                   ) {
                     compactBusyWaitRef.current = false;
-                    if (queueRef.current.length > 0) {
-                      const next = queueRef.current.shift() as string;
-                      setStatus('running');
-                      statusRef.current = 'running';
-                      setTimeout(() => sendExpandedRef.current(next), 0);
-                    } else {
-                      setStatus('idle');
-                      statusRef.current = 'idle';
+                    {
+                      const next = takePlainForActiveConv();
+                      if (next !== undefined) {
+                        setStatus('running');
+                        statusRef.current = 'running';
+                        setTimeout(() => sendExpandedRef.current(next), 0);
+                      } else {
+                        setStatus('idle');
+                        statusRef.current = 'idle';
+                      }
                     }
                   }
                 })
@@ -1044,14 +1090,16 @@ export function App({
                     turnSettledRef.current = false;
                     setStatus('running');
                     statusRef.current = 'running';
-                  } else if (queueRef.current.length > 0) {
-                    const next = queueRef.current.shift() as string;
-                    setStatus('running');
-                    statusRef.current = 'running';
-                    setTimeout(() => sendExpandedRef.current(next), 0);
                   } else {
-                    setStatus('idle');
-                    statusRef.current = 'idle';
+                    const next = takePlainForActiveConv();
+                    if (next !== undefined) {
+                      setStatus('running');
+                      statusRef.current = 'running';
+                      setTimeout(() => sendExpandedRef.current(next), 0);
+                    } else {
+                      setStatus('idle');
+                      statusRef.current = 'idle';
+                    }
                   }
                 })
                 .catch(() => {
@@ -1061,14 +1109,16 @@ export function App({
                   setStatus('running');
                   statusRef.current = 'running';
                 });
-            } else if (queueRef.current.length > 0) {
-              const next = queueRef.current.shift() as string;
-              setStatus('running');
-              statusRef.current = 'running';
-              setTimeout(() => sendExpandedRef.current(next), 0);
             } else {
-              setStatus('idle');
-              statusRef.current = 'idle';
+              const next = takePlainForActiveConv();
+              if (next !== undefined) {
+                setStatus('running');
+                statusRef.current = 'running';
+                setTimeout(() => sendExpandedRef.current(next), 0);
+              } else {
+                setStatus('idle');
+                statusRef.current = 'idle';
+              }
             }
           }
           if (res?.ok) {
@@ -1500,20 +1550,20 @@ export function App({
     // string queue — same precedence as drainNextInput. Ignoring pendingBusyResendRef here would
     // strand a queued busy-resend; a later completed turn + conversation switch could then resend
     // that stale prompt/attachments into the WRONG conversation.
-    const resend = pendingBusyResendRef.current.shift();
+    const resend = takeResendForActiveConv();
     if (resend) {
       setStatus('running');
       statusRef.current = 'running';
       setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
       return;
     }
-    if (queueRef.current.length > 0) {
-      const next = queueRef.current.shift() as string;
+    const next = takePlainForActiveConv();
+    if (next !== undefined) {
       setTimeout(() => sendExpandedRef.current(next), 0);
     } else {
       setStatus('idle');
     }
-  }, []);
+  }, [takeResendForActiveConv, takePlainForActiveConv]);
 
   const sendMessage = useCallback(
     (trimmed: string, submitText?: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
@@ -1573,7 +1623,7 @@ export function App({
               // Preserve the FULL submission (expanded text + attachments) for a verbatim
               // re-send when the lock frees — re-enqueuing bare `trimmed` would drop a /shot
               // or @image submission's image/expansion. Drained by the unlock handlers.
-              pendingBusyResendRef.current.push({ trimmed, submitText, attachments });
+              pendingBusyResendRef.current.push({ convId: convIdRef.current, trimmed, submitText, attachments });
               setStatus('running');
               statusRef.current = 'running';
               setTurns((prev) => [
@@ -1595,7 +1645,7 @@ export function App({
                     const stillCompacting = Array.isArray(ids) && cid != null && ids.includes(cid);
                     if (!stillCompacting) {
                       compactBusyWaitRef.current = false;
-                      const resend = pendingBusyResendRef.current.shift();
+                      const resend = takeResendForActiveConv();
                       if (resend) {
                         setStatus('running');
                         statusRef.current = 'running';
@@ -1621,7 +1671,7 @@ export function App({
                       turnSettledRef.current = false;
                       return;
                     }
-                    const resend = pendingBusyResendRef.current.shift();
+                    const resend = takeResendForActiveConv();
                     if (resend) {
                       setStatus('running');
                       statusRef.current = 'running';
@@ -1696,7 +1746,7 @@ export function App({
       // A turn is in flight — queue this message instead of aborting it. It's
       // flushed after the current turn's `done` (see the stream-event effect).
       if (status === 'running' || status === 'awaiting-approval') {
-        queueRef.current.push(trimmed);
+        queueRef.current.push({ convId: convIdRef.current, text: trimmed });
         pushTurn({ kind: 'note', text: `queued: ${trimmed}` });
         return;
       }

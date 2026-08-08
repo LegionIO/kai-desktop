@@ -4461,10 +4461,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   },
                 });
               }
+              // Informational "compacting + retrying" note. Emit as a `retry` (observer) event,
+              // NOT a `text-delta`: a text-delta has no responseMessageId here (the retry mints a
+              // FRESH id downstream), so the renderer would attach it to the PRIOR attempt's
+              // assistant — mis-attributed, and after a preserved fallback variant it can collide
+              // with a duplicate id. The retry/observer path attaches to the current assistant
+              // without responseMessageId keying, so it survives the id change cleanly.
               emit({
                 conversationId,
-                type: 'text-delta',
-                text: `> ℹ️ The request exceeded the context window; compacted the conversation and retrying…\n\n`,
+                type: 'retry',
+                data: {
+                  reason: 'context-overflow',
+                  text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
+                },
               });
               continue; // drain the rest of the failed stream; the do/while re-runs it
             }
