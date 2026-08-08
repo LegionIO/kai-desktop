@@ -385,27 +385,24 @@ export function App({
   }, [refreshBanner]);
 
   // Scoped dequeue helpers: return the oldest queued entry FOR THE CURRENTLY-ACTIVE conversation,
-  // DROPPING any leading entries that belong to a different conversation (their chat is no longer
-  // this CLI's focus — draining them into the active chat would misroute a prior chat's prompt).
-  // A null-convId entry (queued before a conversation was resolved) matches any active conv.
+  // Scoped dequeue helpers: return + remove the oldest queued entry FOR THE CURRENTLY-ACTIVE
+  // conversation, LEAVING entries for OTHER conversations in place (do NOT drop them — that would
+  // silently lose input the user queued for a chat they switched away from; it re-drains when
+  // they /resume back). A null-convId entry (queued before a conversation was resolved) matches
+  // any active conv. Splice the FIRST matching entry so ordering within a conversation is FIFO.
   const takeResendForActiveConv = useCallback(() => {
     const active = convIdRef.current;
     const q = pendingBusyResendRef.current;
-    while (q.length > 0) {
-      const head = q.shift()!;
-      if (head.convId == null || head.convId === active) return head;
-      // else: belongs to another conversation — drop it (out of focus).
-    }
-    return undefined;
+    const i = q.findIndex((e) => e.convId == null || e.convId === active);
+    if (i < 0) return undefined;
+    return q.splice(i, 1)[0];
   }, []);
   const takePlainForActiveConv = useCallback(() => {
     const active = convIdRef.current;
     const q = queueRef.current;
-    while (q.length > 0) {
-      const head = q.shift()!;
-      if (head.convId == null || head.convId === active) return head.text;
-    }
-    return undefined;
+    const i = q.findIndex((e) => e.convId == null || e.convId === active);
+    if (i < 0) return undefined;
+    return q.splice(i, 1)[0].text;
   }, []);
 
   useEffect(() => {
@@ -1015,6 +1012,11 @@ export function App({
                 void client
                   .invoke<string[]>('conversations:compacting-ids')
                   .then((ids) => {
+                    // A conversation switch (/new, /resume) during the async probe means `cid`
+                    // (the chat we probed) is no longer active — its lock status must NOT drive
+                    // the NEW chat's busy-wait/drain (that would wedge the new chat behind the old
+                    // lock). Bail; the new chat's own flow / a broadcast reconciles it.
+                    if (convIdRef.current !== cid) return;
                     const compacting = Array.isArray(ids) && cid != null && ids.includes(cid);
                     if (compacting) {
                       compactBusyWaitRef.current = true;

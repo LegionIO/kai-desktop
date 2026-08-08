@@ -913,6 +913,25 @@ export function registerConversationHandlers(
       }
     }
 
+    // Durable pendingDrafts (the /compact-busy rollback stash) is owned EXCLUSIVELY by
+    // conversations:set-pending-drafts (an add/remove delta on the current disk record). A
+    // generic put must NEVER write it: the renderer's persistConversation does `{...conv, ...}`
+    // from a conversations.get snapshot, so it carries whatever pendingDrafts was on disk at
+    // get-time — a STALE value that would clobber a concurrently-stashed draft (data loss before
+    // crash recovery). Always take the CURRENT disk value (prev), ignoring the incoming record's.
+    {
+      const prevDrafts = prev
+        ? (prev as { pendingDrafts?: ConversationRecord['pendingDrafts'] }).pendingDrafts
+        : undefined;
+      if (prevDrafts !== undefined) {
+        nextConversation = { ...nextConversation, pendingDrafts: prevDrafts };
+      } else if ((nextConversation as { pendingDrafts?: unknown }).pendingDrafts !== undefined) {
+        // Prev has none — drop any (stale) drafts the incoming record carried.
+        nextConversation = { ...nextConversation };
+        delete (nextConversation as { pendingDrafts?: unknown }).pendingDrafts;
+      }
+    }
+
     const written = writeConversation(appHome, nextConversation);
     broadcastUpsert(appHome, written);
     if (!prev) {
