@@ -1699,17 +1699,28 @@ export function App({
                     }
                     if (autoInFlight === true) {
                       // A standalone automation holds the conversation. No agent `done` will
-                      // drain us. Keep the resend queued + poll again shortly (avoid the tight
-                      // resend loop). Stay 'running' so typed input keeps queuing meanwhile.
-                      setTimeout(() => {
-                        if (convIdRef.current !== cid) return; // switched away — the resend stays scoped/queued
+                      // drain us. Keep the resend queued + POLL (recurring) until the automation
+                      // frees the conversation, then drain — avoids the tight resend loop AND the
+                      // "stuck running forever if still busy at a single poll" gap. Stay 'running'
+                      // so typed input keeps queuing meanwhile; bounded so it can't poll forever.
+                      const pollAutomationFree = (remaining: number): void => {
+                        if (convIdRef.current !== cid) return; // switched away — resend stays scoped/queued
                         client
                           .invoke<boolean>('automations:in-flight', cid)
                           .then((still) => {
                             if (convIdRef.current !== cid) return;
                             if (still === true) {
-                              // still running — the reconnect/next-terminal drain will pick it up;
-                              // leave the resend queued rather than re-poll forever.
+                              if (remaining > 0) {
+                                setTimeout(() => pollAutomationFree(remaining - 1), 2000);
+                              }
+                              // Budget exhausted (a very long automation) — leave the resend
+                              // queued for the reconnect / next-terminal drain rather than poll
+                              // forever, but drop the stuck 'running' indicator to idle so the CLI
+                              // isn't wedged (the queued resend still drains when the user returns).
+                              else if (statusRef.current === 'running') {
+                                setStatus('idle');
+                                statusRef.current = 'idle';
+                              }
                               return;
                             }
                             const r = takeResendForActiveConv();
@@ -1717,10 +1728,14 @@ export function App({
                               setStatus('running');
                               statusRef.current = 'running';
                               setTimeout(() => sendMessageRef.current(r.trimmed, r.submitText, r.attachments), 0);
+                            } else {
+                              setStatus('idle');
+                              statusRef.current = 'idle';
                             }
                           })
                           .catch(() => {});
-                      }, 2000);
+                      };
+                      setTimeout(() => pollAutomationFree(150), 2000); // ~5min of 2s polls
                       return;
                     }
                     const resend = takeResendForActiveConv();

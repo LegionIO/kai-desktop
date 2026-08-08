@@ -2707,12 +2707,20 @@ export function RuntimeProvider({
           if (h) {
             // ONE terminal event only. The error handler is fully terminal; a trailing
             // `done` would recreate the accumulator from the pre-error tree and supersede
-            // the error persist (user message left with no visible error).
+            // the error persist (user message left with no visible error). Stamp the
+            // accumulator's CURRENT pendingAssistantId (a mid-stream fallback/overflow retry may
+            // have replaced the originally-launched responseMessageId — using the stale original
+            // would make the run-generation guard DROP this terminal, leaving the acc stuck).
+            const curId = streamAccumulators.get(conversationId)?.pendingAssistantId;
             h({
               conversationId,
               type: 'error',
               error: 'Compacting the conversation — wait for it to finish, then retry.',
-              ...(typeof responseMessageId === 'string' ? { responseMessageId } : {}),
+              ...(typeof curId === 'string'
+                ? { responseMessageId: curId }
+                : typeof responseMessageId === 'string'
+                  ? { responseMessageId }
+                  : {}),
             });
           }
         }

@@ -5441,6 +5441,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     serverPersistParents.delete(conversationId);
     serverPersistTokens.delete(conversationId);
     clearFinalizedResponseIds(conversationId);
+    // GUI-turn cancel: deleteStreamIfOwned above removed the activeStreams entry, so the aborted
+    // run's finally → cleanupStreamIfOwned finds no owned entry and SKIPS finalizeGuiFallbackIfOwned
+    // — leaking the fallback accumulator + guiFallbackParents marker. Clean them up here directly
+    // (like the inject bookkeeping above). On cancel the RENDERER's onCancel persists the partial +
+    // resets runStatus, so main's fallback DISCARDS (no double-write) rather than finalizes.
+    if (guiFallbackParents.delete(conversationId)) {
+      discardPersistenceAccumulator(conversationId);
+    }
     if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
       try {
