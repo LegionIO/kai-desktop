@@ -367,6 +367,11 @@ export function cancelConversationStream(conversationId: string): void {
 // switch moves the head and would otherwise mis-parent the reply).
 const pendingServerPersistParent = new Map<string, string | null>();
 const serverPersistParents = new Map<string, string | null>();
+// GUI (renderer-persisted) turns for which main keeps a FALLBACK persistence accumulator, keyed
+// to the user-turn head the assistant reply parents on. Present iff a GUI agent:stream turn is
+// live; the terminal handler polls whether the renderer persisted and, if not (sole renderer
+// reloaded/crashed), finalizes main's accumulator so the reply isn't lost. Cleared at terminal.
+const guiFallbackParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
 
 /**
@@ -488,6 +493,15 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
           clearFinalizedResponseIds(event.conversationId);
           void maybeAutoTitle(serverPersistAppHome, event.conversationId);
         }
+      }
+    } else if (fromCurrentRun && serverPersistAppHome && guiFallbackParents.has(event.conversationId)) {
+      // GUI turn (renderer-persisted) — accumulate its output in main as a FALLBACK so a SOLE
+      // renderer that reloads/crashes mid-stream doesn't lose the reply (no one else persists
+      // it). Do NOT let `done` finalize here (that would double-write with the renderer's own
+      // persist); the stream loop's terminal handler polls disk and finalizes this accumulator
+      // ONLY if the renderer didn't. Non-terminal events just build the accumulator.
+      if (event.type !== 'done') {
+        accumulateForPersistence(serverPersistAppHome, event, guiFallbackParents.get(event.conversationId) ?? undefined);
       }
     }
   }
@@ -1038,6 +1052,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       serverPersistTokens.delete(conversationId);
       serverPersistParents.delete(conversationId);
       pendingServerPersistParent.delete(conversationId);
+      // GUI turn: keep a FALLBACK persistence accumulator in main (parented on the user turn the
+      // reply answers — the last message on the incoming branch) so a SOLE renderer that reloads/
+      // crashes mid-stream doesn't lose the reply. The terminal handler discards it if the
+      // renderer persisted (the normal case), or finalizes it if not.
+      {
+        const guiParent = (() => {
+          const arr = messages as Array<{ id?: unknown }>;
+          const last = arr[arr.length - 1];
+          return typeof last?.id === 'string' ? last.id : null;
+        })();
+        guiFallbackParents.set(conversationId, guiParent);
+      }
     }
     const randomBytes = new Uint8Array(4);
     crypto.getRandomValues(randomBytes);
@@ -4661,6 +4687,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // + not tombstoned — else the timer would start a stream against a DELETED chat and
               // run tools invisibly.
               if (!readConversation(appHome, conversationId) || isRecentlyDeleted(conversationId)) return;
+              // The captured `branch` ends at injectedHead. If the user switched branches or
+              // rewound during the (possibly long, /compact-busy) retry wait, the conversation's
+              // active head no longer points at injectedHead — retrying then would run tools
+              // against ABANDONED history and later yank the active head back, overriding the
+              // user's selection. Verify injectedHead is still the current active head before
+              // launching; if it moved, the continuation is stale → abandon.
+              {
+                const cur = readConversation(appHome, conversationId);
+                if (cur) {
+                  const { headId: curHead } = ensureConversationTree(cur);
+                  if (curHead !== injectedHead) return;
+                }
+              }
               // A superseding turn (new GUI/CLI submit) installs a new activeStreams token
               // for this conversation; it owns its own continuation queue, so a stale
               // continuation must not launch. This run's OWN token is already removed by the
@@ -4812,6 +4851,60 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             /* best-effort */
           }
           emit({ conversationId, type: 'done' }); // settle clients (CLI/GUI) — no `done` came from the stream
+        }
+        // GUI (renderer-persisted) turn: main kept a FALLBACK accumulator. The renderer persists
+        // the reply on its ~300ms debounce; normally we just DISCARD main's copy. But if the SOLE
+        // renderer reloaded/crashed mid-stream, NO renderer will persist it — so poll disk briefly
+        // and, if the reply never lands (runStatus stays 'running' / the assistant id is absent),
+        // FINALIZE main's accumulator as the fallback (guarded against double-write). Only when
+        // this run still owns the conversation (not superseded by a newer turn's token).
+        if (serverPersistAppHome && guiFallbackParents.has(conversationId)) {
+          const fbAppHome = serverPersistAppHome;
+          const fbToken = streamToken;
+          guiFallbackParents.delete(conversationId);
+          const pollGuiFallback = (remaining: number): void => {
+            // Superseded / deleted → the newer owner (or nothing) handles it; drop our copy.
+            const owner = activeStreams.get(conversationId)?.token;
+            if ((owner !== undefined && owner !== fbToken) || isRecentlyDeleted(conversationId)) {
+              discardPersistenceAccumulator(conversationId);
+              return;
+            }
+            let rendererPersisted = false;
+            try {
+              const conv = readConversation(fbAppHome, conversationId);
+              // The renderer's terminal persist writes runStatus:'idle'. That is the reliable
+              // "the renderer finished + wrote" signal (it was 'running' throughout the turn).
+              if (conv && conv.runStatus !== 'running') rendererPersisted = true;
+            } catch {
+              /* best-effort — treat as not-yet-persisted, keep polling */
+            }
+            if (rendererPersisted) {
+              discardPersistenceAccumulator(conversationId); // renderer owns the write — no double-persist
+              return;
+            }
+            if (remaining <= 0) {
+              // Budget exhausted with runStatus still 'running' → the renderer almost certainly
+              // reloaded/crashed. Persist main's accumulated reply so it isn't lost, then reset
+              // runStatus + settle clients. finalizeInterruptedTurn no-ops if there's no content.
+              try {
+                finalizeInterruptedTurn(fbAppHome, conversationId);
+              } catch {
+                discardPersistenceAccumulator(conversationId);
+              }
+              try {
+                const conv = readConversation(fbAppHome, conversationId);
+                if (conv && conv.runStatus === 'running') {
+                  conv.runStatus = 'idle';
+                  broadcastUpsert(fbAppHome, writeConversation(fbAppHome, conv));
+                }
+              } catch {
+                /* best-effort */
+              }
+              return;
+            }
+            setTimeout(() => pollGuiFallback(remaining - 1), 100);
+          };
+          pollGuiFallback(80); // ~8s: ample for the renderer's debounced persist; then fall back
         }
       }
     })();
