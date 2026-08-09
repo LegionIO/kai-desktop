@@ -356,6 +356,11 @@ export function reindexIfStale(appHome: string): number {
     conversations,
     activeConversationId: index.activeConversationId,
     settings: { ...index.settings, indexSchemaVersion: INDEX_SCHEMA_VERSION },
+    // Preserve the durable deletion tombstones across a schema reindex — dropping them would
+    // remove resurrection protection for every deleted conversation (a stale client could then
+    // recreate one). rebuildIndexFromConversationFiles never carries them (it scans data files),
+    // so take them from the prior index.
+    deletedIds: Array.isArray(index.deletedIds) ? [...index.deletedIds] : [],
   });
   console.info(`[conversation-store] reindexed ${count} conversation(s) to schema v${INDEX_SCHEMA_VERSION}`);
   return count;
@@ -1096,6 +1101,19 @@ function pushDurableDeletedId(index: ConversationIndex, id: string): void {
 // True iff the id is in the index's durable deleted ring — a restart/TTL-surviving tombstone.
 function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
   return Array.isArray(index.deletedIds) && index.deletedIds.includes(id);
+}
+// Public tombstone check: is this id currently blocked from a create-shaped write (recently
+// deleted in-memory, OR durably deleted and absent from the index)? Callers that BROADCAST a write
+// (conversations:put) use this to avoid emitting a phantom upsert / false success for a write that
+// writeConversation will silently suppress. Returns false for an id still present in the index (a
+// normal update, or a legitimate recreate before the tombstone was set).
+export function isWriteTombstoned(appHome: string, id: string): boolean {
+  if (isRecentlyDeleted(id)) {
+    const idx = readIndex(appHome);
+    return !idx.conversations[id];
+  }
+  const idx = readIndex(appHome);
+  return !idx.conversations[id] && isDurablyDeleted(idx, id);
 }
 
 /**

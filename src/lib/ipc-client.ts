@@ -77,8 +77,11 @@ type AppAPI = {
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     inFlight: (conversationId: string) => Promise<{ inFlight: boolean; serverPersisted: boolean }>;
-    continuationHeartbeat: (clientId: string) => Promise<{ ok: boolean }>;
-    acquireContinuationLease: (conversationId: string, clientId: string) => Promise<{ granted: boolean }>;
+    authorizeContinuation: (
+      conversationId: string,
+      clientId: string,
+      turnToken: string,
+    ) => Promise<{ authorized: boolean }>;
     injectMidTurn: (
       conversationId: string,
       userText: string,

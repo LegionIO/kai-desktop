@@ -1079,14 +1079,26 @@ function truncateToTokenBudget(
 
 /**
  * Use an AI model to extract relevant information from a large tool result.
+ *
+ * Bounded + cancellable: an auxiliary provider that hangs would otherwise (a) survive a turn Stop
+ * while pinning the large tool output in memory, and (b) accumulate one hung request per compacted
+ * result. We forward the turn's abortSignal to the generate call (so Stop cancels it) AND cap the
+ * number of concurrent extractions — over the cap we return null so the caller falls back to the
+ * cheap synchronous head/tail truncation instead of starting yet another abandonable request.
  */
+let outstandingToolExtractions = 0;
+const MAX_OUTSTANDING_TOOL_EXTRACTIONS = 6;
 async function aiExtractRelevantInfo(
   content: string,
   toolName: string,
   userQuery: string,
   maxOutputTokens: number,
   modelConfig: LLMModelConfig,
+  abortSignal?: AbortSignal,
 ): Promise<string | null> {
+  if (abortSignal?.aborted) return null;
+  if (outstandingToolExtractions >= MAX_OUTSTANDING_TOOL_EXTRACTIONS) return null; // fall back to truncation
+  outstandingToolExtractions += 1;
   try {
     const { Agent } = await import('@mastra/core/agent');
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -1109,12 +1121,14 @@ async function aiExtractRelevantInfo(
           model: model as AgentConfig['model'],
         }),
       prompt,
-      { maxSteps: 1 },
+      { maxSteps: 1, ...(abortSignal ? { abortSignal } : {}) },
       { primaryModelConfig: modelConfig, label: 'tool-compaction' },
     );
     return gen ? gen.text.trim() || null : null;
   } catch {
     return null;
+  } finally {
+    outstandingToolExtractions -= 1;
   }
 }
 
@@ -1188,6 +1202,7 @@ export async function compactToolResult(
   settings: ToolCompactionConfig,
   modelConfig?: LLMModelConfig,
   modelName?: string,
+  abortSignal?: AbortSignal,
 ): Promise<ToolCompactionResult> {
   const started = Date.now();
 
@@ -1207,7 +1222,7 @@ export async function compactToolResult(
 
   // Try AI extraction first
   if (settings.useAI && modelConfig) {
-    const extracted = await aiExtractRelevantInfo(content, toolName, userQuery, settings.outputMaxTokens, modelConfig);
+    const extracted = await aiExtractRelevantInfo(content, toolName, userQuery, settings.outputMaxTokens, modelConfig, abortSignal);
     if (extracted) {
       // Bound AI output to outputMaxTokens in case the model went over
       const bounded = truncateToTokenBudget(extracted, settings.outputMaxTokens, truncateOpts, modelName);

@@ -380,52 +380,45 @@ const serverPersistParents = new Map<string, string | null>();
 const guiFallbackParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
 
-// ── GUI continuation lease ────────────────────────────────────────────────────
-// A GUI turn's auto-continue-on-max-turns and plan-restart are driven by the ORIGINATING renderer
-// (it has the user's model/profile/thread settings + plan state to synthesize the follow-up). If
-// that sole renderer RELOADS mid-turn it comes back as a passive MIRROR (no locallyOriginated), so
-// the continuation would silently never fire. We cannot tell "I reloaded (owner gone)" from "I'm a
-// 2nd viewer (owner alive)" from a bare in-flight probe (see the reload-mirror comment in the
-// renderer). This lease resolves that ambiguity: exactly ONE client may hold the continuation lease
-// for a conversation at a time. The originating client acquires it at submit; on reload a renderer
-// re-acquires — GRANTED only if the prior holder is GONE (its heartbeat went stale), which is
-// precisely the reload/crash case. A live 2nd viewer's acquire is DENIED (the real owner's
-// heartbeat is fresh), so the turn is never double-driven. Liveness uses a client heartbeat rather
-// than a socket-close hook so it works uniformly for Electron windows AND web-bridge clients.
-const continuationLeases = new Map<string, string>(); // conversationId -> holder clientId
-const clientLastSeen = new Map<string, number>(); // clientId -> last heartbeat ms
-const CLIENT_LEASE_STALE_MS = 15_000; // holder considered gone after this without a heartbeat
-const CLIENT_SEEN_MAX = 200; // bound the heartbeat map (evict oldest) — clients are few
-function clientIsLive(clientId: string): boolean {
-  const seen = clientLastSeen.get(clientId);
-  return seen !== undefined && Date.now() - seen <= CLIENT_LEASE_STALE_MS;
-}
-function recordClientHeartbeat(clientId: string): void {
-  if (typeof clientId !== 'string' || clientId.length === 0) return;
-  clientLastSeen.delete(clientId); // re-insert at back so ordering reflects recency
-  clientLastSeen.set(clientId, Date.now());
-  while (clientLastSeen.size > CLIENT_SEEN_MAX) {
-    const oldest = clientLastSeen.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    clientLastSeen.delete(oldest);
-  }
-}
-// Grant iff: no current holder, OR this client already holds it, OR the current holder is stale
-// (gone). Records the granted holder + refreshes its heartbeat. Returns whether granted.
-function acquireContinuationLease(conversationId: string, clientId: string): boolean {
-  if (typeof conversationId !== 'string' || !conversationId || typeof clientId !== 'string' || !clientId) {
+// ── Main-authoritative GUI continuation ───────────────────────────────────────
+// A GUI turn's auto-continue-on-max-turns and plan-restart are driven by a renderer (it has the
+// user's model/profile/thread settings + plan state to synthesize the follow-up). With multiple
+// clients — or a client that reloaded mid-turn and came back as a passive mirror — EXACTLY ONE must
+// drive the continuation, or the run is double-restarted (duplicate model calls, supersession
+// races). Rather than a renderer-side lease (which cannot reliably tell "reloaded" from "2nd
+// viewer"), MAIN authorizes: the first client to request continuation for a given turn (keyed by the
+// run's stream TOKEN) is granted; all others are denied. Keying on the turn token means a fresh turn
+// (or a granted continuation, which starts a NEW token) is independently authorizable, so a
+// reloaded winner can keep continuing across successive max-turns hits. No heartbeat/liveness is
+// needed: a crashed/reloaded winner simply isn't the one asking for the NEXT turn's authorization.
+const continuationAuthByConv = new Map<string, { turnToken: string; clientId: string }>();
+const CONTINUATION_AUTH_MAX = 500; // bound the map (evict oldest) — conversations touched are few
+// Grant iff no client has been authorized for THIS conversation+turnToken yet, or this same client
+// already holds it. A request for a DIFFERENT (newer) turnToken resets the record (new turn). Deny
+// only when a DIFFERENT client already won this exact turn.
+function authorizeContinuation(conversationId: string, clientId: string, turnToken: string): boolean {
+  if (
+    typeof conversationId !== 'string' || !conversationId ||
+    typeof clientId !== 'string' || !clientId ||
+    typeof turnToken !== 'string' || !turnToken
+  ) {
     return false;
   }
-  recordClientHeartbeat(clientId);
-  const holder = continuationLeases.get(conversationId);
-  if (holder === undefined || holder === clientId || !clientIsLive(holder)) {
-    continuationLeases.set(conversationId, clientId);
-    return true;
+  const existing = continuationAuthByConv.get(conversationId);
+  if (existing && existing.turnToken === turnToken && existing.clientId !== clientId) {
+    return false; // a different client already won this exact turn's continuation
   }
-  return false;
+  continuationAuthByConv.delete(conversationId); // re-insert at back so ordering reflects recency
+  continuationAuthByConv.set(conversationId, { turnToken, clientId });
+  while (continuationAuthByConv.size > CONTINUATION_AUTH_MAX) {
+    const oldest = continuationAuthByConv.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    continuationAuthByConv.delete(oldest);
+  }
+  return true;
 }
-function releaseContinuationLease(conversationId: string): void {
-  continuationLeases.delete(conversationId);
+function releaseContinuationAuth(conversationId: string): void {
+  continuationAuthByConv.delete(conversationId);
 }
 // Reactive-recovery compaction hook awaits ABANDONED on turn-cancel (raceRecoveryAbort won, but
 // the underlying trusted-plugin callback promise stays pending, pinning its transcript — we can't
@@ -448,9 +441,6 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
   const fbAppHome = serverPersistAppHome;
   const fbToken = streamToken;
   guiFallbackParents.delete(conversationId);
-  // The GUI turn ended → its continuation lease is no longer needed. A follow-up turn (auto-
-  // continue / plan-restart) that the holder starts re-acquires a fresh lease on its own submit.
-  releaseContinuationLease(conversationId);
   const pollGuiFallback = (remaining: number): void => {
     const owner = activeStreams.get(conversationId)?.token;
     if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator
@@ -690,7 +680,22 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
-  broadcastToWebClients('agent:stream-event', eventToBroadcast);
+  // REMOTE clients (web WS 4 MiB / CLI local-bridge 8 MiB frame caps) can't take the full
+  // pre-compaction `originalContent` a tool-compaction event carries (it's the OVERSIZED text that
+  // triggered compaction — up to many MiB). Sending it over-frame disconnects the socket. Local
+  // Electron windows have no frame cap and keep the full text (for the "view original" affordance);
+  // a remote client that needs the original re-fetches the persisted record via conversations:get.
+  // Cap only for the remote payload, leaving the local broadcast above untouched.
+  let remoteEvent = eventToBroadcast;
+  if (
+    (eventToBroadcast as { type?: string }).type === 'tool-compaction' &&
+    typeof (eventToBroadcast as { data?: { originalContent?: unknown } }).data?.originalContent === 'string' &&
+    ((eventToBroadcast as { data: { originalContent: string } }).data.originalContent.length > 4096)
+  ) {
+    const ev = eventToBroadcast as { data: Record<string, unknown> };
+    remoteEvent = { ...ev, data: { ...ev.data, originalContent: '[omitted-in-broadcast]' } } as StreamEvent;
+  }
+  broadcastToWebClients('agent:stream-event', remoteEvent);
 }
 
 /**
@@ -706,8 +711,9 @@ async function gateTitleGenerationMessages(
   config: AppConfig,
   conversationId: string,
   modelKey?: string,
-): Promise<{ suppressed: boolean; messages: unknown[] }> {
-  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey);
+  systemPrompt: string = '',
+): Promise<{ suppressed: boolean; messages: unknown[]; systemPrompt?: string }> {
+  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey, systemPrompt);
 }
 
 /**
@@ -727,16 +733,19 @@ async function maybeAutoTitle(appHome: string, conversationId: string): Promise<
 
     const config = readEffectiveConfig(appHome);
     // Same DLP gate as agent:generate-title — a title-specific deny/modify hook
-    // must apply to CLI-created conversations too. Suppressed ⇒ no title.
-    const gated = await gateTitleGenerationMessages(branch, config, conversationId);
+    // must apply to CLI-created conversations too. Pass the ACTUAL title system prompt through the
+    // gate (so a system-prompt-conditioned hook sees the real outbound context) and USE the gated
+    // system prompt for generation. Suppressed ⇒ no title.
+    const CLI_TITLE_SYSTEM_PROMPT =
+      "Generate a concise conversation title using at most 4 words. Summarize the user's main topic or task, not the assistant's answer. Use a neutral noun phrase, not a sentence. Return only the title text with no quotes or formatting.";
+    const gated = await gateTitleGenerationMessages(branch, config, conversationId, undefined, CLI_TITLE_SYSTEM_PROMPT);
     if (gated.suppressed) return;
 
     const input = buildTitleGenerationInput(gated.messages);
     if (!input) return;
 
     const title = await generateTitle({
-      systemPrompt:
-        "Generate a concise conversation title using at most 4 words. Summarize the user's main topic or task, not the assistant's answer. Use a neutral noun phrase, not a sentence. Return only the title text with no quotes or formatting.",
+      systemPrompt: gated.systemPrompt ?? CLI_TITLE_SYSTEM_PROMPT,
       maxWords: 4,
       input,
       config,
@@ -2640,6 +2649,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             toolCompaction,
             modelEntry?.modelConfig,
             modelEntry?.modelConfig.modelName,
+            controller.signal, // Stop cancels a hung tool-compaction extraction
           );
 
           if (compactionResult.wasCompacted && !controller.signal.aborted) {
@@ -5445,21 +5455,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { inFlight, serverPersisted };
   });
 
-  // GUI continuation-lease liveness heartbeat: the renderer pings periodically so main knows the
-  // holder of a continuation lease is still alive. A holder whose heartbeat goes stale is treated
-  // as gone, letting a reloaded renderer re-acquire the lease (see acquireContinuationLease).
-  ipcMain.handle('agent:continuation-heartbeat', (_event, clientId: string) => {
-    recordClientHeartbeat(clientId);
-    return { ok: true };
-  });
-  // Atomically acquire the continuation lease for a conversation. Granted iff no live client holds
-  // it (see acquireContinuationLease). The originating client acquires at submit; a renderer that
-  // reloaded mid-turn re-acquires and, if granted, adopts the run as locally-driven so auto-
-  // continue / plan-restart resume — otherwise it stays a passive mirror (a live owner still holds
-  // the lease, so a 2nd viewer is denied and the turn is never double-driven).
-  ipcMain.handle('agent:acquire-continuation-lease', (_event, conversationId: string, clientId: string) => {
-    return { granted: acquireContinuationLease(conversationId, clientId) };
-  });
+  // Main-authoritative GUI continuation authorization. A renderer about to drive an auto-continue
+  // (max-turns) or plan-restart asks main to authorize it for THIS turn (keyed by the run's stream
+  // token, which the renderer knows as runGeneration). Main grants the FIRST asker per turn and
+  // denies the rest — so with multiple clients, or a reloaded client that came back as a passive
+  // mirror, exactly one drives the continuation and the run is never double-restarted. A crashed
+  // winner simply isn't the one asking for the NEXT turn's authorization, so continuation resumes.
+  ipcMain.handle(
+    'agent:authorize-continuation',
+    (_event, conversationId: string, clientId: string, turnToken: string) => {
+      return { authorized: authorizeContinuation(conversationId, clientId, turnToken) };
+    },
+  );
 
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
     cancelConversationStreamInner(conversationId);
@@ -5516,8 +5523,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (guiFallbackParents.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }
-    // A cancel ends the turn — drop its continuation lease (a resumed turn re-acquires).
-    releaseContinuationLease(conversationId);
+    // A cancel ends the turn — drop its continuation authorization (a resumed turn re-authorizes).
+    releaseContinuationAuth(conversationId);
     if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
       try {
@@ -5596,20 +5603,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return { title: null };
       }
 
-      // Title generation sends the user's prompt to a model too, so when hook
-      // enforcement is active it must pass through the same UserPromptSubmit gate
-      // (shared with the CLI auto-title path). A `deny` returns
-      // { title: null, suppressed: true } so the renderer does NOT fall back to
-      // deriving a title from the raw messages; a `modify` rewrites the messages.
-      const gated = await gateTitleGenerationMessages(messages, config, conversationId ?? '', modelKey);
-      if (gated.suppressed) return { title: null, suppressed: true };
-      const effectiveMessages = gated.messages;
-
-      const input = buildTitleGenerationInput(effectiveMessages);
-      if (!input) return { title: null };
-
-      const hasImages = messagesContainImages(effectiveMessages);
-
+      // Build the title system prompt FIRST (from the incoming messages) so it can be passed
+      // THROUGH the DLP gate: a system-prompt-conditioned enforcement hook must see the real
+      // outbound title request, and its returned systemPrompt modification must be honored.
+      const hasImages = messagesContainImages(messages);
       const promptParts = [
         'Generate a concise conversation title using at most 4 words.',
         "Summarize the user's main topic or task, not the assistant's answer.",
@@ -5617,7 +5614,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         'Avoid apologies, disclaimers, or copied response text.',
         'Return only the title text with no quotes or formatting.',
       ];
-
       if (hasImages) {
         promptParts.push(
           'The user attached one or more images. [Image] is a placeholder — do not treat it as literal text.',
@@ -5625,15 +5621,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           'Never generate text that refers to not seeing an image or being unable to view it.',
         );
       }
-
       if (hint) {
         promptParts.push(`Context: ${hint}.`);
       }
-
       const CHAT_TITLE_PROMPT = promptParts.join(' ');
 
+      // Title generation sends the user's prompt to a model too, so when hook
+      // enforcement is active it must pass through the same UserPromptSubmit gate
+      // (shared with the CLI auto-title path). A `deny` returns
+      // { title: null, suppressed: true } so the renderer does NOT fall back to
+      // deriving a title from the raw messages; a `modify` rewrites the messages
+      // and/or the system prompt.
+      const gated = await gateTitleGenerationMessages(messages, config, conversationId ?? '', modelKey, CHAT_TITLE_PROMPT);
+      if (gated.suppressed) return { title: null, suppressed: true };
+      const effectiveMessages = gated.messages;
+
+      const input = buildTitleGenerationInput(effectiveMessages);
+      if (!input) return { title: null };
+
       const title = await generateTitle({
-        systemPrompt: CHAT_TITLE_PROMPT,
+        systemPrompt: gated.systemPrompt ?? CHAT_TITLE_PROMPT,
         maxWords: 4,
         input,
         config,

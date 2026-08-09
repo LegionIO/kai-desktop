@@ -41,6 +41,7 @@ import {
   setActiveConversationId,
   nextCompactionRevision,
   isRecentlyDeleted,
+  isWriteTombstoned,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -65,7 +66,17 @@ export type ConversationChange =
 // over the frame-capped remote transports (web WS 4 MiB, CLI local-bridge 8 MiB) DISCONNECTS the
 // socket on media-heavy conversations; /compact can't help (it leaves the raw tree). Cheap
 // synchronous structural strip — NOT the async token-aware stripMediaForSerialization.
-function stripBase64FromPart(part: unknown): unknown {
+//
+// Media is not only at the top level of a content part: a tool-result part carries it under
+// `part.result` (and the canonical model view under `part.result._modelContent`), and a compacted
+// part keeps the pre-compaction copy under `part.originalResult`. So this recurses through nested
+// objects/arrays (depth-bounded) rather than touching only top-level fields — otherwise a
+// media-heavy tool result still blows the remote frame limit.
+const STRIP_MAX_DEPTH = 8;
+function stripBase64FromPart(part: unknown, depth = 0): unknown {
+  if (Array.isArray(part)) {
+    return depth >= STRIP_MAX_DEPTH ? part : part.map((v) => stripBase64FromPart(v, depth + 1));
+  }
   if (!part || typeof part !== 'object') return part;
   const p = part as Record<string, unknown>;
   const out: Record<string, unknown> = { ...p };
@@ -76,6 +87,13 @@ function stripBase64FromPart(part: unknown): unknown {
   }
   // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
   if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
+  // Recurse into nested containers that can hold media (tool-result payloads, compaction backups,
+  // nested content arrays). Depth-bounded to avoid pathological recursion.
+  if (depth < STRIP_MAX_DEPTH) {
+    for (const [k, v] of Object.entries(out)) {
+      if (v && typeof v === 'object') out[k] = stripBase64FromPart(v, depth + 1);
+    }
+  }
   return out;
 }
 function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
@@ -678,12 +696,13 @@ export function registerConversationHandlers(
     const prev = readConversation(appHome, conversation.id);
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
 
-    // Resurrection guard: this conversation was RECENTLY DELETED and is not on disk (prev
-    // null). A stale in-flight optimistic put must NOT recreate it — writeConversation would
-    // skip the write but still return a record, so broadcasting an upsert + returning ok
-    // here would make the renderer launch an agent run against a deleted chat. Reject so the
-    // renderer rolls back instead (matches the compacting-busy rejection contract).
-    if (!prev && isRecentlyDeleted(conversation.id)) {
+    // Resurrection guard: this conversation was DELETED and is not on disk (prev null). A stale
+    // in-flight optimistic put must NOT recreate it — writeConversation would skip the write but
+    // still return a record, so broadcasting an upsert + returning ok here would make the renderer
+    // launch an agent run against a deleted chat. Reject so the renderer rolls back instead
+    // (matches the compacting-busy rejection contract). isWriteTombstoned covers BOTH the in-memory
+    // TTL tombstone AND the durable index ring (survives restart / TTL expiry).
+    if (!prev && isWriteTombstoned(appHome, conversation.id)) {
       return { rejected: 'conversation-deleted' as const };
     }
 
@@ -985,6 +1004,13 @@ export function registerConversationHandlers(
     }
 
     const written = writeConversation(appHome, nextConversation);
+    // If the id is tombstoned (deleted), writeConversation SUPPRESSES the write (returns the record
+    // unchanged, nothing hits disk). Do NOT broadcast a phantom upsert or emit ConversationStart or
+    // report success in that case — signal conversation-deleted so the client rolls back its
+    // optimistic state (matching the renderer's persistConversation deleted-rollback contract).
+    if (isWriteTombstoned(appHome, conversation.id)) {
+      return { rejected: 'conversation-deleted' as const };
+    }
     broadcastUpsert(appHome, written);
     if (!prev) {
       eventBus.emit('conversation', 'created', { id: conversation.id, title: nextConversation.title });

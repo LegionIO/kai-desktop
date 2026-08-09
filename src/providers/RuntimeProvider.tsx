@@ -837,28 +837,14 @@ function supersedeCurrentGeneration(convId: string): void {
  *  interactive send). Gates automation-specific behavior: background accumulation,
  *  open-mid-run seeding, and deferring persistence to the main process. */
 const automationStreams = new Set<string>();
-// Stable per-client-session id for the GUI continuation lease. Minted once per renderer session
-// (a reload mints a NEW one — which is exactly what lets the reloaded client re-acquire a lease the
-// crashed/reloaded prior session held: the old id stops heart-beating and its lease goes stale).
+// Stable per-client-session id used to request MAIN-AUTHORITATIVE continuation authorization. Minted
+// once per renderer session (a reload mints a new one). Continuation of a GUI turn (auto-continue on
+// max-turns / plan-restart) is renderer-driven, so with multiple clients — or a reloaded client that
+// came back as a passive mirror — we must ensure EXACTLY ONE drives it. Rather than a renderer-side
+// lease (which cannot reliably tell "reloaded" from "2nd viewer"), the driving decision is delegated
+// to main: agent:authorize-continuation grants the FIRST caller per turn (keyed by the run's stream
+// token) and denies the rest. See the max-turns / plan-restart handlers.
 const CONTINUATION_CLIENT_ID = msgId();
-// Conversations THIS client currently holds (or believes it holds) the continuation lease for, so
-// auto-continue / plan-restart may fire even on a mirror we adopted after a reload. Distinct from
-// locallyOriginated (which is set at adopt time); this mirrors the main-side grant for clarity.
-const heldContinuationLeases = new Set<string>();
-// Acquire (or refresh) the continuation lease for a conversation this client is driving. Fire-and-
-// forget: the originating client normally wins (fresh turn / already holder). On the rare denial
-// (a live prior holder still owns it — e.g. two windows raced the same submit), we simply don't
-// record it, so this client won't ALSO drive the continuation — the true holder does. Records the
-// grant locally so the terminal handlers can gate continuation on lease ownership too.
-function acquireContinuationLeaseFor(convId: string): void {
-  void app.agent
-    .acquireContinuationLease?.(convId, CONTINUATION_CLIENT_ID)
-    .then((r) => {
-      if (r?.granted) heldContinuationLeases.add(convId);
-      else heldContinuationLeases.delete(convId);
-    })
-    .catch(() => {});
-}
 /** Automation conversations we've begun async-seeding a background accumulator for
  *  (dedupes the disk fetch while events stream in before the seed resolves). */
 const automationSeedInProgress = new Set<string>();
@@ -987,6 +973,17 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
   // drafts; never wholesale-replaces). loadConversationState hydrates from it; restore removes it.
   void applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
 }
+// Re-enqueue an EXISTING draft entry (preserving its id + stashedAt) — used when an atomic claim
+// removed a draft from disk but the restore couldn't apply (chat switched / composer busy). Push
+// to the FRONT so it's the next one restored, and re-ADD it durably so it survives across reload.
+function enqueueRejectedDraftEntry(convId: string, entry: RejectedDraft): void {
+  if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  const q = rejectedDrafts.get(convId) ?? [];
+  if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.pop() : undefined; // drop NEWEST on overflow (keep this requeued one)
+  rejectedDrafts.set(convId, q);
+  applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
+}
 /** Dequeue the OLDEST rejected draft for a conversation, or undefined if none. */
 function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   const q = rejectedDrafts.get(convId);
@@ -1013,21 +1010,24 @@ function dropRejectedDraftLocal(convId: string, id: string): void {
 // ATOMICALLY claim the oldest pending draft on MAIN and restore it into the composer — but only if
 // THIS client won the claim. When several clients hydrated the same durable pendingDrafts, main's
 // single-threaded remove-and-return guarantees exactly one `draft !== null`, so the others don't
-// populate a duplicate composer. On success we restore + drop it locally; if another client won
-// (draft === null) we just drop it locally (it's gone from disk). Falls back to the local dequeue
-// if the claim IPC is unavailable/errors, so a single-client session behaves exactly as before.
+// populate a duplicate composer. Because main removes the draft BEFORE `restore` runs, `restore`
+// must ACK whether it actually applied: it returns true if it populated the composer, false if it
+// bailed (the user switched chats / started typing / added an attachment during the async claim).
+// On a false ack we REQUEUE the claimed draft — durably (re-add via delta) AND locally — so the
+// input is never lost (the r162 claim otherwise dropped it from both disk and memory). Falls back
+// to the local dequeue if the claim IPC is unavailable, so a single-client session is unchanged.
 async function claimAndRestoreDraft(
   convId: string,
-  restore: (d: RejectedDraft) => void,
+  restore: (d: RejectedDraft) => boolean,
 ): Promise<void> {
   const id = peekOldestRejectedDraftId(convId);
   if (!id) return;
   try {
     const res = await app.conversations.claimPendingDraft?.(convId, id);
     if (res === undefined) {
-      // IPC not present (older bridge) — fall back to the local-only path.
+      // IPC not present (older bridge) — fall back to the local-only path. Requeue on a false ack.
       const local = dequeueRejectedDraft(convId);
-      if (local) restore(local);
+      if (local && !restore(local)) enqueueRejectedDraftEntry(convId, local);
       return;
     }
     if (res.ok && res.draft) {
@@ -1038,7 +1038,9 @@ async function claimAndRestoreDraft(
         stashedAt: res.draft.stashedAt,
       };
       dropRejectedDraftLocal(convId, d.id);
-      restore(d);
+      // If restore bailed, the draft is already gone from disk (main removed it) — REQUEUE it so
+      // it survives (durable re-add + local) rather than vanishing.
+      if (!restore(d)) enqueueRejectedDraftEntry(convId, d);
     } else {
       // Another client claimed it (or it's gone) — reconcile our local mirror, restore nothing.
       dropRejectedDraftLocal(convId, id);
@@ -2491,11 +2493,12 @@ export function RuntimeProvider({
         if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return; // don't clobber
         // ATOMIC claim on main so only ONE client restores this draft (the poll restores the rest).
         void claimAndRestoreDraft(id, (rejected) => {
-          if (activeIdRef.current !== id) return; // switched during the async claim — don't clobber
+          if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
           const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
-          if (t.trim().length > 0 || attachmentsRef.current.length > 0) return;
+          if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
           if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
           restoreComposerDraft(rejected.text);
+          return true;
         });
       }, 0);
     }
@@ -2528,54 +2531,43 @@ export function RuntimeProvider({
         // content + a running indicator. Ownership:
         //  - automation / SERVER-PERSISTED (CLI) turn → MAIN-owned: mark automationStreams (render
         //    live, never persist here — main writes the authoritative terminal state).
-        //  - GUI-started turn → seed a passive MIRROR accumulator (NO locallyOriginated, NOT in
-        //    automationStreams). We CANNOT tell "this renderer reloaded (original owner gone)" from
-        //    "I'm a 2nd viewer (original owner alive)" from a bare in-flight probe alone — so we
-        //    seed a mirror, then ASYNCHRONOUSLY try to ACQUIRE the continuation lease from main.
-        //    Main grants it ONLY if no LIVE client holds it (the prior holder's heartbeat went
-        //    stale = it reloaded/crashed). If granted, we UPGRADE this mirror to locally-driven so
-        //    auto-continue / plan-restart resume; if denied (a live owner still holds it — the
-        //    2nd-viewer case), we stay a passive mirror and never double-drive the turn. Either way
-        //    the reply itself is safe: main's persistence fallback covers the reloaded-owner case,
-        //    and a live owner persists its own.
+        //  - GUI-started turn → seed a PASSIVE MIRROR accumulator (NO locallyOriginated, NOT in
+        //    automationStreams). We cannot tell "reloaded (owner gone)" from "2nd viewer (owner
+        //    alive)" from a bare in-flight probe, so we NEVER persist from a mirror — main's GUI
+        //    persistence fallback covers a reloaded/crashed owner, and a live owner persists its
+        //    own (so a mirror's stale-disk snapshot can't clobber the complete reply). CONTINUATION
+        //    (auto-continue / plan-restart) is NOT gated on being the originator here: it's decided
+        //    by MAIN at continuation time (agent:authorize-continuation grants exactly one client
+        //    per turn), which safely handles both the reloaded-owner and multi-viewer cases without
+        //    a renderer-side lease. We stash the run's settings (reconstructed from disk) on the
+        //    mirror so that IF this client wins that authorization, its continuation uses the right
+        //    model/profile/thread rather than the live active-chat refs.
         const mainOwned = autoInFlight || agentInFlight.serverPersisted;
         if (mainOwned) automationStreams.add(id);
-        streamAccumulators.set(id, { messages: [...t], headId: h });
+        streamAccumulators.set(id, {
+          messages: [...t],
+          headId: h,
+          ...(mainOwned
+            ? {}
+            : {
+                runConfig: {
+                  selectedModelKey: conv.selectedModelKey ?? null,
+                  reasoningEffort: conv.reasoningEffort ?? undefined,
+                  selectedProfileKey: conv.selectedProfileKey ?? null,
+                  fallbackEnabled: conv.fallbackEnabled ?? false,
+                  cwd: null,
+                  executionMode: conv.executionMode ?? undefined,
+                  threadOverrides: {
+                    temperature: conv.temperature ?? null,
+                    systemPromptOverride: conv.systemPromptOverride ?? null,
+                    maxSteps: conv.maxSteps ?? null,
+                    maxRetries: conv.maxRetries ?? null,
+                    runtimeOverride: conv.runtimeOverride ?? null,
+                  },
+                },
+              }),
+        });
         setIsRunning(true);
-        if (!mainOwned) {
-          // GUI mirror — race for the continuation lease. Reconstruct the run's settings from the
-          // persisted conversation so an adopted continuation uses the right model/profile/thread.
-          void app.agent
-            .acquireContinuationLease?.(id, CONTINUATION_CLIENT_ID)
-            .then((r) => {
-              if (!r?.granted) return;
-              heldContinuationLeases.add(id);
-              const acc = streamAccumulators.get(id);
-              // Only upgrade if we still hold THIS mirror (not superseded/switched/terminated) and
-              // it hasn't already become locally-driven.
-              if (acc && acc.locallyOriginated !== true) {
-                acc.locallyOriginated = true;
-                if (!acc.runConfig) {
-                  acc.runConfig = {
-                    selectedModelKey: conv.selectedModelKey ?? null,
-                    reasoningEffort: conv.reasoningEffort ?? undefined,
-                    selectedProfileKey: conv.selectedProfileKey ?? null,
-                    fallbackEnabled: conv.fallbackEnabled ?? false,
-                    cwd: null,
-                    executionMode: conv.executionMode ?? undefined,
-                    threadOverrides: {
-                      temperature: conv.temperature ?? null,
-                      systemPromptOverride: conv.systemPromptOverride ?? null,
-                      maxSteps: conv.maxSteps ?? null,
-                      maxRetries: conv.maxRetries ?? null,
-                      runtimeOverride: conv.runtimeOverride ?? null,
-                    },
-                  };
-                }
-              }
-            })
-            .catch(() => {});
-        }
       } else {
         setIsRunning(false);
       }
@@ -2681,28 +2673,16 @@ export function RuntimeProvider({
       // ATOMIC claim on main (one draft per tick, oldest first) so concurrent clients don't both
       // restore the same draft; only the winner populates its composer.
       void claimAndRestoreDraft(id, (rejected) => {
-        if (activeIdRef.current !== id) return; // switched during the async claim — don't clobber
+        if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
         const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
-        if (t.trim().length > 0 || attachmentsRef.current.length > 0) return;
+        if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
         if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
         restoreComposerDraft(rejected.text);
+        return true;
       });
     }, 1500);
     return () => clearInterval(timer);
   }, [addAttachments]);
-
-  // GUI continuation-lease heartbeat: tell main this client is alive so it retains any continuation
-  // lease this session holds. If this renderer reloads/crashes, the heartbeat stops and main lets
-  // the reloaded session re-acquire the lease (its prior holder id goes stale). Cheap fire-and-
-  // forget on a 5s cadence (well under the 15s stale threshold).
-  useEffect(() => {
-    const beat = () => {
-      void app.agent.continuationHeartbeat?.(CONTINUATION_CLIENT_ID).catch(() => {});
-    };
-    beat();
-    const timer = setInterval(beat, 5000);
-    return () => clearInterval(timer);
-  }, []);
 
   // Reload the active conversation when the main process appends to it (e.g. an
   // automation targeting this thread). Our own persists never grow the tree past
@@ -2732,7 +2712,6 @@ export function RuntimeProvider({
           pendingCompactionHandoff.delete(deletedId);
           clearLateCompactionHandoffTimer(deletedId);
           rejectedDrafts.delete(deletedId);
-          heldContinuationLeases.delete(deletedId);
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
           clearFinalizedBranch(deletedId);
@@ -3418,7 +3397,24 @@ export function RuntimeProvider({
           }
           if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
         } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
-          return; // superseded run's late event — drop
+          // Event from a DIFFERENT generation than this accumulator is locked to. Normally this is
+          // a superseded (older) run's late event → drop it. BUT a `user-message` under a different
+          // generation is a NEW turn taking over this conversation (a 2nd GUI window / a CLI submit
+          // into the conv we're viewing). Dropping it would strand THIS client: it keeps showing
+          // the old (now aborted) run, main suppresses the old run's terminal, and the authoritative
+          // upsert is ignored while our accumulator exists — and a Stop here would cancel the NEW
+          // run. So RESEED as a passive MIRROR of the new turn: adopt the new generation, drop the
+          // originating flag (main persists / the new originator drives), and fall through so the
+          // user-message renders. (Only when the new generation isn't itself already superseded.)
+          if (e.type === 'user-message' && !supersededGenerations.get(convId)?.has(evGen)) {
+            acc.runGeneration = evGen;
+            acc.locallyOriginated = false;
+            acc.pendingAssistantId = (e as { responseMessageId?: string }).responseMessageId ?? acc.pendingAssistantId;
+            traceRuntime('stream.supersede-adopt-mirror', convId, { newGeneration: evGen });
+            // fall through — render the new turn's user-message + subsequent events as a mirror
+          } else {
+            return; // superseded run's late event — drop
+          }
         }
       } else if (
         // No runGeneration → a pre-stream busy rejection (sent directly / synthesized, not
@@ -3950,20 +3946,63 @@ export function RuntimeProvider({
         // (model/CWD) instead of the run's — relative-path tools in the wrong project — and
         // (b) double-drive a main-owned turn. main/CLI re-submits to continue its own run.
         const mainOwned = e.automation || e.serverPersisted || automationStreams.has(convId);
-        // Only the ORIGINATING client drives the auto-continue — a mirroring client (2nd GUI
-        // window / web client) has a locallyOriginated:false accumulator built from broadcasts;
-        // if it also continued, every mirror would independently restart the run (duplicate
-        // model calls, supersession races, another client's model/CWD). Mirrors just render.
-        const autoContinue = agentCfg?.autoContinueOnMaxTurns === true && !mainOwned && acc.locallyOriginated === true;
+        // A GUI continuation (max-turns auto-continue) may be driven by ANY GUI client — the
+        // ORIGINATOR or a client that reloaded mid-turn and came back as a mirror. To ensure
+        // EXACTLY ONE drives it (no duplicate model calls / supersession races), MAIN authorizes:
+        // we ask agent:authorize-continuation for THIS turn (keyed by the run's stream token) and
+        // proceed only if granted; a denied client cleans up like a mirror and re-renders the
+        // winner's continuation from broadcasts. So the gate here is only "do we WANT to continue"
+        // (config on, not main-owned); the single-driver guarantee is main's, not locallyOriginated.
+        const wantsAutoContinue = agentCfg?.autoContinueOnMaxTurns === true && !mainOwned;
+        const turnToken = acc.runGeneration;
 
-        if (autoContinue) {
-          // Auto-continue: finalize current response and immediately restart the stream
-          finalizeAssistantResponse(acc);
-          const _ptAC = persistTimersRef.current.get(convId);
-          if (_ptAC) {
-            clearTimeout(_ptAC);
-            persistTimersRef.current.delete(convId);
-          }
+        if (wantsAutoContinue) {
+          // Ask MAIN to authorize this client as the single continuation driver for this turn.
+          // Denied → clean up like a mirror (drop the live accumulator, reconcile from disk once
+          // the winner's continuation lands) and DON'T mutate turn state. Authorized → run the
+          // existing continuation body. All of this is async, so return synchronously now; the
+          // IIFE fully handles both outcomes (and the manual-card path below is skipped).
+          void (async () => {
+            let authorized = false;
+            try {
+              const r = await app.agent.authorizeContinuation?.(
+                convId,
+                CONTINUATION_CLIENT_ID,
+                turnToken ?? convId,
+              );
+              // If the IPC is absent (older bridge), fall back to the originator-only rule so a
+              // single-client session still auto-continues.
+              authorized = r ? r.authorized : acc.locallyOriginated === true;
+            } catch {
+              authorized = acc.locallyOriginated === true;
+            }
+            // Re-validate we still own this exact turn's accumulator after the async hop (a Stop /
+            // supersede / switch may have swapped it). If not, do nothing — the new owner drives.
+            const cur = streamAccumulators.get(convId);
+            if (cur !== acc) return;
+            if (!authorized) {
+              // Not the driver — mirror cleanup: drop the accumulator + reconcile from disk when
+              // the winner's continuation lands. Never persist idle here (that would race the
+              // winner's continuation write).
+              const _ptDenied = persistTimersRef.current.get(convId);
+              if (_ptDenied) {
+                clearTimeout(_ptDenied);
+                persistTimersRef.current.delete(convId);
+              }
+              streamAccumulators.delete(convId);
+              if (isActiveConv) {
+                setIsRunning(false);
+                void loadConversationState(convId, { skipInFlightSeed: true });
+              }
+              return;
+            }
+            // Authorized — finalize current response and immediately restart the stream.
+            finalizeAssistantResponse(acc);
+            const _ptAC = persistTimersRef.current.get(convId);
+            if (_ptAC) {
+              clearTimeout(_ptAC);
+              persistTimersRef.current.delete(convId);
+            }
           const branch = getActiveBranch(acc.messages, acc.headId);
           const responseMessageId = msgId();
           // If a compaction succeeded earlier in THIS turn, its record is in
@@ -4150,6 +4189,8 @@ export function RuntimeProvider({
           // all outcomes (persisted → launch; rejected/unknown/superseded → retry-or-abandon)
           // and is compaction-agnostic.
           launchAfterCompactionPersist(300, continuationPersist);
+          return;
+          })();
           return;
         }
 
@@ -4441,10 +4482,13 @@ export function RuntimeProvider({
           // so we restart in plan-first mode with a synthetic user message telling the
           // agent to continue refining the plan.
           const planModeRejectRestart = (e.data as Record<string, unknown> | undefined)?.planModeRejectRestart;
-          // Only the ORIGINATING client restarts (mirrors have locallyOriginated:false) — else
-          // every mirror independently restarts the plan turn (duplicate runs / races / wrong
-          // client settings). A mirror still renders the restarted run via broadcasts.
-          if ((planModeRestart || planModeRejectRestart) && acc.locallyOriginated === true) {
+          // A plan-restart may be driven by ANY GUI client (originator or a reloaded mirror); MAIN
+          // authorizes the single driver per turn (see the max_turns auto-continue). Enter on
+          // "wants restart" (a plan-restart signal on a non-main-owned run); the authorization
+          // inside the delayed launch guarantees exactly one client actually restarts.
+          const planMainOwned = e.automation || e.serverPersisted || automationStreams.has(convId);
+          const planTurnToken = acc.runGeneration;
+          if ((planModeRestart || planModeRejectRestart) && !planMainOwned) {
             const label = planModeRestart ? 'plan-restart' : 'plan-reject-restart';
             console.info(`[UI:stream] ${label} — auto-continuing with plan-first mode`);
             // Snapshot THIS run's settings for the delayed launch. Prefer the run's OWN
@@ -4479,7 +4523,24 @@ export function RuntimeProvider({
             const planRunConfig = { ...(acc.runConfig ?? {}), executionMode: 'plan-first' as const };
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
-            setTimeout(() => {
+            setTimeout(async () => {
+              // MAIN-authoritative single-driver gate: only one client may restart this turn.
+              // Denied → do nothing (the winner restarts; this client re-renders via broadcasts).
+              let planAuthorized = false;
+              try {
+                const r = await app.agent.authorizeContinuation?.(
+                  convId,
+                  CONTINUATION_CLIENT_ID,
+                  planTurnToken ?? convId,
+                );
+                planAuthorized = r ? r.authorized : acc.locallyOriginated === true;
+              } catch {
+                planAuthorized = acc.locallyOriginated === true;
+              }
+              if (!planAuthorized) {
+                console.info(`[UI:stream] ${label} — not authorized (another client drives it)`);
+                return;
+              }
               // Ownership check BEFORE replacing the accumulator: the done handler above
               // deleted convId's accumulator, so during this 100ms delay either nothing
               // took over (still absent) or a replacement turn installed a NEW accumulator.
@@ -4871,7 +4932,6 @@ export function RuntimeProvider({
         runConfig: { selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, cwd, executionMode, threadOverrides },
         locallyOriginated: true, // this client started the turn → it drives any auto-continue/restart
       });
-      acquireContinuationLeaseFor(convId); // originator holds the lease; a reload can re-acquire it
       const branch = getActiveBranch(newTree, newHead);
 
       const persistRes = await persistConversation(
@@ -5131,7 +5191,6 @@ export function RuntimeProvider({
         runConfig: reloadRunConfig,
         locallyOriginated: true, // this client started the reload → it drives any auto-continue/restart
       });
-      acquireContinuationLeaseFor(convId);
       const branch = getActiveBranch(newTree, actualParent);
       const reloadPreHead = headIdRef.current;
       const reloadPersistRes = await persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
@@ -5297,7 +5356,6 @@ export function RuntimeProvider({
         runConfig: editRunConfig,
         locallyOriginated: true, // this client started the edit → it drives any auto-continue/restart
       });
-      acquireContinuationLeaseFor(convId);
       const branch = getActiveBranch(newTree, newHead);
 
       const editPersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -5845,7 +5903,6 @@ export function RuntimeProvider({
         runConfig: variantRunConfig,
         locallyOriginated: true, // user-initiated continue-after-max-turns → this client drives it
       });
-      acquireContinuationLeaseFor(convId);
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
       if (persistRes?.rejected) {
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
@@ -5938,7 +5995,6 @@ export function RuntimeProvider({
       runConfig: continueRunConfig,
       locallyOriginated: true, // user-initiated continue-task → this client drives any further continuation
     });
-    acquireContinuationLeaseFor(convId);
     const branch = getActiveBranch(newTree, newHead);
     const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     // /compact holds the conversation: roll back the optimistic continue turn + running

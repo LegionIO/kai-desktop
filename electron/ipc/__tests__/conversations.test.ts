@@ -460,6 +460,28 @@ describe('conversations IPC: pending-draft claim (atomic single-winner)', () => 
 });
 
 describe('conversations IPC: error paths', () => {
+  it('conversations:put of a just-deleted (tombstoned) conversation is rejected, not a phantom upsert', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    // Create then delete → the id is tombstoned. A stale client that re-puts it must be rejected
+    // with conversation-deleted (writeConversation suppresses the write; no phantom upsert/success).
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('tomb-put', {}));
+    await harness.invoke('conversations:delete', FAKE_EVENT, 'tomb-put');
+    const res = await harness.invoke<{ ok?: boolean; rejected?: string }>(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('tomb-put', { title: 'resurrected?' }),
+    );
+    expect(res.rejected).toBe('conversation-deleted');
+    expect(res.ok).not.toBe(true);
+    // Nothing landed on disk.
+    const fetched = await harness.invoke<unknown>('conversations:get', FAKE_EVENT, 'tomb-put');
+    expect(fetched).toBeNull();
+  });
+
   it('returns null for conversations:get when the id is unknown', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

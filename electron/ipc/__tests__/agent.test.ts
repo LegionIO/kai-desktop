@@ -301,6 +301,28 @@ describe('agent IPC: tool approval channels', () => {
 // Sub-agent inventory channel
 // ---------------------------------------------------------------------------
 
+describe('agent IPC: continuation authorization (single driver per turn)', () => {
+  it('authorizes the first client per turn token and denies a second, resetting on a new token', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+    const authorize = (clientId: string, turnToken: string) =>
+      harness.invoke<{ authorized: boolean }>('agent:authorize-continuation', FAKE_EVENT, 'conv-auth', clientId, turnToken);
+
+    // First client wins this turn.
+    expect((await authorize('clientA', 'tok-1')).authorized).toBe(true);
+    // A different client is DENIED for the same turn (no double-drive).
+    expect((await authorize('clientB', 'tok-1')).authorized).toBe(false);
+    // The winner re-asking for the same turn is idempotently still authorized.
+    expect((await authorize('clientA', 'tok-1')).authorized).toBe(true);
+    // A NEW turn token resets — a different client can now win (e.g. the winner reloaded).
+    expect((await authorize('clientB', 'tok-2')).authorized).toBe(true);
+    expect((await authorize('clientA', 'tok-2')).authorized).toBe(false);
+  });
+});
+
 describe('agent IPC: sub-agent channels', () => {
   it('returns the active sub-agent id list from agent:sub-agent-list', async () => {
     const harness = await createIpcHarness({
