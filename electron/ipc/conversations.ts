@@ -85,6 +85,14 @@ function stripBase64FromPart(part: unknown, depth = 0): unknown {
     const v = out[k];
     if (typeof v === 'string' && v.length > 256) out[k] = '[omitted-in-broadcast]';
   }
+  // UI-only pre-compaction backups: `originalResult`/`originalContent` hold the FULL oversized text
+  // that tool compaction shrank (kept so the renderer can "view original"). It's multi-MiB by
+  // definition and never needed from an upsert (re-fetched via conversations:get), so cap it too —
+  // otherwise a compacted tool result still blows the remote frame limit.
+  for (const k of ['originalResult', 'originalContent']) {
+    const v = out[k];
+    if (typeof v === 'string' && v.length > 4096) out[k] = '[omitted-in-broadcast]';
+  }
   // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
   if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
   // Recurse into nested containers that can hold media (tool-result payloads, compaction backups,
@@ -103,14 +111,23 @@ function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
           if (!n || typeof n !== 'object') return n;
           const m = n as Record<string, unknown>;
           if (!Array.isArray(m.content)) return n;
-          return { ...m, content: (m.content as unknown[]).map(stripBase64FromPart) };
+          return { ...m, content: (m.content as unknown[]).map((p) => stripBase64FromPart(p)) };
         })
       : nodes;
-  return {
+  const out: ConversationRecord = {
     ...conv,
     ...(conv.messageTree !== undefined ? { messageTree: stripTree(conv.messageTree) as unknown[] } : {}),
     ...(Array.isArray(conv.messages) ? { messages: stripTree(conv.messages) as unknown[] } : {}),
   };
+  // pendingDrafts is a PRIVATE per-conversation stash (the /compact-busy rollback drafts, with
+  // possibly multi-MiB attachments) managed exclusively via conversations:set-pending-drafts /
+  // claim-pending-draft — no client uses it from an upsert broadcast, and its attachments would
+  // blow the remote frame cap. Omit it from the broadcast entirely (each client hydrates it from
+  // its own conversations:get / delta channel).
+  if ((out as { pendingDrafts?: unknown }).pendingDrafts !== undefined) {
+    delete (out as { pendingDrafts?: unknown }).pendingDrafts;
+  }
+  return out;
 }
 
 function broadcastChange(change: ConversationChange): void {
@@ -1273,14 +1290,22 @@ export function registerConversationHandlers(
     },
   );
 
-  // ATOMICALLY claim (remove-and-return) ONE pending draft on main, so that when multiple clients
-  // have hydrated the same durable pendingDrafts and each tries to restore it, only ONE client
-  // wins — the others get `draft: null` and don't populate a duplicate composer. `id` claims that
-  // specific draft; omitting it claims the OLDEST. The remove happens under main's single-threaded
-  // read-modify-write, so two concurrent claims for the same id can't both succeed.
+  // Soft-RESERVE + return ONE pending draft on main (lease+ACK), so that when multiple clients have
+  // hydrated the same durable pendingDrafts, only ONE restores it. Unlike a remove-and-return, the
+  // draft is NOT deleted here — it's marked claimedBy/claimedAt and RETAINED, so a renderer that
+  // crashes/reloads between claiming and restoring does NOT lose the input (the reservation expires
+  // and the draft is re-claimable). The renderer sends conversations:ack-pending-draft after it
+  // actually restores (→ hard-remove) or fails (→ release the reservation). `id` reserves that
+  // specific draft; omitting it reserves the OLDEST unreserved one.
+  const DRAFT_RESERVATION_TTL_MS = 30_000;
+  const isLiveReservation = (d: { claimedAt?: unknown; claimedBy?: unknown }, byClient?: string): boolean => {
+    if (typeof d?.claimedBy !== 'string' || typeof d?.claimedAt !== 'number') return false;
+    if (Date.now() - d.claimedAt > DRAFT_RESERVATION_TTL_MS) return false; // expired → not live
+    return byClient ? d.claimedBy !== byClient : true; // "reserved by ANOTHER client" when byClient given
+  };
   ipcMain.handle(
     'conversations:claim-pending-draft',
-    (_event, conversationId: string, id?: string) => {
+    (_event, conversationId: string, id?: string, clientId?: string) => {
       if (typeof conversationId !== 'string' || !conversationId) return { ok: false, draft: null };
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, draft: null };
@@ -1289,13 +1314,17 @@ export function registerConversationHandlers(
         text?: unknown;
         attachments?: unknown;
         stashedAt?: unknown;
+        claimedAt?: unknown;
+        claimedBy?: unknown;
       }>;
       if (!Array.isArray(existing) || existing.length === 0) return { ok: true, draft: null };
+      // Reserve a SPECIFIC id (only if not live-reserved by another client), or the OLDEST draft
+      // that is not currently live-reserved by another client.
       const idx =
         typeof id === 'string' && id.length > 0
-          ? existing.findIndex((d) => String(d?.id) === id)
-          : 0; // oldest (front)
-      if (idx === -1) return { ok: true, draft: null }; // already claimed by another client
+          ? existing.findIndex((d) => String(d?.id) === id && !isLiveReservation(d, clientId))
+          : existing.findIndex((d) => !isLiveReservation(d, clientId));
+      if (idx === -1) return { ok: true, draft: null }; // reserved by another client / gone
       const claimedRaw = existing[idx];
       const claimed = {
         id: typeof claimedRaw?.id === 'string' ? claimedRaw.id : '',
@@ -1303,12 +1332,58 @@ export function registerConversationHandlers(
         attachments: Array.isArray(claimedRaw?.attachments) ? (claimedRaw.attachments as unknown[]) : [],
         stashedAt: typeof claimedRaw?.stashedAt === 'number' ? claimedRaw.stashedAt : Date.now(),
       };
-      const remaining = existing.filter((_, i) => i !== idx);
+      // RETAIN the draft, stamping the reservation (NOT a remove). A crash before ack leaves it on
+      // disk; the reservation expires and it becomes re-claimable.
+      const next = existing.map((d, i) =>
+        i === idx ? { ...d, claimedAt: Date.now(), claimedBy: typeof clientId === 'string' ? clientId : 'unknown' } : d,
+      );
       const updated: ConversationRecord = { ...conv };
-      if (remaining.length === 0) delete (updated as { pendingDrafts?: unknown }).pendingDrafts;
-      else (updated as { pendingDrafts?: unknown }).pendingDrafts = remaining;
+      (updated as { pendingDrafts?: unknown }).pendingDrafts = next;
       writeConversation(appHome, updated);
       return { ok: true, draft: claimed };
+    },
+  );
+
+  // ACK a prior claim: `restored: true` HARD-REMOVES the draft (it reached the composer);
+  // `restored: false` RELEASES the reservation (restore failed / bailed) so it's re-claimable now
+  // rather than after the TTL. Only affects a draft this client currently reserves.
+  ipcMain.handle(
+    'conversations:ack-pending-draft',
+    (_event, conversationId: string, id: string, restored: boolean, clientId?: string) => {
+      if (typeof conversationId !== 'string' || !conversationId || typeof id !== 'string' || !id) {
+        return { ok: false };
+      }
+      const conv = readConversation(appHome, conversationId);
+      if (!conv) return { ok: false };
+      const existing = ((conv as { pendingDrafts?: unknown }).pendingDrafts ?? []) as Array<{
+        id?: unknown;
+        claimedBy?: unknown;
+      }>;
+      if (!Array.isArray(existing) || existing.length === 0) return { ok: true };
+      const idx = existing.findIndex((d) => String(d?.id) === id);
+      if (idx === -1) return { ok: true }; // already gone
+      // Guard: only the reserving client may ack (a stale ack from another client is ignored).
+      const holder = existing[idx].claimedBy;
+      if (typeof clientId === 'string' && typeof holder === 'string' && holder !== clientId) {
+        return { ok: true };
+      }
+      let next: unknown[];
+      if (restored) {
+        next = existing.filter((_, i) => i !== idx); // hard-remove — it reached the composer
+      } else {
+        next = existing.map((d, i) => {
+          if (i !== idx) return d;
+          const rest = { ...(d as Record<string, unknown>) };
+          delete rest.claimedAt;
+          delete rest.claimedBy; // release the reservation for re-claim
+          return rest;
+        });
+      }
+      const updated: ConversationRecord = { ...conv };
+      if (next.length === 0) delete (updated as { pendingDrafts?: unknown }).pendingDrafts;
+      else (updated as { pendingDrafts?: unknown }).pendingDrafts = next;
+      writeConversation(appHome, updated);
+      return { ok: true };
     },
   );
 

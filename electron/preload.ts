@@ -168,12 +168,17 @@ const appAPI = {
       ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
         ok: boolean;
       }>,
-    // Atomic single-draft claim (remove-and-return) so only one of several clients that hydrated
-    // the same pendingDrafts restores a given draft. `draft: null` means already claimed / none.
-    claimPendingDraft: (conversationId: string, id?: string) =>
-      ipcRenderer.invoke('conversations:claim-pending-draft', conversationId, id) as Promise<{
+    // Soft-reserve + return one draft (lease+ACK): the draft is RETAINED (marked reserved), so a
+    // crash before ack doesn't lose it. `draft: null` means reserved by another client / none.
+    claimPendingDraft: (conversationId: string, id?: string, clientId?: string) =>
+      ipcRenderer.invoke('conversations:claim-pending-draft', conversationId, id, clientId) as Promise<{
         ok: boolean;
         draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null;
+      }>,
+    // ACK a claim: restored=true hard-removes the draft; restored=false releases the reservation.
+    ackPendingDraft: (conversationId: string, id: string, restored: boolean, clientId?: string) =>
+      ipcRenderer.invoke('conversations:ack-pending-draft', conversationId, id, restored, clientId) as Promise<{
+        ok: boolean;
       }>,
     // Cross-client /compact busy sync: current compacting set + change subscription.
     compactingIds: () => ipcRenderer.invoke('conversations:compacting-ids') as Promise<string[]>,

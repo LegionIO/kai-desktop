@@ -391,11 +391,24 @@ let serverPersistAppHome: string | null = null;
 // (or a granted continuation, which starts a NEW token) is independently authorizable, so a
 // reloaded winner can keep continuing across successive max-turns hits. No heartbeat/liveness is
 // needed: a crashed/reloaded winner simply isn't the one asking for the NEXT turn's authorization.
-const continuationAuthByConv = new Map<string, { turnToken: string; clientId: string }>();
+const continuationAuthByConv = new Map<string, { turnToken: string; clientId: string; grantedAt: number }>();
 const CONTINUATION_AUTH_MAX = 500; // bound the map (evict oldest) — conversations touched are few
-// Grant iff no client has been authorized for THIS conversation+turnToken yet, or this same client
-// already holds it. A request for a DIFFERENT (newer) turnToken resets the record (new turn). Deny
-// only when a DIFFERENT client already won this exact turn.
+// A grant is abandoned if its holder never launches within this window (crashed/reloaded after
+// authorization but before the continuation started). After it, another client (including the
+// reloaded one with a fresh clientId) may win the same turn — so a crash can't wedge continuation.
+const CONTINUATION_AUTH_STALE_MS = 20_000;
+// Stream tokens are `${Date.now()}-${random}`; parse the ms prefix to compare turn recency. A
+// higher prefix = a newer turn. Unparseable → 0 (treated as oldest, so a well-formed token wins).
+function turnTokenTime(token: string): number {
+  const dash = token.indexOf('-');
+  const n = Number.parseInt(dash > 0 ? token.slice(0, dash) : token, 10);
+  return Number.isFinite(n) ? n : 0;
+}
+// Grant iff: no record, OR this client already holds THIS turn, OR the incoming turn is strictly
+// NEWER than the recorded one (a new turn supersedes), OR the recorded grant is STALE (holder never
+// launched). CRUCIALLY, a request for an OLDER turn than the recorded one is DENIED and does NOT
+// overwrite the record — otherwise a delayed request for turn A could revoke turn B's live winner
+// and let a second client also drive B (duplicate continuations).
 function authorizeContinuation(conversationId: string, clientId: string, turnToken: string): boolean {
   if (
     typeof conversationId !== 'string' || !conversationId ||
@@ -404,12 +417,24 @@ function authorizeContinuation(conversationId: string, clientId: string, turnTok
   ) {
     return false;
   }
+  const now = Date.now();
   const existing = continuationAuthByConv.get(conversationId);
-  if (existing && existing.turnToken === turnToken && existing.clientId !== clientId) {
-    return false; // a different client already won this exact turn's continuation
+  if (existing && existing.turnToken === turnToken) {
+    // Same turn: only the holder may (re)win it, unless the grant went stale (holder gone).
+    if (existing.clientId !== clientId && now - existing.grantedAt <= CONTINUATION_AUTH_STALE_MS) {
+      return false;
+    }
+  } else if (existing) {
+    // Different turn. Reject a request for an OLDER turn (a delayed/stale request must not revoke a
+    // newer live winner). A strictly-newer turn supersedes; an equal-time-but-different token
+    // (clock tie) is allowed through only if the prior grant is stale.
+    const incomingNewer = turnTokenTime(turnToken) > turnTokenTime(existing.turnToken);
+    if (!incomingNewer && now - existing.grantedAt <= CONTINUATION_AUTH_STALE_MS) {
+      return false;
+    }
   }
   continuationAuthByConv.delete(conversationId); // re-insert at back so ordering reflects recency
-  continuationAuthByConv.set(conversationId, { turnToken, clientId });
+  continuationAuthByConv.set(conversationId, { turnToken, clientId, grantedAt: now });
   while (continuationAuthByConv.size > CONTINUATION_AUTH_MAX) {
     const oldest = continuationAuthByConv.keys().next().value as string | undefined;
     if (oldest === undefined) break;
@@ -681,21 +706,67 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
   // REMOTE clients (web WS 4 MiB / CLI local-bridge 8 MiB frame caps) can't take the full
-  // pre-compaction `originalContent` a tool-compaction event carries (it's the OVERSIZED text that
-  // triggered compaction — up to many MiB). Sending it over-frame disconnects the socket. Local
-  // Electron windows have no frame cap and keep the full text (for the "view original" affordance);
-  // a remote client that needs the original re-fetches the persisted record via conversations:get.
-  // Cap only for the remote payload, leaving the local broadcast above untouched.
-  let remoteEvent = eventToBroadcast;
-  if (
-    (eventToBroadcast as { type?: string }).type === 'tool-compaction' &&
-    typeof (eventToBroadcast as { data?: { originalContent?: unknown } }).data?.originalContent === 'string' &&
-    ((eventToBroadcast as { data: { originalContent: string } }).data.originalContent.length > 4096)
-  ) {
-    const ev = eventToBroadcast as { data: Record<string, unknown> };
-    remoteEvent = { ...ev, data: { ...ev.data, originalContent: '[omitted-in-broadcast]' } } as StreamEvent;
+  // pre-compaction `originalContent` that tool-compaction/tool-result events carry (the OVERSIZED
+  // text that triggered compaction — up to many MiB), nor large nested `_modelContent` media in a
+  // tool result. Sending over-frame disconnects the socket. Local Electron windows have no frame
+  // cap and keep the full payload (for the "view original" affordance); a remote client re-fetches
+  // the persisted record via conversations:get. Cap only the remote payload.
+  broadcastToWebClients('agent:stream-event', capRemoteStreamEvent(eventToBroadcast));
+}
+
+// Cap the oversized fields of a stream event for the remote (frame-capped) fan-out. Returns the
+// event unchanged when nothing needs capping (the common case), else a shallow-cloned copy with:
+//  - tool-compaction: data.originalContent replaced when large;
+//  - tool-result: compaction.originalContent replaced when large, and the result payload's nested
+//    base64/_modelContent stripped (bounded recursion) so a media-heavy result can't exceed a frame.
+const REMOTE_ORIGINAL_CAP = 4096;
+function capRemoteStreamEvent(event: StreamEvent): StreamEvent {
+  const type = (event as { type?: string }).type;
+  if (type === 'tool-compaction') {
+    const data = (event as { data?: { originalContent?: unknown } }).data;
+    if (typeof data?.originalContent === 'string' && data.originalContent.length > REMOTE_ORIGINAL_CAP) {
+      const ev = event as { data: Record<string, unknown> };
+      return { ...ev, data: { ...ev.data, originalContent: '[omitted-in-broadcast]' } } as StreamEvent;
+    }
+    return event;
   }
-  broadcastToWebClients('agent:stream-event', remoteEvent);
+  if (type === 'tool-result') {
+    const e = event as {
+      compaction?: { originalContent?: unknown };
+      result?: unknown;
+    };
+    const bigOriginal =
+      typeof e.compaction?.originalContent === 'string' && e.compaction.originalContent.length > REMOTE_ORIGINAL_CAP;
+    const hasResult = e.result !== undefined && e.result !== null;
+    if (!bigOriginal && !hasResult) return event;
+    const out: Record<string, unknown> = { ...(event as Record<string, unknown>) };
+    if (bigOriginal) {
+      out.compaction = { ...(e.compaction as object), originalContent: '[omitted-in-broadcast]' };
+    }
+    if (hasResult) out.result = stripRemoteMediaDeep(e.result);
+    return out as StreamEvent;
+  }
+  return event;
+}
+// Bounded recursive strip of base64/_modelContent from a tool-result payload for remote fan-out.
+const REMOTE_STRIP_MAX_DEPTH = 8;
+function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
+  if (Array.isArray(value)) {
+    return depth >= REMOTE_STRIP_MAX_DEPTH ? value : value.map((v) => stripRemoteMediaDeep(v, depth + 1));
+  }
+  if (!value || typeof value !== 'object') return value;
+  const src = value as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...src };
+  for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
+    if (typeof out[k] === 'string' && (out[k] as string).length > 256) out[k] = '[omitted-in-broadcast]';
+  }
+  if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
+  if (depth < REMOTE_STRIP_MAX_DEPTH) {
+    for (const [k, v] of Object.entries(out)) {
+      if (v && typeof v === 'object') out[k] = stripRemoteMediaDeep(v, depth + 1);
+    }
+  }
+  return out;
 }
 
 /**
@@ -713,7 +784,11 @@ async function gateTitleGenerationMessages(
   modelKey?: string,
   systemPrompt: string = '',
 ): Promise<{ suppressed: boolean; messages: unknown[]; systemPrompt?: string }> {
-  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey, systemPrompt);
+  // NB: gateMessagesThroughUserPromptSubmit takes (…, modelKey, purpose, systemPrompt). Pass the
+  // purpose explicitly so the title systemPrompt lands in the SIXTH arg — passing it as the fifth
+  // would put it in `purpose` and leave the gate's systemPrompt empty (DLP hooks then see no
+  // system prompt, and a system-prompt-conditioned rule could wrongly pass).
+  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey, 'title-generation', systemPrompt);
 }
 
 /**

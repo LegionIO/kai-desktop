@@ -1183,12 +1183,17 @@ export function deleteConversation(appHome: string, id: string): boolean {
   // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
   tombstoneConversation(id);
   const index = readIndex(appHome);
-  if (index.conversations[id]) {
+  const hadEntry = Boolean(index.conversations[id]);
+  if (hadEntry) {
     delete index.conversations[id];
     if (index.activeConversationId === id) index.activeConversationId = null;
-    pushDurableDeletedId(index, id);
-    writeIndex(appHome, index);
   }
+  // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was already
+  // absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone and a
+  // stale client could resurrect the just-deleted conversation. Write whenever anything changed.
+  const before = index.deletedIds?.length ?? 0;
+  pushDurableDeletedId(index, id);
+  if (hadEntry || (index.deletedIds?.length ?? 0) !== before) writeIndex(appHome, index);
   return true;
 }
 
@@ -1199,6 +1204,7 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   assertMigratedBeforeWrite(appHome);
   const index = readIndex(appHome);
   const removed: string[] = [];
+  let tombstoned = 0;
   for (const id of ids) {
     // Only drop the index entry once the data file is GONE (removed now, or already
     // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
@@ -1212,17 +1218,19 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     } catch {
       fileGone = false; // removal failed — retain the index entry
     }
-    if (fileGone && index.conversations[id]) {
+    if (!fileGone) continue;
+    if (index.conversations[id]) {
       delete index.conversations[id];
       if (index.activeConversationId === id) index.activeConversationId = null;
-      // Tombstone so a stale in-flight persist can't resurrect this just-deleted id (in-memory
-      // fast path + durable index ring for restart/TTL survival).
-      tombstoneConversation(id);
-      pushDurableDeletedId(index, id);
-      removed.push(id);
+      removed.push(id); // return value: ids that had an index entry removed
     }
+    // Tombstone once the file is gone — in-memory fast path + DURABLE index ring — even if the
+    // index entry was already absent (rebuilt/corrupt index), so a restart can't resurrect it.
+    tombstoneConversation(id);
+    pushDurableDeletedId(index, id);
+    tombstoned += 1;
   }
-  if (removed.length > 0) writeIndex(appHome, index);
+  if (removed.length > 0 || tombstoned > 0) writeIndex(appHome, index);
   return removed;
 }
 

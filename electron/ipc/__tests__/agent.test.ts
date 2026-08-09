@@ -310,16 +310,22 @@ describe('agent IPC: continuation authorization (single driver per turn)', () =>
     });
     const authorize = (clientId: string, turnToken: string) =>
       harness.invoke<{ authorized: boolean }>('agent:authorize-continuation', FAKE_EVENT, 'conv-auth', clientId, turnToken);
+    // Realistic stream tokens are `${Date.now()}-${rand}`; recency is compared by the ms prefix.
+    const tok1 = '1000000000000-aaaa';
+    const tok2 = '2000000000000-bbbb'; // strictly newer turn
 
     // First client wins this turn.
-    expect((await authorize('clientA', 'tok-1')).authorized).toBe(true);
+    expect((await authorize('clientA', tok1)).authorized).toBe(true);
     // A different client is DENIED for the same turn (no double-drive).
-    expect((await authorize('clientB', 'tok-1')).authorized).toBe(false);
+    expect((await authorize('clientB', tok1)).authorized).toBe(false);
     // The winner re-asking for the same turn is idempotently still authorized.
-    expect((await authorize('clientA', 'tok-1')).authorized).toBe(true);
-    // A NEW turn token resets — a different client can now win (e.g. the winner reloaded).
-    expect((await authorize('clientB', 'tok-2')).authorized).toBe(true);
-    expect((await authorize('clientA', 'tok-2')).authorized).toBe(false);
+    expect((await authorize('clientA', tok1)).authorized).toBe(true);
+    // A strictly NEWER turn supersedes — a different client can win it (e.g. the winner reloaded).
+    expect((await authorize('clientB', tok2)).authorized).toBe(true);
+    // Same (new) turn, other client → denied (single driver).
+    expect((await authorize('clientA', tok2)).authorized).toBe(false);
+    // A DELAYED request for the OLDER turn must NOT revoke the newer turn's winner.
+    expect((await authorize('clientA', tok1)).authorized).toBe(false);
   });
 });
 

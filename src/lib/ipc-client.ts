@@ -155,7 +155,14 @@ type AppAPI = {
     claimPendingDraft: (
       conversationId: string,
       id?: string,
+      clientId?: string,
     ) => Promise<{ ok: boolean; draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null }>;
+    ackPendingDraft: (
+      conversationId: string,
+      id: string,
+      restored: boolean,
+      clientId?: string,
+    ) => Promise<{ ok: boolean }>;
     compactingIds: () => Promise<string[]>;
     onCompactingChanged: (
       callback: (payload: { conversationId: string; compacting: boolean }) => void,

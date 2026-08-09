@@ -1007,6 +1007,15 @@ function dropRejectedDraftLocal(convId: string, id: string): void {
   if (next.length === 0) rejectedDrafts.delete(convId);
   else rejectedDrafts.set(convId, next);
 }
+// Re-add an entry to the LOCAL in-memory queue only (front, deduped) — NO durable delta. Used when
+// a lease-claimed draft failed to restore: the ack(restored=false) already left it on disk, so a
+// durable re-add would duplicate the on-disk copy; we only need it back in this session's queue.
+function requeueRejectedDraftLocalOnly(convId: string, entry: RejectedDraft): void {
+  if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  const q = rejectedDrafts.get(convId) ?? [];
+  if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  rejectedDrafts.set(convId, q);
+}
 // ATOMICALLY claim the oldest pending draft on MAIN and restore it into the composer — but only if
 // THIS client won the claim. When several clients hydrated the same durable pendingDrafts, main's
 // single-threaded remove-and-return guarantees exactly one `draft !== null`, so the others don't
@@ -1023,7 +1032,7 @@ async function claimAndRestoreDraft(
   const id = peekOldestRejectedDraftId(convId);
   if (!id) return;
   try {
-    const res = await app.conversations.claimPendingDraft?.(convId, id);
+    const res = await app.conversations.claimPendingDraft?.(convId, id, CONTINUATION_CLIENT_ID);
     if (res === undefined) {
       // IPC not present (older bridge) — fall back to the local-only path. Requeue on a false ack.
       const local = dequeueRejectedDraft(convId);
@@ -1038,11 +1047,20 @@ async function claimAndRestoreDraft(
         stashedAt: res.draft.stashedAt,
       };
       dropRejectedDraftLocal(convId, d.id);
-      // If restore bailed, the draft is already gone from disk (main removed it) — REQUEUE it so
-      // it survives (durable re-add + local) rather than vanishing.
-      if (!restore(d)) enqueueRejectedDraftEntry(convId, d);
+      // Lease+ACK: the draft is still RETAINED on disk (reserved, not removed) — so a crash between
+      // here and the ack does NOT lose it (the reservation expires → re-claimable). ACK the
+      // outcome: restored=true hard-removes it; restored=false releases the reservation AND we
+      // requeue locally so this session retries it. (ack is best-effort; a lost ack just leaves the
+      // reservation to expire, after which the draft is re-claimable — never lost.)
+      const applied = restore(d);
+      void app.conversations.ackPendingDraft?.(convId, d.id, applied, CONTINUATION_CLIENT_ID).catch(() => {});
+      // On a failed restore the ack(false) released the reservation → the draft is STILL on disk
+      // (unreserved), so re-add it to the LOCAL queue only (no durable delta — that would duplicate
+      // the on-disk copy) so this session retries it on a later tick.
+      if (!applied) requeueRejectedDraftLocalOnly(convId, d);
     } else {
-      // Another client claimed it (or it's gone) — reconcile our local mirror, restore nothing.
+      // Reserved by another client (or gone) — reconcile our local mirror, restore nothing. Do NOT
+      // drop it durably (another client holds the reservation and will ack it).
       dropRejectedDraftLocal(convId, id);
     }
   } catch {
@@ -2555,7 +2573,7 @@ export function RuntimeProvider({
                   reasoningEffort: conv.reasoningEffort ?? undefined,
                   selectedProfileKey: conv.selectedProfileKey ?? null,
                   fallbackEnabled: conv.fallbackEnabled ?? false,
-                  cwd: null,
+                  cwd: conv.currentWorkingDirectory ?? null,
                   executionMode: conv.executionMode ?? undefined,
                   threadOverrides: {
                     temperature: conv.temperature ?? null,
@@ -3410,6 +3428,16 @@ export function RuntimeProvider({
             acc.runGeneration = evGen;
             acc.locallyOriginated = false;
             acc.pendingAssistantId = (e as { responseMessageId?: string }).responseMessageId ?? acc.pendingAssistantId;
+            // RESET run-specific state carried over from the SUPERSEDED run — this accumulator now
+            // mirrors a DIFFERENT run. Leaving the old runConfig / pendingCompaction / seed
+            // provenance would, if this mirror later won continuation authorization, restart with
+            // the wrong model/CWD or persist an unrelated compaction record. Timing is refreshed on
+            // the next event; the branch is reconciled from disk at this run's terminal.
+            acc.runConfig = undefined;
+            acc.pendingCompaction = undefined;
+            acc.seededBackground = undefined;
+            acc.seededDiskHeadId = undefined;
+            acc.awaitingApproval = undefined;
             traceRuntime('stream.supersede-adopt-mirror', convId, { newGeneration: evGen });
             // fall through — render the new turn's user-message + subsequent events as a mirror
           } else {
@@ -4374,6 +4402,13 @@ export function RuntimeProvider({
             clearTimeout(_ptAuto);
             persistTimersRef.current.delete(convId);
           }
+          // NOTE (known narrow limitation): if this client is a MIRROR (e.g. a sole renderer that
+          // reloaded mid-turn) AND this done carries a plan-restart signal, the mandatory plan
+          // restart is NOT driven here — a mirror must not persist/finalize, and safely reusing the
+          // originator plan-restart machinery from a mirror would require reseeding it as a driver
+          // mid-terminal (deferred: high-risk vs. the payoff). The reply itself is preserved by
+          // main's GUI persistence fallback; the user sees the plan and can manually continue. A
+          // LIVE originating client (the common case) still drives the restart via the block below.
           streamAccumulators.delete(convId);
           traceRuntime('stream.authoritative-done', convId, {
             eventAutomation: Boolean(e.automation),

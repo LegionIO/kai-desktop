@@ -457,6 +457,54 @@ describe('conversations IPC: pending-draft claim (atomic single-winner)', () => 
     );
     expect(remaining.draft?.id).toBe('new');
   });
+
+  it('claim RETAINS the draft (lease+ack): a claim without ack leaves it re-claimable by its holder', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('lease1', {}));
+    await harness.invoke('conversations:set-pending-drafts', FAKE_EVENT, 'lease1', {
+      add: [{ id: 'd', text: 'unsent', attachments: [], stashedAt: 1 }],
+      removeIds: [],
+    });
+    // Client A reserves it (retained on disk, not removed).
+    const a = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'A');
+    expect(a.draft?.id).toBe('d');
+    // Another client B is denied while A's reservation is live.
+    const b = await harness.invoke<{ draft: unknown }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'B');
+    expect(b.draft).toBeNull();
+    // A's OWN re-claim is allowed (idempotent for the holder) — proving the draft is still on disk.
+    const a2 = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'A');
+    expect(a2.draft?.id).toBe('d');
+  });
+
+  it('ack(restored=true) hard-removes the draft; ack(restored=false) releases it for re-claim', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('lease2', {}));
+    await harness.invoke('conversations:set-pending-drafts', FAKE_EVENT, 'lease2', {
+      add: [
+        { id: 'd1', text: 'first', attachments: [], stashedAt: 1 },
+        { id: 'd2', text: 'second', attachments: [], stashedAt: 2 },
+      ],
+      removeIds: [],
+    });
+    // Reserve + ack(false) → released, so a fresh claim by another client succeeds.
+    await harness.invoke('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd1', 'A');
+    await harness.invoke('conversations:ack-pending-draft', FAKE_EVENT, 'lease2', 'd1', false, 'A');
+    const reclaim = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd1', 'B');
+    expect(reclaim.draft?.id).toBe('d1');
+    // Reserve + ack(true) → hard-removed; a later claim of that id returns null.
+    await harness.invoke('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd2', 'A');
+    await harness.invoke('conversations:ack-pending-draft', FAKE_EVENT, 'lease2', 'd2', true, 'A');
+    const gone = await harness.invoke<{ draft: unknown }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd2', 'C');
+    expect(gone.draft).toBeNull();
+  });
 });
 
 describe('conversations IPC: error paths', () => {

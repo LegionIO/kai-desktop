@@ -1099,6 +1099,13 @@ async function aiExtractRelevantInfo(
   if (abortSignal?.aborted) return null;
   if (outstandingToolExtractions >= MAX_OUTSTANDING_TOOL_EXTRACTIONS) return null; // fall back to truncation
   outstandingToolExtractions += 1;
+  let slotReleased = false;
+  const releaseSlot = () => {
+    if (!slotReleased) {
+      slotReleased = true;
+      outstandingToolExtractions -= 1;
+    }
+  };
   try {
     const { Agent } = await import('@mastra/core/agent');
     type AgentConfig = ConstructorParameters<typeof Agent>[0];
@@ -1111,7 +1118,7 @@ async function aiExtractRelevantInfo(
       content,
     ].join('\n');
 
-    const gen = await auxAgentGenerate(
+    const genPromise = auxAgentGenerate(
       (model) =>
         new Agent({
           id: `tool-compact-${Date.now()}`,
@@ -1124,11 +1131,41 @@ async function aiExtractRelevantInfo(
       { maxSteps: 1, ...(abortSignal ? { abortSignal } : {}) },
       { primaryModelConfig: modelConfig, label: 'tool-compaction' },
     );
+    // Hold the concurrency slot until the underlying generate ACTUALLY settles (so a provider that
+    // ignores abortSignal still counts against the cap — it can't let us start unbounded requests),
+    // but RELEASE it on settle regardless of whether we're still awaiting.
+    void genPromise.then(releaseSlot, releaseSlot);
+
+    // RACE the generate against abort: if the turn is Stopped and the provider ignores the signal,
+    // the caller must not block on a hung request (it would pin the large tool output). On abort we
+    // return null (→ caller falls back to truncation); the slot stays held until genPromise settles.
+    if (abortSignal) {
+      const aborted = await new Promise<'aborted' | { text: string } | null>((resolve) => {
+        const onAbort = () => resolve('aborted');
+        if (abortSignal.aborted) return resolve('aborted');
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+        void genPromise.then(
+          (r) => {
+            abortSignal.removeEventListener('abort', onAbort);
+            resolve(r);
+          },
+          () => {
+            abortSignal.removeEventListener('abort', onAbort);
+            resolve(null);
+          },
+        );
+      });
+      if (aborted === 'aborted' || !aborted) return null;
+      return aborted.text.trim() || null;
+    }
+    const gen = await genPromise;
     return gen ? gen.text.trim() || null : null;
   } catch {
     return null;
   } finally {
-    outstandingToolExtractions -= 1;
+    // If we returned WITHOUT racing (no signal / sync throw before genPromise), release here. When
+    // we raced, the slot is released by the genPromise.then above when the request truly settles.
+    if (!abortSignal) releaseSlot();
   }
 }
 
