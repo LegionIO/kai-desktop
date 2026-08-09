@@ -1247,6 +1247,44 @@ export function registerConversationHandlers(
     },
   );
 
+  // ATOMICALLY claim (remove-and-return) ONE pending draft on main, so that when multiple clients
+  // have hydrated the same durable pendingDrafts and each tries to restore it, only ONE client
+  // wins — the others get `draft: null` and don't populate a duplicate composer. `id` claims that
+  // specific draft; omitting it claims the OLDEST. The remove happens under main's single-threaded
+  // read-modify-write, so two concurrent claims for the same id can't both succeed.
+  ipcMain.handle(
+    'conversations:claim-pending-draft',
+    (_event, conversationId: string, id?: string) => {
+      if (typeof conversationId !== 'string' || !conversationId) return { ok: false, draft: null };
+      const conv = readConversation(appHome, conversationId);
+      if (!conv) return { ok: false, draft: null };
+      const existing = ((conv as { pendingDrafts?: unknown }).pendingDrafts ?? []) as Array<{
+        id?: unknown;
+        text?: unknown;
+        attachments?: unknown;
+        stashedAt?: unknown;
+      }>;
+      if (!Array.isArray(existing) || existing.length === 0) return { ok: true, draft: null };
+      const idx =
+        typeof id === 'string' && id.length > 0
+          ? existing.findIndex((d) => String(d?.id) === id)
+          : 0; // oldest (front)
+      if (idx === -1) return { ok: true, draft: null }; // already claimed by another client
+      const claimedRaw = existing[idx];
+      const claimed = {
+        id: typeof claimedRaw?.id === 'string' ? claimedRaw.id : '',
+        text: typeof claimedRaw?.text === 'string' ? claimedRaw.text : '',
+        attachments: Array.isArray(claimedRaw?.attachments) ? (claimedRaw.attachments as unknown[]) : [],
+        stashedAt: typeof claimedRaw?.stashedAt === 'number' ? claimedRaw.stashedAt : Date.now(),
+      };
+      const remaining = existing.filter((_, i) => i !== idx);
+      const updated: ConversationRecord = { ...conv };
+      if (remaining.length === 0) delete (updated as { pendingDrafts?: unknown }).pendingDrafts;
+      else (updated as { pendingDrafts?: unknown }).pendingDrafts = remaining;
+      writeConversation(appHome, updated);
+      return { ok: true, draft: claimed };
+    },
+  );
 
   // prefix and PERSISTS the compaction record (conversationCompaction) so the
   // next turn reuses it — matching the metadata-only, non-destructive design of

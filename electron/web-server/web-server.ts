@@ -400,6 +400,8 @@ export function getBridgeScript(): string {
       stream: function(cId, msgs, mk, re, pk, fb, cwd, em, to, rid) { return invoke('agent:stream', cId, msgs, mk, re, pk, fb, cwd, em, to, rid); },
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
       inFlight: function(cId) { return invoke('agent:in-flight', cId); },
+      continuationHeartbeat: function(clientId) { return invoke('agent:continuation-heartbeat', clientId); },
+      acquireContinuationLease: function(cId, clientId) { return invoke('agent:acquire-continuation-lease', cId, clientId); },
       injectMidTurn: function(cId, text) { return invoke('agent:inject-mid-turn', cId, text); },
       listInjects: function(cId) { return invoke('agent:list-injects', cId); },
       cancelInject: function(cId, id) { return invoke('agent:cancel-inject', cId, id); },
@@ -429,6 +431,7 @@ export function getBridgeScript(): string {
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       compact: function(id) { return invoke('conversations:compact', id, { __timeoutMs: 300000 }); },
       setPendingDrafts: function(id, delta) { return invoke('conversations:set-pending-drafts', id, delta); },
+      claimPendingDraft: function(id, draftId) { return invoke('conversations:claim-pending-draft', id, draftId); },
       compactingIds: function() { return invoke('conversations:compacting-ids'); },
       onCompactingChanged: function(cb) { return on('conversations:compacting', cb); },
       onChanged: function(cb) { return on('conversations:changed', cb); }

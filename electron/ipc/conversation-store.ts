@@ -138,6 +138,13 @@ export type ConversationIndex = {
   conversations: Record<string, ConversationIndexEntry>;
   activeConversationId: string | null;
   settings: Record<string, unknown>;
+  // DURABLE deletion tombstones — a bounded, most-recent-last ring of ids that have been
+  // deleted. Survives process restart (unlike the in-memory recentlyDeletedConversations map),
+  // so a stale client that reconnects after a backend restart or after the in-memory TTL expired
+  // still cannot resurrect a deleted conversation via a create-shaped writeConversation. Bounded
+  // (DURABLE_DELETED_MAX) so it never grows unboundedly; the oldest ids age out, which is safe
+  // because a genuinely-stale persist for a long-ago-deleted id is not a realistic occurrence.
+  deletedIds?: string[];
 };
 
 // ── paths ────────────────────────────────────────────────────────────────────
@@ -286,6 +293,9 @@ export function readIndex(appHome: string): ConversationIndex {
       conversations: parsed.conversations ?? {},
       activeConversationId: parsed.activeConversationId ?? null,
       settings: parsed.settings ?? {},
+      deletedIds: Array.isArray(parsed.deletedIds)
+        ? parsed.deletedIds.filter((x): x is string => typeof x === 'string')
+        : [],
     };
   } catch {
     // Corrupt/truncated index — the per-file conversation records are the source
@@ -1068,6 +1078,26 @@ export function isRecentlyDeleted(id: string): boolean {
   return true;
 }
 
+// Bound on the DURABLE deleted-id ring persisted in the index. Larger than the in-memory cap
+// because it is the long-lived resurrection defense (survives restart / TTL expiry); a few
+// thousand ids is a trivial index-size cost. Oldest ids age out first (drop-front).
+const DURABLE_DELETED_MAX = 10_000;
+// Append an id to the index's durable deleted-id ring (dedup + drop-oldest). Mutates the passed
+// index in place; the caller is responsible for writeIndex. Idempotent for an id already present
+// (re-inserts at the back so it ages out last).
+function pushDurableDeletedId(index: ConversationIndex, id: string): void {
+  const list = Array.isArray(index.deletedIds) ? index.deletedIds : [];
+  const existing = list.indexOf(id);
+  if (existing !== -1) list.splice(existing, 1);
+  list.push(id);
+  while (list.length > DURABLE_DELETED_MAX) list.shift();
+  index.deletedIds = list;
+}
+// True iff the id is in the index's durable deleted ring — a restart/TTL-surviving tombstone.
+function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
+  return Array.isArray(index.deletedIds) && index.deletedIds.includes(id);
+}
+
 /**
  * Write one conversation file and update its index entry (single-file cost).
  * Returns the record actually written — which may be a SANITIZED/backfilled copy
@@ -1093,14 +1123,19 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
     /* best-effort — fall back to fresh backfill */
   }
   const sanitized = sanitizeConversationTree(conv, priorTree);
-  // Resurrection guard: if this id was RECENTLY DELETED and is not currently in the index,
-  // a stale in-flight persist is trying to recreate it. SKIP the write (return the record
-  // to the caller unchanged) rather than resurrect a deleted conversation with stale
-  // messages + run state. A conversation still present in the index (a normal update, or a
-  // legitimate recreate before the tombstone was set) writes normally.
+  // Resurrection guard: if this id was DELETED and is not currently in the index, a stale
+  // in-flight persist is trying to recreate it. SKIP the write (return the record to the caller
+  // unchanged) rather than resurrect a deleted conversation with stale messages + run state. Two
+  // tombstone sources: the in-memory TTL map (fast path, covers the common mid-flight delete) AND
+  // the DURABLE index ring (survives process restart / TTL expiry, so a client reconnecting long
+  // after the delete still can't resurrect it). A conversation still present in the index (a
+  // normal update, or a legitimate recreate before the tombstone was set) writes normally.
   if (isRecentlyDeleted(sanitized.id)) {
     const idx = readIndex(appHome);
     if (!idx.conversations[sanitized.id]) return sanitized;
+  } else {
+    const idx = readIndex(appHome);
+    if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) return sanitized;
   }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   const index = readIndex(appHome);
@@ -1133,6 +1168,7 @@ export function deleteConversation(appHome: string, id: string): boolean {
   if (index.conversations[id]) {
     delete index.conversations[id];
     if (index.activeConversationId === id) index.activeConversationId = null;
+    pushDurableDeletedId(index, id);
     writeIndex(appHome, index);
   }
   return true;
@@ -1161,8 +1197,10 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     if (fileGone && index.conversations[id]) {
       delete index.conversations[id];
       if (index.activeConversationId === id) index.activeConversationId = null;
-      // Tombstone so a stale in-flight persist can't resurrect this just-deleted id.
+      // Tombstone so a stale in-flight persist can't resurrect this just-deleted id (in-memory
+      // fast path + durable index ring for restart/TTL survival).
       tombstoneConversation(id);
+      pushDurableDeletedId(index, id);
       removed.push(id);
     }
   }
@@ -1176,7 +1214,8 @@ export function clearAllConversations(appHome: string): void {
   // Tombstone every id being cleared so a stale in-flight persist (a running stream, or a
   // trusted client that read a record before the clear) can't resurrect a wiped conversation.
   const priorIndex = readIndex(appHome);
-  for (const id of Object.keys(priorIndex.conversations)) tombstoneConversation(id);
+  const clearedIds = Object.keys(priorIndex.conversations);
+  for (const id of clearedIds) tombstoneConversation(id);
   const dir = conversationsDir(appHome);
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
@@ -1189,7 +1228,16 @@ export function clearAllConversations(appHome: string): void {
       }
     }
   }
-  writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: priorIndex.settings });
+  // Carry the durable deleted-id ring forward (preserving prior tombstones) and add every id we
+  // just cleared, so a stale client can't resurrect a wiped conversation after restart/TTL expiry.
+  const nextIndex: ConversationIndex = {
+    conversations: {},
+    activeConversationId: null,
+    settings: priorIndex.settings,
+    deletedIds: Array.isArray(priorIndex.deletedIds) ? [...priorIndex.deletedIds] : [],
+  };
+  for (const id of clearedIds) pushDurableDeletedId(nextIndex, id);
+  writeIndex(appHome, nextIndex);
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────

@@ -1057,6 +1057,23 @@ function truncateToTokenBudget(
     }
     out = content.slice(0, Math.max(0, head)) + marker + (tail > 0 ? content.slice(-tail) : '');
   }
+  // Final guard: the loop can exit (12-iteration cap, or the head/tail<=0 break returning the bare
+  // marker) with `out` STILL over budget — e.g. a validly-tiny outputMaxTokens smaller than the
+  // marker's own token cost. This result feeds a context reserve, so an oversize summary defeats
+  // it. Hard-truncate by characters against a conservative token->char bound (~1 token ceils to a
+  // few chars; estimateToolTokens over-counts, so shrinking chars monotonically reduces tokens)
+  // until it fits or nothing is left.
+  if (estimateToolTokens(out, modelName) > maxTokens) {
+    // Start from the marker (or `out` if it is already shorter) and shrink monotonically by
+    // characters until it fits or nothing is left. estimateToolTokens over-counts, so fewer
+    // chars never means more tokens; each step drops at least one char so this always terminates.
+    let capped = out.length > marker.length ? marker : out;
+    while (capped.length > 0 && estimateToolTokens(capped, modelName) > maxTokens) {
+      const next = Math.floor(capped.length * 0.7);
+      capped = capped.slice(0, next < capped.length ? next : capped.length - 1);
+    }
+    out = capped;
+  }
   return out;
 }
 

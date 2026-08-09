@@ -379,6 +379,54 @@ const serverPersistParents = new Map<string, string | null>();
 // reloaded/crashed), finalizes main's accumulator so the reply isn't lost. Cleared at terminal.
 const guiFallbackParents = new Map<string, string | null>();
 let serverPersistAppHome: string | null = null;
+
+// ── GUI continuation lease ────────────────────────────────────────────────────
+// A GUI turn's auto-continue-on-max-turns and plan-restart are driven by the ORIGINATING renderer
+// (it has the user's model/profile/thread settings + plan state to synthesize the follow-up). If
+// that sole renderer RELOADS mid-turn it comes back as a passive MIRROR (no locallyOriginated), so
+// the continuation would silently never fire. We cannot tell "I reloaded (owner gone)" from "I'm a
+// 2nd viewer (owner alive)" from a bare in-flight probe (see the reload-mirror comment in the
+// renderer). This lease resolves that ambiguity: exactly ONE client may hold the continuation lease
+// for a conversation at a time. The originating client acquires it at submit; on reload a renderer
+// re-acquires — GRANTED only if the prior holder is GONE (its heartbeat went stale), which is
+// precisely the reload/crash case. A live 2nd viewer's acquire is DENIED (the real owner's
+// heartbeat is fresh), so the turn is never double-driven. Liveness uses a client heartbeat rather
+// than a socket-close hook so it works uniformly for Electron windows AND web-bridge clients.
+const continuationLeases = new Map<string, string>(); // conversationId -> holder clientId
+const clientLastSeen = new Map<string, number>(); // clientId -> last heartbeat ms
+const CLIENT_LEASE_STALE_MS = 15_000; // holder considered gone after this without a heartbeat
+const CLIENT_SEEN_MAX = 200; // bound the heartbeat map (evict oldest) — clients are few
+function clientIsLive(clientId: string): boolean {
+  const seen = clientLastSeen.get(clientId);
+  return seen !== undefined && Date.now() - seen <= CLIENT_LEASE_STALE_MS;
+}
+function recordClientHeartbeat(clientId: string): void {
+  if (typeof clientId !== 'string' || clientId.length === 0) return;
+  clientLastSeen.delete(clientId); // re-insert at back so ordering reflects recency
+  clientLastSeen.set(clientId, Date.now());
+  while (clientLastSeen.size > CLIENT_SEEN_MAX) {
+    const oldest = clientLastSeen.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    clientLastSeen.delete(oldest);
+  }
+}
+// Grant iff: no current holder, OR this client already holds it, OR the current holder is stale
+// (gone). Records the granted holder + refreshes its heartbeat. Returns whether granted.
+function acquireContinuationLease(conversationId: string, clientId: string): boolean {
+  if (typeof conversationId !== 'string' || !conversationId || typeof clientId !== 'string' || !clientId) {
+    return false;
+  }
+  recordClientHeartbeat(clientId);
+  const holder = continuationLeases.get(conversationId);
+  if (holder === undefined || holder === clientId || !clientIsLive(holder)) {
+    continuationLeases.set(conversationId, clientId);
+    return true;
+  }
+  return false;
+}
+function releaseContinuationLease(conversationId: string): void {
+  continuationLeases.delete(conversationId);
+}
 // Reactive-recovery compaction hook awaits ABANDONED on turn-cancel (raceRecoveryAbort won, but
 // the underlying trusted-plugin callback promise stays pending, pinning its transcript — we can't
 // force-cancel a callback protocol). Bounded so repeated cancel→retry cycles against hung hooks
@@ -400,6 +448,9 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
   const fbAppHome = serverPersistAppHome;
   const fbToken = streamToken;
   guiFallbackParents.delete(conversationId);
+  // The GUI turn ended → its continuation lease is no longer needed. A follow-up turn (auto-
+  // continue / plan-restart) that the holder starts re-acquires a fresh lease on its own submit.
+  releaseContinuationLease(conversationId);
   const pollGuiFallback = (remaining: number): void => {
     const owner = activeStreams.get(conversationId)?.token;
     if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator
@@ -5394,6 +5445,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { inFlight, serverPersisted };
   });
 
+  // GUI continuation-lease liveness heartbeat: the renderer pings periodically so main knows the
+  // holder of a continuation lease is still alive. A holder whose heartbeat goes stale is treated
+  // as gone, letting a reloaded renderer re-acquire the lease (see acquireContinuationLease).
+  ipcMain.handle('agent:continuation-heartbeat', (_event, clientId: string) => {
+    recordClientHeartbeat(clientId);
+    return { ok: true };
+  });
+  // Atomically acquire the continuation lease for a conversation. Granted iff no live client holds
+  // it (see acquireContinuationLease). The originating client acquires at submit; a renderer that
+  // reloaded mid-turn re-acquires and, if granted, adopts the run as locally-driven so auto-
+  // continue / plan-restart resume — otherwise it stays a passive mirror (a live owner still holds
+  // the lease, so a 2nd viewer is denied and the turn is never double-driven).
+  ipcMain.handle('agent:acquire-continuation-lease', (_event, conversationId: string, clientId: string) => {
+    return { granted: acquireContinuationLease(conversationId, clientId) };
+  });
+
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
     cancelConversationStreamInner(conversationId);
     return { ok: true };
@@ -5449,6 +5516,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (guiFallbackParents.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }
+    // A cancel ends the turn — drop its continuation lease (a resumed turn re-acquires).
+    releaseContinuationLease(conversationId);
     if (wasServerPersist) {
       discardPersistenceAccumulator(conversationId);
       try {

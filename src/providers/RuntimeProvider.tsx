@@ -837,6 +837,28 @@ function supersedeCurrentGeneration(convId: string): void {
  *  interactive send). Gates automation-specific behavior: background accumulation,
  *  open-mid-run seeding, and deferring persistence to the main process. */
 const automationStreams = new Set<string>();
+// Stable per-client-session id for the GUI continuation lease. Minted once per renderer session
+// (a reload mints a NEW one — which is exactly what lets the reloaded client re-acquire a lease the
+// crashed/reloaded prior session held: the old id stops heart-beating and its lease goes stale).
+const CONTINUATION_CLIENT_ID = msgId();
+// Conversations THIS client currently holds (or believes it holds) the continuation lease for, so
+// auto-continue / plan-restart may fire even on a mirror we adopted after a reload. Distinct from
+// locallyOriginated (which is set at adopt time); this mirrors the main-side grant for clarity.
+const heldContinuationLeases = new Set<string>();
+// Acquire (or refresh) the continuation lease for a conversation this client is driving. Fire-and-
+// forget: the originating client normally wins (fresh turn / already holder). On the rare denial
+// (a live prior holder still owns it — e.g. two windows raced the same submit), we simply don't
+// record it, so this client won't ALSO drive the continuation — the true holder does. Records the
+// grant locally so the terminal handlers can gate continuation on lease ownership too.
+function acquireContinuationLeaseFor(convId: string): void {
+  void app.agent
+    .acquireContinuationLease?.(convId, CONTINUATION_CLIENT_ID)
+    .then((r) => {
+      if (r?.granted) heldContinuationLeases.add(convId);
+      else heldContinuationLeases.delete(convId);
+    })
+    .catch(() => {});
+}
 /** Automation conversations we've begun async-seeding a background accumulator for
  *  (dedupes the disk fetch while events stream in before the seed resolves). */
 const automationSeedInProgress = new Set<string>();
@@ -971,40 +993,144 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
   if (q.length === 0) rejectedDrafts.delete(convId);
-  if (next) void applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
+  if (next) applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
   return next;
+}
+// Peek the OLDEST rejected draft's id without removing it (used to name the atomic claim below).
+function peekOldestRejectedDraftId(convId: string): string | undefined {
+  const q = rejectedDrafts.get(convId);
+  return q && q.length > 0 ? q[0]?.id : undefined;
+}
+// Remove a specific draft id from the in-memory queue only (no durable delta — the atomic claim
+// on main already mutated disk). Used to keep the local mirror consistent after a claim resolves.
+function dropRejectedDraftLocal(convId: string, id: string): void {
+  const q = rejectedDrafts.get(convId);
+  if (!q) return;
+  const next = q.filter((d) => d.id !== id);
+  if (next.length === 0) rejectedDrafts.delete(convId);
+  else rejectedDrafts.set(convId, next);
+}
+// ATOMICALLY claim the oldest pending draft on MAIN and restore it into the composer — but only if
+// THIS client won the claim. When several clients hydrated the same durable pendingDrafts, main's
+// single-threaded remove-and-return guarantees exactly one `draft !== null`, so the others don't
+// populate a duplicate composer. On success we restore + drop it locally; if another client won
+// (draft === null) we just drop it locally (it's gone from disk). Falls back to the local dequeue
+// if the claim IPC is unavailable/errors, so a single-client session behaves exactly as before.
+async function claimAndRestoreDraft(
+  convId: string,
+  restore: (d: RejectedDraft) => void,
+): Promise<void> {
+  const id = peekOldestRejectedDraftId(convId);
+  if (!id) return;
+  try {
+    const res = await app.conversations.claimPendingDraft?.(convId, id);
+    if (res === undefined) {
+      // IPC not present (older bridge) — fall back to the local-only path.
+      const local = dequeueRejectedDraft(convId);
+      if (local) restore(local);
+      return;
+    }
+    if (res.ok && res.draft) {
+      const d: RejectedDraft = {
+        id: res.draft.id || id,
+        text: res.draft.text,
+        attachments: (res.draft.attachments as RejectedDraft['attachments']) ?? [],
+        stashedAt: res.draft.stashedAt,
+      };
+      dropRejectedDraftLocal(convId, d.id);
+      restore(d);
+    } else {
+      // Another client claimed it (or it's gone) — reconcile our local mirror, restore nothing.
+      dropRejectedDraftLocal(convId, id);
+    }
+  } catch {
+    // Claim failed — leave the draft in place (both disk and local) for a later retry tick.
+  }
 }
 // Apply a DELTA to a conversation record's durable `pendingDrafts` — add these drafts, remove
 // these ids — via a FIELD-ONLY main-side update (conversations:setPendingDrafts). A DELTA (not a
 // wholesale replace of this client's local queue) is essential: two clients concurrently
 // stashing/restoring drafts for the SAME conversation must MERGE, not last-writer-wins-erase.
 // Main read-modify-writes the CURRENT disk pendingDrafts (never a stale whole-record put).
-// Best-effort + fire-and-forget: the in-memory queue is authoritative within a session; this is
-// the crash/reload-survival copy.
-async function applyPendingDraftsDelta(
-  convId: string,
-  add: RejectedDraft[],
-  removeIds: string[],
-): Promise<void> {
-  const addPayload = add.map((d) => ({
-    id: d.id,
-    text: d.text,
-    attachments: d.attachments as unknown[],
-    stashedAt: d.stashedAt,
-  }));
-  // Bounded retry: the in-memory queue is authoritative within a session, but the DURABLE copy
-  // matters across restart — a dropped ADD loses the stash if the process exits, and a dropped
-  // REMOVE resurrects an already-restored draft on the next launch. A field-only main write
-  // rarely fails; a few spaced retries turn a transient IPC/disk blip into an eventual success
-  // without blocking the caller (still fire-and-forget from the call sites).
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
-      return;
-    } catch {
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
-      /* else: exhausted — the in-memory queue still restores within the session */
+// Best-effort: the in-memory queue is authoritative within a session; this is the
+// crash/reload-survival copy.
+//
+// Deltas for a given conversation are SERIALIZED and COALESCED through a per-conv buffer +
+// single-flight flusher. Serialization matters because the retry loop below can sleep between
+// attempts: without it, an ADD whose first attempt fails could re-persist a draft AFTER a
+// concurrent REMOVE for that same id already landed (resurrecting a restored draft — struct P3
+// r162). Coalescing (an ADD then a REMOVE of the SAME id within one flush cancel out) also
+// collapses the common stash-then-immediately-restore case into a no-op write.
+type PendingDraftDelta = { adds: Map<string, RejectedDraft>; removes: Set<string> };
+const pendingDraftDeltas = new Map<string, PendingDraftDelta>();
+const draftDeltaFlushing = new Map<string, Promise<void>>();
+function applyPendingDraftsDelta(convId: string, add: RejectedDraft[], removeIds: string[]): void {
+  let buf = pendingDraftDeltas.get(convId);
+  if (!buf) {
+    buf = { adds: new Map(), removes: new Set() };
+    pendingDraftDeltas.set(convId, buf);
+  }
+  for (const d of add) {
+    buf.removes.delete(d.id); // a re-add supersedes a pending remove of the same id
+    buf.adds.set(d.id, d);
+  }
+  for (const id of removeIds) {
+    if (buf.adds.delete(id)) continue; // add+remove of same id in one flush → net no-op
+    buf.removes.add(id);
+  }
+  // Kick the flusher if idle; if one is running it will re-check the buffer when it finishes.
+  if (!draftDeltaFlushing.has(convId)) void flushPendingDraftDeltas(convId);
+}
+async function flushPendingDraftDeltas(convId: string): Promise<void> {
+  if (draftDeltaFlushing.has(convId)) return;
+  const run = (async () => {
+    // Drain until the buffer is empty; a delta enqueued mid-write is picked up on the next lap.
+    for (;;) {
+      const buf = pendingDraftDeltas.get(convId);
+      if (!buf || (buf.adds.size === 0 && buf.removes.size === 0)) {
+        pendingDraftDeltas.delete(convId);
+        return;
+      }
+      pendingDraftDeltas.delete(convId); // take ownership of this batch; new ops start a fresh buffer
+      const addPayload = [...buf.adds.values()].map((d) => ({
+        id: d.id,
+        text: d.text,
+        attachments: d.attachments as unknown[],
+        stashedAt: d.stashedAt,
+      }));
+      const removeIds = [...buf.removes];
+      // Bounded retry: the in-memory queue is authoritative within a session, but the DURABLE copy
+      // matters across restart — a dropped ADD loses the stash if the process exits, and a dropped
+      // REMOVE resurrects an already-restored draft on the next launch. A field-only main write
+      // rarely fails; a few spaced retries turn a transient IPC/disk blip into an eventual success.
+      let ok = false;
+      for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+        try {
+          await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
+          ok = true;
+        } catch {
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        }
+      }
+      if (!ok) {
+        // Exhausted this batch. Re-fold it into the buffer so a later delta's flush retries it —
+        // but only ops not already superseded by a newer op (a fresh remove wins over our add).
+        const next = pendingDraftDeltas.get(convId) ?? { adds: new Map(), removes: new Set() };
+        for (const d of buf.adds.values()) if (!next.removes.has(d.id) && !next.adds.has(d.id)) next.adds.set(d.id, d);
+        for (const id of buf.removes) if (!next.adds.has(id)) next.removes.add(id);
+        pendingDraftDeltas.set(convId, next);
+        return; // stop laps; the next applyPendingDraftsDelta call restarts the flusher
+      }
     }
+  })();
+  draftDeltaFlushing.set(convId, run);
+  try {
+    await run;
+  } finally {
+    draftDeltaFlushing.delete(convId);
+    // If ops arrived after the loop observed an empty buffer but before we cleared the flag, flush.
+    const buf = pendingDraftDeltas.get(convId);
+    if (buf && (buf.adds.size > 0 || buf.removes.size > 0)) void flushPendingDraftDeltas(convId);
   }
 }
 // Hydrate the in-memory queue from a conversation record's persisted `pendingDrafts` (a reload
@@ -2363,10 +2489,14 @@ export function RuntimeProvider({
         if ((rejectedDrafts.get(id)?.length ?? 0) === 0) return;
         const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
         if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return; // don't clobber
-        const rejected = dequeueRejectedDraft(id); // OLDEST first; the poll restores the rest
-        if (!rejected) return;
-        if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
-        restoreComposerDraft(rejected.text);
+        // ATOMIC claim on main so only ONE client restores this draft (the poll restores the rest).
+        void claimAndRestoreDraft(id, (rejected) => {
+          if (activeIdRef.current !== id) return; // switched during the async claim — don't clobber
+          const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
+          if (t.trim().length > 0 || attachmentsRef.current.length > 0) return;
+          if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+          restoreComposerDraft(rejected.text);
+        });
       }, 0);
     }
 
@@ -2400,16 +2530,52 @@ export function RuntimeProvider({
         //    live, never persist here — main writes the authoritative terminal state).
         //  - GUI-started turn → seed a passive MIRROR accumulator (NO locallyOriginated, NOT in
         //    automationStreams). We CANNOT tell "this renderer reloaded (original owner gone)" from
-        //    "I'm a 2nd viewer (original owner alive)" from a bare in-flight probe, so we must NOT
-        //    ADOPT it: adopting from a PARTIAL disk snapshot could overwrite the owner's full reply
-        //    or double-restart the turn (a real multi-client corruption). A mirror renders live and
-        //    reconciles from disk on the terminal event; if the true owner crashed, the reply is
-        //    lost (inherent to renderer-owned persistence) and startup resetStaleRunStatus clears
-        //    the stuck runStatus — strictly safer than corrupting a live turn.
+        //    "I'm a 2nd viewer (original owner alive)" from a bare in-flight probe alone — so we
+        //    seed a mirror, then ASYNCHRONOUSLY try to ACQUIRE the continuation lease from main.
+        //    Main grants it ONLY if no LIVE client holds it (the prior holder's heartbeat went
+        //    stale = it reloaded/crashed). If granted, we UPGRADE this mirror to locally-driven so
+        //    auto-continue / plan-restart resume; if denied (a live owner still holds it — the
+        //    2nd-viewer case), we stay a passive mirror and never double-drive the turn. Either way
+        //    the reply itself is safe: main's persistence fallback covers the reloaded-owner case,
+        //    and a live owner persists its own.
         const mainOwned = autoInFlight || agentInFlight.serverPersisted;
         if (mainOwned) automationStreams.add(id);
         streamAccumulators.set(id, { messages: [...t], headId: h });
         setIsRunning(true);
+        if (!mainOwned) {
+          // GUI mirror — race for the continuation lease. Reconstruct the run's settings from the
+          // persisted conversation so an adopted continuation uses the right model/profile/thread.
+          void app.agent
+            .acquireContinuationLease?.(id, CONTINUATION_CLIENT_ID)
+            .then((r) => {
+              if (!r?.granted) return;
+              heldContinuationLeases.add(id);
+              const acc = streamAccumulators.get(id);
+              // Only upgrade if we still hold THIS mirror (not superseded/switched/terminated) and
+              // it hasn't already become locally-driven.
+              if (acc && acc.locallyOriginated !== true) {
+                acc.locallyOriginated = true;
+                if (!acc.runConfig) {
+                  acc.runConfig = {
+                    selectedModelKey: conv.selectedModelKey ?? null,
+                    reasoningEffort: conv.reasoningEffort ?? undefined,
+                    selectedProfileKey: conv.selectedProfileKey ?? null,
+                    fallbackEnabled: conv.fallbackEnabled ?? false,
+                    cwd: null,
+                    executionMode: conv.executionMode ?? undefined,
+                    threadOverrides: {
+                      temperature: conv.temperature ?? null,
+                      systemPromptOverride: conv.systemPromptOverride ?? null,
+                      maxSteps: conv.maxSteps ?? null,
+                      maxRetries: conv.maxRetries ?? null,
+                      runtimeOverride: conv.runtimeOverride ?? null,
+                    },
+                  };
+                }
+              }
+            })
+            .catch(() => {});
+        }
       } else {
         setIsRunning(false);
       }
@@ -2512,13 +2678,31 @@ export function RuntimeProvider({
       if (!id || (rejectedDrafts.get(id)?.length ?? 0) === 0) return;
       const composerText = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
       if (composerText.trim().length > 0 || attachmentsRef.current.length > 0) return;
-      const rejected = dequeueRejectedDraft(id); // one per tick, oldest first (drains over ticks)
-      if (!rejected) return;
-      if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
-      restoreComposerDraft(rejected.text);
+      // ATOMIC claim on main (one draft per tick, oldest first) so concurrent clients don't both
+      // restore the same draft; only the winner populates its composer.
+      void claimAndRestoreDraft(id, (rejected) => {
+        if (activeIdRef.current !== id) return; // switched during the async claim — don't clobber
+        const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
+        if (t.trim().length > 0 || attachmentsRef.current.length > 0) return;
+        if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+        restoreComposerDraft(rejected.text);
+      });
     }, 1500);
     return () => clearInterval(timer);
   }, [addAttachments]);
+
+  // GUI continuation-lease heartbeat: tell main this client is alive so it retains any continuation
+  // lease this session holds. If this renderer reloads/crashes, the heartbeat stops and main lets
+  // the reloaded session re-acquire the lease (its prior holder id goes stale). Cheap fire-and-
+  // forget on a 5s cadence (well under the 15s stale threshold).
+  useEffect(() => {
+    const beat = () => {
+      void app.agent.continuationHeartbeat?.(CONTINUATION_CLIENT_ID).catch(() => {});
+    };
+    beat();
+    const timer = setInterval(beat, 5000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Reload the active conversation when the main process appends to it (e.g. an
   // automation targeting this thread). Our own persists never grow the tree past
@@ -2548,6 +2732,7 @@ export function RuntimeProvider({
           pendingCompactionHandoff.delete(deletedId);
           clearLateCompactionHandoffTimer(deletedId);
           rejectedDrafts.delete(deletedId);
+          heldContinuationLeases.delete(deletedId);
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
           clearFinalizedBranch(deletedId);
@@ -4686,6 +4871,7 @@ export function RuntimeProvider({
         runConfig: { selectedModelKey, reasoningEffort, selectedProfileKey, fallbackEnabled, cwd, executionMode, threadOverrides },
         locallyOriginated: true, // this client started the turn → it drives any auto-continue/restart
       });
+      acquireContinuationLeaseFor(convId); // originator holds the lease; a reload can re-acquire it
       const branch = getActiveBranch(newTree, newHead);
 
       const persistRes = await persistConversation(
@@ -4945,6 +5131,7 @@ export function RuntimeProvider({
         runConfig: reloadRunConfig,
         locallyOriginated: true, // this client started the reload → it drives any auto-continue/restart
       });
+      acquireContinuationLeaseFor(convId);
       const branch = getActiveBranch(newTree, actualParent);
       const reloadPreHead = headIdRef.current;
       const reloadPersistRes = await persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
@@ -5110,6 +5297,7 @@ export function RuntimeProvider({
         runConfig: editRunConfig,
         locallyOriginated: true, // this client started the edit → it drives any auto-continue/restart
       });
+      acquireContinuationLeaseFor(convId);
       const branch = getActiveBranch(newTree, newHead);
 
       const editPersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
@@ -5657,6 +5845,7 @@ export function RuntimeProvider({
         runConfig: variantRunConfig,
         locallyOriginated: true, // user-initiated continue-after-max-turns → this client drives it
       });
+      acquireContinuationLeaseFor(convId);
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
       if (persistRes?.rejected) {
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
@@ -5749,6 +5938,7 @@ export function RuntimeProvider({
       runConfig: continueRunConfig,
       locallyOriginated: true, // user-initiated continue-task → this client drives any further continuation
     });
+    acquireContinuationLeaseFor(convId);
     const branch = getActiveBranch(newTree, newHead);
     const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
     // /compact holds the conversation: roll back the optimistic continue turn + running

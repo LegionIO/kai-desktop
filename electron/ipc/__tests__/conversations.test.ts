@@ -400,6 +400,65 @@ describe('conversations IPC: list / get / put round-trip', () => {
   });
 });
 
+describe('conversations IPC: pending-draft claim (atomic single-winner)', () => {
+  it('claim-pending-draft returns the draft once, then null for a concurrent claim of the same id', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('cd', {}));
+    await harness.invoke('conversations:set-pending-drafts', FAKE_EVENT, 'cd', {
+      add: [{ id: 'dr1', text: 'unsent input', attachments: [], stashedAt: 1 }],
+      removeIds: [],
+    });
+    const first = await harness.invoke<{ ok: boolean; draft: { id: string; text: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'cd',
+      'dr1',
+    );
+    expect(first.ok).toBe(true);
+    expect(first.draft).toMatchObject({ id: 'dr1', text: 'unsent input' });
+    const second = await harness.invoke<{ ok: boolean; draft: unknown }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'cd',
+      'dr1',
+    );
+    expect(second.ok).toBe(true);
+    expect(second.draft).toBeNull();
+  });
+
+  it('claim-pending-draft with no id claims the OLDEST and leaves the rest', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('cd2', {}));
+    await harness.invoke('conversations:set-pending-drafts', FAKE_EVENT, 'cd2', {
+      add: [
+        { id: 'old', text: 'first', attachments: [], stashedAt: 1 },
+        { id: 'new', text: 'second', attachments: [], stashedAt: 2 },
+      ],
+      removeIds: [],
+    });
+    const claimed = await harness.invoke<{ ok: boolean; draft: { id: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'cd2',
+    );
+    expect(claimed.draft?.id).toBe('old');
+    const remaining = await harness.invoke<{ ok: boolean; draft: { id: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'cd2',
+    );
+    expect(remaining.draft?.id).toBe('new');
+  });
+});
+
 describe('conversations IPC: error paths', () => {
   it('returns null for conversations:get when the id is unknown', async () => {
     const harness = await createIpcHarness({

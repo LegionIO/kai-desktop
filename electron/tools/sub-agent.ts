@@ -701,7 +701,10 @@ async function resumeSubAgent(
     });
     broadcastEvent({
       subAgentConversationId,
-      parentConversationId,
+      // Route to the parent CONVERSATION id (matching the retained paused status just above);
+      // the bare local `parentConversationId` is the tool-call id, which parent-scoped consumers
+      // would discard — leaving them without the terminal `done` for this blocked resume.
+      parentConversationId: parentThreadId ?? parentConversationId,
       parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'done',
@@ -900,7 +903,12 @@ async function resumeSubAgent(
     // runner's own error emit (and the pre-refactor resume path).
     broadcastEvent({
       subAgentConversationId,
-      parentConversationId,
+      // Terminal lifecycle events must reach PARENT-scoped consumers (the CLI reducer scopes by
+      // parent conversation id); the local `parentConversationId` here holds the TOOL-CALL id
+      // (see the resumable-state note above), so route via parentThreadId — matching the resumed-
+      // run status emit below and the paused/done emits. Using the bare tool-call id would make
+      // parent-scoped clients discard this failure and leave the agent shown as still running.
+      parentConversationId: parentThreadId ?? parentConversationId,
       parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'error',
@@ -908,7 +916,7 @@ async function resumeSubAgent(
     } as SubAgentEvent);
     broadcastEvent({
       subAgentConversationId,
-      parentConversationId,
+      parentConversationId: parentThreadId ?? parentConversationId,
       parentToolCallId,
       conversationId: subAgentConversationId,
       type: 'sub-agent-status',
@@ -981,7 +989,10 @@ async function resumeSubAgent(
       ownerGeneration: resumeGeneration,
       config,
       dbPath,
-      routing: { parentConversationId, parentToolCallId },
+      // Broadcast-only routing — route the `stopped` transition to the parent conversation id
+      // (parentThreadId) so parent-scoped consumers accept it; bare parentConversationId is the
+      // tool-call id and would be discarded.
+      routing: { parentConversationId: parentThreadId ?? parentConversationId, parentToolCallId },
     });
     cleanupRuntime(subAgentConversationId, resumeGeneration);
 
@@ -991,7 +1002,10 @@ async function resumeSubAgent(
     if (stillOwns) {
       broadcastEvent({
         subAgentConversationId,
-        parentConversationId,
+        // Terminal `done` for a resumed run — route to the parent CONVERSATION id so
+        // parent-scoped consumers (CLI reducer) finalize the thread; the bare local
+        // `parentConversationId` is the tool-call id and would be discarded by them.
+        parentConversationId: parentThreadId ?? parentConversationId,
         parentToolCallId,
         conversationId: subAgentConversationId,
         type: 'done',
@@ -1526,7 +1540,11 @@ export function createSubAgentTool(
           ownerGeneration: runGeneration,
           config,
           dbPath,
-          routing: { parentConversationId: ctx.toolCallId, parentToolCallId: ctx.toolCallId },
+          // routing is used only for the `stopped` BROADCAST — route it to the parent
+          // conversation id so parent-scoped consumers accept it (the tool-call id would be
+          // discarded, leaving a stopped agent shown as running). The status DB write keys on
+          // subAgentConversationId, unaffected.
+          routing: { parentConversationId: ctx.conversationId ?? ctx.toolCallId, parentToolCallId: ctx.toolCallId },
         });
 
         // A terminal `failed`/`error` run (e.g. a UserPromptSubmit hook denied
@@ -1593,7 +1611,12 @@ export function createSubAgentTool(
         if (!aborted) {
           broadcastEvent({
             subAgentConversationId,
-            parentConversationId: ctx.toolCallId,
+            // Route terminal lifecycle events to the PARENT CONVERSATION id so parent-scoped
+            // consumers (the CLI reducer) accept them — matching the success finalize routing
+            // (ctx.conversationId) and the live-status emits. The tool-call id is only the
+            // resumable-STATE routing field, not a lifecycle-broadcast scope; using it here would
+            // make parent-scoped clients discard the failure and show the agent as still running.
+            parentConversationId: ctx.conversationId ?? ctx.toolCallId,
             parentToolCallId: ctx.toolCallId,
             conversationId: subAgentConversationId,
             type: 'error',
@@ -1602,7 +1625,7 @@ export function createSubAgentTool(
         }
         broadcastEvent({
           subAgentConversationId,
-          parentConversationId: ctx.toolCallId,
+          parentConversationId: ctx.conversationId ?? ctx.toolCallId,
           parentToolCallId: ctx.toolCallId,
           conversationId: subAgentConversationId,
           type: 'sub-agent-status',
@@ -1661,11 +1684,15 @@ export function createSubAgentTool(
           ownerGeneration: runGeneration,
           config,
           dbPath,
-          routing: { parentConversationId: ctx.toolCallId, parentToolCallId: ctx.toolCallId },
+          // Broadcast-only routing — send the `stopped` transition to the parent conversation id
+          // so parent-scoped consumers accept it (tool-call id would be discarded).
+          routing: { parentConversationId: ctx.conversationId ?? ctx.toolCallId, parentToolCallId: ctx.toolCallId },
         });
         broadcastEvent({
           subAgentConversationId,
-          parentConversationId: ctx.toolCallId,
+          // Match the terminal error/failed routing above: parent-scoped consumers that accepted
+          // the failure must also see the matching `done`, so route to the parent conversation id.
+          parentConversationId: ctx.conversationId ?? ctx.toolCallId,
           parentToolCallId: ctx.toolCallId,
           conversationId: subAgentConversationId,
           type: 'done',

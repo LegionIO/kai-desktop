@@ -182,6 +182,40 @@ describe('per-file read/write', () => {
     expect(readIndex(appHome).conversations.c1).toBeUndefined();
   });
 
+  it('records a DURABLE deletion tombstone in the index (survives an index re-read)', () => {
+    writeConversation(appHome, makeConv('d1'));
+    deleteConversation(appHome, 'd1');
+    // The durable ring persisted to the index carries the deleted id — this is the tombstone
+    // that survives a process restart / the in-memory TTL expiry, blocking later resurrection.
+    expect(readIndex(appHome).deletedIds).toContain('d1');
+  });
+
+  it('a durably-tombstoned id that is absent from the index is NOT resurrected by writeConversation', () => {
+    // Simulate a restart where only the DURABLE tombstone survives (no in-memory recentlyDeleted
+    // entry, no index conversation entry) by hand-writing an index whose deletedIds holds the id.
+    writeIndex(appHome, {
+      conversations: {},
+      activeConversationId: null,
+      settings: {},
+      deletedIds: ['ghost'],
+    });
+    // A stale client tries to persist the deleted conversation — the resurrection guard must skip
+    // the write, so no file/index entry appears.
+    writeConversation(appHome, makeConv('ghost', { title: 'stale' }));
+    expect(readConversation(appHome, 'ghost')).toBeNull();
+    expect(readIndex(appHome).conversations.ghost).toBeUndefined();
+  });
+
+  it('clearAllConversations preserves prior durable tombstones and adds the cleared ids', () => {
+    writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: {}, deletedIds: ['old'] });
+    writeConversation(appHome, makeConv('clr1'));
+    writeConversation(appHome, makeConv('clr2'));
+    clearAllConversations(appHome);
+    const deleted = readIndex(appHome).deletedIds ?? [];
+    expect(deleted).toContain('old');
+    expect(deleted).toEqual(expect.arrayContaining(['clr1', 'clr2']));
+  });
+
   it('clearAllConversations empties files + index but keeps settings', () => {
     writeConversation(appHome, makeConv('c1'));
     writeConversation(appHome, makeConv('c2'));

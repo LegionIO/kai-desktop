@@ -54,6 +54,12 @@ const appAPI = {
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
     inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<{ inFlight: boolean; serverPersisted: boolean }>,
+    /** GUI continuation-lease liveness heartbeat (client-session id). */
+    continuationHeartbeat: (clientId: string) =>
+      ipcRenderer.invoke('agent:continuation-heartbeat', clientId) as Promise<{ ok: boolean }>,
+    /** Atomically acquire the continuation lease for a conversation (reload-adopt gate). */
+    acquireContinuationLease: (conversationId: string, clientId: string) =>
+      ipcRenderer.invoke('agent:acquire-continuation-lease', conversationId, clientId) as Promise<{ granted: boolean }>,
     /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
      *  running turn (spliced at its next step boundary) instead of a new turn. */
     injectMidTurn: (conversationId: string, userText: string) =>
@@ -162,6 +168,13 @@ const appAPI = {
     ) =>
       ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
         ok: boolean;
+      }>,
+    // Atomic single-draft claim (remove-and-return) so only one of several clients that hydrated
+    // the same pendingDrafts restores a given draft. `draft: null` means already claimed / none.
+    claimPendingDraft: (conversationId: string, id?: string) =>
+      ipcRenderer.invoke('conversations:claim-pending-draft', conversationId, id) as Promise<{
+        ok: boolean;
+        draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null;
       }>,
     // Cross-client /compact busy sync: current compacting set + change subscription.
     compactingIds: () => ipcRenderer.invoke('conversations:compacting-ids') as Promise<string[]>,

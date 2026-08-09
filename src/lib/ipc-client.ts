@@ -77,6 +77,8 @@ type AppAPI = {
     ) => Promise<unknown>;
     cancelStream: (conversationId: string) => Promise<unknown>;
     inFlight: (conversationId: string) => Promise<{ inFlight: boolean; serverPersisted: boolean }>;
+    continuationHeartbeat: (clientId: string) => Promise<{ ok: boolean }>;
+    acquireContinuationLease: (conversationId: string, clientId: string) => Promise<{ granted: boolean }>;
     injectMidTurn: (
       conversationId: string,
       userText: string,
@@ -147,6 +149,10 @@ type AppAPI = {
       conversationId: string,
       delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
     ) => Promise<{ ok: boolean }>;
+    claimPendingDraft: (
+      conversationId: string,
+      id?: string,
+    ) => Promise<{ ok: boolean; draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null }>;
     compactingIds: () => Promise<string[]>;
     onCompactingChanged: (
       callback: (payload: { conversationId: string; compacting: boolean }) => void,
