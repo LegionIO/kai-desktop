@@ -4128,8 +4128,10 @@ export function RuntimeProvider({
             // continue from it (never the partial in-memory accumulator). A local originator's
             // accumulator IS authoritative, so it skips this.
             if (acc.locallyOriginated !== true) {
+              let finConfirmed: boolean | undefined;
               try {
                 const fin = await app.agent.finalizeGuiFallback?.(convId, turnToken ?? undefined);
+                finConfirmed = fin?.confirmed;
                 // Reload the confirmed branch (whether main finalized its fallback or the renderer's
                 // own earlier persist is authoritative — either way disk now holds the full turn).
                 const confirmed = await app.conversations.get(convId);
@@ -4143,7 +4145,27 @@ export function RuntimeProvider({
                   if (confirmedHead) acc.headId = confirmedHead;
                 }
               } catch {
-                /* main finalize / disk read failed — fall back to the in-memory branch (best-effort) */
+                /* main finalize / disk read failed — treated as unconfirmed below */
+                finConfirmed = false;
+              }
+              // ABORT the continuation if main could NOT confirm the authoritative branch: a
+              // token mismatch means a REPLACEMENT turn took over (continuing would abort it), and a
+              // failed fallback write means the full reply isn't on disk (continuing would truncate
+              // history + replay tool side effects). Only `confirmed === false` aborts — `undefined`
+              // (older bridge, no finalize IPC) keeps the pre-existing best-effort behavior. Drop our
+              // accumulator + reconcile from disk (the winner's turn / retry will drive it).
+              if (finConfirmed === false) {
+                const _ptUnc = persistTimersRef.current.get(convId);
+                if (_ptUnc) {
+                  clearTimeout(_ptUnc);
+                  persistTimersRef.current.delete(convId);
+                }
+                if (streamAccumulators.get(convId) === acc) streamAccumulators.delete(convId);
+                if (isActiveConv) {
+                  setIsRunning(false);
+                  void loadConversationState(convId, { skipInFlightSeed: true });
+                }
+                return;
               }
               // Re-validate ownership after the awaits.
               if (streamAccumulators.get(convId) !== acc) return;
@@ -4288,6 +4310,12 @@ export function RuntimeProvider({
                 cleanupIfLost();
                 return;
               }
+              // RENEW our continuation authorization while we retry: a concurrent /compact can hold
+              // the conversation for up to ~285s, but the main-side auth grant goes stale after 20s.
+              // Without renewal another client could re-win this same turn mid-retry and both would
+              // launch. Re-asserting as the current holder is idempotent (granted) and refreshes the
+              // grant's timestamp. Fire-and-forget — the launch below still gates on stillOwns().
+              void app.agent.authorizeContinuation?.(convId, CONTINUATION_CLIENT_ID, turnToken ?? convId).catch(() => {});
               launchAfterCompactionPersist(remaining - 1, repersistContinuation());
             }, 1000);
           };
@@ -4769,8 +4797,10 @@ export function RuntimeProvider({
               // A MIRROR winner has a PARTIAL accumulator — finalize main's authoritative full-turn
               // fallback and reload the confirmed branch before restarting (same as max-turns).
               if (acc.locallyOriginated !== true) {
+                let planFinConfirmed: boolean | undefined;
                 try {
                   const fin = await app.agent.finalizeGuiFallback?.(convId, planTurnToken ?? undefined);
+                  planFinConfirmed = fin?.confirmed;
                   const confirmed = await app.conversations.get(convId);
                   const confirmedTree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
                     ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
@@ -4782,7 +4812,18 @@ export function RuntimeProvider({
                     if (confirmedHead) acc.headId = confirmedHead;
                   }
                 } catch {
-                  /* best-effort — fall back to the in-memory branch */
+                  planFinConfirmed = false;
+                }
+                // ABORT the restart if main couldn't confirm the authoritative branch (a replacement
+                // turn took over, or the fallback write failed) — continuing would abort the newer
+                // turn or restart from truncated history. `undefined` (older bridge) keeps the
+                // best-effort behavior.
+                if (planFinConfirmed === false) {
+                  if (isActiveConv) {
+                    setIsRunning(false);
+                    void loadConversationState(convId, { skipInFlightSeed: true });
+                  }
+                  return;
                 }
               }
               // Ownership check BEFORE replacing the accumulator: the done handler above
@@ -4896,6 +4937,9 @@ export function RuntimeProvider({
                           cleanupIfOwnershipLost();
                           return;
                         }
+                        // Renew our continuation authorization while retrying past the auth TTL
+                        // (a /compact can hold the conv far longer than 20s) — same as max-turns.
+                        void app.agent.authorizeContinuation?.(convId, CONTINUATION_CLIENT_ID, planTurnToken ?? convId).catch(() => {});
                         attemptPlanRestart(
                           remaining - 1,
                           persistConversation(convId, treeForStream, headForStream, {

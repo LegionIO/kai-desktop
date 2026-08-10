@@ -570,11 +570,17 @@ function persistAccumulatedReturningHead(
           delete (replaced as { tokenCount?: unknown }).tokenCount;
           delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
           nextTree[nodeIdx] = replaced;
+          // Preserve the CURRENT head + runStatus if they've moved PAST this node — a newer user
+          // turn / branch-nav / replacement run may have advanced the head and set 'running' since
+          // this (now-superseded) turn ended. Only when the head still points AT this node (the
+          // normal terminal case) do we finalize it to idle. Never rewind the head to this node or
+          // force 'idle' over a live newer turn.
+          const headStillHere = conv.headId === effectiveId || conv.headId == null;
           const nextConv = {
             ...conv,
             messageTree: nextTree,
-            headId: opts?.keepRunning ? conv.headId : effectiveId,
-            runStatus: opts?.keepRunning ? conv.runStatus : 'idle',
+            headId: headStillHere && !opts?.keepRunning ? effectiveId : conv.headId,
+            runStatus: headStillHere && !opts?.keepRunning ? 'idle' : conv.runStatus,
           } as typeof conv;
           const written = writeConversation(appHome, nextConv);
           markResponseFinalized(conversationId, acc.responseMessageId);

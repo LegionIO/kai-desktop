@@ -123,6 +123,32 @@ describe('stream persistence accumulator', () => {
     clearFinalizedResponseIds('web');
   });
 
+  it('finalizeInterruptedTurnReplacing PRESERVES a head/runStatus that moved past the node (newer turn)', () => {
+    clearFinalizedResponseIds('web2');
+    writeMock.mockClear();
+    // A newer user turn advanced the head + set 'running' AFTER this (superseded) turn's node.
+    readMock.mockReturnValueOnce({
+      id: 'web2',
+      headId: 'newerUser',
+      runStatus: 'running',
+      messageTree: [
+        { id: 'u', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-web2', parentId: 'u', role: 'assistant', content: [{ type: 'text', text: '[capped]' }] },
+        { id: 'newerUser', parentId: 'resp-web2', role: 'user', content: [{ type: 'text', text: 'next' }] },
+      ],
+    } as unknown as { headId?: string | null });
+    feed({ conversationId: 'web2', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-web2' });
+    finalizeInterruptedTurnReplacing(APP_HOME, 'web2');
+    const writtenConv = writeMock.mock.calls[0][1] as { headId: string; runStatus: string; messageTree: Array<{ id: string; content: unknown }> };
+    // The superseded node's content is still replaced with the full copy...
+    const node = writtenConv.messageTree.find((m) => m.id === 'resp-web2')!;
+    expect(JSON.stringify(node.content)).toContain('FULL reply');
+    // ...but the CURRENT head + running status of the newer turn are NOT rewound / clobbered.
+    expect(writtenConv.headId).toBe('newerUser');
+    expect(writtenConv.runStatus).toBe('running');
+    clearFinalizedResponseIds('web2');
+  });
+
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
     // finalize deletes the accumulator, so a second finalize with nothing newly
     // accumulated hits the empty guard and does not append.
