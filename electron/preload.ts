@@ -36,6 +36,7 @@ const appAPI = {
         maxSteps?: number | null;
         maxRetries?: number | null;
         runtimeOverride?: string | null;
+        continuationPredecessorToken?: string;
       },
       responseMessageId?: string,
     ) =>

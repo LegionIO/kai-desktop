@@ -2938,6 +2938,23 @@ export function RuntimeProvider({
     const responseMessageId = args[args.length - 1];
     Promise.resolve(app.agent.stream(...args))
       .then((res) => {
+        // A STALE-CONTINUATION rejection (main refused this continuation because a NEWER turn was
+        // issued for the conversation): the newer turn is the authoritative driver. Silently DROP
+        // our superseded continuation accumulator (no compacting-error surface, no persist) so the
+        // newer turn's events render cleanly. Only if we still own the launched accumulator.
+        if (
+          res &&
+          typeof res === 'object' &&
+          (res as { staleContinuation?: unknown }).staleContinuation === true
+        ) {
+          if (
+            typeof responseMessageId === 'string' &&
+            streamAccumulators.get(conversationId)?.pendingAssistantId === responseMessageId
+          ) {
+            streamAccumulators.delete(conversationId);
+          }
+          return;
+        }
         if (
           res &&
           typeof res === 'object' &&
@@ -4147,7 +4164,7 @@ export function RuntimeProvider({
                     retryCfg.fallbackEnabled ?? false,
                     retryCfg.cwd ?? undefined,
                     retryCfg.executionMode ?? 'auto',
-                    retryCfg.threadOverrides ?? undefined,
+                    { ...(retryCfg.threadOverrides ?? {}), ...(retryToken ? { continuationPredecessorToken: retryToken } : {}) },
                     rid,
                   );
                 })();
@@ -4295,7 +4312,9 @@ export function RuntimeProvider({
               cfg.fallbackEnabled ?? false,
               runCwd ?? undefined,
               cfg.executionMode ?? 'auto',
-              cfg.threadOverrides ?? undefined,
+              // Tag the predecessor turn token so main rejects this continuation if a NEWER turn was
+              // issued for the conversation since (another client's fresh user turn) — don't clobber it.
+              { ...(cfg.threadOverrides ?? {}), ...(turnToken ? { continuationPredecessorToken: turnToken } : {}) },
               responseMessageId,
             );
           // Await a persist that ACTUALLY WROTE the compaction-bearing record before
@@ -4829,7 +4848,7 @@ export function RuntimeProvider({
                       planCfgSnapshot.fallbackEnabled ?? false,
                       planCwdSnapshot ?? undefined,
                       'plan-first',
-                      planCfgSnapshot.threadOverrides ?? undefined,
+                      { ...(planCfgSnapshot.threadOverrides ?? {}), ...(planTurnToken ? { continuationPredecessorToken: planTurnToken } : {}) },
                       rid,
                     );
                   })();
@@ -4939,7 +4958,7 @@ export function RuntimeProvider({
                     cfg.fallbackEnabled ?? false,
                     planCwdSnapshot ?? undefined,
                     'plan-first',
-                    cfg.threadOverrides ?? undefined,
+                    { ...(cfg.threadOverrides ?? {}), ...(planTurnToken ? { continuationPredecessorToken: planTurnToken } : {}) },
                     responseMessageId,
                   );
                 // The plan restart is MANDATORY (the prior stream was aborted for it). If a

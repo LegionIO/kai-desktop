@@ -72,6 +72,7 @@ type AppAPI = {
         maxSteps?: number | null;
         maxRetries?: number | null;
         runtimeOverride?: string | null;
+        continuationPredecessorToken?: string;
       },
       responseMessageId?: string,
     ) => Promise<unknown>;

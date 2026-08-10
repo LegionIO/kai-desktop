@@ -426,7 +426,29 @@ const latestIssuedTurnToken = new Map<string, string>();
 const CONTINUATION_AUTH_STALE_MS = 20_000;
 // Stream tokens are `${Date.now()}-${random}`; parse the ms prefix to compare turn recency. A
 // higher prefix = a newer turn. Unparseable → 0 (treated as oldest, so a well-formed token wins).
+// Per-token MONOTONIC ordinal, assigned at stream start (recordIssuedTurnToken). Turn recency is
+// compared by this ordinal, NOT the token's wall-clock prefix — a system clock correction
+// (backward or forward) would otherwise reorder turns (deny a newer turn's continuation, or expire
+// a live grant and admit a second driver). A monotonic counter is immune to clock jumps.
+let turnOrdinalCounter = 0;
+const turnOrdinalByToken = new Map<string, number>();
+const TURN_ORDINAL_MAX = 2000; // bound the map (evict oldest)
+function recordIssuedTurnToken(token: string): void {
+  if (turnOrdinalByToken.has(token)) return;
+  turnOrdinalByToken.set(token, ++turnOrdinalCounter);
+  while (turnOrdinalByToken.size > TURN_ORDINAL_MAX) {
+    const oldest = turnOrdinalByToken.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    turnOrdinalByToken.delete(oldest);
+  }
+}
+// Recency of a turn token: prefer its monotonic ordinal (immune to clock jumps); fall back to the
+// wall-clock `${Date.now()}-…` prefix for a token not issued this session (e.g. a cross-session /
+// pre-restart token, which can't race a live turn anyway). Ordinals are offset above any plausible
+// ms epoch so an ordinal always outranks a wall-clock fallback (a live-session turn is newest).
 function turnTokenTime(token: string): number {
+  const ord = turnOrdinalByToken.get(token);
+  if (ord !== undefined) return Number.MAX_SAFE_INTEGER - TURN_ORDINAL_MAX + ord;
   const dash = token.indexOf('-');
   const n = Number.parseInt(dash > 0 ? token.slice(0, dash) : token, 10);
   return Number.isFinite(n) ? n : 0;
@@ -1142,6 +1164,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       maxSteps?: number | null;
       maxRetries?: number | null;
       runtimeOverride?: string | null;
+      // Set by a renderer-driven CONTINUATION (max-turns auto-continue / plan-restart): the token of
+      // the turn this continuation follows. Main rejects the launch if a NEWER turn was issued for
+      // the conversation since (another client submitted a fresh user turn in the auth->launch
+      // window) — so the genuine new turn wins and the stale continuation is dropped, instead of
+      // this continuation's unconditional abort clobbering it.
+      continuationPredecessorToken?: string;
     },
     responseMessageId?: string,
   ) => {
@@ -1204,6 +1232,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { conversationId, busy: true as const, delivered };
     }
 
+    // STALE-CONTINUATION guard: a renderer-driven continuation carries the predecessor turn's token.
+    // If a NEWER turn has been issued for this conversation since that predecessor (another client
+    // submitted a fresh user turn in the auth->launch window), this continuation is stale — reject it
+    // rather than let its unconditional abort below clobber the genuine newer turn. (A continuation
+    // whose predecessor IS still the latest proceeds normally.)
+    {
+      const predToken = threadOverrides?.continuationPredecessorToken;
+      if (typeof predToken === 'string' && predToken) {
+        const latest = latestIssuedTurnToken.get(conversationId);
+        if (latest !== undefined && latest !== predToken && turnTokenTime(latest) > turnTokenTime(predToken)) {
+          return { conversationId, busy: true as const, delivered: false, staleContinuation: true as const };
+        }
+      }
+    }
+
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
@@ -1251,6 +1294,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
     // Record the latest issued turn token so a delayed continuation request for an OLDER turn is
     // rejected even after a newer turn has already finished (see authorizeContinuation). Bounded.
+    // Also assign a monotonic ordinal so turn recency comparisons are immune to system-clock jumps.
+    recordIssuedTurnToken(streamToken);
     latestIssuedTurnToken.delete(conversationId);
     latestIssuedTurnToken.set(conversationId, streamToken);
     while (latestIssuedTurnToken.size > CONTINUATION_AUTH_MAX) {

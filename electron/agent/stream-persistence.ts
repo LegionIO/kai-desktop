@@ -570,6 +570,14 @@ function persistAccumulatedReturningHead(
           delete (replaced as { tokenCount?: unknown }).tokenCount;
           delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
           nextTree[nodeIdx] = replaced;
+          // Also refresh the LEGACY FLAT `messages` array's matching node — search + Markdown export
+          // read from `messages`, so leaving the web client's frame-capped copy there would make
+          // them permanently show truncated output. Overwrite its content with main's full parts.
+          const nextMessages = Array.isArray(conv.messages)
+            ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
+                m && typeof m === 'object' && m.id === effectiveId ? { ...m, content: acc.parts } : m,
+              )
+            : conv.messages;
           // Preserve the CURRENT head + runStatus if they've moved PAST this node — a newer user
           // turn / branch-nav / replacement run may have advanced the head and set 'running' since
           // this (now-superseded) turn ended. Only when the head still points AT this node (the
@@ -579,6 +587,7 @@ function persistAccumulatedReturningHead(
           const nextConv = {
             ...conv,
             messageTree: nextTree,
+            messages: nextMessages,
             headId: headStillHere && !opts?.keepRunning ? effectiveId : conv.headId,
             runStatus: headStillHere && !opts?.keepRunning ? 'idle' : conv.runStatus,
           } as typeof conv;

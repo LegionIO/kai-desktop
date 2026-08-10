@@ -81,15 +81,12 @@ function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
   // entire serialized upsert frame; once spent, remaining parts are omitted (clients re-fetch full
   // content via conversations:get).
   const budget = newRemoteBudget();
+  // Deep-strip each WHOLE node through the shared cap (under the one shared budget): this caps a
+  // large STRING `content` (a legacy/plugin message can carry a multi-MiB string, which the old
+  // array-only path passed through unchanged and blew the frame) as well as media inside an array
+  // content, and bounds the cumulative frame across all nodes.
   const stripTree = (nodes: unknown): unknown =>
-    Array.isArray(nodes)
-      ? nodes.map((n) => {
-          if (!n || typeof n !== 'object') return n;
-          const m = n as Record<string, unknown>;
-          if (!Array.isArray(m.content)) return n;
-          return { ...m, content: (m.content as unknown[]).map((p) => stripRemoteMediaDeep(p, budget)) };
-        })
-      : nodes;
+    Array.isArray(nodes) ? nodes.map((n) => stripRemoteMediaDeep(n, budget)) : nodes;
   const out: ConversationRecord = {
     ...conv,
     ...(conv.messageTree !== undefined ? { messageTree: stripTree(conv.messageTree) as unknown[] } : {}),

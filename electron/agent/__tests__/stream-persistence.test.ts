@@ -109,6 +109,11 @@ describe('stream persistence accumulator', () => {
         { id: 'u', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
         { id: 'resp-web', parentId: 'u', role: 'assistant', content: [{ type: 'text', text: '[capped]' }] },
       ],
+      // Legacy flat `messages` array (used by search + Markdown export) also carries the capped copy.
+      messages: [
+        { id: 'u', role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-web', role: 'assistant', content: [{ type: 'text', text: '[capped]' }] },
+      ],
     } as unknown as { headId?: string | null });
     feed({ conversationId: 'web', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-web' });
     const head = finalizeInterruptedTurnReplacing(APP_HOME, 'web');
@@ -116,10 +121,17 @@ describe('stream persistence accumulator', () => {
     expect(appendMock).not.toHaveBeenCalled();
     expect(writeMock).toHaveBeenCalledTimes(1);
     expect(head).toBe('resp-web');
-    const writtenConv = writeMock.mock.calls[0][1] as { messageTree: Array<{ id: string; content: unknown }> };
+    const writtenConv = writeMock.mock.calls[0][1] as {
+      messageTree: Array<{ id: string; content: unknown }>;
+      messages: Array<{ id: string; content: unknown }>;
+    };
     const node = writtenConv.messageTree.find((m) => m.id === 'resp-web')!;
     expect(JSON.stringify(node.content)).toContain('FULL reply');
     expect(JSON.stringify(node.content)).not.toContain('[capped]');
+    // The legacy flat `messages` node is ALSO refreshed (search/export read from it).
+    const flat = writtenConv.messages.find((m) => m.id === 'resp-web')!;
+    expect(JSON.stringify(flat.content)).toContain('FULL reply');
+    expect(JSON.stringify(flat.content)).not.toContain('[capped]');
     clearFinalizedResponseIds('web');
   });
 
