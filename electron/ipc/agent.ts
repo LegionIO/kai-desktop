@@ -397,6 +397,12 @@ const guiFallbackRemoteOrigin = new Set<string>();
 // assistant permanently frame-capped. So the new-turn admission finalize-REPLACES the pending copy
 // FIRST (before discarding). Cleared when the poll/defer resolves.
 const pendingRemoteReplace = new Set<string>();
+// Same idea for a LOCAL-origin GUI fallback whose terminal persistence poll is in flight: the
+// guiFallbackParents marker is consumed when the poll starts, so a new-turn admission during the
+// poll window can't see the live local fallback and would discard main's full accumulator (the sole
+// complete reply if the renderer reloaded before persisting). Admission APPENDS main's copy for a
+// pending LOCAL fallback (unless the renderer already persisted). Cleared when the poll resolves.
+const pendingLocalReplace = new Set<string>();
 let serverPersistAppHome: string | null = null;
 
 // ── Main-authoritative GUI continuation ───────────────────────────────────────
@@ -531,23 +537,30 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
   // losing the uncapped result. The admission finalize-REPLACES a pending copy first (see the
   // agent:stream discard site). Cleared once the poll finalizes/discards normally.
   if (remoteOrigin) pendingRemoteReplace.add(conversationId);
+  else pendingLocalReplace.add(conversationId); // LOCAL fallback: flushable by admission during the poll
   const pollGuiFallback = (remaining: number): void => {
     const owner = activeStreams.get(conversationId)?.token;
-    if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator (admission finalized any pending remote copy)
+    if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator (admission finalized any pending remote/local copy)
     if (isRecentlyDeleted(conversationId)) {
       pendingRemoteReplace.delete(conversationId);
+      pendingLocalReplace.delete(conversationId);
       discardPersistenceAccumulator(conversationId);
       return;
     }
     let rendererPersisted = false;
     try {
       const conv = readConversation(fbAppHome, conversationId);
-      if (conv && conv.runStatus !== 'running') rendererPersisted = true; // its terminal persist wrote idle
+      // A GENUINE terminal persist writes 'idle' (or an error state) — NOT 'awaiting-approval',
+      // which means the turn PAUSED for a tool approval, not finished. Treating awaiting-approval as
+      // "renderer persisted" would discard main's accumulator while the turn is still live (main may
+      // resume + complete it), leaving disk at the pre-approval state. Only a real terminal counts.
+      if (conv && conv.runStatus !== 'running' && conv.runStatus !== 'awaiting-approval') rendererPersisted = true;
     } catch {
       /* best-effort — treat as not-yet-persisted, keep polling */
     }
     if (rendererPersisted) {
       pendingRemoteReplace.delete(conversationId);
+      pendingLocalReplace.delete(conversationId);
       if (remoteOrigin) {
         // REMOTE-originated: the web client persisted a FRAME-CAPPED assistant under the run's
         // responseMessageId. Main holds the FULL events — REPLACE that node's content in place
@@ -564,6 +577,7 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
     }
     if (remaining <= 0) {
       pendingRemoteReplace.delete(conversationId);
+      pendingLocalReplace.delete(conversationId);
       // Budget exhausted, runStatus still 'running' → the renderer reloaded/crashed. Persist
       // main's accumulated reply, reset runStatus, settle. finalizeInterruptedTurn no-ops if empty.
       try {
@@ -1264,11 +1278,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       } catch {
         /* fall through to the discard below */
       }
-    } else if (guiFallbackParents.delete(conversationId) && hasPersistenceAccumulator(conversationId)) {
+    } else if (
+      // LOCAL fallback either not-yet-polling (guiFallbackParents still set) OR mid-poll
+      // (pendingLocalReplace set — guiFallbackParents already consumed by the poll).
+      (guiFallbackParents.delete(conversationId) || pendingLocalReplace.delete(conversationId)) &&
+      hasPersistenceAccumulator(conversationId)
+    ) {
       let rendererPersisted = false;
       try {
         const prior = readConversation(appHome, conversationId);
-        if (prior && prior.runStatus !== 'running') rendererPersisted = true;
+        // Only a GENUINE terminal (idle/error) means the renderer persisted — 'awaiting-approval'
+        // is a live pause, so main's full copy is still needed (don't drop it as redundant).
+        if (prior && prior.runStatus !== 'running' && prior.runStatus !== 'awaiting-approval') rendererPersisted = true;
       } catch {
         /* treat as not-persisted → flush main's full copy */
       }
@@ -1280,6 +1301,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       }
     }
+    pendingLocalReplace.delete(conversationId); // ensure cleared even if the branch above didn't run
     guiFallbackRemoteOrigin.delete(conversationId);
     // Discard any half-accumulated server-persist buffer from a superseded run
     // so its partial output can't merge into this fresh turn's assistant message.
@@ -5766,7 +5788,42 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         pendingRemoteReplace.add(conversationId);
         deferReplace(80); // ~8s budget, matching the GUI fallback poll
       } else {
-        discardPersistenceAccumulator(conversationId);
+        // LOCAL cancel: the renderer's onCancel persists the partial + resets runStatus. Normally
+        // main's copy is then redundant. But if the renderer CRASHES/reloads after cancelStream
+        // returns but before its persist lands, discarding now loses the partial. So DEFER (same as
+        // the remote case, but APPEND main's copy): poll for the renderer's persist; if it lands,
+        // discard main's (renderer owns the write); if it never does, finalize main's partial.
+        const deferLocal = (remaining: number): void => {
+          if (!pendingLocalReplace.has(conversationId)) return;
+          if (activeStreams.has(conversationId)) {
+            pendingLocalReplace.delete(conversationId);
+            return; // a replacement turn's admission already handled the pending local copy
+          }
+          let persisted = false;
+          try {
+            const conv = readConversation(appHome, conversationId);
+            if (conv && conv.runStatus !== 'running' && conv.runStatus !== 'awaiting-approval') persisted = true;
+          } catch {
+            /* keep polling */
+          }
+          if (persisted) {
+            pendingLocalReplace.delete(conversationId);
+            discardPersistenceAccumulator(conversationId); // renderer persisted — no double-write
+            return;
+          }
+          if (remaining <= 0) {
+            pendingLocalReplace.delete(conversationId);
+            try {
+              finalizeInterruptedTurn(appHome, conversationId); // renderer never persisted → save main's partial
+            } catch {
+              discardPersistenceAccumulator(conversationId);
+            }
+            return;
+          }
+          setTimeout(() => deferLocal(remaining - 1), 100);
+        };
+        pendingLocalReplace.add(conversationId);
+        deferLocal(80);
       }
     }
     // A cancel ends the turn — drop its continuation authorization (a resumed turn re-authorizes).
