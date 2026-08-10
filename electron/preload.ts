@@ -1055,8 +1055,8 @@ const appAPI = {
       ipcRenderer.on('dictation:final', handler);
       return () => ipcRenderer.removeListener('dictation:final', handler);
     },
-    onError: (callback: (message: string) => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, message: string) => callback(message);
+    onError: (callback: (message: string | null) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, message: string | null) => callback(message);
       ipcRenderer.on('dictation:error', handler);
       return () => ipcRenderer.removeListener('dictation:error', handler);
     },

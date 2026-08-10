@@ -627,7 +627,7 @@ type AppAPI = {
     onLevel: (callback: (level: number) => void) => () => void;
     onPartial: (callback: (text: string) => void) => () => void;
     onFinal: (callback: (text: string) => void) => () => void;
-    onError: (callback: (message: string) => void) => () => void;
+    onError: (callback: (message: string | null) => void) => () => void;
     onTypingMode: (callback: (mode: string) => void) => () => void;
   };
   titlebar: {
