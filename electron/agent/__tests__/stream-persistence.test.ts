@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const appendMock = vi.fn();
 const readMock = vi.fn((_appHome?: string, _conversationId?: string) => null as { headId?: string | null } | null);
+const writeMock = vi.fn((_appHome: string, conv: unknown) => conv);
 vi.mock('../../ipc/conversations.js', () => ({
   // Return a minimal record whose headId is the id of the appended assistant
   // message, so finalizeInterruptedTurn's "return the new head" contract can be
@@ -22,13 +23,14 @@ vi.mock('../../ipc/conversations.js', () => ({
 }));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readConversation: (appHome: string, conversationId: string) => readMock(appHome, conversationId),
-  writeConversation: vi.fn(),
+  writeConversation: (appHome: string, conv: unknown) => writeMock(appHome, conv),
 }));
 
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
+  finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
 } from '../stream-persistence.js';
@@ -94,6 +96,31 @@ describe('stream persistence accumulator', () => {
     expect(secondMsg.id).toContain('resp-1'); // derived from it for traceability
     expect(secondHead).toBeTruthy();
     clearFinalizedResponseIds('cont');
+  });
+
+  it('finalizeInterruptedTurnReplacing REPLACES an existing assistant node (web-origin) instead of appending a duplicate', () => {
+    clearFinalizedResponseIds('web');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    readMock.mockReturnValueOnce({
+      id: 'web',
+      headId: 'resp-web',
+      messageTree: [
+        { id: 'u', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-web', parentId: 'u', role: 'assistant', content: [{ type: 'text', text: '[capped]' }] },
+      ],
+    } as unknown as { headId?: string | null });
+    feed({ conversationId: 'web', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-web' });
+    const head = finalizeInterruptedTurnReplacing(APP_HOME, 'web');
+    // REPLACE via writeConversation (no append → no duplicate sibling variant).
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    expect(head).toBe('resp-web');
+    const writtenConv = writeMock.mock.calls[0][1] as { messageTree: Array<{ id: string; content: unknown }> };
+    const node = writtenConv.messageTree.find((m) => m.id === 'resp-web')!;
+    expect(JSON.stringify(node.content)).toContain('FULL reply');
+    expect(JSON.stringify(node.content)).not.toContain('[capped]');
+    clearFinalizedResponseIds('web');
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {

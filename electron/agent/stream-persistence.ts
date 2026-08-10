@@ -6,6 +6,7 @@ import {
   ensureConversationTree,
   getConversationBranch,
 } from '../ipc/conversations.js';
+import type { StoredTreeMessage } from '../ipc/conversations.js';
 import { readConversation, writeConversation, nextCompactionRevision } from '../ipc/conversation-store.js';
 import { getAppHome } from '../local-bridge/paths.js';
 import { isStrictPrefix, messageContentSignature } from './compaction.js';
@@ -392,6 +393,13 @@ export function finalizeInterruptedTurn(appHome: string, conversationId: string)
   return persistAccumulatedReturningHead(appHome, conversationId);
 }
 
+// Like finalizeInterruptedTurn but for a REMOTE-originated turn: the web client already persisted a
+// frame-capped assistant node under the same responseMessageId, so REPLACE that node's content with
+// main's full copy (upsert by id) rather than appending a duplicate sibling variant.
+export function finalizeInterruptedTurnReplacing(appHome: string, conversationId: string): string | null {
+  return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
+}
+
 export type PersistedInjectedUserTurn = {
   /** Stable id of the user node appended to the authoritative conversation tree. */
   messageId: string;
@@ -466,7 +474,7 @@ function persistAccumulated(appHome: string, conversationId: string): boolean {
 function persistAccumulatedReturningHead(
   appHome: string,
   conversationId: string,
-  opts?: { keepRunning?: boolean },
+  opts?: { keepRunning?: boolean; replaceById?: boolean },
 ): string | null {
   const acc = accumulators.get(conversationId);
   accumulators.delete(conversationId);
@@ -545,9 +553,40 @@ function persistAccumulatedReturningHead(
           `parts=${acc.parts.length}${orphanRisk ? ' ORPHAN_RISK=true' : ''}`,
       );
     }
+    // REMOTE-origin upsert (replaceById): a web client already persisted a FRAME-CAPPED assistant
+    // node under this same responseMessageId; appending would collision-rename to a bogus sibling
+    // variant. Instead, REPLACE that node's content in place with main's FULL parts. Only when a
+    // node with that id actually exists on disk; else fall through to the normal append.
+    if (opts?.replaceById && effectiveId) {
+      try {
+        const conv = readConversation(appHome, conversationId);
+        const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
+        const nodeIdx = treeArr ? treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant') : -1;
+        if (conv && treeArr && nodeIdx >= 0) {
+          const nextTree = treeArr.slice();
+          // Overwrite content; drop the cached token count/sig so writeConversation's backfill
+          // recomputes them for the new (full) content.
+          const replaced = { ...nextTree[nodeIdx], content: acc.parts };
+          delete (replaced as { tokenCount?: unknown }).tokenCount;
+          delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
+          nextTree[nodeIdx] = replaced;
+          const nextConv = {
+            ...conv,
+            messageTree: nextTree,
+            headId: opts?.keepRunning ? conv.headId : effectiveId,
+            runStatus: opts?.keepRunning ? conv.runStatus : 'idle',
+          } as typeof conv;
+          const written = writeConversation(appHome, nextConv);
+          markResponseFinalized(conversationId, acc.responseMessageId);
+          broadcastUpsert(appHome, written);
+          return effectiveId;
+        }
+      } catch {
+        // Fall through to the normal append on any read/write failure.
+      }
+    }
     // Parent on the head captured at submit so a mid-run branch change
     // (rewind/edit/variant) can't reparent the reply. `parentId: undefined`
-    // in options falls back to the current head, so only pass it when known.
     // runStatus: keep 'running' when the caller is saving an intermediate
     // errored variant mid-fallback (the retry is still in flight) — otherwise a
     // concurrent automation could see 'idle' and fork the branch; else 'idle'.

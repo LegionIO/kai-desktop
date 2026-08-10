@@ -30,11 +30,13 @@ import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
+  finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
   messageContentSignature,
 } from '../agent/stream-persistence.js';
 import { drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
+import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
 import {
@@ -400,6 +402,13 @@ let serverPersistAppHome: string | null = null;
 // needed: a crashed/reloaded winner simply isn't the one asking for the NEXT turn's authorization.
 const continuationAuthByConv = new Map<string, { turnToken: string; clientId: string; grantedAt: number }>();
 const CONTINUATION_AUTH_MAX = 500; // bound the map (evict oldest) — conversations touched are few
+// The most recent stream token ISSUED for each conversation (set at every stream start). Used to
+// reject a continuation request for a turn OLDER than the latest issued — covers the case where a
+// newer turn B started AND FINISHED (leaving no active stream token and no continuation-auth record)
+// before turn A's delayed continuation request arrives: without this, A's request would find no
+// active token + no record and be wrongly granted, relaunching stale history. Bounded like the auth
+// map; a missing entry (evicted) falls back to the other recency rules.
+const latestIssuedTurnToken = new Map<string, string>();
 // A grant is abandoned if its holder never launches within this window (crashed/reloaded after
 // authorization but before the continuation started). After it, another client (including the
 // reloaded one with a fresh clientId) may win the SAME turn — so a crash can't wedge continuation.
@@ -435,6 +444,10 @@ function authorizeContinuation(conversationId: string, clientId: string, turnTok
   // authoritative anti-stale guard — an older/superseded turn is never the active token.
   const activeToken = activeStreams.get(conversationId)?.token;
   if (activeToken !== undefined && activeToken !== turnToken) return false;
+  // Reject a turn OLDER than the latest one ever issued for this conversation — covers a newer turn
+  // that already started AND finished (no active token, no auth record) before this delayed request.
+  const latestIssued = latestIssuedTurnToken.get(conversationId);
+  if (latestIssued !== undefined && turnTokenTime(turnToken) < turnTokenTime(latestIssued)) return false;
   const existing = continuationAuthByConv.get(conversationId);
   if (existing && existing.turnToken === turnToken) {
     // Same turn: only the holder may (re)win it, unless the grant went stale (holder gone).
@@ -496,12 +509,11 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
     }
     if (rendererPersisted) {
       if (remoteOrigin) {
-        // REMOTE-originated: the web client persisted a FRAME-CAPPED tree (media stripped in
-        // transit). Main holds the FULL events, so finalize MAIN's copy as authoritative — it
-        // overwrites the capped placeholders with the real media. Main is the single writer here,
-        // so there's no double-persist race (the remote client only rendered/optimistically wrote).
+        // REMOTE-originated: the web client persisted a FRAME-CAPPED assistant under the run's
+        // responseMessageId. Main holds the FULL events — REPLACE that node's content in place
+        // (upsert by id) with main's full copy, rather than appending a duplicate sibling variant.
         try {
-          finalizeInterruptedTurn(fbAppHome, conversationId);
+          finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
         } catch {
           discardPersistenceAccumulator(conversationId);
         }
@@ -731,68 +743,10 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
-  // REMOTE clients (web WS 4 MiB / CLI local-bridge 8 MiB frame caps) can't take the full
-  // pre-compaction `originalContent` that tool-compaction/tool-result events carry (the OVERSIZED
-  // text that triggered compaction — up to many MiB), nor large nested `_modelContent` media in a
-  // tool result. Sending over-frame disconnects the socket. Local Electron windows have no frame
-  // cap and keep the full payload (for the "view original" affordance); a remote client re-fetches
-  // the persisted record via conversations:get. Cap only the remote payload.
-  broadcastToWebClients('agent:stream-event', capRemoteStreamEvent(eventToBroadcast));
-}
-
-// Cap the oversized fields of a stream event for the remote (frame-capped) fan-out. Returns the
-// event unchanged when nothing needs capping (the common case), else a shallow-cloned copy with:
-//  - tool-compaction: data.originalContent replaced when large;
-//  - tool-result: compaction.originalContent replaced when large, and the result payload's nested
-//    base64/_modelContent stripped (bounded recursion) so a media-heavy result can't exceed a frame.
-const REMOTE_ORIGINAL_CAP = 4096;
-function capRemoteStreamEvent(event: StreamEvent): StreamEvent {
-  const type = (event as { type?: string }).type;
-  if (type === 'tool-compaction') {
-    const data = (event as { data?: { originalContent?: unknown } }).data;
-    if (typeof data?.originalContent === 'string' && data.originalContent.length > REMOTE_ORIGINAL_CAP) {
-      const ev = event as { data: Record<string, unknown> };
-      return { ...ev, data: { ...ev.data, originalContent: '[omitted-in-broadcast]' } } as StreamEvent;
-    }
-    return event;
-  }
-  if (type === 'tool-result') {
-    const e = event as {
-      compaction?: { originalContent?: unknown };
-      result?: unknown;
-    };
-    const bigOriginal =
-      typeof e.compaction?.originalContent === 'string' && e.compaction.originalContent.length > REMOTE_ORIGINAL_CAP;
-    const hasResult = e.result !== undefined && e.result !== null;
-    if (!bigOriginal && !hasResult) return event;
-    const out: Record<string, unknown> = { ...(event as Record<string, unknown>) };
-    if (bigOriginal) {
-      out.compaction = { ...(e.compaction as object), originalContent: '[omitted-in-broadcast]' };
-    }
-    if (hasResult) out.result = stripRemoteMediaDeep(e.result);
-    return out as StreamEvent;
-  }
-  return event;
-}
-// Bounded recursive strip of base64/_modelContent from a tool-result payload for remote fan-out.
-const REMOTE_STRIP_MAX_DEPTH = 8;
-function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
-  if (Array.isArray(value)) {
-    // Depth exhausted → omit the container rather than pass an un-scrubbed subtree over-frame.
-    return depth >= REMOTE_STRIP_MAX_DEPTH ? '[omitted-in-broadcast]' : value.map((v) => stripRemoteMediaDeep(v, depth + 1));
-  }
-  if (!value || typeof value !== 'object') return value;
-  if (depth >= REMOTE_STRIP_MAX_DEPTH) return '[omitted-in-broadcast]'; // omit un-scrubbed object at ceiling
-  const src = value as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...src };
-  for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
-    if (typeof out[k] === 'string' && (out[k] as string).length > 256) out[k] = '[omitted-in-broadcast]';
-  }
-  if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
-  for (const [k, v] of Object.entries(out)) {
-    if (v && typeof v === 'object') out[k] = stripRemoteMediaDeep(v, depth + 1);
-  }
-  return out;
+  // REMOTE clients are frame-capped (web WS 4 MiB / CLI local-bridge 8 MiB) — strip oversized
+  // media/originals from the copy fanned out to them (local Electron windows keep the full event).
+  // Shared with the sub-agent broadcast (electron/agent/remote-frame-cap.ts).
+  broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
 }
 
 /**
@@ -1245,6 +1199,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
+    // Record the latest issued turn token so a delayed continuation request for an OLDER turn is
+    // rejected even after a newer turn has already finished (see authorizeContinuation). Bounded.
+    latestIssuedTurnToken.delete(conversationId);
+    latestIssuedTurnToken.set(conversationId, streamToken);
+    while (latestIssuedTurnToken.size > CONTINUATION_AUTH_MAX) {
+      const oldest = latestIssuedTurnToken.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      latestIssuedTurnToken.delete(oldest);
+    }
 
     // Is this run driven by agent:submit (CLI/headless)? That path ALREADY
     // broadcast the user-message (with a submitNonce for dedup) before calling us
@@ -5626,11 +5589,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // run's finally → cleanupStreamIfOwned finds no owned entry and SKIPS finalizeGuiFallbackIfOwned
     // — leaking the fallback accumulator + guiFallbackParents marker. Clean them up here directly
     // (like the inject bookkeeping above). On cancel the RENDERER's onCancel persists the partial +
-    // resets runStatus, so main's fallback DISCARDS (no double-write) rather than finalizes.
+    // resets runStatus, so main's fallback normally DISCARDS (no double-write). EXCEPT a REMOTE
+    // origin: the web client's cancel-persist carries the FRAME-CAPPED partial, so main must
+    // REPLACE-finalize its FULL copy (upsert by id) instead of discarding — else Stop after a large
+    // tool result would permanently store only omission placeholders.
+    const remoteOriginCancel = guiFallbackRemoteOrigin.delete(conversationId);
     if (guiFallbackParents.delete(conversationId)) {
-      discardPersistenceAccumulator(conversationId);
+      if (remoteOriginCancel) {
+        try {
+          finalizeInterruptedTurnReplacing(appHome, conversationId);
+        } catch {
+          discardPersistenceAccumulator(conversationId);
+        }
+      } else {
+        discardPersistenceAccumulator(conversationId);
+      }
     }
-    guiFallbackRemoteOrigin.delete(conversationId); // clear the origin marker on cancel too
     // A cancel ends the turn — drop its continuation authorization (a resumed turn re-authorizes).
     releaseContinuationAuth(conversationId);
     if (wasServerPersist) {

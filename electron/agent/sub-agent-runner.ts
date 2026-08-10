@@ -8,6 +8,7 @@
 
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { capRemoteEvent } from './remote-frame-cap.js';
 import { z } from 'zod';
 import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames, buildAgentInstructions } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
@@ -149,7 +150,10 @@ function broadcastSubAgentEvent(event: SubAgentEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', event);
   }
-  broadcastToWebClients('agent:stream-event', event);
+  // REMOTE clients are frame-capped (web 4 MiB / CLI 8 MiB) — a sub-agent tool result can retain
+  // large media/originals that would exceed a frame and disconnect the socket. Strip the remote
+  // copy (same shared cap as the parent stream); local Electron windows get the full event.
+  broadcastToWebClients('agent:stream-event', capRemoteEvent(event));
 }
 
 /** Sub-agent control signal — set by the sub_agent_control tool */
