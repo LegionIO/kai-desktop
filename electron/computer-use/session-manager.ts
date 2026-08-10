@@ -22,8 +22,8 @@ import type { AppshotMetadata } from '../../shared/appshots.js';
 import { createAppshotStore, jpegBytesFromDataUrl } from './appshot-store.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { resolvePersistedAppShotsConfig, type AppConfig } from '../config/schema.js';
-import { resolveModelCatalog, resolveModelForThread } from '../agent/model-catalog.js';
-import { ComputerUseOrchestrator } from './orchestrator.js';
+import { resolveModelCatalog } from '../agent/model-catalog.js';
+import { ComputerUseOrchestrator, getEntryForRole } from './orchestrator.js';
 import { closeOperatorWindow, openComputerSetupWindow, openOperatorWindow } from './operator-window.js';
 import { closeOverlayWindow, createOverlayWindow, updateOverlayState } from './overlay-window.js';
 import {
@@ -407,9 +407,15 @@ export class ComputerUseSessionManager extends EventEmitter {
   private pushOverlayState(session: ComputerSession): void {
     const config = this.getConfig();
     const catalog = resolveModelCatalog(config);
+    // Resolve the banner's model the SAME way the orchestrator resolves the model
+    // that actually plans/drives each cycle (getEntryForRole), so the banner title
+    // can't drift from the status message ("Planning with <model>..."). A stale or
+    // absent session.selectedModelKey under an active profile otherwise made the
+    // banner fall back to the global default model while the loop ran on the
+    // profile's primary. An explicit session pick (byKey) still wins.
     const modelEntry = session.selectedModelKey
-      ? catalog.byKey.get(session.selectedModelKey)
-      : resolveModelForThread(config, null);
+      ? (catalog.byKey.get(session.selectedModelKey) ?? getEntryForRole(config, session, 'driver'))
+      : getEntryForRole(config, session, 'driver');
 
     const cycleTiming = this.orchestrator.getCycleTiming(session.id);
 
