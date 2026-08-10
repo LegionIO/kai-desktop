@@ -1082,7 +1082,7 @@ export function registerConversationHandlers(
     // of indexed ids AND on-disk record files, so an ORPHAN record (file present, no index entry)
     // is torn down + tombstoned too (else its live stream keeps running / a stale persist recreates
     // it). Abort each cleared conversation's live agent stream, automation, and compaction.
-    const cleared = clearAllConversations(appHome);
+    const { cleared, fullyCleared } = clearAllConversations(appHome);
     for (const conversationId of cleared) {
       cancelConversationStream(conversationId);
       abortAutomationForConversation(conversationId);
@@ -1101,13 +1101,12 @@ export function registerConversationHandlers(
     }
 
     // A FULL reset tells clients to discard EVERY accumulator + supersede their generations. That's
-    // correct only when everything was actually cleared. If a record's rm FAILED, clearAllConversations
-    // PRESERVED it (and left its stream running) — a full reset would then make clients drop that
-    // preserved live run's accumulator (its tools keep executing, output ignored/unpersisted). So:
-    // reset only when the store is now empty; otherwise clear diffs + broadcast a per-id DELETE for
-    // each successfully-cleared id, leaving the preserved conversation(s) intact on clients.
-    const storeEmptyNow = Object.keys(readIndex(appHome).conversations).length === 0;
-    if (storeEmptyNow) {
+    // correct only when EVERYTHING was actually removed. If ANY record's rm FAILED (an indexed OR an
+    // orphan file survived), clearAllConversations reports fullyCleared=false and left that record +
+    // its live stream intact — a full reset would then drop that surviving run's accumulator on
+    // clients (its tools keep executing, output ignored). So: reset only when fully cleared;
+    // otherwise clear diffs + broadcast a per-id DELETE for each successfully-cleared id.
+    if (fullyCleared) {
       clearAllDiffs();
       broadcastReset(appHome);
     } else {

@@ -947,6 +947,9 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
 type RejectedDraft = { id: string; text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
+// Conversations with a draft claim currently in flight on THIS client — serializes the load-restore
+// and the composer-empty poll so they can't both claim (and double-restore) the same draft.
+const draftClaimInFlight = new Set<string>();
 // Rejected drafts are DURABLE USER INPUT (the user's unsent text/attachments), NOT a cache —
 // per the durably-persist decision they are cleared ONLY on restore into the composer or when
 // the conversation is deleted, NEVER by a time-based TTL or count-eviction (both silently lose
@@ -1029,8 +1032,14 @@ async function claimAndRestoreDraft(
   convId: string,
   restore: (d: RejectedDraft) => boolean,
 ): Promise<void> {
+  // Renderer-side claim-in-flight guard: the load-time restore and the composer-empty poll can
+  // overlap for the SAME conversation, and main treats THIS client's own live reservation as
+  // available (so it can re-claim after a crash) — so two concurrent same-client claims would both
+  // receive the draft and double-restore it. Serialize per conversation on this client.
+  if (draftClaimInFlight.has(convId)) return;
   const id = peekOldestRejectedDraftId(convId);
   if (!id) return;
+  draftClaimInFlight.add(convId);
   try {
     const res = await app.conversations.claimPendingDraft?.(convId, id, CONTINUATION_CLIENT_ID);
     if (res === undefined) {
@@ -1070,6 +1079,8 @@ async function claimAndRestoreDraft(
     }
   } catch {
     // Claim failed — leave the draft in place (both disk and local) for a later retry tick.
+  } finally {
+    draftClaimInFlight.delete(convId);
   }
 }
 // Apply a DELTA to a conversation record's durable `pendingDrafts` — add these drafts, remove
@@ -4027,14 +4038,103 @@ export function RuntimeProvider({
                 clearTimeout(_ptDenied);
                 persistTimersRef.current.delete(convId);
               }
+              // WINNER-FAILURE RECOVERY: if the authorized winner dies AFTER auth but BEFORE it
+              // launches, no client re-asks and the main-side grant just expires (~20s) with the
+              // continuation never happening. So schedule ONE re-attempt just past that TTL: re-ask
+              // authorization for this SAME turn — if the winner launched, its continuation started a
+              // NEW turn (this old turnToken is no longer the active stream) so main DENIES and we do
+              // nothing; if the winner vanished, the old turn is still active + its grant is stale so
+              // main GRANTS us, and we drive the continuation from the CONFIRMED disk branch.
+              const denyRc = acc.runConfig;
+              const denyLive = streamHandlerRef.current;
+              const retryCfg = denyRc ?? {
+                selectedModelKey: denyLive.selectedModelKey,
+                reasoningEffort: denyLive.reasoningEffort,
+                selectedProfileKey: denyLive.selectedProfileKey,
+                fallbackEnabled: denyLive.fallbackEnabled,
+                executionMode: denyLive.executionMode,
+                threadOverrides: denyLive.threadOverrides,
+                cwd: currentWorkingDirectoryRef.current,
+              };
+              const retryToken = turnToken;
               streamAccumulators.delete(convId);
               if (isActiveConv) {
                 setIsRunning(false);
                 void loadConversationState(convId, { skipInFlightSeed: true });
               }
+              setTimeout(() => {
+                void (async () => {
+                  // Only if nothing is driving this conversation now (no live accumulator = no
+                  // winner continuation running / took over).
+                  if (streamAccumulators.has(convId)) return;
+                  let regranted = false;
+                  try {
+                    const r = await app.agent.authorizeContinuation?.(convId, CONTINUATION_CLIENT_ID, retryToken ?? convId);
+                    regranted = Boolean(r?.authorized);
+                  } catch {
+                    regranted = false;
+                  }
+                  if (!regranted || streamAccumulators.has(convId)) return;
+                  const confirmed = await app.conversations.get(convId).catch(() => null);
+                  const tree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
+                    ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
+                    : null;
+                  const head = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
+                  if (!tree || tree.length === 0 || !head) return;
+                  const branchRetry = getActiveBranch(tree, head);
+                  const rid = msgId();
+                  supersedeCurrentGeneration(convId);
+                  streamAccumulators.set(convId, {
+                    messages: [...tree],
+                    headId: head,
+                    pendingAssistantTiming: createPendingAssistantTiming(),
+                    pendingAssistantId: rid,
+                    runConfig: retryCfg,
+                    locallyOriginated: true, // this client is now the driver
+                  });
+                  await persistConversation(convId, tree, head, { runStatus: 'running' });
+                  if (streamAccumulators.get(convId)?.pendingAssistantId !== rid) return;
+                  launchAgentStream(
+                    convId,
+                    branchRetry,
+                    retryCfg.selectedModelKey ?? undefined,
+                    retryCfg.reasoningEffort ?? 'medium',
+                    retryCfg.selectedProfileKey ?? undefined,
+                    retryCfg.fallbackEnabled ?? false,
+                    retryCfg.cwd ?? undefined,
+                    retryCfg.executionMode ?? 'auto',
+                    retryCfg.threadOverrides ?? undefined,
+                    rid,
+                  );
+                })();
+              }, 21000);
               return;
             }
             // Authorized — finalize current response and immediately restart the stream.
+            // A MIRROR that WON (a reloaded sole client) has only a PARTIAL accumulator (built from
+            // post-reload broadcasts) — continuing from it would persist TRUNCATED history and
+            // discard main's complete copy. So for a non-locally-originated winner, reload the
+            // CONFIRMED full branch from disk (main's GUI persistence fallback finalized it) and
+            // continue from THAT, not the partial in-memory accumulator.
+            if (acc.locallyOriginated !== true) {
+              try {
+                const confirmed = await app.conversations.get(convId);
+                const confirmedTree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
+                  ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
+                  : null;
+                const confirmedHead = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
+                // Only adopt the disk branch if it is at least as complete as our partial one
+                // (never regress to fewer messages — a not-yet-finalized disk read).
+                if (confirmedTree && confirmedTree.length >= acc.messages.length) {
+                  acc.messages = confirmedTree;
+                  if (confirmedHead) acc.headId = confirmedHead;
+                }
+              } catch {
+                /* disk read failed — fall back to the in-memory branch (best-effort) */
+              }
+              // Re-validate ownership after the await.
+              if (streamAccumulators.get(convId) !== acc) return;
+            }
             finalizeAssistantResponse(acc);
             const _ptAC = persistTimersRef.current.get(convId);
             if (_ptAC) {

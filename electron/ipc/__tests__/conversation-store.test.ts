@@ -255,8 +255,9 @@ describe('per-file read/write', () => {
       settings: {},
       deletedIds: [],
     });
-    const cleared = clearAllConversations(appHome);
+    const { cleared, fullyCleared } = clearAllConversations(appHome);
     expect(cleared.sort()).toEqual(['indexed', 'orphanfile']);
+    expect(fullyCleared).toBe(true); // both files removed → a full clear
     // BOTH are durably tombstoned so neither can be resurrected.
     const deleted = readIndex(appHome).deletedIds ?? [];
     expect(deleted).toEqual(expect.arrayContaining(['indexed', 'orphanfile']));

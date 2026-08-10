@@ -1244,11 +1244,13 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   return removed;
 }
 
-/** Wipe all conversations. Returns the ids that were actually cleared (the UNION of indexed ids and
- *  on-disk record files) so the caller can cancel live streams + broadcast a delete for each —
- *  INCLUDING an orphan record (file present, no index entry, e.g. after a file write landed but the
- *  index write failed), which a live stream could otherwise keep running / a stale persist recreate. */
-export function clearAllConversations(appHome: string): string[] {
+/** Wipe all conversations. Returns `{ cleared, fullyCleared }`: `cleared` is the ids actually
+ *  removed (the UNION of indexed ids and on-disk record files, INCLUDING an orphan record whose file
+ *  exists but has no index entry) so the caller can cancel streams + broadcast a delete for each;
+ *  `fullyCleared` is false if ANY record file survived (an rm failure — indexed OR orphan), so the
+ *  caller must NOT broadcast a full reset (that would drop clients' accumulators for a still-live
+ *  surviving run). */
+export function clearAllConversations(appHome: string): { cleared: string[]; fullyCleared: boolean } {
   // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
   assertMigratedBeforeWrite(appHome);
   const priorIndex = readIndex(appHome);
@@ -1267,6 +1269,7 @@ export function clearAllConversations(appHome: string): string[] {
   // confirmed GONE (removed now, or already absent = an index-only entry) are actually cleared.
   const cleared: string[] = [];
   const preserved: Record<string, ConversationIndexEntry> = {};
+  let anySurvived = false;
   for (const id of candidateIds) {
     let fileGone = false;
     try {
@@ -1280,8 +1283,9 @@ export function clearAllConversations(appHome: string): string[] {
       // Tombstone only once the file is actually gone so a stale in-flight persist can't resurrect.
       tombstoneConversation(id);
       cleared.push(id);
-    } else if (priorIndex.conversations[id]) {
-      preserved[id] = priorIndex.conversations[id]; // keep the surviving record's index entry
+    } else {
+      anySurvived = true; // a file (indexed OR orphan) survived — NOT a full clear
+      if (priorIndex.conversations[id]) preserved[id] = priorIndex.conversations[id];
     }
   }
   // Carry the durable deleted-id ring forward (preserving prior tombstones) and add every id we
@@ -1297,7 +1301,7 @@ export function clearAllConversations(appHome: string): string[] {
   };
   for (const id of cleared) pushDurableDeletedId(nextIndex, id);
   writeIndex(appHome, nextIndex);
-  return cleared;
+  return { cleared, fullyCleared: !anySurvived };
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────
