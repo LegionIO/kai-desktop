@@ -130,22 +130,24 @@ const memoryConfigSchema = z.object({
 const toolCompactionSchema = z.object({
   enabled: z.boolean(),
   useAI: z.boolean(),
-  triggerTokens: z.number().positive(),
-  outputMaxTokens: z.number().positive(),
-  truncateMinChars: z.number().positive(),
+  // Token/char counts must be whole numbers >= 1: a fractional budget (e.g. 0.5) truncates every
+  // non-empty result to '' (any non-empty string costs >= 1 token), silently erasing context.
+  triggerTokens: z.number().int().min(1),
+  outputMaxTokens: z.number().int().min(1),
+  truncateMinChars: z.number().int().min(1),
   truncateHeadRatio: z.number().min(0).max(1),
-  truncateMinTailChars: z.number().positive(),
+  truncateMinTailChars: z.number().int().min(1),
 });
 
 const conversationCompactionSchema = z.object({
   enabled: z.boolean(),
   mode: z.enum(['observational-memory']),
   triggerPercent: z.number().min(0).max(1),
-  ignoreRecentUserMessages: z.number().nonnegative(),
-  ignoreRecentAssistantMessages: z.number().nonnegative(),
-  outputMaxTokens: z.number().positive(),
-  promptReserveTokens: z.number().positive(),
-  contextWindowTokens: z.number().positive().optional(),
+  ignoreRecentUserMessages: z.number().int().nonnegative(),
+  ignoreRecentAssistantMessages: z.number().int().nonnegative(),
+  outputMaxTokens: z.number().int().min(1),
+  promptReserveTokens: z.number().int().min(1),
+  contextWindowTokens: z.number().int().min(1).optional(),
 });
 
 /**

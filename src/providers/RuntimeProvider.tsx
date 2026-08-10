@@ -1195,6 +1195,40 @@ function createPendingAssistantTiming(startedAt = nowIso()): PendingAssistantTim
   return { startedAt };
 }
 
+// Reconstruct a run's captured settings from a persisted conversation record — used when a passive
+// mirror (no in-memory runConfig) wins a continuation and must restart with THIS conversation's
+// model/profile/CWD/thread overrides rather than the currently-active chat's live refs.
+function runConfigFromConversationRecord(conv: Record<string, unknown>): NonNullable<MessageAccumulator['runConfig']> {
+  const s = conv as {
+    selectedModelKey?: string | null;
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    selectedProfileKey?: string | null;
+    fallbackEnabled?: boolean;
+    currentWorkingDirectory?: string | null;
+    executionMode?: 'auto' | 'plan-first';
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  };
+  return {
+    selectedModelKey: s.selectedModelKey ?? null,
+    reasoningEffort: s.reasoningEffort ?? undefined,
+    selectedProfileKey: s.selectedProfileKey ?? null,
+    fallbackEnabled: s.fallbackEnabled ?? false,
+    cwd: s.currentWorkingDirectory ?? null,
+    executionMode: s.executionMode ?? undefined,
+    threadOverrides: {
+      temperature: s.temperature ?? null,
+      systemPromptOverride: s.systemPromptOverride ?? null,
+      maxSteps: s.maxSteps ?? null,
+      maxRetries: s.maxRetries ?? null,
+      runtimeOverride: s.runtimeOverride ?? null,
+    },
+  };
+}
+
 function getAccumulatorStartedAt(acc: MessageAccumulator | undefined): string | null {
   if (!acc) return null;
 
@@ -4144,6 +4178,14 @@ export function RuntimeProvider({
                   acc.messages = confirmedTree;
                   if (confirmedHead) acc.headId = confirmedHead;
                 }
+                // A PLAIN passive mirror (a 2nd viewer, not a reload) built purely from broadcasts
+                // has NO runConfig; without it the continuation below falls back to the ACTIVE
+                // chat's live model/profile/CWD — wrong for a background conv the user switched away
+                // from (relative-path tools could hit the wrong workspace). Hydrate the run settings
+                // from THIS conversation's persisted record before continuing.
+                if (!acc.runConfig && confirmed) {
+                  acc.runConfig = runConfigFromConversationRecord(confirmed as Record<string, unknown>);
+                }
               } catch {
                 /* main finalize / disk read failed — treated as unconfirmed below */
                 finConfirmed = false;
@@ -4694,7 +4736,7 @@ export function RuntimeProvider({
             // a `?? live` fallback would wrongly inherit the active chat's model/profile).
             const planLive = streamHandlerRef.current;
             const planRc = acc.runConfig;
-            const planCfgSnapshot = planRc
+            let planCfgSnapshot = planRc
               ? {
                   selectedModelKey: planRc.selectedModelKey,
                   reasoningEffort: planRc.reasoningEffort,
@@ -4710,13 +4752,13 @@ export function RuntimeProvider({
                   threadOverrides: planLive.threadOverrides,
                 };
             // cwd follows the same rule: captured VERBATIM (incl. explicit null) when rc present.
-            const planCwdSnapshot = planRc ? planRc.cwd : currentWorkingDirectoryRef.current;
+            let planCwdSnapshot = planRc ? planRc.cwd : currentWorkingDirectoryRef.current;
             // The restart launches in plan-first mode, so the continuation's runConfig must
             // record executionMode:'plan-first' — NOT the original acc.runConfig (usually
             // 'auto'). Otherwise a further max_turns continuation of the RESTARTED planning
             // run would resume in 'auto', silently restoring mutating tools the user expects
             // to be gated during planning.
-            const planRunConfig = { ...(acc.runConfig ?? {}), executionMode: 'plan-first' as const };
+            let planRunConfig = { ...(acc.runConfig ?? {}), executionMode: 'plan-first' as const };
             // Small delay to let the executionMode state update propagate from the
             // onExecutionModeChanged listener in App.tsx.
             setTimeout(async () => {
@@ -4810,6 +4852,23 @@ export function RuntimeProvider({
                   if (confirmedTree && confirmedTree.length > 0) {
                     acc.messages = confirmedTree;
                     if (confirmedHead) acc.headId = confirmedHead;
+                  }
+                  // Plain passive mirror: hydrate run settings from disk (see max-turns). The plan
+                  // config snapshots below were captured from acc.runConfig BEFORE this setTimeout;
+                  // if it was absent, recompute them from the hydrated settings so the restart uses
+                  // THIS conv's model/profile/CWD, not the active chat's.
+                  if (!acc.runConfig && confirmed) {
+                    const hydrated = runConfigFromConversationRecord(confirmed as Record<string, unknown>);
+                    acc.runConfig = hydrated;
+                    planCfgSnapshot = {
+                      selectedModelKey: hydrated.selectedModelKey,
+                      reasoningEffort: hydrated.reasoningEffort,
+                      selectedProfileKey: hydrated.selectedProfileKey,
+                      fallbackEnabled: hydrated.fallbackEnabled,
+                      threadOverrides: hydrated.threadOverrides,
+                    };
+                    planCwdSnapshot = hydrated.cwd;
+                    planRunConfig = { ...hydrated, executionMode: 'plan-first' as const };
                   }
                 } catch {
                   planFinConfirmed = false;

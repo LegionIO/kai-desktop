@@ -1207,17 +1207,37 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
-    // A remote-origin deferred replace-finalize (cancel OR normal terminal) was waiting to overwrite
-    // the web client's capped copy with main's FULL copy. This new turn is about to discard that
-    // accumulator, so FINALIZE the full copy NOW (before discarding) — else the prior assistant
-    // would stay frame-capped.
-    if (pendingRemoteReplace.delete(conversationId)) {
+    // A live GUI persistence FALLBACK for the PRIOR turn is about to be discarded by this new turn.
+    // If main still holds the authoritative full copy and it hasn't been superseded on disk, FLUSH
+    // it first — else the prior turn's complete reply is lost (e.g. a sole renderer reloaded after
+    // terminal output but before its own persist landed, within the fallback poll's window).
+    //   - REMOTE origin (pendingRemoteReplace): replace the web client's capped node in place.
+    //   - LOCAL origin: append main's copy, but ONLY if the renderer hasn't already persisted (disk
+    //     still 'running'); if it persisted (runStatus flipped) main's fallback is redundant → drop.
+    const hadRemotePending = pendingRemoteReplace.delete(conversationId);
+    if (hadRemotePending) {
       try {
         finalizeInterruptedTurnReplacing(appHome, conversationId);
       } catch {
         /* fall through to the discard below */
       }
+    } else if (guiFallbackParents.delete(conversationId) && hasPersistenceAccumulator(conversationId)) {
+      let rendererPersisted = false;
+      try {
+        const prior = readConversation(appHome, conversationId);
+        if (prior && prior.runStatus !== 'running') rendererPersisted = true;
+      } catch {
+        /* treat as not-persisted → flush main's full copy */
+      }
+      if (!rendererPersisted) {
+        try {
+          finalizeInterruptedTurn(appHome, conversationId);
+        } catch {
+          /* fall through to the discard below */
+        }
+      }
     }
+    guiFallbackRemoteOrigin.delete(conversationId);
     // Discard any half-accumulated server-persist buffer from a superseded run
     // so its partial output can't merge into this fresh turn's assistant message.
     discardPersistenceAccumulator(conversationId);
