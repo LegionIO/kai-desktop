@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { capRemoteEvent, stripRemoteMediaDeep } from '../remote-frame-cap.js';
+import { capRemoteEvent, stripRemoteMediaDeep, newRemoteBudget } from '../remote-frame-cap.js';
 
 describe('capRemoteEvent (remote frame-cap for stream/sub-agent events)', () => {
   it('caps a large tool-compaction originalContent', () => {
@@ -65,5 +65,27 @@ describe('capRemoteEvent (remote frame-cap for stream/sub-agent events)', () => 
     expect(bytes).toBeLessThan(4 * 1024 * 1024);
     // The tail entries were omitted once the budget was spent.
     expect(JSON.stringify(capped)).toContain('[omitted-in-broadcast]');
+  });
+
+  it('bounds a CJK-heavy payload by UTF-8 BYTES, not UTF-16 units', () => {
+    // Each CJK char is 1 UTF-16 unit but 3 UTF-8 bytes. Counting units would let ~13×250k-char CJK
+    // strings (~3 MiB units but ~10 MiB bytes) pass; the byte budget must still bound the frame.
+    const event = {
+      conversationId: 'c',
+      type: 'tool-result',
+      result: Array.from({ length: 20 }, () => '中'.repeat(250 * 1024)),
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(capRemoteEvent(event)), 'utf8');
+    expect(bytes).toBeLessThan(4 * 1024 * 1024);
+  });
+
+  it('a SHARED budget bounds many parts together (upsert case)', () => {
+    // Simulate the conversation-upsert path: many parts stripped under ONE shared budget must not
+    // each get a fresh cap. 40 parts of 250 KiB under one budget stays bounded.
+    const budget = newRemoteBudget();
+    const parts = Array.from({ length: 40 }, () => stripRemoteMediaDeep('x'.repeat(250 * 1024), budget));
+    const bytes = Buffer.byteLength(JSON.stringify(parts), 'utf8');
+    expect(bytes).toBeLessThan(4 * 1024 * 1024);
+    expect(JSON.stringify(parts)).toContain('[omitted-in-broadcast]');
   });
 });

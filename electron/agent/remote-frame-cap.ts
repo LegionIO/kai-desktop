@@ -39,7 +39,10 @@ function stripInner(value: unknown, depth: number, budget: Budget): unknown {
   if (budget.used >= REMOTE_EVENT_BYTE_BUDGET) return OMIT; // budget spent — omit the rest
   if (typeof value === 'string') {
     const capped = capString(value);
-    budget.used += capped.length;
+    // Charge the UTF-8 BYTE length, not the JS string length (UTF-16 units): a CJK char is 1 unit
+    // but 3 bytes, so counting units undercounts the serialized frame ~3x and lets a CJK-heavy
+    // payload blow the limit. Buffer.byteLength gives the exact UTF-8 size cheaply (no copy).
+    budget.used += Buffer.byteLength(capped, 'utf8');
     return capped;
   }
   if (typeof value === 'number' || typeof value === 'boolean' || value == null) {
@@ -88,12 +91,17 @@ function stripInner(value: unknown, depth: number, budget: Budget): unknown {
   return out;
 }
 
-// Public: strip a standalone value (used by the conversation-upsert per-part strip). Each part gets
-// its OWN budget — a single message part rarely approaches the frame alone, and the upsert also
-// omits pendingDrafts + the caller relies on per-part safety; a whole-tree aggregate budget is not
-// applied here (the tree can legitimately be large across many parts and clients re-fetch full).
-export function stripRemoteMediaDeep(value: unknown): unknown {
-  return stripInner(value, 0, { used: 0 });
+// Public: strip a standalone value for the remote fan-out. Callers that strip MANY values that
+// share ONE frame (e.g. every message part of a conversation upsert) must pass a SHARED budget from
+// newRemoteBudget() so the cumulative cap bounds the WHOLE frame — a fresh per-value budget would
+// let N parts each spend the full budget (N×3 MiB total, over-frame). Omit the budget only for a
+// genuinely standalone value.
+export type RemoteCapBudget = Budget;
+export function newRemoteBudget(): RemoteCapBudget {
+  return { used: 0 };
+}
+export function stripRemoteMediaDeep(value: unknown, budget?: RemoteCapBudget): unknown {
+  return stripInner(value, 0, budget ?? { used: 0 });
 }
 
 // Cap a stream/sub-agent event for the remote fan-out. Deep-caps the ENTIRE event under ONE shared

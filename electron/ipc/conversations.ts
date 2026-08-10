@@ -1,7 +1,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
-import { stripRemoteMediaDeep } from '../agent/remote-frame-cap.js';
+import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -75,17 +75,19 @@ export type ConversationChange =
 // remote frame-cap (stripRemoteMediaDeep) — the same depth-bounded strip used for stream/sub-agent
 // broadcasts — which caps media, pre-compaction backups, AND any oversized string, so a media- or
 // text-heavy tool result can't blow the remote frame limit on an upsert.
-function stripBase64FromPart(part: unknown): unknown {
-  return stripRemoteMediaDeep(part);
-}
 function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
+  // ONE shared budget across the whole upsert (both trees, all parts): a per-part budget would let
+  // N parts each spend the full cap (N × budget total, over-frame). The cumulative budget bounds the
+  // entire serialized upsert frame; once spent, remaining parts are omitted (clients re-fetch full
+  // content via conversations:get).
+  const budget = newRemoteBudget();
   const stripTree = (nodes: unknown): unknown =>
     Array.isArray(nodes)
       ? nodes.map((n) => {
           if (!n || typeof n !== 'object') return n;
           const m = n as Record<string, unknown>;
           if (!Array.isArray(m.content)) return n;
-          return { ...m, content: (m.content as unknown[]).map((p) => stripBase64FromPart(p)) };
+          return { ...m, content: (m.content as unknown[]).map((p) => stripRemoteMediaDeep(p, budget)) };
         })
       : nodes;
   const out: ConversationRecord = {
@@ -1098,8 +1100,22 @@ export function registerConversationHandlers(
       }
     }
 
-    clearAllDiffs();
-    broadcastReset(appHome);
+    // A FULL reset tells clients to discard EVERY accumulator + supersede their generations. That's
+    // correct only when everything was actually cleared. If a record's rm FAILED, clearAllConversations
+    // PRESERVED it (and left its stream running) — a full reset would then make clients drop that
+    // preserved live run's accumulator (its tools keep executing, output ignored/unpersisted). So:
+    // reset only when the store is now empty; otherwise clear diffs + broadcast a per-id DELETE for
+    // each successfully-cleared id, leaving the preserved conversation(s) intact on clients.
+    const storeEmptyNow = Object.keys(readIndex(appHome).conversations).length === 0;
+    if (storeEmptyNow) {
+      clearAllDiffs();
+      broadcastReset(appHome);
+    } else {
+      for (const conversationId of cleared) {
+        clearConversationDiffs(conversationId);
+        broadcastDelete(appHome, conversationId);
+      }
+    }
     return { ok: true };
   });
 

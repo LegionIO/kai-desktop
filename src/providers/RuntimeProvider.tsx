@@ -4405,20 +4405,31 @@ export function RuntimeProvider({
         // its own fabricated (attachment-free) user branch and corrupt active history — mirror
         // the round-132 mid-stream gate on the TERMINAL path too.
         const doneMirror = !!streamAccumulators.get(convId) && acc.locallyOriginated !== true;
-        if (e.automation || e.serverPersisted || automationStreams.has(convId) || doneMirror) {
+        // A plan-restart / plan-reject-restart is MANDATORY (the prior stream was aborted for it)
+        // and is now MAIN-AUTHORITATIVE — the delayed launch below asks agent:authorize-continuation
+        // and only ONE client actually restarts. So a GUI MIRROR (not main-owned) that carries a
+        // plan-restart signal must FALL THROUGH to that block rather than be short-circuited here:
+        // otherwise a reloaded sole client (a mirror) would drop the mandatory restart and planning
+        // would stall until manual intervention. The transient finalize/persist a losing mirror runs
+        // is immediately superseded by the winner's restart (the branch is rewritten), so — unlike
+        // ordinary mirror history — it can't corrupt surviving active history for THIS case.
+        // Main-owned runs (automation / CLI serverPersisted) still take the early-return: they
+        // restart server-side, and a renderer must never persist their turn.
+        const doneData = e.data as Record<string, unknown> | undefined;
+        const mirrorWantsPlanRestart =
+          doneMirror &&
+          !(e.automation || e.serverPersisted || automationStreams.has(convId)) &&
+          Boolean(doneData?.planModeRestart || doneData?.planModeRejectRestart);
+        if (
+          (e.automation || e.serverPersisted || automationStreams.has(convId) || doneMirror) &&
+          !mirrorWantsPlanRestart
+        ) {
           automationStreams.delete(convId);
           const _ptAuto = persistTimersRef.current.get(convId);
           if (_ptAuto) {
             clearTimeout(_ptAuto);
             persistTimersRef.current.delete(convId);
           }
-          // NOTE (known narrow limitation): if this client is a MIRROR (e.g. a sole renderer that
-          // reloaded mid-turn) AND this done carries a plan-restart signal, the mandatory plan
-          // restart is NOT driven here — a mirror must not persist/finalize, and safely reusing the
-          // originator plan-restart machinery from a mirror would require reseeding it as a driver
-          // mid-terminal (deferred: high-risk vs. the payoff). The reply itself is preserved by
-          // main's GUI persistence fallback; the user sees the plan and can manually continue. A
-          // LIVE originating client (the common case) still drives the restart via the block below.
           streamAccumulators.delete(convId);
           traceRuntime('stream.authoritative-done', convId, {
             eventAutomation: Boolean(e.automation),
@@ -4439,7 +4450,6 @@ export function RuntimeProvider({
         // Plan-mode transitions (accept, reject, dismiss) send a done event while
         // a tool is still awaiting approval.  Clear the flag so the normal done
         // path can clean up or restart the stream correctly.
-        const doneData = e.data as Record<string, unknown> | undefined;
         if (
           acc.awaitingApproval &&
           doneData &&
