@@ -52,28 +52,12 @@ export function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
 
 // Cap the oversized fields of a stream/sub-agent event for the remote fan-out. Returns the event
 // unchanged when nothing needs capping (the common case), else a shallow-cloned capped copy:
-//  - tool-compaction: data.originalContent replaced when large;
-//  - tool-result / any event with a result or compaction: the result payload is deep-stripped and
-//    compaction.originalContent capped.
+// Cap the oversized fields of a stream/sub-agent event for the remote fan-out. Deep-caps the ENTIRE
+// event (media + oversized backups + any oversized string, recursively, with depth-exhaustion
+// omission), so no field of any event type can exceed the frame — not just tool-result payloads.
+// Small control fields (type/conversationId/runGeneration/toolCallId/toolName) are short by nature
+// and pass through the string cap untouched. Returns the same object when nothing changed.
 export function capRemoteEvent<T>(event: T): T {
-  const e = event as unknown as {
-    type?: string;
-    data?: { originalContent?: unknown };
-    compaction?: { originalContent?: unknown };
-    result?: unknown;
-  };
-  if (e.type === 'tool-compaction') {
-    if (typeof e.data?.originalContent === 'string' && e.data.originalContent.length > REMOTE_ORIGINAL_CAP) {
-      return { ...(event as Record<string, unknown>), data: { ...e.data, originalContent: '[omitted-in-broadcast]' } } as T;
-    }
-    return event;
-  }
-  const bigOriginal =
-    typeof e.compaction?.originalContent === 'string' && e.compaction.originalContent.length > REMOTE_ORIGINAL_CAP;
-  const hasResult = e.result !== undefined && e.result !== null;
-  if (!bigOriginal && !hasResult) return event;
-  const out: Record<string, unknown> = { ...(event as Record<string, unknown>) };
-  if (bigOriginal) out.compaction = { ...(e.compaction as object), originalContent: '[omitted-in-broadcast]' };
-  if (hasResult) out.result = stripRemoteMediaDeep(e.result);
-  return out as T;
+  if (!event || typeof event !== 'object') return event;
+  return stripRemoteMediaDeep(event) as T;
 }

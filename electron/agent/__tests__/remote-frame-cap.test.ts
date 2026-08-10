@@ -10,9 +10,9 @@ describe('capRemoteEvent (remote frame-cap for stream/sub-agent events)', () => 
     expect(out.data.originalContent).toBe('[omitted-in-broadcast]');
   });
 
-  it('leaves a small tool-compaction originalContent untouched (returns the same object)', () => {
+  it('leaves a small tool-compaction originalContent untouched (value-equal)', () => {
     const ev = { type: 'tool-compaction', data: { originalContent: 'short' } };
-    expect(capRemoteEvent(ev)).toBe(ev);
+    expect(capRemoteEvent(ev)).toEqual(ev);
   });
 
   it('strips a tool-result compaction.originalContent AND nested _modelContent / base64', () => {
@@ -40,8 +40,14 @@ describe('capRemoteEvent (remote frame-cap for stream/sub-agent events)', () => 
     expect(serialized).toContain('[omitted-in-broadcast]');
   });
 
-  it('returns a non-tool event unchanged', () => {
+  it('caps a large string on a NON-tool event (e.g. user-message.text)', () => {
+    const out = capRemoteEvent({ type: 'user-message', text: 'a'.repeat(300 * 1024) }) as { text: string };
+    expect(out.text).toContain('[truncated-in-broadcast]');
+    expect(out.text.length).toBeLessThan(300 * 1024);
+  });
+
+  it('leaves a small non-tool event value-equal', () => {
     const ev = { type: 'text-delta', text: 'hi' };
-    expect(capRemoteEvent(ev)).toBe(ev);
+    expect(capRemoteEvent(ev)).toEqual(ev);
   });
 });

@@ -387,6 +387,13 @@ const guiFallbackParents = new Map<string, string | null>();
 // copy rather than deferring to the remote client's capped persist. (A LOCAL Electron window gets
 // the full events, so its persist is authoritative and main discards its fallback as usual.)
 const guiFallbackRemoteOrigin = new Set<string>();
+// Conversations with a REMOTE-cancel deferred replace-finalize in flight (see the cancel path):
+// main is waiting for the web client's capped cancel-persist to land before overwriting it with its
+// full copy. If a NEW turn is admitted for the conversation before that lands, the new turn's
+// accumulator-discard would drop main's full copy AND its deferred poll would bail on the active
+// stream — leaving the prior assistant permanently frame-capped. So the new-turn admission
+// finalize-replaces the pending copy FIRST (before discarding). Cleared when the defer resolves.
+const pendingRemoteCancelReplace = new Set<string>();
 let serverPersistAppHome: string | null = null;
 
 // ── Main-authoritative GUI continuation ───────────────────────────────────────
@@ -1188,6 +1195,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
+    // A remote-cancel deferred replace-finalize was waiting to overwrite the web client's capped
+    // copy with main's FULL copy. This new turn is about to discard that accumulator, so FINALIZE
+    // the full copy NOW (before discarding) — else the prior assistant would stay frame-capped.
+    if (pendingRemoteCancelReplace.delete(conversationId)) {
+      try {
+        finalizeInterruptedTurnReplacing(appHome, conversationId);
+      } catch {
+        /* fall through to the discard below */
+      }
+    }
     // Discard any half-accumulated server-persist buffer from a superseded run
     // so its partial output can't merge into this fresh turn's assistant message.
     discardPersistenceAccumulator(conversationId);
@@ -5603,8 +5620,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // accumulator alive meanwhile (do NOT discard). Bounded; if it never lands (renderer gone)
         // replace anyway so the full copy still wins.
         const deferReplace = (remaining: number): void => {
-          // Superseded by a replacement turn → that run owns the accumulator; stop.
-          if (activeStreams.has(conversationId)) return;
+          // A replacement turn was admitted → it already finalize-replaced our pending copy at
+          // admission (see the agent:stream discard site) and owns the accumulator now. Stop.
+          if (!pendingRemoteCancelReplace.has(conversationId)) return;
+          if (activeStreams.has(conversationId)) {
+            pendingRemoteCancelReplace.delete(conversationId);
+            return;
+          }
           let persisted = false;
           try {
             const conv = readConversation(appHome, conversationId);
@@ -5613,6 +5635,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             /* keep polling */
           }
           if (persisted || remaining <= 0) {
+            pendingRemoteCancelReplace.delete(conversationId);
             try {
               finalizeInterruptedTurnReplacing(appHome, conversationId);
             } catch {
@@ -5622,6 +5645,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
           setTimeout(() => deferReplace(remaining - 1), 100);
         };
+        pendingRemoteCancelReplace.add(conversationId);
         deferReplace(80); // ~8s budget, matching the GUI fallback poll
       } else {
         discardPersistenceAccumulator(conversationId);

@@ -1244,15 +1244,26 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   return removed;
 }
 
-export function clearAllConversations(appHome: string): void {
+/** Wipe all conversations. Returns the ids that were actually cleared (the UNION of indexed ids and
+ *  on-disk record files) so the caller can cancel live streams + broadcast a delete for each —
+ *  INCLUDING an orphan record (file present, no index entry, e.g. after a file write landed but the
+ *  index write failed), which a live stream could otherwise keep running / a stale persist recreate. */
+export function clearAllConversations(appHome: string): string[] {
   // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
   assertMigratedBeforeWrite(appHome);
-  // Tombstone every id being cleared so a stale in-flight persist (a running stream, or a
-  // trusted client that read a record before the clear) can't resurrect a wiped conversation.
   const priorIndex = readIndex(appHome);
-  const clearedIds = Object.keys(priorIndex.conversations);
-  for (const id of clearedIds) tombstoneConversation(id);
   const dir = conversationsDir(appHome);
+  // UNION of indexed ids and on-disk record files — an orphan file (no index entry) must be
+  // tombstoned + torn down too, else a stale client / live stream can resurrect it.
+  const clearedIds = new Set<string>(Object.keys(priorIndex.conversations));
+  if (existsSync(dir)) {
+    for (const name of readdirSync(dir)) {
+      if (name.endsWith('.json')) clearedIds.add(name.slice(0, -'.json'.length));
+    }
+  }
+  // Tombstone every id being cleared so a stale in-flight persist (a running stream, or a trusted
+  // client that read a record before the clear) can't resurrect a wiped conversation.
+  for (const id of clearedIds) tombstoneConversation(id);
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
       if (name.endsWith('.json')) {
@@ -1274,6 +1285,7 @@ export function clearAllConversations(appHome: string): void {
   };
   for (const id of clearedIds) pushDurableDeletedId(nextIndex, id);
   writeIndex(appHome, nextIndex);
+  return [...clearedIds];
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────

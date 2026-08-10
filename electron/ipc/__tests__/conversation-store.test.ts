@@ -245,6 +245,24 @@ describe('per-file read/write', () => {
     expect(Object.keys(readIndex(appHome).conversations)).toHaveLength(0);
   });
 
+  it('clearAllConversations returns + tombstones the UNION of indexed and orphan-file ids', () => {
+    writeConversation(appHome, makeConv('indexed'));
+    // Orphan: a data file with NO index entry (index write failed after the file landed).
+    writeConversation(appHome, makeConv('orphanfile'));
+    writeIndex(appHome, {
+      conversations: { indexed: readIndex(appHome).conversations.indexed },
+      activeConversationId: null,
+      settings: {},
+      deletedIds: [],
+    });
+    const cleared = clearAllConversations(appHome);
+    expect(cleared.sort()).toEqual(['indexed', 'orphanfile']);
+    // BOTH are durably tombstoned so neither can be resurrected.
+    const deleted = readIndex(appHome).deletedIds ?? [];
+    expect(deleted).toEqual(expect.arrayContaining(['indexed', 'orphanfile']));
+    expect(readAllConversations(appHome)).toHaveLength(0);
+  });
+
   it('rejects path-traversal ids', () => {
     expect(() => writeConversation(appHome, makeConv('../evil'))).toThrow();
     // A malformed id on read is treated as "not found", not a throw.

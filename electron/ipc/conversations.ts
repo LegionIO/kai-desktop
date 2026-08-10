@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { stripRemoteMediaDeep } from '../agent/remote-frame-cap.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -69,41 +70,13 @@ export type ConversationChange =
 //
 // Media is not only at the top level of a content part: a tool-result part carries it under
 // `part.result` (and the canonical model view under `part.result._modelContent`), and a compacted
-// part keeps the pre-compaction copy under `part.originalResult`. So this recurses through nested
-// objects/arrays (depth-bounded) rather than touching only top-level fields — otherwise a
-// media-heavy tool result still blows the remote frame limit.
-const STRIP_MAX_DEPTH = 8;
-function stripBase64FromPart(part: unknown, depth = 0): unknown {
-  if (Array.isArray(part)) {
-    // Depth exhausted → omit the whole container rather than pass an un-scrubbed (possibly
-    // media-heavy) subtree that could still exceed the remote frame cap.
-    return depth >= STRIP_MAX_DEPTH ? '[omitted-in-broadcast]' : part.map((v) => stripBase64FromPart(v, depth + 1));
-  }
-  if (!part || typeof part !== 'object') return part;
-  if (depth >= STRIP_MAX_DEPTH) return '[omitted-in-broadcast]'; // depth exhausted → omit un-scrubbed object
-  const p = part as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...p };
-  // Data-URL / base64 image + file parts (renderer content-part shapes + provider shapes).
-  for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
-    const v = out[k];
-    if (typeof v === 'string' && v.length > 256) out[k] = '[omitted-in-broadcast]';
-  }
-  // UI-only pre-compaction backups: `originalResult`/`originalContent` hold the FULL oversized text
-  // that tool compaction shrank (kept so the renderer can "view original"). It's multi-MiB by
-  // definition and never needed from an upsert (re-fetched via conversations:get), so cap it too —
-  // otherwise a compacted tool result still blows the remote frame limit.
-  for (const k of ['originalResult', 'originalContent']) {
-    const v = out[k];
-    if (typeof v === 'string' && v.length > 4096) out[k] = '[omitted-in-broadcast]';
-  }
-  // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
-  if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
-  // Recurse into nested containers that can hold media (tool-result payloads, compaction backups,
-  // nested content arrays). A child at the depth ceiling returns an omission marker (above).
-  for (const [k, v] of Object.entries(out)) {
-    if (v && typeof v === 'object') out[k] = stripBase64FromPart(v, depth + 1);
-  }
-  return out;
+// part keeps the pre-compaction copy under `part.originalResult`; a tool result can also put
+// multi-MiB text under an arbitrary key (output/stdout/content). This delegates to the SHARED
+// remote frame-cap (stripRemoteMediaDeep) — the same depth-bounded strip used for stream/sub-agent
+// broadcasts — which caps media, pre-compaction backups, AND any oversized string, so a media- or
+// text-heavy tool result can't blow the remote frame limit on an upsert.
+function stripBase64FromPart(part: unknown): unknown {
+  return stripRemoteMediaDeep(part);
 }
 function stripBroadcastMedia(conv: ConversationRecord): ConversationRecord {
   const stripTree = (nodes: unknown): unknown =>
@@ -1102,19 +1075,22 @@ export function registerConversationHandlers(
   });
 
   ipcMain.handle('conversations:clear', () => {
-    // Abort any live agent stream AND standalone automation run for EVERY conversation before
-    // wiping — otherwise their tools keep executing invisibly after the records are gone
-    // (same hazard as delete/deleteMany, but for the wipe-all path).
-    for (const conversationId of Object.keys(readIndex(appHome).conversations)) {
+    // clearAllConversations is synchronous (rmSync) with no await, so no tool can execute between
+    // the wipe and the teardown below — same ordering guarantee as deleteMany. It returns the UNION
+    // of indexed ids AND on-disk record files, so an ORPHAN record (file present, no index entry)
+    // is torn down + tombstoned too (else its live stream keeps running / a stale persist recreates
+    // it). Abort each cleared conversation's live agent stream, automation, and compaction.
+    const cleared = clearAllConversations(appHome);
+    for (const conversationId of cleared) {
       cancelConversationStream(conversationId);
       abortAutomationForConversation(conversationId);
       abortActiveCompact(conversationId);
     }
-    // Clean up all computer-use sessions
+    // Clean up computer-use sessions for every cleared conversation.
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
-        for (const conversationId of Object.keys(readIndex(appHome).conversations)) {
+        for (const conversationId of cleared) {
           manager.removeSessionsByConversation(conversationId);
         }
       } catch {
@@ -1122,7 +1098,6 @@ export function registerConversationHandlers(
       }
     }
 
-    clearAllConversations(appHome);
     clearAllDiffs();
     broadcastReset(appHome);
     return { ok: true };
