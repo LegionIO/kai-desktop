@@ -82,6 +82,7 @@ type AppAPI = {
       clientId: string,
       turnToken: string,
     ) => Promise<{ authorized: boolean }>;
+    finalizeGuiFallback: (conversationId: string) => Promise<{ confirmed: boolean; headId: string | null }>;
     injectMidTurn: (
       conversationId: string,
       userText: string,

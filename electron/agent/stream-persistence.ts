@@ -626,3 +626,10 @@ function persistAccumulatedReturningHead(
 export function discardPersistenceAccumulator(conversationId: string): void {
   accumulators.delete(conversationId);
 }
+
+/** Whether main is currently holding a persistence accumulator for a conversation (a live GUI-turn
+ *  fallback or server-persisted accumulation). Used to decide if an on-demand finalize can flush a
+ *  full copy to disk. */
+export function hasPersistenceAccumulator(conversationId: string): boolean {
+  return accumulators.has(conversationId);
+}

@@ -4092,8 +4092,18 @@ export function RuntimeProvider({
                     runConfig: retryCfg,
                     locallyOriginated: true, // this client is now the driver
                   });
-                  await persistConversation(convId, tree, head, { runStatus: 'running' });
+                  // Gate the launch on the persist ACTUALLY landing: a concurrent /compact rejects
+                  // the running-status persist as conversation-busy, and a delete rejects as
+                  // conversation-deleted. Launching regardless would immediately terminate busy or
+                  // run against a deleted chat. On a rejection, drop the accumulator we just set (a
+                  // best-effort recovery — the turn resumes via the normal path once /compact
+                  // clears, or is correctly abandoned for a deleted chat).
+                  const retryPersist = await persistConversation(convId, tree, head, { runStatus: 'running' });
                   if (streamAccumulators.get(convId)?.pendingAssistantId !== rid) return;
+                  if (retryPersist?.rejected || !retryPersist?.persisted) {
+                    streamAccumulators.delete(convId);
+                    return;
+                  }
                   launchAgentStream(
                     convId,
                     branchRetry,
@@ -4112,27 +4122,30 @@ export function RuntimeProvider({
             }
             // Authorized — finalize current response and immediately restart the stream.
             // A MIRROR that WON (a reloaded sole client) has only a PARTIAL accumulator (built from
-            // post-reload broadcasts) — continuing from it would persist TRUNCATED history and
-            // discard main's complete copy. So for a non-locally-originated winner, reload the
-            // CONFIRMED full branch from disk (main's GUI persistence fallback finalized it) and
-            // continue from THAT, not the partial in-memory accumulator.
+            // post-reload broadcasts) that can be missing deltas EVEN AT THE SAME node count — a
+            // length check isn't enough. So ask MAIN to FINALIZE its authoritative full-turn
+            // fallback and return the confirmed head, then reload THAT complete branch from disk and
+            // continue from it (never the partial in-memory accumulator). A local originator's
+            // accumulator IS authoritative, so it skips this.
             if (acc.locallyOriginated !== true) {
               try {
+                const fin = await app.agent.finalizeGuiFallback?.(convId);
+                // Reload the confirmed branch (whether main finalized its fallback or the renderer's
+                // own earlier persist is authoritative — either way disk now holds the full turn).
                 const confirmed = await app.conversations.get(convId);
                 const confirmedTree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
                   ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
                   : null;
-                const confirmedHead = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
-                // Only adopt the disk branch if it is at least as complete as our partial one
-                // (never regress to fewer messages — a not-yet-finalized disk read).
-                if (confirmedTree && confirmedTree.length >= acc.messages.length) {
+                const confirmedHead = fin?.headId
+                  ?? (confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null);
+                if (confirmedTree && confirmedTree.length > 0) {
                   acc.messages = confirmedTree;
                   if (confirmedHead) acc.headId = confirmedHead;
                 }
               } catch {
-                /* disk read failed — fall back to the in-memory branch (best-effort) */
+                /* main finalize / disk read failed — fall back to the in-memory branch (best-effort) */
               }
-              // Re-validate ownership after the await.
+              // Re-validate ownership after the awaits.
               if (streamAccumulators.get(convId) !== acc) return;
             }
             finalizeAssistantResponse(acc);
@@ -4694,7 +4707,83 @@ export function RuntimeProvider({
               }
               if (!planAuthorized) {
                 console.info(`[UI:stream] ${label} — not authorized (another client drives it)`);
+                // WINNER-FAILURE RECOVERY (mirrors the max-turns path): if the authorized winner
+                // dies after its grant but before launching, re-ask past the ~20s TTL — granted only
+                // if this turn is still the active un-continued stream (winner vanished), else the
+                // winner launched (new turn) and we no-op.
+                setTimeout(() => {
+                  void (async () => {
+                    if (streamAccumulators.has(convId)) return;
+                    let regranted = false;
+                    try {
+                      const rr = await app.agent.authorizeContinuation?.(convId, CONTINUATION_CLIENT_ID, planTurnToken ?? convId);
+                      regranted = Boolean(rr?.authorized);
+                    } catch {
+                      regranted = false;
+                    }
+                    if (!regranted || streamAccumulators.has(convId)) return;
+                    try {
+                      await app.agent.finalizeGuiFallback?.(convId);
+                    } catch {
+                      /* best-effort */
+                    }
+                    const confirmed = await app.conversations.get(convId).catch(() => null);
+                    const tree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
+                      ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
+                      : null;
+                    const head = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
+                    if (!tree || tree.length === 0 || !head) return;
+                    const branchRetry = getActiveBranch(tree, head);
+                    const rid = msgId();
+                    supersedeCurrentGeneration(convId);
+                    streamAccumulators.set(convId, {
+                      messages: [...tree],
+                      headId: head,
+                      pendingAssistantTiming: createPendingAssistantTiming(),
+                      pendingAssistantId: rid,
+                      runConfig: planRunConfig,
+                      locallyOriginated: true,
+                    });
+                    const rp = await persistConversation(convId, tree, head, { runStatus: 'running' });
+                    if (streamAccumulators.get(convId)?.pendingAssistantId !== rid) return;
+                    if (rp?.rejected || !rp?.persisted) {
+                      streamAccumulators.delete(convId);
+                      return;
+                    }
+                    launchAgentStream(
+                      convId,
+                      branchRetry,
+                      planCfgSnapshot.selectedModelKey ?? undefined,
+                      planCfgSnapshot.reasoningEffort ?? 'medium',
+                      planCfgSnapshot.selectedProfileKey ?? undefined,
+                      planCfgSnapshot.fallbackEnabled ?? false,
+                      planCwdSnapshot ?? undefined,
+                      'plan-first',
+                      planCfgSnapshot.threadOverrides ?? undefined,
+                      rid,
+                    );
+                  })();
+                }, 21000);
                 return;
+              }
+              // A MIRROR winner has a PARTIAL accumulator — finalize main's authoritative full-turn
+              // fallback and reload the confirmed branch before restarting (same as max-turns).
+              if (acc.locallyOriginated !== true) {
+                try {
+                  const fin = await app.agent.finalizeGuiFallback?.(convId);
+                  const confirmed = await app.conversations.get(convId);
+                  const confirmedTree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
+                    ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)
+                    : null;
+                  const confirmedHead = fin?.headId
+                    ?? (confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null);
+                  if (confirmedTree && confirmedTree.length > 0) {
+                    acc.messages = confirmedTree;
+                    if (confirmedHead) acc.headId = confirmedHead;
+                  }
+                } catch {
+                  /* best-effort — fall back to the in-memory branch */
+                }
               }
               // Ownership check BEFORE replacing the accumulator: the done handler above
               // deleted convId's accumulator, so during this 100ms delay either nothing

@@ -29,6 +29,7 @@ import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submi
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
+  hasPersistenceAccumulator,
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
@@ -5554,6 +5555,34 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       return { authorized: authorizeContinuation(conversationId, clientId, turnToken) };
     },
   );
+
+  // Force main to FINALIZE its GUI persistence fallback for a conversation NOW and return the
+  // confirmed head. A reloaded MIRROR that won continuation authorization must not continue from its
+  // own PARTIAL (post-reload) accumulator — main holds the FULL turn. This synchronously flushes
+  // main's fallback accumulator (the authoritative full reply) to disk and returns { confirmed:true,
+  // headId } so the winner can reload that complete branch before continuing. Returns
+  // { confirmed:false } when main has no fallback for this conv (the caller then uses its own
+  // accumulator — it IS the originator, or the turn was server-persisted).
+  ipcMain.handle('agent:finalize-gui-fallback', (_event, conversationId: string) => {
+    if (typeof conversationId !== 'string' || !conversationId || !serverPersistAppHome) {
+      return { confirmed: false, headId: null as string | null };
+    }
+    if (!guiFallbackParents.has(conversationId) && !hasPersistenceAccumulator(conversationId)) {
+      return { confirmed: false, headId: null as string | null };
+    }
+    guiFallbackParents.delete(conversationId);
+    guiFallbackRemoteOrigin.delete(conversationId);
+    try {
+      const head = finalizeInterruptedTurn(serverPersistAppHome, conversationId);
+      // finalizeInterruptedTurn returns the persisted assistant head, or null if the accumulator was
+      // empty — in that case fall back to the on-disk head so the caller reloads a valid branch.
+      if (head) return { confirmed: true, headId: head };
+      const conv = readConversation(serverPersistAppHome, conversationId);
+      return { confirmed: true, headId: conv?.headId ?? null };
+    } catch {
+      return { confirmed: false, headId: null as string | null };
+    }
+  });
 
   ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
     cancelConversationStreamInner(conversationId);

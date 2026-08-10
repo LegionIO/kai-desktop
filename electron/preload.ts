@@ -59,6 +59,12 @@ const appAPI = {
       ipcRenderer.invoke('agent:authorize-continuation', conversationId, clientId, turnToken) as Promise<{
         authorized: boolean;
       }>,
+    /** Force main to finalize its GUI persistence fallback (full turn) + return the confirmed head. */
+    finalizeGuiFallback: (conversationId: string) =>
+      ipcRenderer.invoke('agent:finalize-gui-fallback', conversationId) as Promise<{
+        confirmed: boolean;
+        headId: string | null;
+      }>,
     /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
      *  running turn (spliced at its next step boundary) instead of a new turn. */
     injectMidTurn: (conversationId: string, userText: string) =>
