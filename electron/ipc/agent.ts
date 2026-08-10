@@ -579,9 +579,13 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       pendingRemoteReplace.delete(conversationId);
       pendingLocalReplace.delete(conversationId);
       // Budget exhausted, runStatus still 'running' → the renderer reloaded/crashed. Persist
-      // main's accumulated reply, reset runStatus, settle. finalizeInterruptedTurn no-ops if empty.
+      // main's accumulated reply, reset runStatus, settle. For a REMOTE origin use the REPLACE
+      // variant (it replaces a capped node by id if one exists, else appends) so we never leave a
+      // duplicate sibling should the web client have persisted a capped node; finalize* no-ops if
+      // the accumulator is empty.
       try {
-        finalizeInterruptedTurn(fbAppHome, conversationId);
+        if (remoteOrigin) finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
+        else finalizeInterruptedTurn(fbAppHome, conversationId);
       } catch {
         discardPersistenceAccumulator(conversationId);
       }
@@ -5681,7 +5685,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // finalizes to a null head, the write FAILED and we must NOT report confirmed (the caller would
     // continue on a stale branch, losing the authoritative reply).
     const hadContent = persistenceAccumulatorHasContent(conversationId);
-    const remoteOrigin = guiFallbackRemoteOrigin.delete(conversationId);
+    // Remote origin marker may already have been CONSUMED into pendingRemoteReplace by an in-flight
+    // terminal fallback poll — check BOTH, else an explicit flush during the poll would misclassify
+    // the run as local and APPEND a duplicate sibling instead of replacing the web client's capped node.
+    const remoteOrigin = guiFallbackRemoteOrigin.delete(conversationId) || pendingRemoteReplace.has(conversationId);
     guiFallbackParents.delete(conversationId);
     pendingRemoteReplace.delete(conversationId);
     pendingLocalReplace.delete(conversationId);

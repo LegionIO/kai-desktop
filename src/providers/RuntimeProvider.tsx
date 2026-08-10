@@ -4106,7 +4106,7 @@ export function RuntimeProvider({
               // main GRANTS us, and we drive the continuation from the CONFIRMED disk branch.
               const denyRc = acc.runConfig;
               const denyLive = streamHandlerRef.current;
-              const retryCfg = denyRc ?? {
+              let retryCfg = denyRc ?? {
                 selectedModelKey: denyLive.selectedModelKey,
                 reasoningEffort: denyLive.reasoningEffort,
                 selectedProfileKey: denyLive.selectedProfileKey,
@@ -4115,6 +4115,7 @@ export function RuntimeProvider({
                 threadOverrides: denyLive.threadOverrides,
                 cwd: currentWorkingDirectoryRef.current,
               };
+              const retryHadRunConfig = Boolean(denyRc);
               const retryToken = turnToken;
               streamAccumulators.delete(convId);
               if (isActiveConv) {
@@ -4140,6 +4141,13 @@ export function RuntimeProvider({
                     : null;
                   const head = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
                   if (!tree || tree.length === 0 || !head) return;
+                  // If the run had NO captured runConfig (a passive mirror), hydrate the settings
+                  // from THIS conversation's confirmed record — NOT the live refs, which may now be
+                  // a DIFFERENT active chat (the user switched A→B) and would launch A's continuation
+                  // with B's model/profile/CWD.
+                  if (!retryHadRunConfig && confirmed) {
+                    retryCfg = runConfigFromConversationRecord(confirmed as Record<string, unknown>);
+                  }
                   const branchRetry = getActiveBranch(tree, head);
                   const rid = msgId();
                   supersedeCurrentGeneration(convId);
@@ -4850,6 +4858,21 @@ export function RuntimeProvider({
                       : null;
                     const head = confirmed ? ((confirmed as { headId?: string | null }).headId ?? null) : null;
                     if (!tree || tree.length === 0 || !head) return;
+                    // Hydrate settings from THIS conv's confirmed record if the run had no captured
+                    // runConfig (a passive mirror) — the pre-captured snapshots fell back to the live
+                    // refs, which may now be a different active chat (A->B switch).
+                    if (!acc.runConfig && confirmed) {
+                      const hydrated = runConfigFromConversationRecord(confirmed as Record<string, unknown>);
+                      planCfgSnapshot = {
+                        selectedModelKey: hydrated.selectedModelKey,
+                        reasoningEffort: hydrated.reasoningEffort,
+                        selectedProfileKey: hydrated.selectedProfileKey,
+                        fallbackEnabled: hydrated.fallbackEnabled,
+                        threadOverrides: hydrated.threadOverrides,
+                      };
+                      planCwdSnapshot = hydrated.cwd;
+                      planRunConfig = { ...hydrated, executionMode: 'plan-first' as const };
+                    }
                     const branchRetry = getActiveBranch(tree, head);
                     const rid = msgId();
                     supersedeCurrentGeneration(convId);
