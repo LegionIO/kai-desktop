@@ -30,6 +30,7 @@ import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   hasPersistenceAccumulator,
+  persistenceAccumulatorHasContent,
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
@@ -388,13 +389,14 @@ const guiFallbackParents = new Map<string, string | null>();
 // copy rather than deferring to the remote client's capped persist. (A LOCAL Electron window gets
 // the full events, so its persist is authoritative and main discards its fallback as usual.)
 const guiFallbackRemoteOrigin = new Set<string>();
-// Conversations with a REMOTE-cancel deferred replace-finalize in flight (see the cancel path):
-// main is waiting for the web client's capped cancel-persist to land before overwriting it with its
-// full copy. If a NEW turn is admitted for the conversation before that lands, the new turn's
-// accumulator-discard would drop main's full copy AND its deferred poll would bail on the active
-// stream — leaving the prior assistant permanently frame-capped. So the new-turn admission
-// finalize-replaces the pending copy FIRST (before discarding). Cleared when the defer resolves.
-const pendingRemoteCancelReplace = new Set<string>();
+// Conversations with a REMOTE-origin deferred replace-finalize in flight (both the cancel path AND
+// the normal terminal fallback poll): main holds the FULL turn while the web client persists only a
+// FRAME-CAPPED copy, and main is waiting to overwrite that capped copy with its full one. If a NEW
+// turn is admitted for the conversation before that lands, the new turn's accumulator-discard would
+// drop main's full copy (and the poll would bail on the active-stream check) — leaving the prior
+// assistant permanently frame-capped. So the new-turn admission finalize-REPLACES the pending copy
+// FIRST (before discarding). Cleared when the poll/defer resolves.
+const pendingRemoteReplace = new Set<string>();
 let serverPersistAppHome: string | null = null;
 
 // ── Main-authoritative GUI continuation ───────────────────────────────────────
@@ -501,10 +503,17 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
   const fbToken = streamToken;
   const remoteOrigin = guiFallbackRemoteOrigin.delete(conversationId); // consume the marker
   guiFallbackParents.delete(conversationId);
+  // For a REMOTE-origin terminal, register a pending replace up front: if a NEW turn is admitted for
+  // this conversation before the poll observes the web client's capped persist, the poll would bail
+  // on the active-stream check (below) and the new turn's admission would discard main's full copy —
+  // losing the uncapped result. The admission finalize-REPLACES a pending copy first (see the
+  // agent:stream discard site). Cleared once the poll finalizes/discards normally.
+  if (remoteOrigin) pendingRemoteReplace.add(conversationId);
   const pollGuiFallback = (remaining: number): void => {
     const owner = activeStreams.get(conversationId)?.token;
-    if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator
+    if (owner !== undefined && owner !== fbToken) return; // superseded — replacement owns the accumulator (admission finalized any pending remote copy)
     if (isRecentlyDeleted(conversationId)) {
+      pendingRemoteReplace.delete(conversationId);
       discardPersistenceAccumulator(conversationId);
       return;
     }
@@ -516,6 +525,7 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       /* best-effort — treat as not-yet-persisted, keep polling */
     }
     if (rendererPersisted) {
+      pendingRemoteReplace.delete(conversationId);
       if (remoteOrigin) {
         // REMOTE-originated: the web client persisted a FRAME-CAPPED assistant under the run's
         // responseMessageId. Main holds the FULL events — REPLACE that node's content in place
@@ -531,6 +541,7 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       return;
     }
     if (remaining <= 0) {
+      pendingRemoteReplace.delete(conversationId);
       // Budget exhausted, runStatus still 'running' → the renderer reloaded/crashed. Persist
       // main's accumulated reply, reset runStatus, settle. finalizeInterruptedTurn no-ops if empty.
       try {
@@ -1196,10 +1207,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
-    // A remote-cancel deferred replace-finalize was waiting to overwrite the web client's capped
-    // copy with main's FULL copy. This new turn is about to discard that accumulator, so FINALIZE
-    // the full copy NOW (before discarding) — else the prior assistant would stay frame-capped.
-    if (pendingRemoteCancelReplace.delete(conversationId)) {
+    // A remote-origin deferred replace-finalize (cancel OR normal terminal) was waiting to overwrite
+    // the web client's capped copy with main's FULL copy. This new turn is about to discard that
+    // accumulator, so FINALIZE the full copy NOW (before discarding) — else the prior assistant
+    // would stay frame-capped.
+    if (pendingRemoteReplace.delete(conversationId)) {
       try {
         finalizeInterruptedTurnReplacing(appHome, conversationId);
       } catch {
@@ -5562,21 +5574,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // main's fallback accumulator (the authoritative full reply) to disk and returns { confirmed:true,
   // headId } so the winner can reload that complete branch before continuing. Returns
   // { confirmed:false } when main has no fallback for this conv (the caller then uses its own
-  // accumulator — it IS the originator, or the turn was server-persisted).
-  ipcMain.handle('agent:finalize-gui-fallback', (_event, conversationId: string) => {
+  // accumulator — it IS the originator, or the turn was server-persisted) OR when a REPLACEMENT turn
+  // now owns the conversation (never finalize/discard a newer turn's accumulator).
+  ipcMain.handle('agent:finalize-gui-fallback', (_event, conversationId: string, turnToken?: string) => {
     if (typeof conversationId !== 'string' || !conversationId || !serverPersistAppHome) {
+      return { confirmed: false, headId: null as string | null };
+    }
+    // TURN-TOKEN guard: only finalize the turn the caller was authorized for. If a REPLACEMENT turn
+    // is now the active stream (a different token), its accumulator must NOT be finalized/discarded
+    // by this stale call — refuse. (No active stream = the turn ended; safe to finalize the fallback.)
+    const activeToken = activeStreams.get(conversationId)?.token;
+    if (typeof turnToken === 'string' && activeToken !== undefined && activeToken !== turnToken) {
       return { confirmed: false, headId: null as string | null };
     }
     if (!guiFallbackParents.has(conversationId) && !hasPersistenceAccumulator(conversationId)) {
       return { confirmed: false, headId: null as string | null };
     }
+    // Distinguish an EMPTY accumulator (head null is fine) from one that HAD content — if the latter
+    // finalizes to a null head, the write FAILED and we must NOT report confirmed (the caller would
+    // continue on a stale branch, losing the authoritative reply).
+    const hadContent = persistenceAccumulatorHasContent(conversationId);
     guiFallbackParents.delete(conversationId);
     guiFallbackRemoteOrigin.delete(conversationId);
     try {
       const head = finalizeInterruptedTurn(serverPersistAppHome, conversationId);
-      // finalizeInterruptedTurn returns the persisted assistant head, or null if the accumulator was
-      // empty — in that case fall back to the on-disk head so the caller reloads a valid branch.
       if (head) return { confirmed: true, headId: head };
+      if (hadContent) return { confirmed: false, headId: null as string | null }; // write failed → not confirmed
+      // Genuinely empty accumulator: the on-disk head is the confirmed branch.
       const conv = readConversation(serverPersistAppHome, conversationId);
       return { confirmed: true, headId: conv?.headId ?? null };
     } catch {
@@ -5651,9 +5675,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const deferReplace = (remaining: number): void => {
           // A replacement turn was admitted → it already finalize-replaced our pending copy at
           // admission (see the agent:stream discard site) and owns the accumulator now. Stop.
-          if (!pendingRemoteCancelReplace.has(conversationId)) return;
+          if (!pendingRemoteReplace.has(conversationId)) return;
           if (activeStreams.has(conversationId)) {
-            pendingRemoteCancelReplace.delete(conversationId);
+            pendingRemoteReplace.delete(conversationId);
             return;
           }
           let persisted = false;
@@ -5664,7 +5688,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             /* keep polling */
           }
           if (persisted || remaining <= 0) {
-            pendingRemoteCancelReplace.delete(conversationId);
+            pendingRemoteReplace.delete(conversationId);
             try {
               finalizeInterruptedTurnReplacing(appHome, conversationId);
             } catch {
@@ -5674,7 +5698,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
           setTimeout(() => deferReplace(remaining - 1), 100);
         };
-        pendingRemoteCancelReplace.add(conversationId);
+        pendingRemoteReplace.add(conversationId);
         deferReplace(80); // ~8s budget, matching the GUI fallback poll
       } else {
         discardPersistenceAccumulator(conversationId);

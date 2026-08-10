@@ -60,8 +60,8 @@ const appAPI = {
         authorized: boolean;
       }>,
     /** Force main to finalize its GUI persistence fallback (full turn) + return the confirmed head. */
-    finalizeGuiFallback: (conversationId: string) =>
-      ipcRenderer.invoke('agent:finalize-gui-fallback', conversationId) as Promise<{
+    finalizeGuiFallback: (conversationId: string, turnToken?: string) =>
+      ipcRenderer.invoke('agent:finalize-gui-fallback', conversationId, turnToken) as Promise<{
         confirmed: boolean;
         headId: string | null;
       }>,

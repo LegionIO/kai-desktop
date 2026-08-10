@@ -327,6 +327,24 @@ describe('agent IPC: continuation authorization (single driver per turn)', () =>
     // A DELAYED request for the OLDER turn must NOT revoke the newer turn's winner.
     expect((await authorize('clientA', tok1)).authorized).toBe(false);
   });
+
+  it('agent:finalize-gui-fallback returns confirmed:false when main holds no fallback for the conv', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+    // No GUI fallback + no persistence accumulator for this conv → the caller must use its own
+    // accumulator (confirmed:false), never a spurious confirmation off a stale disk head.
+    const res = await harness.invoke<{ confirmed: boolean; headId: string | null }>(
+      'agent:finalize-gui-fallback',
+      FAKE_EVENT,
+      'conv-no-fallback',
+      'tok-x',
+    );
+    expect(res.confirmed).toBe(false);
+    expect(res.headId).toBeNull();
+  });
 });
 
 describe('agent IPC: sub-agent channels', () => {

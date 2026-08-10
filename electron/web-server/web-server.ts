@@ -401,7 +401,7 @@ export function getBridgeScript(): string {
       cancelStream: function(cId) { return invoke('agent:cancel-stream', cId); },
       inFlight: function(cId) { return invoke('agent:in-flight', cId); },
       authorizeContinuation: function(cId, clientId, turnToken) { return invoke('agent:authorize-continuation', cId, clientId, turnToken); },
-      finalizeGuiFallback: function(cId) { return invoke('agent:finalize-gui-fallback', cId); },
+      finalizeGuiFallback: function(cId, turnToken) { return invoke('agent:finalize-gui-fallback', cId, turnToken); },
       injectMidTurn: function(cId, text) { return invoke('agent:inject-mid-turn', cId, text); },
       listInjects: function(cId) { return invoke('agent:list-injects', cId); },
       cancelInject: function(cId, id) { return invoke('agent:cancel-inject', cId, id); },

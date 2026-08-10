@@ -4129,7 +4129,7 @@ export function RuntimeProvider({
             // accumulator IS authoritative, so it skips this.
             if (acc.locallyOriginated !== true) {
               try {
-                const fin = await app.agent.finalizeGuiFallback?.(convId);
+                const fin = await app.agent.finalizeGuiFallback?.(convId, turnToken ?? undefined);
                 // Reload the confirmed branch (whether main finalized its fallback or the renderer's
                 // own earlier persist is authoritative — either way disk now holds the full turn).
                 const confirmed = await app.conversations.get(convId);
@@ -4723,7 +4723,7 @@ export function RuntimeProvider({
                     }
                     if (!regranted || streamAccumulators.has(convId)) return;
                     try {
-                      await app.agent.finalizeGuiFallback?.(convId);
+                      await app.agent.finalizeGuiFallback?.(convId, planTurnToken ?? undefined);
                     } catch {
                       /* best-effort */
                     }
@@ -4770,7 +4770,7 @@ export function RuntimeProvider({
               // fallback and reload the confirmed branch before restarting (same as max-turns).
               if (acc.locallyOriginated !== true) {
                 try {
-                  const fin = await app.agent.finalizeGuiFallback?.(convId);
+                  const fin = await app.agent.finalizeGuiFallback?.(convId, planTurnToken ?? undefined);
                   const confirmed = await app.conversations.get(convId);
                   const confirmedTree = confirmed && Array.isArray((confirmed as { messageTree?: unknown }).messageTree)
                     ? ((confirmed as { messageTree: StoredMessage[] }).messageTree)

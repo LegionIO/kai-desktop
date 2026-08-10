@@ -633,3 +633,11 @@ export function discardPersistenceAccumulator(conversationId: string): void {
 export function hasPersistenceAccumulator(conversationId: string): boolean {
   return accumulators.has(conversationId);
 }
+
+/** Whether the held accumulator (if any) has non-empty content to persist. Lets an on-demand
+ *  finalize distinguish "nothing to write" (head null is fine) from "had content but the write
+ *  failed" (head null is a data-loss signal). */
+export function persistenceAccumulatorHasContent(conversationId: string): boolean {
+  const acc = accumulators.get(conversationId);
+  return !!acc && acc.sawContent && acc.parts.length > 0;
+}
