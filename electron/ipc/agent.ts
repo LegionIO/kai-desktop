@@ -5596,11 +5596,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const remoteOriginCancel = guiFallbackRemoteOrigin.delete(conversationId);
     if (guiFallbackParents.delete(conversationId)) {
       if (remoteOriginCancel) {
-        try {
-          finalizeInterruptedTurnReplacing(appHome, conversationId);
-        } catch {
-          discardPersistenceAccumulator(conversationId);
-        }
+        // The web client's onCancel persists its FRAME-CAPPED tree AFTER cancelStream returns.
+        // If we REPLACE-finalize main's full copy NOW (synchronously), that later capped persist
+        // would overwrite it. So DEFER: poll briefly for the renderer's cancel-persist to land
+        // (runStatus flips off 'running'), THEN replace-finalize main's full copy on top. Keep the
+        // accumulator alive meanwhile (do NOT discard). Bounded; if it never lands (renderer gone)
+        // replace anyway so the full copy still wins.
+        const deferReplace = (remaining: number): void => {
+          // Superseded by a replacement turn → that run owns the accumulator; stop.
+          if (activeStreams.has(conversationId)) return;
+          let persisted = false;
+          try {
+            const conv = readConversation(appHome, conversationId);
+            if (conv && conv.runStatus !== 'running') persisted = true;
+          } catch {
+            /* keep polling */
+          }
+          if (persisted || remaining <= 0) {
+            try {
+              finalizeInterruptedTurnReplacing(appHome, conversationId);
+            } catch {
+              discardPersistenceAccumulator(conversationId);
+            }
+            return;
+          }
+          setTimeout(() => deferReplace(remaining - 1), 100);
+        };
+        deferReplace(80); // ~8s budget, matching the GUI fallback poll
       } else {
         discardPersistenceAccumulator(conversationId);
       }

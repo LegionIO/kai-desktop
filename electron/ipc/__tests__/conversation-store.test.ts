@@ -145,6 +145,18 @@ describe('per-file read/write', () => {
     expect(Object.keys(readIndex(appHome).conversations)).toEqual(['b2']);
   });
 
+  it('deleteConversations returns an ORPHAN record (file present, no index entry) so the caller tears it down', () => {
+    // Simulate an orphan: a data file on disk with NO index entry (a rebuilt/corrupt index).
+    writeConversation(appHome, makeConv('orphan'));
+    writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: {}, deletedIds: [] });
+    const removed = deleteConversations(appHome, ['orphan', 'never-existed']);
+    // The orphan (file confirmed gone) is returned so the caller cancels its stream + broadcasts;
+    // a never-existed id (no file, no entry) is a true no-op and omitted.
+    expect(removed).toEqual(['orphan']);
+    expect(readConversation(appHome, 'orphan')).toBeNull();
+    expect(readIndex(appHome).deletedIds).toContain('orphan');
+  });
+
   it('deleteConversations clears activeConversationId when the active chat is deleted', () => {
     writeConversation(appHome, makeConv('a1'));
     const idx = readIndex(appHome);

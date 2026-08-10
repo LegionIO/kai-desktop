@@ -9,11 +9,20 @@
 
 const REMOTE_ORIGINAL_CAP = 4096;
 const REMOTE_STRIP_MAX_DEPTH = 8;
+// Any string field longer than this is truncated for the remote copy — not just the whitelisted
+// media keys. A tool/MCP result can put multi-MiB text under an arbitrary key (e.g. `output`,
+// `stdout`, `content`); left intact it would exceed the CLI 8 MiB / web 4 MiB frame and disconnect
+// the client. 256 KiB keeps normal text intact while bounding a single string's contribution.
+const REMOTE_STRING_CAP = 256 * 1024;
+function capString(s: string): string {
+  return s.length > REMOTE_STRING_CAP ? `${s.slice(0, REMOTE_STRING_CAP)}…[truncated-in-broadcast]` : s;
+}
 
-// Bounded recursive strip of base64 / _modelContent / oversized backups from a payload for the
-// remote fan-out. A depth-exhausted container is replaced with an omission marker (NOT returned
-// verbatim) so a deeply-nested media blob can't bypass the cap.
+// Bounded recursive strip of base64 / _modelContent / oversized backups / any oversized string from
+// a payload for the remote fan-out. A depth-exhausted container is replaced with an omission marker
+// (NOT returned verbatim) so a deeply-nested media blob can't bypass the cap.
 export function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return capString(value); // a top-level / primitive string too
   if (Array.isArray(value)) {
     return depth >= REMOTE_STRIP_MAX_DEPTH
       ? '[omitted-in-broadcast]'
@@ -31,7 +40,12 @@ export function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
   }
   if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
   for (const [k, v] of Object.entries(out)) {
-    if (v && typeof v === 'object') out[k] = stripRemoteMediaDeep(v, depth + 1);
+    if (typeof v === 'string') {
+      // Any other oversized string field (not already replaced above) → truncate.
+      if (out[k] !== '[omitted-in-broadcast]') out[k] = capString(v);
+    } else if (v && typeof v === 'object') {
+      out[k] = stripRemoteMediaDeep(v, depth + 1);
+    }
   }
   return out;
 }

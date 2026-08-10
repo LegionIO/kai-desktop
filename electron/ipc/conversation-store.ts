@@ -1181,6 +1181,7 @@ export function deleteConversation(appHome: string, id: string): boolean {
   if (!fileGone) return false;
   // Tombstone only once the file is actually gone, so a stale in-flight persist can't
   // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
+  // (Deleting an already-absent id is a benign idempotent success — returns true.)
   tombstoneConversation(id);
   const index = readIndex(appHome);
   if (index.conversations[id]) {
@@ -1189,9 +1190,7 @@ export function deleteConversation(appHome: string, id: string): boolean {
   }
   // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was already
   // absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone and a
-  // stale client could resurrect the just-deleted conversation. pushDurableDeletedId may REPLACE
-  // (ring at cap → length unchanged) or MOVE an existing id, so always WRITE on a successful
-  // deletion rather than gating on a length delta (which would miss those cases).
+  // stale client could resurrect the just-deleted conversation.
   pushDurableDeletedId(index, id);
   writeIndex(appHome, index);
   return true;
@@ -1199,38 +1198,49 @@ export function deleteConversation(appHome: string, id: string): boolean {
 
 /** Batch delete: removes each conversation file and its index entry with a SINGLE
  *  index write at the end (vs. one per id via {@link deleteConversation}). Returns
- *  the ids that had an index entry removed. */
+ *  every id whose data file was confirmed GONE (including an orphan record with no
+ *  index entry) — the caller uses this to drive stream/session teardown + broadcasts. */
 export function deleteConversations(appHome: string, ids: string[]): string[] {
   assertMigratedBeforeWrite(appHome);
   const index = readIndex(appHome);
   const removed: string[] = [];
-  let tombstoned = 0;
   for (const id of ids) {
     // Only drop the index entry once the data file is GONE (removed now, or already
     // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
     // would orphan that data AND make the conversation invisible — so keep the entry and
     // skip this id (the caller can retry).
     let fileGone = false;
+    let fileExisted = false;
     try {
       const p = conversationPath(appHome, id);
-      if (existsSync(p)) rmSync(p);
+      if (existsSync(p)) {
+        fileExisted = true;
+        rmSync(p);
+      }
       fileGone = true;
     } catch {
       fileGone = false; // removal failed — retain the index entry
     }
     if (!fileGone) continue;
-    if (index.conversations[id]) {
+    const hadEntry = Boolean(index.conversations[id]);
+    if (hadEntry) {
       delete index.conversations[id];
       if (index.activeConversationId === id) index.activeConversationId = null;
-      removed.push(id); // return value: ids that had an index entry removed
     }
+    // A genuine no-op (no file ever existed AND no index entry) is skipped — nothing was deleted,
+    // so no teardown/tombstone. Otherwise (a real record removed, OR an orphan file/index entry):
+    if (!fileExisted && !hadEntry) continue;
     // Tombstone once the file is gone — in-memory fast path + DURABLE index ring — even if the
     // index entry was already absent (rebuilt/corrupt index), so a restart can't resurrect it.
     tombstoneConversation(id);
     pushDurableDeletedId(index, id);
-    tombstoned += 1;
+    // Return EVERY id whose record was actually removed (had a file and/or an index entry) — the
+    // caller drives stream/automation/compaction cancellation, deletion broadcasts, and session
+    // cleanup off this list. An orphan record (file but no index entry) still had those side
+    // effects and must get the same teardown.
+    removed.push(id);
   }
-  if (removed.length > 0 || tombstoned > 0) writeIndex(appHome, index);
+  if (removed.length > 0) writeIndex(appHome, index);
   return removed;
 }
 
