@@ -6,6 +6,7 @@ import {
   shouldCompact,
   shouldCompactAsync,
   shouldCompactBranchMediaAware,
+  messageContentSignature,
   type ChatMessage,
 } from '../compaction';
 import {
@@ -15,6 +16,23 @@ import {
   __clearExactTokenCacheForTests,
   __setTokenizerWorkerPathForTests,
 } from '../tokenization';
+
+describe('messageContentSignature (prefix-free — no structural collisions)', () => {
+  const sig = (content: unknown) =>
+    messageContentSignature({ id: 'm', role: 'assistant', content } as Parameters<typeof messageContentSignature>[0]);
+
+  it('distinguishes ["a","b"] from a single string that reproduces the delimiter bytes', () => {
+    // Without length-prefixing, the array-of-two-strings and the single-string forms fed identical
+    // bytes → a same-id rewrite between them would pass the drift check and reuse a stale summary.
+    expect(sig(['a', 'b'])).not.toBe(sig(['a b']));
+    expect(sig(['a', 'b'])).not.toBe(sig([' s a s b ']));
+  });
+
+  it('is stable for equal content and sensitive to a real change', () => {
+    expect(sig([{ type: 'text', text: 'hello' }])).toBe(sig([{ type: 'text', text: 'hello' }]));
+    expect(sig([{ type: 'text', text: 'hello' }])).not.toBe(sig([{ type: 'text', text: 'hell' }]));
+  });
+});
 
 describe('shouldCompact (cheap pre-check gate + exact count)', () => {
   beforeEach(() => __clearExactTokenCacheForTests());

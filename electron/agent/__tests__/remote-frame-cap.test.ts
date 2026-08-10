@@ -50,4 +50,20 @@ describe('capRemoteEvent (remote frame-cap for stream/sub-agent events)', () => 
     const ev = { type: 'text-delta', text: 'hi' };
     expect(capRemoteEvent(ev)).toEqual(ev);
   });
+
+  it('enforces a CUMULATIVE frame budget (many individually-small strings cannot exceed it)', () => {
+    // 40 strings of 250 KiB each pass the per-string cap (< 256 KiB) but total ~10 MiB — over the
+    // frame. The aggregate budget must omit the overflow so the serialized event stays bounded.
+    const event = {
+      conversationId: 'c',
+      type: 'tool-result',
+      result: Array.from({ length: 40 }, () => 'x'.repeat(250 * 1024)),
+    };
+    const capped = capRemoteEvent(event);
+    const bytes = Buffer.byteLength(JSON.stringify(capped), 'utf8');
+    // Comfortably under the tighter (web 4 MiB) frame limit.
+    expect(bytes).toBeLessThan(4 * 1024 * 1024);
+    // The tail entries were omitted once the budget was spent.
+    expect(JSON.stringify(capped)).toContain('[omitted-in-broadcast]');
+  });
 });

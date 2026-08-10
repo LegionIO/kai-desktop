@@ -4,60 +4,103 @@
 // Electron windows have no frame cap, so we strip ONLY the copy fanned out to remote clients; a
 // remote client that needs the full payload re-fetches the persisted record via conversations:get.
 //
-// This is the single shared implementation used by both the main agent stream broadcast and the
-// sub-agent broadcast (a leaf module so neither has to import the other).
+// This is the single shared implementation used by the main agent stream broadcast, the sub-agent
+// broadcasts, AND the conversation-upsert broadcast (a leaf module so callers don't import each
+// other).
 
 const REMOTE_ORIGINAL_CAP = 4096;
 const REMOTE_STRIP_MAX_DEPTH = 8;
-// Any string field longer than this is truncated for the remote copy — not just the whitelisted
-// media keys. A tool/MCP result can put multi-MiB text under an arbitrary key (e.g. `output`,
-// `stdout`, `content`); left intact it would exceed the CLI 8 MiB / web 4 MiB frame and disconnect
-// the client. 256 KiB keeps normal text intact while bounding a single string's contribution.
+// Per-string ceiling — one string field longer than this is truncated. A tool/MCP result can put
+// multi-MiB text under an arbitrary key (`output`, `stdout`, `content`); 256 KiB keeps normal text
+// intact while bounding a single string's contribution.
 const REMOTE_STRING_CAP = 256 * 1024;
+// CUMULATIVE serialized-byte budget for one whole event/payload. Per-string caps alone don't bound
+// the frame — e.g. 40 strings of 250 KiB each pass individually but total ~10 MiB, over the CLI's
+// 8 MiB frame, disconnecting it. Once the running total exceeds this budget, every remaining subtree
+// is replaced with an omission marker. Set below both frame limits (web 4 MiB is the tighter one),
+// with headroom for the JSON envelope + control fields; a remote client re-fetches full content via
+// conversations:get, so aggressive omission past the budget only affects the live event, not the
+// persisted record.
+const REMOTE_EVENT_BYTE_BUDGET = 3 * 1024 * 1024;
+
+const OMIT = '[omitted-in-broadcast]';
+
 function capString(s: string): string {
   return s.length > REMOTE_STRING_CAP ? `${s.slice(0, REMOTE_STRING_CAP)}…[truncated-in-broadcast]` : s;
 }
 
+type Budget = { used: number };
+
 // Bounded recursive strip of base64 / _modelContent / oversized backups / any oversized string from
-// a payload for the remote fan-out. A depth-exhausted container is replaced with an omission marker
-// (NOT returned verbatim) so a deeply-nested media blob can't bypass the cap.
-export function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
-  if (typeof value === 'string') return capString(value); // a top-level / primitive string too
+// a payload for the remote fan-out. A depth-exhausted container OR a budget-exhausted subtree is
+// replaced with an omission marker (NOT returned verbatim) so neither a deeply-nested blob nor a
+// large aggregate of individually-small strings can exceed the frame.
+function stripInner(value: unknown, depth: number, budget: Budget): unknown {
+  if (budget.used >= REMOTE_EVENT_BYTE_BUDGET) return OMIT; // budget spent — omit the rest
+  if (typeof value === 'string') {
+    const capped = capString(value);
+    budget.used += capped.length;
+    return capped;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || value == null) {
+    budget.used += 8;
+    return value;
+  }
   if (Array.isArray(value)) {
-    return depth >= REMOTE_STRIP_MAX_DEPTH
-      ? '[omitted-in-broadcast]'
-      : value.map((v) => stripRemoteMediaDeep(v, depth + 1));
-  }
-  if (!value || typeof value !== 'object') return value;
-  if (depth >= REMOTE_STRIP_MAX_DEPTH) return '[omitted-in-broadcast]';
-  const src = value as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...src };
-  for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
-    if (typeof out[k] === 'string' && (out[k] as string).length > 256) out[k] = '[omitted-in-broadcast]';
-  }
-  for (const k of ['originalResult', 'originalContent']) {
-    if (typeof out[k] === 'string' && (out[k] as string).length > REMOTE_ORIGINAL_CAP) out[k] = '[omitted-in-broadcast]';
-  }
-  if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
-  for (const [k, v] of Object.entries(out)) {
-    if (typeof v === 'string') {
-      // Any other oversized string field (not already replaced above) → truncate.
-      if (out[k] !== '[omitted-in-broadcast]') out[k] = capString(v);
-    } else if (v && typeof v === 'object') {
-      out[k] = stripRemoteMediaDeep(v, depth + 1);
+    if (depth >= REMOTE_STRIP_MAX_DEPTH) return OMIT;
+    const arr: unknown[] = [];
+    for (const v of value) {
+      if (budget.used >= REMOTE_EVENT_BYTE_BUDGET) {
+        arr.push(OMIT);
+        break;
+      }
+      arr.push(stripInner(v, depth + 1, budget));
     }
+    return arr;
+  }
+  if (typeof value !== 'object') return value;
+  if (depth >= REMOTE_STRIP_MAX_DEPTH) return OMIT;
+  const src = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(src)) {
+    budget.used += k.length + 4;
+    if (budget.used >= REMOTE_EVENT_BYTE_BUDGET) {
+      out[k] = OMIT;
+      continue;
+    }
+    // Whitelisted media keys: drop wholesale when large (base64 image/file data URLs, source blobs).
+    if ((k === 'image' || k === 'data' || k === 'dataUrl' || k === 'url' || k === 'source') && typeof v === 'string' && v.length > 256) {
+      out[k] = OMIT;
+      continue;
+    }
+    // UI-only pre-compaction backups: full oversized text — never needed in a broadcast.
+    if ((k === 'originalResult' || k === 'originalContent') && typeof v === 'string' && v.length > REMOTE_ORIGINAL_CAP) {
+      out[k] = OMIT;
+      continue;
+    }
+    // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
+    if (k === '_modelContent' && Array.isArray(v)) {
+      out[k] = OMIT;
+      continue;
+    }
+    out[k] = stripInner(v, depth + 1, budget);
   }
   return out;
 }
 
-// Cap the oversized fields of a stream/sub-agent event for the remote fan-out. Returns the event
-// unchanged when nothing needs capping (the common case), else a shallow-cloned capped copy:
-// Cap the oversized fields of a stream/sub-agent event for the remote fan-out. Deep-caps the ENTIRE
-// event (media + oversized backups + any oversized string, recursively, with depth-exhaustion
-// omission), so no field of any event type can exceed the frame — not just tool-result payloads.
-// Small control fields (type/conversationId/runGeneration/toolCallId/toolName) are short by nature
-// and pass through the string cap untouched. Returns the same object when nothing changed.
+// Public: strip a standalone value (used by the conversation-upsert per-part strip). Each part gets
+// its OWN budget — a single message part rarely approaches the frame alone, and the upsert also
+// omits pendingDrafts + the caller relies on per-part safety; a whole-tree aggregate budget is not
+// applied here (the tree can legitimately be large across many parts and clients re-fetch full).
+export function stripRemoteMediaDeep(value: unknown): unknown {
+  return stripInner(value, 0, { used: 0 });
+}
+
+// Cap a stream/sub-agent event for the remote fan-out. Deep-caps the ENTIRE event under ONE shared
+// cumulative byte budget so the serialized frame stays bounded regardless of how the payload is
+// shaped (one huge string, many medium strings, deep nesting, or media). Small control fields
+// (type/conversationId/runGeneration/toolCallId/toolName) are short and pass through untouched.
 export function capRemoteEvent<T>(event: T): T {
   if (!event || typeof event !== 'object') return event;
-  return stripRemoteMediaDeep(event) as T;
+  return stripInner(event, 0, { used: 0 }) as T;
 }

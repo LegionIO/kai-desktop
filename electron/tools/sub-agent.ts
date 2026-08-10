@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { join } from 'path';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import {
   runSubAgent,
   getActiveSubAgentCount,
@@ -140,7 +141,10 @@ function broadcastEvent(event: SubAgentEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('agent:stream-event', event);
   }
-  broadcastToWebClients('agent:stream-event', event);
+  // REMOTE clients are frame-capped — a large provider error / result on a terminal sub-agent
+  // event would exceed the frame and disconnect them before it arrives. Cap the remote copy (same
+  // shared cap as the stream + sub-agent-runner broadcasts); local windows get the full event.
+  broadcastToWebClients('agent:stream-event', capRemoteEvent(event));
 }
 
 /** Classified terminal outcome shared by the initial-run and resume paths. */

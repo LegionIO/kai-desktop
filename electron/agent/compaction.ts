@@ -71,12 +71,16 @@ export function messageContentSignature(
     // materializing a history-sized intermediate string on the main process (this runs on
     // every conversations:put) risks a stall/OOM. Walking the structure and update()-ing the
     // hash with each primitive reads the existing strings in place (no second full-size copy).
-    // Deterministic object key order so two equal messages hash equal.
+    // Deterministic object key order so two equal messages hash equal. Strings + keys are
+    // LENGTH-PREFIXED (prefix-free encoding) so structurally-different inputs can't collide by
+    // having string content that reproduces the delimiter bytes — e.g. without a length prefix,
+    // ["a","b"] and ["a\x1fsb"] feed identical bytes, letting a same-id rewrite between them pass
+    // the drift check and reuse a stale summary.
     const feed = (v: unknown): void => {
       if (v === null || v === undefined) {
         hash.update(' n');
       } else if (typeof v === 'string') {
-        hash.update(' s');
+        hash.update(` s${v.length}:`); // length-prefixed → prefix-free
         hash.update(v); // reads the existing string in place; no giant new allocation
       } else if (typeof v === 'number' || typeof v === 'boolean') {
         hash.update(' p');
@@ -88,7 +92,7 @@ export function messageContentSignature(
       } else if (typeof v === 'object') {
         hash.update(' {');
         for (const key of Object.keys(v as Record<string, unknown>).sort()) {
-          hash.update(' k');
+          hash.update(` k${key.length}:`); // length-prefixed key
           hash.update(key);
           feed((v as Record<string, unknown>)[key]);
         }

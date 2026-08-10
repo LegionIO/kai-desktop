@@ -1255,37 +1255,49 @@ export function clearAllConversations(appHome: string): string[] {
   const dir = conversationsDir(appHome);
   // UNION of indexed ids and on-disk record files — an orphan file (no index entry) must be
   // tombstoned + torn down too, else a stale client / live stream can resurrect it.
-  const clearedIds = new Set<string>(Object.keys(priorIndex.conversations));
+  const candidateIds = new Set<string>(Object.keys(priorIndex.conversations));
   if (existsSync(dir)) {
     for (const name of readdirSync(dir)) {
-      if (name.endsWith('.json')) clearedIds.add(name.slice(0, -'.json'.length));
+      if (name.endsWith('.json')) candidateIds.add(name.slice(0, -'.json'.length));
     }
   }
-  // Tombstone every id being cleared so a stale in-flight persist (a running stream, or a trusted
-  // client that read a record before the clear) can't resurrect a wiped conversation.
-  for (const id of clearedIds) tombstoneConversation(id);
-  if (existsSync(dir)) {
-    for (const name of readdirSync(dir)) {
-      if (name.endsWith('.json')) {
-        try {
-          rmSync(join(dir, name));
-        } catch {
-          /* ignore */
-        }
-      }
+  // Remove each record file. A FAILED rm must NOT be treated as cleared — tombstoning/returning it
+  // (and dropping the index entry) would leave the record on disk yet invisible + stop its stream,
+  // stranding it. So preserve failures (per-file, like deleteConversations): only ids whose file is
+  // confirmed GONE (removed now, or already absent = an index-only entry) are actually cleared.
+  const cleared: string[] = [];
+  const preserved: Record<string, ConversationIndexEntry> = {};
+  for (const id of candidateIds) {
+    let fileGone = false;
+    try {
+      const p = conversationPath(appHome, id);
+      if (existsSync(p)) rmSync(p);
+      fileGone = true;
+    } catch {
+      fileGone = false; // rm failed — retain this record
+    }
+    if (fileGone) {
+      // Tombstone only once the file is actually gone so a stale in-flight persist can't resurrect.
+      tombstoneConversation(id);
+      cleared.push(id);
+    } else if (priorIndex.conversations[id]) {
+      preserved[id] = priorIndex.conversations[id]; // keep the surviving record's index entry
     }
   }
   // Carry the durable deleted-id ring forward (preserving prior tombstones) and add every id we
-  // just cleared, so a stale client can't resurrect a wiped conversation after restart/TTL expiry.
+  // actually cleared, so a stale client can't resurrect a wiped conversation after restart/TTL.
   const nextIndex: ConversationIndex = {
-    conversations: {},
-    activeConversationId: null,
+    conversations: preserved,
+    activeConversationId:
+      priorIndex.activeConversationId && preserved[priorIndex.activeConversationId]
+        ? priorIndex.activeConversationId
+        : null,
     settings: priorIndex.settings,
     deletedIds: Array.isArray(priorIndex.deletedIds) ? [...priorIndex.deletedIds] : [],
   };
-  for (const id of clearedIds) pushDurableDeletedId(nextIndex, id);
+  for (const id of cleared) pushDurableDeletedId(nextIndex, id);
   writeIndex(appHome, nextIndex);
-  return [...clearedIds];
+  return cleared;
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────
