@@ -124,7 +124,12 @@ export function enforceHeapSnapshotRetention(dir: string, retention: HeapSnapsho
   // unlink, dropFront can't shrink `files`, so stop.
   if (retention.maxCount > 0) {
     let guard = 0;
-    while (files.length + failed.length > retention.maxCount && files.length > 0 && guard < 1000) {
+    // Stop while more than ONE deletable file remains: never delete the NEWEST remaining snapshot to
+    // satisfy the COUNT cap. If older files are UNDELETABLE (moved to `failed`, still counting toward
+    // the cap), deleting the newest would leave only stale data — better to tolerate exceeding the
+    // cap than to evict the freshest snapshot the user actually needs. (`files` is oldest→newest, so
+    // stopping at length 1 preserves the newest survivor.)
+    while (files.length + failed.length > retention.maxCount && files.length > 1 && guard < 1000) {
       dropFront(files); // always shifts one off `files` (deleted → evicted, or failed → `failed`)
       guard++;
     }

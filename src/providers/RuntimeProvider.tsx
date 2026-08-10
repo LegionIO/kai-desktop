@@ -845,6 +845,14 @@ const automationStreams = new Set<string>();
 // to main: agent:authorize-continuation grants the FIRST caller per turn (keyed by the run's stream
 // token) and denies the rest. See the max-turns / plan-restart handlers.
 const CONTINUATION_CLIENT_ID = msgId();
+// True when this renderer is a WEB-bridge client (browser), not an Electron window. A web client
+// receives FRAME-CAPPED stream events (large tool output/media stripped for the transport), so even
+// for a turn it ORIGINATED (locallyOriginated:true) its in-memory accumulator is TRUNCATED — a
+// continuation must therefore reload the authoritative full branch from main first, exactly like a
+// passive mirror, instead of continuing from (and overwriting the full nodes with) the capped copy.
+const IS_WEB_BRIDGE = Boolean(
+  (window as unknown as { app?: { __isWebBridge?: boolean } }).app?.__isWebBridge,
+);
 /** Automation conversations we've begun async-seeding a background accumulator for
  *  (dedupes the disk fetch while events stream in before the seed resolves). */
 const automationSeedInProgress = new Set<string>();
@@ -4178,7 +4186,11 @@ export function RuntimeProvider({
             // fallback and return the confirmed head, then reload THAT complete branch from disk and
             // continue from it (never the partial in-memory accumulator). A local originator's
             // accumulator IS authoritative, so it skips this.
-            if (acc.locallyOriginated !== true) {
+            // Reload the authoritative full branch before continuing when this client's accumulator
+            // may be TRUNCATED: a passive mirror (locallyOriginated !== true) OR a WEB client (which
+            // receives frame-capped events even for a turn it originated). An Electron originator has
+            // the full events, so it skips this.
+            if (acc.locallyOriginated !== true || IS_WEB_BRIDGE) {
               let finConfirmed: boolean | undefined;
               try {
                 const fin = await app.agent.finalizeGuiFallback?.(convId, turnToken ?? undefined);
@@ -4873,7 +4885,9 @@ export function RuntimeProvider({
               }
               // A MIRROR winner has a PARTIAL accumulator — finalize main's authoritative full-turn
               // fallback and reload the confirmed branch before restarting (same as max-turns).
-              if (acc.locallyOriginated !== true) {
+              // Reload the authoritative branch before restarting when the accumulator may be
+              // truncated: a passive mirror OR a WEB client (capped events even when it originated).
+              if (acc.locallyOriginated !== true || IS_WEB_BRIDGE) {
                 let planFinConfirmed: boolean | undefined;
                 try {
                   const fin = await app.agent.finalizeGuiFallback?.(convId, planTurnToken ?? undefined);

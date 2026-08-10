@@ -76,6 +76,24 @@ describe('enforceHeapSnapshotRetention', () => {
     rmSync(unremovable, { recursive: true, force: true });
   });
 
+  it('never deletes the NEWEST snapshot to satisfy the count cap when the older one is undeletable', () => {
+    // maxCount:1, oldest undeletable + newest deletable. The sweep must NOT delete the newest to
+    // reach the cap (that would leave only stale data) — it tolerates exceeding the cap instead.
+    const unremovable = join(dir, 'heap-20260101T000000.heapsnapshot');
+    mkdirSync(unremovable);
+    writeFileSync(join(unremovable, 'blocker'), 'x');
+    const oldT = new Date(2026, 0, 1, 0, 0);
+    utimesSync(unremovable, oldT, oldT);
+    makeSnap('heap-20260101T000005.heapsnapshot', 10, 5); // newest, deletable
+
+    const evicted = enforceHeapSnapshotRetention(dir, { maxCount: 1, maxTotalBytes: 0 });
+
+    expect(evicted).not.toContain('heap-20260101T000005.heapsnapshot'); // newest preserved
+    const remaining = readdirSync(dir).filter((n) => n.endsWith('.heapsnapshot')).sort();
+    expect(remaining).toContain('heap-20260101T000005.heapsnapshot');
+    rmSync(unremovable, { recursive: true, force: true });
+  });
+
   it('evicts oldest beyond maxTotalBytes', () => {
     makeSnap('heap-20260101T000000.heapsnapshot', 100, 0);
     makeSnap('heap-20260101T000001.heapsnapshot', 100, 1);

@@ -5681,10 +5681,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // finalizes to a null head, the write FAILED and we must NOT report confirmed (the caller would
     // continue on a stale branch, losing the authoritative reply).
     const hadContent = persistenceAccumulatorHasContent(conversationId);
+    const remoteOrigin = guiFallbackRemoteOrigin.delete(conversationId);
     guiFallbackParents.delete(conversationId);
-    guiFallbackRemoteOrigin.delete(conversationId);
+    pendingRemoteReplace.delete(conversationId);
+    pendingLocalReplace.delete(conversationId);
     try {
-      const head = finalizeInterruptedTurn(serverPersistAppHome, conversationId);
+      // REMOTE origin: the web client already persisted a FRAME-CAPPED node under this
+      // responseMessageId — REPLACE it in place with main's full copy (appending would create a
+      // duplicate sibling). LOCAL origin: append (no capped node to replace).
+      const head = remoteOrigin
+        ? finalizeInterruptedTurnReplacing(serverPersistAppHome, conversationId)
+        : finalizeInterruptedTurn(serverPersistAppHome, conversationId);
       if (head) return { confirmed: true, headId: head };
       if (hadContent) return { confirmed: false, headId: null as string | null }; // write failed → not confirmed
       // Genuinely empty accumulator: the on-disk head is the confirmed branch.
