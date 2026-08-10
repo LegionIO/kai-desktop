@@ -4688,44 +4688,60 @@ export function RuntimeProvider({
           );
           return;
         }
-        finalizeAssistantResponse(acc);
-        // Apply messageMeta from the done event (e.g. sourceModel reported by
-        // an inference provider) to the last assistant message before persisting.
-        if (e.messageMeta && Object.keys(e.messageMeta).length > 0) {
-          const branch = getActiveBranch(acc.messages, acc.headId);
-          const last = branch[branch.length - 1];
-          if (last?.role === 'assistant') {
-            const idx = acc.messages.findIndex((m) => m.id === last.id);
-            if (idx >= 0) acc.messages[idx] = applyAssistantMessageMeta(acc.messages[idx], e.messageMeta);
+        // A MIRROR falling through here ONLY for a mandatory plan-restart must NOT run the normal
+        // terminal finalize/persist below: persisting its PARTIAL accumulator as 'idle' would make
+        // main treat it as the renderer's authoritative terminal + discard main's FULL fallback
+        // (truncating history + aborting the restart) BEFORE the plan-restart block's
+        // finalizeGuiFallback runs. So for that case, only clear the debounce timer and skip
+        // straight to the plan-restart block (which finalizes main's authoritative copy, reloads the
+        // confirmed branch, and restarts). Its own ownership check tolerates the absent accumulator.
+        if (mirrorWantsPlanRestart) {
+          const _ptMirrorPlan = persistTimersRef.current.get(convId);
+          if (_ptMirrorPlan) {
+            clearTimeout(_ptMirrorPlan);
+            persistTimersRef.current.delete(convId);
           }
-        }
-        const _ptDone = persistTimersRef.current.get(convId);
-        if (_ptDone) {
-          clearTimeout(_ptDone);
-          persistTimersRef.current.delete(convId);
-        }
-        recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
-        streamAccumulators.delete(convId);
-        persistConversation(
-          convId,
-          acc.messages,
-          acc.headId,
-          {
-            runStatus: 'idle',
-            lastAssistantUpdateAt: nowIso(),
-            hasUnread: !isActiveConv,
-            ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
-          },
-          seedContextFor(acc),
-        );
-        if (isActiveConv) {
-          setTree([...acc.messages]);
-          setHeadId(acc.headId);
-          // Update the model selector to reflect the actual model used (may differ
-          // from requested if a fallback occurred during the pipeline run).
-          const resolvedModel = (e.data as Record<string, unknown> | undefined)?.model as string | undefined;
-          if (resolvedModel) {
-            onModelFallbackRef.current?.(resolvedModel);
+          streamAccumulators.delete(convId); // drop the partial mirror; do NOT persist it
+        } else {
+          finalizeAssistantResponse(acc);
+          // Apply messageMeta from the done event (e.g. sourceModel reported by
+          // an inference provider) to the last assistant message before persisting.
+          if (e.messageMeta && Object.keys(e.messageMeta).length > 0) {
+            const branch = getActiveBranch(acc.messages, acc.headId);
+            const last = branch[branch.length - 1];
+            if (last?.role === 'assistant') {
+              const idx = acc.messages.findIndex((m) => m.id === last.id);
+              if (idx >= 0) acc.messages[idx] = applyAssistantMessageMeta(acc.messages[idx], e.messageMeta);
+            }
+          }
+          const _ptDone = persistTimersRef.current.get(convId);
+          if (_ptDone) {
+            clearTimeout(_ptDone);
+            persistTimersRef.current.delete(convId);
+          }
+          recordFinalizedBranch(convId, acc.messages, acc.headId); // survives the delete for onNew's fallback base
+          streamAccumulators.delete(convId);
+          persistConversation(
+            convId,
+            acc.messages,
+            acc.headId,
+            {
+              runStatus: 'idle',
+              lastAssistantUpdateAt: nowIso(),
+              hasUnread: !isActiveConv,
+              ...(acc.pendingCompaction ? { conversationCompaction: acc.pendingCompaction } : {}),
+            },
+            seedContextFor(acc),
+          );
+          if (isActiveConv) {
+            setTree([...acc.messages]);
+            setHeadId(acc.headId);
+            // Update the model selector to reflect the actual model used (may differ
+            // from requested if a fallback occurred during the pipeline run).
+            const resolvedModel = (e.data as Record<string, unknown> | undefined)?.model as string | undefined;
+            if (resolvedModel) {
+              onModelFallbackRef.current?.(resolvedModel);
+            }
           }
         }
         {
