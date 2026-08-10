@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   type MockWindow = {
@@ -36,6 +36,10 @@ const mocks = vi.hoisted(() => {
   const state = {
     windows: [] as MockWindow[],
     browserWindowOptions: [] as Array<Record<string, unknown>>,
+    // Result the recorder window's `window._mic.startLiveStream(...)` eval
+    // resolves to. Default = success; tests set an error to drive the mic-start
+    // failure path.
+    startLiveStreamResult: { ok: true, sampleRate: 16000 } as { ok?: boolean; sampleRate?: number; error?: string },
     recognizer: null as null | {
       recognizing?: (_sender: unknown, event: { result: { text?: string } }) => void;
       recognized?: (_sender: unknown, event: { result: { reason: number; text?: string } }) => void;
@@ -194,7 +198,7 @@ const mocks = vi.hoisted(() => {
       this.webContents = {
         session: { setPermissionRequestHandler: vi.fn() },
         executeJavaScript: vi.fn(async (script: string) => {
-          if (script.includes('startLiveStream')) return { ok: true, sampleRate: 16000 };
+          if (script.includes('startLiveStream')) return state.startLiveStreamResult;
           if (script.includes('stopLiveStream')) return [];
           if (script.includes('drainLiveChunks')) return [];
           if (script.includes('getLevel')) return 0;
@@ -218,6 +222,7 @@ const mocks = vi.hoisted(() => {
   const reset = () => {
     state.windows = [];
     state.browserWindowOptions = [];
+    state.startLiveStreamResult = { ok: true, sampleRate: 16000 };
     state.recognizer = null;
     state.pushStream = null;
     state.targetPid = 4242;
@@ -579,6 +584,75 @@ describe.skipIf(process.platform !== 'darwin')('dictation manager native session
       expect(manager.getDictationState().state).toBe('active');
     });
     expect(mocks.startLocalMacosTakeoverMonitor).toHaveBeenCalled();
+  });
+});
+
+describe.skipIf(process.platform !== 'darwin')('dictation mic-failure banner lifecycle', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.stubGlobal('__BRAND_PRODUCT_NAME', 'Kai');
+    vi.stubGlobal('__BRAND_APP_SLUG', 'kai');
+    mocks.reset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('keeps the overlay shown and broadcasts a friendly error when mic start fails, then hides after 5s', async () => {
+    vi.useFakeTimers();
+    const manager = await import('../dictation-manager.js');
+    // Drive the recorder-window mic start to fail (e.g. OverconstrainedError).
+    mocks.state.startLiveStreamResult = { error: 'OverconstrainedError' };
+
+    manager.initDictation(createConfig() as never);
+    await manager.toggleDictation();
+
+    // Session did not become active; it fell back to idle.
+    expect(manager.getDictationState().state).toBe('idle');
+    // The error was broadcast to the overlay with a friendly prefix...
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:error', expect.stringContaining('Mic capture failed'));
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith(
+      'dictation:error',
+      expect.stringContaining('OverconstrainedError'),
+    );
+    // ...and the overlay was NOT hidden yet — the banner must stay visible.
+    expect(mocks.hideDictationOverlay).not.toHaveBeenCalled();
+
+    // After the banner window elapses, the overlay hides on its own.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(mocks.hideDictationOverlay).toHaveBeenCalledTimes(1);
+  });
+
+  it('first hotkey press while the error banner shows dismisses it (no start); second press starts', async () => {
+    vi.useFakeTimers();
+    const manager = await import('../dictation-manager.js');
+    mocks.state.startLiveStreamResult = { error: 'OverconstrainedError' };
+
+    manager.initDictation(createConfig() as never);
+    await manager.toggleDictation(); // fails → banner active
+
+    expect(manager.getDictationState().state).toBe('idle');
+    expect(mocks.hideDictationOverlay).not.toHaveBeenCalled();
+    const nativeInstancesAfterFail = mocks.DictationNativeSessionClient.instances.length;
+
+    // First press: dismiss the banner. Clears the error and hides now — does NOT
+    // start a new (likely-failing) session.
+    await manager.toggleDictation();
+    expect(mocks.sendToOverlay).toHaveBeenCalledWith('dictation:error', null);
+    expect(mocks.hideDictationOverlay).toHaveBeenCalledTimes(1);
+    expect(manager.getDictationState().state).toBe('idle');
+    expect(mocks.DictationNativeSessionClient.instances.length).toBe(nativeInstancesAfterFail);
+
+    // The auto-hide timer was cancelled: advancing time does not hide again.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(mocks.hideDictationOverlay).toHaveBeenCalledTimes(1);
+
+    // Second press: now the mic works, so a real session starts.
+    mocks.state.startLiveStreamResult = { ok: true, sampleRate: 16000 };
+    await manager.toggleDictation();
+    expect(manager.getDictationState().state).toBe('active');
+    expect(mocks.DictationNativeSessionClient.instances.length).toBeGreaterThan(nativeInstancesAfterFail);
   });
 });
 

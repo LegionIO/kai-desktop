@@ -107,3 +107,30 @@ describe('computer-use getModelChainForRole — profile fallback chain', () => {
     expect(chain.map((c) => c.key)).toEqual(['profile-primary']);
   });
 });
+
+describe('computer-use overlay banner — modelDisplayName follows the driver model', () => {
+  // Regression: the overlay banner resolved its title from session.selectedModelKey
+  // (falling back to the GLOBAL default model), while the loop's "Planning with
+  // <model>..." status used the driver model resolved from the active profile. With
+  // a profile active and no session model set, the banner showed the wrong model
+  // (global default) while the loop ran on the profile primary. The banner must use
+  // the SAME getEntryForRole('driver') resolution the orchestrator drives with.
+  const bannerDisplayName = (s: ComputerSession): string => {
+    const entry = s.selectedModelKey
+      ? (config.models.catalog.find((m) => m.key === s.selectedModelKey) ?? getEntryForRole(config, s, 'driver'))
+      : getEntryForRole(config, s, 'driver');
+    return entry?.displayName ?? s.selectedModelKey ?? 'AI';
+  };
+
+  it('matches the profile primary (the model that actually drives) under an active profile', () => {
+    const s = session({ selectedProfileKey: 'fast' });
+    expect(bannerDisplayName(s)).toBe('profile-primary');
+    // ...and equals the driver entry the loop plans with — no drift.
+    expect(bannerDisplayName(s)).toBe(getEntryForRole(config, s, 'driver')?.displayName);
+  });
+
+  it('honors an explicit session model pick over the profile primary', () => {
+    const s = session({ selectedProfileKey: 'fast', selectedModelKey: 'default-m' });
+    expect(bannerDisplayName(s)).toBe('default-m');
+  });
+});

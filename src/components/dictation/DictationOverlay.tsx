@@ -49,6 +49,13 @@ export const DictationOverlay: FC = () => {
     });
     const unsubError = app.dictation.onError((msg) => {
       if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
+      // A null/empty message means "clear the banner now" (e.g. the hotkey was
+      // pressed to dismiss it). Otherwise show it and auto-dismiss after 5s.
+      if (!msg) {
+        errorTimeoutRef.current = null;
+        setError(null);
+        return;
+      }
       setError(msg);
       errorTimeoutRef.current = setTimeout(() => {
         setError(null);
@@ -60,11 +67,17 @@ export const DictationOverlay: FC = () => {
     });
 
     // Fetch initial state/mode; both may have been broadcast before we mounted.
-    app.dictation.getState().then((state) => {
-      setDictState(state.state);
-      setElapsed(state.elapsed);
-    }).catch(() => {});
-    app.dictation.getTypingMode().then((mode) => setTypingMode(mode)).catch(() => {});
+    app.dictation
+      .getState()
+      .then((state) => {
+        setDictState(state.state);
+        setElapsed(state.elapsed);
+      })
+      .catch(() => {});
+    app.dictation
+      .getTypingMode()
+      .then((mode) => setTypingMode(mode))
+      .catch(() => {});
 
     return () => {
       unsubState();
@@ -97,7 +110,10 @@ export const DictationOverlay: FC = () => {
   // Load devices when expanded
   useEffect(() => {
     if (expanded) {
-      app.mic.listDevices().then(setDevices).catch(() => {});
+      app.mic
+        .listDevices()
+        .then(setDevices)
+        .catch(() => {});
     }
   }, [expanded]);
 
@@ -121,7 +137,7 @@ export const DictationOverlay: FC = () => {
   }, []);
 
   useEffect(() => {
-    app.dictation.resizeOverlay(expanded ? (error ? 320 : 280) : (error ? 96 : 52));
+    app.dictation.resizeOverlay(expanded ? (error ? 320 : 280) : error ? 96 : 52);
   }, [error, expanded]);
 
   const isStarting = dictState === 'starting';
@@ -148,28 +164,30 @@ export const DictationOverlay: FC = () => {
       onMouseLeave={handleMouseLeave}
       onClickCapture={handleClickCapture}
     >
-      <div
-        className="flex flex-col rounded-2xl border border-white/10 bg-black/80 backdrop-blur-xl shadow-2xl overflow-hidden"
-      >
+      <div className="flex flex-col rounded-2xl border border-white/10 bg-black/80 backdrop-blur-xl shadow-2xl overflow-hidden">
         {/* Main bar */}
         <div className="flex items-center gap-2.5 px-3 py-2.5">
           {/* Recording status */}
           <span className="relative flex h-2.5 w-2.5 shrink-0">
-            <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-70 ${
-              isActive ? 'bg-red-400' : isStarting ? 'bg-sky-300' : 'bg-white/30'
-            }`} />
-            <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
-              isActive ? 'bg-red-500' : isStarting ? 'bg-sky-400' : 'bg-white/35'
-            }`} />
+            <span
+              className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-70 ${
+                isActive ? 'bg-red-400' : isStarting ? 'bg-sky-300' : 'bg-white/30'
+              }`}
+            />
+            <span
+              className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+                isActive ? 'bg-red-500' : isStarting ? 'bg-sky-400' : 'bg-white/35'
+              }`}
+            />
           </span>
 
           {/* Typing mode indicator */}
           {typingMode !== 'idle' && (
-            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-              typingMode === 'ax'
-                ? 'bg-emerald-500/20 text-emerald-300'
-                : 'bg-amber-500/20 text-amber-300'
-            }`}>
+            <span
+              className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                typingMode === 'ax' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'
+              }`}
+            >
               {typingMode === 'ax' ? 'AX' : 'KB'}
             </span>
           )}
@@ -197,11 +215,7 @@ export const DictationOverlay: FC = () => {
             onClick={() => handleExpand(!expanded)}
             className="ml-auto rounded-lg p-1 text-white/60 hover:text-white hover:bg-white/10 transition-colors"
           >
-            {expanded ? (
-              <ChevronUpIcon className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronDownIcon className="h-3.5 w-3.5" />
-            )}
+            {expanded ? <ChevronUpIcon className="h-3.5 w-3.5" /> : <ChevronDownIcon className="h-3.5 w-3.5" />}
           </button>
 
           {/* Stop button */}
@@ -229,9 +243,7 @@ export const DictationOverlay: FC = () => {
           <div className="border-t border-white/10">
             {/* Device picker */}
             <div className="px-3 py-2 space-y-1">
-              <div className="text-[10px] font-medium text-white/50 uppercase tracking-wider">
-                Input Device
-              </div>
+              <div className="text-[10px] font-medium text-white/50 uppercase tracking-wider">Input Device</div>
               <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
                 {devices.map((device) => (
                   <button
@@ -249,9 +261,7 @@ export const DictationOverlay: FC = () => {
                   </button>
                 ))}
                 {devices.length === 0 && (
-                  <div className="text-[10px] text-white/40 py-2 text-center">
-                    No devices found
-                  </div>
+                  <div className="text-[10px] text-white/40 py-2 text-center">No devices found</div>
                 )}
               </div>
             </div>

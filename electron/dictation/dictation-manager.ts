@@ -116,6 +116,16 @@ let config: DictationConfig | null = null;
 let fullConfig: AppConfig | null = null;
 let persistConfigValue: PersistConfigValue | null = null;
 
+// How long the mic-failure banner stays visible before the overlay auto-hides.
+// Kept in sync with the renderer's onError auto-dismiss so the text fades and the
+// window hides together.
+const ERROR_BANNER_MS = 5000;
+// True while a start-failure error banner is being shown (overlay still visible,
+// state === 'idle'). The first hotkey press in this window dismisses the banner
+// rather than starting a fresh (likely-failing) session; a second press starts.
+let errorBannerActive = false;
+let errorBannerHideTimer: ReturnType<typeof setTimeout> | null = null;
+
 // STT state (own instance for dictation, separate from in-app live-stt)
 let recognizer: sdk.SpeechRecognizer | null = null;
 let pushStream: sdk.PushAudioInputStream | null = null;
@@ -315,6 +325,13 @@ export async function toggleDictation(): Promise<void> {
     if (state === 'active' || state === 'starting') {
       await stopDictationInner();
     } else if (state === 'idle') {
+      // If a mic-failure banner is currently showing, the first hotkey press
+      // dismisses it instead of immediately retrying (which would likely fail
+      // again the same way). A second press then starts normally.
+      if (errorBannerActive) {
+        dismissErrorBanner();
+        return;
+      }
       await startDictationInner();
     }
   });
@@ -568,6 +585,14 @@ function handleNativeSessionExit(generation: number, message: string): void {
 async function startDictationInner(): Promise<void> {
   if (state !== 'idle' || !config?.enabled) return;
 
+  // A new session supersedes any lingering mic-failure banner: cancel its
+  // auto-hide timer and clear the flag so it can't hide the overlay mid-session.
+  // (The overlay is about to be reused/shown for the new session.)
+  if (errorBannerHideTimer) {
+    clearTimeout(errorBannerHideTimer);
+    errorBannerHideTimer = null;
+  }
+  errorBannerActive = false;
   // Platform-capability seam (#82): "dictation anywhere" — inserting transcribed
   // text into any app's focused native field. Supported natively on macOS and
   // EXPERIMENTALLY on Windows/Linux (ADR-0005), where the manager's helper
@@ -787,9 +812,50 @@ async function startDictationInner(): Promise<void> {
     sessionGeneration += 1;
     broadcastState();
     await cleanupSession();
-    hideDictationOverlay();
-    broadcastError(message);
+    // Show the failure in the overlay BEFORE hiding it. hideDictationOverlay()
+    // only hides the window, so previously the error IPC arrived at an invisible
+    // overlay and the banner appeared-then-vanished. Instead: broadcast a
+    // friendly message while the overlay is still shown, then hide after
+    // ERROR_BANNER_MS. A hotkey press during this window dismisses early
+    // (see toggleDictation).
+    showMicFailureBanner(message);
   }
+}
+
+/**
+ * Present the start-failure error banner in the overlay for ERROR_BANNER_MS,
+ * then auto-hide. Idempotent: a newer failure resets the timer and message.
+ */
+function showMicFailureBanner(rawMessage: string): void {
+  const friendly = `Mic capture failed: ${rawMessage}`;
+  errorBannerActive = true;
+  if (errorBannerHideTimer) clearTimeout(errorBannerHideTimer);
+  broadcastError(friendly);
+  errorBannerHideTimer = setTimeout(() => {
+    errorBannerHideTimer = null;
+    errorBannerActive = false;
+    hideDictationOverlay();
+  }, ERROR_BANNER_MS);
+}
+
+/**
+ * Dismiss the mic-failure banner immediately: clear the auto-hide timer, tell the
+ * overlay to clear the error, and hide the window. Safe to call when no banner is
+ * showing.
+ */
+function dismissErrorBanner(): void {
+  if (errorBannerHideTimer) {
+    clearTimeout(errorBannerHideTimer);
+    errorBannerHideTimer = null;
+  }
+  errorBannerActive = false;
+  clearOverlayError();
+  hideDictationOverlay();
+}
+
+/** Tell the overlay to clear any showing error (null message = clear). */
+function clearOverlayError(): void {
+  sendToOverlay('dictation:error', null);
 }
 
 function isStartingSession(generation: number): boolean {
@@ -3130,16 +3196,44 @@ window._mic = {
 
   async startLiveStream(deviceId) {
     try {
-      const constraints = {
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-        },
+      // Base audio constraints. We deliberately do NOT request a mandatory
+      // sampleRate: many mics don't expose a native 16k capture rate, and a bare
+      // sampleRate value is treated as a hard constraint by Chromium → an
+      // OverconstrainedError with no device satisfying it. It's also unnecessary:
+      // the AudioContext below runs the graph at 16k (the browser resamples the
+      // source into it) and we return a fixed 16k rate downstream, so the device
+      // capture rate is irrelevant.
+      const baseAudio = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
       };
-      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+      // A specific deviceId is an EXACT (hard) constraint, so a stale/rotated id
+      // (unplugged headset, renamed device, permission reset) throws
+      // OverconstrainedError. Try the requested device first, then fall back to
+      // the default mic so dictation still starts instead of hard-failing.
+      const openStream = async (withDeviceId) => {
+        const constraints = {
+          audio: withDeviceId ? { ...baseAudio, deviceId: { exact: withDeviceId } } : baseAudio,
+        };
+        return navigator.mediaDevices.getUserMedia(constraints);
+      };
+      let usedDefaultFallback = false;
+      try {
+        this.stream = await openStream(deviceId || null);
+      } catch (err) {
+        // Only retry with the default device when a SPECIFIC device was
+        // requested and the failure is a constraint/device problem — a genuine
+        // permission denial (NotAllowedError) should surface as-is.
+        const name = err && err.name;
+        const retryable = name === 'OverconstrainedError' || name === 'NotFoundError' || name === 'NotReadableError';
+        if (deviceId && retryable) {
+          this.stream = await openStream(null);
+          usedDefaultFallback = true;
+        } else {
+          throw err;
+        }
+      }
       this.context = new AudioContext({ sampleRate: 16000 });
       const source = this.context.createMediaStreamSource(this.stream);
       this.processor = this.context.createScriptProcessor(4096, 1, 1);
@@ -3183,7 +3277,7 @@ window._mic = {
       };
       source.connect(this.processor);
       this.processor.connect(this.context.destination);
-      return { ok: true, sampleRate: 16000 };
+      return { ok: true, sampleRate: 16000, usedDefaultFallback };
     } catch (err) {
       return { error: err.message || String(err) };
     }
