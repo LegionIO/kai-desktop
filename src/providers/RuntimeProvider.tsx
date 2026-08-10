@@ -1058,9 +1058,14 @@ async function claimAndRestoreDraft(
       // (unreserved), so re-add it to the LOCAL queue only (no durable delta — that would duplicate
       // the on-disk copy) so this session retries it on a later tick.
       if (!applied) requeueRejectedDraftLocalOnly(convId, d);
+    } else if (res.ok && res.reserved) {
+      // Another client holds a LIVE reservation on this draft. Do NOT drop our local marker — if
+      // that client crashed before ack, its reservation expires (~30s) and we must be able to
+      // reclaim it on a later poll tick. Keeping the marker means the poll keeps retrying; the
+      // draft is never orphaned. (No composer clobber — we didn't restore anything.)
+      // (leave rejectedDrafts[convId] as-is)
     } else {
-      // Reserved by another client (or gone) — reconcile our local mirror, restore nothing. Do NOT
-      // drop it durably (another client holds the reservation and will ack it).
+      // Genuinely gone (no live reservation, not returned) — reconcile our local mirror.
       dropRejectedDraftLocal(convId, id);
     }
   } catch {
@@ -3438,6 +3443,11 @@ export function RuntimeProvider({
             acc.seededBackground = undefined;
             acc.seededDiskHeadId = undefined;
             acc.awaitingApproval = undefined;
+            // Also drop the superseded run's pending approvals + timing: a same-named tool in the
+            // successor must not inherit a dead approval id, and response timing must start fresh
+            // for the new run (not from the old run's clock). Timing re-seeds on the next event.
+            acc.deferredApprovals = undefined;
+            acc.pendingAssistantTiming = undefined;
             traceRuntime('stream.supersede-adopt-mirror', convId, { newGeneration: evGen });
             // fall through — render the new turn's user-message + subsequent events as a mirror
           } else {

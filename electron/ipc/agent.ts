@@ -378,6 +378,13 @@ const serverPersistParents = new Map<string, string | null>();
 // live; the terminal handler polls whether the renderer persisted and, if not (sole renderer
 // reloaded/crashed), finalizes main's accumulator so the reply isn't lost. Cleared at terminal.
 const guiFallbackParents = new Map<string, string | null>();
+// GUI turns ORIGINATED by a REMOTE (web-bridge) client — those clients receive the frame-capped
+// stream events (capRemoteStreamEvent strips large tool-result media/originals), so if they persist
+// their accumulator as authoritative history the full media would be LOST. For these turns MAIN is
+// authoritative: it accumulated the FULL (un-capped) events, so at terminal it FINALIZES its own
+// copy rather than deferring to the remote client's capped persist. (A LOCAL Electron window gets
+// the full events, so its persist is authoritative and main discards its fallback as usual.)
+const guiFallbackRemoteOrigin = new Set<string>();
 let serverPersistAppHome: string | null = null;
 
 // ── Main-authoritative GUI continuation ───────────────────────────────────────
@@ -395,7 +402,8 @@ const continuationAuthByConv = new Map<string, { turnToken: string; clientId: st
 const CONTINUATION_AUTH_MAX = 500; // bound the map (evict oldest) — conversations touched are few
 // A grant is abandoned if its holder never launches within this window (crashed/reloaded after
 // authorization but before the continuation started). After it, another client (including the
-// reloaded one with a fresh clientId) may win the same turn — so a crash can't wedge continuation.
+// reloaded one with a fresh clientId) may win the SAME turn — so a crash can't wedge continuation.
+// Staleness NEVER resurrects an OLDER turn (see below).
 const CONTINUATION_AUTH_STALE_MS = 20_000;
 // Stream tokens are `${Date.now()}-${random}`; parse the ms prefix to compare turn recency. A
 // higher prefix = a newer turn. Unparseable → 0 (treated as oldest, so a well-formed token wins).
@@ -404,11 +412,16 @@ function turnTokenTime(token: string): number {
   const n = Number.parseInt(dash > 0 ? token.slice(0, dash) : token, 10);
   return Number.isFinite(n) ? n : 0;
 }
-// Grant iff: no record, OR this client already holds THIS turn, OR the incoming turn is strictly
-// NEWER than the recorded one (a new turn supersedes), OR the recorded grant is STALE (holder never
-// launched). CRUCIALLY, a request for an OLDER turn than the recorded one is DENIED and does NOT
-// overwrite the record — otherwise a delayed request for turn A could revoke turn B's live winner
-// and let a second client also drive B (duplicate continuations).
+// Grant continuation-driver authorization for a turn to exactly ONE client. Rules:
+//  1. The turn must be the conversation's CURRENT active stream (activeStreams token) — a request
+//     for a turn that has already been superseded/ended is denied outright, so a delayed old-turn
+//     request can never abort or duplicate a newer live continuation (the r164-TTL regression:
+//     staleness must NOT let an older token win). When no stream is active (the brief window at a
+//     turn's terminal before the continuation registers its own), fall through to the recency rules.
+//  2. For that turn: the first client wins; the holder may re-win; a different client is denied
+//     UNLESS the grant went stale (holder crashed pre-launch → winner-failure recovery).
+//  3. A record for an OLDER turn than the incoming one is replaced (new turn supersedes); a record
+//     for a NEWER turn than the incoming one always denies (never downgrade to an older turn).
 function authorizeContinuation(conversationId: string, clientId: string, turnToken: string): boolean {
   if (
     typeof conversationId !== 'string' || !conversationId ||
@@ -418,6 +431,10 @@ function authorizeContinuation(conversationId: string, clientId: string, turnTok
     return false;
   }
   const now = Date.now();
+  // Rule 1: if a stream is active for this conversation, the requested turn MUST be it. This is the
+  // authoritative anti-stale guard — an older/superseded turn is never the active token.
+  const activeToken = activeStreams.get(conversationId)?.token;
+  if (activeToken !== undefined && activeToken !== turnToken) return false;
   const existing = continuationAuthByConv.get(conversationId);
   if (existing && existing.turnToken === turnToken) {
     // Same turn: only the holder may (re)win it, unless the grant went stale (holder gone).
@@ -425,13 +442,9 @@ function authorizeContinuation(conversationId: string, clientId: string, turnTok
       return false;
     }
   } else if (existing) {
-    // Different turn. Reject a request for an OLDER turn (a delayed/stale request must not revoke a
-    // newer live winner). A strictly-newer turn supersedes; an equal-time-but-different token
-    // (clock tie) is allowed through only if the prior grant is stale.
-    const incomingNewer = turnTokenTime(turnToken) > turnTokenTime(existing.turnToken);
-    if (!incomingNewer && now - existing.grantedAt <= CONTINUATION_AUTH_STALE_MS) {
-      return false;
-    }
+    // Different turn. NEVER grant an OLDER turn than the recorded one — regardless of staleness —
+    // so a delayed/stale request can't revoke a newer winner. A strictly-newer turn supersedes.
+    if (turnTokenTime(turnToken) <= turnTokenTime(existing.turnToken)) return false;
   }
   continuationAuthByConv.delete(conversationId); // re-insert at back so ordering reflects recency
   continuationAuthByConv.set(conversationId, { turnToken, clientId, grantedAt: now });
@@ -465,6 +478,7 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
   if (fbOwner !== undefined && fbOwner !== streamToken) return; // replacement owns it — leave alone
   const fbAppHome = serverPersistAppHome;
   const fbToken = streamToken;
+  const remoteOrigin = guiFallbackRemoteOrigin.delete(conversationId); // consume the marker
   guiFallbackParents.delete(conversationId);
   const pollGuiFallback = (remaining: number): void => {
     const owner = activeStreams.get(conversationId)?.token;
@@ -481,7 +495,19 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       /* best-effort — treat as not-yet-persisted, keep polling */
     }
     if (rendererPersisted) {
-      discardPersistenceAccumulator(conversationId); // renderer owns the write — no double-persist
+      if (remoteOrigin) {
+        // REMOTE-originated: the web client persisted a FRAME-CAPPED tree (media stripped in
+        // transit). Main holds the FULL events, so finalize MAIN's copy as authoritative — it
+        // overwrites the capped placeholders with the real media. Main is the single writer here,
+        // so there's no double-persist race (the remote client only rendered/optimistically wrote).
+        try {
+          finalizeInterruptedTurn(fbAppHome, conversationId);
+        } catch {
+          discardPersistenceAccumulator(conversationId);
+        }
+        return;
+      }
+      discardPersistenceAccumulator(conversationId); // local renderer owns the (full) write — no double-persist
       return;
     }
     if (remaining <= 0) {
@@ -752,19 +778,19 @@ function capRemoteStreamEvent(event: StreamEvent): StreamEvent {
 const REMOTE_STRIP_MAX_DEPTH = 8;
 function stripRemoteMediaDeep(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) {
-    return depth >= REMOTE_STRIP_MAX_DEPTH ? value : value.map((v) => stripRemoteMediaDeep(v, depth + 1));
+    // Depth exhausted → omit the container rather than pass an un-scrubbed subtree over-frame.
+    return depth >= REMOTE_STRIP_MAX_DEPTH ? '[omitted-in-broadcast]' : value.map((v) => stripRemoteMediaDeep(v, depth + 1));
   }
   if (!value || typeof value !== 'object') return value;
+  if (depth >= REMOTE_STRIP_MAX_DEPTH) return '[omitted-in-broadcast]'; // omit un-scrubbed object at ceiling
   const src = value as Record<string, unknown>;
   const out: Record<string, unknown> = { ...src };
   for (const k of ['image', 'data', 'dataUrl', 'url', 'source']) {
     if (typeof out[k] === 'string' && (out[k] as string).length > 256) out[k] = '[omitted-in-broadcast]';
   }
   if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
-  if (depth < REMOTE_STRIP_MAX_DEPTH) {
-    for (const [k, v] of Object.entries(out)) {
-      if (v && typeof v === 'object') out[k] = stripRemoteMediaDeep(v, depth + 1);
-    }
+  for (const [k, v] of Object.entries(out)) {
+    if (v && typeof v === 'object') out[k] = stripRemoteMediaDeep(v, depth + 1);
   }
   return out;
 }
@@ -1266,6 +1292,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           return typeof last?.id === 'string' ? last.id : null;
         })();
         guiFallbackParents.set(conversationId, guiParent);
+        // Mark the origin: a web-bridge invoke passes a null sender (invokeHandler's fake event),
+        // whereas an Electron window has a real WebContents sender. A remote origin means the
+        // persisting client will have received frame-capped events, so main must finalize its own
+        // full copy at terminal (see finalizeGuiFallbackIfOwned / guiFallbackRemoteOrigin).
+        if (event == null || event.sender == null) guiFallbackRemoteOrigin.add(conversationId);
+        else guiFallbackRemoteOrigin.delete(conversationId);
       }
     }
     const randomBytes = new Uint8Array(4);
@@ -5598,6 +5630,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (guiFallbackParents.delete(conversationId)) {
       discardPersistenceAccumulator(conversationId);
     }
+    guiFallbackRemoteOrigin.delete(conversationId); // clear the origin marker on cancel too
     // A cancel ends the turn — drop its continuation authorization (a resumed turn re-authorizes).
     releaseContinuationAuth(conversationId);
     if (wasServerPersist) {

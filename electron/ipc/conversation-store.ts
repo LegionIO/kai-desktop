@@ -1183,17 +1183,17 @@ export function deleteConversation(appHome: string, id: string): boolean {
   // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
   tombstoneConversation(id);
   const index = readIndex(appHome);
-  const hadEntry = Boolean(index.conversations[id]);
-  if (hadEntry) {
+  if (index.conversations[id]) {
     delete index.conversations[id];
     if (index.activeConversationId === id) index.activeConversationId = null;
   }
   // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was already
   // absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone and a
-  // stale client could resurrect the just-deleted conversation. Write whenever anything changed.
-  const before = index.deletedIds?.length ?? 0;
+  // stale client could resurrect the just-deleted conversation. pushDurableDeletedId may REPLACE
+  // (ring at cap → length unchanged) or MOVE an existing id, so always WRITE on a successful
+  // deletion rather than gating on a length delta (which would miss those cases).
   pushDurableDeletedId(index, id);
-  if (hadEntry || (index.deletedIds?.length ?? 0) !== before) writeIndex(appHome, index);
+  writeIndex(appHome, index);
   return true;
 }
 

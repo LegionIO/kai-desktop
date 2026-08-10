@@ -156,7 +156,7 @@ type AppAPI = {
       conversationId: string,
       id?: string,
       clientId?: string,
-    ) => Promise<{ ok: boolean; draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null }>;
+    ) => Promise<{ ok: boolean; draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null; reserved?: boolean }>;
     ackPendingDraft: (
       conversationId: string,
       id: string,

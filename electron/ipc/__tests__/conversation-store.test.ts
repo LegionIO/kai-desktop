@@ -190,6 +190,15 @@ describe('per-file read/write', () => {
     expect(readIndex(appHome).deletedIds).toContain('d1');
   });
 
+  it('records the durable tombstone even when the file exists but the index entry is absent (rebuilt index)', () => {
+    // Simulate a rebuilt/corrupt index: the data file exists but the index has no entry for it.
+    writeConversation(appHome, makeConv('drebuilt'));
+    writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: {}, deletedIds: [] });
+    // Deleting must STILL persist the durable tombstone (else a restart could resurrect it).
+    expect(deleteConversation(appHome, 'drebuilt')).toBe(true);
+    expect(readIndex(appHome).deletedIds).toContain('drebuilt');
+  });
+
   it('a durably-tombstoned id that is absent from the index is NOT resurrected by writeConversation', () => {
     // Simulate a restart where only the DURABLE tombstone survives (no in-memory recentlyDeleted
     // entry, no index conversation entry) by hand-writing an index whose deletedIds holds the id.

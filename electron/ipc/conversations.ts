@@ -75,9 +75,12 @@ export type ConversationChange =
 const STRIP_MAX_DEPTH = 8;
 function stripBase64FromPart(part: unknown, depth = 0): unknown {
   if (Array.isArray(part)) {
-    return depth >= STRIP_MAX_DEPTH ? part : part.map((v) => stripBase64FromPart(v, depth + 1));
+    // Depth exhausted → omit the whole container rather than pass an un-scrubbed (possibly
+    // media-heavy) subtree that could still exceed the remote frame cap.
+    return depth >= STRIP_MAX_DEPTH ? '[omitted-in-broadcast]' : part.map((v) => stripBase64FromPart(v, depth + 1));
   }
   if (!part || typeof part !== 'object') return part;
+  if (depth >= STRIP_MAX_DEPTH) return '[omitted-in-broadcast]'; // depth exhausted → omit un-scrubbed object
   const p = part as Record<string, unknown>;
   const out: Record<string, unknown> = { ...p };
   // Data-URL / base64 image + file parts (renderer content-part shapes + provider shapes).
@@ -96,11 +99,9 @@ function stripBase64FromPart(part: unknown, depth = 0): unknown {
   // Reserved plugin media convention: drop the whole _modelContent blob (base64 lives here).
   if (Array.isArray(out._modelContent)) out._modelContent = '[omitted-in-broadcast]';
   // Recurse into nested containers that can hold media (tool-result payloads, compaction backups,
-  // nested content arrays). Depth-bounded to avoid pathological recursion.
-  if (depth < STRIP_MAX_DEPTH) {
-    for (const [k, v] of Object.entries(out)) {
-      if (v && typeof v === 'object') out[k] = stripBase64FromPart(v, depth + 1);
-    }
+  // nested content arrays). A child at the depth ceiling returns an omission marker (above).
+  for (const [k, v] of Object.entries(out)) {
+    if (v && typeof v === 'object') out[k] = stripBase64FromPart(v, depth + 1);
   }
   return out;
 }
@@ -1324,7 +1325,13 @@ export function registerConversationHandlers(
         typeof id === 'string' && id.length > 0
           ? existing.findIndex((d) => String(d?.id) === id && !isLiveReservation(d, clientId))
           : existing.findIndex((d) => !isLiveReservation(d, clientId));
-      if (idx === -1) return { ok: true, draft: null }; // reserved by another client / gone
+      if (idx === -1) {
+        // Distinguish "reserved by another live client (retry after its lease expires)" from
+        // "genuinely none". A renderer that sees `reserved` must KEEP its local marker and retry,
+        // not drop it — otherwise a crashed claimant's draft is never reclaimed after expiry.
+        const anyLiveReserved = existing.some((d) => isLiveReservation(d, clientId));
+        return { ok: true, draft: null, reserved: anyLiveReserved };
+      }
       const claimedRaw = existing[idx];
       const claimed = {
         id: typeof claimedRaw?.id === 'string' ? claimedRaw.id : '',

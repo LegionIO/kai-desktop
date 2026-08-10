@@ -174,6 +174,7 @@ const appAPI = {
       ipcRenderer.invoke('conversations:claim-pending-draft', conversationId, id, clientId) as Promise<{
         ok: boolean;
         draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null;
+        reserved?: boolean;
       }>,
     // ACK a claim: restored=true hard-removes the draft; restored=false releases the reservation.
     ackPendingDraft: (conversationId: string, id: string, restored: boolean, clientId?: string) =>
