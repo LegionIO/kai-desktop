@@ -63,6 +63,64 @@ describe('resolveLiveInjectedParentId', () => {
   it('preserves an explicit null persisted parent for main-owned streams', () => {
     expect(resolveLiveInjectedParentId([], 'assistant-live', null, true)).toBeNull();
   });
+
+  it('recovers the live branch tip when BOTH the persisted parent and the live head are dangling (mid-burst)', () => {
+    // Reproduces the Matthew-automation back-to-back injection burst: a prior
+    // injected node set acc.headId to a mastra `msg-*` id that this accumulator
+    // never materialized, so the fallback head is itself dangling. Naively
+    // returning it would leave getActiveBranch truncating at the dangling edge.
+    const messages = [
+      n('user-1', null),
+      n('assistant-1', 'user-1', 'assistant'),
+      n('inj-1', 'assistant-1'),
+      n('assistant-2', 'inj-1', 'assistant'),
+    ];
+    // head = a mastra id absent from the accumulator; candidate parent likewise absent.
+    const result = resolveLiveInjectedParentId(
+      messages as never[],
+      'msg-1786461563064-ee54ec41',
+      'msg-1786461407021-4e1409a2',
+    );
+    // Should parent onto the newest node that actually reaches a root, keeping
+    // the full chain visible mid-stream.
+    expect(result).toBe('assistant-2');
+  });
+
+  it('recovers the live branch tip for renderer-owned streams when the head is dangling', () => {
+    const messages = [n('user-1', null), n('assistant-live', 'user-1', 'assistant')];
+    expect(resolveLiveInjectedParentId(messages as never[], 'msg-dangling', 'ignored', false)).toBe('assistant-live');
+  });
+
+  it('skips a node whose ancestry passes through a dangling edge when choosing the tip', () => {
+    // A detached subtree (its root parents on a missing id) must NOT be chosen
+    // as the recovery tip — only a node that cleanly reaches a real root.
+    const messages = [
+      n('user-1', null),
+      n('assistant-1', 'user-1', 'assistant'),
+      n('detached-root', 'gone-missing'), // dangling ancestor
+      n('detached-child', 'detached-root', 'assistant'),
+    ];
+    const result = resolveLiveInjectedParentId(messages as never[], 'msg-dangling', 'msg-also-dangling');
+    expect(result).toBe('assistant-1');
+  });
+
+  it('falls back to the raw head when NO node reaches a root (fully detached accumulator)', () => {
+    const messages = [n('orphan', 'missing-parent', 'assistant')];
+    expect(resolveLiveInjectedParentId(messages as never[], 'msg-dangling', 'msg-also-dangling')).toBe('msg-dangling');
+  });
+
+  it('does not hang on a parentId cycle while searching for the branch tip', () => {
+    // Cycle a↔b plus one clean chain; the clean tip must win and the cycle must
+    // not loop forever.
+    const messages = [
+      n('user-1', null),
+      n('assistant-1', 'user-1', 'assistant'),
+      n('cyc-a', 'cyc-b'),
+      n('cyc-b', 'cyc-a'),
+    ];
+    const result = resolveLiveInjectedParentId(messages as never[], 'msg-dangling', 'msg-also-dangling');
+    expect(result).toBe('assistant-1');
+  });
 });
 
 // getActiveBranch/ensureTree operate structurally on {id,parentId,role}; cast

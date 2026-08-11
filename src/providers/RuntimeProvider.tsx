@@ -400,6 +400,40 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
 }
 
 /**
+ * Return the id of the newest message in `messages` whose parentId chain
+ * terminates at a root WITHOUT hitting a dangling edge (a parentId absent from
+ * the tree) or a cycle — i.e. a node `getActiveBranch` can actually walk to a
+ * root from. Returns null if no such node exists.
+ *
+ * Used to recover a reachable display parent when the intended parent/head is a
+ * dangling authoritative id: parenting the injected node here keeps the full
+ * prior chain visible mid-stream instead of truncating at the dangling edge.
+ * Messages are appended in arrival order, so scanning newest→oldest yields the
+ * live branch tip. Cycle-guarded so a corrupt parentId loop can't hang the
+ * renderer.
+ */
+function lastConnectedNodeId(messages: StoredMessage[]): string | null {
+  const byId = new Map(messages.map((m) => [m.id, m]));
+  const reachesRoot = (startId: string): boolean => {
+    const visited = new Set<string>();
+    let current: string | null = startId;
+    while (current) {
+      if (visited.has(current)) return false; // cycle → not a clean chain
+      visited.add(current);
+      const node = byId.get(current);
+      if (!node) return false; // dangling edge → chain doesn't reach a root
+      if (node.parentId == null) return true; // reached a root
+      current = node.parentId;
+    }
+    return true;
+  };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (reachesRoot(messages[i].id)) return messages[i].id;
+  }
+  return null;
+}
+
+/**
  * Choose the parent used for a server-persisted injected user message in the
  * LIVE renderer accumulator. Main may just have persisted the partial assistant
  * under an authoritative id that this accumulator does not contain yet. Using
@@ -407,6 +441,16 @@ export function getActiveBranch(tree: StoredMessage[], headId: string | null): S
  * getActiveBranch would return only the new node and the prior chat would appear
  * to vanish until the authoritative reload. Prefer the persisted parent only
  * when it exists locally; otherwise retain the current live head for display.
+ *
+ * Burst hardening: during back-to-back mid-turn injections, `currentHeadId`
+ * (the fallback) can ITSELF be a dangling authoritative id — the previous
+ * injected node in the burst set `acc.headId` to a mastra `msg-*` id that this
+ * accumulator never materialized. Falling back to it would leave the edge just
+ * as dangling and still truncate the branch mid-stream. So when neither the
+ * candidate nor the live head is present locally, parent onto the live branch
+ * tip (the newest node that actually reaches a root), and only as a last resort
+ * keep the raw head. This affects LIVE display only; the authoritative `done`
+ * reload fixes the exact parent from disk regardless.
  */
 export function resolveLiveInjectedParentId(
   messages: StoredMessage[],
@@ -414,12 +458,21 @@ export function resolveLiveInjectedParentId(
   persistedParentId: string | null,
   mainOwnsPersistence = true,
 ): string | null {
+  const inTree = (id: string | null): boolean => id !== null && messages.some((message) => message.id === id);
   // Renderer-owned streams persist with a debounce, so disk may lag the live
   // assistant even when the persisted parent exists locally. The live head is
-  // authoritative for display in that mode.
-  if (!mainOwnsPersistence) return currentHeadId;
+  // authoritative for display in that mode — but if that head is itself a
+  // dangling id (mid-burst), recover the live branch tip rather than orphaning
+  // the branch.
+  if (!mainOwnsPersistence)
+    return inTree(currentHeadId) ? currentHeadId : (lastConnectedNodeId(messages) ?? currentHeadId);
   if (persistedParentId === null) return null;
-  return messages.some((message) => message.id === persistedParentId) ? persistedParentId : currentHeadId;
+  if (inTree(persistedParentId)) return persistedParentId;
+  if (inTree(currentHeadId)) return currentHeadId;
+  // Both the authoritative parent and the live head are absent locally: parent
+  // onto the live branch tip so the injected node stays reachable and
+  // getActiveBranch keeps the full prior chain visible mid-stream.
+  return lastConnectedNodeId(messages) ?? currentHeadId;
 }
 
 /**
@@ -1446,9 +1499,7 @@ function applyToolProgress(
   // the id/most-recent match, which then sets the binding via mergeLiveOutput.
   const subAgentConvId = e.data?.subAgentConversationId;
   if (subAgentConvId) {
-    tcIdx = content.findIndex(
-      (p) => p.type === 'tool-call' && p.liveOutput?.subAgentConversationId === subAgentConvId,
-    );
+    tcIdx = content.findIndex((p) => p.type === 'tool-call' && p.liveOutput?.subAgentConversationId === subAgentConvId);
     if (tcIdx >= 0) matchMode = 'sub-agent';
   }
   if (tcIdx < 0 && e.toolCallId) {
@@ -3271,8 +3322,7 @@ export function RuntimeProvider({
         // just the stream terminator, not a completion signal. Only default to
         // `completed` when the current status is non-terminal (e.g. still running).
         const terminalStatuses = ['completed', 'failed', 'stopped', 'paused', 'error'];
-        const doneStatus =
-          existing && terminalStatuses.includes(existing.status) ? existing.status : 'completed';
+        const doneStatus = existing && terminalStatuses.includes(existing.status) ? existing.status : 'completed';
         globalSubAgentThreads.set(saId, {
           conversationId: saId,
           parentConversationId: e.parentConversationId ?? existing?.parentConversationId ?? '',
@@ -6103,9 +6153,7 @@ export function RuntimeProvider({
     // is `paused`). The caller must NOT clear its input on a false result — that
     // would silently discard the user's message.
     try {
-      const res = (await app.agent.sendSubAgentMessage(subAgentConversationId, text)) as
-        | { ok?: boolean }
-        | undefined;
+      const res = (await app.agent.sendSubAgentMessage(subAgentConversationId, text)) as { ok?: boolean } | undefined;
       return res?.ok !== false;
     } catch (err) {
       console.error('[Runtime] Sub-agent message failed:', err);
