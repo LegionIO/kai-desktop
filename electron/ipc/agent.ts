@@ -303,7 +303,6 @@ import {
   pendingQuestionAnswers,
   stashQuestionAnswers,
   resolveAskUserGateOutcome,
-  waitForRacedAnswer,
   rekeyRacedAnswer,
   formatRacedAnswerAsUserTurn,
 } from '../tools/ask-user.js';
@@ -758,6 +757,12 @@ function racedStateInvalid(state: RacedAnswerState, conversationId: string): boo
 function attemptRacedAnswerDelivery(conversationId: string): void {
   const claimant = liveRacedAnswerClaimant.get(conversationId);
   if (!claimant) return; // no live successor yet — answer arrival / successor start will retry
+  // The claimant must STILL own the active stream. Between supersession (which
+  // replaces activeStreams synchronously with turn C) and claimant B's async
+  // finally (which deregisters B), B lingers here; delivering would splice the
+  // stale answer into the UNRELATED turn C. Only deliver into the turn that
+  // actually registered as claimant AND still owns the stream.
+  if (activeStreams.get(conversationId)?.token !== claimant.token) return;
   const { state } = claimant;
   if (racedStateInvalid(state, conversationId)) {
     // Expired or a Stop intervened — abandon; answers stay in the bounded stash.
@@ -4540,7 +4545,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 toolName: state.toolName,
                 execToolCallId: state.toolCallId,
               });
-              let raced = pendingQuestionAnswers.get(streamId);
+              const raced = pendingQuestionAnswers.get(streamId);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
               // ── Abort path: register the successor handoff IMMEDIATELY ──────
               // On a non-terminal abort, the answer is delivered by the NEXT
@@ -4592,37 +4597,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   },
                 };
               }
-              // ── Non-abort path (turn still live): recover an answer that raced
-              // the settle (grace-wait for a just-submitted answer), then either
-              // run the tool with it or skip on a genuine dismiss/reject.
-              if (!raced && outcome.skip) {
-                raced = await waitForRacedAnswer(streamId);
-              }
+              // ── Non-abort path (turn still live) ──────────────────────────
+              // A genuine reject / non-aborted dismiss: the user did NOT answer
+              // (an answer would have resolved the approval as `true` via
+              // agent:answer-tool-question, taking the happy path below). Do NOT
+              // grace-poll for a late answer here — that would let an answer from
+              // another surface (inline / pop-out / CLI / web) arriving in the
+              // next ~250ms OVERRIDE an already-settled dismiss/reject and run the
+              // tool. Skip cleanly.
               if (outcome.skip) {
-                if (raced) {
-                  // Not an abort (turn still live) but resolved non-true with an
-                  // answer present — honor it: re-key to the exec id and run the
-                  // tool. (rekeyRacedAnswer is a no-op when the ids are equal.)
-                  rekeyRacedAnswer(streamId, state.toolCallId, raced);
-                  traceDiagnostic({
-                    scope: 'agent',
-                    event: 'question.answer-recovered-post-settle',
-                    level: 'warn',
-                    conversationId,
-                    toolName: state.toolName,
-                    // Use the metadata-safe key `reason` (not `settleReason`): the
-                    // trace sanitizer only passes a categorical value through for
-                    // keys matching /(^|_)(reason|cause)$/, and `abort` etc. are
-                    // in CATEGORICAL_REASONS. A camelCase key would be omitted.
-                    fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
-                  });
-                } else {
-                  // Genuine dismiss/reject with no answer — skip execution so the
-                  // tool never emits the misleading no-answer error.
-                  state.cancel();
-                  return { skip: true as const, result: outcome.result };
-                }
-              } else if (raced) {
+                state.cancel();
+                return { skip: true as const, result: outcome.result };
+              }
+              if (raced) {
                 // Happy path (approved === true): the answer is already stashed
                 // under the key execute() reads. rekey is a no-op for equal ids.
                 rekeyRacedAnswer(streamId, state.toolCallId, raced);
