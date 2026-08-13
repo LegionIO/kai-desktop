@@ -34,7 +34,7 @@ import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
-import { pendingQuestionAnswers, waitForRacedAnswer } from '../../tools/ask-user.js';
+import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -1210,24 +1210,18 @@ function createAskUserHandler(
     });
 
     if (approved !== true) {
-      // A fully-submitted answer can race an abort that settles this as 'dismiss'
-      // (answer-tool-question stashes unconditionally). The abort settles the
-      // approval SYNCHRONOUSLY, so this path can run before the user's already-
-      // sent answer IPC is processed — on the abort path, wait a brief grace
-      // window for it to land. If an answer arrived, honor it instead of
-      // reporting a dismiss the user never made.
-      const abortedDismiss = approved === 'dismiss' && Boolean(abortSignal?.aborted);
-      const raced = abortedDismiss
-        ? await waitForRacedAnswer(toolCallId)
-        : pendingQuestionAnswers.get(toolCallId);
-      if (raced) {
-        pendingQuestionAnswers.delete(toolCallId);
-        debugLog(`[ASK_USER] Recovered raced answer after non-true settle toolCallId=${toolCallId}`);
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ success: true, answers: raced }) }],
-        };
-      }
-      debugLog(`[ASK_USER] User dismissed/rejected toolCallId=${toolCallId}`);
+      // NOTE: unlike the Mastra gate, the SDK runtime canNOT recover a raced
+      // answer inline. When abort wins, the abortSignal has already torn down
+      // the `query()` subprocess and its stream loop has exited — returning a
+      // result here goes into a dead call. And a replacement turn mints a fresh
+      // random `sdk-ask-*` id, so an answer stashed under THIS id can't be
+      // matched later either. So we deliberately do NOT grace-poll or consume
+      // the stash here: leave any late answer in the bounded (FIFO-evicted)
+      // stash rather than delete it into a canceled query. (Delivering a
+      // post-abort answer to the SDK runtime would require re-injecting it as a
+      // new user turn in the restart orchestration — out of scope here and not
+      // the GUI/Mastra race this change targets.)
+      debugLog(`[ASK_USER] User dismissed/rejected (or aborted) toolCallId=${toolCallId}`);
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],
         isError: true,

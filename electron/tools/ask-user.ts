@@ -103,6 +103,25 @@ export async function waitForRacedAnswer(
   return answer;
 }
 
+/**
+ * Move a recovered raced answer from the stream-side id to the execute-side id
+ * so the tool's execute() (which reads `context.toolCallId`, the exec id) finds
+ * it. Critically a NO-OP when the two ids are equal: for ask_user, pairing is by
+ * id-identity so `streamId === execToolCallId`, meaning the answer is ALREADY
+ * under the key execute() reads — a naive copy-then-delete would delete the very
+ * entry it just wrote and lose the answer. Only re-key + delete when the ids
+ * genuinely differ.
+ */
+export function rekeyRacedAnswer(
+  streamToolCallId: string,
+  execToolCallId: string,
+  answers: Record<string, string>,
+): void {
+  if (streamToolCallId === execToolCallId) return;
+  stashQuestionAnswers(execToolCallId, answers);
+  pendingQuestionAnswers.delete(streamToolCallId);
+}
+
 const questionOptionSchema = z.object({
   label: z.string().describe('Short display text for the option (1-5 words)'),
   description: z.string().optional().describe('Explanation of what this option means'),

@@ -298,6 +298,7 @@ import {
   stashQuestionAnswers,
   resolveAskUserGateOutcome,
   waitForRacedAnswer,
+  rekeyRacedAnswer,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -4242,15 +4243,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 toolName: state.toolName,
                 execToolCallId: state.toolCallId,
               });
-              // Copy answers from the stream-side id (what the renderer submits
-              // via agent:answer-tool-question) to the execute-side id, so the
-              // tool's execute() can find them. Do this REGARDLESS of the approval
-              // outcome: a fully-submitted answer can race an abort (turn ended /
-              // superseded / plan-restart) that settles this promise as 'dismiss'
-              // a beat before/after the answer lands. The answer is stashed under
-              // the streamId either way (answer-tool-question stashes
-              // unconditionally now), so recover it here so a raced answer is not
-              // silently lost.
+              // The answer is stashed under `streamId` (answer-tool-question
+              // stashes unconditionally). Recover it here so a raced answer is
+              // not lost. Re-key to the exec id only when the ids differ — for
+              // ask_user, pairing is by id-identity so `streamId ===
+              // state.toolCallId` and the answer is already under the key
+              // execute() reads (rekeyRacedAnswer is a no-op then, avoiding a
+              // copy-then-delete that would drop the entry). See rekeyRacedAnswer.
               let raced = pendingQuestionAnswers.get(streamId);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
               // Abort-first race: controller.abort() settles the approval
@@ -4262,8 +4261,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 raced = await waitForRacedAnswer(streamId);
               }
               if (raced) {
-                stashQuestionAnswers(state.toolCallId, raced);
-                pendingQuestionAnswers.delete(streamId);
+                rekeyRacedAnswer(streamId, state.toolCallId, raced);
               }
               if (outcome.skip) {
                 // If the user DID answer in the race window, honor the answer even

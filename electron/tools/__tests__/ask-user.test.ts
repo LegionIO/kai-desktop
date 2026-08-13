@@ -14,7 +14,7 @@ import { join } from 'path';
 // tool only needs the store write to happen, so stub the notify seam.
 vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
 
-import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer } from '../ask-user.js';
+import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer, rekeyRacedAnswer } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
@@ -45,6 +45,23 @@ describe('stashQuestionAnswers', () => {
     stashQuestionAnswers('dup', { v: '2' });
     expect(pendingQuestionAnswers.size).toBe(1);
     expect(pendingQuestionAnswers.get('dup')).toEqual({ v: '2' });
+  });
+});
+
+describe('rekeyRacedAnswer', () => {
+  it('is a NO-OP when the ids are equal — the answer stays retrievable (regression)', () => {
+    // ask_user pairs by id-identity, so streamId === execId. A naive
+    // copy-then-delete would delete the entry it just wrote; rekey must not.
+    stashQuestionAnswers('same-id', { Q: 'kept' });
+    rekeyRacedAnswer('same-id', 'same-id', { Q: 'kept' });
+    expect(pendingQuestionAnswers.get('same-id')).toEqual({ Q: 'kept' });
+  });
+
+  it('moves the answer from the stream id to a DIFFERENT exec id', () => {
+    stashQuestionAnswers('stream-id', { Q: 'moved' });
+    rekeyRacedAnswer('stream-id', 'exec-id', { Q: 'moved' });
+    expect(pendingQuestionAnswers.has('stream-id')).toBe(false);
+    expect(pendingQuestionAnswers.get('exec-id')).toEqual({ Q: 'moved' });
   });
 });
 
