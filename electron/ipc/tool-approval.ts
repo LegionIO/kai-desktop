@@ -22,13 +22,26 @@ import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 // ---------------------------------------------------------------------------
 
 /**
- * Map of toolCallId → promise resolver.
+ * Categorical reason recorded when an approval settles. Threaded explicitly so
+ * the trace records the true source: an `ask_user` answer settles as `answered`
+ * (not a bare `approve`), a generic tool approval as `approve`, an abort as
+ * `abort`, and a colliding-id fail-closed eviction as `duplicate-evict`.
+ */
+export type ApprovalSettleSource = 'answered' | 'approve' | 'reject' | 'dismiss' | 'abort' | 'duplicate-evict';
+
+/** Resolver stored per pending approval. `source` (optional) lets the IPC
+ *  handler that settles the entry name the true reason for the trace; when
+ *  omitted it is derived from the resolved value. */
+type PendingApproval = { resolve: (approved: boolean | 'dismiss', source?: ApprovalSettleSource) => void };
+
+/**
+ * Map of toolCallId → resolver.
  *
  * When a tool call needs user approval (e.g. ask_user, confirm-writes mode),
  * the caller registers a pending entry and awaits the returned Promise.
  * The IPC handlers in agent.ts resolve the entry when the user responds.
  */
-export const pendingToolApprovals = new Map<string, { resolve: (approved: boolean | 'dismiss') => void }>();
+export const pendingToolApprovals = new Map<string, PendingApproval>();
 
 /** Optional diagnostic context for an approval, so the (previously invisible)
  *  approve/reject/dismiss/abort lifecycle shows up in the diagnostic trace. */
@@ -39,10 +52,9 @@ export type ApprovalTraceContext = {
   execToolCallId?: string;
 };
 
-/** Map a settled approval outcome to a categorical reason for the trace.
- *  `answered`/`approve`/`reject`/`dismiss` come from the IPC handlers; `abort`
- *  from the turn controller aborting; `duplicate-evict` from a colliding id. */
-function settleReason(value: boolean | 'dismiss', aborted: boolean): string {
+/** Derive a categorical settle reason from the resolved value + abort flag,
+ *  used only when the settler did not pass an explicit {@link ApprovalSettleSource}. */
+function settleReason(value: boolean | 'dismiss', aborted: boolean): ApprovalSettleSource {
   if (aborted) return 'abort';
   if (value === true) return 'approve';
   if (value === false) return 'reject';
@@ -72,17 +84,12 @@ export function registerPendingApproval(
   // A duplicate toolCallId would overwrite the map entry and orphan the prior
   // waiter's resolver forever (its Promise never settles → the earlier tool
   // call hangs). Settle any existing entry fail-closed (deny) before replacing.
+  // Pass the explicit `duplicate-evict` source so the prior waiter's own settle
+  // closure records exactly ONE settled event with that reason (not a spurious
+  // extra `reject` on top of a separately-logged eviction).
   const existing = pendingToolApprovals.get(toolCallId);
   if (existing) {
-    traceDiagnostic({
-      scope: 'agent',
-      event: 'approval.settled',
-      level: 'warn',
-      conversationId: trace?.conversationId,
-      toolName: trace?.toolName,
-      fields: { toolCallId, reason: 'duplicate-evict', execToolCallId: trace?.execToolCallId },
-    });
-    existing.resolve(false);
+    existing.resolve(false, 'duplicate-evict');
     pendingToolApprovals.delete(toolCallId);
   }
   traceDiagnostic({
@@ -100,32 +107,38 @@ export function registerPendingApproval(
     // stayed attached to the (turn-scoped, reused per tool call) abortSignal
     // until the signal aborted — accumulating one listener per approved tool call.
     let settled = false;
-    const onAbort = (): void => settle('dismiss', true);
-    const settle = (value: boolean | 'dismiss', aborted = false): void => {
+    const onAbort = (): void => settle('dismiss', 'abort');
+    const settle = (value: boolean | 'dismiss', source?: ApprovalSettleSource): void => {
       if (settled) return;
       settled = true;
       abortSignal?.removeEventListener('abort', onAbort);
       pendingToolApprovals.delete(toolCallId);
+      const reason = source ?? settleReason(value, false);
       traceDiagnostic({
         scope: 'agent',
         event: 'approval.settled',
+        // A fail-closed eviction / abort is worth flagging; a normal settle isn't.
+        level: reason === 'duplicate-evict' ? 'warn' : undefined,
         conversationId: trace?.conversationId,
         toolName: trace?.toolName,
         fields: {
           toolCallId,
-          reason: settleReason(value, aborted),
-          aborted,
+          reason,
+          aborted: reason === 'abort',
           execToolCallId: trace?.execToolCallId,
         },
       });
       resolve(value);
     };
 
-    pendingToolApprovals.set(toolCallId, { resolve: (value) => settle(value) });
+    // The stored resolver forwards the explicit settle source (e.g. `answered`
+    // from agent:answer-tool-question, `duplicate-evict` from an eviction) so the
+    // trace records the true reason rather than one derived only from the value.
+    pendingToolApprovals.set(toolCallId, { resolve: (value, source) => settle(value, source) });
 
     if (abortSignal) {
       if (abortSignal.aborted) {
-        settle('dismiss', true);
+        settle('dismiss', 'abort');
       } else {
         abortSignal.addEventListener('abort', onAbort, { once: true });
       }

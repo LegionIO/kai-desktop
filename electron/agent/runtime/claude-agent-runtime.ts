@@ -34,7 +34,7 @@ import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
-import { pendingQuestionAnswers } from '../../tools/ask-user.js';
+import { pendingQuestionAnswers, waitForRacedAnswer } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -1211,9 +1211,15 @@ function createAskUserHandler(
 
     if (approved !== true) {
       // A fully-submitted answer can race an abort that settles this as 'dismiss'
-      // (answer-tool-question stashes unconditionally). If an answer landed in the
-      // race window, honor it instead of reporting a dismiss the user never made.
-      const raced = pendingQuestionAnswers.get(toolCallId);
+      // (answer-tool-question stashes unconditionally). The abort settles the
+      // approval SYNCHRONOUSLY, so this path can run before the user's already-
+      // sent answer IPC is processed — on the abort path, wait a brief grace
+      // window for it to land. If an answer arrived, honor it instead of
+      // reporting a dismiss the user never made.
+      const abortedDismiss = approved === 'dismiss' && Boolean(abortSignal?.aborted);
+      const raced = abortedDismiss
+        ? await waitForRacedAnswer(toolCallId)
+        : pendingQuestionAnswers.get(toolCallId);
       if (raced) {
         pendingQuestionAnswers.delete(toolCallId);
         debugLog(`[ASK_USER] Recovered raced answer after non-true settle toolCallId=${toolCallId}`);

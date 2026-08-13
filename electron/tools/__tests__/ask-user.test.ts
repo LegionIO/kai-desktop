@@ -14,7 +14,7 @@ import { join } from 'path';
 // tool only needs the store write to happen, so stub the notify seam.
 vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
 
-import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR } from '../ask-user.js';
+import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
@@ -103,6 +103,29 @@ describe('resolveAskUserGateOutcome', () => {
       expect(out.result.error).toMatch(/cancelled|turn ended/i);
       expect(out.result.error).not.toMatch(/dismissed the question/i);
     }
+  });
+});
+
+describe('waitForRacedAnswer', () => {
+  it('returns immediately when the answer is already stashed', async () => {
+    stashQuestionAnswers('tc-now', { Q: 'A' });
+    const answer = await waitForRacedAnswer('tc-now', 20, 10);
+    expect(answer).toEqual({ Q: 'A' });
+  });
+
+  it('resolves as soon as an answer lands within the grace window (abort-first race)', async () => {
+    // The answer IPC lands shortly AFTER the gate began waiting — exactly the
+    // abort-first race the grace wait is meant to cover.
+    setTimeout(() => stashQuestionAnswers('tc-late', { Q: 'landed' }), 30);
+    const answer = await waitForRacedAnswer('tc-late', 20, 10);
+    expect(answer).toEqual({ Q: 'landed' });
+  });
+
+  it('resolves undefined after exhausting its poll attempts when no answer arrives', async () => {
+    // Attempt-count bound (not a wall-clock deadline) so it terminates even
+    // under vitest's frozen system clock (vi.setSystemTime in the global setup).
+    const answer = await waitForRacedAnswer('tc-never', 3, 5);
+    expect(answer).toBeUndefined();
   });
 });
 

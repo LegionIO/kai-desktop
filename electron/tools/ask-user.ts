@@ -70,6 +70,39 @@ export function resolveAskUserGateOutcome(
   };
 }
 
+/** Grace budget for {@link waitForRacedAnswer}: number of poll attempts and the
+ *  delay between them. ~10 × 25ms ≈ 250ms comfortably covers an in-flight answer
+ *  IPC message that lost the race to a synchronous controller abort, and is
+ *  imperceptible to the user. Expressed as an ATTEMPT COUNT rather than a
+ *  wall-clock deadline so it is immune to a frozen/mocked `Date.now()`. */
+const RACED_ANSWER_ATTEMPTS = 10;
+const RACED_ANSWER_POLL_MS = 25;
+
+/**
+ * Briefly wait for a user answer that raced a controller abort to land in the
+ * stash under `key`. When `controller.abort()` fires, it settles the pending
+ * approval SYNCHRONOUSLY; the awaiting gate then resumes as a microtask, which
+ * can run BEFORE the user's already-sent `agent:answer-tool-question` IPC
+ * message is processed. Without a grace window the gate sees no answer, skips,
+ * and the answer is orphaned under the old tool-call id (a restart mints a new
+ * one). Resolves as soon as the answer appears, or after `attempts` polls.
+ *
+ * Only meaningful on the abort path — a genuine user dismiss/reject has no
+ * in-flight answer to wait for, so callers should not invoke this then.
+ */
+export async function waitForRacedAnswer(
+  key: string,
+  attempts: number = RACED_ANSWER_ATTEMPTS,
+  stepMs: number = RACED_ANSWER_POLL_MS,
+): Promise<Record<string, string> | undefined> {
+  let answer = pendingQuestionAnswers.get(key);
+  for (let i = 0; i < attempts && !answer; i++) {
+    await new Promise((r) => setTimeout(r, stepMs));
+    answer = pendingQuestionAnswers.get(key);
+  }
+  return answer;
+}
+
 const questionOptionSchema = z.object({
   label: z.string().describe('Short display text for the option (1-5 words)'),
   description: z.string().optional().describe('Explanation of what this option means'),

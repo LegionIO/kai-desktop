@@ -297,6 +297,7 @@ import {
   pendingQuestionAnswers,
   stashQuestionAnswers,
   resolveAskUserGateOutcome,
+  waitForRacedAnswer,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -4250,12 +4251,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the streamId either way (answer-tool-question stashes
               // unconditionally now), so recover it here so a raced answer is not
               // silently lost.
-              const raced = pendingQuestionAnswers.get(streamId);
+              let raced = pendingQuestionAnswers.get(streamId);
+              const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
+              // Abort-first race: controller.abort() settles the approval
+              // SYNCHRONOUSLY, so this continuation can resume before the user's
+              // already-sent answer IPC is processed. On the abort path with no
+              // answer yet, wait a brief grace window for it to land rather than
+              // skipping (and orphaning it under this now-dead tool-call id).
+              if (!raced && outcome.skip && outcome.reason === 'abort') {
+                raced = await waitForRacedAnswer(streamId);
+              }
               if (raced) {
                 stashQuestionAnswers(state.toolCallId, raced);
                 pendingQuestionAnswers.delete(streamId);
               }
-              const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
               if (outcome.skip) {
                 // If the user DID answer in the race window, honor the answer even
                 // though the gate resolved non-true: run the tool with the stashed
@@ -5952,7 +5961,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       fields: { toolCallId, hadPending: Boolean(pending), answerCount: Object.keys(answers ?? {}).length },
     });
     if (pending) {
-      pending.resolve(true);
+      // Resolve with the explicit `answered` source so the trace distinguishes a
+      // real ask_user answer from a generic tool approval.
+      pending.resolve(true, 'answered');
       pendingToolApprovals.delete(toolCallId);
     }
     return { ok: true };
