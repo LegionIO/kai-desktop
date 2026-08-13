@@ -152,6 +152,12 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   activeStreamModelKeys.delete(conversationId);
   activeStreamRuntime.delete(conversationId);
   activeObserverSessions.delete(conversationId);
+  // If THIS run was the live raced-answer claimant, deregister it so a raced
+  // answer isn't delivered into an ended turn (and a later unrelated turn isn't
+  // mistaken for the claimant). Token-scoped: a replacement claimant is left intact.
+  if (liveRacedAnswerClaimant.get(conversationId)?.token === token) {
+    liveRacedAnswerClaimant.delete(conversationId);
+  }
   // Per-turn same-turn bookkeeping — clear on terminal cleanup so a one-off chat
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
@@ -660,26 +666,31 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 }
 
 /**
- * Raced-answer → successor handoff.
+ * Raced-answer → successor rendezvous.
  *
  * When an ask_user question is still pending and its turn aborts WITH INTENT TO
  * RESTART (a supersession by a new submit, or a plan-mode restart — NOT a
  * terminal Stop/dismiss), the submitted answer must be carried into THE actual
  * successor turn. Rather than a polling coordinator guessing which later Mastra
- * turn is the successor (the source of many races — unrelated-turn delivery,
- * runtime-resolution timing, dead-run queueing), we register a handoff keyed by
- * conversation and let the NEXT streamHandler invocation for that conversation
- * CLAIM it: that invocation is the successor BY CONSTRUCTION — it owns the
- * stream, its runtime is known, and it can splice the answer into ITSELF.
+ * turn is the successor, we run a RENDEZVOUS between three events, in any order:
+ *   1. handoff registration (the aborting gate) — records the pending answerKey(s),
+ *   2. successor start (streamHandler) — the NEXT Mastra turn registers itself as
+ *      the live claimant (bound by construction: it owns the stream), and
+ *   3. answer arrival (agent:answer-tool-question) — stashes the answer.
+ * Delivery fires from whichever of (2)/(3) happens LAST once BOTH a live Mastra
+ * successor AND the stashed answer are present. This closes the loss window where
+ * a successor started before a slow/remote answer arrived (a bare "claim on start"
+ * would have dropped it).
  *
- * The answer itself lives in the pending-answer stash under `answerKey` (so a
- * remote/slow answer that arrives after the abort is still caught at claim time).
- * The handoff carries only the metadata needed to validate the claim.
+ * The answer text lives in the pending-answer stash under each `answerKey`
+ * throughout; the rendezvous reads + removes it only at the delivery moment.
  */
 type RacedAnswerHandoff = {
-  answerKey: string;
-  /** explicit-cancel generation at abort; a claim is void if it has advanced (a
-   *  Stop happened between abort and the successor starting). */
+  /** Pending answer stash keys — a SET so parallel ask_user calls in one turn,
+   *  which each register on the shared controller abort, don't overwrite. */
+  answerKeys: Set<string>;
+  /** explicit-cancel generation at abort; the rendezvous is void if it advanced
+   *  (a Stop happened between abort and delivery). */
   cancelGenAtAbort: number;
   /** Absolute expiry — a successor that never comes (rare) lets this age out
    *  instead of attaching a stale answer to a much-later unrelated turn. */
@@ -688,13 +699,29 @@ type RacedAnswerHandoff = {
 const racedAnswerHandoffs = new Map<string, RacedAnswerHandoff>();
 const MAX_RACED_ANSWER_HANDOFFS = 200;
 // Past the renderer's ~21s plan-first winner-failure recovery window, so a
-// legitimately-delayed successor can still claim; a truly absent successor ages
+// legitimately-delayed successor can still deliver; a truly absent successor ages
 // out and the answer simply stays in the bounded stash.
 const RACED_ANSWER_HANDOFF_TTL_MS = 30_000;
 
-/** Register (or replace) a conversation's pending raced-answer handoff. */
-function registerRacedAnswerHandoff(conversationId: string, handoff: Omit<RacedAnswerHandoff, 'expiresAt'>): void {
-  racedAnswerHandoffs.set(conversationId, { ...handoff, expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS });
+/** The live Mastra successor turn for a conversation that is ready to receive a
+ *  raced answer via cooperative injection. Registered by streamHandler and
+ *  cleared on its teardown; `deliver` splices text into THAT running turn. */
+const liveRacedAnswerClaimant = new Map<string, { token: string; deliver: (text: string) => Promise<boolean> }>();
+
+/** Register (or MERGE) a conversation's pending raced-answer handoff. Parallel
+ *  ask_user gates aborting together each add their own answerKey. */
+function registerRacedAnswerHandoff(conversationId: string, answerKey: string, cancelGenAtAbort: number): void {
+  const existing = racedAnswerHandoffs.get(conversationId);
+  if (existing && (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort) {
+    existing.answerKeys.add(answerKey);
+    existing.expiresAt = Date.now() + RACED_ANSWER_HANDOFF_TTL_MS;
+    return;
+  }
+  racedAnswerHandoffs.set(conversationId, {
+    answerKeys: new Set([answerKey]),
+    cancelGenAtAbort,
+    expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+  });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
     const oldest = racedAnswerHandoffs.keys().next().value;
     if (oldest === undefined) break;
@@ -703,23 +730,80 @@ function registerRacedAnswerHandoff(conversationId: string, handoff: Omit<RacedA
 }
 
 /**
- * Claim a pending raced-answer handoff for a conversation whose successor turn
- * has just started. Returns the answer text to splice into THIS turn as a
- * cooperative inject, or null if there's no valid claim. Removes the handoff (and
- * the stashed answer) on a successful claim. Void — leaving the answer stashed —
- * when the handoff is expired or a Stop advanced the cancel generation since the
- * abort.
+ * Attempt to deliver any raced answers for a conversation to its live Mastra
+ * successor. Called from BOTH the successor-start path and the answer-arrival
+ * path; fires only when a live claimant AND at least one stashed answer are
+ * present and the handoff is still valid. Idempotent and self-cleaning: delivers
+ * each present answer, removes it from the stash + handoff, and on the resolved
+ * `injectUserTurnAndRestart` result re-stashes (keeping the key in the handoff)
+ * if delivery wasn't a confirmed cooperative splice.
  */
-function claimRacedAnswerHandoff(conversationId: string): string | null {
+function attemptRacedAnswerDelivery(conversationId: string): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
-  if (!handoff) return null;
-  racedAnswerHandoffs.delete(conversationId);
-  if (Date.now() > handoff.expiresAt) return null;
-  if ((explicitCancelGeneration.get(conversationId) ?? 0) !== handoff.cancelGenAtAbort) return null;
-  const answer = pendingQuestionAnswers.get(handoff.answerKey);
-  if (!answer) return null;
-  pendingQuestionAnswers.delete(handoff.answerKey);
-  return formatRacedAnswerAsUserTurn(answer);
+  if (!handoff) return;
+  if (Date.now() > handoff.expiresAt || (explicitCancelGeneration.get(conversationId) ?? 0) !== handoff.cancelGenAtAbort) {
+    // Expired or a Stop intervened — abandon delivery; answers stay in the
+    // bounded stash. Drop the handoff so a later unrelated turn can't match it.
+    racedAnswerHandoffs.delete(conversationId);
+    return;
+  }
+  const claimant = liveRacedAnswerClaimant.get(conversationId);
+  if (!claimant) return; // no live successor yet — answer arrival will retry
+  for (const answerKey of [...handoff.answerKeys]) {
+    const answer = pendingQuestionAnswers.get(answerKey);
+    if (!answer) continue; // answer not arrived yet — successor stays registered; arrival retries
+    // Consume optimistically; restore on a non-confirmed delivery.
+    pendingQuestionAnswers.delete(answerKey);
+    handoff.answerKeys.delete(answerKey);
+    const text = formatRacedAnswerAsUserTurn(answer);
+    void claimant
+      .deliver(text)
+      .then((ok) => {
+        if (!ok) {
+          stashQuestionAnswers(answerKey, answer);
+          handoff.answerKeys.add(answerKey);
+        }
+        traceDiagnostic({
+          scope: 'agent',
+          event: 'question.answer-handoff-claimed',
+          level: ok ? 'warn' : 'error',
+          conversationId,
+          toolName: 'ask_user',
+          fields: { status: ok ? 'delivered' : 'failed' },
+        });
+      })
+      .catch(() => {
+        stashQuestionAnswers(answerKey, answer);
+        handoff.answerKeys.add(answerKey);
+      });
+  }
+  if (handoff.answerKeys.size === 0) racedAnswerHandoffs.delete(conversationId);
+}
+
+/** Find the conversation whose pending handoff contains `answerKey` (the
+ *  answer-arrival side of the rendezvous only knows the key). Bounded scan over
+ *  the small handoff map. */
+function conversationForRacedAnswerKey(answerKey: string): string | undefined {
+  for (const [conversationId, handoff] of racedAnswerHandoffs) {
+    if (handoff.answerKeys.has(answerKey)) return conversationId;
+  }
+  return undefined;
+}
+
+/** Register the current Mastra turn as the live claimant + attempt delivery
+ *  (the answer may already be stashed). Returns a cleanup fn to call on teardown. */
+function registerLiveRacedAnswerClaimant(
+  conversationId: string,
+  token: string,
+  deliver: (text: string) => Promise<boolean>,
+): () => void {
+  liveRacedAnswerClaimant.set(conversationId, { token, deliver });
+  attemptRacedAnswerDelivery(conversationId);
+  return () => {
+    if (liveRacedAnswerClaimant.get(conversationId)?.token === token) {
+      liveRacedAnswerClaimant.delete(conversationId);
+    }
+  };
 }
 
 /**
@@ -1856,43 +1940,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       activeStreamRuntime.set(conversationId, { token: streamToken, runtimeId: runtime.id });
     }
 
-    // Raced-answer → successor handoff (see registerRacedAnswerHandoff): if a
+    // Raced-answer → successor rendezvous (see registerRacedAnswerHandoff): if a
     // prior turn aborted-to-restart while an ask_user answer was pending, THIS
-    // turn is the successor by construction. EVERY successor that owns the stream
-    // must CONSUME the handoff (claimRacedAnswerHandoff deletes it) so it can't
-    // linger and be claimed by a later unrelated turn — but only a Mastra
-    // successor can actually deliver (cooperative injects require Mastra); a
-    // non-Mastra successor invalidates it and the answer stays in the stash. The
-    // claim is also void if a Stop advanced the cancel generation or it expired.
+    // turn is the successor by construction. A Mastra successor registers itself
+    // as the live claimant and attempts delivery now (the answer may already be
+    // stashed); if the answer arrives LATER, agent:answer-tool-question retries
+    // delivery. Cleared on teardown (cleanupRacedAnswerClaimant) so a later
+    // unrelated turn can't be treated as the successor. Only Mastra registers
+    // (cooperative injects require it); a non-Mastra successor invalidates any
+    // pending handoff so it can't linger for a later Mastra turn.
+    // Cleanup of this claimant registration is centralized (token-scoped) in
+    // cleanupStreamIfOwned, which runs on every terminal + early-exit path.
     if (activeStreams.get(conversationId)?.token === streamToken && racedAnswerHandoffs.has(conversationId)) {
-      const handoffText = claimRacedAnswerHandoff(conversationId); // deletes the handoff (+ stashed answer) if claimable
-      if (handoffText && runtime.id === 'mastra') {
-        // Deliver via the shared cooperative-injection path so the injected user
-        // node is PERSISTED correctly (server-owned turns persist at the
-        // prepareStep boundary; GUI turns append to disk + broadcast stable
-        // metadata) — not just enqueued. Fire-and-forget; it splices into THIS
-        // running Mastra turn.
-        const reinject = injectUserTurnAndRestart;
-        if (reinject) {
-          void reinject(conversationId, handoffText).catch(() => {
-            /* best-effort: injectUserTurnAndRestart reports failure as a resolved
-               value, not a throw, so this only fires on an unexpected error */
-          });
-        } else {
-          enqueueInject(conversationId, handoffText);
-          broadcastStreamEvent({ conversationId, type: 'user-message', text: handoffText }, streamToken);
-        }
-        traceDiagnostic({
-          scope: 'agent',
-          event: 'question.answer-handoff-claimed',
-          level: 'warn',
-          conversationId,
-          toolName: 'ask_user',
+      if (runtime.id === 'mastra') {
+        registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
+          const reinject = injectUserTurnAndRestart;
+          if (!reinject) return false;
+          try {
+            const res = await reinject(conversationId, text);
+            return Boolean(res?.ok && res.injectedCooperatively);
+          } catch {
+            return false;
+          }
         });
-      } else if (handoffText) {
-        // Non-Mastra successor consumed the handoff but can't cooperatively inject
-        // — the answer text is dropped (the run can't splice it). Traced so this
-        // rare case is visible.
+      } else {
+        // Non-Mastra successor can't cooperatively inject — invalidate the handoff
+        // (answers stay in the bounded stash) so it can't attach to a later turn.
+        racedAnswerHandoffs.delete(conversationId);
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-dropped-non-mastra',
@@ -4456,7 +4530,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // Non-terminal abort (supersession / plan-restart): the answer
                 // stays stashed under `streamId`; the actual successor claims it
                 // (see registerRacedAnswerHandoff + the claim in streamHandler).
-                registerRacedAnswerHandoff(conversationId, { answerKey: streamId, cancelGenAtAbort });
+                registerRacedAnswerHandoff(conversationId, streamId, cancelGenAtAbort);
                 traceDiagnostic({
                   scope: 'agent',
                   event: 'question.answer-handoff-registered',
@@ -6200,6 +6274,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve(true, 'answered');
       pendingToolApprovals.delete(toolCallId);
     }
+    // Answer-arrival side of the raced-answer rendezvous: if this answer belongs
+    // to a pending handoff whose successor is already live (the successor started
+    // before the answer landed — a slow/remote client), deliver it now. No-op if
+    // there's no matching handoff/claimant yet (the successor-start path delivers
+    // once it registers). answer-tool-question only knows the answerKey
+    // (=toolCallId), so locate the owning conversation by that key.
+    const owningConv = conversationForRacedAnswerKey(toolCallId);
+    if (owningConv) attemptRacedAnswerDelivery(owningConv);
     return { ok: true };
   });
 
