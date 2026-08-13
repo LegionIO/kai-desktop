@@ -362,6 +362,20 @@ const cancelledSubmits = new Set<number>();
 // aborted run's own teardown, so a small cap is safe.
 const explicitlyCancelledTokens = new Set<string>();
 const MAX_EXPLICITLY_CANCELLED_TOKENS = 100;
+// Monotonic per-conversation counter, incremented on every explicit Stop. A
+// deferred raced-answer re-injection captures this at schedule time and re-checks
+// it at fire time: if it advanced, the user pressed Stop (on this turn OR a
+// successor) during the delay, so the re-injection must NOT start a new run.
+const explicitCancelGeneration = new Map<string, number>();
+const MAX_EXPLICIT_CANCEL_GEN_ENTRIES = 500;
+function bumpExplicitCancelGeneration(conversationId: string): void {
+  explicitCancelGeneration.set(conversationId, (explicitCancelGeneration.get(conversationId) ?? 0) + 1);
+  while (explicitCancelGeneration.size > MAX_EXPLICIT_CANCEL_GEN_ENTRIES) {
+    const oldest = explicitCancelGeneration.keys().next().value;
+    if (oldest === undefined) break;
+    explicitCancelGeneration.delete(oldest);
+  }
+}
 function markTokenExplicitlyCancelled(token: string): void {
   explicitlyCancelledTokens.add(token);
   while (explicitlyCancelledTokens.size > MAX_EXPLICITLY_CANCELLED_TOKENS) {
@@ -642,7 +656,16 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 export type InjectUserTurnFn = (
   conversationId: string,
   userText: string,
-  opts?: { modelKey?: string; reasoningEffort?: ReasoningEffort; profileKey?: string; cwd?: string },
+  opts?: {
+    modelKey?: string;
+    reasoningEffort?: ReasoningEffort;
+    profileKey?: string;
+    cwd?: string;
+    /** Execution mode for the restarted turn. Threaded so a re-injection from a
+     *  plan-first turn (e.g. an ask_user answer recovered after a plan-mode
+     *  restart) does NOT silently resume in `auto` with mutating tools enabled. */
+    executionMode?: ExecutionMode;
+  },
 ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
 
 let injectUserTurnAndRestart: InjectUserTurnFn | null = null;
@@ -4325,8 +4348,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   });
                   const reinject = injectUserTurnAndRestart;
                   if (reinject) {
+                    // Capture the explicit-cancel generation now; re-check it at
+                    // fire time so a Stop on THIS turn or any SUCCESSOR during the
+                    // delay cancels the pending re-injection (never restart after
+                    // Stop). Carry the turn's execution mode so a plan-first turn's
+                    // recovered answer does NOT resume in `auto` with mutating
+                    // tools enabled.
+                    const cancelGenAtSchedule = explicitCancelGeneration.get(conversationId) ?? 0;
+                    const reinjectMode = effectiveExecutionMode;
                     setTimeout(() => {
-                      void reinject(conversationId, answerText).catch((err) => {
+                      if ((explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtSchedule) {
+                        traceDiagnostic({
+                          scope: 'agent',
+                          event: 'question.answer-reinject-cancelled-by-stop',
+                          level: 'warn',
+                          conversationId,
+                          toolName: 'ask_user',
+                          fields: { toolCallId: state.toolCallId, streamId },
+                        });
+                        return;
+                      }
+                      void reinject(conversationId, answerText, { executionMode: reinjectMode }).catch((err) => {
                         traceDiagnostic({
                           scope: 'agent',
                           event: 'question.answer-reinject-failed',
@@ -5556,7 +5598,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       opts?.profileKey ?? updated.selectedProfileKey ?? undefined,
       updated.fallbackEnabled,
       opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
-      undefined,
+      opts?.executionMode,
     );
     return { ok: true };
   };
@@ -5853,6 +5895,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // Shared cancel body — used by the IPC handler above AND cancelConversationStream (called
   // when a conversation is deleted). Idempotent + race-guarded (deleteStreamIfOwned).
   function cancelConversationStreamInner(conversationId: string): void {
+    // An explicit user Stop for this conversation — bump the cancel generation so
+    // any deferred raced-answer re-injection scheduled before now aborts at fire
+    // time (covers a Stop on a SUCCESSOR turn during the re-inject delay).
+    bumpExplicitCancelGeneration(conversationId);
     // Cancel a submit still waiting on toolsReady (no activeStreams entry yet)
     // so it bails after the await instead of starting a run for a gone client.
     const pendingSubmitId = currentPendingSubmit.get(conversationId);
