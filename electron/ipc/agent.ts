@@ -645,69 +645,76 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 
 /**
  * Deliver an ask_user answer that raced a NON-explicit turn abort (supersession
- * or plan-mode restart) to the turn that takes over — WITHOUT racing the
- * lifecycle machinery with a fixed timer.
+ * or plan-mode restart) into the turn that takes over — WITHOUT racing the
+ * lifecycle machinery with a fixed timer, and WITHOUT ever starting a fresh turn
+ * ourselves (which is where the mode/timing hazards live).
  *
  * Strategy (polled, bounded):
  *  - If the user pressed Stop (on this turn OR a successor) at any point, the
  *    explicit-cancel generation advances past the value captured AT ABORT time →
  *    abort delivery. Never restart after Stop.
- *  - Prefer COOPERATIVE delivery: once a replacement turn's active stream exists,
- *    hand the answer to injectUserTurnAndRestart. On the Mastra path it splices
- *    into the RUNNING replacement (inheriting the replacement's correct execution
- *    mode — critical for a plan-first continuation started by enter/exit_plan_mode
- *    restart), so we never start our own `auto` turn that would make the mandatory
- *    plan-first restart stale.
- *  - Only if NO replacement turn appears within the deadline (a plain
- *    supersession that never relaunched, or an idle conversation) do we start a
- *    fresh turn ourselves, carrying the aborted turn's mode as the best available
- *    fallback.
+ *  - Deliver ONLY cooperatively, and ONLY once a genuine REPLACEMENT turn owns
+ *    the stream: a token that is BOTH different from the aborted turn's AND
+ *    non-undefined. Waiting for the aborted token to disappear guarantees we
+ *    never cooperatively queue the answer into the still-aborted run (whose
+ *    terminal drain won't restart a dead controller → the answer would be lost).
+ *    On the Mastra path the splice inherits the REPLACEMENT's execution mode, so
+ *    a plan-first continuation stays plan-first — we never inject an `auto` turn
+ *    that would make the mandatory plan-first restart stale.
+ *  - If NO replacement turn appears within the (generous, past the renderer's
+ *    ~21s plan-first recovery window) deadline, give up on auto-delivery and
+ *    RE-STASH the answer in the bounded (FIFO-evicted) stash rather than start a
+ *    fresh turn with a possibly-wrong mode. A genuinely-superseded turn that
+ *    never relaunched is rare and benign; correctness (never mis-mode, never
+ *    lose into a dead run) beats always-deliver.
  */
 function deliverRacedAnswerToReplacement(opts: {
   conversationId: string;
   answerText: string;
+  answers: Record<string, string>;
+  reStashKey: string;
   cancelGenAtAbort: number;
   abortedToken: string;
-  fallbackExecutionMode: ExecutionMode;
-  onOutcome?: (outcome: 'stopped' | 'cooperative' | 'fresh-turn' | 'failed') => void;
+  onOutcome?: (outcome: 'stopped' | 'cooperative' | 'given-up' | 'failed') => void;
 }): void {
-  const { conversationId, answerText, cancelGenAtAbort, abortedToken, fallbackExecutionMode, onOutcome } = opts;
+  const { conversationId, answerText, answers, reStashKey, cancelGenAtAbort, abortedToken, onOutcome } = opts;
   const STEP_MS = 100;
-  const MAX_ATTEMPTS = 50; // ~5s — ample for the renderer's async plan-first restart authorization
+  // ~25s: past the renderer's ~21s plan-first winner-failure recovery window, so
+  // we don't give up (and lose the plan-first continuation) before it can start.
+  const MAX_ATTEMPTS = 250;
   const stoppedSinceAbort = (): boolean =>
     (explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtAbort;
-  const deliver = (executionMode: ExecutionMode | undefined): void => {
-    const reinject = injectUserTurnAndRestart;
-    if (!reinject) {
-      onOutcome?.('failed');
-      return;
-    }
-    void reinject(conversationId, answerText, executionMode ? { executionMode } : undefined).catch(() => {
-      onOutcome?.('failed');
-    });
-  };
   const tick = (remaining: number): void => {
     if (stoppedSinceAbort()) {
       onOutcome?.('stopped');
       return;
     }
-    // A REPLACEMENT turn is live (a different token than the aborted turn — the
-    // aborted turn's own entry may briefly linger until its teardown runs; don't
-    // mistake it for a replacement) — deliver into it. On the Mastra path this
-    // splices cooperatively into the running replacement, inheriting ITS correct
-    // execution mode (so a plan-first continuation stays plan-first). Don't pass
-    // executionMode: let the running replacement's own mode govern.
     const activeToken = activeStreams.get(conversationId)?.token;
+    // A genuine REPLACEMENT turn owns the stream (a different token — and the
+    // aborted turn's own entry is GONE, so injectUserTurnAndRestart can't queue
+    // into the dead run). Deliver cooperatively; the running replacement's own
+    // mode governs (don't pass executionMode).
     if (activeToken !== undefined && activeToken !== abortedToken) {
-      deliver(undefined);
+      const reinject = injectUserTurnAndRestart;
+      if (!reinject) {
+        stashQuestionAnswers(reStashKey, answers);
+        onOutcome?.('failed');
+        return;
+      }
+      void reinject(conversationId, answerText).catch(() => {
+        // Delivery threw — preserve the answer so it isn't lost.
+        stashQuestionAnswers(reStashKey, answers);
+        onOutcome?.('failed');
+      });
       onOutcome?.('cooperative');
       return;
     }
     if (remaining <= 0) {
-      // No replacement turn appeared — start a fresh turn with the aborted turn's
-      // mode as the best available signal (correct for a plain supersession).
-      deliver(fallbackExecutionMode);
-      onOutcome?.('fresh-turn');
+      // No replacement turn appeared in the window — give up on auto-delivery and
+      // preserve the answer in the bounded stash rather than start a fresh turn
+      // with a possibly-wrong (auto) mode or queue into a lingering dead run.
+      stashQuestionAnswers(reStashKey, answers);
+      onOutcome?.('given-up');
       return;
     }
     setTimeout(() => tick(remaining - 1), STEP_MS);
@@ -4408,15 +4415,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // Non-explicit abort (supersession / plan-restart): a replacement
                   // turn is coming, but continuing THIS tool is futile (its result
                   // is suppressed as a superseded-run event) and would consume+
-                  // delete the answer inside a dead turn. Instead, DELIVER the
-                  // answer to the next turn: re-inject it as a fresh user message
-                  // once this turn's teardown has released the active-stream entry
-                  // (deferred so injectUserTurnAndRestart doesn't enqueue into the
-                  // dying turn's queue). Clear the stash so nothing lingers under
-                  // the dead id.
+                  // delete the answer inside a dead turn. Deliver the answer to the
+                  // REPLACEMENT turn cooperatively once it appears (see
+                  // deliverRacedAnswerToReplacement). Clear the stash under the dead
+                  // id now; the helper re-stashes if it ultimately gives up.
+                  const racedAnswer = raced;
                   pendingQuestionAnswers.delete(streamId);
                   if (streamId !== state.toolCallId) pendingQuestionAnswers.delete(state.toolCallId);
-                  const answerText = formatRacedAnswerAsUserTurn(raced);
+                  const answerText = formatRacedAnswerAsUserTurn(racedAnswer);
                   traceDiagnostic({
                     scope: 'agent',
                     event: 'question.answer-reinjected-after-abort',
@@ -4425,18 +4431,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     toolName: state.toolName,
                     fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
                   });
-                  // Coordinate with the replacement turn instead of racing it with
-                  // a fixed timer: wait for the successor stream to appear and
-                  // deliver cooperatively (inheriting ITS mode — keeps a plan-first
-                  // restart plan-first), abort if the user Stopped in the meantime,
-                  // or start a fresh turn (with the aborted turn's mode) only if no
-                  // successor materializes.
+                  // Coordinate with the replacement turn instead of racing it with a
+                  // fixed timer: wait (past the renderer's ~21s plan-first recovery
+                  // window) for a genuine successor stream, deliver cooperatively so
+                  // it inherits the successor's mode (keeps plan-first plan-first),
+                  // abort if the user Stopped meanwhile, or give up and preserve the
+                  // answer in the stash — never start a fresh (possibly-auto) turn.
                   deliverRacedAnswerToReplacement({
                     conversationId,
                     answerText,
+                    answers: racedAnswer,
+                    reStashKey: streamId,
                     cancelGenAtAbort,
                     abortedToken: streamToken,
-                    fallbackExecutionMode: effectiveExecutionMode,
                     onOutcome: (deliveryOutcome) => {
                       traceDiagnostic({
                         scope: 'agent',
