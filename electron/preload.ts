@@ -54,7 +54,8 @@ const appAPI = {
         responseMessageId,
       ),
     cancelStream: (conversationId: string) => ipcRenderer.invoke('agent:cancel-stream', conversationId),
-    inFlight: (conversationId: string) => ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<{ inFlight: boolean; serverPersisted: boolean }>,
+    inFlight: (conversationId: string) =>
+      ipcRenderer.invoke('agent:in-flight', conversationId) as Promise<{ inFlight: boolean; serverPersisted: boolean }>,
     /** Main-authoritative GUI continuation authorization (one driver per turn). */
     authorizeContinuation: (conversationId: string, clientId: string, turnToken: string) =>
       ipcRenderer.invoke('agent:authorize-continuation', conversationId, clientId, turnToken) as Promise<{
@@ -170,7 +171,10 @@ const appAPI = {
     // on main (add/remove by id; merges concurrent clients; no whole-record clobber).
     setPendingDrafts: (
       conversationId: string,
-      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
+      delta: {
+        add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
+        removeIds?: string[];
+      },
     ) =>
       ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
         ok: boolean;
@@ -420,6 +424,31 @@ const appAPI = {
           marketplaceUrl: string;
         }>
       >,
+    marketplaceStatus: () =>
+      ipcRenderer.invoke('plugin:marketplace-status') as Promise<{
+        configured: boolean;
+        ready: boolean;
+        reachable: boolean;
+        catalogSize: number;
+      }>,
+    marketplaceSnapshot: () =>
+      ipcRenderer.invoke('plugin:marketplace-snapshot') as Promise<{
+        catalog: Array<{
+          name: string;
+          displayName: string;
+          description: string;
+          repo: string;
+          ref: string;
+          version: string;
+          author?: string;
+          tags?: string[];
+          icon?: string;
+          installed: boolean;
+          installedVersion?: string;
+          marketplaceUrl: string;
+        }>;
+        status: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number };
+      }>,
     marketplaceInstall: (pluginName: string) =>
       ipcRenderer.invoke('plugin:marketplace-install', pluginName) as Promise<{
         success: boolean;
@@ -471,6 +500,16 @@ const appAPI = {
       const handler = (_event: Electron.IpcRendererEvent, data: { plugins: string[] }) => callback(data);
       ipcRenderer.on('plugin:pending-restart-changed', handler);
       return () => ipcRenderer.removeListener('plugin:pending-restart-changed', handler);
+    },
+    onMarketplaceReady: (
+      callback: (data: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number }) => void,
+    ) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        data: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number },
+      ) => callback(data);
+      ipcRenderer.on('plugin:marketplace-ready', handler);
+      return () => ipcRenderer.removeListener('plugin:marketplace-ready', handler);
     },
     getFailedUpdates: () =>
       ipcRenderer.invoke('plugin:failed-updates') as Promise<

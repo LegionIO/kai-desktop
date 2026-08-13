@@ -23,6 +23,11 @@ describe('plugin process control IPC', () => {
     pausePlugin: vi.fn(async () => {}),
     resumePlugin: vi.fn(async () => {}),
     killPlugin: vi.fn(async () => {}),
+    getMarketplaceStatus: vi.fn(() => ({ configured: true, ready: false, reachable: false, catalogSize: 0 })),
+    getMarketplaceSnapshot: vi.fn(() => ({
+      catalog: [],
+      status: { configured: true, ready: false, reachable: false, catalogSize: 0 },
+    })),
   } as unknown as PluginManager;
 
   beforeEach(() => {
@@ -38,5 +43,23 @@ describe('plugin process control IPC', () => {
   ] as const)('forwards %s to PluginManager.%s', async (channel, method) => {
     await expect(handlers.get(channel)?.({}, 'fixture-plugin')).resolves.toEqual({ success: true });
     expect(manager[method]).toHaveBeenCalledWith('fixture-plugin');
+  });
+
+  it('forwards plugin:marketplace-status to PluginManager.getMarketplaceStatus', () => {
+    expect(handlers.get('plugin:marketplace-status')?.({})).toEqual({
+      configured: true,
+      ready: false,
+      reachable: false,
+      catalogSize: 0,
+    });
+    expect(manager.getMarketplaceStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards plugin:marketplace-snapshot to PluginManager.getMarketplaceSnapshot', () => {
+    expect(handlers.get('plugin:marketplace-snapshot')?.({})).toEqual({
+      catalog: [],
+      status: { configured: true, ready: false, reachable: false, catalogSize: 0 },
+    });
+    expect(manager.getMarketplaceSnapshot).toHaveBeenCalledTimes(1);
   });
 });

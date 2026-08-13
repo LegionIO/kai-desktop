@@ -40,6 +40,37 @@ function isNewerVersion(catalogVersion: string, installedVersion: string): boole
   return cPatch > iPatch;
 }
 
+// Detect an IPC call that reached the transport but hit no registered handler
+// in the main process. This is the OTA skew case: an OTA overlay ships a NEW
+// preload + renderer over the OLD bundled main process (main is never
+// OTA-updated — see electron/ota/bootstrap.ts), so a channel the new preload
+// exposes may have no handler on the running main. Electron rejects such an
+// invoke with "No handler registered for '<channel>'". We treat that as
+// "unsupported here" and fall back to an older channel rather than surfacing an
+// error that would break the whole Plugins view until a full app update.
+function isNoHandlerError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /No handler registered for/i.test(msg) || /not supported in web mode/i.test(msg);
+}
+
+type MarketplaceStatus = { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number };
+
+// Fetch marketplace status, tolerating an OTA-skewed / older main process that
+// has no `plugin:marketplace-status` handler. Returns `supported: false` in
+// that case (with a permissive default) so the caller knows the status signal
+// is unavailable and can compensate (e.g. bounded polling for the original
+// startup race, which the old main can't broadcast its way out of).
+async function fetchStatusOrDefault(): Promise<{ status: MarketplaceStatus; supported: boolean }> {
+  const fallback: MarketplaceStatus = { configured: true, ready: true, reachable: true, catalogSize: 0 };
+  if (typeof app.plugins.marketplaceStatus !== 'function') return { status: fallback, supported: false };
+  try {
+    return { status: await app.plugins.marketplaceStatus(), supported: true };
+  } catch (err) {
+    if (isNoHandlerError(err)) return { status: fallback, supported: false };
+    throw err;
+  }
+}
+
 // Parse author string like "Name <https://example.com>" into {name, url}.
 // The URL is only returned if it uses an allowlisted scheme (https:// or
 // mailto:) — anything else (javascript:, data:, file:, etc.) is dropped so
@@ -60,6 +91,19 @@ export const PluginMarketplace: FC = () => {
   const [catalog, setCatalog] = useState<MarketplaceEntry[]>([]);
   const [installedVersions, setInstalledVersions] = useState<Map<string, string>>(new Map());
   const [loading, setLoading] = useState(true);
+  // Distinguishes a genuinely unconfigured marketplace from one whose startup
+  // catalog fetch simply hasn't settled yet, and (once settled) whether the
+  // endpoint was actually reachable. Without this the view falsely shows
+  // "No marketplace configured" during the async init window, and can't tell a
+  // valid empty catalog from an unreachable endpoint.
+  const [marketplaceReady, setMarketplaceReady] = useState(false);
+  const [marketplaceConfigured, setMarketplaceConfigured] = useState(false);
+  const [marketplaceReachable, setMarketplaceReachable] = useState(false);
+  // Whether the running main actually reported status. False under OTA skew (new
+  // renderer over an older main with no status handler); the reachable/ready/
+  // configured flags are then meaningless, so the UI falls back to the legacy
+  // single empty-state rather than the new loading/unreachable/no-plugins states.
+  const [marketplaceStatusSupported, setMarketplaceStatusSupported] = useState(true);
   const searchRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<MarketplaceTab>('available');
 
@@ -78,15 +122,93 @@ export const PluginMarketplace: FC = () => {
   const [updatingAll, setUpdatingAll] = useState(false);
   const updatingAllRef = useRef(false);
   const loadReqId = useRef(0);
+  // Guards against scheduling work after unmount: an in-flight loadData() can
+  // resolve after the cleanup ran, and must not arm a new polling timer then.
+  const mountedRef = useRef(true);
+  // OTA-skew safety net: when the running main is too old to expose
+  // marketplace-status (so it also never broadcasts marketplace-ready), the
+  // original startup race can leave the catalog momentarily empty with no event
+  // to recover from. In that ONE case we poll marketplaceCatalog until it
+  // arrives or a deadline passes. The deadline must cover the old main's real
+  // init window: fetchCatalog processes URLs SEQUENTIALLY at up to 60s each, so
+  // size the ceiling for a few configured marketplaces (enterprise + public),
+  // with a gentle backoff (cheap, and stops as soon as the catalog is non-empty).
+  const legacyPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const legacyPollDeadline = useRef<number | null>(null);
+  const LEGACY_POLL_MAX_MS = 200_000; // ~3 URLs × 60s + margin
+  const legacyPollDelayMs = (elapsed: number) =>
+    elapsed < 10_000 ? 1500 : elapsed < 30_000 ? 3000 : elapsed < 90_000 ? 6000 : 10_000;
 
   const loadData = useCallback(async () => {
     const reqId = ++loadReqId.current;
     try {
-      const [catalogData, pluginList] = await Promise.all([app.plugins.marketplaceCatalog(), app.plugins.list()]);
+      // Prefer the atomic snapshot so catalog + status come from a single
+      // main-process read — two separate round-trips can interleave with a
+      // concurrent fetch commit and pair an old catalog with new status. Guard
+      // on BOTH the preload function existing AND the invoke succeeding: under
+      // OTA skew the new preload exposes the function while the old main lacks
+      // the handler, so a preload `typeof` check alone is not enough.
+      if (typeof app.plugins.marketplaceSnapshot === 'function') {
+        try {
+          const [snapshot, pluginList] = await Promise.all([app.plugins.marketplaceSnapshot(), app.plugins.list()]);
+          if (reqId !== loadReqId.current) return;
+          setCatalog(snapshot.catalog);
+          setInstalledVersions(new Map(pluginList.map((p: { name: string; version: string }) => [p.name, p.version])));
+          setMarketplaceConfigured(snapshot.status.configured);
+          setMarketplaceReady(snapshot.status.ready);
+          setMarketplaceReachable(snapshot.status.reachable);
+          setMarketplaceStatusSupported(true);
+          setError(null);
+          return;
+        } catch (err) {
+          // Only swallow the OTA-skew "no handler" case; real errors fall
+          // through to the catch below via rethrow.
+          if (!isNoHandlerError(err)) throw err;
+        }
+      }
+      // Fallback: separate catalog + status calls. marketplaceStatus can also be
+      // missing a handler under OTA skew, so fetch it defensively; when it's
+      // unsupported we default to configured+ready+reachable (the old behavior:
+      // show whatever the catalog holds).
+      const [catalogData, pluginList, statusResult] = await Promise.all([
+        app.plugins.marketplaceCatalog(),
+        app.plugins.list(),
+        fetchStatusOrDefault(),
+      ]);
       if (reqId !== loadReqId.current) return;
+      const { status, supported: statusSupported } = statusResult;
       setCatalog(catalogData);
       setInstalledVersions(new Map(pluginList.map((p: { name: string; version: string }) => [p.name, p.version])));
+      setMarketplaceConfigured(status.configured);
+      setMarketplaceReady(status.ready);
+      setMarketplaceReachable(status.reachable);
+      setMarketplaceStatusSupported(statusSupported);
       setError(null);
+
+      // OTA-skew recovery: an old main can't tell us whether its startup fetch
+      // has settled, and never broadcasts marketplace-ready. If the catalog is
+      // still empty, poll (until a deadline that covers the old main's ~60s/URL
+      // fetch window) so a slow initial fetch surfaces without the user having
+      // to manually refresh. A non-empty catalog, or a main new enough to report
+      // status, needs no polling.
+      if (!statusSupported && catalogData.length === 0) {
+        const now = Date.now();
+        if (legacyPollDeadline.current === null) legacyPollDeadline.current = now + LEGACY_POLL_MAX_MS;
+        // Don't arm a timer if the component unmounted while this load was in
+        // flight (cleanup already ran) — otherwise polling + state updates leak.
+        if (mountedRef.current && now < legacyPollDeadline.current) {
+          const elapsed = LEGACY_POLL_MAX_MS - (legacyPollDeadline.current - now);
+          if (legacyPollTimer.current) clearTimeout(legacyPollTimer.current);
+          legacyPollTimer.current = setTimeout(() => void loadData(), legacyPollDelayMs(elapsed));
+        }
+      } else {
+        // Settled (or catalog arrived) — stop any further polling.
+        legacyPollDeadline.current = null;
+        if (legacyPollTimer.current) {
+          clearTimeout(legacyPollTimer.current);
+          legacyPollTimer.current = null;
+        }
+      }
     } catch (err) {
       if (reqId !== loadReqId.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load marketplace data');
@@ -96,7 +218,32 @@ export const PluginMarketplace: FC = () => {
   }, []);
 
   useEffect(() => {
+    // Re-arm on (re)mount: StrictMode runs setup→cleanup→setup on the same ref
+    // in dev, and the cleanup below sets this false. Without re-arming, the
+    // second setup would leave polling permanently disabled.
+    mountedRef.current = true;
     loadData();
+    return () => {
+      mountedRef.current = false;
+      if (legacyPollTimer.current) {
+        clearTimeout(legacyPollTimer.current);
+        legacyPollTimer.current = null;
+      }
+    };
+  }, [loadData]);
+
+  // If the view is opened while the startup catalog fetch is still in flight,
+  // reload once the main process signals it has settled — this replaces the
+  // transient loading state with the real catalog (or the unconfigured/
+  // unreachable empty state) without the user needing to refresh manually.
+  useEffect(() => {
+    if (typeof app.plugins.onMarketplaceReady !== 'function') return;
+    return app.plugins.onMarketplaceReady((status) => {
+      setMarketplaceConfigured(status.configured);
+      setMarketplaceReady(status.ready);
+      setMarketplaceReachable(status.reachable);
+      void loadData();
+    });
   }, [loadData]);
 
   useEffect(() => {
@@ -122,11 +269,27 @@ export const PluginMarketplace: FC = () => {
       setCatalog(refreshed);
       const pluginList = await app.plugins.list();
       setInstalledVersions(new Map(pluginList.map((p: { name: string; version: string }) => [p.name, p.version])));
-      setError(null);
+      // Default to reachable so an older/OTA-skewed main (no status handler)
+      // keeps the prior success behavior; the current main always reports it.
+      const { status } = await fetchStatusOrDefault();
+      setMarketplaceConfigured(status.configured);
+      setMarketplaceReady(status.ready);
+      setMarketplaceReachable(status.reachable);
+      // Only treat a refresh as failed-to-reach when the marketplace is
+      // actually configured; an unconfigured brand isn't a connectivity error.
+      const reachable = !status.configured || status.reachable;
       const elapsed = Date.now() - startTime;
       if (elapsed < 1000) await new Promise((r) => setTimeout(r, 1000 - elapsed));
-      setJustRefreshed(true);
-      setTimeout(() => setJustRefreshed(false), 2000);
+      if (reachable) {
+        // Genuine success — clear any prior error and flash the success state.
+        setError(null);
+        setJustRefreshed(true);
+        setTimeout(() => setJustRefreshed(false), 2000);
+      } else {
+        // The refresh resolved but reached no configured URL — surface it as an
+        // error instead of the misleading green "Up to date" success state.
+        setError('Couldn’t reach the plugin marketplace. Check your connection and try again.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to refresh marketplace');
     } finally {
@@ -318,8 +481,71 @@ export const PluginMarketplace: FC = () => {
               {/* ── Available Tab ── */}
               {activeTab === 'available' && (
                 <>
-                  {/* No catalog configured */}
-                  {catalog.length === 0 && !error && (
+                  {/* Configured but startup catalog fetch not yet settled —
+                      show loading rather than the misleading "unconfigured".
+                      Only when the main reported real status (not OTA-skew). */}
+                  {catalog.length === 0 &&
+                    !error &&
+                    marketplaceStatusSupported &&
+                    marketplaceConfigured &&
+                    !marketplaceReady && (
+                      <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
+                        <LoaderIcon className="mx-auto h-8 w-8 animate-spin text-muted-foreground/40" />
+                        <p className="mt-4 text-sm text-muted-foreground">Loading marketplace…</p>
+                      </div>
+                    )}
+
+                  {/* Configured + settled, but no configured URL was reachable
+                      and there's no cache — a genuine connectivity failure. */}
+                  {catalog.length === 0 &&
+                    !error &&
+                    marketplaceStatusSupported &&
+                    marketplaceConfigured &&
+                    marketplaceReady &&
+                    !marketplaceReachable && (
+                      <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
+                        <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
+                        <p className="mt-4 text-sm text-muted-foreground">Couldn’t reach the plugin marketplace</p>
+                        <p className="mt-1 text-xs text-muted-foreground/70">Check your connection and try again.</p>
+                        <button
+                          type="button"
+                          onClick={handleRefresh}
+                          disabled={refreshing}
+                          className={cn(
+                            'mt-4 inline-flex items-center gap-1.5 rounded-lg border border-border/70 bg-card px-3 py-1.5 text-xs font-medium transition-colors',
+                            refreshing
+                              ? 'cursor-not-allowed text-muted-foreground/50'
+                              : 'text-foreground hover:bg-muted/50',
+                          )}
+                        >
+                          <RefreshCwIcon className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
+                          {refreshing ? 'Retrying…' : 'Try again'}
+                        </button>
+                      </div>
+                    )}
+
+                  {/* Configured + settled + reachable, but the endpoint returned
+                      zero plugins — a VALID empty catalog, not a failure. */}
+                  {catalog.length === 0 &&
+                    !error &&
+                    marketplaceStatusSupported &&
+                    marketplaceConfigured &&
+                    marketplaceReady &&
+                    marketplaceReachable && (
+                      <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
+                        <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
+                        <p className="mt-4 text-sm text-muted-foreground">No plugins available</p>
+                        <p className="mt-1 text-xs text-muted-foreground/70">
+                          The marketplace is reachable but currently lists no plugins.
+                        </p>
+                      </div>
+                    )}
+
+                  {/* Genuinely no marketplace URLs for this brand — OR the running
+                      main is too old to report status (OTA skew), in which case we
+                      fall back to the classic pre-status message rather than
+                      guessing "no plugins" vs "unreachable". */}
+                  {catalog.length === 0 && !error && (!marketplaceStatusSupported || !marketplaceConfigured) && (
                     <div className="rounded-2xl border border-dashed border-border/70 bg-card/30 px-6 py-16 text-center">
                       <PackageIcon className="mx-auto h-10 w-10 text-muted-foreground/40" />
                       <p className="mt-4 text-sm text-muted-foreground">No marketplace configured</p>

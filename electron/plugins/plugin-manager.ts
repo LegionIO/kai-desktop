@@ -138,6 +138,27 @@ export class PluginManager {
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
   private marketplaceService: MarketplaceService | null = null;
+  /**
+   * True once {@link initMarketplace} has run to completion (success OR
+   * network-fetch failure that fell back to cache). Distinguishes a genuinely
+   * unconfigured marketplace from one whose async startup catalog fetch simply
+   * hasn't resolved yet — the renderer needs this to avoid falsely showing
+   * "No marketplace configured" when opened mid-init. See getMarketplaceStatus().
+   */
+  private marketplaceInitialized = false;
+  /**
+   * Single-flight guard for catalog refreshes, KEYED by the ordered URL list.
+   * Two callers with the SAME url set coalesce onto one in-flight run. Callers
+   * with a DIFFERENT url set (e.g. after a mid-session branding change) must
+   * NOT join that flight — but they also must not run CONCURRENTLY against the
+   * same MarketplaceService (both mutate its cached catalog + reachability, and
+   * a late old-set fetch could commit over the new one). So a differing key
+   * CHAINS after the current flight: at most one refresh touches the service at
+   * a time, and the last-committed refresh is authoritative.
+   */
+  private inFlightCatalogFetch: { key: string; promise: Promise<MarketplaceCatalogEntry[]> } | null = null;
+  /** Tail of the serialize-different-keys chain (resolves when the last-queued refresh settles). */
+  private catalogRefreshChain: Promise<unknown> = Promise.resolve();
   private catalogRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private lastUpdateCount = 0;
   private pendingRestart: Set<string> = new Set();
@@ -1880,33 +1901,135 @@ export class PluginManager {
   /* ── Marketplace ── */
 
   async initMarketplace(marketplaceUrls: string[]): Promise<void> {
-    if (marketplaceUrls.length === 0) return;
-
-    this.marketplaceService = new MarketplaceService(
-      this.pluginsDir,
-      this.appHome,
-      this.getConfig,
-      this.setConfig,
-      this.brandRequiredPluginNamesSet,
-    );
-
-    let catalog: MarketplaceCatalogEntry[] = [];
     try {
-      catalog = await this.marketplaceService.fetchCatalog(marketplaceUrls);
-      console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
-    } catch (err) {
-      console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
-      catalog = this.marketplaceService.getCachedCatalog() ?? [];
-    }
+      if (marketplaceUrls.length === 0) {
+        // Nothing to fetch — there is no configured marketplace. init is
+        // still "done" so the renderer stops waiting and shows the (correct)
+        // unconfigured empty state rather than a perpetual spinner.
+        return;
+      }
 
-    if (this.brandRequiredPluginNames.length > 0) {
-      await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
-        serialize: (name, fn) => this.withInstallLock(name, fn),
-        afterInstall: async (name, result) => {
-          await this.swapToInstalledPlugin(name, result.version, result);
-        },
-      });
+      this.marketplaceService = new MarketplaceService(
+        this.pluginsDir,
+        this.appHome,
+        this.getConfig,
+        this.setConfig,
+        this.brandRequiredPluginNamesSet,
+      );
+
+      try {
+        // Full refresh (fetch + required-plugin auto-install) under the
+        // single-flight guard so a concurrent renderer/periodic refresh joins
+        // this one instead of racing it.
+        const catalog = await this.refreshCatalogSingleFlight(marketplaceUrls);
+        console.info(`[Marketplace] Fetched ${catalog.length} plugins from ${marketplaceUrls.length} marketplace(s)`);
+      } catch (err) {
+        console.warn('[Marketplace] Catalog fetch failed, using cache if available:', err);
+      }
+    } finally {
+      // Always signal renderers that startup init has settled — even on an
+      // unexpected throw — so a marketplace view opened mid-init can reload
+      // and leave its loading state instead of spinning forever.
+      this.marketplaceInitialized = true;
+      this.broadcastMarketplaceReady();
     }
+  }
+
+  private broadcastMarketplaceReady(): void {
+    broadcastToAllWindows('plugin:marketplace-ready', this.getMarketplaceStatus());
+  }
+
+  /**
+   * Run the FULL catalog refresh (fetch + required-plugin auto-install) under a
+   * single-flight guard: if a refresh is already in progress, await it rather
+   * than starting a competing one. Covering auto-install (not just fetch) is
+   * essential — auto-install eligibility is decided BEFORE the per-plugin
+   * install lock is taken, so two overlapping refreshes could each decide the
+   * same plugin needs (re)installing and both proceed. One authoritative
+   * refresh at a time makes the cached catalog, reachability, and installs
+   * consistent across startup, renderer-triggered, and periodic refreshes.
+   */
+  private refreshCatalogSingleFlight(urls: string[]): Promise<MarketplaceCatalogEntry[]> {
+    // Same url set as the in-flight refresh → coalesce onto it.
+    const key = JSON.stringify(urls);
+    if (this.inFlightCatalogFetch && this.inFlightCatalogFetch.key === key) {
+      return this.inFlightCatalogFetch.promise;
+    }
+    if (!this.marketplaceService) return Promise.resolve([]);
+
+    // Different (or first) url set → CHAIN after whatever is currently queued so
+    // only one refresh mutates the MarketplaceService at a time. This prevents a
+    // late old-set fetch from committing over a newer set and stops an
+    // A→B→A sequence from running A twice concurrently.
+    const runAfterChain = this.catalogRefreshChain.then(async () => {
+      const service = this.marketplaceService;
+      if (!service) return [];
+      const catalog = await service.fetchCatalog(urls);
+      if (this.brandRequiredPluginNames.length > 0) {
+        const updated = await service.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
+          serialize: (name, fn) => this.withInstallLock(name, fn),
+          afterInstall: async (name, result) => {
+            await this.swapToInstalledPlugin(name, result.version, result);
+          },
+        });
+        if (updated.length > 0) this.broadcastUpdateCount();
+      }
+      return catalog;
+    });
+
+    const promise = runAfterChain.finally(() => {
+      if (this.inFlightCatalogFetch?.promise === promise) this.inFlightCatalogFetch = null;
+    });
+    // Advance the chain tail (swallow errors so one failed refresh doesn't wedge
+    // the chain for every subsequent caller).
+    this.catalogRefreshChain = promise.catch(() => {});
+    this.inFlightCatalogFetch = { key, promise };
+    return promise;
+  }
+
+  /**
+   * Report marketplace availability so the renderer can distinguish the states
+   * that all previously surfaced as an empty catalog:
+   *   - `configured=false`                        → no marketplace URLs for this brand
+   *   - `configured=true, ready=false`            → startup catalog fetch still in flight
+   *   - `configured=true, ready=true, reachable=false` → fetch failed / all URLs
+   *                                                 unreachable (and no cache)
+   *   - `configured=true, ready=true, reachable=true`  → endpoint healthy; a
+   *                                                 catalogSize of 0 is a VALID
+   *                                                 empty catalog, not a failure
+   *
+   * `reachable` reflects the actual fetch outcome (did any configured URL
+   * respond with a valid catalog), NOT catalogSize — a reachable endpoint may
+   * legitimately return zero plugins.
+   */
+  getMarketplaceStatus(): { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number } {
+    const configured = this.getMarketplaceUrls().length > 0;
+    // null (fetch never settled) counts as not-reachable. When unconfigured,
+    // "reachable" is meaningless — report false; the renderer gates on
+    // `configured` first.
+    const reachable = configured ? this.marketplaceService?.wasLastFetchReachable() === true : false;
+    return {
+      configured,
+      ready: this.marketplaceInitialized,
+      reachable,
+      catalogSize: this.marketplaceService?.getCachedCatalog()?.length ?? 0,
+    };
+  }
+
+  /**
+   * Atomic catalog + status read. Both are derived from the same in-memory
+   * snapshot with NO await in between, so a concurrent fetch commit can't pair
+   * an old catalog with new status (or vice-versa) the way two separate IPC
+   * round-trips can. Renderers should prefer this over calling
+   * getMarketplaceCatalog() and getMarketplaceStatus() separately.
+   */
+  getMarketplaceSnapshot(): {
+    catalog: MarketplaceCatalogEntry[];
+    status: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number };
+  } {
+    const catalog = this.getMarketplaceCatalog();
+    const status = this.getMarketplaceStatus();
+    return { catalog, status };
   }
 
   private async withInstallLock<T>(pluginName: string, fn: () => Promise<T>): Promise<T> {
@@ -2181,20 +2304,14 @@ export class PluginManager {
     const urls = marketplaceUrls ?? this.getMarketplaceUrls();
     if (urls.length === 0) return [];
 
-    const catalog = await this.marketplaceService.fetchCatalog(urls);
-    if (this.brandRequiredPluginNames.length > 0) {
-      // Swap after install (not before) so a failed background download leaves the
-      // currently-running required plugin intact, and a broken release rolls back.
-      const updated = await this.marketplaceService.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
-        serialize: (name, fn) => this.withInstallLock(name, fn),
-        afterInstall: async (name, result) => {
-          await this.swapToInstalledPlugin(name, result.version, result);
-        },
-      });
-      if (updated.length > 0) {
-        this.broadcastUpdateCount();
-      }
-    }
+    // Full refresh (fetch + required-plugin auto-install) under the single-flight
+    // guard — dedupes with a concurrent startup init or periodic refresh so the
+    // same required plugin isn't (re)installed twice.
+    await this.refreshCatalogSingleFlight(urls);
+    // Broadcast the refreshed status so a marketplace view already open (e.g.
+    // during the periodic 4-hour refresh, or a refresh triggered elsewhere)
+    // reloads with the new reachability/catalog instead of showing stale state.
+    this.broadcastMarketplaceReady();
     return this.getMarketplaceCatalog();
   }
 
