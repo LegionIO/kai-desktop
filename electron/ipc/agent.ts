@@ -1858,23 +1858,44 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
     // Raced-answer → successor handoff (see registerRacedAnswerHandoff): if a
     // prior turn aborted-to-restart while an ask_user answer was pending, THIS
-    // turn is the successor by construction. Splice the answer into it as a
-    // cooperative inject so it's delivered to the correct turn with the correct
-    // mode — only for Mastra (cooperative injects require it); a non-Mastra
-    // successor leaves the handoff to age out (answer stays stashed). The claim
-    // is void if a Stop advanced the cancel generation or the handoff expired.
-    if (
-      runtime.id === 'mastra' &&
-      activeStreams.get(conversationId)?.token === streamToken &&
-      racedAnswerHandoffs.has(conversationId)
-    ) {
-      const handoffText = claimRacedAnswerHandoff(conversationId);
-      if (handoffText) {
-        enqueueInject(conversationId, handoffText);
-        broadcastStreamEvent({ conversationId, type: 'user-message', text: handoffText }, streamToken);
+    // turn is the successor by construction. EVERY successor that owns the stream
+    // must CONSUME the handoff (claimRacedAnswerHandoff deletes it) so it can't
+    // linger and be claimed by a later unrelated turn — but only a Mastra
+    // successor can actually deliver (cooperative injects require Mastra); a
+    // non-Mastra successor invalidates it and the answer stays in the stash. The
+    // claim is also void if a Stop advanced the cancel generation or it expired.
+    if (activeStreams.get(conversationId)?.token === streamToken && racedAnswerHandoffs.has(conversationId)) {
+      const handoffText = claimRacedAnswerHandoff(conversationId); // deletes the handoff (+ stashed answer) if claimable
+      if (handoffText && runtime.id === 'mastra') {
+        // Deliver via the shared cooperative-injection path so the injected user
+        // node is PERSISTED correctly (server-owned turns persist at the
+        // prepareStep boundary; GUI turns append to disk + broadcast stable
+        // metadata) — not just enqueued. Fire-and-forget; it splices into THIS
+        // running Mastra turn.
+        const reinject = injectUserTurnAndRestart;
+        if (reinject) {
+          void reinject(conversationId, handoffText).catch(() => {
+            /* best-effort: injectUserTurnAndRestart reports failure as a resolved
+               value, not a throw, so this only fires on an unexpected error */
+          });
+        } else {
+          enqueueInject(conversationId, handoffText);
+          broadcastStreamEvent({ conversationId, type: 'user-message', text: handoffText }, streamToken);
+        }
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-claimed',
+          level: 'warn',
+          conversationId,
+          toolName: 'ask_user',
+        });
+      } else if (handoffText) {
+        // Non-Mastra successor consumed the handoff but can't cooperatively inject
+        // — the answer text is dropped (the run can't splice it). Traced so this
+        // rare case is visible.
+        traceDiagnostic({
+          scope: 'agent',
+          event: 'question.answer-handoff-dropped-non-mastra',
           level: 'warn',
           conversationId,
           toolName: 'ask_user',
@@ -4402,71 +4423,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 toolName: state.toolName,
                 execToolCallId: state.toolCallId,
               });
-              // The answer is stashed under `streamId` (answer-tool-question
-              // stashes unconditionally). Recover it here so a raced answer is
-              // not lost. Re-key to the exec id only when the ids differ — for
-              // ask_user, pairing is by id-identity so `streamId ===
-              // state.toolCallId` and the answer is already under the key
-              // execute() reads (rekeyRacedAnswer is a no-op then, avoiding a
-              // copy-then-delete that would drop the entry). See rekeyRacedAnswer.
               let raced = pendingQuestionAnswers.get(streamId);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
-              // Snapshot the explicit-cancel generation AT ABORT TIME (before the
-              // grace wait) — a Stop on this turn OR a successor while we're inside
-              // waitForRacedAnswer must be observed as an advance later. Capturing
-              // after the wait would miss a Stop that landed during it.
-              const cancelGenAtAbort =
-                outcome.skip && outcome.reason === 'abort' ? (explicitCancelGeneration.get(conversationId) ?? 0) : 0;
-              // Abort-first race: controller.abort() settles the approval
-              // SYNCHRONOUSLY, so this continuation can resume before the user's
-              // already-sent answer IPC is processed. On the abort path with no
-              // answer yet, wait a brief grace window for it to land rather than
-              // skipping (and orphaning it under this now-dead tool-call id).
-              if (!raced && outcome.skip && outcome.reason === 'abort') {
-                raced = await waitForRacedAnswer(streamId);
-              }
-              if (outcome.skip) {
-                if (outcome.reason === 'abort') {
-                  const terminalAbort = terminalAbortTokens.has(streamToken);
-                  if (terminalAbort) {
-                    // TERMINAL abort (explicit Stop, or exit_plan_mode dismiss) —
-                    // no successor turn is coming. Do NOT hand the answer to the
-                    // replacement coordinator (it would otherwise inject the stale
-                    // answer into a later UNRELATED turn the user starts). Any
-                    // answer stays in the bounded (FIFO-evicted) stash; skip cleanly.
-                    traceDiagnostic({
-                      scope: 'agent',
-                      event: 'question.answer-dropped-on-terminal-abort',
-                      level: 'warn',
-                      conversationId,
-                      toolName: state.toolName,
-                      fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
-                    });
-                    state.cancel();
-                    return {
-                      skip: true as const,
-                      result: {
-                        isError: true,
-                        error: 'The turn was stopped before this question was answered.',
-                      },
-                    };
-                  }
-                  // Non-explicit abort (supersession / plan-restart): continuing
-                  // THIS tool is futile (its result is suppressed as a superseded-
-                  // run event) and would consume the answer inside a dead turn.
-                  // REGISTER A HANDOFF: the answer stays stashed under `streamId`,
-                  // and the NEXT streamHandler invocation for this conversation —
-                  // the actual successor, by construction — claims it and splices
-                  // it into itself (see registerRacedAnswerHandoff / the claim in
-                  // streamHandler). This binds delivery to the real successor
-                  // (correct turn, correct mode) rather than guessing at any later
-                  // Mastra turn. A Stop (cancel-generation advance) or expiry voids
-                  // the claim; a never-arriving successor lets it age out with the
-                  // answer left in the bounded stash.
-                  registerRacedAnswerHandoff(conversationId, { answerKey: streamId, cancelGenAtAbort });
+              // ── Abort path: register the successor handoff IMMEDIATELY ──────
+              // On a non-terminal abort, the answer is delivered by the NEXT
+              // stream (the successor) claiming a handoff — NOT inline here. The
+              // handoff must be registered BEFORE we yield anywhere: a fast
+              // successor could reach its sole claim site within the ~250ms the
+              // grace wait would otherwise block, and an unregistered handoff then
+              // orphans the answer. Registration does NOT need the answer present
+              // (it lives in the stash independently; the claim reads it at claim
+              // time via the handoff↔stash rendezvous), so register + return with
+              // no await. A TERMINAL abort (Stop / genuine plan dismiss) registers
+              // nothing — the answer just stays in the bounded stash.
+              if (outcome.skip && outcome.reason === 'abort') {
+                const cancelGenAtAbort = explicitCancelGeneration.get(conversationId) ?? 0;
+                if (terminalAbortTokens.has(streamToken)) {
                   traceDiagnostic({
                     scope: 'agent',
-                    event: 'question.answer-handoff-registered',
+                    event: 'question.answer-dropped-on-terminal-abort',
                     level: 'warn',
                     conversationId,
                     toolName: state.toolName,
@@ -4475,13 +4450,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   state.cancel();
                   return {
                     skip: true as const,
-                    result: {
-                      isError: true,
-                      error:
-                        'The turn ended before this question was answered; if the user has answered, their response will arrive as a new message.',
-                    },
+                    result: { isError: true, error: 'The turn was stopped before this question was answered.' },
                   };
                 }
+                // Non-terminal abort (supersession / plan-restart): the answer
+                // stays stashed under `streamId`; the actual successor claims it
+                // (see registerRacedAnswerHandoff + the claim in streamHandler).
+                registerRacedAnswerHandoff(conversationId, { answerKey: streamId, cancelGenAtAbort });
+                traceDiagnostic({
+                  scope: 'agent',
+                  event: 'question.answer-handoff-registered',
+                  level: 'warn',
+                  conversationId,
+                  toolName: state.toolName,
+                  fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
+                });
+                state.cancel();
+                return {
+                  skip: true as const,
+                  result: {
+                    isError: true,
+                    error:
+                      'The turn ended before this question was answered; if the user has answered, their response will arrive as a new message.',
+                  },
+                };
+              }
+              // ── Non-abort path (turn still live): recover an answer that raced
+              // the settle (grace-wait for a just-submitted answer), then either
+              // run the tool with it or skip on a genuine dismiss/reject.
+              if (!raced && outcome.skip) {
+                raced = await waitForRacedAnswer(streamId);
+              }
+              if (outcome.skip) {
                 if (raced) {
                   // Not an abort (turn still live) but resolved non-true with an
                   // answer present — honor it: re-key to the exec id and run the
