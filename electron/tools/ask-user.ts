@@ -122,6 +122,21 @@ export function rekeyRacedAnswer(
   pendingQuestionAnswers.delete(streamToolCallId);
 }
 
+/**
+ * Format a recovered ask_user answer (keyed by question text, as the renderer
+ * submits it) into a user-turn message for re-injection when the original turn
+ * aborted before it could consume the answer. Mirrors the alerts.ts
+ * `formatAnswer` style ("- question → choice") so the model reads it as the
+ * user answering the question it asked.
+ */
+export function formatRacedAnswerAsUserTurn(answers: Record<string, string>): string {
+  const entries = Object.entries(answers ?? {});
+  const lines = entries.length
+    ? entries.map(([question, choice]) => `- ${question} → ${choice}`)
+    : ['(no answer provided)'];
+  return `[Answering your question]\n${lines.join('\n')}`;
+}
+
 const questionOptionSchema = z.object({
   label: z.string().describe('Short display text for the option (1-5 words)'),
   description: z.string().optional().describe('Explanation of what this option means'),

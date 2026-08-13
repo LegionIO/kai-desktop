@@ -14,7 +14,7 @@ import { join } from 'path';
 // tool only needs the store write to happen, so stub the notify seam.
 vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
 
-import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer, rekeyRacedAnswer } from '../ask-user.js';
+import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer, rekeyRacedAnswer, formatRacedAnswerAsUserTurn } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
@@ -62,6 +62,22 @@ describe('rekeyRacedAnswer', () => {
     rekeyRacedAnswer('stream-id', 'exec-id', { Q: 'moved' });
     expect(pendingQuestionAnswers.has('stream-id')).toBe(false);
     expect(pendingQuestionAnswers.get('exec-id')).toEqual({ Q: 'moved' });
+  });
+});
+
+describe('formatRacedAnswerAsUserTurn', () => {
+  it('renders each question → choice as a user-turn message', () => {
+    const text = formatRacedAnswerAsUserTurn({
+      'Which environment?': 'prod',
+      'Confirm region?': 'us-east-1',
+    });
+    expect(text).toContain('[Answering your question]');
+    expect(text).toContain('- Which environment? → prod');
+    expect(text).toContain('- Confirm region? → us-east-1');
+  });
+
+  it('falls back to a placeholder when there are no answers', () => {
+    expect(formatRacedAnswerAsUserTurn({})).toContain('(no answer provided)');
   });
 });
 

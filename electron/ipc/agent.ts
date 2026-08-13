@@ -299,6 +299,7 @@ import {
   resolveAskUserGateOutcome,
   waitForRacedAnswer,
   rekeyRacedAnswer,
+  formatRacedAnswerAsUserTurn,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -4260,21 +4261,70 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (!raced && outcome.skip && outcome.reason === 'abort') {
                 raced = await waitForRacedAnswer(streamId);
               }
-              if (raced) {
-                rekeyRacedAnswer(streamId, state.toolCallId, raced);
-              }
               if (outcome.skip) {
-                // If the user DID answer in the race window, honor the answer even
-                // though the gate resolved non-true: run the tool with the stashed
-                // answer rather than skipping with a cancel result.
+                if (raced && outcome.reason === 'abort') {
+                  // The answer landed, but a genuine turn-abort (supersession /
+                  // cancel / plan-restart) already tore this turn down —
+                  // continuing the tool here is futile (its result is suppressed
+                  // as a superseded-run event) and would consume+delete the
+                  // answer inside a dead turn. Instead, DELIVER the answer to the
+                  // next turn: re-inject it as a fresh user message once this
+                  // turn's teardown has released the active-stream entry (deferred
+                  // so injectUserTurnAndRestart doesn't enqueue into the dying
+                  // turn's queue). Clear the stash so nothing lingers under the
+                  // dead id.
+                  pendingQuestionAnswers.delete(streamId);
+                  if (streamId !== state.toolCallId) pendingQuestionAnswers.delete(state.toolCallId);
+                  const answerText = formatRacedAnswerAsUserTurn(raced);
+                  traceDiagnostic({
+                    scope: 'agent',
+                    event: 'question.answer-reinjected-after-abort',
+                    level: 'warn',
+                    conversationId,
+                    toolName: state.toolName,
+                    fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
+                  });
+                  const reinject = injectUserTurnAndRestart;
+                  if (reinject) {
+                    setTimeout(() => {
+                      void reinject(conversationId, answerText).catch((err) => {
+                        traceDiagnostic({
+                          scope: 'agent',
+                          event: 'question.answer-reinject-failed',
+                          level: 'error',
+                          conversationId,
+                          toolName: 'ask_user',
+                          fields: { error: err instanceof Error ? err.message : String(err) },
+                        });
+                      });
+                    }, 150);
+                  }
+                  state.cancel();
+                  return {
+                    skip: true as const,
+                    result: {
+                      isError: true,
+                      error:
+                        'The turn ended before this question was answered; the user has since answered and their response will arrive as a new message.',
+                    },
+                  };
+                }
                 if (raced) {
+                  // Not an abort (turn still live) but resolved non-true with an
+                  // answer present — honor it: re-key to the exec id and run the
+                  // tool. (rekeyRacedAnswer is a no-op when the ids are equal.)
+                  rekeyRacedAnswer(streamId, state.toolCallId, raced);
                   traceDiagnostic({
                     scope: 'agent',
                     event: 'question.answer-recovered-post-settle',
                     level: 'warn',
                     conversationId,
                     toolName: state.toolName,
-                    fields: { toolCallId: state.toolCallId, streamId, settleReason: outcome.reason },
+                    // Use the metadata-safe key `reason` (not `settleReason`): the
+                    // trace sanitizer only passes a categorical value through for
+                    // keys matching /(^|_)(reason|cause)$/, and `abort` etc. are
+                    // in CATEGORICAL_REASONS. A camelCase key would be omitted.
+                    fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
                   });
                 } else {
                   // Genuine dismiss/reject/abort with no answer — skip execution so
@@ -4282,6 +4332,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   state.cancel();
                   return { skip: true as const, result: outcome.result };
                 }
+              } else if (raced) {
+                // Happy path (approved === true): the answer is already stashed
+                // under the key execute() reads. rekey is a no-op for equal ids.
+                rekeyRacedAnswer(streamId, state.toolCallId, raced);
               }
             }
           },
