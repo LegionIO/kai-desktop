@@ -853,19 +853,18 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
   const claimant = liveRacedAnswerClaimant.get(conversationId);
   if (claimant && claimant.token === token) {
     liveRacedAnswerClaimant.delete(conversationId);
-    // Answers left undelivered stay in the bounded stash; drop the state.
+  }
+  // Drop the pre-successor holding entry ONLY when it wasn't registered BY the
+  // run being torn down. A handoff whose sourceToken === token was created by
+  // THIS run for the NEXT successor — either the predecessor registering its own
+  // (must survive until the successor transfers it), OR a chained case where this
+  // run was itself a claimant AND its own ask_user was then superseded, freshly
+  // registering the next turn's handoff. Deleting it would lose that next answer.
+  // A handoff registered by a DIFFERENT (earlier) run — e.g. a successor that
+  // config/hook-failed before transferring — is stale and consumed here.
+  const handoff = racedAnswerHandoffs.get(conversationId);
+  if (handoff && handoff.sourceToken !== token) {
     racedAnswerHandoffs.delete(conversationId);
-  } else if (claimant === undefined) {
-    // No live claimant. A pre-successor handoff may exist. Its OWN predecessor
-    // (the aborting run that registered it) also calls this in its finally — it
-    // must NOT delete the handoff it just created before the successor transfers
-    // it (that reopened the loss race). Only a LATER run's teardown (token !=
-    // sourceToken) invalidates it — e.g. a successor that config/hook-failed
-    // before transferring, or a non-Mastra successor.
-    const handoff = racedAnswerHandoffs.get(conversationId);
-    if (handoff && handoff.sourceToken !== token) {
-      racedAnswerHandoffs.delete(conversationId);
-    }
   }
 }
 
