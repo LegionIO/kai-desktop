@@ -83,7 +83,10 @@ type AppAPI = {
       clientId: string,
       turnToken: string,
     ) => Promise<{ authorized: boolean }>;
-    finalizeGuiFallback: (conversationId: string, turnToken?: string) => Promise<{ confirmed: boolean; headId: string | null }>;
+    finalizeGuiFallback: (
+      conversationId: string,
+      turnToken?: string,
+    ) => Promise<{ confirmed: boolean; headId: string | null }>;
     injectMidTurn: (
       conversationId: string,
       userText: string,
@@ -152,13 +155,20 @@ type AppAPI = {
     compact: (conversationId: string) => Promise<{ ok: boolean; summarizedCount?: number; error?: string }>;
     setPendingDrafts: (
       conversationId: string,
-      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
+      delta: {
+        add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
+        removeIds?: string[];
+      },
     ) => Promise<{ ok: boolean }>;
     claimPendingDraft: (
       conversationId: string,
       id?: string,
       clientId?: string,
-    ) => Promise<{ ok: boolean; draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null; reserved?: boolean }>;
+    ) => Promise<{
+      ok: boolean;
+      draft: { id: string; text: string; attachments: unknown[]; stashedAt: number } | null;
+      reserved?: boolean;
+    }>;
     ackPendingDraft: (
       conversationId: string,
       id: string,
@@ -166,9 +176,7 @@ type AppAPI = {
       clientId?: string,
     ) => Promise<{ ok: boolean }>;
     compactingIds: () => Promise<string[]>;
-    onCompactingChanged: (
-      callback: (payload: { conversationId: string; compacting: boolean }) => void,
-    ) => () => void;
+    onCompactingChanged: (callback: (payload: { conversationId: string; compacting: boolean }) => void) => () => void;
   };
   alerts: {
     list: (openOnly?: boolean) => Promise<AlertIndexEntry[]>;
@@ -302,6 +310,24 @@ type AppAPI = {
         marketplaceUrl: string;
       }>
     >;
+    marketplaceStatus: () => Promise<{ configured: boolean; ready: boolean; reachable: boolean; catalogSize: number }>;
+    marketplaceSnapshot?: () => Promise<{
+      catalog: Array<{
+        name: string;
+        displayName: string;
+        description: string;
+        repo: string;
+        ref: string;
+        version: string;
+        author?: string;
+        tags?: string[];
+        icon?: string;
+        installed: boolean;
+        installedVersion?: string;
+        marketplaceUrl: string;
+      }>;
+      status: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number };
+    }>;
     marketplaceInstall: (
       pluginName: string,
     ) => Promise<{ success: boolean; needsConfirmation?: boolean; pluginName?: string; reason?: string }>;
@@ -334,6 +360,9 @@ type AppAPI = {
     getPendingRestart: () => Promise<string[]>;
     restartApp: () => Promise<{ success: boolean }>;
     onPendingRestartChanged: (callback: (data: { plugins: string[] }) => void) => () => void;
+    onMarketplaceReady?: (
+      callback: (data: { configured: boolean; ready: boolean; reachable: boolean; catalogSize: number }) => void,
+    ) => () => void;
     getFailedUpdates: () => Promise<
       Array<{ name: string; attemptedVersion: string; runningVersion: string; error: string }>
     >;

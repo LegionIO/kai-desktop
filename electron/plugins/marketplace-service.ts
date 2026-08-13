@@ -161,6 +161,22 @@ const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 export class MarketplaceService {
   private cachedCatalog: MarketplaceCatalogEntry[] | null = null;
   private cacheDir: string;
+  /**
+   * Whether the most recent {@link fetchCatalog} reached at least one configured
+   * marketplace URL. A catalog can be legitimately empty (`{ "plugins": [] }`)
+   * on a reachable endpoint, so callers must NOT infer connectivity from catalog
+   * size — they read this flag instead. `null` until the first fetch runs.
+   */
+  private lastFetchReachedAnyUrl: boolean | null = null;
+  /**
+   * Last-known catalog entries PER source URL, captured before the first-URL-wins
+   * merge. This is what a failed source recovers from on a partial outage — the
+   * MERGED cache can't serve that role because a name collision discards the
+   * lower-priority source's entry, so if the winning source later drops that
+   * plugin while the other source is down, it would be lost. Keyed by URL;
+   * persisted to a sidecar file so it survives restart. `null` until first load.
+   */
+  private perUrlSnapshots: Record<string, MarketplaceCatalogEntry[]> | null = null;
 
   constructor(
     private pluginsDir: string,
@@ -175,33 +191,116 @@ export class MarketplaceService {
   /* ── Catalog fetch & merge ── */
 
   async fetchCatalog(urls: string[]): Promise<MarketplaceCatalogEntry[]> {
-    const allPlugins = new Map<string, MarketplaceCatalogEntry>();
     const installedPlugins = this.getConfig().marketplace?.installedPlugins ?? {};
+    // Per-URL snapshots captured up-front (loading the sidecar if memory is cold)
+    // so a URL that fails this round can recover ITS OWN last-known entries —
+    // unaffected by cross-source name-collision merging.
+    const priorSnapshots = this.getPerUrlSnapshots();
+    // This round's freshly-fetched entries per URL + which URLs were reached.
+    const freshByUrl = new Map<string, MarketplaceCatalogEntry[]>();
+    const succeededUrls = new Set<string>();
 
     for (const url of urls) {
       try {
         const catalog = await this.fetchSingleCatalog(url, true);
+        // Stage this URL's entries FIRST. A malformed entry (e.g. a null in
+        // catalog.plugins) throws while iterating; only after the whole entry
+        // loop succeeds do we mark the URL succeeded and record its snapshot.
+        const staged: MarketplaceCatalogEntry[] = [];
         for (const plugin of catalog.plugins) {
-          // First URL wins on name collisions (enterprise URLs should be listed first)
-          if (!allPlugins.has(plugin.name)) {
-            const installedInfo = installedPlugins[plugin.name];
-            allPlugins.set(plugin.name, {
-              ...plugin,
-              installed: this.isPluginInstalled(plugin.name),
-              installedVersion: installedInfo?.version,
-              marketplaceUrl: url,
-            });
-          }
+          const installedInfo = installedPlugins[plugin.name];
+          staged.push({
+            ...plugin,
+            installed: this.isPluginInstalled(plugin.name),
+            installedVersion: installedInfo?.version,
+            marketplaceUrl: url,
+          });
         }
+        succeededUrls.add(url);
+        freshByUrl.set(url, staged);
       } catch (err) {
         console.warn(`[Marketplace] Failed to fetch catalog from ${url}:`, err);
       }
     }
 
-    const entries = [...allPlugins.values()];
+    // Reachable iff at least one configured URL responded with a valid catalog.
+    // With no URLs there was nothing to reach (leave false; the "configured"
+    // check on PluginManager gates the renderer's unconfigured state).
+    this.lastFetchReachedAnyUrl = urls.length > 0 ? succeededUrls.size > 0 : false;
+
+    // Compute the NEXT per-URL snapshot set: fresh entries for URLs reached this
+    // round, prior snapshot for URLs that failed but are still configured. URLs
+    // no longer configured are dropped (removed source). This is the source of
+    // truth for a future partial-outage recovery.
+    const nextSnapshots: Record<string, MarketplaceCatalogEntry[]> = {};
+    for (const url of urls) {
+      if (succeededUrls.has(url)) {
+        nextSnapshots[url] = freshByUrl.get(url) ?? [];
+      } else if (priorSnapshots[url]) {
+        // Refresh installed-status against current on-disk state, keep the rest.
+        nextSnapshots[url] = priorSnapshots[url].map((cached) => ({
+          ...cached,
+          installed: this.isPluginInstalled(cached.name),
+          installedVersion: installedPlugins[cached.name]?.version ?? cached.installedVersion,
+        }));
+      }
+    }
+
+    // Merge in configured-URL order (first URL wins on name collisions —
+    // enterprise URLs are listed first) to produce the flattened catalog.
+    const merged = new Map<string, MarketplaceCatalogEntry>();
+    for (const url of urls) {
+      for (const entry of nextSnapshots[url] ?? []) {
+        if (!merged.has(entry.name)) merged.set(entry.name, entry);
+      }
+    }
+
+    const entries = [...merged.values()];
+    this.perUrlSnapshots = nextSnapshots;
     this.cachedCatalog = entries;
-    this.writeCatalogCache(entries);
+    this.writeCatalogCache(entries, nextSnapshots);
     return entries;
+  }
+
+  /**
+   * Per-URL catalog snapshots (memory, loading the sidecar cache on a cold read).
+   * Empty object when nothing has been cached yet.
+   */
+  private getPerUrlSnapshots(): Record<string, MarketplaceCatalogEntry[]> {
+    if (this.perUrlSnapshots) return this.perUrlSnapshots;
+    try {
+      const p = join(this.cacheDir, 'marketplace-sources.json');
+      if (existsSync(p)) {
+        const raw = JSON.parse(readFileSync(p, 'utf-8')) as Record<string, MarketplaceCatalogEntry[]>;
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          this.perUrlSnapshots = raw;
+          return raw;
+        }
+      }
+    } catch {
+      /* ignore cache read errors */
+    }
+    // Upgrade path: an install predating the sidecar has only the flat
+    // marketplace.json. Seed per-URL snapshots by grouping those entries on
+    // their marketplaceUrl so a FIRST post-upgrade fetch that happens offline
+    // can still recover per source (rather than losing the whole cache).
+    const flat = this.getCachedCatalog() ?? [];
+    const seeded: Record<string, MarketplaceCatalogEntry[]> = {};
+    for (const entry of flat) {
+      if (!entry.marketplaceUrl) continue;
+      (seeded[entry.marketplaceUrl] ??= []).push(entry);
+    }
+    this.perUrlSnapshots = seeded;
+    return seeded;
+  }
+
+  /**
+   * Whether the last {@link fetchCatalog} reached at least one configured
+   * marketplace URL. `null` before the first fetch. Distinguishes a valid
+   * empty catalog (`true`, zero plugins) from an unreachable endpoint (`false`).
+   */
+  wasLastFetchReachable(): boolean | null {
+    return this.lastFetchReachedAnyUrl;
   }
 
   private async fetchSingleCatalog(url: string, bustCache = false): Promise<MarketplaceCatalog> {
@@ -711,10 +810,19 @@ export class MarketplaceService {
     return null;
   }
 
-  private writeCatalogCache(entries: MarketplaceCatalogEntry[]): void {
+  private writeCatalogCache(
+    entries: MarketplaceCatalogEntry[],
+    perUrlSnapshots?: Record<string, MarketplaceCatalogEntry[]>,
+  ): void {
     try {
       mkdirSync(this.cacheDir, { recursive: true });
       writeFileSync(join(this.cacheDir, 'marketplace.json'), JSON.stringify(entries, null, 2));
+      // Persist the per-URL snapshots sidecar so a partial-outage recovery
+      // survives restart (see perUrlSnapshots). Only written when provided —
+      // install/uninstall/rollback update only the flattened cache.
+      if (perUrlSnapshots) {
+        writeFileSync(join(this.cacheDir, 'marketplace-sources.json'), JSON.stringify(perUrlSnapshots, null, 2));
+      }
     } catch (err) {
       console.warn('[Marketplace] Failed to write catalog cache:', err);
     }

@@ -64,6 +64,19 @@ export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginMa
     return pluginManager.getMarketplaceCatalog();
   });
 
+  // Distinguishes "no marketplace configured" from "configured but the startup
+  // catalog fetch hasn't settled yet" so the renderer doesn't falsely report
+  // the former during the async init window.
+  ipcMain.handle('plugin:marketplace-status', () => {
+    return pluginManager.getMarketplaceStatus();
+  });
+
+  // Atomic catalog + status read — avoids the renderer pairing an old catalog
+  // with newer status (or vice-versa) across two separate round-trips.
+  ipcMain.handle('plugin:marketplace-snapshot', () => {
+    return pluginManager.getMarketplaceSnapshot();
+  });
+
   ipcMain.handle('plugin:marketplace-install', async (_event, pluginName: string) => {
     try {
       await pluginManager.installFromMarketplace(pluginName);

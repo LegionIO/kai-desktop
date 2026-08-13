@@ -2452,14 +2452,15 @@ if (gotSingleInstanceLock) {
     // fire the event before any handler registered here can observe it.
     const pluginsReady = (async () => {
       try {
-        // Initialize marketplace and auto-install required plugins before loading
+        // Initialize marketplace and auto-install required plugins before loading.
+        // Always call initMarketplace (even with no URLs) so it can flip the
+        // "marketplace ready" flag and broadcast — the renderer waits on that to
+        // avoid a false "No marketplace configured" during the async fetch.
         const marketplaceUrls = getBrandMarketplaceUrls();
-        if (marketplaceUrls.length > 0) {
-          try {
-            await pluginManager.initMarketplace(marketplaceUrls);
-          } catch (err) {
-            console.warn(`[${__BRAND_PRODUCT_NAME}] Marketplace init failed (non-fatal):`, err);
-          }
+        try {
+          await pluginManager.initMarketplace(marketplaceUrls);
+        } catch (err) {
+          console.warn(`[${__BRAND_PRODUCT_NAME}] Marketplace init failed (non-fatal):`, err);
         }
 
         await pluginManager.loadAll();

@@ -485,6 +485,8 @@ export function getBridgeScript(): string {
       bannerAction: function(pn, bid, act, data) { return invoke('plugin:banner-action', pn, bid, act, data); },
       action: function(pn, tid, act, data) { return invoke('plugin:action', pn, tid, act, data); },
       marketplaceCatalog: function() { return invoke('plugin:marketplace-catalog'); },
+      marketplaceStatus: function() { return invoke('plugin:marketplace-status'); },
+      marketplaceSnapshot: function() { return invoke('plugin:marketplace-snapshot'); },
       marketplaceInstall: function(pn) { return invoke('plugin:marketplace-install', pn); },
       marketplaceInstallUnverified: function(pn) { return invoke('plugin:marketplace-install-unverified', pn); },
       marketplaceUninstall: function(pn) { return invoke('plugin:marketplace-uninstall', pn); },
@@ -508,6 +510,7 @@ export function getBridgeScript(): string {
       onModalCallback: function(cb) { return on('plugin:modal-callback', cb); },
       onUpdatesAvailable: function(cb) { return on('plugin:updates-available', cb); },
       onPendingRestartChanged: function(cb) { return on('plugin:pending-restart-changed', cb); },
+      onMarketplaceReady: function(cb) { return on('plugin:marketplace-ready', cb); },
       onFailedUpdatesChanged: function(cb) { return on('plugin:failed-updates-changed', cb); },
       onConsentRequired: function(cb) { return on('plugin:consent-required', cb); }
     },
