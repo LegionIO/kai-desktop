@@ -690,6 +690,8 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
  * `answerKey` throughout; delivery reads + removes it only at the delivery moment.
  */
 const RACED_ANSWER_HANDOFF_TTL_MS = 30_000;
+const MAX_RACED_ANSWER_DELIVERY_RETRIES = 20;
+const RACED_ANSWER_RETRY_MS = 500;
 type RacedAnswerState = {
   /** Pending answer stash keys — a SET so parallel ask_user calls in one turn,
    *  which each register on the shared controller abort, don't overwrite. */
@@ -701,6 +703,9 @@ type RacedAnswerState = {
    *  (that would delete it before the successor transfers it); only a LATER
    *  run's teardown may invalidate a pre-successor handoff. */
   sourceToken: string;
+  /** Bounded count of delivery retries after a failed cooperative splice, so a
+   *  persistently-failing inject can't reschedule forever. */
+  deliveryRetries: number;
   expiresAt: number;
 };
 // PRE-successor holding map: keys registered by an aborting gate before the
@@ -733,6 +738,7 @@ function registerRacedAnswerHandoff(
     answerKeys: new Set([answerKey]),
     cancelGenAtAbort,
     sourceToken,
+    deliveryRetries: 0,
     expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
   });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
@@ -777,13 +783,24 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     pendingQuestionAnswers.delete(answerKey);
     state.answerKeys.delete(answerKey);
     const text = formatRacedAnswerAsUserTurn(answer);
+    const onFailure = (): void => {
+      stashQuestionAnswers(answerKey, answer);
+      // Only re-register + retry if THIS claimant still owns the conversation
+      // (else a teardown/replacement has taken over and will handle its own).
+      if (liveRacedAnswerClaimant.get(conversationId) !== claimant) return;
+      state.answerKeys.add(answerKey);
+      // Schedule a bounded retry — successor registration + answer arrival have
+      // already happened, so nothing else would re-trigger delivery; without this
+      // the restored answer sits dormant until claimant teardown (lost).
+      if (state.deliveryRetries < MAX_RACED_ANSWER_DELIVERY_RETRIES) {
+        state.deliveryRetries += 1;
+        setTimeout(() => attemptRacedAnswerDelivery(conversationId), RACED_ANSWER_RETRY_MS);
+      }
+    };
     void claimant
       .deliver(text)
       .then((ok) => {
-        if (!ok) {
-          stashQuestionAnswers(answerKey, answer);
-          if (liveRacedAnswerClaimant.get(conversationId) === claimant) state.answerKeys.add(answerKey);
-        }
+        if (!ok) onFailure();
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-claimed',
@@ -793,10 +810,7 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
           fields: { status: ok ? 'delivered' : 'failed' },
         });
       })
-      .catch(() => {
-        stashQuestionAnswers(answerKey, answer);
-        if (liveRacedAnswerClaimant.get(conversationId) === claimant) state.answerKeys.add(answerKey);
-      });
+      .catch(() => onFailure());
   }
 }
 
@@ -810,6 +824,23 @@ function conversationForRacedAnswerKey(answerKey: string): string | undefined {
     if (h.answerKeys.has(answerKey)) return conversationId;
   }
   return undefined;
+}
+
+/** Purge a specific answerKey from any pending handoff / live claimant (used when
+ *  the user explicitly rejects/dismisses the question AFTER its turn aborted +
+ *  registered a handoff — a delayed answer from another surface must then NOT be
+ *  delivered). Drops the whole entry when it holds no other keys. */
+function purgeRacedAnswerForKey(answerKey: string): void {
+  for (const [conversationId, c] of liveRacedAnswerClaimant) {
+    if (c.state.answerKeys.delete(answerKey) && c.state.answerKeys.size === 0) {
+      liveRacedAnswerClaimant.delete(conversationId);
+    }
+  }
+  for (const [conversationId, h] of racedAnswerHandoffs) {
+    if (h.answerKeys.delete(answerKey) && h.answerKeys.size === 0) {
+      racedAnswerHandoffs.delete(conversationId);
+    }
+  }
 }
 
 /** Tear down a successor's raced-answer state for this token: clear its claimant
@@ -6267,6 +6298,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve(false);
       pendingToolApprovals.delete(toolCallId);
     }
+    // If the turn already aborted + registered a raced-answer handoff for this
+    // question, an explicit reject must purge it so a delayed answer from another
+    // surface can't still be delivered to the successor.
+    purgeRacedAnswerForKey(toolCallId);
     closeApprovalWindow(toolCallId);
     return { ok: true };
   });
@@ -6277,6 +6312,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       pending.resolve('dismiss');
       pendingToolApprovals.delete(toolCallId);
     }
+    purgeRacedAnswerForKey(toolCallId);
     closeApprovalWindow(toolCallId);
     return { ok: true };
   });
