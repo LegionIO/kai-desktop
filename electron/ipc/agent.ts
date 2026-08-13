@@ -644,6 +644,79 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 }
 
 /**
+ * Deliver an ask_user answer that raced a NON-explicit turn abort (supersession
+ * or plan-mode restart) to the turn that takes over — WITHOUT racing the
+ * lifecycle machinery with a fixed timer.
+ *
+ * Strategy (polled, bounded):
+ *  - If the user pressed Stop (on this turn OR a successor) at any point, the
+ *    explicit-cancel generation advances past the value captured AT ABORT time →
+ *    abort delivery. Never restart after Stop.
+ *  - Prefer COOPERATIVE delivery: once a replacement turn's active stream exists,
+ *    hand the answer to injectUserTurnAndRestart. On the Mastra path it splices
+ *    into the RUNNING replacement (inheriting the replacement's correct execution
+ *    mode — critical for a plan-first continuation started by enter/exit_plan_mode
+ *    restart), so we never start our own `auto` turn that would make the mandatory
+ *    plan-first restart stale.
+ *  - Only if NO replacement turn appears within the deadline (a plain
+ *    supersession that never relaunched, or an idle conversation) do we start a
+ *    fresh turn ourselves, carrying the aborted turn's mode as the best available
+ *    fallback.
+ */
+function deliverRacedAnswerToReplacement(opts: {
+  conversationId: string;
+  answerText: string;
+  cancelGenAtAbort: number;
+  abortedToken: string;
+  fallbackExecutionMode: ExecutionMode;
+  onOutcome?: (outcome: 'stopped' | 'cooperative' | 'fresh-turn' | 'failed') => void;
+}): void {
+  const { conversationId, answerText, cancelGenAtAbort, abortedToken, fallbackExecutionMode, onOutcome } = opts;
+  const STEP_MS = 100;
+  const MAX_ATTEMPTS = 50; // ~5s — ample for the renderer's async plan-first restart authorization
+  const stoppedSinceAbort = (): boolean =>
+    (explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtAbort;
+  const deliver = (executionMode: ExecutionMode | undefined): void => {
+    const reinject = injectUserTurnAndRestart;
+    if (!reinject) {
+      onOutcome?.('failed');
+      return;
+    }
+    void reinject(conversationId, answerText, executionMode ? { executionMode } : undefined).catch(() => {
+      onOutcome?.('failed');
+    });
+  };
+  const tick = (remaining: number): void => {
+    if (stoppedSinceAbort()) {
+      onOutcome?.('stopped');
+      return;
+    }
+    // A REPLACEMENT turn is live (a different token than the aborted turn — the
+    // aborted turn's own entry may briefly linger until its teardown runs; don't
+    // mistake it for a replacement) — deliver into it. On the Mastra path this
+    // splices cooperatively into the running replacement, inheriting ITS correct
+    // execution mode (so a plan-first continuation stays plan-first). Don't pass
+    // executionMode: let the running replacement's own mode govern.
+    const activeToken = activeStreams.get(conversationId)?.token;
+    if (activeToken !== undefined && activeToken !== abortedToken) {
+      deliver(undefined);
+      onOutcome?.('cooperative');
+      return;
+    }
+    if (remaining <= 0) {
+      // No replacement turn appeared — start a fresh turn with the aborted turn's
+      // mode as the best available signal (correct for a plain supersession).
+      deliver(fallbackExecutionMode);
+      onOutcome?.('fresh-turn');
+      return;
+    }
+    setTimeout(() => tick(remaining - 1), STEP_MS);
+  };
+  setTimeout(() => tick(MAX_ATTEMPTS), STEP_MS);
+}
+
+
+/**
  * Inject a user turn into a conversation and (re)start the stream — the shared
  * mechanism behind the GUI/CLI "mid-turn follow-up" behavior. When the target
  * is busy, streamHandler aborts the in-flight run and restarts with the new
@@ -4293,6 +4366,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // copy-then-delete that would drop the entry). See rekeyRacedAnswer.
               let raced = pendingQuestionAnswers.get(streamId);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
+              // Snapshot the explicit-cancel generation AT ABORT TIME (before the
+              // grace wait) — a Stop on this turn OR a successor while we're inside
+              // waitForRacedAnswer must be observed as an advance later. Capturing
+              // after the wait would miss a Stop that landed during it.
+              const cancelGenAtAbort =
+                outcome.skip && outcome.reason === 'abort' ? (explicitCancelGeneration.get(conversationId) ?? 0) : 0;
               // Abort-first race: controller.abort() settles the approval
               // SYNCHRONOUSLY, so this continuation can resume before the user's
               // already-sent answer IPC is processed. On the abort path with no
@@ -4346,40 +4425,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     toolName: state.toolName,
                     fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
                   });
-                  const reinject = injectUserTurnAndRestart;
-                  if (reinject) {
-                    // Capture the explicit-cancel generation now; re-check it at
-                    // fire time so a Stop on THIS turn or any SUCCESSOR during the
-                    // delay cancels the pending re-injection (never restart after
-                    // Stop). Carry the turn's execution mode so a plan-first turn's
-                    // recovered answer does NOT resume in `auto` with mutating
-                    // tools enabled.
-                    const cancelGenAtSchedule = explicitCancelGeneration.get(conversationId) ?? 0;
-                    const reinjectMode = effectiveExecutionMode;
-                    setTimeout(() => {
-                      if ((explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtSchedule) {
-                        traceDiagnostic({
-                          scope: 'agent',
-                          event: 'question.answer-reinject-cancelled-by-stop',
-                          level: 'warn',
-                          conversationId,
-                          toolName: 'ask_user',
-                          fields: { toolCallId: state.toolCallId, streamId },
-                        });
-                        return;
-                      }
-                      void reinject(conversationId, answerText, { executionMode: reinjectMode }).catch((err) => {
-                        traceDiagnostic({
-                          scope: 'agent',
-                          event: 'question.answer-reinject-failed',
-                          level: 'error',
-                          conversationId,
-                          toolName: 'ask_user',
-                          fields: { error: err instanceof Error ? err.message : String(err) },
-                        });
+                  // Coordinate with the replacement turn instead of racing it with
+                  // a fixed timer: wait for the successor stream to appear and
+                  // deliver cooperatively (inheriting ITS mode — keeps a plan-first
+                  // restart plan-first), abort if the user Stopped in the meantime,
+                  // or start a fresh turn (with the aborted turn's mode) only if no
+                  // successor materializes.
+                  deliverRacedAnswerToReplacement({
+                    conversationId,
+                    answerText,
+                    cancelGenAtAbort,
+                    abortedToken: streamToken,
+                    fallbackExecutionMode: effectiveExecutionMode,
+                    onOutcome: (deliveryOutcome) => {
+                      traceDiagnostic({
+                        scope: 'agent',
+                        event: 'question.answer-reinject-outcome',
+                        level: deliveryOutcome === 'failed' ? 'error' : 'warn',
+                        conversationId,
+                        toolName: 'ask_user',
+                        fields: { toolCallId: state.toolCallId, streamId, status: deliveryOutcome },
                       });
-                    }, 150);
-                  }
+                    },
+                  });
                   state.cancel();
                   return {
                     skip: true as const,
