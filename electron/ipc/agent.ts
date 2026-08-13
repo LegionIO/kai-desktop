@@ -367,14 +367,17 @@ let submitIdSeq = 0;
 const currentPendingSubmit = new Map<string, number>();
 const cancelledSubmits = new Set<number>();
 
-// Stream tokens that were aborted by an EXPLICIT user Stop (agent:cancel-stream),
-// as opposed to a supersession (new submit) or a plan-mode restart. The ask_user
-// gate consults this: on an explicit Stop it must NOT re-inject a raced answer as
-// a new turn (that would restart the agent the user just stopped). Bounded so a
-// long-lived process can't accumulate tokens; entries are only read within the
-// aborted run's own teardown, so a small cap is safe.
-const explicitlyCancelledTokens = new Set<string>();
-const MAX_EXPLICITLY_CANCELLED_TOKENS = 100;
+// Stream tokens whose abort is TERMINAL — no successor turn is coming. Covers an
+// explicit user Stop (agent:cancel-stream) AND an exit_plan_mode dismissal
+// (planDismissed: plan mode is exited and the turn stops). The ask_user gate
+// consults this: on a terminal abort it must NOT hand a raced answer to the
+// replacement coordinator (there is no replacement — a later UNRELATED turn the
+// user starts must not receive the stale answer). A supersession or a plan-mode
+// RESTART is NOT terminal (a successor is coming), so its token is not marked.
+// Bounded so a long-lived process can't accumulate tokens; entries are only read
+// within the aborted run's own teardown, so a small cap is safe.
+const terminalAbortTokens = new Set<string>();
+const MAX_TERMINAL_ABORT_TOKENS = 100;
 // Monotonic per-conversation counter, incremented on every explicit Stop. A
 // deferred raced-answer re-injection captures this at schedule time and re-checks
 // it at fire time: if it advanced, the user pressed Stop (on this turn OR a
@@ -389,12 +392,12 @@ function bumpExplicitCancelGeneration(conversationId: string): void {
     explicitCancelGeneration.delete(oldest);
   }
 }
-function markTokenExplicitlyCancelled(token: string): void {
-  explicitlyCancelledTokens.add(token);
-  while (explicitlyCancelledTokens.size > MAX_EXPLICITLY_CANCELLED_TOKENS) {
-    const oldest = explicitlyCancelledTokens.values().next().value;
+function markTokenTerminalAbort(token: string): void {
+  terminalAbortTokens.add(token);
+  while (terminalAbortTokens.size > MAX_TERMINAL_ABORT_TOKENS) {
+    const oldest = terminalAbortTokens.values().next().value;
     if (oldest === undefined) break;
-    explicitlyCancelledTokens.delete(oldest);
+    terminalAbortTokens.delete(oldest);
   }
 }
 
@@ -4358,6 +4361,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   broadcastExecutionMode('auto');
                   planDoneSent = true;
                   emit({ conversationId, type: 'done', data: { planDismissed: true } });
+                  // Terminal abort — no successor turn. Mark BEFORE aborting so a
+                  // parallel ask_user gate (same streamToken) doesn't hand a raced
+                  // answer to the replacement coordinator and inject it into a later
+                  // unrelated turn.
+                  markTokenTerminalAbort(streamToken);
                   controller.abort();
                   return;
                 }
@@ -4418,15 +4426,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
               if (outcome.skip) {
                 if (outcome.reason === 'abort') {
-                  const explicitlyCancelled = explicitlyCancelledTokens.has(streamToken);
-                  if (explicitlyCancelled) {
-                    // The user pressed Stop (not a supersession / plan-restart).
-                    // Respect it: do NOT re-inject the answer as a new turn (that
-                    // would restart the agent the user just stopped). Any answer
-                    // stays in the bounded (FIFO-evicted) stash; skip cleanly.
+                  const terminalAbort = terminalAbortTokens.has(streamToken);
+                  if (terminalAbort) {
+                    // TERMINAL abort (explicit Stop, or exit_plan_mode dismiss) —
+                    // no successor turn is coming. Do NOT hand the answer to the
+                    // replacement coordinator (it would otherwise inject the stale
+                    // answer into a later UNRELATED turn the user starts). Any
+                    // answer stays in the bounded (FIFO-evicted) stash; skip cleanly.
                     traceDiagnostic({
                       scope: 'agent',
-                      event: 'question.answer-dropped-on-explicit-stop',
+                      event: 'question.answer-dropped-on-terminal-abort',
                       level: 'warn',
                       conversationId,
                       toolName: state.toolName,
@@ -6003,11 +6012,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
     const controller = activeStreams.get(conversationId);
     if (controller) {
-      // Mark this run's token as explicitly cancelled BEFORE aborting, so the
+      // Mark this run's token as a TERMINAL abort BEFORE aborting, so the
       // ask_user gate (which resumes synchronously off the abort) sees it and
-      // does NOT re-inject a raced answer as a new turn — an explicit Stop must
-      // not restart the agent.
-      markTokenExplicitlyCancelled(controller.token);
+      // does NOT hand a raced answer to the replacement coordinator — an explicit
+      // Stop has no successor and must not restart the agent.
+      markTokenTerminalAbort(controller.token);
       controller.abort();
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).
