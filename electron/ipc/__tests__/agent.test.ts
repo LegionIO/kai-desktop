@@ -265,22 +265,25 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
   });
 
-  it('does NOT stash answers on agent:answer-tool-question when the toolCallId has no pending approval', async () => {
+  it('STASHES answers on agent:answer-tool-question even when the toolCallId has no live pending approval (raced abort)', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
         registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
       },
     });
 
-    // No pendingToolApprovals entry for this id (already dismissed/aborted).
-    const result = await harness.invoke<{ ok: boolean }>('agent:answer-tool-question', FAKE_EVENT, 'tc-stale', {
-      q1: 'ignored',
+    // No pendingToolApprovals entry: the turn's controller already aborted
+    // (superseded / plan-restart) and settled+removed the approval a beat before
+    // the user's fully-submitted answer landed. The OLD behavior dropped the
+    // answer here, and the tool then emitted "No user response received" even
+    // though the user answered. The answer must now be preserved so the gate /
+    // re-invoked execute can recover it (bounded FIFO prevents a leak).
+    const result = await harness.invoke<{ ok: boolean }>('agent:answer-tool-question', FAKE_EVENT, 'tc-raced', {
+      q1: 'The answer I submitted',
     });
 
     expect(result).toEqual({ ok: true });
-    // Guard: a stale id must not leave an orphaned answers entry the terminated
-    // tool will never read.
-    expect(pendingQuestionAnswers.has('tc-stale')).toBe(false);
+    expect(pendingQuestionAnswers.get('tc-raced')).toEqual({ q1: 'The answer I submitted' });
   });
 
   it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {

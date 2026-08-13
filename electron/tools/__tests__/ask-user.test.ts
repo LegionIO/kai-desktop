@@ -14,7 +14,7 @@ import { join } from 'path';
 // tool only needs the store write to happen, so stub the notify seam.
 vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
 
-import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool } from '../ask-user.js';
+import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
@@ -61,7 +61,48 @@ describe('createAskUserTool execute', () => {
   it('returns an error when no answers were stashed for the toolCallId', async () => {
     const tool = createAskUserTool();
     const result = await tool.execute!({ questions: [] }, ctx('tc-missing'));
-    expect(result).toEqual({ error: 'No user response received' });
+    expect(result).toEqual({ error: ASK_USER_NO_ANSWER_ERROR });
+  });
+});
+
+describe('resolveAskUserGateOutcome', () => {
+  it('runs the tool (no skip) when the user approved', () => {
+    expect(resolveAskUserGateOutcome(true, false)).toEqual({ skip: false });
+    // Even if the controller aborted, an explicit approve still runs.
+    expect(resolveAskUserGateOutcome(true, true)).toEqual({ skip: false });
+  });
+
+  it('skips with a "dismissed" result on a genuine reject (false)', () => {
+    const out = resolveAskUserGateOutcome(false, false);
+    expect(out.skip).toBe(true);
+    if (out.skip) {
+      expect(out.reason).toBe('reject');
+      expect(out.result.isError).toBe(true);
+      expect(out.result.error).toMatch(/dismissed/i);
+    }
+  });
+
+  it('skips with a "dismissed" result when the user closed the card (dismiss, not aborted)', () => {
+    const out = resolveAskUserGateOutcome('dismiss', false);
+    expect(out.skip).toBe(true);
+    if (out.skip) {
+      expect(out.reason).toBe('dismiss');
+      expect(out.result.error).toMatch(/dismissed/i);
+    }
+  });
+
+  it('skips with a NEUTRAL "cancelled" result when dismiss is due to an abort (turn ended)', () => {
+    // The bug scenario: the user DID answer, but the turn controller aborted
+    // (superseded / plan-restart) and settled the approval as dismiss. The gate
+    // must NOT emit the scary "dismissed the question" error — it reports a
+    // neutral cancellation, and the raced answer (recovered separately) can run.
+    const out = resolveAskUserGateOutcome('dismiss', true);
+    expect(out.skip).toBe(true);
+    if (out.skip) {
+      expect(out.reason).toBe('abort');
+      expect(out.result.error).toMatch(/cancelled|turn ended/i);
+      expect(out.result.error).not.toMatch(/dismissed the question/i);
+    }
   });
 });
 
@@ -93,14 +134,14 @@ describe('createAskUserTool headless fallback', () => {
   it('still errors (no alert) when headless but there is no conversation to resume into', async () => {
     const tool = createAskUserTool(appHome);
     const result = await tool.execute!({ questions: [q] }, headlessCtx('tc-h2', undefined));
-    expect(result).toEqual({ error: 'No user response received' });
+    expect(result).toEqual({ error: ASK_USER_NO_ANSWER_ERROR });
     expect(listAlerts(appHome)).toHaveLength(0);
   });
 
   it('does NOT raise an alert in the interactive path (not headless)', async () => {
     const tool = createAskUserTool(appHome);
     const result = await tool.execute!({ questions: [q] }, ctx('tc-i'));
-    expect(result).toEqual({ error: 'No user response received' });
+    expect(result).toEqual({ error: ASK_USER_NO_ANSWER_ERROR });
     expect(listAlerts(appHome)).toHaveLength(0);
   });
 

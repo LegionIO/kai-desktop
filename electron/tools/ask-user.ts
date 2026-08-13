@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
 import { createAlert, listAlerts, type AlertQuestion } from '../ipc/alert-store.js';
 import { notifyAlertCreated } from '../ipc/alert-notify.js';
+import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 
 /**
  * Shared map where agent.ts stores user answers before the tool's execute runs.
@@ -25,6 +26,48 @@ export function stashQuestionAnswers(toolCallId: string, answers: Record<string,
     if (oldest === undefined) break;
     pendingQuestionAnswers.delete(oldest);
   }
+}
+
+/**
+ * The message the ask_user tool returns when its `execute` runs but no answers
+ * were recorded. Distinct from a genuine dismiss (handled upstream in the gate,
+ * which skips execution) — this only surfaces if execute runs with no stash,
+ * which normally means the turn was cancelled/superseded before the answer was
+ * consumed. Worded so the model doesn't mistake it for the user staying silent.
+ */
+export const ASK_USER_NO_ANSWER_ERROR =
+  'No response was recorded for this question — it may have been cancelled or interrupted before the answer was consumed.';
+
+/**
+ * Pure decision for how the ask_user approval gate should resolve, given the
+ * `registerPendingApproval` outcome and whether the turn controller was aborted.
+ * Factored out of agent.ts's large stream closure so it is unit-testable.
+ *
+ * - `approved === true` → run the tool (`skip: false`); answers are stashed.
+ * - `false` (genuine reject) or a non-aborted `'dismiss'` (user closed the card)
+ *   → skip with a clear "dismissed" result.
+ * - an ABORTED `'dismiss'` (turn cancelled/superseded/plan-restart while the
+ *   question was open) → skip with a neutral "cancelled" result and do NOT emit
+ *   the scary no-answer error. Any answer the user submitted in the race window
+ *   is preserved in the bounded stash for a restarted turn to consume.
+ */
+export function resolveAskUserGateOutcome(
+  approved: boolean | 'dismiss',
+  aborted: boolean,
+): { skip: false } | { skip: true; result: { isError: true; error: string }; reason: 'reject' | 'dismiss' | 'abort' } {
+  if (approved === true) return { skip: false };
+  if (aborted && approved === 'dismiss') {
+    return {
+      skip: true,
+      reason: 'abort',
+      result: { isError: true, error: 'The question was cancelled because the turn ended before it was answered.' },
+    };
+  }
+  return {
+    skip: true,
+    reason: approved === false ? 'reject' : 'dismiss',
+    result: { isError: true, error: 'The user dismissed the question without answering.' },
+  };
 }
 
 const questionOptionSchema = z.object({
@@ -106,7 +149,22 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
             note: 'No live user to answer right now — raised an Alert. End your turn; the user will answer and their response comes back to you as a new message.',
           };
         }
-        return { error: 'No user response received' };
+        // Interactive turn with no stashed answer: normally unreachable (the gate
+        // in agent.ts skips execution on dismiss), so if we get here the answer
+        // was lost to a race — trace it so the next occurrence is diagnosable.
+        traceDiagnostic({
+          scope: 'agent',
+          event: 'question.answers-missing-at-execute',
+          level: 'warn',
+          conversationId: context.conversationId,
+          toolName: 'ask_user',
+          fields: {
+            toolCallId: context.toolCallId,
+            isHeadless: Boolean(context.isHeadless),
+            hasConversationId: Boolean(context.conversationId),
+          },
+        });
+        return { error: ASK_USER_NO_ANSWER_ERROR };
       }
 
       return {

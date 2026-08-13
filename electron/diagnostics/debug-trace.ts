@@ -106,6 +106,14 @@ const CATEGORICAL_REASONS = new Set([
   'two-failed-health-probes',
   'window-destroyed-during-probe',
   'window-not-presented',
+  // ask_user / tool-approval settle reasons (see tool-approval.ts, agent.ts).
+  // Categorical so they survive metadata-only tracing (no content leak).
+  'answered',
+  'approve',
+  'reject',
+  'dismiss',
+  'abort',
+  'duplicate-evict',
 ]);
 const MAX_STRING = 4000;
 

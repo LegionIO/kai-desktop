@@ -293,7 +293,11 @@ import {
 } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
-import { pendingQuestionAnswers, stashQuestionAnswers } from '../tools/ask-user.js';
+import {
+  pendingQuestionAnswers,
+  stashQuestionAnswers,
+  resolveAskUserGateOutcome,
+} from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
 const activeStreamModelKeys = new Map<string, string>();
@@ -4189,7 +4193,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Abort-aware: a cancel-stream aborts controller.signal, which
               // resolves this with 'dismiss' and deletes the pending entry, so a
               // later GUI approval can't resume a cancelled run (and no leak).
-              const approved = await registerPendingApproval(streamId, controller.signal);
+              const approved = await registerPendingApproval(streamId, controller.signal, {
+                conversationId,
+                toolName: state.toolName,
+                execToolCallId: state.toolCallId,
+              });
               if (approved !== true) {
                 state.cancel();
                 if (approved === 'dismiss') {
@@ -4228,15 +4236,44 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               observer?.onToolAwaitingApproval(state.toolCallId);
               // Abort-aware (see exit_plan_mode above): cancel resolves this as
               // 'dismiss' and cleans up, instead of leaking a pending approval.
-              const approved = await registerPendingApproval(streamId, controller.signal);
-              if (approved !== true) {
-                state.cancel();
-              } else {
-                // Copy answers from stream-side ID to execute-side ID so the tool's execute() can find them
-                const answers = pendingQuestionAnswers.get(streamId);
-                if (answers) {
-                  stashQuestionAnswers(state.toolCallId, answers);
-                  pendingQuestionAnswers.delete(streamId);
+              const approved = await registerPendingApproval(streamId, controller.signal, {
+                conversationId,
+                toolName: state.toolName,
+                execToolCallId: state.toolCallId,
+              });
+              // Copy answers from the stream-side id (what the renderer submits
+              // via agent:answer-tool-question) to the execute-side id, so the
+              // tool's execute() can find them. Do this REGARDLESS of the approval
+              // outcome: a fully-submitted answer can race an abort (turn ended /
+              // superseded / plan-restart) that settles this promise as 'dismiss'
+              // a beat before/after the answer lands. The answer is stashed under
+              // the streamId either way (answer-tool-question stashes
+              // unconditionally now), so recover it here so a raced answer is not
+              // silently lost.
+              const raced = pendingQuestionAnswers.get(streamId);
+              if (raced) {
+                stashQuestionAnswers(state.toolCallId, raced);
+                pendingQuestionAnswers.delete(streamId);
+              }
+              const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
+              if (outcome.skip) {
+                // If the user DID answer in the race window, honor the answer even
+                // though the gate resolved non-true: run the tool with the stashed
+                // answer rather than skipping with a cancel result.
+                if (raced) {
+                  traceDiagnostic({
+                    scope: 'agent',
+                    event: 'question.answer-recovered-post-settle',
+                    level: 'warn',
+                    conversationId,
+                    toolName: state.toolName,
+                    fields: { toolCallId: state.toolCallId, streamId, settleReason: outcome.reason },
+                  });
+                } else {
+                  // Genuine dismiss/reject/abort with no answer — skip execution so
+                  // the tool never emits the misleading no-answer error.
+                  state.cancel();
+                  return { skip: true as const, result: outcome.result };
                 }
               }
             }
@@ -5898,12 +5935,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
-    // Only stash answers if there's actually a pending approval to resolve; a
-    // stale toolCallId (already dismissed/aborted) would otherwise leave an
-    // orphaned pendingQuestionAnswers entry that the terminated tool never reads.
+    // Stash the answers UNCONDITIONALLY, before resolving. A fully-submitted
+    // answer can race an abort (turn ended / superseded / plan-restart) that
+    // already settled + removed the pending approval a beat earlier — the old
+    // `if (pending)` guard dropped the answer in that window, and the tool then
+    // emitted "No user response received" even though the user DID answer. The
+    // stash is bounded (MAX_PENDING_QUESTION_ANSWERS FIFO), so an orphaned entry
+    // for a genuinely-dead turn can't leak. The ask_user gate + execute recover
+    // this entry by id; a still-live pending approval is resolved below.
+    stashQuestionAnswers(toolCallId, answers);
     const pending = pendingToolApprovals.get(toolCallId);
+    traceDiagnostic({
+      scope: 'agent',
+      event: 'question.answer-received',
+      toolName: 'ask_user',
+      fields: { toolCallId, hadPending: Boolean(pending), answerCount: Object.keys(answers ?? {}).length },
+    });
     if (pending) {
-      stashQuestionAnswers(toolCallId, answers);
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
     }

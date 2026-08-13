@@ -1204,9 +1204,23 @@ function createAskUserHandler(
     // 2. Wait for user response via shared pending-approval infrastructure.
     //    The IPC handler (agent:answer-tool-question) stores answers in
     //    pendingQuestionAnswers and resolves the approval promise.
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined);
+    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined, {
+      conversationId,
+      toolName: 'ask_user',
+    });
 
     if (approved !== true) {
+      // A fully-submitted answer can race an abort that settles this as 'dismiss'
+      // (answer-tool-question stashes unconditionally). If an answer landed in the
+      // race window, honor it instead of reporting a dismiss the user never made.
+      const raced = pendingQuestionAnswers.get(toolCallId);
+      if (raced) {
+        pendingQuestionAnswers.delete(toolCallId);
+        debugLog(`[ASK_USER] Recovered raced answer after non-true settle toolCallId=${toolCallId}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: true, answers: raced }) }],
+        };
+      }
       debugLog(`[ASK_USER] User dismissed/rejected toolCallId=${toolCallId}`);
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],
@@ -1264,7 +1278,10 @@ function createExitPlanModeHandler(
     });
 
     // 2. Wait for user approval
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined);
+    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined, {
+      conversationId,
+      toolName: 'exit_plan_mode',
+    });
 
     if (approved === 'dismiss') {
       debugLog(`[EXIT_PLAN_MODE] User dismissed plan toolCallId=${toolCallId}`);
