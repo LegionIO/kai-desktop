@@ -660,99 +660,67 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 }
 
 /**
- * Deliver an ask_user answer that raced a NON-explicit turn abort (supersession
- * or plan-mode restart) into the turn that takes over — WITHOUT racing the
- * lifecycle machinery, and WITHOUT ever starting a fresh turn ourselves (where
- * every mode/timing hazard lived).
+ * Raced-answer → successor handoff.
  *
- * The answer lives in the pending-answer stash under `answerKey` throughout; the
- * helper reads it at delivery time (so an answer that arrives LATE — a remote web
- * client, or main busy past the initial grace poll — is still caught) and only
- * removes it when it hands off cooperatively.
+ * When an ask_user question is still pending and its turn aborts WITH INTENT TO
+ * RESTART (a supersession by a new submit, or a plan-mode restart — NOT a
+ * terminal Stop/dismiss), the submitted answer must be carried into THE actual
+ * successor turn. Rather than a polling coordinator guessing which later Mastra
+ * turn is the successor (the source of many races — unrelated-turn delivery,
+ * runtime-resolution timing, dead-run queueing), we register a handoff keyed by
+ * conversation and let the NEXT streamHandler invocation for that conversation
+ * CLAIM it: that invocation is the successor BY CONSTRUCTION — it owns the
+ * stream, its runtime is known, and it can splice the answer into ITSELF.
  *
- * Strategy (polled, bounded ~25s — past the renderer's ~21s plan-first recovery):
- *  - Stop (on this turn OR a successor) advances the explicit-cancel generation
- *    past the value captured AT ABORT → abort delivery, leave the answer stashed.
- *    Never restart after Stop.
- *  - Deliver ONLY when ALL hold: (a) the answer has arrived in the stash, (b) a
- *    genuine REPLACEMENT turn owns the stream — a token != the aborted token AND
- *    != undefined (the aborted entry is gone, so we never queue into the dead
- *    run), and (c) that replacement's runtime is CONFIRMED Mastra (so
- *    injectUserTurnAndRestart takes the cooperative splice — inheriting the
- *    replacement's mode, keeping plan-first plan-first — rather than its
- *    abort+restart path which would default a new turn to `auto`). Until runtime
- *    resolution sets activeStreamRuntime, a replacement is NOT yet confirmed
- *    Mastra, so we keep waiting.
- *  - injectUserTurnAndRestart reports expected failure as a RESOLVED {ok:false}
- *    (not a throw), so inspect the resolved value: only treat delivery as done
- *    when ok && injectedCooperatively; otherwise re-stash and report failed.
- *  - On the deadline with no qualifying replacement, leave the answer stashed
- *    (bounded/FIFO) rather than start a possibly-wrong-mode fresh turn.
+ * The answer itself lives in the pending-answer stash under `answerKey` (so a
+ * remote/slow answer that arrives after the abort is still caught at claim time).
+ * The handoff carries only the metadata needed to validate the claim.
  */
-function deliverRacedAnswerToReplacement(opts: {
-  conversationId: string;
+type RacedAnswerHandoff = {
   answerKey: string;
+  /** explicit-cancel generation at abort; a claim is void if it has advanced (a
+   *  Stop happened between abort and the successor starting). */
   cancelGenAtAbort: number;
-  abortedToken: string;
-  onOutcome?: (outcome: 'stopped' | 'cooperative' | 'given-up' | 'failed') => void;
-}): void {
-  const { conversationId, answerKey, cancelGenAtAbort, abortedToken, onOutcome } = opts;
-  const STEP_MS = 100;
-  // ~25s: past the renderer's ~21s plan-first winner-failure recovery window, so
-  // we don't give up (and lose the plan-first continuation) before it can start.
-  const MAX_ATTEMPTS = 250;
-  const stoppedSinceAbort = (): boolean =>
-    (explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtAbort;
-  const tick = (remaining: number): void => {
-    if (stoppedSinceAbort()) {
-      onOutcome?.('stopped');
-      return;
-    }
-    const activeToken = activeStreams.get(conversationId)?.token;
-    const replacementIsMastra =
-      activeToken !== undefined && activeToken !== abortedToken && getActiveStreamRuntime(conversationId) === 'mastra';
-    const answer = pendingQuestionAnswers.get(answerKey);
-    // Deliver only when the answer is present AND a confirmed-Mastra replacement
-    // owns the stream (cooperative splice inherits its mode). Otherwise keep
-    // waiting until the deadline.
-    if (answer && replacementIsMastra) {
-      const reinject = injectUserTurnAndRestart;
-      if (!reinject) {
-        onOutcome?.('failed'); // answer stays stashed
-        return;
-      }
-      // Consume the stash only for the delivery attempt; re-stash if it doesn't
-      // confirm a cooperative splice (a resolved {ok:false} OR a throw).
-      pendingQuestionAnswers.delete(answerKey);
-      const answerText = formatRacedAnswerAsUserTurn(answer);
-      void reinject(conversationId, answerText).then(
-        (res) => {
-          if (res?.ok && res.injectedCooperatively) {
-            onOutcome?.('cooperative');
-          } else {
-            stashQuestionAnswers(answerKey, answer);
-            onOutcome?.('failed');
-          }
-        },
-        () => {
-          stashQuestionAnswers(answerKey, answer);
-          onOutcome?.('failed');
-        },
-      );
-      return;
-    }
-    if (remaining <= 0) {
-      // Deadline: no qualifying replacement (or the answer never arrived). Leave
-      // the answer in the bounded stash rather than start a possibly-wrong-mode
-      // fresh turn or queue into a lingering dead run.
-      onOutcome?.('given-up');
-      return;
-    }
-    setTimeout(() => tick(remaining - 1), STEP_MS);
-  };
-  setTimeout(() => tick(MAX_ATTEMPTS), STEP_MS);
+  /** Absolute expiry — a successor that never comes (rare) lets this age out
+   *  instead of attaching a stale answer to a much-later unrelated turn. */
+  expiresAt: number;
+};
+const racedAnswerHandoffs = new Map<string, RacedAnswerHandoff>();
+const MAX_RACED_ANSWER_HANDOFFS = 200;
+// Past the renderer's ~21s plan-first winner-failure recovery window, so a
+// legitimately-delayed successor can still claim; a truly absent successor ages
+// out and the answer simply stays in the bounded stash.
+const RACED_ANSWER_HANDOFF_TTL_MS = 30_000;
+
+/** Register (or replace) a conversation's pending raced-answer handoff. */
+function registerRacedAnswerHandoff(conversationId: string, handoff: Omit<RacedAnswerHandoff, 'expiresAt'>): void {
+  racedAnswerHandoffs.set(conversationId, { ...handoff, expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS });
+  while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
+    const oldest = racedAnswerHandoffs.keys().next().value;
+    if (oldest === undefined) break;
+    racedAnswerHandoffs.delete(oldest);
+  }
 }
 
+/**
+ * Claim a pending raced-answer handoff for a conversation whose successor turn
+ * has just started. Returns the answer text to splice into THIS turn as a
+ * cooperative inject, or null if there's no valid claim. Removes the handoff (and
+ * the stashed answer) on a successful claim. Void — leaving the answer stashed —
+ * when the handoff is expired or a Stop advanced the cancel generation since the
+ * abort.
+ */
+function claimRacedAnswerHandoff(conversationId: string): string | null {
+  const handoff = racedAnswerHandoffs.get(conversationId);
+  if (!handoff) return null;
+  racedAnswerHandoffs.delete(conversationId);
+  if (Date.now() > handoff.expiresAt) return null;
+  if ((explicitCancelGeneration.get(conversationId) ?? 0) !== handoff.cancelGenAtAbort) return null;
+  const answer = pendingQuestionAnswers.get(handoff.answerKey);
+  if (!answer) return null;
+  pendingQuestionAnswers.delete(handoff.answerKey);
+  return formatRacedAnswerAsUserTurn(answer);
+}
 
 /**
  * Inject a user turn into a conversation and (re)start the stream — the shared
@@ -1880,7 +1848,39 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Track the runtime so a mid-turn inject can pick cooperative (Mastra) vs
     // abort+restart (CLI runtimes). Token-scoped so a superseded predecessor's
     // stale runtime is never read for this run (see getActiveStreamRuntime).
-    activeStreamRuntime.set(conversationId, { token: streamToken, runtimeId: runtime.id });
+    // Guard on CURRENT ownership: if a superseding run (B) already took the
+    // active stream while THIS run (A) was awaiting resolveRuntimeForStream, A
+    // must NOT overwrite B's entry with A's stale token (that would leave B
+    // runtime-unknown and block cooperative delivery). Only the owning run writes.
+    if (activeStreams.get(conversationId)?.token === streamToken) {
+      activeStreamRuntime.set(conversationId, { token: streamToken, runtimeId: runtime.id });
+    }
+
+    // Raced-answer → successor handoff (see registerRacedAnswerHandoff): if a
+    // prior turn aborted-to-restart while an ask_user answer was pending, THIS
+    // turn is the successor by construction. Splice the answer into it as a
+    // cooperative inject so it's delivered to the correct turn with the correct
+    // mode — only for Mastra (cooperative injects require it); a non-Mastra
+    // successor leaves the handoff to age out (answer stays stashed). The claim
+    // is void if a Stop advanced the cancel generation or the handoff expired.
+    if (
+      runtime.id === 'mastra' &&
+      activeStreams.get(conversationId)?.token === streamToken &&
+      racedAnswerHandoffs.has(conversationId)
+    ) {
+      const handoffText = claimRacedAnswerHandoff(conversationId);
+      if (handoffText) {
+        enqueueInject(conversationId, handoffText);
+        broadcastStreamEvent({ conversationId, type: 'user-message', text: handoffText }, streamToken);
+        traceDiagnostic({
+          scope: 'agent',
+          event: 'question.answer-handoff-claimed',
+          level: 'warn',
+          conversationId,
+          toolName: 'ask_user',
+        });
+      }
+    }
     for (const [index, message] of messageList.entries()) {
       const contentPreview =
         typeof message.content === 'string'
@@ -4361,11 +4361,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   broadcastExecutionMode('auto');
                   planDoneSent = true;
                   emit({ conversationId, type: 'done', data: { planDismissed: true } });
-                  // Terminal abort — no successor turn. Mark BEFORE aborting so a
-                  // parallel ask_user gate (same streamToken) doesn't hand a raced
-                  // answer to the replacement coordinator and inject it into a later
-                  // unrelated turn.
-                  markTokenTerminalAbort(streamToken);
+                  // Mark terminal (no successor) ONLY for a GENUINE user dismiss —
+                  // registerPendingApproval also resolves 'dismiss' on a controller
+                  // abort (a superseding turn), where a successor DOES exist and a
+                  // parallel ask_user's answer should still hand off to it. Guard on
+                  // !aborted so a superseded exit_plan_mode doesn't wrongly strand it.
+                  if (!controller.signal.aborted) markTokenTerminalAbort(streamToken);
                   controller.abort();
                   return;
                 }
@@ -4453,36 +4454,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // Non-explicit abort (supersession / plan-restart): continuing
                   // THIS tool is futile (its result is suppressed as a superseded-
                   // run event) and would consume the answer inside a dead turn.
-                  // Hand off to the coordinator, which waits for a genuine
-                  // confirmed-Mastra replacement and splices the answer into it
-                  // (inheriting its mode → plan-first stays plan-first). Hand off
-                  // EVEN IF the answer hasn't arrived yet (a remote/slow answer may
-                  // land after the grace poll) — the coordinator polls the stash;
-                  // it reads + removes the answer only at the delivery moment. Leave
-                  // the answer under `streamId` for it (do NOT delete here).
+                  // REGISTER A HANDOFF: the answer stays stashed under `streamId`,
+                  // and the NEXT streamHandler invocation for this conversation —
+                  // the actual successor, by construction — claims it and splices
+                  // it into itself (see registerRacedAnswerHandoff / the claim in
+                  // streamHandler). This binds delivery to the real successor
+                  // (correct turn, correct mode) rather than guessing at any later
+                  // Mastra turn. A Stop (cancel-generation advance) or expiry voids
+                  // the claim; a never-arriving successor lets it age out with the
+                  // answer left in the bounded stash.
+                  registerRacedAnswerHandoff(conversationId, { answerKey: streamId, cancelGenAtAbort });
                   traceDiagnostic({
                     scope: 'agent',
-                    event: 'question.answer-reinjected-after-abort',
+                    event: 'question.answer-handoff-registered',
                     level: 'warn',
                     conversationId,
                     toolName: state.toolName,
                     fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
-                  });
-                  deliverRacedAnswerToReplacement({
-                    conversationId,
-                    answerKey: streamId,
-                    cancelGenAtAbort,
-                    abortedToken: streamToken,
-                    onOutcome: (deliveryOutcome) => {
-                      traceDiagnostic({
-                        scope: 'agent',
-                        event: 'question.answer-reinject-outcome',
-                        level: deliveryOutcome === 'failed' ? 'error' : 'warn',
-                        conversationId,
-                        toolName: 'ask_user',
-                        fields: { toolCallId: state.toolCallId, streamId, status: deliveryOutcome },
-                      });
-                    },
                   });
                   state.cancel();
                   return {
