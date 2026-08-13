@@ -319,11 +319,24 @@ const consumedInjectBytes = new Map<string, number>();
 // the Mastra runtime supports cooperative step-boundary injection (prepareStep +
 // inject-queue), while the CLI runtimes (codex/claude/pi/opencode) can't be
 // stepped and use the abort+restart fallback.
-const activeStreamRuntime = new Map<string, string>();
+// Runtime id driving each conversation's active stream, TOKEN-SCOPED: a
+// superseding replacement sets `activeStreams` (new token) BEFORE it resolves +
+// records its own runtime, so a plain `conversationId → runtimeId` map would
+// still report the ABORTED run's stale runtime during that window. Storing the
+// owning token lets readers confirm the runtime belongs to the CURRENT active
+// stream and treat a not-yet-recorded replacement as "unknown" rather than
+// inheriting the predecessor's value.
+const activeStreamRuntime = new Map<string, { token: string; runtimeId: string }>();
 
-/** The runtime id driving the current active stream for a conversation, if any. */
+/** The runtime id driving the current active stream for a conversation, if any.
+ *  Returns undefined unless a runtime has been recorded FOR THE CURRENT active
+ *  token — so a replacement whose runtime hasn't resolved yet reads as unknown
+ *  (never the superseded predecessor's stale value). */
 export function getActiveStreamRuntime(conversationId: string): string | undefined {
-  return activeStreams.has(conversationId) ? activeStreamRuntime.get(conversationId) : undefined;
+  const activeToken = activeStreams.get(conversationId)?.token;
+  if (activeToken === undefined) return undefined;
+  const entry = activeStreamRuntime.get(conversationId);
+  return entry && entry.token === activeToken ? entry.runtimeId : undefined;
 }
 
 // Conversations whose current turn was started by a client that does NOT persist
@@ -1862,8 +1875,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       modelEntry?.modelConfig?.modelName ?? modelKey ?? config.models.defaultModelKey,
     );
     // Track the runtime so a mid-turn inject can pick cooperative (Mastra) vs
-    // abort+restart (CLI runtimes).
-    activeStreamRuntime.set(conversationId, runtime.id);
+    // abort+restart (CLI runtimes). Token-scoped so a superseded predecessor's
+    // stale runtime is never read for this run (see getActiveStreamRuntime).
+    activeStreamRuntime.set(conversationId, { token: streamToken, runtimeId: runtime.id });
     for (const [index, message] of messageList.entries()) {
       const contentPreview =
         typeof message.content === 'string'
