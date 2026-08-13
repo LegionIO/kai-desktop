@@ -354,6 +354,23 @@ let submitIdSeq = 0;
 const currentPendingSubmit = new Map<string, number>();
 const cancelledSubmits = new Set<number>();
 
+// Stream tokens that were aborted by an EXPLICIT user Stop (agent:cancel-stream),
+// as opposed to a supersession (new submit) or a plan-mode restart. The ask_user
+// gate consults this: on an explicit Stop it must NOT re-inject a raced answer as
+// a new turn (that would restart the agent the user just stopped). Bounded so a
+// long-lived process can't accumulate tokens; entries are only read within the
+// aborted run's own teardown, so a small cap is safe.
+const explicitlyCancelledTokens = new Set<string>();
+const MAX_EXPLICITLY_CANCELLED_TOKENS = 100;
+function markTokenExplicitlyCancelled(token: string): void {
+  explicitlyCancelledTokens.add(token);
+  while (explicitlyCancelledTokens.size > MAX_EXPLICITLY_CANCELLED_TOKENS) {
+    const oldest = explicitlyCancelledTokens.values().next().value;
+    if (oldest === undefined) break;
+    explicitlyCancelledTokens.delete(oldest);
+  }
+}
+
 /**
  * Authoritative (in-memory) check of whether a conversation currently has a turn
  * either STREAMING (`activeStreams`) or SUBMITTED-but-not-yet-streaming
@@ -4263,16 +4280,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
               if (outcome.skip) {
                 if (raced && outcome.reason === 'abort') {
-                  // The answer landed, but a genuine turn-abort (supersession /
-                  // cancel / plan-restart) already tore this turn down —
-                  // continuing the tool here is futile (its result is suppressed
-                  // as a superseded-run event) and would consume+delete the
-                  // answer inside a dead turn. Instead, DELIVER the answer to the
-                  // next turn: re-inject it as a fresh user message once this
-                  // turn's teardown has released the active-stream entry (deferred
-                  // so injectUserTurnAndRestart doesn't enqueue into the dying
-                  // turn's queue). Clear the stash so nothing lingers under the
-                  // dead id.
+                  const explicitlyCancelled = explicitlyCancelledTokens.has(streamToken);
+                  if (explicitlyCancelled) {
+                    // The user pressed Stop (not a supersession / plan-restart).
+                    // Respect it: do NOT re-inject the answer as a new turn (that
+                    // would restart the agent the user just stopped). Leave the
+                    // answer in the bounded (FIFO-evicted) stash and skip cleanly.
+                    traceDiagnostic({
+                      scope: 'agent',
+                      event: 'question.answer-dropped-on-explicit-stop',
+                      level: 'warn',
+                      conversationId,
+                      toolName: state.toolName,
+                      fields: { toolCallId: state.toolCallId, streamId, reason: outcome.reason },
+                    });
+                    state.cancel();
+                    return {
+                      skip: true as const,
+                      result: {
+                        isError: true,
+                        error: 'The turn was stopped before this question was answered.',
+                      },
+                    };
+                  }
+                  // Non-explicit abort (supersession / plan-restart): a replacement
+                  // turn is coming, but continuing THIS tool is futile (its result
+                  // is suppressed as a superseded-run event) and would consume+
+                  // delete the answer inside a dead turn. Instead, DELIVER the
+                  // answer to the next turn: re-inject it as a fresh user message
+                  // once this turn's teardown has released the active-stream entry
+                  // (deferred so injectUserTurnAndRestart doesn't enqueue into the
+                  // dying turn's queue). Clear the stash so nothing lingers under
+                  // the dead id.
                   pendingQuestionAnswers.delete(streamId);
                   if (streamId !== state.toolCallId) pendingQuestionAnswers.delete(state.toolCallId);
                   const answerText = formatRacedAnswerAsUserTurn(raced);
@@ -5823,6 +5862,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
     const controller = activeStreams.get(conversationId);
     if (controller) {
+      // Mark this run's token as explicitly cancelled BEFORE aborting, so the
+      // ask_user gate (which resumes synchronously off the abort) sees it and
+      // does NOT re-inject a raced answer as a new turn — an explicit Stop must
+      // not restart the agent.
+      markTokenExplicitlyCancelled(controller.token);
       controller.abort();
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).
