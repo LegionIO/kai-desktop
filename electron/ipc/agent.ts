@@ -697,6 +697,11 @@ type RacedAnswerState = {
   answerKeys: Set<string>;
   /** explicit-cancel generation at abort; the rendezvous is void if it advanced. */
   cancelGenAtAbort: number;
+  /** The PREDECESSOR run's stream token (the aborting run that registered this).
+   *  Its OWN cleanupStreamIfOwned must NOT consume the handoff it just created
+   *  (that would delete it before the successor transfers it); only a LATER
+   *  run's teardown may invalidate a pre-successor handoff. */
+  sourceToken: string;
   expiresAt: number;
 };
 // PRE-successor holding map: keys registered by an aborting gate before the
@@ -713,7 +718,12 @@ const liveRacedAnswerClaimant = new Map<
 /** Register (or MERGE) a conversation's pending raced-answer handoff in the
  *  pre-successor holding map. Parallel ask_user gates aborting together each add
  *  their own answerKey. */
-function registerRacedAnswerHandoff(conversationId: string, answerKey: string, cancelGenAtAbort: number): void {
+function registerRacedAnswerHandoff(
+  conversationId: string,
+  answerKey: string,
+  cancelGenAtAbort: number,
+  sourceToken: string,
+): void {
   const existing = racedAnswerHandoffs.get(conversationId);
   if (existing && (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort) {
     existing.answerKeys.add(answerKey);
@@ -723,6 +733,7 @@ function registerRacedAnswerHandoff(conversationId: string, answerKey: string, c
   racedAnswerHandoffs.set(conversationId, {
     answerKeys: new Set([answerKey]),
     cancelGenAtAbort,
+    sourceToken,
     expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
   });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
@@ -809,10 +820,16 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
     // Answers left undelivered stay in the bounded stash; drop the state.
     racedAnswerHandoffs.delete(conversationId);
   } else if (claimant === undefined) {
-    // This run never transferred (e.g. config/hook-failed before the transfer
-    // point, or a non-Mastra successor): consume the pre-successor holding entry
-    // so it can't linger within the TTL for a later unrelated turn.
-    racedAnswerHandoffs.delete(conversationId);
+    // No live claimant. A pre-successor handoff may exist. Its OWN predecessor
+    // (the aborting run that registered it) also calls this in its finally — it
+    // must NOT delete the handoff it just created before the successor transfers
+    // it (that reopened the loss race). Only a LATER run's teardown (token !=
+    // sourceToken) invalidates it — e.g. a successor that config/hook-failed
+    // before transferring, or a non-Mastra successor.
+    const handoff = racedAnswerHandoffs.get(conversationId);
+    if (handoff && handoff.sourceToken !== token) {
+      racedAnswerHandoffs.delete(conversationId);
+    }
   }
 }
 
@@ -4556,7 +4573,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // Non-terminal abort (supersession / plan-restart): the answer
                 // stays stashed under `streamId`; the actual successor claims it
                 // (see registerRacedAnswerHandoff + the claim in streamHandler).
-                registerRacedAnswerHandoff(conversationId, streamId, cancelGenAtAbort);
+                registerRacedAnswerHandoff(conversationId, streamId, cancelGenAtAbort, streamToken);
                 traceDiagnostic({
                   scope: 'agent',
                   event: 'question.answer-handoff-registered',
