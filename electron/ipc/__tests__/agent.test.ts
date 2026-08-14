@@ -312,7 +312,13 @@ describe('agent IPC: continuation authorization (single driver per turn)', () =>
       },
     });
     const authorize = (clientId: string, turnToken: string) =>
-      harness.invoke<{ authorized: boolean }>('agent:authorize-continuation', FAKE_EVENT, 'conv-auth', clientId, turnToken);
+      harness.invoke<{ authorized: boolean }>(
+        'agent:authorize-continuation',
+        FAKE_EVENT,
+        'conv-auth',
+        clientId,
+        turnToken,
+      );
     // Realistic stream tokens are `${Date.now()}-${rand}`; recency is compared by the ms prefix.
     const tok1 = '1000000000000-aaaa';
     const tok2 = '2000000000000-bbbb'; // strictly newer turn
@@ -464,5 +470,32 @@ describe("isSupersededRunEvent (mid-turn inject: drop the aborted run's stale ev
   it('does not treat events as stale when no run is active', () => {
     expect(isSupersededRunEvent('A', undefined)).toBe(false);
     expect(isSupersededRunEvent(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', () => {
+  const { resolveInjectedTextFromGatedPayload } = __internal;
+
+  it('returns the surviving user turn text (string content)', () => {
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: 'redacted answer' }]);
+    expect(res).toEqual({ allowed: true, text: 'redacted answer' });
+  });
+
+  it('extracts text from a content-part array (redacting hook rewrote parts)', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      { role: 'assistant', content: 'prior' },
+      { role: 'user', content: [{ type: 'text', text: '[redacted]' }] },
+    ]);
+    expect(res).toEqual({ allowed: true, text: '[redacted]' });
+  });
+
+  it('denies when a hook REMOVED the user turn entirely (nothing to inject)', () => {
+    // A modify hook dropped the sole user message — there is no surviving turn.
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'assistant', content: 'only assistant left' }]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
+
+  it('denies on an empty payload', () => {
+    expect(resolveInjectedTextFromGatedPayload([])).toEqual({ allowed: false, text: '' });
   });
 });

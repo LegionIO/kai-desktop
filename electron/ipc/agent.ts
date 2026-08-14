@@ -199,6 +199,20 @@ function extractLastUserText(messages: unknown[]): string {
 }
 
 /**
+ * Map the post-enforcement payload of a mid-turn inject back to the text to
+ * enqueue. Pure so the gate's decision (redaction vs. removal) is unit-testable
+ * apart from the async hook orchestration. When a modify hook REMOVED the sole
+ * user turn, there is nothing to inject → treat as a denial (`allowed:false`);
+ * otherwise return the surviving turn's (possibly-redacted) text.
+ */
+export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allowed: boolean; text: string } {
+  const survivor = lastUserMessage(payload);
+  if (!survivor) return { allowed: false, text: '' };
+  const text = typeof survivor.content === 'string' ? survivor.content : extractMessageText(survivor.content);
+  return { allowed: true, text };
+}
+
+/**
  * Split a branch into (a) a copy with native media base64 removed from the text
  * projection and (b) the NATIVE token cost of that media.
  *
@@ -5790,11 +5804,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // the renderer only routes here when the active run is the Mastra runtime.
   ipcMain.handle(
     'agent:inject-mid-turn',
-    (
+    async (
       _event,
       conversationId: string,
       userText: string,
-    ): { ok: boolean; cooperative?: boolean; id?: string; error?: string } => {
+    ): Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }> => {
       if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
@@ -5805,7 +5819,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (getActiveStreamRuntime(conversationId) !== 'mastra') {
         return { ok: false, cooperative: false, error: 'active run is not cooperatively injectable' };
       }
-      const id = enqueueInject(conversationId, userText);
+      // Enforce plugin pre-send + UserPromptSubmit policy before the text is
+      // spliced (prepareStep does not re-gate). DENY → reject; redaction →
+      // persist/broadcast/enqueue the redacted text.
+      const gate = await gateInjectedUserText(conversationId, userText);
+      if (!gate.allowed) return { ok: false, cooperative: true, error: gate.reason ?? 'blocked-by-policy' };
+      const injectText = gate.text;
+      const id = enqueueInject(conversationId, injectText);
       if (!id) return { ok: false, error: 'failed-to-enqueue' };
       const activeToken = activeStreams.get(conversationId)?.token;
       const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
@@ -5821,7 +5841,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const write = appendConversationMessages(
           appHome,
           conversationId,
-          [{ id, role: 'user', content: [{ type: 'text', text: userText }], createdAt: persistedCreatedAt }],
+          [{ id, role: 'user', content: [{ type: 'text', text: injectText }], createdAt: persistedCreatedAt }],
           { runStatus: 'running' },
         );
         if (!write) {
@@ -5839,7 +5859,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       broadcastStreamEvent({
         conversationId,
         type: 'user-message',
-        text: userText,
+        text: injectText,
         data: {
           messageId: persistedMessageId,
           parentId: persistedParentId,
@@ -5871,6 +5891,72 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // consecutive user follow-up (streamHandler aborts the in-flight run and
   // restarts with the combined branch) instead of diverting to a new chat.
   // NO skipIfBusy — superseding the in-flight run is the intended behavior.
+
+  // ── Enforcement gate for mid-turn injected user text ───────────────────────
+  // A cooperative inject splices raw user text into the running turn at the next
+  // prepareStep boundary (prepare-step-inject.ts) — that spliced text NEVER
+  // re-enters the primary turn's plugin pre-send / UserPromptSubmit enforcement,
+  // so without this gate an inject (GUI compose-while-running, an automation
+  // follow-up, OR a recovered ask_user answer) would be persisted + sent to the
+  // model UNFILTERED, unlike a normal turn. Run the injected text through the
+  // SAME enforcement a normal turn applies (plugin pre-send FIRST, then the
+  // UserPromptSubmit DLP gate LAST — the ordering at line ~1906), as a single
+  // one-user-message payload. Returns the possibly-redacted text to enqueue, or
+  // `{ allowed:false }` when a hook DENIES (caller must not inject). FAST PATH:
+  // when neither an enforcing UserPromptSubmit hook nor a plugin pre-send hook
+  // exists, returns the input verbatim — zero behavior change for the common case.
+  const gateInjectedUserText = async (
+    conversationId: string,
+    userText: string,
+    modelKey?: string,
+  ): Promise<{ allowed: boolean; text: string; reason?: string }> => {
+    const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
+    const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
+    if (!hasPluginHooks && !hasPromptHooks) return { allowed: true, text: userText };
+    let config: AppConfig;
+    try {
+      config = readEffectiveConfig(appHome);
+    } catch {
+      // Can't read config to run enforcement → fail CLOSED (don't inject unfiltered).
+      return { allowed: false, text: userText, reason: 'Failed to load config for policy enforcement.' };
+    }
+    const resolvedModelKey = modelKey ?? config.models.defaultModelKey;
+    let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
+    // 1) Plugin pre-send middleware (messages:hook). An abort denies the inject; a
+    //    rewrite of the sole user message is honored.
+    if (hasPluginHooks && pluginManager) {
+      try {
+        const hookResult = await pluginManager.runPreSendHooks({
+          messages: payload as unknown as HookMessage[],
+          modelKey: resolvedModelKey,
+          config,
+          systemPrompt: '',
+        });
+        if (hookResult.abort) return { allowed: false, text: userText, reason: 'A plugin blocked this message.' };
+        if (Array.isArray(hookResult.messages)) payload = hookResult.messages as unknown[];
+      } catch {
+        return { allowed: false, text: userText, reason: 'A plugin errored while checking this message.' };
+      }
+    }
+    // 2) UserPromptSubmit DLP gate LAST (authoritative over the final payload).
+    if (hasPromptHooks) {
+      const gated = await gateMessagesThroughUserPromptSubmit(
+        payload,
+        config,
+        conversationId,
+        resolvedModelKey,
+        'mid-turn-inject',
+      );
+      if (gated.suppressed) return { allowed: false, text: userText, reason: 'A policy hook blocked this message.' };
+      payload = gated.messages;
+    }
+    // Extract the (possibly-redacted) text of the surviving user turn. If a hook
+    // REMOVED the user turn entirely, treat it as a denial (nothing to inject).
+    const resolved = resolveInjectedTextFromGatedPayload(payload);
+    if (!resolved.allowed) return { allowed: false, text: userText, reason: 'A policy hook removed this message.' };
+    return { allowed: true, text: resolved.text };
+  };
+
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
@@ -5882,7 +5968,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // user turn so it renders immediately, and let the live turn continue. The
     // CLI runtimes can't be stepped, so they fall through to abort+restart below.
     if (getActiveStreamRuntime(conversationId) === 'mastra') {
-      const injectId = enqueueInject(conversationId, userText);
+      // Enforce the same plugin pre-send + UserPromptSubmit policy a normal turn
+      // applies before this text is spliced into the running turn (prepareStep
+      // does NOT re-gate spliced text). A DENY rejects the inject; a redaction
+      // replaces the text that is enqueued/persisted/broadcast.
+      const gate = await gateInjectedUserText(conversationId, userText, opts?.modelKey);
+      if (!gate.allowed) return { ok: false, error: gate.reason ?? 'blocked-by-policy' };
+      const injectText = gate.text;
+      const injectId = enqueueInject(conversationId, injectText);
       if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
       const activeToken = activeStreams.get(conversationId)?.token;
       const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
@@ -5901,7 +5994,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             {
               id: injectId,
               role: 'user',
-              content: [{ type: 'text', text: userText }],
+              content: [{ type: 'text', text: injectText }],
               createdAt: persistedMeta.createdAt,
             },
           ],
@@ -5931,7 +6024,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         broadcastStreamEvent({
           conversationId,
           type: 'user-message',
-          text: userText,
+          text: injectText,
           data: persistedMeta,
         });
         return { ok: true, injectedCooperatively: true };
@@ -6677,4 +6770,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 }
 
 /** Exposed for unit tests only. */
-export const __internal = { extractLastUserText, observerToolsForExecutionMode };
+export const __internal = {
+  extractLastUserText,
+  observerToolsForExecutionMode,
+  resolveInjectedTextFromGatedPayload,
+};
