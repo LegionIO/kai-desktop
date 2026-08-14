@@ -439,17 +439,42 @@ export function persistCooperativeInjectedUserTurn(
   conversationId: string,
   userText: string,
   requestedMessageId?: string,
+  opts?: {
+    // Parent to pin the inject on when there is NO accumulated assistant prefix to
+    // finalize (finalizeInterruptedTurn returns null). Without this, the inject falls
+    // back to the store's CURRENT head — which, when a newer prompt has already
+    // superseded this run and become the disk head, mis-orders the (older) inject
+    // AFTER the newer prompt. Pass the superseded run's own branch point (the node it
+    // was streaming under) so an empty-prefix inject lands where it chronologically
+    // belongs — before any superseding prompt — and the caller can then reparent that
+    // prompt onto the inject. Ignored when a partial prefix exists (pin to the prefix).
+    noPrefixParentId?: string | null;
+  },
 ): PersistedInjectedUserTurn | null {
   if (!conversationId || !userText) return null;
   const partialAssistantHead = finalizeInterruptedTurn(appHome, conversationId);
   const current = readConversation(appHome, conversationId);
   if (!current) return null;
-  const parentId = partialAssistantHead ?? current.headId ?? null;
+  // Resolve the parent to pin the inject on:
+  //   • a finalized partial prefix → pin on it (the normal cooperative-inject case);
+  //   • else the caller-supplied superseded branch point (noPrefixParentId), when it
+  //     still names a real node on disk — chronologically correct vs. the live head;
+  //   • else the store's current head (first-turn / no-supersession fallback).
+  const noPrefixParent =
+    opts && 'noPrefixParentId' in opts && typeof opts.noPrefixParentId === 'string' && opts.noPrefixParentId
+      ? Array.isArray(current.messageTree) &&
+        (current.messageTree as Array<{ id?: unknown }>).some((m) => m?.id === opts.noPrefixParentId)
+        ? opts.noPrefixParentId
+        : null
+      : null;
+  const explicitParent = partialAssistantHead ?? noPrefixParent ?? null;
+  const parentId = explicitParent ?? current.headId ?? null;
   treeDebugLog(
     `[INJECT-BOUNDARY] conv=${conversationId} partialAssistantHead=${JSON.stringify(partialAssistantHead)} ` +
+      `noPrefixParent=${JSON.stringify(noPrefixParent)} ` +
       `storeHeadId=${JSON.stringify(current.headId)} pinnedParent=${JSON.stringify(parentId)} ` +
       `treeLen=${Array.isArray(current.messageTree) ? current.messageTree.length : -1} ` +
-      `willPassParentId=${partialAssistantHead !== null}`,
+      `willPassParentId=${explicitParent !== null}`,
   );
   const messageId = requestedMessageId || `inject-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const createdAt = new Date().toISOString();
@@ -459,9 +484,10 @@ export function persistCooperativeInjectedUserTurn(
     [{ id: messageId, role: 'user', content: [{ type: 'text', text: userText }], createdAt }],
     {
       runStatus: 'running',
-      // Pin to the partial assistant we just persisted. If there was no partial,
-      // omit parentId so appendConversationMessages uses the store's current head.
-      ...(partialAssistantHead !== null ? { parentId: partialAssistantHead } : {}),
+      // Pin to the partial assistant we just persisted, else the superseded run's
+      // branch point (noPrefixParentId). If neither is available, omit parentId so
+      // appendConversationMessages uses the store's current head.
+      ...(explicitParent !== null ? { parentId: explicitParent } : {}),
     },
   );
   if (!updated?.headId) return null;

@@ -591,4 +591,47 @@ describe('persistCooperativeInjectedUserTurn (CLI/server-persisted cooperative i
     const [, , , options] = appendMock.mock.calls[0];
     expect(options).toEqual({ runStatus: 'running' });
   });
+
+  it('pins an empty-prefix inject to noPrefixParentId (superseded branch point), not the live head', () => {
+    // A newer prompt has already advanced the disk head. The superseded run had no
+    // accumulated assistant content, so there is no partial to finalize. The inject
+    // must pin on the superseded run's OWN branch point (`orig-user`) — where it
+    // chronologically belongs — NOT the store's current head (the newer prompt).
+    readMock.mockReturnValue({
+      headId: 'newer-prompt',
+      messageTree: [
+        { id: 'orig-user', parentId: null, role: 'user' },
+        { id: 'newer-prompt', parentId: 'orig-user', role: 'user' },
+      ],
+    });
+    appendMock.mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci3', 'raced answer', 'inj-e', {
+      noPrefixParentId: 'orig-user',
+    });
+
+    expect(result?.messageId).toBe('inj-e');
+    expect(result?.parentId).toBe('orig-user');
+    const [, , , options] = appendMock.mock.calls[0];
+    // Explicit parent pinned — NOT an omitted parentId (which would fall to the live head).
+    expect(options).toEqual({ runStatus: 'running', parentId: 'orig-user' });
+  });
+
+  it('falls back to the store head when noPrefixParentId names a node absent from disk', () => {
+    // A stale branch point that no longer exists on disk must NOT be pinned (would
+    // create a detached inject); fall back to the store's current head.
+    readMock.mockReturnValue({
+      headId: 'live-head',
+      messageTree: [{ id: 'live-head', parentId: null, role: 'user' }],
+    });
+    appendMock.mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci4', 'answer', 'inj-f', {
+      noPrefixParentId: 'gone-node',
+    });
+
+    expect(result?.parentId).toBe('live-head');
+    const [, , , options] = appendMock.mock.calls[0];
+    expect(options).toEqual({ runStatus: 'running' }); // parentId omitted → append uses store head
+  });
 });

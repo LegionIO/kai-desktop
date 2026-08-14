@@ -1961,10 +1961,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // no prefix to finalize, stranding the inject on the wrong head / off-branch.
     if (hasInjects(conversationId)) {
       if (serverPersistTokens.has(conversationId)) {
+        // Capture the superseded run's OWN branch point BEFORE draining. When a
+        // stranded inject has no accumulated assistant prefix to finalize, this is
+        // where it chronologically belongs (right after the node the superseded run
+        // was streaming under) — NOT the store's current head, which a newer prompt
+        // may already have advanced to (mis-ordering the older inject after it). Only
+        // the FIRST inject uses it; subsequent injects chain onto their predecessor.
+        const supersededBranchPoint = serverPersistParents.get(conversationId) ?? null;
         const stranded = drainInjects(conversationId);
         let persistedAny = false;
+        let priorInjectId: string | null = null;
         for (const entry of stranded) {
-          if (persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id)) persistedAny = true;
+          const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id, {
+            // First inject → pin on the superseded branch point; later injects → pin on
+            // the previously-persisted inject so the batch forms an ordered chain.
+            noPrefixParentId: priorInjectId ?? supersededBranchPoint,
+          });
+          if (persisted) {
+            persistedAny = true;
+            priorInjectId = persisted.messageId;
+          }
         }
         // The replacement's `messages` snapshot was captured BEFORE this drain, so
         // it doesn't include the just-persisted stranded inject (a recovered
@@ -6191,6 +6207,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // token is already cleaned up (absent) by finally — absent means we still own it.
                 const owner = activeStreams.get(conversationId)?.token;
                 if (owner !== undefined && owner !== streamToken) return;
+                // A newer turn may have STARTED AND FINISHED between poll ticks — then
+                // `activeStreams` is empty (owner === undefined) AND disk is 'idle', so the
+                // owner + runStatus checks below both pass even though our turn is stale.
+                // Reject when a strictly-newer turn has been issued for this conversation
+                // (latestIssuedTurnToken advanced past ours): rewriting the head back to our
+                // old drain's injected user here would HIDE the newer completed branch and
+                // could replay model/tool work from stale history. Mirrors authorizeContinuation.
+                const latestIssued = latestIssuedTurnToken.get(conversationId);
+                if (
+                  latestIssued !== undefined &&
+                  latestIssued !== streamToken &&
+                  turnTokenTime(streamToken) < turnTokenTime(latestIssued)
+                ) {
+                  return;
+                }
                 const updated = readConversation(appHome, conversationId);
                 if (updated) {
                   const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
