@@ -580,9 +580,40 @@ export function reorderInjectPrefixOnDisk(
     (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId),
   );
   if (prefixes.length !== 1) {
-    // No misplaced prefix (assistant not yet persisted, or already correctly
-    // ordered). The last injected user should be the head so the continuation
-    // launches on the full chain; advance it only if it isn't already.
+    // No assistant is parented UNDER an injected user. Two sub-cases:
+    //   (a) main's crash-backstop fallback finalized the turn's assistant as a
+    //       SIBLING of the first injected user (a child of the pre-inject head P,
+    //       because the fallback accumulator was still parented on P). That reply
+    //       exists but sits OFF the injected-user branch — thread it in as
+    //       `P → assistant → u1 … uN` so the continuation launches WITH it.
+    //   (b) genuinely no assistant yet (not persisted) or already correctly
+    //       ordered — just make the last injected user the head.
+    const firstInjected = present[0];
+    const firstUser = tree.find((m) => m.id === firstInjected);
+    const preInjectHead = firstUser?.parentId ?? null;
+    const siblingAssistants =
+      preInjectHead !== null
+        ? tree.filter((m) => m.role === 'assistant' && m.parentId === preInjectHead && !idSet.has(m.id))
+        : [];
+    if (firstUser && siblingAssistants.length === 1) {
+      // (a) Reparent: assistant keeps P as parent; first injected user reparents onto it.
+      const sib = siblingAssistants[0];
+      const nextTree = tree.map((m) => (m.id === firstInjected ? { ...m, parentId: sib.id } : m));
+      const branch = getConversationBranch(nextTree, lastInjected);
+      const next: ConversationRecord = {
+        ...conv,
+        messageTree: nextTree,
+        messages: branch,
+        headId: lastInjected,
+        updatedAt: new Date().toISOString(),
+        messageCount: branch.length,
+        userMessageCount: branch.filter((m) => m.role === 'user').length,
+      };
+      broadcastUpsert(appHome, writeConversation(appHome, next));
+      return lastInjected;
+    }
+    // (b) The last injected user should be the head so the continuation launches on
+    // the full chain; advance it only if it isn't already.
     if (headId === lastInjected) return headId;
     const branch = getConversationBranch(tree, lastInjected);
     const next: ConversationRecord = {

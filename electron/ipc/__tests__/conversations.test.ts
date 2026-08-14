@@ -975,6 +975,28 @@ describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user re
     expect(reorderInjectPrefixOnDisk(appHome, 'c1', ['inject'])).toBe('inject');
   });
 
+  it('threads a SIBLING fallback assistant onto the branch (main crash-backstop finalize)', () => {
+    // main's fallback finalized the assistant as a SIBLING of the injected user
+    // (both children of the pre-inject head u1): u1 → {asst, inject}, head=asst.
+    // Repair must thread it as u1 → asst → inject so the reply stays on the branch.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'asst', parentId: 'u1', role: 'assistant', content: 'reply' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+      ],
+      'asst',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['inject']);
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst', 'inject']);
+  });
+
   it('moves the prefix before the whole chain for a MULTI-inject batch', () => {
     // Renderer parented the assistant under the LAST injected user (u2):
     // pre → u1 → u2 → asst (head=asst). Repair → pre → asst → u1 → u2 (head=u2).

@@ -929,11 +929,20 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       }
       // The claimant was torn down / replaced WHILE delivery was in flight (an async
       // policy gate let the successor finish or be superseded after we optimistically
-      // removed the key). Without this the answer would sit orphaned in the stash
-      // with nothing to re-trigger it. Re-register it as a pre-successor handoff so a
-      // later turn (or a fresh claim) can pick it up — UNLESS an explicit cancel
-      // (Stop) bumped the generation, in which case it must NOT be resurrected.
-      if ((explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort) {
+      // removed the key). Re-register it as a pre-successor handoff so a later turn
+      // can pick it up — but ONLY under the SAME conditions as claimant teardown
+      // (dropRacedAnswerClaimantForToken): (a) no explicit cancel (Stop) bumped the
+      // generation, (b) the torn-down token wasn't a TERMINAL abort (a genuine
+      // plan/dismiss), and (c) a LIVE replacement actually superseded it
+      // (latestIssuedTurnToken advanced past it). On ordinary completion — no
+      // replacement — DISCARD, so an unrelated later turn can't claim the stale answer.
+      const latestIssued = latestIssuedTurnToken.get(conversationId);
+      const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== claimant.token;
+      if (
+        (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
+        !terminalAbortTokens.has(claimant.token) &&
+        supersededByLiveReplacement
+      ) {
         // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
         registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
         // If a replacement claimant is ALREADY live (it passed its claim site before
@@ -6479,8 +6488,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
           // stale answer can't restart a stopped run or abort a newer one.
           if (cooperativeOnly) return { ok: false, notCooperative: true };
-          // Otherwise fall through to abort+restart with the (gated) text.
-          userText = gate.text;
+          // Otherwise fall through to abort+restart. Use the ORIGINAL userText (NOT
+          // gate.text): the fresh turn re-runs plugin pre-send + UserPromptSubmit as
+          // part of its normal flow, so passing the already-gated text would apply
+          // non-idempotent redaction/prefix hooks TWICE (and could desync persisted
+          // text from model input). Enforcement happens exactly once, on the fresh turn.
+          // (userText is left unchanged — just fall through.)
         } else {
           const injectText = gate.text;
           const injectId = enqueueInject(conversationId, injectText);
