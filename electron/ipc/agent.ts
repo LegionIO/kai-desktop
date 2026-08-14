@@ -1021,7 +1021,27 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // it). Do NOT let `done` finalize here (that would double-write with the renderer's own
       // persist); the stream loop's terminal handler polls disk and finalizes this accumulator
       // ONLY if the renderer didn't. Non-terminal events just build the accumulator.
-      if (event.type !== 'done') {
+      if (event.type === 'inject-consumed') {
+        // Ordered cooperative-inject boundary (emitted AFTER the prior step's
+        // chunks are in the accumulator — race-free, unlike the prepareStep-time
+        // injectConsumedHandler). Split main's fallback: finalize the prefix,
+        // reparent each injected user onto it, advance the head + rebind the
+        // continuation accumulator. Shapes the crash-backstop tree correctly.
+        const injEntries = ((event.data as { entries?: Array<{ id?: unknown }> } | undefined)?.entries ?? []).filter(
+          (en): en is { id: string } => typeof en?.id === 'string',
+        );
+        let lastInjectedId: string | null = null;
+        for (const en of injEntries) {
+          const prefixHead = finalizeGuiFallbackPrefixAtInject(serverPersistAppHome, event.conversationId, en.id);
+          if (prefixHead) {
+            reparentConversationMessage(serverPersistAppHome, event.conversationId, en.id, prefixHead, {
+              makeHead: true,
+            });
+          }
+          lastInjectedId = en.id;
+        }
+        if (lastInjectedId) guiFallbackParents.set(event.conversationId, lastInjectedId);
+      } else if (event.type !== 'done') {
         accumulateForPersistence(serverPersistAppHome, event, guiFallbackParents.get(event.conversationId) ?? undefined);
       }
     }
@@ -1421,40 +1441,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
     const activeToken = activeStreams.get(conversationId)?.token;
     if (!isServerPersistOwner(conversationId, activeToken)) {
-      // GUI (renderer-owned) turn: the renderer owns the authoritative persist,
-      // but main keeps a crash-backstop FALLBACK accumulator. Shape it correctly
-      // at THIS consumption boundary (after prior-step tool results — toolIndex
-      // intact) so a renderer crash yields correct chronology. The injected user
-      // node(s) were pre-persisted (by injectUserTurnAndRestart) parented on the
-      // pre-inject head; finalize the fallback PREFIX, then reparent each injected
-      // user ONTO the prefix and rebind the fallback parent + continuation
-      // accumulator to the last injected user. Only when this run owns a GUI
-      // fallback for the conversation.
-      if (guiFallbackParents.has(conversationId)) {
-        let lastInjectedId: string | null = null;
-        for (const entry of entries) {
-          const prefixHead = finalizeGuiFallbackPrefixAtInject(appHome, conversationId, entry.id);
-          if (prefixHead) {
-            // Attach the pre-persisted injected user onto the finalized prefix so
-            // the fallback branch reads prefix-assistant → injected-user → cont,
-            // AND advance the head to the injected user — the prefix finalize
-            // moved the head onto the prefix, so without this a renderer crash
-            // before any continuation content would reload with the head on the
-            // prefix and the injected user hidden off the active branch.
-            reparentConversationMessage(appHome, conversationId, entry.id, prefixHead, { makeHead: true });
-          }
-          lastInjectedId = entry.id;
-        }
-        if (lastInjectedId) {
-          guiFallbackParents.set(conversationId, lastInjectedId);
-          traceDiagnostic({
-            scope: 'agent',
-            event: 'inject.gui-fallback-boundary',
-            conversationId,
-            messageId: lastInjectedId,
-          });
-        }
-      }
+      // GUI (renderer-owned) turn: the fallback-accumulator boundary split does
+      // NOT happen here. This injectConsumedHandler fires from prepareStep (a
+      // side-channel that can run BEFORE the prior step's fullStream chunks reach
+      // main's fallback accumulator), so finalizing here could split before a late
+      // tool-call/result landed. The split instead happens on the ORDERED
+      // `inject-consumed` STREAM event (see broadcastStreamEvent's GUI-fallback
+      // branch → splitGuiFallbackAtInjectBoundary), which is emitted only after
+      // prior-step chunks are consumed. Here we only keep the consumed-marker
+      // bookkeeping above.
       return;
     }
     let lastMessageId: string | null = null;
