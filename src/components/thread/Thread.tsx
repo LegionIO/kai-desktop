@@ -1832,16 +1832,18 @@ const Composer: FC<{
     setComposerText('');
     void sendMidTurn(t).then(({ status, reason }) => {
       // Only fall back to a normal (superseding) send when the message wasn't
-      // handled. 'blocked' means a policy hook rejected it — restore the draft so
-      // it isn't silently lost, but do NOT resend.
+      // handled AND the composer is still empty — the async check may have let the
+      // user type a new draft or switch chats, so resubmitting the old text would
+      // clobber the new draft / send into the wrong chat. 'blocked' means a policy
+      // hook rejected it — restore the draft (if still empty), do NOT resend.
+      const current = composerRuntime.getState().text ?? '';
       if (status === 'fallback') {
-        composerRuntime.setText(t);
-        composerRuntime.send();
-        composerRuntime.setText('');
+        if (current.trim().length === 0) {
+          composerRuntime.setText(t);
+          composerRuntime.send();
+          composerRuntime.setText('');
+        }
       } else if (status === 'blocked') {
-        // Restore the rejected draft — but ONLY if the composer is still empty, so
-        // a NEW draft the user typed during the async policy check isn't clobbered.
-        const current = composerRuntime.getState().text ?? '';
         if (current.trim().length === 0) {
           composerRuntime.setText(t);
           setComposerText(t);

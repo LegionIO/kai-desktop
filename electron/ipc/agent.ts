@@ -1010,11 +1010,20 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
       return;
     }
     // The claimant is torn down but may STILL hold undelivered answer keys (a slow
-    // or remote answer that never arrived before this successor finished). Don't
-    // lose them: re-register them as a pre-successor handoff so a LATER turn (or a
-    // late answer within TTL) can still pick them up. cancelGenAtAbort is refreshed
-    // to the current generation so a Stop that bumped it still invalidates them.
-    if (claimant.state.answerKeys.size > 0 && !racedStateInvalid(claimant.state, conversationId)) {
+    // or remote answer that never arrived before this successor finished). Re-register
+    // them as a pre-successor handoff so a LATER turn / late answer can pick them up —
+    // but ONLY when this run is being SUPERSEDED by a live replacement (a NEWER turn
+    // token was issued for this conversation). On ORDINARY completion (this token is
+    // still the latest issued — no replacement), DISCARD instead: keeping the answer
+    // alive would let an unrelated turn C started within the 30s TTL claim + inject
+    // A's stale answer. (The answer stays in the bounded stash either way.)
+    const latestIssued = latestIssuedTurnToken.get(conversationId);
+    const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== token;
+    if (
+      supersededByLiveReplacement &&
+      claimant.state.answerKeys.size > 0 &&
+      !racedStateInvalid(claimant.state, conversationId)
+    ) {
       for (const key of claimant.state.answerKeys) {
         registerRacedAnswerHandoff(
           conversationId,

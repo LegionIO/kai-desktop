@@ -186,19 +186,25 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       composerRuntime.setText('');
       resetHistoryNavigation('');
       void sendMidTurn(toSend).then(({ status, reason }) => {
-        // 'fallback' → not injectable; restore + normal (superseding) send.
-        // 'blocked' → a policy hook rejected it (handled); restore the draft so
-        //   it isn't silently lost, but do NOT resend. Surface the reason.
+        // 'fallback' → not injectable; restore + normal (superseding) send — but
+        // ONLY if the composer is still EMPTY. The async policy/enforcement check
+        // may have taken long enough for the user to type a NEW draft (or the
+        // resolved-onto composer is a different chat's after a switch); resubmitting
+        // the old text then would clobber the new draft / send into the wrong chat.
+        // If a new draft is present, drop the old text (it wasn't sent) rather than
+        // overwrite.
+        const current = composerRuntime.getState().text ?? '';
         if (status === 'fallback') {
-          composerRuntime.setText(toSend);
-          composerRuntime.send();
-          composerRuntime.setText('');
+          if (current.trim().length === 0) {
+            composerRuntime.setText(toSend);
+            composerRuntime.send();
+            composerRuntime.setText('');
+          }
         } else if (status === 'blocked') {
           // Restore the rejected draft so it isn't silently lost — but ONLY if the
           // composer is still empty. The async policy check may have taken long
           // enough for the user to start a NEW draft; clobbering it would be worse
           // than the (logged) loss of the blocked text.
-          const current = composerRuntime.getState().text ?? '';
           if (current.trim().length === 0) {
             composerRuntime.setText(toSend);
             setText(toSend);
