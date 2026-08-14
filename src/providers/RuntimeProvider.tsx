@@ -5410,6 +5410,16 @@ export function RuntimeProvider({
           if (text) {
             const res = await app.agent.injectMidTurn(convId, text);
             if (res.ok && res.cooperative) return; // spliced into the running turn
+            // A policy hook BLOCKED the send — it was HANDLED (rejected), not a
+            // "couldn't inject" case. Do NOT fall through to a normal turn (that
+            // would re-run the blocked text + supersede the active run, and a
+            // plugin pre-send abort may already have persisted the raw node). Stop
+            // here; the draft stays in the composer (onNew already consumed it, so
+            // surface the reason for the user).
+            if (res.blocked) {
+              if (res.error) console.warn(`[mid-turn-inject] blocked: ${res.error}`);
+              return;
+            }
             // Not cooperatively injectable (CLI runtime / race) — fall through to a
             // normal new turn, which supersedes the running one. NOTE: everything below
             // must use the LIVE accumulator / activeIdRef, not the closure tree/headId

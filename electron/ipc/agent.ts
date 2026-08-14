@@ -875,17 +875,30 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     state.answerKeys.delete(answerKey);
     const text = formatRacedAnswerAsUserTurn(answer);
     const onFailure = (): void => {
+      // Always put the answer back in the stash.
       stashQuestionAnswers(answerKey, answer);
-      // Only re-register + retry if THIS claimant still owns the conversation
-      // (else a teardown/replacement has taken over and will handle its own).
-      if (liveRacedAnswerClaimant.get(conversationId) !== claimant) return;
-      state.answerKeys.add(answerKey);
-      // Schedule a bounded retry — successor registration + answer arrival have
-      // already happened, so nothing else would re-trigger delivery; without this
-      // the restored answer sits dormant until claimant teardown (lost).
-      if (state.deliveryRetries < MAX_RACED_ANSWER_DELIVERY_RETRIES) {
-        state.deliveryRetries += 1;
-        setTimeout(() => attemptRacedAnswerDelivery(conversationId), RACED_ANSWER_RETRY_MS);
+      if (liveRacedAnswerClaimant.get(conversationId) === claimant) {
+        // THIS claimant still owns the conversation — re-arm its own bounded retry.
+        state.answerKeys.add(answerKey);
+        if (state.deliveryRetries < MAX_RACED_ANSWER_DELIVERY_RETRIES) {
+          state.deliveryRetries += 1;
+          setTimeout(() => attemptRacedAnswerDelivery(conversationId), RACED_ANSWER_RETRY_MS);
+        }
+        return;
+      }
+      // The claimant was torn down / replaced WHILE delivery was in flight (an async
+      // policy gate let the successor finish or be superseded after we optimistically
+      // removed the key). Without this the answer would sit orphaned in the stash
+      // with nothing to re-trigger it. Re-register it as a pre-successor handoff so a
+      // later turn (or a fresh claim) can pick it up — UNLESS an explicit cancel
+      // (Stop) bumped the generation, in which case it must NOT be resurrected.
+      if ((explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort) {
+        registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token);
+        // If a replacement claimant is ALREADY live (it passed its claim site before
+        // this teardown), MERGE the requeued key into it + deliver, so the answer
+        // isn't stuck until the next trigger. No-op if there's no live claimant yet
+        // (a later successor start transfers the handoff instead).
+        mergePendingHandoffIntoLiveClaimant(conversationId);
       }
     };
     // A TERMINAL outcome (policy hook blocked the answer / a hook errored) must
@@ -966,6 +979,12 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
           token, // sourceToken = this finished successor; a later DIFFERENT run claims it
         );
       }
+      liveRacedAnswerClaimant.delete(conversationId);
+      // A replacement C may ALREADY be the live claimant (it passed its own claim
+      // site before this lagging teardown re-registered the handoff). Merge into it
+      // now so the requeued answer isn't stuck in the pre-successor map until TTL.
+      mergePendingHandoffIntoLiveClaimant(conversationId);
+      return;
     }
     liveRacedAnswerClaimant.delete(conversationId);
   }
@@ -983,14 +1002,42 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
 
 /** Register the current Mastra turn as the live claimant: TRANSFER the pending
  *  handoff keys into a token-scoped claimant record, then attempt delivery (the
- *  answer may already be stashed). No-op if there's no valid pending handoff. */
+ *  answer may already be stashed). When there's no pending handoff YET but a prior
+ *  (different-token) claimant still owns this conversation's raced state — a
+ *  predecessor being superseded by THIS run whose async teardown will re-register
+ *  a handoff shortly — register with EMPTY keys so that late handoff can merge in
+ *  (mergePendingHandoffIntoLiveClaimant). No-op if neither condition holds. */
 function registerLiveRacedAnswerClaimant(
   conversationId: string,
   token: string,
   deliver: (text: string) => Promise<RacedDeliverResult>,
 ): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
-  if (!handoff) return;
+  if (!handoff) {
+    // No handoff now. If a prior claimant still owns the raced state (a predecessor
+    // being superseded by this run), INHERIT its still-pending answer keys into a
+    // fresh claimant bound to THIS token, and attempt delivery — so a supersession
+    // in the delivery window doesn't drop the predecessor's undelivered answer.
+    const prior = liveRacedAnswerClaimant.get(conversationId);
+    if (prior && prior.token !== token) {
+      const inheritedKeys = new Set(prior.state.answerKeys);
+      liveRacedAnswerClaimant.set(conversationId, {
+        token,
+        deliver,
+        state: {
+          answerKeys: inheritedKeys,
+          cancelGenAtAbort: prior.state.cancelGenAtAbort,
+          sourceToken: token,
+          deliveryRetries: 0,
+          expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+        },
+      });
+      if (!racedStateInvalid(liveRacedAnswerClaimant.get(conversationId)!.state, conversationId)) {
+        attemptRacedAnswerDelivery(conversationId);
+      }
+    }
+    return;
+  }
   // If the handoff is BOUND to a specific successor token (a supersession whose
   // successor was already issued at abort time), only that exact successor may
   // transfer it. A mismatch means this is an unrelated later turn — leave the
@@ -1002,6 +1049,28 @@ function registerLiveRacedAnswerClaimant(
   racedAnswerHandoffs.delete(conversationId); // transfer out of the pre-successor map
   if (racedStateInvalid(handoff, conversationId)) return; // expired / Stop → drop (answers stay stashed)
   liveRacedAnswerClaimant.set(conversationId, { token, deliver, state: handoff });
+  attemptRacedAnswerDelivery(conversationId);
+}
+
+/** If a live claimant ALREADY owns the conversation's active stream AND a pending
+ *  pre-successor handoff exists (e.g. a prior claimant's in-flight delivery failed
+ *  and re-registered the answer AFTER the replacement passed its claim site), MERGE
+ *  the handoff's keys into the live claimant and attempt delivery — so a requeued
+ *  answer reaches an already-started successor instead of sitting until TTL. No-op
+ *  if there's no live+owning claimant or no valid handoff. Respects the same
+ *  successor-token binding as registerLiveRacedAnswerClaimant. */
+function mergePendingHandoffIntoLiveClaimant(conversationId: string): void {
+  const claimant = liveRacedAnswerClaimant.get(conversationId);
+  if (!claimant) return;
+  if (activeStreams.get(conversationId)?.token !== claimant.token) return; // not the owning run
+  const handoff = racedAnswerHandoffs.get(conversationId);
+  if (!handoff) return;
+  // Honor the successor binding: only merge a handoff that this claimant is allowed
+  // to claim (unbound, or bound to this claimant's token).
+  if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== claimant.token) return;
+  racedAnswerHandoffs.delete(conversationId);
+  if (racedStateInvalid(handoff, conversationId)) return;
+  for (const key of handoff.answerKeys) claimant.state.answerKeys.add(key);
   attemptRacedAnswerDelivery(conversationId);
 }
 
@@ -2250,7 +2319,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // pending handoff so it can't linger for a later Mastra turn.
     // Cleanup of this claimant registration is centralized (token-scoped) in
     // cleanupStreamIfOwned, which runs on every terminal + early-exit path.
-    if (activeStreams.get(conversationId)?.token === streamToken && racedAnswerHandoffs.has(conversationId)) {
+    // Register when EITHER a pending handoff exists now, OR a prior claimant still
+    // owns this conversation's raced state (a predecessor B being superseded by
+    // THIS run C, whose async teardown may re-register a handoff AFTER we pass this
+    // point — see dropRacedAnswerClaimantForToken). Registering C now (even with no
+    // keys yet) lets that late handoff merge into C instead of sitting until TTL.
+    if (
+      activeStreams.get(conversationId)?.token === streamToken &&
+      (racedAnswerHandoffs.has(conversationId) || liveRacedAnswerClaimant.has(conversationId))
+    ) {
       if (runtime.id === 'mastra') {
         registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
           const reinject = injectUserTurnAndRestart;
