@@ -6259,40 +6259,39 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       // the drained inject as head would then clobber the user's
                       // selection and could restart model/tools on the abandoned branch.
                       //
-                      // Every legitimate terminal-drain shape (the injected user itself
-                      // as head, an assistant mis-parented UNDER an injected user, or
-                      // main's crash-backstop assistant persisted as a SIBLING of the
-                      // first injected user) shares the PRE-INJECT HEAD — the first
-                      // injected user's parent — as a common ancestor of the current
-                      // head. A branch switch to unrelated history moves the head OUT of
-                      // that subtree. So: require the injected users to still be present
-                      // AND the current head to descend from (or be) the pre-inject head;
-                      // otherwise abandon (the inject stays persisted-but-unanswered —
+                      // The head must pass THROUGH an injected node to be a genuine
+                      // terminal-drain shape: after the renderer's idle persist (the only
+                      // state that gets us here), this turn's reply was reordered BEFORE
+                      // the inject chain with the last injected user as head — so the head
+                      // lineage contains an injected user. A user who switched to a
+                      // SIBLING assistant variant beneath the pre-inject head also reaches
+                      // that common ancestor but does NOT pass through any injected node —
+                      // so a mere "descends from preInjectHead" test would wrongly accept
+                      // it, and reorderInjectPrefixOnDisk would then mistake the selected
+                      // historical variant for the just-finished reply and reparent the
+                      // inject onto it. Require an injected node (or the run's own
+                      // just-persisted reply, injectedHead) on the lineage instead;
+                      // otherwise abandon (the inject stays persisted-but-unanswered — the
                       // user can resend; reactive recovery backstops it).
                       const injectedSet = new Set(guiInjectedIds);
                       const byId = new Map(continuationTree.map((m) => [m.id, m] as const));
                       const firstInjected = guiInjectedIds.find((id) => byId.has(id));
-                      const preInjectHead = firstInjected ? (byId.get(firstInjected)?.parentId ?? null) : undefined;
-                      const headInDrainSubtree = ((): boolean => {
+                      const headThroughInject = ((): boolean => {
                         // No injected user present on disk any more → nothing to repair here.
                         if (firstInjected === undefined) return false;
                         let cur: string | null = continuationHead;
                         const seen = new Set<string>();
                         while (cur && !seen.has(cur)) {
-                          // Head is (or descends from) an injected user, or reaches the
-                          // pre-inject head — both mean the head is still on this drain's
-                          // subtree (covers prefix-under-user, sibling-assistant, and the
-                          // plain injected-user-as-head cases).
-                          if (injectedSet.has(cur) || cur === preInjectHead) return true;
+                          // Head is (or descends from) an injected user — the only shape a
+                          // clean idle-persist of THIS turn produces. (injectedHead is one
+                          // of guiInjectedIds for a GUI turn, so it's covered by the set.)
+                          if (injectedSet.has(cur)) return true;
                           seen.add(cur);
                           cur = byId.get(cur)?.parentId ?? null;
                         }
-                        // preInjectHead === null means the injects were roots (no shared
-                        // ancestor to test); fall back to the injected-user-lineage test,
-                        // which the loop above already failed → not on the drain subtree.
                         return false;
                       })();
-                      if (!headInDrainSubtree) return;
+                      if (!headThroughInject) return;
                       const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, guiInjectedIds);
                       const reread = readConversation(appHome, conversationId);
                       if (reread && repairedHead) {
@@ -6522,14 +6521,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // DLP hook must see the same context a normal turn shows it), falling back to
     // the configured default only when the run context is unknown.
     const resolvedModelKey = ctx?.modelKey ?? config.models.defaultModelKey;
-    const resolvedSystemPrompt = ctx?.systemPrompt ?? config.systemPrompt ?? '';
+    // The ACTIVE run's system prompt is ALREADY the hook's OUTPUT (the run applied
+    // UserPromptSubmit / plugin pre-send hooks when it started). Feeding that back
+    // INTO the hooks here would double-apply a prompt-deriving hook (e.g. a suffix
+    // `…|fixture` becomes `…|fixture|fixture`), so the equality check below would
+    // flag every message as a "prompt change" and block it. So distinguish:
+    //   • hookInputPrompt — the PRE-hook base the hooks receive as input (the same
+    //     input a normal turn's hooks get): the configured default. (We can't
+    //     recover the exact pre-hook base the active run used, but the configured
+    //     default is what both the run and this gate feed the hooks, so a
+    //     content-independent hook reproduces the run's post-hook prompt from it.)
+    //   • runPostHookPrompt — the active run's post-hook prompt (ctx.systemPrompt),
+    //     the BASELINE to compare the gate's hook output against. If they match,
+    //     this message didn't cause a message-specific prompt change → allow.
+    const hookInputPrompt = config.systemPrompt ?? '';
+    const runPostHookPrompt = ctx?.systemPrompt ?? config.systemPrompt ?? '';
     let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
     // Track any hook rewrite of the system prompt. A cooperative inject splices
     // into an ALREADY-RUNNING turn whose system prompt is fixed — we CANNOT honor
     // a content-dependent prompt rewrite for this message the way a normal
-    // submission would. So if either hook changes the prompt, FAIL CLOSED rather
-    // than send the text under a prompt the policy didn't intend.
-    let effectivePrompt = resolvedSystemPrompt;
+    // submission would. So if either hook changes the prompt (vs. the run's
+    // post-hook baseline), FAIL CLOSED rather than send the text under a prompt the
+    // policy didn't intend.
+    let effectivePrompt = hookInputPrompt;
     // 1) Plugin pre-send middleware (messages:hook). An abort denies the inject; a
     //    rewrite of the sole user message is honored.
     if (hasPluginHooks && pluginManager) {
@@ -6538,7 +6552,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           messages: payload as unknown as HookMessage[],
           modelKey: resolvedModelKey,
           config,
-          systemPrompt: resolvedSystemPrompt,
+          systemPrompt: hookInputPrompt,
         });
         if (hookResult.abort)
           return { allowed: false, text: userText, reason: 'A plugin blocked this message.', terminal: true };
@@ -6570,9 +6584,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       payload = gated.messages;
       if (typeof gated.systemPrompt === 'string') effectivePrompt = gated.systemPrompt;
     }
-    // A prompt rewrite can't be applied to the running turn a cooperative inject
-    // splices into — fail closed so the text isn't sent under the stale prompt.
-    if (effectivePrompt !== resolvedSystemPrompt) {
+    // A message-specific prompt rewrite can't be applied to the running turn a
+    // cooperative inject splices into — fail closed so the text isn't sent under a
+    // prompt the policy didn't intend. Compare the gate's hook output against the
+    // ACTIVE run's post-hook baseline (NOT the hook INPUT — a content-independent
+    // hook reproduces the run's prompt from the same base, which must be allowed).
+    if (effectivePrompt !== runPostHookPrompt) {
       return {
         allowed: false,
         text: userText,
