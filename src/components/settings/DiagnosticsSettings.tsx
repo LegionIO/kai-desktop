@@ -60,12 +60,18 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             maxTotalBytes?: number;
           };
         };
+        rendererRecovery?: {
+          reloadStalledRenderer?: boolean;
+          stallReloadMs?: number;
+          gpuContextLossHardening?: boolean;
+        };
       };
     }
   ).diagnostics;
   const debugTrace = diagnostics?.debugTrace;
   const memoryDiagnostics = diagnostics?.memoryDiagnostics;
   const heapSnapshot = memoryDiagnostics?.heapSnapshot;
+  const rendererRecovery = diagnostics?.rendererRecovery;
   const ALL_SCOPES = ['agent', 'automation', 'alert', 'plugin', 'renderer', 'window'] as const;
   // Optimistic scope selection: rapid checkbox toggles before a config round-trip
   // must merge against the LATEST intended set, not the stale prop, or the second
@@ -527,6 +533,76 @@ export const DiagnosticsSettings: FC<SettingsProps> = ({ config, updateConfig })
             Oldest snapshots are evicted first once either limit is exceeded (0 = unlimited). The single newest snapshot
             is always kept even if it alone exceeds the byte cap.
           </p>
+        </div>
+      </div>
+
+      {/* Renderer recovery hardening */}
+      <div
+        className="rounded-xl border border-border/70 bg-card/60 p-4"
+        data-setting-id="diagnostics.rendererRecovery"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h4 className="text-xs font-semibold">Renderer recovery</h4>
+            <p className="mt-1 max-w-2xl text-[11px] text-muted-foreground">
+              Hardening for a renderer that comes unloaded during a display reconfigure or GPU context loss (e.g.
+              docking/undocking a monitor) and then sits wedged — a distinct failure from high-memory crashes. Auto-reload
+              revives a renderer that has stayed unloaded past the stall window instead of leaving it dead.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-3">
+          <Toggle
+            id="diagnostics.rendererRecovery.reloadStalledRenderer"
+            label="Auto-reload a stalled renderer"
+            checked={rendererRecovery?.reloadStalledRenderer ?? true}
+            onChange={(value) => void updateConfig('diagnostics.rendererRecovery.reloadStalledRenderer', value)}
+          />
+        </div>
+
+        <div className="mt-3 max-w-xs">
+          <label className="text-[11px] text-muted-foreground">
+            Stall window before reload (seconds)
+            <input
+              type="number"
+              min={5}
+              max={300}
+              disabled={!(rendererRecovery?.reloadStalledRenderer ?? true)}
+              value={Math.round((rendererRecovery?.stallReloadMs ?? 30000) / 1000)}
+              onChange={(event) =>
+                void updateConfig(
+                  'diagnostics.rendererRecovery.stallReloadMs',
+                  Math.min(300, Math.max(5, Number(event.target.value) || 30)) * 1000,
+                )
+              }
+              className="mt-1 w-full rounded-lg border border-border/70 bg-card/80 px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+            />
+          </label>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            A normal load finishes in under 2s; 30s is a safe margin that still revives a wedged renderer within one
+            recovery cycle.
+          </p>
+        </div>
+
+        <div className="mt-4 rounded-lg border border-border/60 bg-background/40 p-3">
+          <Toggle
+            id="diagnostics.rendererRecovery.gpuContextLossHardening"
+            label="GPU context-loss hardening"
+            checked={rendererRecovery?.gpuContextLossHardening ?? false}
+            onChange={(value) => void updateConfig('diagnostics.rendererRecovery.gpuContextLossHardening', value)}
+          />
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Keeps canvas/image rasterization in-process so losing the GPU process during a display change can’t crash the
+            renderer’s decode path. Changes app-wide GPU behavior (a small rendering-performance tradeoff) and only takes
+            effect after you fully quit and reopen the app. Off by default — enable only if display-change crashes recur.
+          </p>
+          {rendererRecovery?.gpuContextLossHardening && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-600 dark:text-amber-400">
+              <AlertTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>Restart required — this applies on the next launch.</span>
+            </div>
+          )}
         </div>
       </div>
 

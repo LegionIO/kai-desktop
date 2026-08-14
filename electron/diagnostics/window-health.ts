@@ -9,6 +9,12 @@ const ACTIVE_WORK_RETRY_MS = 15_000;
 const AUTO_RELOAD_COOLDOWN_MS = 60_000;
 const AUTO_RELOAD_WINDOW_MS = 10 * 60_000;
 const MAX_AUTO_RELOADS_PER_WINDOW = 2;
+// A renderer normally finishes loading in well under 2s. If it stays unloaded
+// past this and recovery keeps getting skipped (the display-reconfigure / GPU
+// context-loss zombie: `did-finish-load` never re-fires), treat it as wedged and
+// force a reload rather than skipping forever. Used only when no policy is
+// injected (tests / defensive default).
+const STALL_RELOAD_MS = 30_000;
 // Renderer JS-heap thresholds for the heap-pressure warning. Either an absolute
 // used-MB ceiling OR a used/limit ratio trips it — a V8/cppgc OOM abort (SIGTRAP
 // during GC) is preceded by the heap climbing toward jsHeapSizeLimit, so leaving
@@ -101,6 +107,14 @@ export interface WindowHealthMonitorOptions {
    * retention. Errors are swallowed by the monitor.
    */
   onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
+  /**
+   * Live renderer-recovery policy. When `reloadStalledRenderer` is set, a
+   * renderer that has been unloaded longer than `stallReloadMs` is force-reloaded
+   * instead of being skipped forever (the display-reconfigure / GPU context-loss
+   * zombie case). Read live so the GUI toggle applies without a relaunch. When
+   * omitted, the built-in default (reload after 30s) applies.
+   */
+  getRendererRecoveryPolicy?: () => { reloadStalledRenderer: boolean; stallReloadMs: number } | null;
   now?: () => number;
   probe?: (window: HealthWindow) => Promise<WindowHealthProbeResult>;
   /** Heap-only sampler for the heartbeat (injectable for tests). */
@@ -352,9 +366,28 @@ export async function sampleRendererHeap(window: HealthWindow): Promise<Renderer
 export class WindowHealthMonitor {
   private readonly now: () => number;
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Bookkeeping so a newly-requested recovery can tell whether it wants to run
+  // sooner than the currently-armed timer (and pre-empt it) vs. coalesce.
+  private recoveryTimerArmedAt: number | null = null;
+  private recoveryTimerDelayMs = 0;
   private recoveryRunning = false;
   private pendingTrigger: string | null = null;
   private loadedWebContentsIds = new Set<number>();
+  // Wall-clock when the current renderer entered the unloaded state (attach /
+  // did-start-loading), cleared on did-finish-load. Lets recovery distinguish a
+  // renderer that's briefly loading from one wedged unloaded for tens of seconds.
+  private unloadedSince: number | null = null;
+  // Whether the CURRENT renderer's main frame has ever finished loading. A
+  // never-loaded startup window stays show:false (no ready-to-show), so it must
+  // be reloadable even while hidden; a window that loaded before and is now
+  // hidden must NOT be force-reloaded (it may be intentionally hidden). Reset on
+  // attach (new renderer).
+  private everLoaded = false;
+  // When runRecovery skips a not-yet-stalled unloaded renderer, it records the
+  // ms until the stall deadline here; the finally arms a single follow-up
+  // recovery at that delay (can't call requestRecovery inline — it would coalesce
+  // under the running guard and the finally would then use a fixed 1s delay).
+  private stallDeadlineRescheduleMs: number | null = null;
   private reloadHistory: number[] = [];
   private attachedWindow: HealthWindow | null = null;
   private windowListeners: Array<{ event: string; listener: (...args: never[]) => void }> = [];
@@ -513,6 +546,10 @@ export class WindowHealthMonitor {
   attachWindow(window: HealthWindow): void {
     this.detachWindow();
     this.attachedWindow = window;
+    // The renderer is unloaded until its first did-finish-load; start the stall
+    // clock now so a window that never finishes its initial load is recoverable.
+    this.unloadedSince = this.now();
+    this.everLoaded = false;
     // Re-arm the heap-snapshot latch for the NEW renderer: it was disarmed after capturing
     // the OLD renderer (armed re-only when the heap dips below the re-arm boundary). A
     // replacement renderer that starts ABOVE the threshold would otherwise never trigger its
@@ -536,7 +573,44 @@ export class WindowHealthMonitor {
     });
     onContents('did-finish-load', () => {
       this.loadedWebContentsIds.add(contents.id);
+      this.everLoaded = true;
       this.log('main-renderer-load-finished', this.windowDetails(window), true);
+    });
+    // The stall clock keys on MAIN-FRAME navigation only. did-start-loading /
+    // did-finish-load / did-fail-load are aggregate WebContents events that also
+    // fire for subframes — Kai renders artifact/code previews in <iframe>s — so
+    // an iframe load must NOT arm the stall clock (that would force-reload a
+    // healthy main renderer after 30s and discard UI state). did-start-navigation
+    // and did-frame-finish-load carry isMainFrame; use them for the stall clock.
+    onContents('did-start-navigation', (...args: never[]) => {
+      const details = args[0] as { isMainFrame?: boolean } | undefined;
+      if (!details?.isMainFrame) return;
+      // Main frame started (re)navigating → renderer is unloaded until
+      // did-frame-finish-load. Arm the stall watchdog for EVERY main-frame
+      // navigation, not just recovery-initiated reloads: a reload from any path
+      // (crash auto-reload, two-probe recovery, or a normal navigation) that
+      // then silently wedges must still be caught without waiting on an
+      // unrelated focus/display event. The loop-guard caps actual reloads.
+      this.unloadedSince = this.now();
+      this.armStallWatchdog();
+    });
+    onContents('did-frame-finish-load', (...args: never[]) => {
+      const isMainFrame = args[1] as boolean | undefined;
+      if (isMainFrame) {
+        this.unloadedSince = null;
+        this.everLoaded = true;
+      }
+    });
+    onContents('did-fail-load', (...args: never[]) => {
+      // Only a MAIN-FRAME load failure matters: a display reconfigure / context
+      // loss can abort the main-frame load, leaving the renderer unloaded with no
+      // did-frame-finish-load to follow. A subframe (iframe preview) failing to
+      // load is not a renderer stall. Re-arm recovery so the stall-reload path
+      // fires once the main frame has been unloaded past the threshold.
+      const isMainFrame = args[4] as boolean | undefined;
+      if (!isMainFrame) return;
+      this.log('main-renderer-load-failed', this.windowDetails(window), true);
+      this.requestRecovery('renderer-load-failed', 750);
     });
     onContents('unresponsive', () => {
       this.log('main-renderer-unresponsive', this.windowDetails(window), true);
@@ -642,6 +716,7 @@ export class WindowHealthMonitor {
     if (this.recoveryTimer) {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = null;
+      this.recoveryTimerArmedAt = null;
     }
     const window = this.attachedWindow;
     if (window) {
@@ -651,6 +726,8 @@ export class WindowHealthMonitor {
     this.windowListeners = [];
     this.contentsListeners = [];
     this.attachedWindow = null;
+    this.unloadedSince = null;
+    this.stallDeadlineRescheduleMs = null;
     this.pendingTrigger = null;
     this.recoveryRunning = false;
   }
@@ -684,17 +761,54 @@ export class WindowHealthMonitor {
     if (isPrimary) this.reloadAfterRendererCrash(String(details.reason ?? 'unknown'));
   }
 
+  /**
+   * Schedule a recovery at the stall deadline so an unloaded/wedged renderer is
+   * re-checked without waiting on an external focus/display event. Called from
+   * every main-frame navigation start (covers all reload paths) and from the
+   * cooldown-suppressed branch. No-op when stall-reload is disabled. requestRecovery
+   * pre-empts/coalesces, so calling this repeatedly is safe.
+   */
+  private armStallWatchdog(extraDelayMs = 0): void {
+    const policy = this.options.getRendererRecoveryPolicy?.() ?? {
+      reloadStalledRenderer: true,
+      stallReloadMs: STALL_RELOAD_MS,
+    };
+    if (!policy.reloadStalledRenderer) return;
+    this.requestRecovery('stall-watchdog', Math.max(250, policy.stallReloadMs + 250 + extraDelayMs));
+  }
+
   requestRecovery(trigger: string, delayMs = 1_000): void {
     this.pendingTrigger = trigger;
-    if (this.recoveryTimer || this.recoveryRunning) {
+    if (this.recoveryRunning) {
       this.log('recovery-coalesced', { trigger });
       return;
     }
+    if (this.recoveryTimer) {
+      // A timer is already pending. If the new request wants to run at least as
+      // soon as what's scheduled, replace it (a fresh focus/display trigger must
+      // not be blocked behind a longer stall-deadline backstop); otherwise
+      // coalesce. Uses `>` so an equally-soon (or already-due) trigger pre-empts.
+      if (delayMs > this.pendingRecoveryDelayRemainingMs()) {
+        this.log('recovery-coalesced', { trigger });
+        return;
+      }
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
     this.log('recovery-scheduled', { trigger, delayMs });
+    this.recoveryTimerArmedAt = this.now();
+    this.recoveryTimerDelayMs = delayMs;
     this.recoveryTimer = setTimeout(() => {
       this.recoveryTimer = null;
       void this.runRecovery(trigger);
     }, delayMs);
+  }
+
+  /** Remaining ms on the currently-armed recovery timer (Infinity if none). */
+  private pendingRecoveryDelayRemainingMs(): number {
+    if (this.recoveryTimer === null || this.recoveryTimerArmedAt === null) return Infinity;
+    const elapsed = this.now() - this.recoveryTimerArmedAt;
+    return Math.max(0, this.recoveryTimerDelayMs - elapsed);
   }
 
   private async runRecovery(trigger: string): Promise<void> {
@@ -718,11 +832,115 @@ export class WindowHealthMonitor {
         return;
       }
       if (!window.isVisible() || window.isMinimized()) {
-        this.log('recovery-skipped', { trigger, reason: 'window-not-presented', ...this.windowDetails(window) });
+        const unloadedMs = this.unloadedSince === null ? 0 : this.now() - this.unloadedSince;
+        const policy = this.options.getRendererRecoveryPolicy?.() ?? {
+          reloadStalledRenderer: true,
+          stallReloadMs: STALL_RELOAD_MS,
+        };
+        // A never-loaded STARTUP window stays show:false because it can't emit
+        // ready-to-show until it loads — so it must be reloadable even while
+        // hidden, or an initial stall is unrecoverable. A window that HAS loaded
+        // and is now hidden may be intentionally hidden: don't force-reload it,
+        // just keep the watchdog alive (it'll recover once shown).
+        const neverLoaded = !this.everLoaded && !this.loadedWebContentsIds.has(window.webContents.id);
+        if (
+          policy.reloadStalledRenderer &&
+          neverLoaded &&
+          this.unloadedSince !== null &&
+          unloadedMs >= policy.stallReloadMs
+        ) {
+          if (!this.canAutoReload()) {
+            const cooldownMs = this.cooldownRemainingMs();
+            this.log(
+              'auto-reload-suppressed',
+              { trigger, reason: 'reload-loop-guard', context: 'hidden-startup-stall', unloadedMs, cooldownMs },
+              true,
+            );
+            if (cooldownMs > 0) this.stallDeadlineRescheduleMs = cooldownMs + 250;
+            return;
+          }
+          this.reloadHistory.push(this.now());
+          this.log('renderer-reload-stalled-load', { trigger, context: 'hidden-startup', unloadedMs, ...this.windowDetails(window) }, true);
+          this.unloadedSince = this.now();
+          this.stallDeadlineRescheduleMs = policy.stallReloadMs + 250;
+          window.webContents.reload();
+          return;
+        }
+        this.log('recovery-skipped', {
+          trigger,
+          reason: 'window-not-presented',
+          unloadedMs,
+          ...this.windowDetails(window),
+        });
+        // Previously-presented hidden window that's unloaded: keep re-checking
+        // at the CONFIGURED stall cadence (not a hardcoded default).
+        if (policy.reloadStalledRenderer && this.unloadedSince !== null && !this.loadedWebContentsIds.has(window.webContents.id)) {
+          this.stallDeadlineRescheduleMs = policy.stallReloadMs + 250;
+        }
         return;
       }
       if (!this.loadedWebContentsIds.has(window.webContents.id)) {
-        this.log('recovery-skipped', { trigger, reason: 'renderer-not-loaded', ...this.windowDetails(window) });
+        // Renderer isn't loaded. Normally this is a brief in-flight load and we
+        // skip. But a display-reconfigure / GPU context-loss zombie stays
+        // unloaded forever (did-finish-load never re-fires) — the crash logs
+        // showed ~8h of this skip. If it's been unloaded past the stall
+        // threshold, force a reload through the loop-guard instead of skipping.
+        const policy = this.options.getRendererRecoveryPolicy?.() ?? {
+          reloadStalledRenderer: true,
+          stallReloadMs: STALL_RELOAD_MS,
+        };
+        const unloadedMs = this.unloadedSince === null ? 0 : this.now() - this.unloadedSince;
+        if (policy.reloadStalledRenderer && this.unloadedSince !== null && unloadedMs >= policy.stallReloadMs) {
+          if (!this.canAutoReload()) {
+            // The default watchdog can land inside the 60s auto-reload cooldown
+            // (stallReloadMs is ~30s). Rather than give up — which would leave the
+            // renderer wedged until an unrelated event — reschedule for when the
+            // cooldown expires so the retry actually gets to reload. If the block
+            // is the per-window COUNT cap instead (cooldownRemaining==0), don't
+            // reschedule: the cap is a genuine "stop trying" backstop.
+            const cooldownMs = this.cooldownRemainingMs();
+            this.log(
+              'auto-reload-suppressed',
+              { trigger, reason: 'reload-loop-guard', context: 'stalled-load', unloadedMs, cooldownMs },
+              true,
+            );
+            if (cooldownMs > 0) this.stallDeadlineRescheduleMs = cooldownMs + 250;
+            return;
+          }
+          this.reloadHistory.push(this.now());
+          this.log('renderer-reload-stalled-load', { trigger, unloadedMs, ...this.windowDetails(window) }, true);
+          // Reset the stall clock so the loop-guard (not this timer) paces any retry,
+          // and arm a post-reload watchdog: reload() fires did-start-loading but no
+          // listener re-triggers recovery, so if THIS reload also wedges (no
+          // did-finish-load / did-fail-load) nothing would re-check. Schedule a
+          // follow-up one stall window out (armed by the finally); the loop-guard
+          // caps how many times this can actually reload, so it can't hot-loop.
+          this.unloadedSince = this.now();
+          this.stallDeadlineRescheduleMs = policy.stallReloadMs + 250;
+          window.webContents.reload();
+          return;
+        }
+        // Unloaded but not yet past the stall threshold. Skip probing now, but if
+        // stall-reload is enabled and the clock is running, self-schedule a
+        // follow-up at the remaining deadline — otherwise a zombie renderer with
+        // no further focus/display events would stay unloaded forever (the branch
+        // above only fires when SOMETHING re-triggers recovery after the
+        // threshold). Recorded here and armed by the finally (we're inside a
+        // running recovery, so requestRecovery would just coalesce); +250ms
+        // guards against firing a hair early.
+        if (policy.reloadStalledRenderer && this.unloadedSince !== null) {
+          const remainingMs = Math.max(250, policy.stallReloadMs - unloadedMs + 250);
+          this.log('recovery-skipped', {
+            trigger,
+            reason: 'renderer-not-loaded',
+            unloadedMs,
+            rescheduleInMs: remainingMs,
+            ...this.windowDetails(window),
+          });
+          this.stallDeadlineRescheduleMs = remainingMs;
+          return;
+        }
+        this.log('recovery-skipped', { trigger, reason: 'renderer-not-loaded', unloadedMs, ...this.windowDetails(window) });
         return;
       }
 
@@ -780,8 +998,16 @@ export class WindowHealthMonitor {
       // above is guarded by an immediate return + fresh requestRecovery.)
       if (window === null || this.options.getPrimaryWindow() === window) {
         this.recoveryRunning = false;
-        const pending = this.pendingTrigger;
-        if (pending && !this.recoveryTimer) this.requestRecovery(pending, 1_000);
+        // Honor a stall-deadline reschedule first (specific delay), else fall back
+        // to the generic pending-trigger reschedule.
+        const stallMs = this.stallDeadlineRescheduleMs;
+        this.stallDeadlineRescheduleMs = null;
+        if (stallMs !== null && !this.recoveryTimer) {
+          this.requestRecovery('stalled-load-deadline', stallMs);
+        } else {
+          const pending = this.pendingTrigger;
+          if (pending && !this.recoveryTimer) this.requestRecovery(pending, 1_000);
+        }
       }
     }
   }
@@ -804,6 +1030,19 @@ export class WindowHealthMonitor {
     const latest = this.reloadHistory.at(-1);
     if (latest !== undefined && now - latest < AUTO_RELOAD_COOLDOWN_MS) return false;
     return this.reloadHistory.length < MAX_AUTO_RELOADS_PER_WINDOW;
+  }
+
+  /**
+   * Ms until `canAutoReload()` would next return true because of the COOLDOWN
+   * (not the per-window cap). 0 if reloading is already allowed or the block is
+   * the count cap (which the cooldown can't clear). Lets the suppressed
+   * stall-reload branch reschedule for the cooldown's expiry instead of giving up.
+   */
+  private cooldownRemainingMs(): number {
+    const now = this.now();
+    const latest = this.reloadHistory.at(-1);
+    if (latest === undefined) return 0;
+    return Math.max(0, AUTO_RELOAD_COOLDOWN_MS - (now - latest));
   }
 
   private windowDetails(window: HealthWindow): Record<string, unknown> {

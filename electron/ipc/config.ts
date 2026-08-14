@@ -308,6 +308,7 @@ function getDefaultConfig() {
         windowHealthLogMaxBytes: 10485760,
         heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
       },
+      rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },
     },
     advanced: {
       temperature: 0.4,

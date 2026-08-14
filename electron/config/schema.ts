@@ -1230,6 +1230,35 @@ export const appConfigSchema = z.object({
           windowHealthLogMaxBytes: 10485760,
           heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
         }),
+      /**
+       * Renderer crash-recovery hardening. Separate from memoryDiagnostics (that
+       * chases the heap-OOM leak); this targets the OTHER observed crash mode — a
+       * renderer that comes unloaded during a display reconfigure / GPU
+       * context-loss (stack: rust_png decode → cppgc GC) and then sits wedged.
+       * The window-health monitor logged `recovery-skipped renderer-not-loaded`
+       * for ~8h because a zombie renderer never re-fires `did-finish-load`.
+       */
+      rendererRecovery: z
+        .object({
+          /**
+           * Force-reload a renderer that has been unloaded longer than
+           * `stallReloadMs` (via the existing auto-reload loop-guard) instead of
+           * skipping recovery forever. Acts only on an already-unloaded renderer,
+           * so a healthy one is never reloaded — safe to default on. Also re-arms
+           * recovery on `did-fail-load`. Live (no relaunch).
+           */
+          reloadStalledRenderer: z.boolean().default(true),
+          /** How long a renderer may stay unloaded before it's treated as wedged. */
+          stallReloadMs: z.number().int().min(5000).max(300000).default(30000),
+          /**
+           * Keep canvas/PNG rasterization in-process so a GPU-process context
+           * loss during a display reconfigure can't take the decode path down.
+           * Changes app-wide GPU behavior (perf tradeoff) → opt-in, and applied
+           * via a command-line switch at startup, so it is RESTART-REQUIRED.
+           */
+          gpuContextLossHardening: z.boolean().default(false),
+        })
+        .default({ reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false }),
     })
     .default({
       debugTrace: {
@@ -1243,6 +1272,7 @@ export const appConfigSchema = z.object({
         windowHealthLogMaxBytes: 10485760,
         heapSnapshot: { enabled: false, thresholdPct: 85, maxCount: 3, maxTotalBytes: 6442450944 },
       },
+      rendererRecovery: { reloadStalledRenderer: true, stallReloadMs: 30000, gpuContextLossHardening: false },
     }),
   advanced: z.object({
     temperature: z.number().min(0).max(2),
