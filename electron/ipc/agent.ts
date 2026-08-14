@@ -1000,6 +1000,15 @@ function purgeRacedAnswerForKey(answerKey: string): void {
 function dropRacedAnswerClaimantForToken(conversationId: string, token: string): void {
   const claimant = liveRacedAnswerClaimant.get(conversationId);
   if (claimant && claimant.token === token) {
+    // A TERMINAL abort of this token (explicit Stop, or a genuine exit_plan_mode
+    // dismiss — which marks the token terminal WITHOUT bumping the cancel gen) must
+    // DISCARD the claimant's keys, NOT re-register them: there is no successor, so a
+    // late answer must not reach a later unrelated turn. (racedStateInvalid only
+    // catches a cancel-gen bump, so check terminalAbortTokens explicitly.)
+    if (terminalAbortTokens.has(token)) {
+      liveRacedAnswerClaimant.delete(conversationId);
+      return;
+    }
     // The claimant is torn down but may STILL hold undelivered answer keys (a slow
     // or remote answer that never arrived before this successor finished). Don't
     // lose them: re-register them as a pre-successor handoff so a LATER turn (or a
@@ -1085,6 +1094,15 @@ function registerLiveRacedAnswerClaimant(
   }
   racedAnswerHandoffs.delete(conversationId); // transfer out of the pre-successor map
   if (racedStateInvalid(handoff, conversationId)) return; // expired / Stop → drop (answers stay stashed)
+  // If a PRIOR claimant (a superseded predecessor B whose teardown is still pending)
+  // still holds undelivered keys, MERGE them into the handoff before replacing it —
+  // else overwriting B's claimant here loses A's keys B was carrying, and B's later
+  // teardown sees C's token and can't recover them. Keep the earliest expiry.
+  const priorClaimant = liveRacedAnswerClaimant.get(conversationId);
+  if (priorClaimant && priorClaimant.token !== token) {
+    for (const k of priorClaimant.state.answerKeys) handoff.answerKeys.add(k);
+    handoff.expiresAt = Math.min(handoff.expiresAt, priorClaimant.state.expiresAt);
+  }
   liveRacedAnswerClaimant.set(conversationId, { token, deliver, state: handoff });
   attemptRacedAnswerDelivery(conversationId);
 }
@@ -2387,6 +2405,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       (racedAnswerHandoffs.has(conversationId) || liveRacedAnswerClaimant.has(conversationId))
     ) {
       if (runtime.id === 'mastra') {
+        // Bind an UNBOUND pending handoff (a plan-restart, whose successor token was
+        // unknown at abort) to THIS admitted successor, so that if this run dies
+        // before/without claiming (config/hook fail), its teardown
+        // (dropRacedAnswerClaimantForToken, expectedSuccessorToken === token) drops
+        // the handoff instead of leaving it claimable by a later unrelated turn.
+        const pending = racedAnswerHandoffs.get(conversationId);
+        if (pending && pending.expectedSuccessorToken === undefined) {
+          pending.expectedSuccessorToken = streamToken;
+        }
         registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
           const reinject = injectUserTurnAndRestart;
           if (!reinject) return { ok: false };
@@ -2410,7 +2437,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       } else {
         // Non-Mastra successor can't cooperatively inject — invalidate the handoff
         // (answers stay in the bounded stash) so it can't attach to a later turn.
+        // ALSO clear a token-mismatched live claimant left by a superseded Mastra
+        // predecessor whose teardown is still pending: if THIS non-Mastra run
+        // finishes first, its cleanup wouldn't touch that claimant (token mismatch),
+        // and a subsequent Mastra turn could inherit + inject the stale answer.
         racedAnswerHandoffs.delete(conversationId);
+        liveRacedAnswerClaimant.delete(conversationId);
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-dropped-non-mastra',
