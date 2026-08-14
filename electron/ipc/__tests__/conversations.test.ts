@@ -997,6 +997,30 @@ describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user re
     expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst', 'inject']);
   });
 
+  it('selects the ACTIVE variant when a fallback left two assistants under the injected user', () => {
+    // A transient model-fallback left both a failed partial (asst-failed) and the
+    // successful reply (asst-ok) under the injected user; head = asst-ok (active).
+    // Repair must thread asst-ok (not asst-failed) before the user: u1 → asst-ok → inject.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+        { id: 'asst-failed', parentId: 'inject', role: 'assistant', content: 'partial' },
+        { id: 'asst-ok', parentId: 'inject', role: 'assistant', content: 'reply' },
+      ],
+      'asst-ok',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['inject']);
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'asst-ok')?.parentId).toBe('u1');
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst-ok');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst-ok', 'inject']);
+  });
+
   it('moves the prefix before the whole chain for a MULTI-inject batch', () => {
     // Renderer parented the assistant under the LAST injected user (u2):
     // pre → u1 → u2 → asst (head=asst). Repair → pre → asst → u1 → u2 (head=u2).

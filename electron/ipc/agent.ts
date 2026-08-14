@@ -6922,8 +6922,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       controller.abort();
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).
+      const stillOwnedAtCancel = activeStreams.get(conversationId)?.token === controller.token;
       deleteStreamIfOwned(conversationId, controller.token);
       activeStreamModelKeys.delete(conversationId);
+      // deleteStreamIfOwned removed activeStreams synchronously, so the aborted
+      // run's finally → cleanupStreamIfOwned finds no owned entry and SKIPS
+      // activeStreamRuntime.delete — leaking that entry (which now holds the run's
+      // model key + system prompt) in an unbounded map. Clear it HERE, but only when
+      // WE still owned the token (don't clobber a replacement run's fresh entry).
+      if (stillOwnedAtCancel && activeStreamRuntime.get(conversationId)?.token === controller.token) {
+        activeStreamRuntime.delete(conversationId);
+      }
     }
     activeObserverSessions.delete(conversationId);
     // Clear same-turn inject bookkeeping here too: deleteStreamIfOwned above removes

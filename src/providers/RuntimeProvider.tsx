@@ -3850,9 +3850,17 @@ export function RuntimeProvider({
         // instead of reusing the first continuation node.
         const acc2 = streamAccumulators.get(convId);
         if (acc2) {
-          const entries = ((e as { data?: { entries?: Array<{ id?: unknown }> } }).data?.entries ?? []).filter(
+          const rawEntries = ((e as { data?: { entries?: Array<{ id?: unknown }> } }).data?.entries ?? []).filter(
             (en): en is { id: string } => typeof en?.id === 'string',
           );
+          // Filter to ids that actually MATERIALIZED as a node in this accumulator.
+          // Two queued injects with identical post-policy text collapse to ONE node
+          // (the `user-message` text-dedup skips the 2nd), yet the inject-consumed
+          // batch carries BOTH ids — advancing headId to the absent 2nd id would
+          // parent later output on a missing node (branch diverges from disk). Only
+          // reorder/rotate around ids that have a real node here.
+          const presentIds = new Set(acc2.messages.map((m) => m.id));
+          const entries = rawEntries.filter((en) => presentIds.has(en.id));
           // ORDERING REPAIR (batch-aware) for the "inject(s) broadcast before the
           // prefix existed" case: if the prior step's first assistant delta arrived
           // AFTER the user-message handler advanced the head to the injected user(s),

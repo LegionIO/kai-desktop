@@ -575,10 +575,26 @@ export function reorderInjectPrefixOnDisk(
   if (present.length === 0) return headId;
   const lastInjected = present[present.length - 1];
   const idSet = new Set(present);
-  // The misplaced prefix: a lone assistant whose parent is one of the injected users.
-  const prefixes = tree.filter(
+  // Assistant node(s) parented UNDER an injected user (mis-ordered prefix). A
+  // transient model-fallback can leave MULTIPLE variants under the same injected
+  // user (a failed partial + the successful reply); pick the ACTIVE one — the
+  // variant on the current head's ancestor lineage — so the successful reply (not
+  // a failed sibling) is the one threaded before the chain.
+  const allPrefixes = tree.filter(
     (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId),
   );
+  const byIdForLineage = new Map(tree.map((m) => [m.id, m] as const));
+  const onHeadLineage = (id: string): boolean => {
+    let cur: string | null = headId;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      if (cur === id) return true;
+      seen.add(cur);
+      cur = byIdForLineage.get(cur)?.parentId ?? null;
+    }
+    return false;
+  };
+  const prefixes = allPrefixes.length > 1 ? allPrefixes.filter((m) => onHeadLineage(m.id)) : allPrefixes;
   if (prefixes.length !== 1) {
     // No assistant is parented UNDER an injected user. Two sub-cases:
     //   (a) main's crash-backstop fallback finalized the turn's assistant as a
