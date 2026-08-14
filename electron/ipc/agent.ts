@@ -1436,8 +1436,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const prefixHead = finalizeGuiFallbackPrefixAtInject(appHome, conversationId, entry.id);
           if (prefixHead) {
             // Attach the pre-persisted injected user onto the finalized prefix so
-            // the fallback branch reads prefix-assistant → injected-user → cont.
-            reparentConversationMessage(appHome, conversationId, entry.id, prefixHead);
+            // the fallback branch reads prefix-assistant → injected-user → cont,
+            // AND advance the head to the injected user — the prefix finalize
+            // moved the head onto the prefix, so without this a renderer crash
+            // before any continuation content would reload with the head on the
+            // prefix and the injected user hidden off the active branch.
+            reparentConversationMessage(appHome, conversationId, entry.id, prefixHead, { makeHead: true });
           }
           lastInjectedId = entry.id;
         }

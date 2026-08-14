@@ -478,7 +478,15 @@ export function finalizeGuiFallbackPrefixAtInject(
   if (!conversationId || !injectedUserId) return null;
   const acc = accumulators.get(conversationId);
   const hasPrefix = !!acc && acc.sawContent && acc.parts.length > 0;
-  const prefixHead = hasPrefix ? persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true }) : null;
+  // replaceById: the RENDERER (authoritative) may have already persisted this
+  // prefix assistant under the same responseMessageId via its debounce. Appending
+  // would id-collision-rename into a bogus duplicate variant that conversations:put
+  // union-merge then preserves. Upsert the existing node in place instead (falls
+  // through to a normal append when no such node exists yet). keepRunning: the
+  // turn is still live.
+  const prefixHead = hasPrefix
+    ? persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true, replaceById: true })
+    : null;
   // Re-seed a fresh continuation accumulator parented on the injected user (its
   // own children — the continuation reply — then parent correctly on a crash).
   accumulators.set(conversationId, {

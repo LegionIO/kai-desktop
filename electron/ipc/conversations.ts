@@ -475,13 +475,17 @@ export function insertConversationMessageBefore(
 }
 
 /**
- * Repoint an EXISTING node's parent to `newParentId` (a sibling-level reparent),
- * keeping the head unchanged. Used at the GUI cooperative-inject boundary: the
- * injected user node was pre-persisted parented on the pre-inject head, and main
- * then finalizes its fallback assistant PREFIX under that same head — leaving the
- * two as siblings. Reparent the injected user ONTO the finalized prefix so a
- * renderer-crash fallback finalize yields the correct chronology
+ * Repoint an EXISTING node's parent to `newParentId` (a sibling-level reparent).
+ * Used at the GUI cooperative-inject boundary: the injected user node was
+ * pre-persisted parented on the pre-inject head, and main then finalizes its
+ * fallback assistant PREFIX under that same head — leaving the two as siblings.
+ * Reparent the injected user ONTO the finalized prefix so a renderer-crash
+ * fallback finalize yields the correct chronology
  *   … → prefix-assistant → injected-user → continuation.
+ * With `makeHead: true`, also advance the head to the reparented node — the
+ * injected user is the active tail until a continuation assistant appends onto
+ * it, so a crash before any continuation content still reloads WITH the injected
+ * user on the active branch (else the head would sit on the prefix and hide it).
  * No-op if either id is absent, they're equal, already parented, or newParentId
  * is a descendant of messageId (would create a cycle).
  */
@@ -490,6 +494,7 @@ export function reparentConversationMessage(
   conversationId: string,
   messageId: string,
   newParentId: string,
+  options: { makeHead?: boolean } = {},
 ): ConversationRecord | null {
   if (!messageId || !newParentId || messageId === newParentId) return null;
   const conv = readConversation(appHome, conversationId);
@@ -498,7 +503,7 @@ export function reparentConversationMessage(
   const node = tree.find((m) => m.id === messageId);
   const newParent = tree.find((m) => m.id === newParentId);
   if (!node || !newParent) return null;
-  if (node.parentId === newParentId) return conv; // already parented there — no-op
+  const alreadyParented = node.parentId === newParentId;
   // Cycle guard: walk up from newParentId; if we reach messageId, reparenting
   // would form a loop. Bounded by tree size.
   const byId = new Map(tree.map((m) => [m.id, m] as const));
@@ -510,12 +515,17 @@ export function reparentConversationMessage(
     cursor = byId.get(cursor)?.parentId ?? null;
   }
   const now = new Date().toISOString();
-  const nextTree = tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
-  const branch = getConversationBranch(nextTree, headId);
+  const nextTree = alreadyParented
+    ? tree
+    : tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
+  const nextHead = options.makeHead ? messageId : headId;
+  if (alreadyParented && nextHead === headId) return conv; // nothing to change
+  const branch = getConversationBranch(nextTree, nextHead);
   const next: ConversationRecord = {
     ...conv,
     messageTree: nextTree,
     messages: branch,
+    headId: nextHead,
     updatedAt: now,
     messageCount: branch.length,
     userMessageCount: branch.filter((m) => m.role === 'user').length,
