@@ -5418,6 +5418,24 @@ export function RuntimeProvider({
             // surface the reason for the user).
             if (res.blocked) {
               if (res.error) console.warn(`[mid-turn-inject] blocked: ${res.error}`);
+              // The composer already cleared the submitted text on send. A policy
+              // block is terminal (no resend), but the draft must NOT be silently
+              // lost — restore it the same way the conversation-busy rejection does:
+              // put it straight back if this chat is active with an empty composer,
+              // else stash it (FIFO) for restoration when the user returns here.
+              if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+                const composerHasNewDraft =
+                  activeIdRef.current === convId &&
+                  (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
+                const canRestoreNow =
+                  activeIdRef.current === convId && attachmentsRef.current.length === 0 && !composerHasNewDraft;
+                if (canRestoreNow) {
+                  if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
+                  restoreComposerDraft(submittedText);
+                } else {
+                  enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
+                }
+              }
               return;
             }
             // Not cooperatively injectable (CLI runtime / race) — fall through to a
