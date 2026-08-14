@@ -52,6 +52,7 @@ import {
   hasInjects,
   listInjects,
   removeInject,
+  reenqueueFreshAtFront,
 } from '../agent/inject-queue.js';
 import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
@@ -177,6 +178,7 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
   consumedInjectBytes.delete(conversationId);
+  consumedInjectTexts.delete(conversationId);
 }
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
@@ -218,7 +220,13 @@ export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allow
   if (payload.length !== 1) return { allowed: false, text: '' };
   const only = payload[0] as { role?: unknown; content?: unknown } | null;
   if (!only || typeof only !== 'object' || only.role !== 'user') return { allowed: false, text: '' };
-  if (typeof only.content === 'string') return { allowed: true, text: only.content };
+  // A hook that redacts the message to EMPTY text is effectively removing it — an
+  // empty inject can't be enqueued (enqueueInject rejects it) and would otherwise
+  // trigger a spurious supersede / a 20× retry. Treat empty resolved text as a
+  // terminal removal (allowed:false) at every branch below.
+  if (typeof only.content === 'string') {
+    return only.content.trim().length > 0 ? { allowed: true, text: only.content } : { allowed: false, text: '' };
+  }
   if (!Array.isArray(only.content)) return { allowed: false, text: '' };
   // Concatenate text parts VERBATIM; reject if any non-text part is present (an
   // inject is a plain user-text turn — a hook that introduced media/file parts
@@ -230,7 +238,7 @@ export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allow
     if (p.type !== 'text') return { allowed: false, text: '' };
     text += p.text ?? '';
   }
-  return { allowed: true, text };
+  return text.trim().length > 0 ? { allowed: true, text } : { allowed: false, text: '' };
 }
 
 /**
@@ -371,6 +379,11 @@ const conversationsWithConsumedInject = new Set<string>();
  *  conservative token proxy) or a big inject + a media tool could overflow the next
  *  step. Cleared at each turn start. */
 const consumedInjectBytes = new Map<string, number>();
+/** Texts of mid-turn injects CONSUMED this turn (FIFO), per conversation. Used to
+ *  REQUEUE them on a mid-stream model-fallback (which restarts from the original
+ *  messages with the queue already drained), so the fallback attempt's prepareStep
+ *  re-splices a just-consumed injected answer. Cleared at each turn's terminal. */
+const consumedInjectTexts = new Map<string, string[]>();
 
 // Track the runtime driving each active stream, so a mid-turn inject can route:
 // the Mastra runtime supports cooperative step-boundary injection (prepareStep +
@@ -1742,6 +1755,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // it. Overflow recovery must not auto-retry from the outer `messages` (which
     // lacks the consumed inject) regardless of who owns persistence.
     if (entries.length > 0) conversationsWithConsumedInject.add(conversationId);
+    // Track the consumed inject TEXTS (in order) so a mid-turn model-fallback —
+    // which restarts streamWithFallback from the ORIGINAL messages, with the queue
+    // already drained — can REQUEUE them for the fallback attempt's prepareStep.
+    // Without this the fallback model never sees a just-consumed injected answer.
+    if (entries.length > 0) {
+      const prior = consumedInjectTexts.get(conversationId) ?? [];
+      consumedInjectTexts.set(conversationId, [...prior, ...entries.map((e) => e.text)]);
+    }
     // Accumulate consumed-inject text bytes so the media budget can charge them
     // (they aren't in the outer `messages` branch it sums).
     if (entries.length > 0) {
@@ -2029,6 +2050,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // only meaningful within the turn that consumed the inject).
     conversationsWithConsumedInject.delete(conversationId);
     consumedInjectBytes.delete(conversationId);
+    consumedInjectTexts.delete(conversationId);
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -5502,6 +5524,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // don't get the failed + successful variants concatenated (matching
               // the renderer + persistence + other collectors).
               accumulatedResponseText = '';
+              // The fallback restarts streamWithFallback from the ORIGINAL messages
+              // with the inject queue ALREADY drained by the failed attempt's
+              // prepareStep — so a just-consumed injected answer would vanish from
+              // the fallback model's context. REQUEUE the consumed inject texts (at
+              // the front, fresh ids) so the fallback's prepareStep re-splices them.
+              // Cleared after requeue so a second fallback doesn't double-splice.
+              const toRequeue = consumedInjectTexts.get(conversationId);
+              if (toRequeue && toRequeue.length > 0) {
+                reenqueueFreshAtFront(conversationId, toRequeue);
+                consumedInjectTexts.delete(conversationId);
+                conversationsWithConsumedInject.delete(conversationId);
+              }
               // streamWithFallback restarts the next model from the ORIGINAL messages —
               // the failed attempt's tool args/results are NOT in the new model's
               // context. Reset the same-turn media budget accumulators so the fallback
@@ -6963,6 +6997,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // would otherwise leak for a conversation cancelled mid-turn after consuming an inject.
     conversationsWithConsumedInject.delete(conversationId);
     consumedInjectBytes.delete(conversationId);
+    consumedInjectTexts.delete(conversationId);
     // Drop any server-side persistence accumulation + ownership for a cancelled
     // turn, and reset a CLI turn's runStatus so it doesn't look stuck 'running'.
     // First preserve any ACCEPTED cooperative injects still queued (a cancellation

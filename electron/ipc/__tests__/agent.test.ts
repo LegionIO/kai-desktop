@@ -503,6 +503,18 @@ describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', ()
     expect(res).toEqual({ allowed: false, text: '' });
   });
 
+  it('denies when a hook redacts the message to EMPTY text (string or parts)', () => {
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: '' }])).toEqual({ allowed: false, text: '' });
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: '   ' }])).toEqual({
+      allowed: false,
+      text: '',
+    });
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: [{ type: 'text', text: '' }] }])).toEqual({
+      allowed: false,
+      text: '',
+    });
+  });
+
   it('denies on an empty payload', () => {
     expect(resolveInjectedTextFromGatedPayload([])).toEqual({ allowed: false, text: '' });
   });
