@@ -831,7 +831,19 @@ function registerRacedAnswerHandoff(
   if (expiresAtOverride !== undefined && now > expiresAtOverride) return;
   const expiresAt = expiresAtOverride ?? now + RACED_ANSWER_HANDOFF_TTL_MS;
   const existing = racedAnswerHandoffs.get(conversationId);
-  if (existing && (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort) {
+  // MERGE into the existing handoff ONLY when it belongs to the SAME source run
+  // (parallel ask_user gates of one turn each add their key), the cancel generation
+  // still matches (no Stop since), AND it hasn't expired. During rapid supersessions
+  // a STALE unclaimed handoff from an EARLIER run can linger with the same cancel
+  // generation but a DIFFERENT sourceToken/expectedSuccessorToken — merging a newer
+  // key into it would bind the new answer to a dead successor or drop it as expired.
+  // In that case fall through and REPLACE the stale state with a fresh binding.
+  if (
+    existing &&
+    existing.sourceToken === sourceToken &&
+    (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort &&
+    now <= existing.expiresAt
+  ) {
     existing.answerKeys.add(answerKey);
     // Keep the EARLIER expiry (never extend) — merge must not renew a bounded TTL.
     existing.expiresAt = Math.min(existing.expiresAt, expiresAt);
@@ -1900,8 +1912,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (hasInjects(conversationId)) {
       if (serverPersistTokens.has(conversationId)) {
         const stranded = drainInjects(conversationId);
+        let persistedAny = false;
         for (const entry of stranded) {
-          persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+          if (persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id)) persistedAny = true;
+        }
+        // The replacement's `messages` snapshot was captured BEFORE this drain, so
+        // it doesn't include the just-persisted stranded inject (a recovered
+        // ask_user answer) — the model wouldn't see it and it could sit off the
+        // active branch. Rebuild `messages` from the authoritative on-disk branch
+        // (which now ends at the stranded inject) so the replacement turn runs WITH
+        // it in context and persists onto it.
+        if (persistedAny) {
+          const rebuilt = readConversation(appHome, conversationId);
+          if (rebuilt) {
+            const { tree, headId } = ensureConversationTree(rebuilt);
+            messages = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]);
+          }
         }
       }
       clearInjects(conversationId);
@@ -5719,6 +5745,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               ? getProviderDefinedToolNames(modelEntry.modelConfig)
               : new Set<string>();
             activeModelEntryForRecovery = modelEntry;
+            // Restore the active-run context's model key to the PRIMARY too, so a
+            // mid-turn inject during the retry gates under the model its text will
+            // actually be sent to (not the fallback the failed attempt used).
+            if (modelEntry?.key) updateActiveRunModelKey(conversationId, streamToken, modelEntry.key);
             // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
             // reply can't collide with a failed sibling preserved under the prior attempt's id.
             currentResponseMessageId = undefined;
