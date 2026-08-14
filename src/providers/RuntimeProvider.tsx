@@ -752,10 +752,11 @@ export function usePromptHistory(): PromptHistoryState {
  *                  should do the normal send (supersede / new turn).
  */
 type MidTurnSendResult = 'injected' | 'blocked' | 'fallback';
+type MidTurnSendOutcome = { status: MidTurnSendResult; reason?: string };
 type MidTurnComposerState = {
   isRunning: boolean;
   midTurnSend: 'splice' | 'queue-editable';
-  sendMidTurn: (text: string) => Promise<MidTurnSendResult>;
+  sendMidTurn: (text: string) => Promise<MidTurnSendOutcome>;
   /** Pending (not-yet-spliced) injects for the active conversation — the
    *  queue-editable chip UI. Empty in 'splice' mode (chips are only shown when
    *  the setting opts in). */
@@ -768,7 +769,7 @@ type MidTurnComposerState = {
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   isRunning: false,
   midTurnSend: 'splice',
-  sendMidTurn: async () => 'fallback',
+  sendMidTurn: async () => ({ status: 'fallback' }),
   pendingInjects: [],
   cancelInject: async () => null,
 });
@@ -6199,23 +6200,24 @@ export function RuntimeProvider({
   }, [midTurnMode]);
 
   const sendMidTurn = useCallback(
-    async (text: string): Promise<MidTurnSendResult> => {
+    async (text: string): Promise<MidTurnSendOutcome> => {
       const convId = activeIdRef.current;
       const trimmed = text.trim();
-      if (!convId || !trimmed || !isRunningRef.current) return 'fallback';
+      if (!convId || !trimmed || !isRunningRef.current) return { status: 'fallback' };
       try {
         const res = await app.agent.injectMidTurn(convId, trimmed);
         if (res.ok && res.cooperative) {
           void refreshPendingInjects();
-          return 'injected';
+          return { status: 'injected' };
         }
         // A policy hook BLOCKED the message — it was handled (rejected), NOT a
         // "couldn't inject" case. The caller must NOT fall back to a normal send
-        // that would re-run the blocked text.
-        if (res.blocked) return 'blocked';
-        return 'fallback';
+        // that would re-run the blocked text; it restores the draft + surfaces
+        // the reason instead.
+        if (res.blocked) return { status: 'blocked', reason: res.error };
+        return { status: 'fallback' };
       } catch {
-        return 'fallback';
+        return { status: 'fallback' };
       }
     },
     [refreshPendingInjects],

@@ -945,26 +945,38 @@ function purgeRacedAnswerForKey(answerKey: string): void {
 }
 
 /** Tear down a successor's raced-answer state for this token: clear its claimant
- *  AND drop the pre-successor holding entry for the conversation. Called on every
- *  terminal/early-exit path (from cleanupStreamIfOwned, BEFORE its ownership
- *  guard), so a successor that transferred the keys OR config/hook-failed before
- *  transferring both leave no stale state for a later unrelated turn. Token-scoped
- *  claimant clear so a replacement's own claimant survives. */
+ *  AND drop a pre-successor holding entry ONLY when THIS token was its intended
+ *  (now-dead) successor. Called on every terminal/early-exit path (from
+ *  cleanupStreamIfOwned, BEFORE its ownership guard). Token-scoped claimant clear
+ *  so a replacement's own claimant survives. */
 function dropRacedAnswerClaimantForToken(conversationId: string, token: string): void {
   const claimant = liveRacedAnswerClaimant.get(conversationId);
   if (claimant && claimant.token === token) {
+    // The claimant is torn down but may STILL hold undelivered answer keys (a slow
+    // or remote answer that never arrived before this successor finished). Don't
+    // lose them: re-register them as a pre-successor handoff so a LATER turn (or a
+    // late answer within TTL) can still pick them up. cancelGenAtAbort is refreshed
+    // to the current generation so a Stop that bumped it still invalidates them.
+    if (claimant.state.answerKeys.size > 0 && !racedStateInvalid(claimant.state, conversationId)) {
+      for (const key of claimant.state.answerKeys) {
+        registerRacedAnswerHandoff(
+          conversationId,
+          key,
+          explicitCancelGeneration.get(conversationId) ?? 0,
+          token, // sourceToken = this finished successor; a later DIFFERENT run claims it
+        );
+      }
+    }
     liveRacedAnswerClaimant.delete(conversationId);
   }
-  // Drop the pre-successor holding entry ONLY when it wasn't registered BY the
-  // run being torn down. A handoff whose sourceToken === token was created by
-  // THIS run for the NEXT successor — either the predecessor registering its own
-  // (must survive until the successor transfers it), OR a chained case where this
-  // run was itself a claimant AND its own ask_user was then superseded, freshly
-  // registering the next turn's handoff. Deleting it would lose that next answer.
-  // A handoff registered by a DIFFERENT (earlier) run — e.g. a successor that
-  // config/hook-failed before transferring — is stale and consumed here.
+  // Drop a pre-successor holding entry ONLY when THIS token was its INTENDED
+  // successor that has now died (bound handoff, expectedSuccessorToken === token).
+  // A handoff bound to a DIFFERENT successor — e.g. a newer A→B handoff registered
+  // while an OLDER superseded run C's cleanup lagged — must survive C's teardown
+  // (C is neither its source nor its intended successor). An UNBOUND handoff
+  // (plan-restart, no known successor) is never dropped here; it ages out via TTL.
   const handoff = racedAnswerHandoffs.get(conversationId);
-  if (handoff && handoff.sourceToken !== token) {
+  if (handoff && handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken === token) {
     racedAnswerHandoffs.delete(conversationId);
   }
 }
@@ -6043,6 +6055,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const resolvedModelKey = ctx?.modelKey ?? config.models.defaultModelKey;
     const resolvedSystemPrompt = ctx?.systemPrompt ?? config.systemPrompt ?? '';
     let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
+    // Track any hook rewrite of the system prompt. A cooperative inject splices
+    // into an ALREADY-RUNNING turn whose system prompt is fixed — we CANNOT honor
+    // a content-dependent prompt rewrite for this message the way a normal
+    // submission would. So if either hook changes the prompt, FAIL CLOSED rather
+    // than send the text under a prompt the policy didn't intend.
+    let effectivePrompt = resolvedSystemPrompt;
     // 1) Plugin pre-send middleware (messages:hook). An abort denies the inject; a
     //    rewrite of the sole user message is honored.
     if (hasPluginHooks && pluginManager) {
@@ -6056,6 +6074,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (hookResult.abort)
           return { allowed: false, text: userText, reason: 'A plugin blocked this message.', terminal: true };
         if (Array.isArray(hookResult.messages)) payload = hookResult.messages as unknown[];
+        if (typeof hookResult.systemPrompt === 'string') effectivePrompt = hookResult.systemPrompt;
       } catch {
         return {
           allowed: false,
@@ -6066,6 +6085,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
     // 2) UserPromptSubmit DLP gate LAST (authoritative over the final payload).
+    //    Run it under the prompt the plugin stage produced (mirrors the normal
+    //    turn's order), and capture any further prompt rewrite it makes.
     if (hasPromptHooks) {
       const gated = await gateMessagesThroughUserPromptSubmit(
         payload,
@@ -6073,11 +6094,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         conversationId,
         resolvedModelKey,
         'mid-turn-inject',
-        resolvedSystemPrompt,
+        effectivePrompt,
       );
       if (gated.suppressed)
         return { allowed: false, text: userText, reason: 'A policy hook blocked this message.', terminal: true };
       payload = gated.messages;
+      if (typeof gated.systemPrompt === 'string') effectivePrompt = gated.systemPrompt;
+    }
+    // A prompt rewrite can't be applied to the running turn a cooperative inject
+    // splices into — fail closed so the text isn't sent under the stale prompt.
+    if (effectivePrompt !== resolvedSystemPrompt) {
+      return {
+        allowed: false,
+        text: userText,
+        reason: 'A policy hook changed the system prompt for this message; it cannot be injected mid-turn.',
+        terminal: true,
+      };
     }
     // Extract the (possibly-redacted) text of the surviving user turn. If a hook
     // REMOVED the user turn entirely, treat it as a denial (nothing to inject).

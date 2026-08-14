@@ -1830,13 +1830,18 @@ const Composer: FC<{
     }
     composerRuntime.setText('');
     setComposerText('');
-    void sendMidTurn(t).then((result) => {
+    void sendMidTurn(t).then(({ status, reason }) => {
       // Only fall back to a normal (superseding) send when the message wasn't
-      // handled. 'blocked' means a policy hook rejected it — do NOT resend.
-      if (result === 'fallback') {
+      // handled. 'blocked' means a policy hook rejected it — restore the draft so
+      // it isn't silently lost, but do NOT resend.
+      if (status === 'fallback') {
         composerRuntime.setText(t);
         composerRuntime.send();
         composerRuntime.setText('');
+      } else if (status === 'blocked') {
+        composerRuntime.setText(t);
+        setComposerText(t);
+        if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
       }
     });
   }, [attachments.length, composerRuntime, composerText, sendMidTurn]);

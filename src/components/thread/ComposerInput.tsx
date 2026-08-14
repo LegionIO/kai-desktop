@@ -185,13 +185,18 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       setText('');
       composerRuntime.setText('');
       resetHistoryNavigation('');
-      void sendMidTurn(toSend).then((result) => {
+      void sendMidTurn(toSend).then(({ status, reason }) => {
         // 'fallback' → not injectable; restore + normal (superseding) send.
-        // 'blocked' → a policy hook rejected it (handled); do NOT resend.
-        if (result === 'fallback') {
+        // 'blocked' → a policy hook rejected it (handled); restore the draft so
+        //   it isn't silently lost, but do NOT resend. Surface the reason.
+        if (status === 'fallback') {
           composerRuntime.setText(toSend);
           composerRuntime.send();
           composerRuntime.setText('');
+        } else if (status === 'blocked') {
+          composerRuntime.setText(toSend);
+          setText(toSend);
+          if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
         }
       });
       return;
