@@ -392,7 +392,19 @@ const consumedInjectBytes = new Map<string, number>();
 // inheriting the predecessor's value.
 const activeStreamRuntime = new Map<
   string,
-  { token: string; runtimeId: string; modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode }
+  {
+    token: string;
+    runtimeId: string;
+    modelKey?: string;
+    systemPrompt?: string;
+    // The PRE-hook system prompt base this run fed its own pre-send / UserPromptSubmit
+    // hooks (streamConfig.systemPrompt ?? config.systemPrompt). A mid-turn inject must
+    // replay the hooks from THIS base — not the legacy config default — else a run using
+    // a chat/profile/thread-specific prompt would produce effectivePrompt !== the run's
+    // post-hook prompt even for an allow-only hook, wrongly blocking every inject.
+    preHookSystemPrompt?: string;
+    executionMode?: ExecutionMode;
+  }
 >();
 
 /** The runtime id driving the current active stream for a conversation, if any.
@@ -414,12 +426,19 @@ export function getActiveStreamRuntime(conversationId: string): string | undefin
  *  fields when unrecorded (caller falls back to defaults). */
 function getActiveRunContext(
   conversationId: string,
-): { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode } | undefined {
+):
+  | { modelKey?: string; systemPrompt?: string; preHookSystemPrompt?: string; executionMode?: ExecutionMode }
+  | undefined {
   const activeToken = activeStreams.get(conversationId)?.token;
   if (activeToken === undefined) return undefined;
   const entry = activeStreamRuntime.get(conversationId);
   if (!entry || entry.token !== activeToken) return undefined;
-  return { modelKey: entry.modelKey, systemPrompt: entry.systemPrompt, executionMode: entry.executionMode };
+  return {
+    modelKey: entry.modelKey,
+    systemPrompt: entry.systemPrompt,
+    preHookSystemPrompt: entry.preHookSystemPrompt,
+    executionMode: entry.executionMode,
+  };
 }
 
 /** Update the active run's recorded model key after a mid-stream model-fallback,
@@ -2280,6 +2299,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // override, changing what Mastra sends). The mode-aware BUDGET prompt is computed
     // separately below (budgetSystemPrompt) and never written back.
     let effectiveSystemPrompt = streamConfig?.systemPrompt ?? config.systemPrompt ?? '';
+    // Capture the PRE-hook base (before the pre-send / UserPromptSubmit hooks below
+    // may rewrite effectiveSystemPrompt) so a mid-turn inject can replay the hooks
+    // from the SAME input this run used — recorded on activeStreamRuntime below.
+    const preHookSystemPrompt = effectiveSystemPrompt;
 
     // Inject execution mode before plugin hooks so prompt/message middleware sees
     // the same mode that the runtime will use.
@@ -2576,6 +2599,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // gateInjectedUserText). modelKey is refreshed on model-fallback below.
         modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
         systemPrompt: effectiveSystemPrompt,
+        preHookSystemPrompt,
         executionMode: effectiveExecutionMode,
       });
     }
@@ -4450,6 +4474,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           ? "\n\nThis conversation is too large for the model's context window. Run /compact to summarize older messages, then retry."
           : "\n\nThis request is too large for the model's context window. Start a new chat, remove large/older messages or attachments, or switch to a model with a larger context window, then retry.";
 
+      // Response ids this run streamed (event.responseMessageId). The terminal-drain
+      // repair uses these to recognize main's crash-backstop fallback reply — a
+      // sibling assistant under the pre-inject head, written by THIS run when the
+      // renderer crashed before persisting — and DISTINGUISH it from a user-selected
+      // historical sibling variant (whose id this run never produced).
+      const runReplyResponseIds = new Set<string>();
+
       try {
         if (controller.signal.aborted) {
           emit({ conversationId, type: 'done' });
@@ -5499,6 +5530,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               sawToolOrTextThisTurn = true;
               if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
             }
+            // Record every response id this run emits so the terminal-drain repair
+            // can recognize main's crash-backstop fallback reply (written under one
+            // of these ids) vs. a user-selected historical sibling variant.
+            if (typeof event.responseMessageId === 'string' && event.responseMessageId) {
+              runReplyResponseIds.add(event.responseMessageId);
+            }
             // After a plan-related done event has been sent and the stream aborted,
             // ignore any trailing events (especially the generator's final plain done).
             if (planDoneSent || overflowRecoveryTookOver) {
@@ -6259,39 +6296,51 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       // the drained inject as head would then clobber the user's
                       // selection and could restart model/tools on the abandoned branch.
                       //
-                      // The head must pass THROUGH an injected node to be a genuine
-                      // terminal-drain shape: after the renderer's idle persist (the only
-                      // state that gets us here), this turn's reply was reordered BEFORE
-                      // the inject chain with the last injected user as head — so the head
-                      // lineage contains an injected user. A user who switched to a
-                      // SIBLING assistant variant beneath the pre-inject head also reaches
-                      // that common ancestor but does NOT pass through any injected node —
-                      // so a mere "descends from preInjectHead" test would wrongly accept
-                      // it, and reorderInjectPrefixOnDisk would then mistake the selected
-                      // historical variant for the just-finished reply and reparent the
-                      // inject onto it. Require an injected node (or the run's own
-                      // just-persisted reply, injectedHead) on the lineage instead;
-                      // otherwise abandon (the inject stays persisted-but-unanswered — the
-                      // user can resend; reactive recovery backstops it).
+                      // The head must be a genuine terminal-drain shape:
+                      //  (1) it passes THROUGH an injected node — after the renderer's
+                      //      idle persist (the usual state that gets us here), this turn's
+                      //      reply was reordered BEFORE the inject chain with the last
+                      //      injected user as head, so the head lineage contains an inject;
+                      //      OR
+                      //  (2) it is THIS run's crash-backstop fallback reply — a sibling
+                      //      assistant under the pre-inject head that main persisted (when
+                      //      the renderer crashed before its own reorder), identified by an
+                      //      id THIS run actually streamed (runReplyResponseIds).
+                      // A user who switched to a historical SIBLING variant beneath the
+                      // pre-inject head reaches the common ancestor too, but neither passes
+                      // through an inject NOR carries an id this run produced — so it's
+                      // rejected. Otherwise abandon (the inject stays persisted-but-
+                      // unanswered — the user can resend; reactive recovery backstops it).
                       const injectedSet = new Set(guiInjectedIds);
                       const byId = new Map(continuationTree.map((m) => [m.id, m] as const));
                       const firstInjected = guiInjectedIds.find((id) => byId.has(id));
-                      const headThroughInject = ((): boolean => {
+                      const preInjectHead = firstInjected ? (byId.get(firstInjected)?.parentId ?? null) : undefined;
+                      const headIsGenuineDrainShape = ((): boolean => {
                         // No injected user present on disk any more → nothing to repair here.
                         if (firstInjected === undefined) return false;
                         let cur: string | null = continuationHead;
                         const seen = new Set<string>();
                         while (cur && !seen.has(cur)) {
-                          // Head is (or descends from) an injected user — the only shape a
-                          // clean idle-persist of THIS turn produces. (injectedHead is one
-                          // of guiInjectedIds for a GUI turn, so it's covered by the set.)
+                          // (1) Head is (or descends from) an injected user.
                           if (injectedSet.has(cur)) return true;
+                          // (2) Head is (or descends from) THIS run's fallback reply — an
+                          // assistant this run streamed (id in runReplyResponseIds) that
+                          // sits directly under the pre-inject head (the crash-backstop
+                          // sibling shape reorderInjectPrefixOnDisk case (a) repairs).
+                          const node = byId.get(cur);
+                          if (
+                            node?.role === 'assistant' &&
+                            runReplyResponseIds.has(cur) &&
+                            (node.parentId ?? null) === (preInjectHead ?? null)
+                          ) {
+                            return true;
+                          }
                           seen.add(cur);
                           cur = byId.get(cur)?.parentId ?? null;
                         }
                         return false;
                       })();
-                      if (!headThroughInject) return;
+                      if (!headIsGenuineDrainShape) return;
                       const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, guiInjectedIds);
                       const reread = readConversation(appHome, conversationId);
                       if (reread && repairedHead) {
@@ -6385,6 +6434,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const gate = await gateInjectedUserText(conversationId, userText, {
         modelKey: runCtx?.modelKey,
         systemPrompt: runCtx?.systemPrompt,
+        preHookSystemPrompt: runCtx?.preHookSystemPrompt,
         executionMode: runCtx?.executionMode,
         // GUI mid-turn send always gates under the live run's model — revalidate
         // against a mid-stream fallback that lands during the async gate.
@@ -6497,7 +6547,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   const gateInjectedUserText = async (
     conversationId: string,
     userText: string,
-    ctx?: { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode; revalidateLiveModel?: boolean },
+    ctx?: {
+      modelKey?: string;
+      systemPrompt?: string;
+      preHookSystemPrompt?: string;
+      executionMode?: ExecutionMode;
+      revalidateLiveModel?: boolean;
+    },
   ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean }> => {
     const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
     const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
@@ -6526,16 +6582,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // INTO the hooks here would double-apply a prompt-deriving hook (e.g. a suffix
     // `…|fixture` becomes `…|fixture|fixture`), so the equality check below would
     // flag every message as a "prompt change" and block it. So distinguish:
-    //   • hookInputPrompt — the PRE-hook base the hooks receive as input (the same
-    //     input a normal turn's hooks get): the configured default. (We can't
-    //     recover the exact pre-hook base the active run used, but the configured
-    //     default is what both the run and this gate feed the hooks, so a
-    //     content-independent hook reproduces the run's post-hook prompt from it.)
+    //   • hookInputPrompt — the PRE-hook base the hooks receive as input, the SAME
+    //     input the active run fed its own hooks (ctx.preHookSystemPrompt, i.e.
+    //     streamConfig.systemPrompt ?? config.systemPrompt — a chat/profile/thread
+    //     override, NOT the legacy config default). Feeding the legacy default here
+    //     when the run used an override would leave effectivePrompt !== the run's
+    //     post-hook prompt even for an allow-only hook, wrongly blocking every send.
     //   • runPostHookPrompt — the active run's post-hook prompt (ctx.systemPrompt),
     //     the BASELINE to compare the gate's hook output against. If they match,
     //     this message didn't cause a message-specific prompt change → allow.
-    const hookInputPrompt = config.systemPrompt ?? '';
-    const runPostHookPrompt = ctx?.systemPrompt ?? config.systemPrompt ?? '';
+    const hookInputPrompt = ctx?.preHookSystemPrompt ?? config.systemPrompt ?? '';
+    const runPostHookPrompt = ctx?.systemPrompt ?? hookInputPrompt;
     let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
     // Track any hook rewrite of the system prompt. A cooperative inject splices
     // into an ALREADY-RUNNING turn whose system prompt is fixed — we CANNOT honor
@@ -6675,6 +6732,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Gate under the LIVE run's context — the splice lands in that run.
           modelKey: runCtx?.modelKey,
           systemPrompt: runCtx?.systemPrompt,
+          preHookSystemPrompt: runCtx?.preHookSystemPrompt,
           executionMode: runCtx?.executionMode,
           // Revalidate against a mid-stream model change during the async gate.
           revalidateLiveModel: true,
