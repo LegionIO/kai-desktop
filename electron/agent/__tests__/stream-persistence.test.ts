@@ -9,7 +9,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const appendMock = vi.fn();
-const readMock = vi.fn((_appHome?: string, _conversationId?: string) => null as { headId?: string | null } | null);
+const readMock = vi.fn(
+  (_appHome?: string, _conversationId?: string) =>
+    null as {
+      headId?: string | null;
+      runStatus?: string;
+      messageTree?: Array<Record<string, unknown>>;
+      messages?: Array<Record<string, unknown>>;
+    } | null,
+);
 const writeMock = vi.fn((_appHome: string, conv: unknown) => conv);
 vi.mock('../../ipc/conversations.js', () => ({
   // Return a minimal record whose headId is the id of the appended assistant

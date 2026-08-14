@@ -6252,6 +6252,47 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     // head check. No-op when nothing needs reordering.
                     let launchBranch = continuationBranch;
                     if (guiInjectedIds.length > 0) {
+                      // BRANCH-SWITCH guard: the user can rewind or switch this
+                      // conversation's active branch WHILE we wait for the idle
+                      // persist — that changes the disk head WITHOUT minting a newer
+                      // stream token (so the recency guard above still passes). Forcing
+                      // the drained inject as head would then clobber the user's
+                      // selection and could restart model/tools on the abandoned branch.
+                      //
+                      // Every legitimate terminal-drain shape (the injected user itself
+                      // as head, an assistant mis-parented UNDER an injected user, or
+                      // main's crash-backstop assistant persisted as a SIBLING of the
+                      // first injected user) shares the PRE-INJECT HEAD — the first
+                      // injected user's parent — as a common ancestor of the current
+                      // head. A branch switch to unrelated history moves the head OUT of
+                      // that subtree. So: require the injected users to still be present
+                      // AND the current head to descend from (or be) the pre-inject head;
+                      // otherwise abandon (the inject stays persisted-but-unanswered —
+                      // user can resend; reactive recovery backstops it).
+                      const injectedSet = new Set(guiInjectedIds);
+                      const byId = new Map(continuationTree.map((m) => [m.id, m] as const));
+                      const firstInjected = guiInjectedIds.find((id) => byId.has(id));
+                      const preInjectHead = firstInjected ? (byId.get(firstInjected)?.parentId ?? null) : undefined;
+                      const headInDrainSubtree = ((): boolean => {
+                        // No injected user present on disk any more → nothing to repair here.
+                        if (firstInjected === undefined) return false;
+                        let cur: string | null = continuationHead;
+                        const seen = new Set<string>();
+                        while (cur && !seen.has(cur)) {
+                          // Head is (or descends from) an injected user, or reaches the
+                          // pre-inject head — both mean the head is still on this drain's
+                          // subtree (covers prefix-under-user, sibling-assistant, and the
+                          // plain injected-user-as-head cases).
+                          if (injectedSet.has(cur) || cur === preInjectHead) return true;
+                          seen.add(cur);
+                          cur = byId.get(cur)?.parentId ?? null;
+                        }
+                        // preInjectHead === null means the injects were roots (no shared
+                        // ancestor to test); fall back to the injected-user-lineage test,
+                        // which the loop above already failed → not on the drain subtree.
+                        return false;
+                      })();
+                      if (!headInDrainSubtree) return;
                       const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, guiInjectedIds);
                       const reread = readConversation(appHome, conversationId);
                       if (reread && repairedHead) {

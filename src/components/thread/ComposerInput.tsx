@@ -29,6 +29,21 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const compactingIds = useCompactingIds();
   const compactStatus = compactStatusFor && compactStatusFor.id === conversationId ? compactStatusFor.msg : null;
   const compactInFlight = conversationId ? compactingIds.has(conversationId) : false;
+  // Transient, conversation-scoped status for a mid-turn send that was BLOCKED by a
+  // pre-send / UserPromptSubmit policy hook. Packaged users have no DevTools, so a
+  // console.warn is invisible and Send appears to do nothing — surface the reason
+  // inline (mirrors the compactStatus affordance). Auto-clears after a few seconds.
+  const [sendBlockFor, setSendBlockFor] = useState<{ id: string | null; msg: string } | null>(null);
+  const sendBlockStatus = sendBlockFor && sendBlockFor.id === conversationId ? sendBlockFor.msg : null;
+  const sendBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showSendBlock = useCallback((id: string | null, reason?: string) => {
+    if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+    setSendBlockFor({
+      id,
+      msg: reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.',
+    });
+    sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+  }, []);
   const historyIndexRef = useRef(-1);
   const draftBeforeHistoryRef = useRef('');
   const historyConversationRef = useRef<string | null>(conversationId);
@@ -155,6 +170,13 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     return () => clearTimeout(t);
   }, [compactStatusFor, compactingIds]);
 
+  // Clear the send-block timer on unmount so it can't fire into a gone component.
+  useEffect(() => {
+    return () => {
+      if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+    };
+  }, []);
+
   const handleSubmit = useCallback(() => {
     if (!text.trim() && attachments.length === 0) return;
     // Don't start a normal turn while an on-demand /compact summary is in flight —
@@ -198,7 +220,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
           // the origin chat (dropped only if there's no origin id, which can't
           // happen for a real send).
           if (originConversationId) stashRejectedDraft(originConversationId, toSend);
-          if (status === 'blocked' && reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+          if (status === 'blocked') showSendBlock(originConversationId ?? null, reason);
           return;
         }
         if (status === 'fallback') {
@@ -208,7 +230,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
         } else if (status === 'blocked') {
           composerRuntime.setText(toSend);
           setText(toSend);
-          if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+          showSendBlock(originConversationId ?? conversationId ?? null, reason);
         }
       });
       return;
@@ -228,6 +250,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     sendMidTurn,
     getActiveConversationId,
     stashRejectedDraft,
+    showSendBlock,
     text,
   ]);
 
@@ -277,6 +300,11 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       {compactStatus && (
         <div className="px-3 pb-1 text-xs text-muted-foreground" role="status" aria-live="polite">
           {compactStatus}
+        </div>
+      )}
+      {sendBlockStatus && (
+        <div className="px-3 pb-1 text-xs text-amber-600 dark:text-amber-400" role="status" aria-live="polite">
+          {sendBlockStatus}
         </div>
       )}
       <RichChatInput

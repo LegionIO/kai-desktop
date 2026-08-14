@@ -1817,6 +1817,20 @@ const Composer: FC<{
   const activeConversationId = useActiveConversationId();
   const { sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
+  // Transient status for a mid-turn send BLOCKED by a policy hook — packaged users
+  // have no DevTools, so a console.warn is invisible and Send looks like a no-op.
+  const [midTurnBlockNotice, setMidTurnBlockNotice] = useState<string | null>(null);
+  const midTurnBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showMidTurnBlock = useCallback((reason?: string) => {
+    if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
+    setMidTurnBlockNotice(reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.');
+    midTurnBlockTimerRef.current = setTimeout(() => setMidTurnBlockNotice(null), 6000);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
+    };
+  }, []);
 
   // Compose-while-running: send the current composer text into the live turn (the
   // Send button rendered while running). Cooperatively spliced on Mastra; falls
@@ -1838,7 +1852,7 @@ const Composer: FC<{
       const current = composerRuntime.getState().text ?? '';
       if (!stillHere || current.trim().length > 0) {
         if (originConversationId) stashRejectedDraft(originConversationId, t);
-        if (status === 'blocked' && reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+        if (status === 'blocked') showMidTurnBlock(reason);
         return;
       }
       if (status === 'fallback') {
@@ -1848,10 +1862,18 @@ const Composer: FC<{
       } else if (status === 'blocked') {
         composerRuntime.setText(t);
         setComposerText(t);
-        if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+        showMidTurnBlock(reason);
       }
     });
-  }, [attachments.length, composerRuntime, composerText, sendMidTurn, getActiveConversationId, stashRejectedDraft]);
+  }, [
+    attachments.length,
+    composerRuntime,
+    composerText,
+    sendMidTurn,
+    getActiveConversationId,
+    stashRejectedDraft,
+    showMidTurnBlock,
+  ]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
@@ -2183,6 +2205,11 @@ const Composer: FC<{
           ) : null
         ) : (
           <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
+            {midTurnBlockNotice && (
+              <div className="px-1 pb-2 text-xs text-amber-600 dark:text-amber-400" role="status" aria-live="polite">
+                {midTurnBlockNotice}
+              </div>
+            )}
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel
