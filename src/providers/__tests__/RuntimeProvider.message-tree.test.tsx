@@ -301,11 +301,11 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(msg.parentId).toBe('assistant-old');
   });
 
-  it('rotates to a FRESH node id when the pendingAssistantId is a cooperative-inject-closed prefix', () => {
-    // After a mid-turn inject, the reply-so-far (msg-shared) is a CLOSED prefix
-    // (finalizedInjectResponseIds). The continuation arrives under the SAME
-    // responseMessageId (pendingAssistantId), but must NOT reuse the prefix node
-    // id — it gets a fresh node, parented on the injected user (the live head).
+  it('rotates to the DETERMINISTIC continuation id when the pendingAssistantId is a closed prefix', () => {
+    // After a mid-turn inject, the reply-so-far (msg-shared) is a CLOSED prefix.
+    // The continuation arrives under the SAME reused responseMessageId
+    // (pendingAssistantId) but must resolve to the per-boundary continuation id
+    // (`${injectedUser}-cont`, shared with main), parented on the injected user.
     const acc = {
       messages: [
         { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
@@ -314,16 +314,17 @@ describe('shared Kai/Mastra assistant ids', () => {
       ],
       headId: 'user-inject',
       pendingAssistantId: 'msg-shared',
-      finalizedInjectResponseIds: new Set(['msg-shared']),
+      closedPrefixIds: new Set(['msg-shared']),
+      injectContinuationId: 'user-inject-cont',
     } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
 
     const first = getOrCreateAssistantInAcc(acc);
-    expect(first.msg.id).not.toBe('msg-shared'); // rotated to a fresh id
+    expect(first.msg.id).toBe('user-inject-cont'); // deterministic, cross-process
     expect(first.msg.parentId).toBe('user-inject'); // parented on the injected user
 
-    // A second delta of the SAME reused id appends to the SAME rotated node.
+    // A second delta of the SAME reused id appends to the SAME continuation node.
     const second = getOrCreateAssistantInAcc(acc);
-    expect(second.msg.id).toBe(first.msg.id);
+    expect(second.msg.id).toBe('user-inject-cont');
   });
 
   it('creates the fallback retry as a sibling with its newly echoed id', () => {

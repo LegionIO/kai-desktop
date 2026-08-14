@@ -487,13 +487,19 @@ export function finalizeGuiFallbackPrefixAtInject(
   const prefixHead = hasPrefix
     ? persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true, replaceById: true })
     : null;
-  // Re-seed a fresh continuation accumulator parented on the injected user (its
-  // own children — the continuation reply — then parent correctly on a crash).
+  // Re-seed a fresh continuation accumulator parented on the injected user, with
+  // a DETERMINISTIC responseMessageId derived from the injected user id
+  // (`${injectedUserId}-cont`). The RENDERER derives the identical id for its
+  // authoritative continuation node, so a renderer-crash fallback finalize (which
+  // upserts by responseMessageId) targets the SAME node instead of appending a
+  // duplicate sibling variant. Unique per boundary (distinct injected user id),
+  // so a second inject in the same run doesn't collide with the first.
   accumulators.set(conversationId, {
     parts: [],
     toolIndex: new Map(),
     sawContent: false,
     parentId: injectedUserId,
+    responseMessageId: `${injectedUserId}-cont`,
   });
   return prefixHead;
 }

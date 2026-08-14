@@ -187,19 +187,23 @@ type MessageAccumulator = {
   /** Assistant id preallocated for the current inference response. Mastra uses
    * the same id for its persisted output row and echoes it on stream events. */
   pendingAssistantId?: string | null;
-  /** responseMessageIds already "closed" by a cooperative mid-turn inject boundary
-   *  in THIS renderer. Mastra reuses the SAME responseMessageId across steps of a
-   *  run, so after an inject splits the reply the CONTINUATION arrives under the
-   *  same id — which would otherwise reuse the (already-rendered) prefix assistant
-   *  node id and, on persist, collapse the continuation into the prefix (dropping
-   *  the injected user off the active branch). When a delta's responseMessageId is
-   *  in this set, getOrCreateAssistantInAcc mints a FRESH node id (remembered in
-   *  `rotatedResponseIds` so all continuation deltas hit the same fresh node) —
-   *  the renderer analogue of the main-side `-cont-` id rotation. */
-  finalizedInjectResponseIds?: Set<string>;
-  /** reused responseMessageId → the fresh node id minted for its post-inject
-   *  continuation (so repeated deltas of that id append to one node). */
-  rotatedResponseIds?: Map<string, string>;
+  /** Cooperative-inject continuation override. Mastra reuses the SAME
+   *  responseMessageId across a run's steps, so after a mid-turn inject splits the
+   *  reply the CONTINUATION arrives under the reused id — which would otherwise
+   *  reuse the (already-rendered) PREFIX assistant node id and, on persist,
+   *  collapse the continuation into the prefix (dropping the injected user off the
+   *  active branch). At the inject boundary we set this to a DETERMINISTIC id
+   *  derived from the injected user node id (`${injectedUserId}-cont`) — which the
+   *  MAIN-process fallback accumulator derives identically, so a renderer-crash
+   *  fallback replace-by-id matches instead of appending a duplicate; and which is
+   *  UNIQUE PER BOUNDARY (each inject has a distinct user id), so a second inject
+   *  in the same run rotates to a new node rather than colliding. Consumed by
+   *  getOrCreateAssistantInAcc for the FIRST continuation node, then cleared. */
+  injectContinuationId?: string | null;
+  /** Assistant node ids that are CLOSED prefixes (a cooperative inject boundary
+   *  passed with this node as the reply-so-far). getOrCreateAssistantInAcc must
+   *  not reuse a closed id even if a later event re-sets pendingAssistantId to it. */
+  closedPrefixIds?: Set<string>;
   /** STABLE run generation (the server's streamToken) this accumulator is locked to —
    *  set from the first event bearing runGeneration; later events from a DIFFERENT
    *  generation are a superseded run's and dropped (except compaction). */
@@ -1380,21 +1384,15 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
 
 export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
   let desiredId = acc.pendingAssistantId ?? undefined;
-  // Cooperative-inject continuation: if `desiredId` is a responseMessageId that a
-  // mid-turn inject already closed as a prefix, do NOT reuse the prefix's node id
-  // (that collapses the continuation into the prefix on persist, dropping the
-  // injected user off-branch). Rotate to a FRESH node id, stable across the
-  // continuation's deltas via `rotatedResponseIds`. Mirrors the main-side
-  // `-cont-` rotation in stream-persistence.persistAccumulatedReturningHead.
-  if (desiredId && acc.finalizedInjectResponseIds?.has(desiredId)) {
-    const rotated = acc.rotatedResponseIds?.get(desiredId);
-    if (rotated) {
-      desiredId = rotated;
-    } else {
-      const fresh = msgId();
-      (acc.rotatedResponseIds ??= new Map()).set(desiredId, fresh);
-      desiredId = fresh;
-    }
+  // Cooperative-inject continuation: if the reused responseMessageId (desiredId)
+  // is a CLOSED prefix, do NOT reuse the prefix node id (that collapses the
+  // continuation into the prefix on persist, dropping the injected user
+  // off-branch). Use the DETERMINISTIC per-boundary continuation id
+  // (`${injectedUserId}-cont`, set at the boundary) — which the main-process
+  // fallback derives identically (so a crash-time replace-by-id matches, no
+  // duplicate) and which differs per inject (so a 2nd inject rotates again).
+  if (desiredId && acc.closedPrefixIds?.has(desiredId)) {
+    desiredId = acc.injectContinuationId ?? `${desiredId}-cont`;
   }
   const branch = getActiveBranch(acc.messages, acc.headId);
   const last = branch[branch.length - 1];
@@ -3697,15 +3695,18 @@ export function RuntimeProvider({
             };
             acc.messages.push(userMsg);
             acc.headId = userMsg.id;
-            // Cooperative-inject boundary: the reply so far (acc.pendingAssistantId,
-            // Mastra's reused responseMessageId) is now a CLOSED prefix. Mark it so
-            // the continuation — arriving under the SAME responseMessageId — gets a
-            // FRESH node id (see getOrCreateAssistantInAcc) instead of reusing the
-            // prefix node id and collapsing the continuation into it (which would
-            // drop this injected user off the persisted active branch).
-            if (acc.pendingAssistantId) {
-              (acc.finalizedInjectResponseIds ??= new Set()).add(acc.pendingAssistantId);
-            }
+            // Cooperative-inject boundary: close the reply-so-far as a prefix and
+            // point the continuation at a DETERMINISTIC per-boundary node id
+            // (`${injectedUser}-cont`), which the main-process fallback derives
+            // identically. Close BOTH the reused responseMessageId (pendingAssistantId)
+            // AND any prior boundary's continuation id, so a SECOND inject in the
+            // same run rotates to the new id instead of reusing the first
+            // continuation node. getOrCreateAssistantInAcc maps a closed id → the
+            // latest injectContinuationId.
+            acc.closedPrefixIds ??= new Set();
+            if (acc.pendingAssistantId) acc.closedPrefixIds.add(acc.pendingAssistantId);
+            if (acc.injectContinuationId) acc.closedPrefixIds.add(acc.injectContinuationId);
+            acc.injectContinuationId = `${userMsg.id}-cont`;
             traceRuntime('stream.user-message', convId, {
               messageId: userMsg.id,
               parentId: userMsg.parentId,
