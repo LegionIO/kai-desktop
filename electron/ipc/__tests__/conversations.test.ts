@@ -36,6 +36,7 @@ import {
   ensureConversationTree,
   getConversationBranch,
   registerConversationHandlers,
+  reparentConversationMessage,
   summarizablePrefixMatchesDisk,
 } from '../conversations.js';
 import { sumBranchTokenCounts } from '../../agent/tokenization.js';
@@ -809,6 +810,57 @@ describe('appendConversationMessages', () => {
       appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }], { skipIfBusy: true }),
     ).toBeNull();
     expect(appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }])).not.toBeNull();
+  });
+});
+
+describe('reparentConversationMessage', () => {
+  const seed = (tree: Array<{ id: string; parentId: string | null; role: string; content: string }>, headId: string) =>
+    writeConversationStore(appHome, {
+      conversations: { c1: makeConversation('c1', { messageTree: tree as never, headId }) as never },
+      activeConversationId: null,
+      settings: {},
+    });
+
+  it('repoints an existing node onto a new parent (sibling reparent), head unchanged', () => {
+    // u1 → a1(prefix) ; u2(injected) also under u1 (sibling of a1). Reparent u2 onto a1.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'a1', parentId: 'u1', role: 'assistant', content: 'prefix' },
+        { id: 'u2', parentId: 'u1', role: 'user', content: 'injected answer' },
+      ],
+      'a1',
+    );
+    const res = reparentConversationMessage(appHome, 'c1', 'u2', 'a1');
+    expect(res).not.toBeNull();
+    const tree = (
+      readConversationStore(appHome).conversations.c1 as { messageTree: Array<{ id: string; parentId: string | null }> }
+    ).messageTree;
+    expect(tree.find((m) => m.id === 'u2')?.parentId).toBe('a1');
+    expect((readConversationStore(appHome).conversations.c1 as { headId: string }).headId).toBe('a1');
+  });
+
+  it('is a no-op when the new parent would create a cycle (newParent descends from node)', () => {
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'u2', parentId: 'u1', role: 'user', content: 'injected' },
+        { id: 'a1', parentId: 'u2', role: 'assistant', content: 'reply' },
+      ],
+      'a1',
+    );
+    reparentConversationMessage(appHome, 'c1', 'u2', 'a1');
+    const tree = (
+      readConversationStore(appHome).conversations.c1 as { messageTree: Array<{ id: string; parentId: string | null }> }
+    ).messageTree;
+    expect(tree.find((m) => m.id === 'u2')?.parentId).toBe('u1'); // unchanged
+  });
+
+  it('returns null for a missing node, missing new parent, or self-parent', () => {
+    seed([{ id: 'u1', parentId: null, role: 'user', content: 'q' }], 'u1');
+    expect(reparentConversationMessage(appHome, 'c1', 'nope', 'u1')).toBeNull();
+    expect(reparentConversationMessage(appHome, 'c1', 'u1', 'nope')).toBeNull();
+    expect(reparentConversationMessage(appHome, 'c1', 'u1', 'u1')).toBeNull();
   });
 });
 

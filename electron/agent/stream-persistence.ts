@@ -458,6 +458,39 @@ export function persistCooperativeInjectedUserTurn(
 }
 
 /**
+ * GUI cooperative-inject boundary handling for main's FALLBACK accumulator (the
+ * crash-backstop copy; the renderer owns the authoritative persist). Called at
+ * the prepareStep CONSUMPTION boundary (after prior-step tool RESULTS, so the
+ * accumulator's toolIndex is intact — NOT at enqueue time). Finalizes the
+ * accumulated assistant PREFIX as a fallback node (parented on its current
+ * parent, keepRunning), then re-seeds a FRESH continuation accumulator parented
+ * on `injectedUserId` (the already-persisted injected user node). Returns the
+ * finalized prefix's id (so the caller can reparent the injected user ONTO it,
+ * yielding correct chronology on a crash finalize), or null when there was no
+ * prefix content (nothing to attach the user under — the caller then leaves the
+ * user where it is and just rebinds the continuation).
+ */
+export function finalizeGuiFallbackPrefixAtInject(
+  appHome: string,
+  conversationId: string,
+  injectedUserId: string,
+): string | null {
+  if (!conversationId || !injectedUserId) return null;
+  const acc = accumulators.get(conversationId);
+  const hasPrefix = !!acc && acc.sawContent && acc.parts.length > 0;
+  const prefixHead = hasPrefix ? persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true }) : null;
+  // Re-seed a fresh continuation accumulator parented on the injected user (its
+  // own children — the continuation reply — then parent correctly on a crash).
+  accumulators.set(conversationId, {
+    parts: [],
+    toolIndex: new Map(),
+    sawContent: false,
+    parentId: injectedUserId,
+  });
+  return prefixHead;
+}
+
+/**
  * Shared persist body for both the normal `done` finalize and the mid-turn
  * interrupt finalize. Deletes the accumulator, then persists its parts as an
  * assistant message if there's content; otherwise just clears a lingering

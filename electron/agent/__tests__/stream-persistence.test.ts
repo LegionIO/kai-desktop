@@ -32,6 +32,7 @@ import {
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
+  finalizeGuiFallbackPrefixAtInject,
   clearFinalizedResponseIds,
 } from '../stream-persistence.js';
 import type { StreamEvent } from '../mastra-agent.js';
@@ -96,6 +97,37 @@ describe('stream persistence accumulator', () => {
     expect(secondMsg.id).toContain('resp-1'); // derived from it for traceability
     expect(secondHead).toBeTruthy();
     clearFinalizedResponseIds('cont');
+  });
+
+  it('finalizeGuiFallbackPrefixAtInject finalizes the prefix, returns its head, and reseeds the continuation under the injected user', () => {
+    clearFinalizedResponseIds('gui');
+    // Prefix content accumulated before the inject boundary.
+    feed({ conversationId: 'gui', type: 'text-delta', text: 'prefix reply', responseMessageId: 'resp-g' });
+    const prefixHead = finalizeGuiFallbackPrefixAtInject(APP_HOME, 'gui', 'injected-user-id');
+    // The prefix was finalized (one append) and its head returned.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    expect(prefixHead).toBeTruthy();
+    // A fresh continuation accumulator is now parented on the injected user, so a
+    // later continuation delta finalizes as a child of the injected user.
+    feed({ conversationId: 'gui', type: 'text-delta', text: 'continuation', responseMessageId: 'resp-g2' });
+    finalizeInterruptedTurn(APP_HOME, 'gui');
+    expect(appendMock).toHaveBeenCalledTimes(2);
+    const contCall = appendMock.mock.calls[1];
+    // appendConversationMessages(home, id, msgs, opts) — opts.parentId is the injected user.
+    expect((contCall[3] as { parentId?: string } | undefined)?.parentId).toBe('injected-user-id');
+    clearFinalizedResponseIds('gui');
+  });
+
+  it('finalizeGuiFallbackPrefixAtInject with NO prefix content just reseeds under the injected user (no append)', () => {
+    clearFinalizedResponseIds('gui2');
+    const prefixHead = finalizeGuiFallbackPrefixAtInject(APP_HOME, 'gui2', 'iu2');
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(prefixHead).toBeNull();
+    // Reseeded accumulator is parented on the injected user.
+    feed({ conversationId: 'gui2', type: 'text-delta', text: 'reply', responseMessageId: 'r' });
+    finalizeInterruptedTurn(APP_HOME, 'gui2');
+    expect((appendMock.mock.calls[0][3] as { parentId?: string } | undefined)?.parentId).toBe('iu2');
+    clearFinalizedResponseIds('gui2');
   });
 
   it('finalizeInterruptedTurnReplacing REPLACES an existing assistant node (web-origin) instead of appending a duplicate', () => {

@@ -20,6 +20,7 @@ import {
   ensureConversationTree,
   getConversationBranch,
   appendConversationMessages,
+  reparentConversationMessage,
 } from './conversations.js';
 import { readConversation, writeConversation, nextCompactionRevision, isRecentlyDeleted } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
@@ -35,9 +36,10 @@ import {
   finalizeInterruptedTurnReplacing,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
+  finalizeGuiFallbackPrefixAtInject,
   messageContentSignature,
 } from '../agent/stream-persistence.js';
-import { drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
+import { clearInjects, drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
 import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
@@ -1418,7 +1420,39 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       consumedInjectBytes.set(conversationId, (consumedInjectBytes.get(conversationId) ?? 0) + addBytes);
     }
     const activeToken = activeStreams.get(conversationId)?.token;
-    if (!isServerPersistOwner(conversationId, activeToken)) return;
+    if (!isServerPersistOwner(conversationId, activeToken)) {
+      // GUI (renderer-owned) turn: the renderer owns the authoritative persist,
+      // but main keeps a crash-backstop FALLBACK accumulator. Shape it correctly
+      // at THIS consumption boundary (after prior-step tool results — toolIndex
+      // intact) so a renderer crash yields correct chronology. The injected user
+      // node(s) were pre-persisted (by injectUserTurnAndRestart) parented on the
+      // pre-inject head; finalize the fallback PREFIX, then reparent each injected
+      // user ONTO the prefix and rebind the fallback parent + continuation
+      // accumulator to the last injected user. Only when this run owns a GUI
+      // fallback for the conversation.
+      if (guiFallbackParents.has(conversationId)) {
+        let lastInjectedId: string | null = null;
+        for (const entry of entries) {
+          const prefixHead = finalizeGuiFallbackPrefixAtInject(appHome, conversationId, entry.id);
+          if (prefixHead) {
+            // Attach the pre-persisted injected user onto the finalized prefix so
+            // the fallback branch reads prefix-assistant → injected-user → cont.
+            reparentConversationMessage(appHome, conversationId, entry.id, prefixHead);
+          }
+          lastInjectedId = entry.id;
+        }
+        if (lastInjectedId) {
+          guiFallbackParents.set(conversationId, lastInjectedId);
+          traceDiagnostic({
+            scope: 'agent',
+            event: 'inject.gui-fallback-boundary',
+            conversationId,
+            messageId: lastInjectedId,
+          });
+        }
+      }
+      return;
+    }
     let lastMessageId: string | null = null;
     for (const entry of entries) {
       const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
@@ -1602,6 +1636,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // only meaningful within the turn that consumed the inject).
     conversationsWithConsumedInject.delete(conversationId);
     consumedInjectBytes.delete(conversationId);
+    // Handle cooperative injects STRANDED by a just-superseded turn (queued but
+    // not yet drained — e.g. a raced ask_user answer). They belonged to that turn;
+    // carrying them into this fresh/superseding turn would splice an unrelated
+    // message. If the superseded turn was a SERVER-persist owner, its injects were
+    // only QUEUED (persistence deferred to the consumption boundary) — DRAIN +
+    // persist them now so the accepted user message isn't lost; then CLEAR the
+    // rest (GUI-owned, already persisted at injection by the renderer). No-op for
+    // the drain-at-end continuation (it drainInjects() before re-invoking us → the
+    // queue is already empty) and for a plain first turn.
+    if (hasInjects(conversationId)) {
+      if (serverPersistTokens.has(conversationId)) {
+        const stranded = drainInjects(conversationId);
+        for (const entry of stranded) {
+          persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+        }
+      }
+      clearInjects(conversationId);
+    }
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -6165,6 +6217,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
       }
     }
+    // Any injects STILL queued here are GUI-owned (the server-owned drain above
+    // already consumed + persisted server injects). A GUI-turn Stop: the renderer
+    // owns persistence (already persisted the injected user at injection) and the
+    // Stop is respected (no restart to drain), so main must CLEAR them — else they
+    // linger in the conversation-scoped queue and a later turn drains a stale
+    // answer/follow-up. No-op when empty; never touches a server-owned deferred
+    // inject (drained above).
+    clearInjects(conversationId);
     pendingServerPersist.delete(conversationId);
     pendingServerPersistParent.delete(conversationId);
     serverPersistParents.delete(conversationId);

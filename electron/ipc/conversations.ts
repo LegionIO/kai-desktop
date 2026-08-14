@@ -474,9 +474,59 @@ export function insertConversationMessageBefore(
   return written;
 }
 
+/**
+ * Repoint an EXISTING node's parent to `newParentId` (a sibling-level reparent),
+ * keeping the head unchanged. Used at the GUI cooperative-inject boundary: the
+ * injected user node was pre-persisted parented on the pre-inject head, and main
+ * then finalizes its fallback assistant PREFIX under that same head — leaving the
+ * two as siblings. Reparent the injected user ONTO the finalized prefix so a
+ * renderer-crash fallback finalize yields the correct chronology
+ *   … → prefix-assistant → injected-user → continuation.
+ * No-op if either id is absent, they're equal, already parented, or newParentId
+ * is a descendant of messageId (would create a cycle).
+ */
+export function reparentConversationMessage(
+  appHome: string,
+  conversationId: string,
+  messageId: string,
+  newParentId: string,
+): ConversationRecord | null {
+  if (!messageId || !newParentId || messageId === newParentId) return null;
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const node = tree.find((m) => m.id === messageId);
+  const newParent = tree.find((m) => m.id === newParentId);
+  if (!node || !newParent) return null;
+  if (node.parentId === newParentId) return conv; // already parented there — no-op
+  // Cycle guard: walk up from newParentId; if we reach messageId, reparenting
+  // would form a loop. Bounded by tree size.
+  const byId = new Map(tree.map((m) => [m.id, m] as const));
+  let cursor: string | null = newParentId;
+  const seen = new Set<string>();
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === messageId) return conv; // would cycle — refuse (no-op)
+    seen.add(cursor);
+    cursor = byId.get(cursor)?.parentId ?? null;
+  }
+  const now = new Date().toISOString();
+  const nextTree = tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
+  const branch = getConversationBranch(nextTree, headId);
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    updatedAt: now,
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+  };
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return written;
+}
+
 function timestampMs(value: string | null | undefined): number {
-  if (!value) return 0;
-  const parsed = Date.parse(value);
+  if (!value) return 0;  const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
