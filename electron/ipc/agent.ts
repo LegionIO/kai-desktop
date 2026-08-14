@@ -362,7 +362,10 @@ const consumedInjectBytes = new Map<string, number>();
 // owning token lets readers confirm the runtime belongs to the CURRENT active
 // stream and treat a not-yet-recorded replacement as "unknown" rather than
 // inheriting the predecessor's value.
-const activeStreamRuntime = new Map<string, { token: string; runtimeId: string }>();
+const activeStreamRuntime = new Map<
+  string,
+  { token: string; runtimeId: string; modelKey?: string; systemPrompt?: string }
+>();
 
 /** The runtime id driving the current active stream for a conversation, if any.
  *  Returns undefined unless a runtime has been recorded FOR THE CURRENT active
@@ -373,6 +376,19 @@ export function getActiveStreamRuntime(conversationId: string): string | undefin
   if (activeToken === undefined) return undefined;
   const entry = activeStreamRuntime.get(conversationId);
   return entry && entry.token === activeToken ? entry.runtimeId : undefined;
+}
+
+/** The active run's model + system prompt (for the CURRENT active token only), so
+ *  a mid-turn inject gates its text through DLP/UserPromptSubmit under the SAME
+ *  model/prompt context a normal turn uses — a model/prompt-conditioned hook must
+ *  see what the running turn shows it, or it could allow an injected message it
+ *  would block. Undefined fields when unrecorded (caller falls back to defaults). */
+function getActiveRunContext(conversationId: string): { modelKey?: string; systemPrompt?: string } | undefined {
+  const activeToken = activeStreams.get(conversationId)?.token;
+  if (activeToken === undefined) return undefined;
+  const entry = activeStreamRuntime.get(conversationId);
+  if (!entry || entry.token !== activeToken) return undefined;
+  return { modelKey: entry.modelKey, systemPrompt: entry.systemPrompt };
 }
 
 // Conversations whose current turn was started by a client that does NOT persist
@@ -760,9 +776,14 @@ const racedAnswerHandoffs = new Map<string, RacedAnswerState>();
 const MAX_RACED_ANSWER_HANDOFFS = 200;
 // The live Mastra successor claimant: owns the transferred keys + a `deliver`
 // that splices text into THAT running turn. Token-scoped; torn down on teardown.
+// `deliver` returns `terminal:true` for a permanent outcome (a policy hook block /
+// hook failure) so the retry loop drops the answer instead of re-running
+// enforcement up to the retry cap; `ok:false` without `terminal` is a transient
+// ownership race that IS retried.
+type RacedDeliverResult = { ok: boolean; terminal?: boolean };
 const liveRacedAnswerClaimant = new Map<
   string,
-  { token: string; deliver: (text: string) => Promise<boolean>; state: RacedAnswerState }
+  { token: string; deliver: (text: string) => Promise<RacedDeliverResult>; state: RacedAnswerState }
 >();
 
 /** Register (or MERGE) a conversation's pending raced-answer handoff in the
@@ -853,17 +874,27 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
         setTimeout(() => attemptRacedAnswerDelivery(conversationId), RACED_ANSWER_RETRY_MS);
       }
     };
+    // A TERMINAL outcome (policy hook blocked the answer / a hook errored) must
+    // NOT be retried — re-running enforcement 20× would repeat the same block and
+    // then silently drop the answer anyway. Purge the key so it isn't re-stashed
+    // or re-delivered from any surface, and surface it in the trace.
+    const onTerminal = (): void => {
+      purgeRacedAnswerForKey(answerKey);
+    };
     void claimant
       .deliver(text)
-      .then((ok) => {
-        if (!ok) onFailure();
+      .then((res) => {
+        if (!res.ok) {
+          if (res.terminal) onTerminal();
+          else onFailure();
+        }
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-claimed',
-          level: ok ? 'warn' : 'error',
+          level: res.ok ? 'warn' : 'error',
           conversationId,
           toolName: 'ask_user',
-          fields: { status: ok ? 'delivered' : 'failed' },
+          fields: { status: res.ok ? 'delivered' : res.terminal ? 'blocked-by-policy' : 'failed' },
         });
       })
       .catch(() => onFailure());
@@ -930,7 +961,7 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
 function registerLiveRacedAnswerClaimant(
   conversationId: string,
   token: string,
-  deliver: (text: string) => Promise<boolean>,
+  deliver: (text: string) => Promise<RacedDeliverResult>,
 ): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
   if (!handoff) return;
@@ -971,7 +1002,7 @@ export type InjectUserTurnFn = (
      *  restart) does NOT silently resume in `auto` with mutating tools enabled. */
     executionMode?: ExecutionMode;
   },
-) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
+) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean; blockedByPolicy?: boolean }>;
 
 let injectUserTurnAndRestart: InjectUserTurnFn | null = null;
 
@@ -2154,7 +2185,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // must NOT overwrite B's entry with A's stale token (that would leave B
     // runtime-unknown and block cooperative delivery). Only the owning run writes.
     if (activeStreams.get(conversationId)?.token === streamToken) {
-      activeStreamRuntime.set(conversationId, { token: streamToken, runtimeId: runtime.id });
+      activeStreamRuntime.set(conversationId, {
+        token: streamToken,
+        runtimeId: runtime.id,
+        // Captured so a mid-turn inject can gate its text under the SAME model +
+        // system prompt this run uses (see getActiveRunContext / gateInjectedUserText).
+        modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
+        systemPrompt: effectiveSystemPrompt,
+      });
     }
 
     // Raced-answer → successor rendezvous (see registerRacedAnswerHandoff): if a
@@ -2172,12 +2210,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (runtime.id === 'mastra') {
         registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
           const reinject = injectUserTurnAndRestart;
-          if (!reinject) return false;
+          if (!reinject) return { ok: false };
           try {
             const res = await reinject(conversationId, text);
-            return Boolean(res?.ok && res.injectedCooperatively);
+            if (res?.ok && res.injectedCooperatively) return { ok: true };
+            // A policy block is permanent for this content — don't retry it.
+            return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
           } catch {
-            return false;
+            return { ok: false };
           }
         });
       } else {
@@ -5821,9 +5861,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
       // Enforce plugin pre-send + UserPromptSubmit policy before the text is
       // spliced (prepareStep does not re-gate). DENY → reject; redaction →
-      // persist/broadcast/enqueue the redacted text.
-      const gate = await gateInjectedUserText(conversationId, userText);
+      // persist/broadcast/enqueue the redacted text. Gate under the active run's
+      // model + system prompt so a conditioned hook sees the same context a normal
+      // turn shows it.
+      const tokenBeforeGate = activeStreams.get(conversationId)?.token;
+      const runCtx = getActiveRunContext(conversationId);
+      const gate = await gateInjectedUserText(conversationId, userText, {
+        modelKey: runCtx?.modelKey,
+        systemPrompt: runCtx?.systemPrompt,
+      });
       if (!gate.allowed) return { ok: false, cooperative: true, error: gate.reason ?? 'blocked-by-policy' };
+      // The gate awaited hooks; the cooperatively-injectable run may have finished
+      // or been superseded meanwhile. If the active token changed (or the run is no
+      // longer Mastra), enqueueing would strand the text (no prepareStep to drain
+      // it) or splice it into a DIFFERENT run. Tell the renderer to fall back to a
+      // normal turn instead (cooperative:false), same as the runtime pre-check.
+      if (
+        activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
+        getActiveStreamRuntime(conversationId) !== 'mastra'
+      ) {
+        return { ok: false, cooperative: false, error: 'active run ended during policy enforcement' };
+      }
       const injectText = gate.text;
       const id = enqueueInject(conversationId, injectText);
       if (!id) return { ok: false, error: 'failed-to-enqueue' };
@@ -5908,8 +5966,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   const gateInjectedUserText = async (
     conversationId: string,
     userText: string,
-    modelKey?: string,
-  ): Promise<{ allowed: boolean; text: string; reason?: string }> => {
+    ctx?: { modelKey?: string; systemPrompt?: string },
+  ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean }> => {
     const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
     const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
     if (!hasPluginHooks && !hasPromptHooks) return { allowed: true, text: userText };
@@ -5918,9 +5976,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       config = readEffectiveConfig(appHome);
     } catch {
       // Can't read config to run enforcement → fail CLOSED (don't inject unfiltered).
+      // Not terminal: a transient read error may clear on a later retry.
       return { allowed: false, text: userText, reason: 'Failed to load config for policy enforcement.' };
     }
-    const resolvedModelKey = modelKey ?? config.models.defaultModelKey;
+    // Gate under the ACTIVE run's model + system prompt (a model/prompt-conditioned
+    // DLP hook must see the same context a normal turn shows it), falling back to
+    // the configured default only when the run context is unknown.
+    const resolvedModelKey = ctx?.modelKey ?? config.models.defaultModelKey;
+    const resolvedSystemPrompt = ctx?.systemPrompt ?? config.systemPrompt ?? '';
     let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
     // 1) Plugin pre-send middleware (messages:hook). An abort denies the inject; a
     //    rewrite of the sole user message is honored.
@@ -5930,12 +5993,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           messages: payload as unknown as HookMessage[],
           modelKey: resolvedModelKey,
           config,
-          systemPrompt: '',
+          systemPrompt: resolvedSystemPrompt,
         });
-        if (hookResult.abort) return { allowed: false, text: userText, reason: 'A plugin blocked this message.' };
+        if (hookResult.abort)
+          return { allowed: false, text: userText, reason: 'A plugin blocked this message.', terminal: true };
         if (Array.isArray(hookResult.messages)) payload = hookResult.messages as unknown[];
       } catch {
-        return { allowed: false, text: userText, reason: 'A plugin errored while checking this message.' };
+        return {
+          allowed: false,
+          text: userText,
+          reason: 'A plugin errored while checking this message.',
+          terminal: true,
+        };
       }
     }
     // 2) UserPromptSubmit DLP gate LAST (authoritative over the final payload).
@@ -5946,14 +6015,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         conversationId,
         resolvedModelKey,
         'mid-turn-inject',
+        resolvedSystemPrompt,
       );
-      if (gated.suppressed) return { allowed: false, text: userText, reason: 'A policy hook blocked this message.' };
+      if (gated.suppressed)
+        return { allowed: false, text: userText, reason: 'A policy hook blocked this message.', terminal: true };
       payload = gated.messages;
     }
     // Extract the (possibly-redacted) text of the surviving user turn. If a hook
     // REMOVED the user turn entirely, treat it as a denial (nothing to inject).
     const resolved = resolveInjectedTextFromGatedPayload(payload);
-    if (!resolved.allowed) return { allowed: false, text: userText, reason: 'A policy hook removed this message.' };
+    if (!resolved.allowed)
+      return { allowed: false, text: userText, reason: 'A policy hook removed this message.', terminal: true };
     return { allowed: true, text: resolved.text };
   };
 
@@ -5971,63 +6043,84 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // Enforce the same plugin pre-send + UserPromptSubmit policy a normal turn
       // applies before this text is spliced into the running turn (prepareStep
       // does NOT re-gate spliced text). A DENY rejects the inject; a redaction
-      // replaces the text that is enqueued/persisted/broadcast.
-      const gate = await gateInjectedUserText(conversationId, userText, opts?.modelKey);
-      if (!gate.allowed) return { ok: false, error: gate.reason ?? 'blocked-by-policy' };
-      const injectText = gate.text;
-      const injectId = enqueueInject(conversationId, injectText);
-      if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
-      const activeToken = activeStreams.get(conversationId)?.token;
-      const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
-      let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
-        messageId: injectId,
-        // For deferred server-owned persistence, omit the stale disk parent so a
-        // co-viewing renderer keeps its current live assistant head.
-        ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
-        createdAt: new Date().toISOString(),
-      };
-      if (!serverOwnsPersistence) {
-        const write = appendConversationMessages(
-          appHome,
-          conversationId,
-          [
-            {
-              id: injectId,
-              role: 'user',
-              content: [{ type: 'text', text: injectText }],
-              createdAt: persistedMeta.createdAt,
-            },
-          ],
-          // Keep runStatus 'running' — the turn is still live; we're extending it.
-          { runStatus: 'running' },
-        );
-        if (write?.headId) {
-          const messageId = write.headId;
-          const node = (
-            (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
-          ).find((message) => message.id === messageId);
-          persistedMeta = {
-            messageId,
-            parentId: node?.parentId ?? null,
-            createdAt: node?.createdAt ?? persistedMeta.createdAt,
-          };
-        } else {
-          persistedMeta = null;
-        }
-      }
-      if (!persistedMeta) {
-        removeInject(conversationId, injectId);
-        // Conversation vanished between the runtime check and the write — the run
-        // is effectively gone; fall through to the abort+restart path which
-        // re-reads + handles a missing conversation cleanly.
+      // replaces the text that is enqueued/persisted/broadcast. Gate under the
+      // ACTIVE run's model + system prompt so a model/prompt-conditioned hook sees
+      // the same context a normal turn shows it.
+      const tokenBeforeGate = activeStreams.get(conversationId)?.token;
+      const runCtx = getActiveRunContext(conversationId);
+      const gate = await gateInjectedUserText(conversationId, userText, {
+        modelKey: opts?.modelKey ?? runCtx?.modelKey,
+        systemPrompt: runCtx?.systemPrompt,
+      });
+      if (!gate.allowed)
+        return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: gate.terminal };
+      // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
+      // this conversation's active token changed (or the run ended), the run we
+      // resolved as cooperatively-injectable is gone — enqueueing now would strand
+      // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
+      // than the one we gated for. Fall through to the abort+restart path, which
+      // re-reads current state and starts a fresh turn with the (gated) text.
+      if (
+        activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
+        getActiveStreamRuntime(conversationId) !== 'mastra'
+      ) {
+        userText = gate.text; // carry the gated text into the fallback path
       } else {
-        broadcastStreamEvent({
-          conversationId,
-          type: 'user-message',
-          text: injectText,
-          data: persistedMeta,
-        });
-        return { ok: true, injectedCooperatively: true };
+        const injectText = gate.text;
+        const injectId = enqueueInject(conversationId, injectText);
+        if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
+        const activeToken = activeStreams.get(conversationId)?.token;
+        const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+        let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
+          messageId: injectId,
+          // For deferred server-owned persistence, omit the stale disk parent so a
+          // co-viewing renderer keeps its current live assistant head.
+          ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
+          createdAt: new Date().toISOString(),
+        };
+        if (!serverOwnsPersistence) {
+          const write = appendConversationMessages(
+            appHome,
+            conversationId,
+            [
+              {
+                id: injectId,
+                role: 'user',
+                content: [{ type: 'text', text: injectText }],
+                createdAt: persistedMeta.createdAt,
+              },
+            ],
+            // Keep runStatus 'running' — the turn is still live; we're extending it.
+            { runStatus: 'running' },
+          );
+          if (write?.headId) {
+            const messageId = write.headId;
+            const node = (
+              (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+            ).find((message) => message.id === messageId);
+            persistedMeta = {
+              messageId,
+              parentId: node?.parentId ?? null,
+              createdAt: node?.createdAt ?? persistedMeta.createdAt,
+            };
+          } else {
+            persistedMeta = null;
+          }
+        }
+        if (!persistedMeta) {
+          removeInject(conversationId, injectId);
+          // Conversation vanished between the runtime check and the write — the run
+          // is effectively gone; fall through to the abort+restart path which
+          // re-reads + handles a missing conversation cleanly.
+        } else {
+          broadcastStreamEvent({
+            conversationId,
+            type: 'user-message',
+            text: injectText,
+            data: persistedMeta,
+          });
+          return { ok: true, injectedCooperatively: true };
+        }
       }
     }
 
