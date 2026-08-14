@@ -1479,22 +1479,41 @@ export function reorderPrefixBeforeInjectedUserChain(
   const idSet = new Set(injectedIds);
   const contIds = new Set(injectedIds.map((id) => `${id}-cont`));
   // The misplaced prefix: a non-continuation assistant whose parent is one of the
-  // batch's injected users.
-  const prefixes = messages.filter(
+  // batch's injected users. A transient model-fallback can leave MULTIPLE variants
+  // (a failed partial + the successful reply) — select the ACTIVE one on the
+  // current head's ancestor lineage (matches the single-entry + disk repairs).
+  const allPrefixes = messages.filter(
     (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId) && !contIds.has(m.id),
   );
-  if (prefixes.length !== 1) return { messages, headId };
-  const prefix = prefixes[0];
+  let prefix: StoredMessage | undefined;
+  if (allPrefixes.length === 1) {
+    prefix = allPrefixes[0];
+  } else if (allPrefixes.length > 1) {
+    const byId = new Map(messages.map((m) => [m.id, m] as const));
+    const onHeadLineage = (id: string): boolean => {
+      let cur: string | null = headId;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur)) {
+        if (cur === id) return true;
+        seen.add(cur);
+        cur = byId.get(cur)?.parentId ?? null;
+      }
+      return false;
+    };
+    prefix = allPrefixes.find((m) => onHeadLineage(m.id));
+  }
+  if (!prefix) return { messages, headId };
   const firstUser = messages.find((m) => m.id === injectedIds[0]);
   if (!firstUser) return { messages, headId };
+  const prefixId = prefix.id;
   const chainParent = firstUser.parentId; // the pre-inject head
   const nextMessages = messages.map((m) => {
-    if (m.id === prefix.id) return { ...m, parentId: chainParent };
-    if (m.id === injectedIds[0]) return { ...m, parentId: prefix.id };
+    if (m.id === prefixId) return { ...m, parentId: chainParent };
+    if (m.id === injectedIds[0]) return { ...m, parentId: prefixId };
     return m;
   });
   // If the head was the misplaced prefix, advance it to the tail of the user chain.
-  const nextHead = headId === prefix.id ? injectedIds[injectedIds.length - 1] : headId;
+  const nextHead = headId === prefixId ? injectedIds[injectedIds.length - 1] : headId;
   return { messages: nextMessages, headId: nextHead };
 }
 

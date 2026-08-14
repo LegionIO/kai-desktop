@@ -52,7 +52,6 @@ import {
   hasInjects,
   listInjects,
   removeInject,
-  reenqueueFreshAtFront,
 } from '../agent/inject-queue.js';
 import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
@@ -178,7 +177,6 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
   consumedInjectBytes.delete(conversationId);
-  consumedInjectTexts.delete(conversationId);
 }
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
@@ -379,11 +377,6 @@ const conversationsWithConsumedInject = new Set<string>();
  *  conservative token proxy) or a big inject + a media tool could overflow the next
  *  step. Cleared at each turn start. */
 const consumedInjectBytes = new Map<string, number>();
-/** Texts of mid-turn injects CONSUMED this turn (FIFO), per conversation. Used to
- *  REQUEUE them on a mid-stream model-fallback (which restarts from the original
- *  messages with the queue already drained), so the fallback attempt's prepareStep
- *  re-splices a just-consumed injected answer. Cleared at each turn's terminal. */
-const consumedInjectTexts = new Map<string, string[]>();
 
 // Track the runtime driving each active stream, so a mid-turn inject can route:
 // the Mastra runtime supports cooperative step-boundary injection (prepareStep +
@@ -1755,14 +1748,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // it. Overflow recovery must not auto-retry from the outer `messages` (which
     // lacks the consumed inject) regardless of who owns persistence.
     if (entries.length > 0) conversationsWithConsumedInject.add(conversationId);
-    // Track the consumed inject TEXTS (in order) so a mid-turn model-fallback —
-    // which restarts streamWithFallback from the ORIGINAL messages, with the queue
-    // already drained — can REQUEUE them for the fallback attempt's prepareStep.
-    // Without this the fallback model never sees a just-consumed injected answer.
-    if (entries.length > 0) {
-      const prior = consumedInjectTexts.get(conversationId) ?? [];
-      consumedInjectTexts.set(conversationId, [...prior, ...entries.map((e) => e.text)]);
-    }
     // Accumulate consumed-inject text bytes so the media budget can charge them
     // (they aren't in the outer `messages` branch it sums).
     if (entries.length > 0) {
@@ -2050,7 +2035,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // only meaningful within the turn that consumed the inject).
     conversationsWithConsumedInject.delete(conversationId);
     consumedInjectBytes.delete(conversationId);
-    consumedInjectTexts.delete(conversationId);
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -5524,18 +5508,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // don't get the failed + successful variants concatenated (matching
               // the renderer + persistence + other collectors).
               accumulatedResponseText = '';
-              // The fallback restarts streamWithFallback from the ORIGINAL messages
-              // with the inject queue ALREADY drained by the failed attempt's
-              // prepareStep — so a just-consumed injected answer would vanish from
-              // the fallback model's context. REQUEUE the consumed inject texts (at
-              // the front, fresh ids) so the fallback's prepareStep re-splices them.
-              // Cleared after requeue so a second fallback doesn't double-splice.
-              const toRequeue = consumedInjectTexts.get(conversationId);
-              if (toRequeue && toRequeue.length > 0) {
-                reenqueueFreshAtFront(conversationId, toRequeue);
-                consumedInjectTexts.delete(conversationId);
-                conversationsWithConsumedInject.delete(conversationId);
-              }
+              // NOTE: a just-consumed cooperative inject is NOT re-queued for the
+              // fallback attempt. It's already PERSISTED on the branch (the
+              // consumption handler wrote it) and IS in the messages the fallback
+              // re-reads from disk on a server-owned turn; re-queuing would make the
+              // consumption handler persist it a SECOND time (duplicate user turn)
+              // and, for a GUI turn, parent fallback state on a never-broadcast id
+              // (detaching the reply on crash recovery). The benign residual — a
+              // fallback model may not re-see an inject consumed by the FAILED
+              // attempt within the same step — is preferable to duplicate/detached
+              // persistence; the answer stays on the branch either way.
               // streamWithFallback restarts the next model from the ORIGINAL messages —
               // the failed attempt's tool args/results are NOT in the new model's
               // context. Reset the same-turn media budget accumulators so the fallback
@@ -6997,7 +6979,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // would otherwise leak for a conversation cancelled mid-turn after consuming an inject.
     conversationsWithConsumedInject.delete(conversationId);
     consumedInjectBytes.delete(conversationId);
-    consumedInjectTexts.delete(conversationId);
     // Drop any server-side persistence accumulation + ownership for a cancelled
     // turn, and reset a CLI turn's runStatus so it doesn't look stuck 'running'.
     // First preserve any ACCEPTED cooperative injects still queued (a cancellation

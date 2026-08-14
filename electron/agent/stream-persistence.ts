@@ -79,12 +79,6 @@ type Accumulator = {
   parentId?: string;
   /** Shared Kai/Mastra response id captured from stream events. */
   responseMessageId?: string;
-  /** True when responseMessageId was PROVISIONALLY pre-seeded at a cooperative-
-   *  inject boundary (`${injectedUserId}-cont`) rather than captured from a real
-   *  stream event. A subsequent real event's response id OVERRIDES it — else a
-   *  fallback attempt that rotated to a fresh id would leave main upserting under
-   *  the stale `-cont` id and append a duplicate sibling on remote finalize. */
-  provisionalResponseId?: boolean;
 };
 
 const accumulators = new Map<string, Accumulator>();
@@ -136,16 +130,6 @@ function ensureAcc(conversationId: string, parentId?: string, responseMessageId?
   }
   if (acc.responseMessageId === undefined && responseMessageId !== undefined) {
     acc.responseMessageId = responseMessageId;
-  } else if (
-    acc.provisionalResponseId &&
-    responseMessageId !== undefined &&
-    responseMessageId !== acc.responseMessageId
-  ) {
-    // A real stream event supersedes a provisionally pre-seeded boundary id (e.g.
-    // a fallback attempt rotated to a fresh id) — adopt it so main upserts the
-    // renderer's actual node instead of a stale `-cont` sibling.
-    acc.responseMessageId = responseMessageId;
-    acc.provisionalResponseId = false;
   }
   return acc;
 }
@@ -523,9 +507,6 @@ export function finalizeGuiFallbackPrefixAtInject(
     sawContent: false,
     parentId: injectedUserId,
     responseMessageId: `${injectedUserId}-cont`,
-    // Provisional: a real stream event (e.g. a fallback attempt's rotated id) may
-    // override this so main upserts the renderer's actual node, not a stale sibling.
-    provisionalResponseId: true,
   });
   return prefixHead;
 }
