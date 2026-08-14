@@ -37,6 +37,7 @@ import {
   getConversationBranch,
   registerConversationHandlers,
   reparentConversationMessage,
+  reorderInjectPrefixOnDisk,
   summarizablePrefixMatchesDisk,
 } from '../conversations.js';
 import { sumBranchTokenCounts } from '../../agent/tokenization.js';
@@ -928,6 +929,50 @@ describe('reparentConversationMessage', () => {
     // The active branch must contain all three injects in order.
     const ids = conv.messages.map((m) => m.id);
     expect(ids).toEqual(['u1', 'a1', 'inj1', 'inj2', 'inj3']);
+  });
+});
+
+describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user repair', () => {
+  const seed = (tree: Array<{ id: string; parentId: string | null; role: string; content: string }>, headId: string) =>
+    writeConversationStore(appHome, {
+      conversations: { c1: makeConversation('c1', { messageTree: tree as never, headId }) as never },
+      activeConversationId: null,
+      settings: {},
+    });
+
+  it('swaps an assistant mis-parented under the injected user and makes the user the head', () => {
+    // The inject arrived after the final prepareStep; the renderer parented the
+    // turn's assistant UNDER the injected user (u1 → inject → assistant, head=assistant).
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+        { id: 'asst', parentId: 'inject', role: 'assistant', content: 'reply' },
+      ],
+      'asst',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', 'inject');
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'asst')?.parentId).toBe('u1');
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst');
+    expect(conv.headId).toBe('inject');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst', 'inject']);
+  });
+
+  it('is a no-op (returns current head) when the injected user has no assistant child', () => {
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+      ],
+      'inject',
+    );
+    expect(reorderInjectPrefixOnDisk(appHome, 'c1', 'inject')).toBe('inject');
   });
 });
 

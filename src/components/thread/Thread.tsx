@@ -1830,12 +1830,12 @@ const Composer: FC<{
     }
     composerRuntime.setText('');
     setComposerText('');
-    void sendMidTurn(t).then(({ status, reason }) => {
-      // Only fall back to a normal (superseding) send when the message wasn't
-      // handled AND the composer is still empty — the async check may have let the
-      // user type a new draft or switch chats, so resubmitting the old text would
-      // clobber the new draft / send into the wrong chat. 'blocked' means a policy
-      // hook rejected it — restore the draft (if still empty), do NOT resend.
+    void sendMidTurn(t).then(({ status, reason, originConversationId }) => {
+      // If the user switched chats during the async check, the send was routed to
+      // `originConversationId` — don't resubmit/restore into the now-active chat.
+      if (originConversationId !== activeConversationId) return;
+      // Only fall back (superseding send) / restore when the composer is still
+      // empty — the async check may have let the user type a new draft.
       const current = composerRuntime.getState().text ?? '';
       if (status === 'fallback') {
         if (current.trim().length === 0) {
@@ -1851,7 +1851,7 @@ const Composer: FC<{
         if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
       }
     });
-  }, [attachments.length, composerRuntime, composerText, sendMidTurn]);
+  }, [attachments.length, activeConversationId, composerRuntime, composerText, sendMidTurn]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse

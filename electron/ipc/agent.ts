@@ -21,6 +21,7 @@ import {
   getConversationBranch,
   appendConversationMessages,
   reparentConversationMessage,
+  reorderInjectPrefixOnDisk,
 } from './conversations.js';
 import {
   readConversation,
@@ -201,23 +202,29 @@ function extractLastUserText(messages: unknown[]): string {
 /**
  * Map the post-enforcement payload of a mid-turn inject back to the text to
  * enqueue. Pure so the gate's decision (redaction vs. removal) is unit-testable
- * apart from the async hook orchestration. When a modify hook REMOVED the sole
- * user turn, there is nothing to inject → treat as a denial (`allowed:false`).
- * Text is extracted VERBATIM (no whitespace normalization — an inject may be
- * multiline / spacing-sensitive code, unlike extractMessageText's display
- * projection). A surviving turn whose content is non-text (a hook rewrote it into
- * file/image/tool parts) can't be spliced as a user-text inject → denial.
+ * apart from the async hook orchestration. The input is a SINGLE text-only user
+ * message; a hook may redact its text but must NOT restructure it — a cooperative
+ * inject can only carry one plain user-text turn. So this DENIES (fail closed)
+ * unless the payload is EXACTLY one text-only user message: an empty payload (hook
+ * removed the turn), MORE than one message (hook added system/context messages we
+ * can't faithfully splice), a non-user role, or any non-text part. Text is
+ * extracted VERBATIM (no whitespace normalization — an inject may be multiline /
+ * spacing-sensitive code, unlike extractMessageText's display projection).
  */
 export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allowed: boolean; text: string } {
-  const survivor = lastUserMessage(payload);
-  if (!survivor) return { allowed: false, text: '' };
-  if (typeof survivor.content === 'string') return { allowed: true, text: survivor.content };
-  if (!Array.isArray(survivor.content)) return { allowed: false, text: '' };
+  // Exactly one message — a hook that ADDED messages (e.g. a system safety turn +
+  // the rewritten user turn) can't be represented as a single user-text inject, so
+  // fail closed rather than silently drop the added context while sending the text.
+  if (payload.length !== 1) return { allowed: false, text: '' };
+  const only = payload[0] as { role?: unknown; content?: unknown } | null;
+  if (!only || typeof only !== 'object' || only.role !== 'user') return { allowed: false, text: '' };
+  if (typeof only.content === 'string') return { allowed: true, text: only.content };
+  if (!Array.isArray(only.content)) return { allowed: false, text: '' };
   // Concatenate text parts VERBATIM; reject if any non-text part is present (an
   // inject is a plain user-text turn — a hook that introduced media/file parts
   // produced something we can't faithfully splice, so fail closed).
   let text = '';
-  for (const part of survivor.content) {
+  for (const part of only.content) {
     if (!part || typeof part !== 'object') return { allowed: false, text: '' };
     const p = part as { type?: string; text?: string };
     if (p.type !== 'text') return { allowed: false, text: '' };
@@ -1982,6 +1989,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const oldest = latestIssuedTurnToken.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       latestIssuedTurnToken.delete(oldest);
+    }
+
+    // Bind an UNBOUND raced-answer handoff (a plan-mode restart, whose successor
+    // token was unknown at abort) to THIS just-issued successor token NOW — before
+    // any early exit (config-load / pre-send hook / runtime resolution). If this
+    // run exits before reaching the claim site, its teardown
+    // (dropRacedAnswerClaimantForToken, expectedSuccessorToken === token) then
+    // drops the handoff instead of leaving it claimable by an unrelated later turn
+    // within the 30s TTL. (A handoff already bound to a different successor is left
+    // alone; the claim site re-checks binding before transferring.)
+    {
+      const pendingHandoff = racedAnswerHandoffs.get(conversationId);
+      if (pendingHandoff && pendingHandoff.expectedSuccessorToken === undefined) {
+        pendingHandoff.expectedSuccessorToken = streamToken;
+      }
     }
 
     // Is this run driven by agent:submit (CLI/headless)? That path ALREADY
@@ -5879,8 +5901,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 lastInjectedText = entry.text;
               }
             } else {
-              // Already on disk at injection — use its own id as the head.
-              lastInjectedHead = entry.id;
+              // GUI turn: the inject was ALREADY persisted at injection. But if it
+              // arrived AFTER the final prepareStep, no inject-consumed fired and the
+              // renderer parented THIS turn's assistant UNDER the injected user
+              // (user → assistant), making the assistant the disk head — so `entry.id`
+              // is NOT the head and the continuation's head check would fail. Repair
+              // the order on disk (assistant → injectedUser) and take the injected
+              // user (now the head) as the continuation head.
+              const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, entry.id);
+              lastInjectedHead = repairedHead ?? entry.id;
               lastInjectedText = entry.text;
             }
           }

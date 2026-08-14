@@ -185,14 +185,17 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       setText('');
       composerRuntime.setText('');
       resetHistoryNavigation('');
-      void sendMidTurn(toSend).then(({ status, reason }) => {
-        // 'fallback' → not injectable; restore + normal (superseding) send — but
-        // ONLY if the composer is still EMPTY. The async policy/enforcement check
-        // may have taken long enough for the user to type a NEW draft (or the
-        // resolved-onto composer is a different chat's after a switch); resubmitting
-        // the old text then would clobber the new draft / send into the wrong chat.
-        // If a new draft is present, drop the old text (it wasn't sent) rather than
-        // overwrite.
+      void sendMidTurn(toSend).then(({ status, reason, originConversationId }) => {
+        // The async policy/enforcement check may have let the user SWITCH chats.
+        // This composer belongs to `conversationId`; if the send was routed to a
+        // DIFFERENT conversation (or this composer is no longer that chat's), do
+        // NOT resubmit/restore here — that would send into / clobber the wrong
+        // chat. Drop the old text (it wasn't sent; the switched-away chat keeps
+        // its own draft handling via the rejected-draft queue on the main side).
+        if (originConversationId !== conversationId) return;
+        // Only fall back / restore when the composer is still EMPTY — the user may
+        // have typed a NEW draft during the async check; clobbering it is worse
+        // than the (logged) loss of the old text.
         const current = composerRuntime.getState().text ?? '';
         if (status === 'fallback') {
           if (current.trim().length === 0) {
@@ -201,10 +204,6 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
             composerRuntime.setText('');
           }
         } else if (status === 'blocked') {
-          // Restore the rejected draft so it isn't silently lost — but ONLY if the
-          // composer is still empty. The async policy check may have taken long
-          // enough for the user to start a NEW draft; clobbering it would be worse
-          // than the (logged) loss of the blocked text.
           if (current.trim().length === 0) {
             composerRuntime.setText(toSend);
             setText(toSend);

@@ -481,17 +481,25 @@ describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', ()
     expect(res).toEqual({ allowed: true, text: 'redacted answer' });
   });
 
-  it('extracts text from a content-part array (redacting hook rewrote parts)', () => {
+  it('extracts text from a single content-part user message (redacting hook rewrote parts)', () => {
     const res = resolveInjectedTextFromGatedPayload([
-      { role: 'assistant', content: 'prior' },
       { role: 'user', content: [{ type: 'text', text: '[redacted]' }] },
     ]);
     expect(res).toEqual({ allowed: true, text: '[redacted]' });
   });
 
-  it('denies when a hook REMOVED the user turn entirely (nothing to inject)', () => {
-    // A modify hook dropped the sole user message — there is no surviving turn.
+  it('denies when a hook REMOVED the user turn (payload is not a single user message)', () => {
     const res = resolveInjectedTextFromGatedPayload([{ role: 'assistant', content: 'only assistant left' }]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
+
+  it('denies when a hook ADDED extra messages (can’t splice added context as one inject)', () => {
+    // A modify hook returned a system safety message + the rewritten user turn.
+    // We can’t represent that as a single user-text inject → fail closed.
+    const res = resolveInjectedTextFromGatedPayload([
+      { role: 'system', content: 'SAFETY: redacted per policy' },
+      { role: 'user', content: [{ type: 'text', text: 'answer' }] },
+    ]);
     expect(res).toEqual({ allowed: false, text: '' });
   });
 

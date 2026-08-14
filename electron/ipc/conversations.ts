@@ -16,11 +16,21 @@ import { clearAllDiffs, clearConversationDiffs } from '../tools/diff-tracker.js'
 import { resolveStreamConfig } from '../agent/model-catalog.js';
 import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submit-gate.js';
-import { compactConversationPrefix, isStrictPrefix, shouldCompactBranchMediaAware, selectProtectedTail, messageContentSignature } from '../agent/compaction.js';
+import {
+  compactConversationPrefix,
+  isStrictPrefix,
+  shouldCompactBranchMediaAware,
+  selectProtectedTail,
+  messageContentSignature,
+} from '../agent/compaction.js';
 import { stripBranchMediaForCount, DEFAULT_MAX_TOTAL_MEDIA_BYTES } from '../agent/media-fit.js';
 import { normalizeAgentCwd, buildAgentInstructions } from '../agent/mastra-agent.js';
 import { withWorkingDirectoryPrompt } from '../agent/instructions.js';
-import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE, serializeToolSchemasForStatic } from '../agent/static-tokens.js';
+import {
+  estimateStaticRequestTokens,
+  WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
+  serializeToolSchemasForStatic,
+} from '../agent/static-tokens.js';
 import { getRegisteredTools, whenToolsReady, cancelConversationStream } from './agent.js';
 import { resolveHeaderTemplates } from '../agent/header-templates.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
@@ -515,9 +525,7 @@ export function reparentConversationMessage(
     cursor = byId.get(cursor)?.parentId ?? null;
   }
   const now = new Date().toISOString();
-  const nextTree = alreadyParented
-    ? tree
-    : tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
+  const nextTree = alreadyParented ? tree : tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
   const nextHead = options.makeHead ? messageId : headId;
   if (alreadyParented && nextHead === headId) return conv; // nothing to change
   const branch = getConversationBranch(nextTree, nextHead);
@@ -536,8 +544,56 @@ export function reparentConversationMessage(
 }
 
 function timestampMs(value: string | null | undefined): number {
-  if (!value) return 0;  const parsed = Date.parse(value);
+  if (!value) return 0;
+  const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * On-disk mirror of the renderer's reorderPrefixBeforeInjectedUser repair, for the
+ * GUI terminal-drain case: a cooperative inject arrived after the final
+ * prepareStep, so no `inject-consumed` fired and the renderer persisted the turn's
+ * assistant reply UNDER the injected user (user → assistant), making that assistant
+ * the disk head. The model produced that assistant BEFORE seeing the inject, so the
+ * order is wrong. If exactly one assistant node is parented on `injectedUserId`,
+ * swap them (assistant takes the user's parent, user reparents onto the assistant)
+ * and make the injected user the head — so a continuation launched on it sees the
+ * correct `… → assistant → injectedUser` order and the head check matches. Returns
+ * the injected user id when it is (now) the head, else the current head. No-op if
+ * the injected user is missing or has no lone assistant child.
+ */
+export function reorderInjectPrefixOnDisk(
+  appHome: string,
+  conversationId: string,
+  injectedUserId: string,
+): string | null {
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const user = tree.find((m) => m.id === injectedUserId);
+  if (!user) return headId;
+  const childAssistants = tree.filter((m) => m.parentId === injectedUserId && m.role === 'assistant');
+  if (childAssistants.length !== 1) return headId;
+  const prefix = childAssistants[0];
+  const userParent = user.parentId;
+  const nextTree = tree.map((m) => {
+    if (m.id === prefix.id) return { ...m, parentId: userParent };
+    if (m.id === injectedUserId) return { ...m, parentId: prefix.id };
+    return m;
+  });
+  const branch = getConversationBranch(nextTree, injectedUserId);
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    headId: injectedUserId,
+    updatedAt: new Date().toISOString(),
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+  };
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return injectedUserId;
 }
 
 type ConversationMessageLike = {
@@ -772,7 +828,11 @@ export function registerConversationHandlers(
       const incomingTreeArr = tree as Array<{ id?: unknown }>;
       const treeSig = (nodes: Array<{ id?: unknown }>): string =>
         nodes
-          .map((m) => (typeof m?.id === 'string' ? `${m.id}:${messageContentSignature(m as Parameters<typeof messageContentSignature>[0])}` : ''))
+          .map((m) =>
+            typeof m?.id === 'string'
+              ? `${m.id}:${messageContentSignature(m as Parameters<typeof messageContentSignature>[0])}`
+              : '',
+          )
           .join('|');
       const headChanged = (conversation.headId ?? null) !== (prev.headId ?? null);
       const treeChanged = treeSig(prevTreeArr2) !== treeSig(incomingTreeArr);
@@ -899,7 +959,7 @@ export function registerConversationHandlers(
         // append bypass preservation, dropping a freshly-committed record for a stale one.)
         const finalActiveBranchIds = getConversationBranch(
           finalTree as unknown as StoredTreeMessage[],
-          (nextConversation.headId ?? prev.headId) ?? null,
+          nextConversation.headId ?? prev.headId ?? null,
         ).map((m) => m.id);
         const coveredPrefixIntact =
           coveredIds.size === 0 ||
@@ -993,7 +1053,7 @@ export function registerConversationHandlers(
             // rejects the record and re-summarizes/rebills every turn.
             const finalActiveIds = getConversationBranch(
               (nextConversation.messageTree ?? []) as StoredTreeMessage[],
-              (nextConversation.headId ?? prev.headId) ?? null,
+              nextConversation.headId ?? prev.headId ?? null,
             ).map((m) => m.id);
             const prefixOk = isStrictPrefix(keptComp.compactedMessageIds, finalActiveIds);
             const drifted =
@@ -1297,7 +1357,10 @@ export function registerConversationHandlers(
     (
       _event,
       conversationId: string,
-      delta: { add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>; removeIds?: string[] },
+      delta: {
+        add?: Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
+        removeIds?: string[];
+      },
     ) => {
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false };
@@ -1319,10 +1382,13 @@ export function registerConversationHandlers(
       // Keep existing entries that are (a) still valid, (b) not removed, (c) not superseded by an
       // add with the same id (an add replaces its own id); then append the adds. Bound to the
       // per-conversation cap (oldest first) as a pathological safety valve.
-      const kept = existing.filter(
-        (d) => isValid(d) && !removeIds.has(String(d.id)) && !addIds.has(String(d.id)),
-      );
-      let merged = [...kept, ...addList] as Array<{ id: string; text: string; attachments: unknown[]; stashedAt: number }>;
+      const kept = existing.filter((d) => isValid(d) && !removeIds.has(String(d.id)) && !addIds.has(String(d.id)));
+      let merged = [...kept, ...addList] as Array<{
+        id: string;
+        text: string;
+        attachments: unknown[];
+        stashedAt: number;
+      }>;
       const CAP = 200;
       if (merged.length > CAP) merged = merged.slice(merged.length - CAP);
       const existingLen = existing.length;
@@ -1450,7 +1516,8 @@ export function registerConversationHandlers(
     if (typeof conversationId !== 'string' || !conversationId) return { ok: false, error: 'invalid-id' };
     // Reject a concurrent `/compact` for the same conversation (avoid a duplicate
     // paid summarization + persist race). Released in the finally below.
-    if (compactInFlight.has(conversationId)) return { ok: false, error: 'conversation-busy', busyKind: 'compaction' as const };
+    if (compactInFlight.has(conversationId))
+      return { ok: false, error: 'conversation-busy', busyKind: 'compaction' as const };
     compactInFlight.add(conversationId);
     try {
       return await runCompact(conversationId);
@@ -1459,7 +1526,9 @@ export function registerConversationHandlers(
     }
   });
 
-  const runCompact = async (conversationId: string): Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }> => {
+  const runCompact = async (
+    conversationId: string,
+  ): Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }> => {
     const config = getConfig?.();
     if (!config) return { ok: false, error: 'config-unavailable' };
     if (!config.compaction?.conversation?.enabled) return { ok: false, error: 'compaction-disabled' };
@@ -1516,11 +1585,9 @@ export function registerConversationHandlers(
       return await Promise.race([
         inner,
         new Promise<{ ok: boolean; error?: string; summarizedCount?: number; busyKind?: string }>((resolve) => {
-          abort.signal.addEventListener(
-            'abort',
-            () => resolve({ ok: false, error: 'compaction-timeout' }),
-            { once: true },
-          );
+          abort.signal.addEventListener('abort', () => resolve({ ok: false, error: 'compaction-timeout' }), {
+            once: true,
+          });
         }),
       ]);
     } finally {
@@ -1810,7 +1877,9 @@ export function registerConversationHandlers(
       // catalog maxInputTokens OR the window resolveConversationTokenization INFERS from
       // the model name (an entry with no explicit maxInputTokens must not be skipped, or
       // a smaller inferred-window fallback would be missed).
-      const windowOf = (m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null): number => {
+      const windowOf = (
+        m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null,
+      ): number => {
         if (!m) return 0;
         if (hasOverride) return override as number;
         const explicit = m.modelConfig.maxInputTokens;
@@ -1821,7 +1890,9 @@ export function registerConversationHandlers(
           return 0;
         }
       };
-      const consider = (m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null): void => {
+      const consider = (
+        m: { modelConfig: { modelName: string; maxInputTokens?: number } } | undefined | null,
+      ): void => {
         if (!m?.modelConfig.modelName) return;
         const mw = windowOf(m);
         if (mw > 0) eligibleValidationModels.push({ modelName: m.modelConfig.modelName, window: mw });
@@ -2005,7 +2076,12 @@ export function registerConversationHandlers(
       hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit') || (getPluginManager?.()?.hasPreSendHooks() ?? false);
     if (!hooksMayAlterBudget) {
       const stored = conv.conversationCompaction as
-        | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
+        | {
+            compactionId?: string;
+            summaryText?: string;
+            compactedMessageIds?: string[];
+            coveredContentSig?: Record<string, string>;
+          }
         | null
         | undefined;
       if (
@@ -2031,7 +2107,11 @@ export function registerConversationHandlers(
         // means new messages became eligible — recompute to summarize them.
         if (coveredCount === boundaryIndex && isStrictPrefix(stored.compactedMessageIds, branchIds)) {
           const candidate = [
-            { id: `compaction-summary-${stored.compactionId}`, role: 'assistant' as const, content: stored.summaryText },
+            {
+              id: `compaction-summary-${stored.compactionId}`,
+              role: 'assistant' as const,
+              content: stored.summaryText,
+            },
             ...messages.slice(coveredCount),
           ];
           // Reuse the stored summary as a no-op ONLY if it's safe on EVERY eligible
@@ -2065,7 +2145,11 @@ export function registerConversationHandlers(
               // `[summary, ...freshSuffix]` may now exceed token/media budgets even though
               // the compactionId, boundary, and prefix ids are unchanged.
               const rCandidate = [
-                { id: `compaction-summary-${stored.compactionId}`, role: 'assistant' as const, content: stored.summaryText },
+                {
+                  id: `compaction-summary-${stored.compactionId}`,
+                  role: 'assistant' as const,
+                  content: stored.summaryText,
+                },
                 ...projectForCompactionCandidate(
                   rBranch.slice(coveredCount) as Array<{ id?: unknown; role?: unknown; content?: unknown }>,
                 ),
@@ -2321,10 +2405,13 @@ export function registerConversationHandlers(
     // Validate the candidate against EVERY eligible model (trigger + hard input budget,
     // each model's own tokenizer) — the SAME check the stored-summary reuse short-circuit
     // uses. If it's unsafe on any model, report nothing-to-compact rather than persist.
-    if (!(await candidateSafeForAllModels(result.compactedMessages as Parameters<typeof shouldCompactBranchMediaAware>[0]))) {
+    if (
+      !(await candidateSafeForAllModels(
+        result.compactedMessages as Parameters<typeof shouldCompactBranchMediaAware>[0],
+      ))
+    ) {
       return { ok: false, error: 'nothing-to-compact' };
     }
-
 
     // Persist the record only (tree untouched). Re-read to avoid clobbering a
     // concurrent write, then merge just the compaction field.
@@ -2412,9 +2499,7 @@ export function registerConversationHandlers(
         ),
       ];
       if (
-        !(await candidateSafeForAllModels(
-          recomposedCandidate as Parameters<typeof shouldCompactBranchMediaAware>[0],
-        ))
+        !(await candidateSafeForAllModels(recomposedCandidate as Parameters<typeof shouldCompactBranchMediaAware>[0]))
       ) {
         return { ok: false, error: 'nothing-to-compact' };
       }
@@ -2427,7 +2512,8 @@ export function registerConversationHandlers(
     // Doing this await AFTER the reread would reopen the TOCTOU the final reread closes: a
     // concurrent delete / selection change during the await could be clobbered by the write.
     const staticInputStillValid =
-      (await raceAbort(staticInputFingerprint(chatBasePrompt, chatCwd, getRegisteredTools()))) === validatedStaticInputFingerprint;
+      (await raceAbort(staticInputFingerprint(chatBasePrompt, chatCwd, getRegisteredTools()))) ===
+      validatedStaticInputFingerprint;
     if (signal?.aborted) return { ok: false, error: 'compaction-timeout' };
     if (!staticInputStillValid) {
       // Tool schemas / expanded instructions changed during summarization — the record was

@@ -752,7 +752,14 @@ export function usePromptHistory(): PromptHistoryState {
  *                  should do the normal send (supersede / new turn).
  */
 type MidTurnSendResult = 'injected' | 'blocked' | 'fallback';
-type MidTurnSendOutcome = { status: MidTurnSendResult; reason?: string };
+type MidTurnSendOutcome = {
+  status: MidTurnSendResult;
+  reason?: string;
+  /** The conversation the send was routed to (active id at call time). A caller
+   *  whose composer belongs to a DIFFERENT conversation now (the user switched
+   *  chats during the async gate) must NOT resubmit/restore into the wrong chat. */
+  originConversationId?: string | null;
+};
 type MidTurnComposerState = {
   isRunning: boolean;
   midTurnSend: 'splice' | 'queue-editable';
@@ -6338,21 +6345,21 @@ export function RuntimeProvider({
     async (text: string): Promise<MidTurnSendOutcome> => {
       const convId = activeIdRef.current;
       const trimmed = text.trim();
-      if (!convId || !trimmed || !isRunningRef.current) return { status: 'fallback' };
+      if (!convId || !trimmed || !isRunningRef.current) return { status: 'fallback', originConversationId: convId };
       try {
         const res = await app.agent.injectMidTurn(convId, trimmed);
         if (res.ok && res.cooperative) {
           void refreshPendingInjects();
-          return { status: 'injected' };
+          return { status: 'injected', originConversationId: convId };
         }
         // A policy hook BLOCKED the message — it was handled (rejected), NOT a
         // "couldn't inject" case. The caller must NOT fall back to a normal send
         // that would re-run the blocked text; it restores the draft + surfaces
         // the reason instead.
-        if (res.blocked) return { status: 'blocked', reason: res.error };
-        return { status: 'fallback' };
+        if (res.blocked) return { status: 'blocked', reason: res.error, originConversationId: convId };
+        return { status: 'fallback', originConversationId: convId };
       } catch {
-        return { status: 'fallback' };
+        return { status: 'fallback', originConversationId: convId };
       }
     },
     [refreshPendingInjects],
