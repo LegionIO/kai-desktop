@@ -17,7 +17,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const { attachments, addAttachments } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
-  const { isRunning, sendMidTurn, getActiveConversationId } = useMidTurnComposer();
+  const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   // /compact status is SCOPED to the conversation it belongs to. In-flight compactions
   // live in a MODULE-LEVEL store (compaction-ui-store) keyed by conversation id — NOT
@@ -186,26 +186,28 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       composerRuntime.setText('');
       resetHistoryNavigation('');
       void sendMidTurn(toSend).then(({ status, reason, originConversationId }) => {
+        if (status === 'injected') return; // spliced — nothing to restore
         // Compare against the LIVE active conversation at resolution time (not a
-        // value captured at render): if the user switched chats during the async
-        // gate, the send's originConversationId no longer matches the now-active
-        // chat — do NOT resubmit into / clobber the wrong chat. Drop the old text.
-        if (originConversationId !== getActiveConversationId()) return;
-        // Only fall back / restore when the composer is still EMPTY — the user may
-        // have typed a NEW draft during the async check; clobbering it is worse
-        // than the (logged) loss of the old text.
+        // value captured at render). If the user switched chats during the async
+        // gate, don't resubmit/restore into the wrong chat — STASH the text for the
+        // ORIGINATING conversation so it resurfaces when the user returns there.
+        const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
         const current = composerRuntime.getState().text ?? '';
+        if (!stillHere || current.trim().length > 0) {
+          // Switched away OR a new draft is present here — don't clobber; stash for
+          // the origin chat (dropped only if there's no origin id, which can't
+          // happen for a real send).
+          if (originConversationId) stashRejectedDraft(originConversationId, toSend);
+          if (status === 'blocked' && reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+          return;
+        }
         if (status === 'fallback') {
-          if (current.trim().length === 0) {
-            composerRuntime.setText(toSend);
-            composerRuntime.send();
-            composerRuntime.setText('');
-          }
+          composerRuntime.setText(toSend);
+          composerRuntime.send();
+          composerRuntime.setText('');
         } else if (status === 'blocked') {
-          if (current.trim().length === 0) {
-            composerRuntime.setText(toSend);
-            setText(toSend);
-          }
+          composerRuntime.setText(toSend);
+          setText(toSend);
           if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
         }
       });
@@ -225,6 +227,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     runCompact,
     sendMidTurn,
     getActiveConversationId,
+    stashRejectedDraft,
     text,
   ]);
 

@@ -776,6 +776,11 @@ type MidTurnComposerState = {
    *  switched chats since the send — resubmitting/restoring only when it still
    *  matches the send's originConversationId. */
   getActiveConversationId: () => string | null;
+  /** Stash a draft for later restoration in a SPECIFIC conversation (FIFO), used
+   *  when a mid-turn send's async gate resolved after the user switched chats or
+   *  typed a new draft — so the old text isn't silently dropped but resurfaces when
+   *  the user returns to `convId`. */
+  stashRejectedDraft: (convId: string, text: string) => void;
 };
 
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
@@ -785,6 +790,7 @@ const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   pendingInjects: [],
   cancelInject: async () => null,
   getActiveConversationId: () => null,
+  stashRejectedDraft: () => {},
 });
 
 export function useMidTurnComposer(): MidTurnComposerState {
@@ -6398,10 +6404,22 @@ export function RuntimeProvider({
   }, [isRunning, midTurnMode, refreshPendingInjects]);
 
   const getActiveConversationId = useCallback(() => activeIdRef.current, []);
+  const stashRejectedDraft = useCallback((convId: string, text: string) => {
+    if (!convId || !text.trim()) return;
+    enqueueRejectedDraft(convId, { text, attachments: [] });
+  }, []);
 
   const midTurnComposerState = useMemo<MidTurnComposerState>(
-    () => ({ isRunning, midTurnSend: midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId }),
-    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId],
+    () => ({
+      isRunning,
+      midTurnSend: midTurnMode,
+      sendMidTurn,
+      pendingInjects,
+      cancelInject,
+      getActiveConversationId,
+      stashRejectedDraft,
+    }),
+    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId, stashRejectedDraft],
   );
   const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
     () => ({

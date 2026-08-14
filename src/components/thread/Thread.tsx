@@ -1815,7 +1815,7 @@ const Composer: FC<{
   const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
-  const { sendMidTurn, getActiveConversationId } = useMidTurnComposer();
+  const { sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
 
   // Compose-while-running: send the current composer text into the live turn (the
@@ -1831,28 +1831,27 @@ const Composer: FC<{
     composerRuntime.setText('');
     setComposerText('');
     void sendMidTurn(t).then(({ status, reason, originConversationId }) => {
-      // Compare against the LIVE active conversation at resolution time — if the
-      // user switched chats during the async gate, don't resubmit/restore into the
-      // now-active chat.
-      if (originConversationId !== getActiveConversationId()) return;
-      // Only fall back (superseding send) / restore when the composer is still
-      // empty — the async check may have let the user type a new draft.
+      if (status === 'injected') return;
+      // If the user switched chats or typed a new draft during the async gate,
+      // STASH the text for the ORIGINATING conversation rather than dropping it.
+      const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
       const current = composerRuntime.getState().text ?? '';
+      if (!stillHere || current.trim().length > 0) {
+        if (originConversationId) stashRejectedDraft(originConversationId, t);
+        if (status === 'blocked' && reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
+        return;
+      }
       if (status === 'fallback') {
-        if (current.trim().length === 0) {
-          composerRuntime.setText(t);
-          composerRuntime.send();
-          composerRuntime.setText('');
-        }
+        composerRuntime.setText(t);
+        composerRuntime.send();
+        composerRuntime.setText('');
       } else if (status === 'blocked') {
-        if (current.trim().length === 0) {
-          composerRuntime.setText(t);
-          setComposerText(t);
-        }
+        composerRuntime.setText(t);
+        setComposerText(t);
         if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
       }
     });
-  }, [attachments.length, composerRuntime, composerText, sendMidTurn, getActiveConversationId]);
+  }, [attachments.length, composerRuntime, composerText, sendMidTurn, getActiveConversationId, stashRejectedDraft]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse

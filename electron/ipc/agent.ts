@@ -1952,23 +1952,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
         // The replacement's `messages` snapshot was captured BEFORE this drain, so
         // it doesn't include the just-persisted stranded inject (a recovered
-        // ask_user answer) — the model wouldn't see it and it could sit off the
-        // active branch. Rebuild `messages` from the authoritative on-disk branch
-        // (which now ends at the stranded inject) so the replacement turn runs WITH
-        // it in context and persists onto it.
-        //
-        // BUT NOT for a fresh agent:submit (pendingServerPersist set): there the
-        // incoming `messages` already carries the NEWLY submitted prompt (persisted
-        // before this handler ran) that supersedes this run — rebuilding from the
-        // disk branch (which ends at the OLD stranded inject, before that new
-        // prompt) would DROP the new turn from model input, making the model answer
-        // the stranded inject while the renderer attributes the reply to the new
-        // prompt. Only a CONTINUATION (stale `messages`) needs the disk rebuild.
-        if (persistedAny && !pendingServerPersist.has(conversationId)) {
+        // ask_user answer). Reconcile the model input with the disk branch (which
+        // now ends at the stranded inject) WITHOUT dropping any NEWER prompt the
+        // incoming `messages` carries (a fresh GUI/CLI submit that superseded this
+        // run — via agent:stream OR agent:submit — already has its new user turn in
+        // `messages`). Take the disk branch as the base, then APPEND the incoming
+        // branch's trailing user turn(s) that aren't already on it — so the model
+        // sees `…history… → strandedInject → newPrompt` and neither is lost.
+        if (persistedAny) {
           const rebuilt = readConversation(appHome, conversationId);
           if (rebuilt) {
             const { tree, headId } = ensureConversationTree(rebuilt);
-            messages = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]);
+            const diskBranch = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]);
+            // The incoming `messages`' trailing user turn(s): everything after the
+            // last message that also appears (by a shallow role+text match) at the
+            // corresponding position in the disk branch is a NEW turn to preserve.
+            // Simplest robust rule: if the incoming branch's LAST message is a user
+            // turn whose text isn't the stranded inject's, append it.
+            const incomingLast = lastUserMessage(messages as unknown[]);
+            const strandedTexts = new Set(stranded.map((e) => e.text));
+            const incomingLastText =
+              incomingLast && typeof incomingLast.content !== 'undefined'
+                ? typeof incomingLast.content === 'string'
+                  ? incomingLast.content
+                  : extractMessageText(incomingLast.content)
+                : '';
+            if (incomingLast && incomingLastText && !strandedTexts.has(incomingLastText)) {
+              // A newer prompt superseded this run — keep it AFTER the stranded inject.
+              messages = [...diskBranch, incomingLast];
+            } else {
+              // Pure continuation (no newer prompt) — the disk branch is authoritative.
+              messages = diskBranch;
+            }
           }
         }
       }
