@@ -1988,9 +1988,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // and the head advances to it. Then rebuild `messages` from that branch —
             // NOT an in-memory append (which would duplicate the prompt in model
             // input and leave the disk reply mis-parented).
-            const incomingLast = lastUserMessage(messages as unknown[]);
+            const incomingLast = lastUserMessage(messages as unknown[]) as { id?: unknown; content?: unknown } | null;
+            const incomingLastId = typeof incomingLast?.id === 'string' ? incomingLast.id : undefined;
             const strandedIds = new Set(stranded.map((e) => e.id));
-            const strandedTexts = new Set(stranded.map((e) => e.text));
             const incomingLastText =
               incomingLast && typeof incomingLast.content !== 'undefined'
                 ? typeof incomingLast.content === 'string'
@@ -1998,19 +1998,34 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   : extractMessageText(incomingLast.content)
                 : '';
             let effectiveHead = headId;
-            if (incomingLast && incomingLastText && !strandedTexts.has(incomingLastText)) {
-              // Locate the new prompt's already-persisted disk node (newest matching
-              // user node that isn't a stranded inject and isn't already on the head).
+            // The incoming last user turn is a NEWER superseding prompt (to
+            // reparent after the stranded inject) ONLY when it's a DISTINCT node —
+            // identified by ID, not text: a fresh prompt whose text happens to
+            // equal the inject's is still a different node that must be preserved.
+            // (When the incoming id IS a stranded inject, this run is a pure
+            // continuation of that inject — nothing extra to reparent.)
+            const incomingIsDistinctPrompt =
+              !!incomingLast &&
+              !!incomingLastText &&
+              (incomingLastId === undefined || !strandedIds.has(incomingLastId));
+            if (incomingIsDistinctPrompt) {
+              // Locate the new prompt's already-persisted disk node. Prefer an exact
+              // ID match (the incoming node), else fall back to the newest user node
+              // (not a stranded inject, off the current head) with matching text.
               const headLine = new Set(getConversationBranch(tree, headId).map((m) => m.id));
-              const newPromptNode = [...tree]
-                .reverse()
-                .find(
-                  (m) =>
-                    m.role === 'user' &&
-                    !strandedIds.has(m.id) &&
-                    !headLine.has(m.id) &&
-                    extractMessageText(m.content) === incomingLastText,
-                );
+              const newPromptNode =
+                (incomingLastId !== undefined && !strandedIds.has(incomingLastId)
+                  ? tree.find((m) => m.id === incomingLastId && !headLine.has(m.id))
+                  : undefined) ??
+                [...tree]
+                  .reverse()
+                  .find(
+                    (m) =>
+                      m.role === 'user' &&
+                      !strandedIds.has(m.id) &&
+                      !headLine.has(m.id) &&
+                      extractMessageText(m.content) === incomingLastText,
+                  );
               if (newPromptNode && headId) {
                 const reparented = reparentConversationMessage(appHome, conversationId, newPromptNode.id, headId, {
                   makeHead: true,
@@ -2021,6 +2036,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const finalConv = readConversation(appHome, conversationId) ?? rebuilt;
             const { tree: finalTree } = ensureConversationTree(finalConv);
             messages = stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]);
+          }
+        }
+      } else {
+        // GUI-owned turn: the inject was ALREADY persisted at injection by the
+        // renderer. Normally the renderer keeps it on the active branch — but if
+        // ANOTHER GUI client submitted from a stale branch before receiving this
+        // inject's broadcast, conversations:put's union-merge can leave the inject
+        // as an off-branch SIBLING while the new prompt is the head. Reconcile any
+        // such stranded inject node onto the current head (so the replacement's
+        // branch — rebuilt below — includes it), THEN clear the queue.
+        const stranded = drainInjects(conversationId);
+        const conv = readConversation(appHome, conversationId);
+        if (conv) {
+          const { tree, headId } = ensureConversationTree(conv);
+          const headLine = new Set(getConversationBranch(tree, headId).map((m) => m.id));
+          let head = headId;
+          let reconciled = false;
+          for (const entry of stranded) {
+            // Only reconcile an inject node that EXISTS on disk but sits OFF the
+            // active branch (the cross-client stale-submit sibling case).
+            if (tree.some((m) => m.id === entry.id) && !headLine.has(entry.id) && head) {
+              const r = reparentConversationMessage(appHome, conversationId, entry.id, head, { makeHead: true });
+              if (r?.headId) {
+                head = r.headId;
+                reconciled = true;
+              }
+            }
+          }
+          if (reconciled) {
+            const reread = readConversation(appHome, conversationId) ?? conv;
+            const { tree: rt } = ensureConversationTree(reread);
+            messages = stripDisplayOnlyParts(getConversationBranch(rt, head) as unknown[]);
           }
         }
       }
