@@ -6029,12 +6029,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // against a mid-stream fallback that lands during the async gate.
         revalidateLiveModel: true,
       });
-      // A policy BLOCK is a handled, terminal outcome — the message was
-      // intentionally rejected. Return blocked:true (NOT cooperative:false) so the
-      // renderer surfaces it WITHOUT falling back to a normal superseding send that
-      // would re-run the blocked text (and, for a plugin pre-send abort, the raw
-      // user node may already be persisted).
-      if (!gate.allowed) return { ok: false, blocked: true, error: gate.reason ?? 'blocked-by-policy' };
+      // A TERMINAL policy BLOCK is a handled, permanent rejection — return
+      // blocked:true so the renderer surfaces it WITHOUT falling back to a normal
+      // superseding send that would re-run the blocked text (and, for a plugin
+      // pre-send abort, the raw user node may already be persisted). A NON-terminal
+      // denial (e.g. a mid-stream model-fallback changed the model during the async
+      // gate) is transient: fall back to a normal turn (cooperative:false) so it's
+      // re-evaluated under the new model rather than reported as a permanent block.
+      if (!gate.allowed) {
+        return gate.terminal
+          ? { ok: false, blocked: true, error: gate.reason ?? 'blocked-by-policy' }
+          : { ok: false, cooperative: false, error: gate.reason ?? 'gate-invalidated' };
+      }
       // The gate awaited hooks; the cooperatively-injectable run may have finished
       // or been superseded meanwhile. If the active token changed (or the run is no
       // longer Mastra), enqueueing would strand the text (no prepareStep to drain
@@ -6280,14 +6286,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // model intends that model, so a fallback mismatch must not spuriously deny).
         revalidateLiveModel: opts?.modelKey === undefined,
       });
-      if (!gate.allowed)
-        return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: gate.terminal };
+      // TERMINAL block → reject permanently. NON-terminal (model changed during the
+      // async gate) → for a cooperative-only raced answer, report transient
+      // (notCooperative) so it retries; for a normal caller, fall through to
+      // abort+restart with the gated text so the fresh turn re-gates under the
+      // now-active model.
+      let gateForcedFallthrough = false;
+      if (!gate.allowed) {
+        if (gate.terminal) return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
+        if (cooperativeOnly) return { ok: false, notCooperative: true };
+        gateForcedFallthrough = true;
+      }
       // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
       // this conversation's active token changed (or the run ended), the run we
       // resolved as cooperatively-injectable is gone — enqueueing now would strand
       // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
       // than the one we gated for.
       const ownershipChanged =
+        gateForcedFallthrough ||
         activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
         getActiveStreamRuntime(conversationId) !== 'mastra' ||
         (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken);

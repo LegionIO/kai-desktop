@@ -24,6 +24,7 @@ import {
   getOrCreateAssistantInAcc,
   resolveLiveInjectedParentId,
   reconnectActiveBranchRoot,
+  reorderPrefixBeforeInjectedUser,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -406,6 +407,45 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(acc.messages.filter((message: { parentId: string | null }) => message.parentId === 'user-1')).toHaveLength(
       2,
     );
+  });
+});
+
+describe('reorderPrefixBeforeInjectedUser — inject broadcast before the prefix existed', () => {
+  it('swaps a lone assistant mis-created under the injected user to sit BEFORE it', () => {
+    // user-1 → user-inject (head advanced early) → assistant (first delta arrived
+    // AFTER, so it was created UNDER the injected user). Repair → user-1 → prefix
+    // → user-inject, head follows the user.
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'prefix', 'user-inject');
+    expect(out.messages.find((m) => m.id === 'prefix')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
+    expect(out.headId).toBe('user-inject');
+  });
+
+  it('does NOT touch the legitimate continuation node (${id}-cont) under the user', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-1', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'prefix', role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject-cont', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'user-inject-cont', 'user-inject');
+    // Already correct — the only assistant under the user is the continuation, so no swap.
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
+    expect(out.headId).toBe('user-inject-cont');
+  });
+
+  it('is a no-op when the injected user is missing or has no assistant child', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'user-inject').headId).toBe('user-inject');
+    expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'missing').messages).toBe(messages);
   });
 });
 

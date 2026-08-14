@@ -1839,8 +1839,13 @@ const Composer: FC<{
         composerRuntime.send();
         composerRuntime.setText('');
       } else if (status === 'blocked') {
-        composerRuntime.setText(t);
-        setComposerText(t);
+        // Restore the rejected draft — but ONLY if the composer is still empty, so
+        // a NEW draft the user typed during the async policy check isn't clobbered.
+        const current = composerRuntime.getState().text ?? '';
+        if (current.trim().length === 0) {
+          composerRuntime.setText(t);
+          setComposerText(t);
+        }
         if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
       }
     });

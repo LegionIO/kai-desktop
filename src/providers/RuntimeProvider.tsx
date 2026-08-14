@@ -1383,6 +1383,39 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
   acc.pendingAssistantId = null;
 }
 
+/**
+ * Reorder a mid-turn-inject boundary when the injected user was inserted BEFORE
+ * the prior step's assistant prefix existed. If exactly one assistant node is
+ * parented on `injectedUserId` and it is NOT the per-boundary continuation node
+ * (`${injectedUserId}-cont`, which legitimately follows the user), that assistant
+ * is the prior step's output mis-created under the user — swap them so ordering is
+ * `prefix → injectedUser` (the model produced the prefix before it saw the
+ * inject). Advances headId from the prefix to the user when needed. Pure: returns
+ * new messages/headId (no mutation). No-op otherwise.
+ */
+export function reorderPrefixBeforeInjectedUser(
+  messages: StoredMessage[],
+  headId: string | null,
+  injectedUserId: string,
+): { messages: StoredMessage[]; headId: string | null } {
+  const user = messages.find((m) => m.id === injectedUserId);
+  if (!user) return { messages, headId };
+  const contId = `${injectedUserId}-cont`;
+  const childAssistants = messages.filter(
+    (m) => m.parentId === injectedUserId && m.role === 'assistant' && m.id !== contId,
+  );
+  if (childAssistants.length !== 1) return { messages, headId };
+  const prefix = childAssistants[0];
+  const userParent = user.parentId;
+  const nextMessages = messages.map((m) => {
+    if (m.id === prefix.id) return { ...m, parentId: userParent };
+    if (m.id === injectedUserId) return { ...m, parentId: prefix.id };
+    return m;
+  });
+  const nextHead = headId === prefix.id ? injectedUserId : headId;
+  return { messages: nextMessages, headId: nextHead };
+}
+
 export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
   let desiredId = acc.pendingAssistantId ?? undefined;
   // Cooperative-inject continuation: if the reused responseMessageId (desiredId)
@@ -1399,12 +1432,15 @@ export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: Store
   // `user-message` handler advanced acc.headId to the injected user BEFORE the
   // prior step's remaining deltas arrived (the ordered `inject-consumed` marker
   // that closes the prefix comes AFTER them). Those remainder deltas still belong
-  // to the STILL-OPEN prefix (desiredId not yet in closedPrefixIds), but the
-  // branch tail is now the user — so the tail check below would create a NEW
-  // assistant UNDER the user (`user → remainder`), corrupting order. If a message
-  // with desiredId already exists anywhere in the accumulator, update THAT node in
-  // place so the remainder stays in the prefix, before the user.
-  if (desiredId && !acc.closedPrefixIds?.has(acc.pendingAssistantId ?? '')) {
+  // to the STILL-OPEN node (desiredId not yet closed), but the branch tail is now
+  // the user — so the tail check below would create a NEW assistant UNDER the user
+  // (`user → remainder`), corrupting order. If a message with the RESOLVED desiredId
+  // already exists AND that id is NOT a closed prefix, update THAT node in place so
+  // the remainder stays with the still-open node, before the user. Keyed on
+  // desiredId (the resolved target), NOT pendingAssistantId — after a 2nd inject the
+  // reused pendingAssistantId is closed while desiredId is the OPEN 2nd continuation,
+  // which must still be reused in place rather than duplicated.
+  if (desiredId && !acc.closedPrefixIds?.has(desiredId)) {
     const existingIdx = acc.messages.findIndex((m) => m.id === desiredId && m.role === 'assistant');
     if (existingIdx >= 0) {
       const timed = withPendingAssistantTiming(acc.messages[existingIdx], acc);
@@ -3758,6 +3794,15 @@ export function RuntimeProvider({
             (en): en is { id: string } => typeof en?.id === 'string',
           );
           for (const en of entries) {
+            // ORDERING REPAIR for the "inject broadcast before the prefix existed"
+            // case (see reorderPrefixBeforeInjectedUser): if the prior step's first
+            // assistant delta arrived AFTER the user-message handler advanced the
+            // head to the injected user, that assistant got created UNDER the user
+            // (user → prefix), which is wrong — the model produced it BEFORE seeing
+            // the inject. Swap them back to `prefix → user`.
+            const repaired = reorderPrefixBeforeInjectedUser(acc2.messages, acc2.headId, en.id);
+            acc2.messages = repaired.messages;
+            acc2.headId = repaired.headId;
             acc2.closedPrefixIds ??= new Set();
             if (acc2.pendingAssistantId) acc2.closedPrefixIds.add(acc2.pendingAssistantId);
             if (acc2.injectContinuationId) acc2.closedPrefixIds.add(acc2.injectContinuationId);

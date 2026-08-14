@@ -194,8 +194,15 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
           composerRuntime.send();
           composerRuntime.setText('');
         } else if (status === 'blocked') {
-          composerRuntime.setText(toSend);
-          setText(toSend);
+          // Restore the rejected draft so it isn't silently lost — but ONLY if the
+          // composer is still empty. The async policy check may have taken long
+          // enough for the user to start a NEW draft; clobbering it would be worse
+          // than the (logged) loss of the blocked text.
+          const current = composerRuntime.getState().text ?? '';
+          if (current.trim().length === 0) {
+            composerRuntime.setText(toSend);
+            setText(toSend);
+          }
           if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
         }
       });
