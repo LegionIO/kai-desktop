@@ -743,14 +743,19 @@ export function usePromptHistory(): PromptHistoryState {
 /**
  * Compose-while-running state for the composer: whether a turn is live, the
  * configured mid-turn-send mode, and a helper to enqueue a mid-turn follow-up.
- * `sendMidTurn` returns true if the message was cooperatively injected into the
- * running turn (the composer should then just clear its input); false means the
- * caller should fall back to the normal send (supersede / new turn).
+ * `sendMidTurn` resolves:
+ *   - 'injected' — cooperatively spliced into the running turn (clear the input).
+ *   - 'blocked'  — a policy hook rejected the message; it was HANDLED, so the
+ *                  caller must NOT fall back to a normal send (that would re-run
+ *                  the blocked text / supersede the active turn).
+ *   - 'fallback' — not injectable (CLI runtime / ownership changed); the caller
+ *                  should do the normal send (supersede / new turn).
  */
+type MidTurnSendResult = 'injected' | 'blocked' | 'fallback';
 type MidTurnComposerState = {
   isRunning: boolean;
   midTurnSend: 'splice' | 'queue-editable';
-  sendMidTurn: (text: string) => Promise<boolean>;
+  sendMidTurn: (text: string) => Promise<MidTurnSendResult>;
   /** Pending (not-yet-spliced) injects for the active conversation — the
    *  queue-editable chip UI. Empty in 'splice' mode (chips are only shown when
    *  the setting opts in). */
@@ -763,7 +768,7 @@ type MidTurnComposerState = {
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   isRunning: false,
   midTurnSend: 'splice',
-  sendMidTurn: async () => false,
+  sendMidTurn: async () => 'fallback',
   pendingInjects: [],
   cancelInject: async () => null,
 });
@@ -6194,19 +6199,23 @@ export function RuntimeProvider({
   }, [midTurnMode]);
 
   const sendMidTurn = useCallback(
-    async (text: string): Promise<boolean> => {
+    async (text: string): Promise<MidTurnSendResult> => {
       const convId = activeIdRef.current;
       const trimmed = text.trim();
-      if (!convId || !trimmed || !isRunningRef.current) return false;
+      if (!convId || !trimmed || !isRunningRef.current) return 'fallback';
       try {
         const res = await app.agent.injectMidTurn(convId, trimmed);
         if (res.ok && res.cooperative) {
           void refreshPendingInjects();
-          return true;
+          return 'injected';
         }
-        return false;
+        // A policy hook BLOCKED the message — it was handled (rejected), NOT a
+        // "couldn't inject" case. The caller must NOT fall back to a normal send
+        // that would re-run the blocked text.
+        if (res.blocked) return 'blocked';
+        return 'fallback';
       } catch {
-        return false;
+        return 'fallback';
       }
     },
     [refreshPendingInjects],

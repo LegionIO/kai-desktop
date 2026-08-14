@@ -5,11 +5,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useAppShotPasteHandler } from '@/hooks/useAppShots';
 import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvider';
 import { isCompactCommand } from '@/lib/slash-commands';
-import {
-  useCompactingIds,
-  markConversationCompacting,
-  clearConversationCompacting,
-} from '@/lib/compaction-ui-store';
+import { useCompactingIds, markConversationCompacting, clearConversationCompacting } from '@/lib/compaction-ui-store';
 import { cn } from '@/lib/utils';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
@@ -165,7 +161,8 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     // it would race the paid summarizer (which the backend then discards). A repeat
     // /compact is harmless (runCompact self-guards), so only block non-compact sends.
     if (compactInFlight && !(attachments.length === 0 && isCompactCommand(text))) {
-      if (conversationId) setCompactStatusFor({ id: conversationId, msg: 'Compacting… wait for it to finish before sending.' });
+      if (conversationId)
+        setCompactStatusFor({ id: conversationId, msg: 'Compacting… wait for it to finish before sending.' });
       return;
     }
     // Slash command: `/compact` summarizes older messages instead of sending a
@@ -188,10 +185,10 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       setText('');
       composerRuntime.setText('');
       resetHistoryNavigation('');
-      void sendMidTurn(toSend).then((injected) => {
-        if (!injected) {
-          // Not cooperatively injected — restore and use the normal send path
-          // (which supersedes the running turn).
+      void sendMidTurn(toSend).then((result) => {
+        // 'fallback' → not injectable; restore + normal (superseding) send.
+        // 'blocked' → a policy hook rejected it (handled); do NOT resend.
+        if (result === 'fallback') {
           composerRuntime.setText(toSend);
           composerRuntime.send();
           composerRuntime.setText('');
@@ -203,7 +200,17 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     setText('');
     composerRuntime.setText('');
     resetHistoryNavigation('');
-  }, [attachments.length, composerRuntime, compactInFlight, conversationId, isRunning, resetHistoryNavigation, runCompact, sendMidTurn, text]);
+  }, [
+    attachments.length,
+    composerRuntime,
+    compactInFlight,
+    conversationId,
+    isRunning,
+    resetHistoryNavigation,
+    runCompact,
+    sendMidTurn,
+    text,
+  ]);
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLElement>) => {

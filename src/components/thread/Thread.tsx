@@ -1830,8 +1830,10 @@ const Composer: FC<{
     }
     composerRuntime.setText('');
     setComposerText('');
-    void sendMidTurn(t).then((injected) => {
-      if (!injected) {
+    void sendMidTurn(t).then((result) => {
+      // Only fall back to a normal (superseding) send when the message wasn't
+      // handled. 'blocked' means a policy hook rejected it — do NOT resend.
+      if (result === 'fallback') {
         composerRuntime.setText(t);
         composerRuntime.send();
         composerRuntime.setText('');

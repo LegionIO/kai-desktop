@@ -364,7 +364,7 @@ const consumedInjectBytes = new Map<string, number>();
 // inheriting the predecessor's value.
 const activeStreamRuntime = new Map<
   string,
-  { token: string; runtimeId: string; modelKey?: string; systemPrompt?: string }
+  { token: string; runtimeId: string; modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode }
 >();
 
 /** The runtime id driving the current active stream for a conversation, if any.
@@ -378,17 +378,31 @@ export function getActiveStreamRuntime(conversationId: string): string | undefin
   return entry && entry.token === activeToken ? entry.runtimeId : undefined;
 }
 
-/** The active run's model + system prompt (for the CURRENT active token only), so
- *  a mid-turn inject gates its text through DLP/UserPromptSubmit under the SAME
- *  model/prompt context a normal turn uses — a model/prompt-conditioned hook must
- *  see what the running turn shows it, or it could allow an injected message it
- *  would block. Undefined fields when unrecorded (caller falls back to defaults). */
-function getActiveRunContext(conversationId: string): { modelKey?: string; systemPrompt?: string } | undefined {
+/** The active run's model + system prompt + execution mode (for the CURRENT
+ *  active token only), so a mid-turn inject gates its text through
+ *  DLP/UserPromptSubmit under the SAME model/prompt/mode context a normal turn
+ *  uses — a model/prompt/mode-conditioned hook must see what the running turn
+ *  shows it, or it could allow an injected message it would block. Undefined
+ *  fields when unrecorded (caller falls back to defaults). */
+function getActiveRunContext(
+  conversationId: string,
+): { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode } | undefined {
   const activeToken = activeStreams.get(conversationId)?.token;
   if (activeToken === undefined) return undefined;
   const entry = activeStreamRuntime.get(conversationId);
   if (!entry || entry.token !== activeToken) return undefined;
-  return { modelKey: entry.modelKey, systemPrompt: entry.systemPrompt };
+  return { modelKey: entry.modelKey, systemPrompt: entry.systemPrompt, executionMode: entry.executionMode };
+}
+
+/** Update the active run's recorded model key after a mid-stream model-fallback,
+ *  so a mid-turn inject that arrives AFTER the switch gates under the model the
+ *  text will actually be sent to (not the primary). Token-scoped no-op if the run
+ *  was superseded. */
+function updateActiveRunModelKey(conversationId: string, token: string, modelKey: string): void {
+  const entry = activeStreamRuntime.get(conversationId);
+  if (entry && entry.token === token && activeStreams.get(conversationId)?.token === token) {
+    entry.modelKey = modelKey;
+  }
 }
 
 // Conversations whose current turn was started by a client that does NOT persist
@@ -1001,8 +1015,24 @@ export type InjectUserTurnFn = (
      *  plan-first turn (e.g. an ask_user answer recovered after a plan-mode
      *  restart) does NOT silently resume in `auto` with mutating tools enabled. */
     executionMode?: ExecutionMode;
+    /** COOPERATIVE-ONLY: never fall through to abort+restart. Used by raced-answer
+     *  delivery — a stale ask_user answer must splice into the LIVE successor turn
+     *  or fail; it must NEVER abort a newer run or restart after a Stop. When set
+     *  and the run isn't cooperatively injectable (or ownership changed under the
+     *  async gate), returns { ok:false, notCooperative:true } without restarting. */
+    cooperativeOnly?: boolean;
+    /** The stream token the caller expects to still own the conversation. With
+     *  cooperativeOnly, enqueue only proceeds while this token is active — so a
+     *  supersession that lands during the async policy gate can't misdeliver. */
+    expectedToken?: string;
   },
-) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean; blockedByPolicy?: boolean }>;
+) => Promise<{
+  ok: boolean;
+  error?: string;
+  injectedCooperatively?: boolean;
+  blockedByPolicy?: boolean;
+  notCooperative?: boolean;
+}>;
 
 let injectUserTurnAndRestart: InjectUserTurnFn | null = null;
 
@@ -2189,9 +2219,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         token: streamToken,
         runtimeId: runtime.id,
         // Captured so a mid-turn inject can gate its text under the SAME model +
-        // system prompt this run uses (see getActiveRunContext / gateInjectedUserText).
+        // system prompt + execution mode this run uses (see getActiveRunContext /
+        // gateInjectedUserText). modelKey is refreshed on model-fallback below.
         modelKey: modelEntry?.key ?? modelKey ?? config.models.defaultModelKey,
         systemPrompt: effectiveSystemPrompt,
+        executionMode: effectiveExecutionMode,
       });
     }
 
@@ -2212,9 +2244,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const reinject = injectUserTurnAndRestart;
           if (!reinject) return { ok: false };
           try {
-            const res = await reinject(conversationId, text);
+            // COOPERATIVE-ONLY: a stale ask_user answer must splice into THIS live
+            // successor or fail — never abort a newer run / restart after Stop. Bind
+            // to streamToken so a supersession during the async policy gate fails
+            // (transient) rather than misdelivering.
+            const res = await reinject(conversationId, text, {
+              cooperativeOnly: true,
+              expectedToken: streamToken,
+            });
             if (res?.ok && res.injectedCooperatively) return { ok: true };
             // A policy block is permanent for this content — don't retry it.
+            // notCooperative (ownership changed / not injectable) is transient.
             return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
           } catch {
             return { ok: false };
@@ -5236,6 +5276,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // exempted.
                   providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
                 }
+                // Refresh the run context's model key so a mid-turn inject arriving
+                // AFTER this fallback gates under the model its text will actually
+                // be sent to (a model-conditioned DLP hook would otherwise decide
+                // against the primary's key). Token-scoped no-op if superseded.
+                updateActiveRunModelKey(conversationId, streamToken, fbData.toModelKey);
               }
             }
             if (event.type === 'text-delta') {
@@ -5848,7 +5893,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       _event,
       conversationId: string,
       userText: string,
-    ): Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }> => {
+    ): Promise<{ ok: boolean; cooperative?: boolean; blocked?: boolean; id?: string; error?: string }> => {
       if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
@@ -5869,8 +5914,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const gate = await gateInjectedUserText(conversationId, userText, {
         modelKey: runCtx?.modelKey,
         systemPrompt: runCtx?.systemPrompt,
+        executionMode: runCtx?.executionMode,
       });
-      if (!gate.allowed) return { ok: false, cooperative: true, error: gate.reason ?? 'blocked-by-policy' };
+      // A policy BLOCK is a handled, terminal outcome — the message was
+      // intentionally rejected. Return blocked:true (NOT cooperative:false) so the
+      // renderer surfaces it WITHOUT falling back to a normal superseding send that
+      // would re-run the blocked text (and, for a plugin pre-send abort, the raw
+      // user node may already be persisted).
+      if (!gate.allowed) return { ok: false, blocked: true, error: gate.reason ?? 'blocked-by-policy' };
       // The gate awaited hooks; the cooperatively-injectable run may have finished
       // or been superseded meanwhile. If the active token changed (or the run is no
       // longer Mastra), enqueueing would strand the text (no prepareStep to drain
@@ -5966,7 +6017,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   const gateInjectedUserText = async (
     conversationId: string,
     userText: string,
-    ctx?: { modelKey?: string; systemPrompt?: string },
+    ctx?: { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode },
   ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean }> => {
     const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
     const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
@@ -5978,6 +6029,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // Can't read config to run enforcement → fail CLOSED (don't inject unfiltered).
       // Not terminal: a transient read error may clear on a later retry.
       return { allowed: false, text: userText, reason: 'Failed to load config for policy enforcement.' };
+    }
+    // Overlay the ACTIVE run's execution mode (e.g. a per-thread `plan-first`
+    // override while global config is `auto`) so a mode-aware plugin pre-send hook
+    // sees the same mode the running turn built via configWithExecutionMode — else
+    // it could allow/rewrite an injected message differently than a normal send.
+    if (ctx?.executionMode) {
+      config = { ...config, tools: { ...config.tools, executionMode: ctx.executionMode } };
     }
     // Gate under the ACTIVE run's model + system prompt (a model/prompt-conditioned
     // DLP hook must see the same context a normal turn shows it), falling back to
@@ -6039,6 +6097,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // it — see inject-queue.ts + prepare-step-inject.ts), persist + broadcast the
     // user turn so it renders immediately, and let the live turn continue. The
     // CLI runtimes can't be stepped, so they fall through to abort+restart below.
+    const cooperativeOnly = opts?.cooperativeOnly === true;
+    // A cooperative-only caller (raced-answer delivery) that finds no cooperatively
+    // injectable Mastra run, or whose expected token no longer owns the stream,
+    // must NOT abort+restart — a stale ask_user answer must never abort a newer run
+    // or restart after a Stop. Fail delivery instead (the answer stays stashed).
+    if (
+      cooperativeOnly &&
+      (getActiveStreamRuntime(conversationId) !== 'mastra' ||
+        (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken))
+    ) {
+      return { ok: false, notCooperative: true };
+    }
     if (getActiveStreamRuntime(conversationId) === 'mastra') {
       // Enforce the same plugin pre-send + UserPromptSubmit policy a normal turn
       // applies before this text is spliced into the running turn (prepareStep
@@ -6051,6 +6121,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const gate = await gateInjectedUserText(conversationId, userText, {
         modelKey: opts?.modelKey ?? runCtx?.modelKey,
         systemPrompt: runCtx?.systemPrompt,
+        executionMode: opts?.executionMode ?? runCtx?.executionMode,
       });
       if (!gate.allowed)
         return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: gate.terminal };
@@ -6058,13 +6129,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // this conversation's active token changed (or the run ended), the run we
       // resolved as cooperatively-injectable is gone — enqueueing now would strand
       // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
-      // than the one we gated for. Fall through to the abort+restart path, which
-      // re-reads current state and starts a fresh turn with the (gated) text.
-      if (
+      // than the one we gated for.
+      const ownershipChanged =
         activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
-        getActiveStreamRuntime(conversationId) !== 'mastra'
-      ) {
-        userText = gate.text; // carry the gated text into the fallback path
+        getActiveStreamRuntime(conversationId) !== 'mastra' ||
+        (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken);
+      if (ownershipChanged) {
+        // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
+        // stale answer can't restart a stopped run or abort a newer one.
+        if (cooperativeOnly) return { ok: false, notCooperative: true };
+        // Otherwise fall through to abort+restart with the (gated) text.
+        userText = gate.text;
       } else {
         const injectText = gate.text;
         const injectId = enqueueInject(conversationId, injectText);
