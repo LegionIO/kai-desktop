@@ -31,6 +31,7 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
+  finalizeInterruptedTurnUpsert,
   persistCooperativeInjectedUserTurn,
   finalizeGuiFallbackPrefixAtInject,
   clearFinalizedResponseIds,
@@ -183,7 +184,11 @@ describe('stream persistence accumulator', () => {
     } as unknown as { headId?: string | null });
     feed({ conversationId: 'web2', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-web2' });
     finalizeInterruptedTurnReplacing(APP_HOME, 'web2');
-    const writtenConv = writeMock.mock.calls[0][1] as { headId: string; runStatus: string; messageTree: Array<{ id: string; content: unknown }> };
+    const writtenConv = writeMock.mock.calls[0][1] as {
+      headId: string;
+      runStatus: string;
+      messageTree: Array<{ id: string; content: unknown }>;
+    };
     // The superseded node's content is still replaced with the full copy...
     const node = writtenConv.messageTree.find((m) => m.id === 'resp-web2')!;
     expect(JSON.stringify(node.content)).toContain('FULL reply');
@@ -191,6 +196,50 @@ describe('stream persistence accumulator', () => {
     expect(writtenConv.headId).toBe('newerUser');
     expect(writtenConv.runStatus).toBe('running');
     clearFinalizedResponseIds('web2');
+  });
+
+  it('finalizeInterruptedTurnUpsert REPLACES a local-origin node the renderer already persisted (no duplicate)', () => {
+    // Local originator: the renderer's ~300ms debounced stream-persist already wrote the
+    // assistant node under this run's responseMessageId, but disk is still 'running' (the
+    // originator hasn't reached its terminal persist). A passive client wins continuation and
+    // flushes main's fallback here. A plain append would collision-rename to a bogus
+    // `auto-msg-*` sibling; upsert must REPLACE the existing node in place.
+    clearFinalizedResponseIds('local');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    readMock.mockReturnValueOnce({
+      id: 'local',
+      headId: 'resp-local',
+      runStatus: 'running',
+      messageTree: [
+        { id: 'u', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-local', parentId: 'u', role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+      ],
+      messages: [
+        { id: 'u', role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-local', role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+      ],
+    } as unknown as { headId?: string | null });
+    feed({ conversationId: 'local', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-local' });
+    const head = finalizeInterruptedTurnUpsert(APP_HOME, 'local');
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    expect(head).toBe('resp-local');
+    const writtenConv = writeMock.mock.calls[0][1] as { messageTree: Array<{ id: string; content: unknown }> };
+    const node = writtenConv.messageTree.find((m) => m.id === 'resp-local')!;
+    expect(JSON.stringify(node.content)).toContain('FULL reply');
+    clearFinalizedResponseIds('local');
+  });
+
+  it('finalizeInterruptedTurnUpsert APPENDS when no node with that id exists yet (local, renderer not-yet-persisted)', () => {
+    clearFinalizedResponseIds('local2');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    feed({ conversationId: 'local2', type: 'text-delta', text: 'reply', responseMessageId: 'resp-local2' });
+    finalizeInterruptedTurnUpsert(APP_HOME, 'local2');
+    // No pre-existing node under resp-local2 → falls through to a normal append.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    clearFinalizedResponseIds('local2');
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {

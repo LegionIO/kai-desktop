@@ -400,6 +400,17 @@ export function finalizeInterruptedTurnReplacing(appHome: string, conversationId
   return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
 }
 
+// Terminal finalize for a LOCAL-originated GUI turn whose main-side fallback accumulator must be
+// flushed. Uses the SAME upsert-by-id semantics as the remote path: the local originator's renderer
+// runs a ~300ms debounced stream-persist, so by the time a passive client wins continuation and
+// triggers this flush, disk may ALREADY carry the assistant node under this run's responseMessageId
+// (even though runStatus is still 'running'). A plain append would id-collision-rename it to a bogus
+// `auto-msg-*` duplicate sibling; replaceById upserts the existing node in place (and falls through
+// to a normal append when no such node exists yet).
+export function finalizeInterruptedTurnUpsert(appHome: string, conversationId: string): string | null {
+  return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
+}
+
 export type PersistedInjectedUserTurn = {
   /** Stable id of the user node appended to the authoritative conversation tree. */
   messageId: string;

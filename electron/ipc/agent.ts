@@ -40,6 +40,7 @@ import {
   persistenceAccumulatorHasContent,
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
+  finalizeInterruptedTurnUpsert,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
   finalizeGuiFallbackPrefixAtInject,
@@ -2044,19 +2045,60 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // ANOTHER GUI client submitted from a stale branch before receiving this
         // inject's broadcast, conversations:put's union-merge can leave the inject
         // as an off-branch SIBLING while the new prompt is the head. Reconcile any
-        // such stranded inject node onto the current head (so the replacement's
-        // branch — rebuilt below — includes it), THEN clear the queue.
+        // such stranded inject node onto the branch (so the replacement's branch —
+        // rebuilt below — includes it), THEN clear the queue.
         const stranded = drainInjects(conversationId);
         const conv = readConversation(appHome, conversationId);
         if (conv) {
           const { tree, headId } = ensureConversationTree(conv);
           const headLine = new Set(getConversationBranch(tree, headId).map((m) => m.id));
+          // The stranded injects that actually exist off-branch (the cross-client
+          // stale-submit sibling case) — in FIFO order.
+          const offBranch = stranded.filter((e) => tree.some((m) => m.id === e.id) && !headLine.has(e.id));
+          // Is the current head a DISTINCT superseding prompt? That is: a user node
+          // submitted AFTER these injects were queued (a fresh submit from another
+          // client that won the head), NOT itself one of the stranded injects and
+          // NOT already carrying an inject as an ancestor. If so, the injects are
+          // OLDER and must land BEFORE it — `pre → inject… → newPrompt` — never
+          // after it (which would present the stale inject as the current request).
+          const strandedIds = new Set(stranded.map((e) => e.id));
+          const headNode = headId ? tree.find((m) => m.id === headId) : undefined;
+          const headIsSupersedingPrompt =
+            !!headNode && headNode.role === 'user' && !strandedIds.has(headNode.id) && offBranch.length > 0;
           let head = headId;
           let reconciled = false;
-          for (const entry of stranded) {
-            // Only reconcile an inject node that EXISTS on disk but sits OFF the
-            // active branch (the cross-client stale-submit sibling case).
-            if (tree.some((m) => m.id === entry.id) && !headLine.has(entry.id) && head) {
+          if (headIsSupersedingPrompt && headNode) {
+            // Splice the inject chain between the superseding prompt and its parent:
+            // reparent the first inject onto the prompt's parent, chain the rest in
+            // FIFO order, then reparent the prompt onto the last inject. Head stays
+            // at the (unchanged-id) superseding prompt so it remains the request.
+            const promptParent = headNode.parentId;
+            if (typeof promptParent === 'string' && promptParent) {
+              let chainTail = promptParent;
+              let spliced = true;
+              for (const entry of offBranch) {
+                const r = reparentConversationMessage(appHome, conversationId, entry.id, chainTail);
+                if (!r) {
+                  spliced = false;
+                  break;
+                }
+                chainTail = entry.id;
+              }
+              if (spliced) {
+                const r = reparentConversationMessage(appHome, conversationId, headNode.id, chainTail, {
+                  makeHead: true,
+                });
+                if (r?.headId) {
+                  head = r.headId;
+                  reconciled = true;
+                }
+              }
+            }
+          } else {
+            // No superseding prompt — the head is (or descends from) prior history.
+            // Reconcile each off-branch inject onto the current head in FIFO order.
+            for (const entry of offBranch) {
+              if (!head) break;
               const r = reparentConversationMessage(appHome, conversationId, entry.id, head, { makeHead: true });
               if (r?.headId) {
                 head = r.headId;
@@ -6965,10 +7007,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     try {
       // REMOTE origin: the web client already persisted a FRAME-CAPPED node under this
       // responseMessageId — REPLACE it in place with main's full copy (appending would create a
-      // duplicate sibling). LOCAL origin: append (no capped node to replace).
+      // duplicate sibling). LOCAL origin: the originator's renderer runs a ~300ms debounced
+      // stream-persist, so disk may ALREADY carry this run's assistant node (still 'running')
+      // by the time a passive client wins continuation and flushes here — UPSERT by id so we
+      // don't collision-rename it into a duplicate `auto-msg-*` sibling; falls through to a
+      // normal append when no such node exists yet.
       const head = remoteOrigin
         ? finalizeInterruptedTurnReplacing(serverPersistAppHome, conversationId)
-        : finalizeInterruptedTurn(serverPersistAppHome, conversationId);
+        : finalizeInterruptedTurnUpsert(serverPersistAppHome, conversationId);
       if (head) return { confirmed: true, headId: head };
       if (hadContent) return { confirmed: false, headId: null as string | null }; // write failed → not confirmed
       // Genuinely empty accumulator: the on-disk head is the confirmed branch.
