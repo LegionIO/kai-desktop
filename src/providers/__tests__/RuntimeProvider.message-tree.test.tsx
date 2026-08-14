@@ -301,6 +301,31 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(msg.parentId).toBe('assistant-old');
   });
 
+  it('rotates to a FRESH node id when the pendingAssistantId is a cooperative-inject-closed prefix', () => {
+    // After a mid-turn inject, the reply-so-far (msg-shared) is a CLOSED prefix
+    // (finalizedInjectResponseIds). The continuation arrives under the SAME
+    // responseMessageId (pendingAssistantId), but must NOT reuse the prefix node
+    // id — it gets a fresh node, parented on the injected user (the live head).
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        { id: 'msg-shared', parentId: 'user-1', role: 'assistant', content: [{ type: 'text', text: 'prefix' }], createdAt: new Date() },
+        { id: 'user-inject', parentId: 'msg-shared', role: 'user', content: [{ type: 'text', text: 'answer' }], createdAt: new Date() },
+      ],
+      headId: 'user-inject',
+      pendingAssistantId: 'msg-shared',
+      finalizedInjectResponseIds: new Set(['msg-shared']),
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const first = getOrCreateAssistantInAcc(acc);
+    expect(first.msg.id).not.toBe('msg-shared'); // rotated to a fresh id
+    expect(first.msg.parentId).toBe('user-inject'); // parented on the injected user
+
+    // A second delta of the SAME reused id appends to the SAME rotated node.
+    const second = getOrCreateAssistantInAcc(acc);
+    expect(second.msg.id).toBe(first.msg.id);
+  });
+
   it('creates the fallback retry as a sibling with its newly echoed id', () => {
     const acc = {
       messages: [
