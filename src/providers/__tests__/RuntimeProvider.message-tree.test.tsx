@@ -448,6 +448,22 @@ describe('reorderPrefixBeforeInjectedUser — inject broadcast before the prefix
     expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'user-inject').headId).toBe('user-inject');
     expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'missing').messages).toBe(messages);
   });
+
+  it('selects the ACTIVE variant when a fallback left two assistants under the injected user', () => {
+    // failed partial + successful reply both under user-inject; head = the active one.
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'asst-failed', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'asst-ok', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'asst-ok', 'user-inject');
+    // The head-lineage variant (asst-ok) is threaded before the user; failed one untouched.
+    expect(out.messages.find((m) => m.id === 'asst-ok')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('asst-ok');
+    expect(out.messages.find((m) => m.id === 'asst-failed')?.parentId).toBe('user-inject');
+    expect(out.headId).toBe('user-inject');
+  });
 });
 
 describe('reorderPrefixBeforeInjectedUserChain — batched multi-inject before the prefix existed', () => {

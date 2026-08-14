@@ -607,9 +607,16 @@ export function reorderInjectPrefixOnDisk(
     const firstInjected = present[0];
     const firstUser = tree.find((m) => m.id === firstInjected);
     const preInjectHead = firstUser?.parentId ?? null;
+    // A sibling assistant under the pre-inject head is the fallback-finalized reply
+    // ONLY if it belongs to the JUST-FINISHED turn — i.e. it's on the current head's
+    // ancestor lineage. A regenerated/rewound user turn can leave a SHELVED
+    // historical assistant as a sibling too; reparenting the inject onto that would
+    // attach it to abandoned history. Require the head-lineage evidence.
     const siblingAssistants =
       preInjectHead !== null
-        ? tree.filter((m) => m.role === 'assistant' && m.parentId === preInjectHead && !idSet.has(m.id))
+        ? tree.filter(
+            (m) => m.role === 'assistant' && m.parentId === preInjectHead && !idSet.has(m.id) && onHeadLineage(m.id),
+          )
         : [];
     if (firstUser && siblingAssistants.length === 1) {
       // (a) Reparent: assistant keeps P as parent; first injected user reparents onto it.

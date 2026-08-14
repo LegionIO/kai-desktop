@@ -1972,13 +1972,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const rebuilt = readConversation(appHome, conversationId);
           if (rebuilt) {
             const { tree, headId } = ensureConversationTree(rebuilt);
-            const diskBranch = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]);
-            // The incoming `messages`' trailing user turn(s): everything after the
-            // last message that also appears (by a shallow role+text match) at the
-            // corresponding position in the disk branch is a NEW turn to preserve.
-            // Simplest robust rule: if the incoming branch's LAST message is a user
-            // turn whose text isn't the stranded inject's, append it.
+            // A newer prompt may have superseded this run (a fresh submit persisted
+            // its own user node before the abort/restart reached here). After the
+            // stranded-inject drain advanced the disk head to the inject, that new
+            // prompt node is now on a SIBLING branch. Find it on disk (a user node,
+            // NOT one of the stranded injects, whose text matches the incoming
+            // branch's last user turn) and REPARENT it onto the stranded inject so
+            // the authoritative branch is `…history… → strandedInject → newPrompt`
+            // and the head advances to it. Then rebuild `messages` from that branch —
+            // NOT an in-memory append (which would duplicate the prompt in model
+            // input and leave the disk reply mis-parented).
             const incomingLast = lastUserMessage(messages as unknown[]);
+            const strandedIds = new Set(stranded.map((e) => e.id));
             const strandedTexts = new Set(stranded.map((e) => e.text));
             const incomingLastText =
               incomingLast && typeof incomingLast.content !== 'undefined'
@@ -1986,13 +1991,30 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   ? incomingLast.content
                   : extractMessageText(incomingLast.content)
                 : '';
+            let effectiveHead = headId;
             if (incomingLast && incomingLastText && !strandedTexts.has(incomingLastText)) {
-              // A newer prompt superseded this run — keep it AFTER the stranded inject.
-              messages = [...diskBranch, incomingLast];
-            } else {
-              // Pure continuation (no newer prompt) — the disk branch is authoritative.
-              messages = diskBranch;
+              // Locate the new prompt's already-persisted disk node (newest matching
+              // user node that isn't a stranded inject and isn't already on the head).
+              const headLine = new Set(getConversationBranch(tree, headId).map((m) => m.id));
+              const newPromptNode = [...tree]
+                .reverse()
+                .find(
+                  (m) =>
+                    m.role === 'user' &&
+                    !strandedIds.has(m.id) &&
+                    !headLine.has(m.id) &&
+                    extractMessageText(m.content) === incomingLastText,
+                );
+              if (newPromptNode && headId) {
+                const reparented = reparentConversationMessage(appHome, conversationId, newPromptNode.id, headId, {
+                  makeHead: true,
+                });
+                if (reparented?.headId) effectiveHead = reparented.headId;
+              }
             }
+            const finalConv = readConversation(appHome, conversationId) ?? rebuilt;
+            const { tree: finalTree } = ensureConversationTree(finalConv);
+            messages = stripDisplayOnlyParts(getConversationBranch(finalTree, effectiveHead) as unknown[]);
           }
         }
       }

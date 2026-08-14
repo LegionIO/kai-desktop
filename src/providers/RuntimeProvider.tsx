@@ -1423,15 +1423,37 @@ export function reorderPrefixBeforeInjectedUser(
   const childAssistants = messages.filter(
     (m) => m.parentId === injectedUserId && m.role === 'assistant' && m.id !== contId,
   );
-  if (childAssistants.length !== 1) return { messages, headId };
-  const prefix = childAssistants[0];
+  // A transient model-fallback can leave MULTIPLE assistant variants under the
+  // injected user (a failed partial + the successful reply). Pick the ACTIVE one —
+  // the variant on the current head's ancestor lineage — so the successful reply
+  // (not a failed sibling) is threaded before the user (matches the disk-side
+  // reorderInjectPrefixOnDisk). If none is on the head lineage, don't guess.
+  let prefix: StoredMessage | undefined;
+  if (childAssistants.length === 1) {
+    prefix = childAssistants[0];
+  } else if (childAssistants.length > 1) {
+    const byId = new Map(messages.map((m) => [m.id, m] as const));
+    const onHeadLineage = (id: string): boolean => {
+      let cur: string | null = headId;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur)) {
+        if (cur === id) return true;
+        seen.add(cur);
+        cur = byId.get(cur)?.parentId ?? null;
+      }
+      return false;
+    };
+    prefix = childAssistants.find((m) => onHeadLineage(m.id));
+  }
+  if (!prefix) return { messages, headId };
   const userParent = user.parentId;
+  const prefixId = prefix.id;
   const nextMessages = messages.map((m) => {
-    if (m.id === prefix.id) return { ...m, parentId: userParent };
-    if (m.id === injectedUserId) return { ...m, parentId: prefix.id };
+    if (m.id === prefixId) return { ...m, parentId: userParent };
+    if (m.id === injectedUserId) return { ...m, parentId: prefixId };
     return m;
   });
-  const nextHead = headId === prefix.id ? injectedUserId : headId;
+  const nextHead = headId === prefixId ? injectedUserId : headId;
   return { messages: nextMessages, headId: nextHead };
 }
 
