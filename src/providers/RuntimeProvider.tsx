@@ -1416,6 +1416,47 @@ export function reorderPrefixBeforeInjectedUser(
   return { messages: nextMessages, headId: nextHead };
 }
 
+/**
+ * Batch-aware variant of reorderPrefixBeforeInjectedUser for a multi-inject
+ * boundary consumed together. When several injects were broadcast before the
+ * prior step's first assistant delta, the temporary tree is
+ * `pre → u1 → u2 → … → prefix` (the prefix landed under the LAST user). The prefix
+ * was produced BEFORE any of them, so it belongs BEFORE the whole chain:
+ * `pre → prefix → u1 → u2 → …`. Find the single non-continuation assistant parented
+ * on ANY injected user in the batch, move it to the FIRST injected user's parent,
+ * and reparent that first user onto it — leaving the rest of the user chain intact
+ * after it. Pure. No-op when there's no such misplaced prefix. `injectedIds` is in
+ * FIFO (chain) order.
+ */
+export function reorderPrefixBeforeInjectedUserChain(
+  messages: StoredMessage[],
+  headId: string | null,
+  injectedIds: string[],
+): { messages: StoredMessage[]; headId: string | null } {
+  if (injectedIds.length === 0) return { messages, headId };
+  if (injectedIds.length === 1) return reorderPrefixBeforeInjectedUser(messages, headId, injectedIds[0]);
+  const idSet = new Set(injectedIds);
+  const contIds = new Set(injectedIds.map((id) => `${id}-cont`));
+  // The misplaced prefix: a non-continuation assistant whose parent is one of the
+  // batch's injected users.
+  const prefixes = messages.filter(
+    (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId) && !contIds.has(m.id),
+  );
+  if (prefixes.length !== 1) return { messages, headId };
+  const prefix = prefixes[0];
+  const firstUser = messages.find((m) => m.id === injectedIds[0]);
+  if (!firstUser) return { messages, headId };
+  const chainParent = firstUser.parentId; // the pre-inject head
+  const nextMessages = messages.map((m) => {
+    if (m.id === prefix.id) return { ...m, parentId: chainParent };
+    if (m.id === injectedIds[0]) return { ...m, parentId: prefix.id };
+    return m;
+  });
+  // If the head was the misplaced prefix, advance it to the tail of the user chain.
+  const nextHead = headId === prefix.id ? injectedIds[injectedIds.length - 1] : headId;
+  return { messages: nextMessages, headId: nextHead };
+}
+
 export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
   let desiredId = acc.pendingAssistantId ?? undefined;
   // Cooperative-inject continuation: if the reused responseMessageId (desiredId)
@@ -3793,16 +3834,20 @@ export function RuntimeProvider({
           const entries = ((e as { data?: { entries?: Array<{ id?: unknown }> } }).data?.entries ?? []).filter(
             (en): en is { id: string } => typeof en?.id === 'string',
           );
+          // ORDERING REPAIR (batch-aware) for the "inject(s) broadcast before the
+          // prefix existed" case: if the prior step's first assistant delta arrived
+          // AFTER the user-message handler advanced the head to the injected user(s),
+          // the prefix got created under the LAST injected user. Move it BEFORE the
+          // whole user chain (`pre → prefix → u1 → … `). Done ONCE over the batch —
+          // per-entry FIFO would leave `u1 → prefix → u2`.
+          const repaired = reorderPrefixBeforeInjectedUserChain(
+            acc2.messages,
+            acc2.headId,
+            entries.map((en) => en.id),
+          );
+          acc2.messages = repaired.messages;
+          acc2.headId = repaired.headId;
           for (const en of entries) {
-            // ORDERING REPAIR for the "inject broadcast before the prefix existed"
-            // case (see reorderPrefixBeforeInjectedUser): if the prior step's first
-            // assistant delta arrived AFTER the user-message handler advanced the
-            // head to the injected user, that assistant got created UNDER the user
-            // (user → prefix), which is wrong — the model produced it BEFORE seeing
-            // the inject. Swap them back to `prefix → user`.
-            const repaired = reorderPrefixBeforeInjectedUser(acc2.messages, acc2.headId, en.id);
-            acc2.messages = repaired.messages;
-            acc2.headId = repaired.headId;
             acc2.closedPrefixIds ??= new Set();
             if (acc2.pendingAssistantId) acc2.closedPrefixIds.add(acc2.pendingAssistantId);
             if (acc2.injectContinuationId) acc2.closedPrefixIds.add(acc2.injectContinuationId);

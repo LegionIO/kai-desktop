@@ -25,6 +25,7 @@ import {
   resolveLiveInjectedParentId,
   reconnectActiveBranchRoot,
   reorderPrefixBeforeInjectedUser,
+  reorderPrefixBeforeInjectedUserChain,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -446,6 +447,37 @@ describe('reorderPrefixBeforeInjectedUser — inject broadcast before the prefix
     ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
     expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'user-inject').headId).toBe('user-inject');
     expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'missing').messages).toBe(messages);
+  });
+});
+
+describe('reorderPrefixBeforeInjectedUserChain — batched multi-inject before the prefix existed', () => {
+  it('moves the prefix BEFORE the whole user chain (pre → prefix → u1 → u2)', () => {
+    // Temporary tree: pre → u1 → u2 → prefix (prefix landed under the LAST user).
+    // Per-entry FIFO would leave `u1 → prefix → u2`; the chain repair must yield
+    // pre → prefix → u1 → u2.
+    const messages = [
+      { id: 'pre', parentId: null, role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u1', parentId: 'pre', role: 'user', content: [], createdAt: new Date() },
+      { id: 'u2', parentId: 'u1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'u2', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'prefix', ['u1', 'u2']);
+    const byId = Object.fromEntries(out.messages.map((m) => [m.id, m.parentId]));
+    expect(byId['prefix']).toBe('pre'); // prefix before the chain
+    expect(byId['u1']).toBe('prefix'); // first user after the prefix
+    expect(byId['u2']).toBe('u1'); // chain order preserved
+    expect(out.headId).toBe('u2'); // head advances to the chain tail
+  });
+
+  it('delegates to the single-entry repair for one inject', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'prefix', ['user-inject']);
+    expect(out.messages.find((m) => m.id === 'prefix')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
   });
 });
 

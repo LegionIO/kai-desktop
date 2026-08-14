@@ -816,17 +816,25 @@ const liveRacedAnswerClaimant = new Map<
 
 /** Register (or MERGE) a conversation's pending raced-answer handoff in the
  *  pre-successor holding map. Parallel ask_user gates aborting together each add
- *  their own answerKey. */
+ *  their own answerKey. `expiresAtOverride` carries the ORIGINAL expiry forward on
+ *  a re-registration (claimant teardown) so repeated quick successors can't renew
+ *  the 30s TTL indefinitely — the answer must still age out on its original clock. */
 function registerRacedAnswerHandoff(
   conversationId: string,
   answerKey: string,
   cancelGenAtAbort: number,
   sourceToken: string,
+  expiresAtOverride?: number,
 ): void {
+  const now = Date.now();
+  // A carried-forward expiry that has ALREADY passed → don't resurrect (drop).
+  if (expiresAtOverride !== undefined && now > expiresAtOverride) return;
+  const expiresAt = expiresAtOverride ?? now + RACED_ANSWER_HANDOFF_TTL_MS;
   const existing = racedAnswerHandoffs.get(conversationId);
   if (existing && (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort) {
     existing.answerKeys.add(answerKey);
-    existing.expiresAt = Date.now() + RACED_ANSWER_HANDOFF_TTL_MS;
+    // Keep the EARLIER expiry (never extend) — merge must not renew a bounded TTL.
+    existing.expiresAt = Math.min(existing.expiresAt, expiresAt);
     return;
   }
   // If a DIFFERENT run has already claimed the latest-issued turn token by the
@@ -844,7 +852,7 @@ function registerRacedAnswerHandoff(
     sourceToken,
     deliveryRetries: 0,
     expectedSuccessorToken,
-    expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+    expiresAt,
   });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
     const oldest = racedAnswerHandoffs.keys().next().value;
@@ -907,7 +915,8 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // later turn (or a fresh claim) can pick it up — UNLESS an explicit cancel
       // (Stop) bumped the generation, in which case it must NOT be resurrected.
       if ((explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort) {
-        registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token);
+        // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
+        registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
         // If a replacement claimant is ALREADY live (it passed its claim site before
         // this teardown), MERGE the requeued key into it + deliver, so the answer
         // isn't stuck until the next trigger. No-op if there's no live claimant yet
@@ -991,6 +1000,7 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
           key,
           explicitCancelGeneration.get(conversationId) ?? 0,
           token, // sourceToken = this finished successor; a later DIFFERENT run claims it
+          claimant.state.expiresAt, // carry ORIGINAL expiry — repeated successors can't renew the TTL
         );
       }
       liveRacedAnswerClaimant.delete(conversationId);
@@ -1043,7 +1053,8 @@ function registerLiveRacedAnswerClaimant(
           cancelGenAtAbort: prior.state.cancelGenAtAbort,
           sourceToken: token,
           deliveryRetries: 0,
-          expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+          // Inherit the prior's expiry — a supersession-chain must not renew the TTL.
+          expiresAt: prior.state.expiresAt,
         },
       });
       if (!racedStateInvalid(liveRacedAnswerClaimant.get(conversationId)!.state, conversationId)) {
@@ -6277,97 +6288,112 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // the same context a normal turn shows it.
       const tokenBeforeGate = activeStreams.get(conversationId)?.token;
       const runCtx = getActiveRunContext(conversationId);
-      const gate = await gateInjectedUserText(conversationId, userText, {
-        modelKey: opts?.modelKey ?? runCtx?.modelKey,
-        systemPrompt: runCtx?.systemPrompt,
-        executionMode: opts?.executionMode ?? runCtx?.executionMode,
-        // Only revalidate against a mid-stream model change when we gated under the
-        // LIVE run's model (no caller-forced modelKey — an automation that pins a
-        // model intends that model, so a fallback mismatch must not spuriously deny).
-        revalidateLiveModel: opts?.modelKey === undefined,
-      });
-      // TERMINAL block → reject permanently. NON-terminal (model changed during the
-      // async gate) → for a cooperative-only raced answer, report transient
-      // (notCooperative) so it retries; for a normal caller, fall through to
-      // abort+restart with the gated text so the fresh turn re-gates under the
-      // now-active model.
-      let gateForcedFallthrough = false;
-      if (!gate.allowed) {
-        if (gate.terminal) return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
-        if (cooperativeOnly) return { ok: false, notCooperative: true };
-        gateForcedFallthrough = true;
-      }
-      // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
-      // this conversation's active token changed (or the run ended), the run we
-      // resolved as cooperatively-injectable is gone — enqueueing now would strand
-      // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
-      // than the one we gated for.
-      const ownershipChanged =
-        gateForcedFallthrough ||
-        activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
-        getActiveStreamRuntime(conversationId) !== 'mastra' ||
-        (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken);
-      if (ownershipChanged) {
-        // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
-        // stale answer can't restart a stopped run or abort a newer one.
-        if (cooperativeOnly) return { ok: false, notCooperative: true };
-        // Otherwise fall through to abort+restart with the (gated) text.
-        userText = gate.text;
+      // A cooperative splice injects into the UNCHANGED live run — so it must be
+      // gated (and will execute) under the LIVE run's model/mode, NOT a caller
+      // override. If the caller (e.g. a busy-target automation) pinned a DIFFERENT
+      // model or execution mode than the live run, cooperative splicing would run
+      // the text under the wrong context — fall through to abort+restart instead so
+      // the caller's override is honored on a fresh turn. Cooperative-only callers
+      // (raced-answer delivery) never pin an override, so they always splice.
+      const overrideDiffersFromLive =
+        (opts?.modelKey !== undefined && runCtx?.modelKey !== undefined && opts.modelKey !== runCtx.modelKey) ||
+        (opts?.executionMode !== undefined &&
+          runCtx?.executionMode !== undefined &&
+          opts.executionMode !== runCtx.executionMode);
+      if (overrideDiffersFromLive && !cooperativeOnly) {
+        // Skip cooperative splice; fall through to abort+restart with the override.
       } else {
-        const injectText = gate.text;
-        const injectId = enqueueInject(conversationId, injectText);
-        if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
-        const activeToken = activeStreams.get(conversationId)?.token;
-        const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
-        let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
-          messageId: injectId,
-          // For deferred server-owned persistence, omit the stale disk parent so a
-          // co-viewing renderer keeps its current live assistant head.
-          ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
-          createdAt: new Date().toISOString(),
-        };
-        if (!serverOwnsPersistence) {
-          const write = appendConversationMessages(
-            appHome,
-            conversationId,
-            [
-              {
-                id: injectId,
-                role: 'user',
-                content: [{ type: 'text', text: injectText }],
-                createdAt: persistedMeta.createdAt,
-              },
-            ],
-            // Keep runStatus 'running' — the turn is still live; we're extending it.
-            { runStatus: 'running' },
-          );
-          if (write?.headId) {
-            const messageId = write.headId;
-            const node = (
-              (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
-            ).find((message) => message.id === messageId);
-            persistedMeta = {
-              messageId,
-              parentId: node?.parentId ?? null,
-              createdAt: node?.createdAt ?? persistedMeta.createdAt,
-            };
-          } else {
-            persistedMeta = null;
-          }
+        const gate = await gateInjectedUserText(conversationId, userText, {
+          // Gate under the LIVE run's context — the splice lands in that run.
+          modelKey: runCtx?.modelKey,
+          systemPrompt: runCtx?.systemPrompt,
+          executionMode: runCtx?.executionMode,
+          // Revalidate against a mid-stream model change during the async gate.
+          revalidateLiveModel: true,
+        });
+        // TERMINAL block → reject permanently. NON-terminal (model changed during the
+        // async gate) → for a cooperative-only raced answer, report transient
+        // (notCooperative) so it retries; for a normal caller, fall through to
+        // abort+restart with the gated text so the fresh turn re-gates under the
+        // now-active model.
+        let gateForcedFallthrough = false;
+        if (!gate.allowed) {
+          if (gate.terminal) return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
+          if (cooperativeOnly) return { ok: false, notCooperative: true };
+          gateForcedFallthrough = true;
         }
-        if (!persistedMeta) {
-          removeInject(conversationId, injectId);
-          // Conversation vanished between the runtime check and the write — the run
-          // is effectively gone; fall through to the abort+restart path which
-          // re-reads + handles a missing conversation cleanly.
+        // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
+        // this conversation's active token changed (or the run ended), the run we
+        // resolved as cooperatively-injectable is gone — enqueueing now would strand
+        // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
+        // than the one we gated for.
+        const ownershipChanged =
+          gateForcedFallthrough ||
+          activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
+          getActiveStreamRuntime(conversationId) !== 'mastra' ||
+          (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken);
+        if (ownershipChanged) {
+          // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
+          // stale answer can't restart a stopped run or abort a newer one.
+          if (cooperativeOnly) return { ok: false, notCooperative: true };
+          // Otherwise fall through to abort+restart with the (gated) text.
+          userText = gate.text;
         } else {
-          broadcastStreamEvent({
-            conversationId,
-            type: 'user-message',
-            text: injectText,
-            data: persistedMeta,
-          });
-          return { ok: true, injectedCooperatively: true };
+          const injectText = gate.text;
+          const injectId = enqueueInject(conversationId, injectText);
+          if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
+          const activeToken = activeStreams.get(conversationId)?.token;
+          const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+          let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
+            messageId: injectId,
+            // For deferred server-owned persistence, omit the stale disk parent so a
+            // co-viewing renderer keeps its current live assistant head.
+            ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
+            createdAt: new Date().toISOString(),
+          };
+          if (!serverOwnsPersistence) {
+            const write = appendConversationMessages(
+              appHome,
+              conversationId,
+              [
+                {
+                  id: injectId,
+                  role: 'user',
+                  content: [{ type: 'text', text: injectText }],
+                  createdAt: persistedMeta.createdAt,
+                },
+              ],
+              // Keep runStatus 'running' — the turn is still live; we're extending it.
+              { runStatus: 'running' },
+            );
+            if (write?.headId) {
+              const messageId = write.headId;
+              const node = (
+                (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+              ).find((message) => message.id === messageId);
+              persistedMeta = {
+                messageId,
+                parentId: node?.parentId ?? null,
+                createdAt: node?.createdAt ?? persistedMeta.createdAt,
+              };
+            } else {
+              persistedMeta = null;
+            }
+          }
+          if (!persistedMeta) {
+            removeInject(conversationId, injectId);
+            // Conversation vanished between the runtime check and the write — the run
+            // is effectively gone; fall through to the abort+restart path which
+            // re-reads + handles a missing conversation cleanly.
+          } else {
+            broadcastStreamEvent({
+              conversationId,
+              type: 'user-message',
+              text: injectText,
+              data: persistedMeta,
+            });
+            return { ok: true, injectedCooperatively: true };
+          }
         }
       }
     }

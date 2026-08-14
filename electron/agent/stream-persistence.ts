@@ -485,7 +485,14 @@ export function finalizeGuiFallbackPrefixAtInject(
   // through to a normal append when no such node exists yet). keepRunning: the
   // turn is still live.
   const prefixHead = hasPrefix
-    ? persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true, replaceById: true })
+    ? persistAccumulatedReturningHead(appHome, conversationId, {
+        keepRunning: true,
+        replaceById: true,
+        // Restore the prefix's parent from the accumulator (the pre-inject head) in
+        // case the renderer debounce persisted it temporarily under the injected
+        // user — otherwise reparenting the user onto it below would be a cycle.
+        restoreParentFromAcc: true,
+      })
     : null;
   // Re-seed a fresh continuation accumulator parented on the injected user, with
   // a DETERMINISTIC responseMessageId derived from the injected user id
@@ -521,7 +528,7 @@ function persistAccumulated(appHome: string, conversationId: string): boolean {
 function persistAccumulatedReturningHead(
   appHome: string,
   conversationId: string,
-  opts?: { keepRunning?: boolean; replaceById?: boolean },
+  opts?: { keepRunning?: boolean; replaceById?: boolean; restoreParentFromAcc?: boolean },
 ): string | null {
   const acc = accumulators.get(conversationId);
   accumulators.delete(conversationId);
@@ -616,6 +623,16 @@ function persistAccumulatedReturningHead(
           const replaced = { ...nextTree[nodeIdx], content: acc.parts };
           delete (replaced as { tokenCount?: unknown }).tokenCount;
           delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
+          // restoreParentFromAcc: at a cooperative-inject boundary the renderer's
+          // debounce may have TEMPORARILY persisted this prefix parented UNDER the
+          // injected user (before inject-consumed reordered it). Replacing only the
+          // content would keep that wrong parent, and the caller's later attempt to
+          // parent the user ONTO the prefix would be a cycle. Restore the prefix's
+          // parent to the accumulator's (the pre-inject head) so the boundary tree
+          // is `pre → prefix → user`.
+          if (opts?.restoreParentFromAcc && acc.parentId !== undefined) {
+            (replaced as { parentId?: string | null }).parentId = acc.parentId;
+          }
           nextTree[nodeIdx] = replaced;
           // Also refresh the LEGACY FLAT `messages` array's matching node — search + Markdown export
           // read from `messages`, so leaving the web client's frame-capped copy there would make
