@@ -758,6 +758,19 @@ const windowHealthMonitor = new WindowHealthMonitor({
       return null;
     }
   },
+  // Live renderer-recovery policy: force-reload a renderer wedged unloaded past
+  // the stall threshold (display-reconfigure / GPU context-loss zombie).
+  getRendererRecoveryPolicy: () => {
+    try {
+      const rr = readEffectiveConfig(APP_HOME).diagnostics?.rendererRecovery;
+      return {
+        reloadStalledRenderer: rr?.reloadStalledRenderer ?? true,
+        stallReloadMs: rr?.stallReloadMs ?? 30000,
+      };
+    } catch {
+      return { reloadStalledRenderer: true, stallReloadMs: 30000 };
+    }
+  },
   // Capture a renderer heap snapshot + enforce retention when the heartbeat
   // decides one is due. Heavy (multi-GB write + GC pause) but rare (latched).
   onHeapSnapshotTrigger: async (win) => {
@@ -1161,6 +1174,22 @@ try {
   }
 } catch {
   /* config unreadable at startup — skip the diagnostic switches, never block boot */
+}
+
+// Layer 3 (opt-in, restart-required): force image/canvas rasterization onto the
+// CPU so a GPU-process context loss during a display reconfigure can't take the
+// renderer's raster/decode path down (the observed rust_png→cppgc crash).
+// `disable-gpu-rasterization` is a real, supported Chromium switch on this
+// Electron (verified against the runtime); an earlier attempt used
+// `--disable-features=CanvasOopRasterization`, which is NOT a registered feature
+// on Electron 41.2 and was silently ignored. Read once at startup; changes
+// app-wide GPU behavior so it's off by default and gated behind the setting.
+try {
+  if (readEffectiveConfig(APP_HOME).diagnostics?.rendererRecovery?.gpuContextLossHardening) {
+    app.commandLine.appendSwitch('disable-gpu-rasterization');
+  }
+} catch {
+  /* config unreadable — skip; never block boot */
 }
 
 if (gotSingleInstanceLock) {

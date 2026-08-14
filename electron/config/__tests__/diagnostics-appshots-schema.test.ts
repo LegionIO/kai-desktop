@@ -40,6 +40,23 @@ describe('diagnostics debug trace schema', () => {
     ).toThrow();
   });
 
+  it('defaults renderer recovery to stalled-reload on / 30s / gpu-hardening off', () => {
+    const diagnostics = appConfigSchema.shape.diagnostics.parse(undefined);
+    expect(diagnostics.rendererRecovery).toEqual({
+      reloadStalledRenderer: true,
+      stallReloadMs: 30000,
+      gpuContextLossHardening: false,
+    });
+  });
+
+  it('clamps an out-of-range stallReloadMs', () => {
+    expect(() =>
+      appConfigSchema.shape.diagnostics.parse({ rendererRecovery: { stallReloadMs: 1000 } }),
+    ).toThrow();
+    const ok = appConfigSchema.shape.diagnostics.parse({ rendererRecovery: { stallReloadMs: 60000 } });
+    expect(ok.rendererRecovery.stallReloadMs).toBe(60000);
+  });
+
   it('accepts memoryDiagnostics enabled', () => {
     const diagnostics = appConfigSchema.shape.diagnostics.parse({ memoryDiagnostics: { enabled: true } });
     expect(diagnostics.memoryDiagnostics.enabled).toBe(true);

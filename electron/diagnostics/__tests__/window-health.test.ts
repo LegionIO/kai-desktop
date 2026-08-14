@@ -177,6 +177,7 @@ describe('WindowHealthMonitor recovery policy', () => {
       getMaxLogBytes?: () => number;
       getHeapSnapshotPolicy?: () => { enabled: boolean; thresholdPct: number } | null;
       onHeapSnapshotTrigger?: (window: HealthWindow, sample: RendererHeapSample) => void | Promise<void>;
+      getRendererRecoveryPolicy?: () => { reloadStalledRenderer: boolean; stallReloadMs: number } | null;
       skipLoad?: boolean;
     } = {},
   ): WindowHealthMonitor {
@@ -192,6 +193,7 @@ describe('WindowHealthMonitor recovery policy', () => {
       getMaxLogBytes: options.getMaxLogBytes,
       getHeapSnapshotPolicy: options.getHeapSnapshotPolicy,
       onHeapSnapshotTrigger: options.onHeapSnapshotTrigger,
+      getRendererRecoveryPolicy: options.getRendererRecoveryPolicy,
       now: options.now,
       // Heartbeat off by default so recovery tests are deterministic; the
       // heartbeat suite opts in with a short interval.
@@ -493,6 +495,270 @@ describe('WindowHealthMonitor recovery policy', () => {
 
     await vi.waitFor(() => expect(heapSampler.mock.calls.length).toBeGreaterThan(2));
     expect(onHeapSnapshotTrigger).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('force-reloads a renderer wedged unloaded past the stall threshold', async () => {
+    let now = 1_000_000;
+    // skipLoad → did-finish-load never fires, so the renderer stays unloaded and
+    // unloadedSince is set at attach time.
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 30_000 }),
+    });
+
+    // Before the stall window elapses: recovery skips (still "loading").
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'),
+    );
+    expect(window.webContents.reload).not.toHaveBeenCalled();
+
+    // Advance past the stall window → next recovery force-reloads.
+    now += 31_000;
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1));
+    expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-reload-stalled-load');
+    monitor.detachWindow();
+  });
+
+  it('arms a post-reload watchdog so a reload that also wedges is retried', async () => {
+    // A forced reload can itself wedge (no did-finish-load / did-fail-load). The
+    // reload branch must schedule a follow-up so the second wedge is caught,
+    // rather than relying on an unrelated focus/display event. Short stall window
+    // keeps the real backstop timer quick; injected clock is advanced so the
+    // follow-up sees the renderer still unloaded past the threshold.
+    let now = 7_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+
+    // Past the threshold immediately → first forced reload.
+    now += 1_000;
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1));
+    // The reload branch armed a stalled-load-deadline follow-up. skipLoad means
+    // the reloaded renderer never signals load, so it stays wedged; advance the
+    // clock past the auto-reload cooldown so the follow-up force-reloads again.
+    now += 61_000;
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    monitor.detachWindow();
+  });
+
+  it('reschedules (does not give up) when the stall reload is blocked by the cooldown', async () => {
+    let now = 2_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+
+    // First: past threshold → reload #1 (records reloadHistory at `now`).
+    now += 1_000;
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1));
+
+    // Immediately trigger again, still inside the 60s cooldown → suppressed, but
+    // must record cooldownMs and reschedule rather than give up.
+    now += 1_000; // well past 200ms stall window, still < 60s cooldown
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('event=auto-reload-suppressed'),
+    );
+    const log = readFileSync(logPath, 'utf-8');
+    expect(log).toContain('"reason":"reload-loop-guard"');
+    // The suppressed branch scheduled a follow-up (cooldownMs>0 path).
+    expect(log).toContain('trigger":"stalled-load-deadline"');
+    monitor.detachWindow();
+  });
+
+  it('re-arms (does not reload) a hidden unloaded renderer before the stall threshold', async () => {
+    let now = 3_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+    window.visible = false; // startup stall before ready-to-show
+
+    // unloadedMs ~0 < 200 threshold → don't reload yet, keep the watchdog alive.
+    monitor.requestRecovery('renderer-load-failed', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'),
+    );
+    expect(window.webContents.reload).not.toHaveBeenCalled();
+    expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stalled-load-deadline"');
+    monitor.detachWindow();
+  });
+
+  it('reloads a never-loaded hidden startup window once past the stall threshold', async () => {
+    let now = 3_500_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true, // initial load never finishes → window stays hidden
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+    window.visible = false; // never reached ready-to-show
+
+    // Past the threshold: a never-loaded startup window CAN'T show until it
+    // loads, so it must be reloaded even while hidden.
+    now += 1_000;
+    monitor.requestRecovery('renderer-load-failed', 0);
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1));
+    expect(readFileSync(logPath, 'utf-8')).toContain('"context":"hidden-startup"');
+    monitor.detachWindow();
+  });
+
+  it('does NOT reload a previously-loaded window that is now hidden', async () => {
+    let now = 3_800_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+    // Renderer loaded (makeMonitor emitted did-finish-load → everLoaded=true),
+    // then the main frame starts re-navigating (arming unloadedSince) and the
+    // window is hidden. A previously-presented hidden window must NOT be
+    // force-reloaded even past the threshold.
+    window.webContents.emit('did-start-navigation', { isMainFrame: true });
+    window.visible = false;
+    now += 1_000;
+    monitor.requestRecovery('display-metrics-changed', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"window-not-presented"'),
+    );
+    expect(window.webContents.reload).not.toHaveBeenCalled();
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('"context":"hidden-startup"');
+    monitor.detachWindow();
+  });
+
+  it('arms the stall watchdog on a main-frame navigation start (covers any reload path)', async () => {
+    const monitor = makeMonitor({
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+    // A main-frame navigation (e.g. from a crash auto-reload) must schedule a
+    // watchdog even though no recovery-branch armed one.
+    window.webContents.emit('did-start-navigation', { isMainFrame: true });
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stall-watchdog"'),
+    );
+    monitor.detachWindow();
+  });
+
+  it('does not arm the watchdog on a SUBFRAME navigation start', async () => {
+    const monitor = makeMonitor({
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+    window.webContents.emit('did-start-navigation', { isMainFrame: false });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('trigger":"stall-watchdog"');
+    monitor.detachWindow();
+  });
+
+  it('does not force-reload when reloadStalledRenderer is off', async () => {
+    let now = 1_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: false, stallReloadMs: 30_000 }),
+    });
+
+    now += 120_000; // well past any stall window
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('"reason":"renderer-not-loaded"'),
+    );
+    expect(window.webContents.reload).not.toHaveBeenCalled();
+    monitor.detachWindow();
+  });
+
+  it('clears the stall clock once the renderer finishes loading', async () => {
+    let now = 1_000_000;
+    // Normal load (did-finish-load fires in makeMonitor) → loaded, not stalled.
+    const monitor = makeMonitor({
+      now: () => now,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 30_000 }),
+      probe: () => Promise.resolve(healthyProbe),
+    });
+    now += 120_000;
+    // A loaded renderer takes the normal probe path (healthy) — never the
+    // stalled-load reload branch.
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=recovery-probe-started'));
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('event=renderer-reload-stalled-load');
+    monitor.detachWindow();
+  });
+
+  it('re-arms recovery on a MAIN-FRAME did-fail-load', async () => {
+    const monitor = makeMonitor({ skipLoad: true });
+    // did-fail-load args: (event, errorCode, errorDescription, validatedURL, isMainFrame, …)
+    window.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'file:///index.html', true);
+    await vi.waitFor(() => {
+      const log = readFileSync(logPath, 'utf-8');
+      expect(log).toContain('event=main-renderer-load-failed');
+      expect(log).toContain('trigger":"renderer-load-failed"');
+    });
+    monitor.detachWindow();
+  });
+
+  it('ignores a SUBFRAME did-fail-load (iframe preview failing is not a renderer stall)', async () => {
+    const monitor = makeMonitor({ skipLoad: true });
+    window.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://example.com/frame', false);
+    // Give any errant recovery a moment; nothing should be logged for a subframe.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('event=main-renderer-load-failed');
+    monitor.detachWindow();
+  });
+
+  it('does not arm the stall clock for a subframe load (iframe preview must not force a reload)', async () => {
+    let now = 1_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 30_000 }),
+    });
+    // Main frame finished loading (makeMonitor emitted did-finish-load); now
+    // clear the attach-time stall clock via a main-frame finish, then simulate a
+    // subframe (iframe) navigation starting — which must NOT re-arm the clock.
+    window.webContents.emit('did-frame-finish-load', {}, true); // main frame done → unloadedSince=null
+    window.webContents.emit('did-start-navigation', { isMainFrame: false }); // subframe nav
+    now += 120_000; // long past the stall window
+    // Renderer is loaded (in loadedWebContentsIds) so recovery takes the probe
+    // path, never the stalled-load reload — assert no forced reload.
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() => expect(readFileSync(logPath, 'utf-8')).toContain('event=recovery-probe-started'));
+    expect(readFileSync(logPath, 'utf-8')).not.toContain('event=renderer-reload-stalled-load');
+    monitor.detachWindow();
+  });
+
+  it('self-reschedules and force-reloads a zombie renderer with no further events', async () => {
+    // The global test clock is frozen (vitest.setup setSystemTime), so drive an
+    // injected `now`. skipLoad → renderer never loaded; unloadedSince set at
+    // attach. First recovery arrives before the stall deadline → it schedules a
+    // real-timer follow-up. We advance `now` past the deadline so that when the
+    // follow-up fires (no external event), unloadedMs exceeds the threshold and
+    // it force-reloads. Short stallReloadMs keeps the real timer quick.
+    let now = 5_000_000;
+    const monitor = makeMonitor({
+      now: () => now,
+      skipLoad: true,
+      getRendererRecoveryPolicy: () => ({ reloadStalledRenderer: true, stallReloadMs: 200 }),
+    });
+
+    // First recovery before the deadline (unloadedMs=0 < 200) → skip + reschedule.
+    monitor.requestRecovery('display-added', 0);
+    await vi.waitFor(() =>
+      expect(readFileSync(logPath, 'utf-8')).toContain('trigger":"stalled-load-deadline"'),
+    );
+    expect(window.webContents.reload).not.toHaveBeenCalled();
+
+    // Advance the injected clock past the stall window; the already-scheduled
+    // real-timer follow-up then fires and, seeing unloadedMs ≥ 200, reloads —
+    // with NO external focus/display event in between.
+    now += 1_000;
+    await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1), { timeout: 3000 });
+    expect(readFileSync(logPath, 'utf-8')).toContain('event=renderer-reload-stalled-load');
     monitor.detachWindow();
   });
 });
