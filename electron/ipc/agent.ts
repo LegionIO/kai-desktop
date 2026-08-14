@@ -22,7 +22,12 @@ import {
   appendConversationMessages,
   reparentConversationMessage,
 } from './conversations.js';
-import { readConversation, writeConversation, nextCompactionRevision, isRecentlyDeleted } from './conversation-store.js';
+import {
+  readConversation,
+  writeConversation,
+  nextCompactionRevision,
+  isRecentlyDeleted,
+} from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
@@ -39,7 +44,14 @@ import {
   finalizeGuiFallbackPrefixAtInject,
   messageContentSignature,
 } from '../agent/stream-persistence.js';
-import { clearInjects, drainInjects, enqueueInject, hasInjects, listInjects, removeInject } from '../agent/inject-queue.js';
+import {
+  clearInjects,
+  drainInjects,
+  enqueueInject,
+  hasInjects,
+  listInjects,
+  removeInject,
+} from '../agent/inject-queue.js';
 import { capRemoteEvent } from '../agent/remote-frame-cap.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { setInjectConsumedHandler } from '../agent/prepare-step-inject.js';
@@ -285,7 +297,10 @@ function persistRedactedUserTurn(
       type: 'prompt-redacted',
       data: { messageId: node.id, content: node.content },
     });
-    return { id: node.id as string, sig: messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) };
+    return {
+      id: node.id as string,
+      sig: messageContentSignature(node as Parameters<typeof messageContentSignature>[0]),
+    };
   } catch (err) {
     console.warn('[Agent] Failed to persist redacted user turn:', err);
     return null;
@@ -532,9 +547,12 @@ function turnTokenTime(token: string): number {
 //     for a NEWER turn than the incoming one always denies (never downgrade to an older turn).
 function authorizeContinuation(conversationId: string, clientId: string, turnToken: string): boolean {
   if (
-    typeof conversationId !== 'string' || !conversationId ||
-    typeof clientId !== 'string' || !clientId ||
-    typeof turnToken !== 'string' || !turnToken
+    typeof conversationId !== 'string' ||
+    !conversationId ||
+    typeof clientId !== 'string' ||
+    !clientId ||
+    typeof turnToken !== 'string' ||
+    !turnToken
   ) {
     return false;
   }
@@ -708,6 +726,18 @@ type RacedAnswerState = {
   /** Bounded count of delivery retries after a failed cooperative splice, so a
    *  persistently-failing inject can't reschedule forever. */
   deliveryRetries: number;
+  /** The token of the successor turn that was ALREADY issued at abort time, when
+   *  known. Populated only when a DIFFERENT run had already claimed
+   *  `latestIssuedTurnToken` before this gate registered — i.e. a genuine
+   *  supersession (a fresh submit that issued its token at stream-start, THEN
+   *  aborted us). In that case only a claimant with THIS exact token may transfer
+   *  the handoff: if that successor synchronously config/hook-failed and died, no
+   *  live run will ever carry the token, so the handoff simply ages out instead of
+   *  being mis-delivered to an unrelated later turn (the R27-P2b residual).
+   *  `undefined` when no successor was issued yet at abort (e.g. a plan-mode
+   *  restart, whose successor token is minted asynchronously and is unpredictable
+   *  here) — then the claim stays permissive (any next turn may carry it). */
+  expectedSuccessorToken?: string;
   expiresAt: number;
 };
 // PRE-successor holding map: keys registered by an aborting gate before the
@@ -736,11 +766,21 @@ function registerRacedAnswerHandoff(
     existing.expiresAt = Date.now() + RACED_ANSWER_HANDOFF_TTL_MS;
     return;
   }
+  // If a DIFFERENT run has already claimed the latest-issued turn token by the
+  // time this gate registers, that run is our genuine successor (a fresh submit
+  // issues its token at stream-start, then aborts us). Bind the handoff to it so
+  // a successor that synchronously died can't leave the handoff claimable by an
+  // unrelated later turn. When the latest-issued token is still our OWN (no
+  // successor issued yet — e.g. a plan-mode restart minted asynchronously), leave
+  // it unbound so that async successor may still claim it.
+  const latestIssued = latestIssuedTurnToken.get(conversationId);
+  const expectedSuccessorToken = latestIssued !== undefined && latestIssued !== sourceToken ? latestIssued : undefined;
   racedAnswerHandoffs.set(conversationId, {
     answerKeys: new Set([answerKey]),
     cancelGenAtAbort,
     sourceToken,
     deliveryRetries: 0,
+    expectedSuccessorToken,
     expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
   });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
@@ -880,6 +920,14 @@ function registerLiveRacedAnswerClaimant(
 ): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
   if (!handoff) return;
+  // If the handoff is BOUND to a specific successor token (a supersession whose
+  // successor was already issued at abort time), only that exact successor may
+  // transfer it. A mismatch means this is an unrelated later turn — leave the
+  // handoff in the pre-successor map so the real successor can still claim it, or
+  // so it ages out if that successor died (the R27-P2b residual). Do NOT deliver.
+  if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== token) {
+    return;
+  }
   racedAnswerHandoffs.delete(conversationId); // transfer out of the pre-successor map
   if (racedStateInvalid(handoff, conversationId)) return; // expired / Stop → drop (answers stay stashed)
   liveRacedAnswerClaimant.set(conversationId, { token, deliver, state: handoff });
@@ -1030,19 +1078,38 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         const injEntries = ((event.data as { entries?: Array<{ id?: unknown }> } | undefined)?.entries ?? []).filter(
           (en): en is { id: string } => typeof en?.id === 'string',
         );
+        // The parent the NEXT injected user attaches under. Starts as the
+        // conversation's current fallback parent (the prior head), then walks
+        // forward: each entry's finalize either produces a prefix assistant (new
+        // parent = that assistant) or, when no content intervened in the same
+        // batch, leaves the parent as the PRIOR injected user so the batch chains
+        // in FIFO order. Every entry is reparented under this running parent AND
+        // becomes the head — otherwise a multi-inject batch would strand entries
+        // 2..N off the active branch on a reload/crash before continuation output.
+        let chainParent: string | null = guiFallbackParents.get(event.conversationId) ?? null;
         let lastInjectedId: string | null = null;
         for (const en of injEntries) {
           const prefixHead = finalizeGuiFallbackPrefixAtInject(serverPersistAppHome, event.conversationId, en.id);
-          if (prefixHead) {
-            reparentConversationMessage(serverPersistAppHome, event.conversationId, en.id, prefixHead, {
+          if (prefixHead) chainParent = prefixHead;
+          if (chainParent) {
+            reparentConversationMessage(serverPersistAppHome, event.conversationId, en.id, chainParent, {
               makeHead: true,
             });
           }
+          // The next entry in the batch chains under THIS injected user (its
+          // continuation accumulator was reseeded parented on en.id, so any prefix
+          // it later produces already sits here; with no intervening content the
+          // sibling still threads correctly).
+          chainParent = en.id;
           lastInjectedId = en.id;
         }
         if (lastInjectedId) guiFallbackParents.set(event.conversationId, lastInjectedId);
       } else if (event.type !== 'done') {
-        accumulateForPersistence(serverPersistAppHome, event, guiFallbackParents.get(event.conversationId) ?? undefined);
+        accumulateForPersistence(
+          serverPersistAppHome,
+          event,
+          guiFallbackParents.get(event.conversationId) ?? undefined,
+        );
       }
     }
   }
@@ -1137,7 +1204,14 @@ async function gateTitleGenerationMessages(
   // purpose explicitly so the title systemPrompt lands in the SIXTH arg — passing it as the fifth
   // would put it in `purpose` and leave the gate's systemPrompt empty (DLP hooks then see no
   // system prompt, and a system-prompt-conditioned rule could wrongly pass).
-  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey, 'title-generation', systemPrompt);
+  return gateMessagesThroughUserPromptSubmit(
+    messages,
+    config,
+    conversationId,
+    modelKey,
+    'title-generation',
+    systemPrompt,
+  );
 }
 
 /**
@@ -2292,8 +2366,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // and give actionable (provider-appropriate) guidance + the structured
           // category so the renderer surfaces a recovery hint.
           const pluginOverflow = isContextOverflowError(providerError);
-          const pluginBaseMsg =
-            providerError instanceof Error ? providerError.message : String(providerError);
+          const pluginBaseMsg = providerError instanceof Error ? providerError.message : String(providerError);
           emit({
             conversationId,
             type: 'error',
@@ -2541,8 +2614,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (!nextExecQ || !nextStreamQ) break;
           const nextShared = nextExecQ.find((id) => nextStreamQ.includes(id));
           if (nextShared === undefined) break;
-          pendingExecIdsByToolName.set(toolName, nextExecQ.filter((id) => id !== nextShared));
-          pendingStreamIdsByToolName.set(toolName, nextStreamQ.filter((id) => id !== nextShared));
+          pendingExecIdsByToolName.set(
+            toolName,
+            nextExecQ.filter((id) => id !== nextShared),
+          );
+          pendingStreamIdsByToolName.set(
+            toolName,
+            nextStreamQ.filter((id) => id !== nextShared),
+          );
           if (pendingExecIdsByToolName.get(toolName)?.length === 0) pendingExecIdsByToolName.delete(toolName);
           if (pendingStreamIdsByToolName.get(toolName)?.length === 0) pendingStreamIdsByToolName.delete(toolName);
           streamToolCallIdByExecId.set(nextShared, nextShared);
@@ -2698,7 +2777,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (!toolCallId) return;
         applyArgRecharge(toolCallId, newArgs);
       };
-      const fitToolMediaToBudget = (toolName: string, result: unknown, toolCallId?: string, args?: unknown): Promise<unknown> => {
+      const fitToolMediaToBudget = (
+        toolName: string,
+        result: unknown,
+        toolCallId?: string,
+        args?: unknown,
+      ): Promise<unknown> => {
         const run = mediaFitChain.then(() => fitToolMediaToBudgetInner(toolName, result, toolCallId, args));
         // Keep the chain alive regardless of this run's outcome (swallow to avoid
         // an unhandled rejection breaking the chain for the next result).
@@ -2783,7 +2867,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // summarization + truncation won't GROW past the original in practice, and this can't
           // under-count → no wrongly-retained media → no post-tool overflow).
           if (toolCfg?.useAI) {
-            return canonical ? Math.min(rawBytes, Math.max(maxTokens * 4, Buffer.byteLength(TRUNCATE_MARKER, 'utf8'))) : rawBytes;
+            return canonical
+              ? Math.min(rawBytes, Math.max(maxTokens * 4, Buffer.byteLength(TRUNCATE_MARKER, 'utf8')))
+              : rawBytes;
           }
           const minChars = Math.max(0, toolCfg?.truncateMinChars ?? 200);
           const headRatio = toolCfg?.truncateHeadRatio ?? 0.7;
@@ -2822,9 +2908,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             compactionSupported && toolName !== 'create_artifact' && toolName !== 'update_artifact';
           try {
             const { resultForCompaction } = splitPreservedFields(r);
-            const bodyText = typeof resultForCompaction === 'string'
-              ? resultForCompaction
-              : (JSON.stringify(resultForCompaction) ?? '');
+            const bodyText =
+              typeof resultForCompaction === 'string'
+                ? resultForCompaction
+                : (JSON.stringify(resultForCompaction) ?? '');
             const rawBytes = Buffer.byteLength(bodyText, 'utf8');
             // Diff (preserved in full) is added back on top of the compacted body.
             let diffBytes = 0;
@@ -2840,7 +2927,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               !!toolCfg?.enabled &&
               toolCfg.outputMaxTokens > 0 &&
               bodyTotalTokens > toolCfg.triggerTokens;
-            return (willCompact ? compactedBodyBytesUpperBound(bodyText, rawBytes, bodyTotalTokens) : rawBytes) + diffBytes;
+            return (
+              (willCompact ? compactedBodyBytesUpperBound(bodyText, rawBytes, bodyTotalTokens) : rawBytes) + diffBytes
+            );
           } catch {
             return 0;
           }
@@ -2989,10 +3078,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // a prior image's cached count includes its base64 — counting that as text
         // massively over-counts), and add back the media's NATIVE token estimate
         // so prior media still costs its real (smaller) amount rather than zero.
-        const { messages: branchForSum, nativeMediaTokens, branchMediaBytes } = await splitBranchMediaForTokenSum(
-          messages as unknown[],
-          controller.signal,
-        );
+        const {
+          messages: branchForSum,
+          nativeMediaTokens,
+          branchMediaBytes,
+        } = await splitBranchMediaForTokenSum(messages as unknown[], controller.signal);
         let remaining = Infinity;
         for (const entry of eligibleModels) {
           const t = resolveConversationTokenization(
@@ -3435,7 +3525,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             observer?.onToolExecutionResult(toolCallId, toolName, hookedResult);
             const observerAugmented = withObserverAugmentation(hookedResult, observer?.getToolAugmentation(toolCallId));
-            const compacted = await maybeCompactToolOutput(toolCallId, toolName, observerAugmented, 'direct', effectiveArgs);
+            const compacted = await maybeCompactToolOutput(
+              toolCallId,
+              toolName,
+              observerAugmented,
+              'direct',
+              effectiveArgs,
+            );
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
@@ -3473,7 +3569,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             observer?.onToolExecutionResult(toolCallId, toolName, errorResult);
             const observerAugmented = withObserverAugmentation(errorResult, observer?.getToolAugmentation(toolCallId));
-            const compacted = await maybeCompactToolOutput(toolCallId, toolName, observerAugmented, 'direct', effectiveArgs);
+            const compacted = await maybeCompactToolOutput(
+              toolCallId,
+              toolName,
+              observerAugmented,
+              'direct',
+              effectiveArgs,
+            );
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
@@ -3651,9 +3753,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // pre-send/DLP hooks redact content in memory only, so re-reading disk
           // would feed the summarizer un-redacted content.
           const inMemoryBranch =
-            Array.isArray(messages) && messages.length > 0
-              ? (messages as unknown as ChatMessageForCompaction[])
-              : null;
+            Array.isArray(messages) && messages.length > 0 ? (messages as unknown as ChatMessageForCompaction[]) : null;
           if (!inMemoryBranch) return null;
           // Drift baseline = the RAW turn-start signature (captured pre-hook at the top of
           // the handler), NOT the post-hook in-memory branch. A pre-send/DLP hook rewrites
@@ -3771,10 +3871,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Leaving baseWindow undefined here would SKIP static-input budgeting, so a
           // summary sized to the raw window overflows once system + tool-schema tokens
           // are added on the retry — and recovery is single-use, so the turn then fails.
-          let baseWindow: number | undefined = recoveryConvConfig.contextWindowTokens ?? recoveryModel.modelConfig.maxInputTokens;
+          let baseWindow: number | undefined =
+            recoveryConvConfig.contextWindowTokens ?? recoveryModel.modelConfig.maxInputTokens;
           if (typeof baseWindow !== 'number' || baseWindow <= 0) {
             try {
-              baseWindow = resolveConversationTokenization(recoveryModel.modelConfig.modelName).contextWindowTokens ?? undefined;
+              baseWindow =
+                resolveConversationTokenization(recoveryModel.modelConfig.modelName).contextWindowTokens ?? undefined;
             } catch {
               /* leave undefined — no window to budget against */
             }
@@ -3828,12 +3930,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // recovery model's config already carries the overridden endpoint, so
             // the summarizer must NOT fall back to the ambient chain (which would
             // send the transcript to the model's original provider).
-            { disableAmbientFallback: !!resolution.providerOverride,
+            {
+              disableAmbientFallback: !!resolution.providerOverride,
               externalPromptOverReserve: recoveryExternalOverReserve,
               protectNewestUser: true, // live recovery: never summarize away the current user turn
               ...(recoveryCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
                 ? { systemPromptOverride: recoveryCompactionPrompt }
-                : {}) },
+                : {}),
+            },
           );
 
           // Only proceed if THIS run still owns the conversation — a superseding
@@ -3937,7 +4041,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // reuse falls through to the normal shouldCompact/recompute path; we never
           // drop a message. Substitution stays LOCAL to this turn's `messages`.
           const storedCompaction = readConversation(appHome, conversationId)?.conversationCompaction as
-            | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
+            | {
+                compactionId?: string;
+                summaryText?: string;
+                compactedMessageIds?: string[];
+                coveredContentSig?: Record<string, string>;
+              }
             | null
             | undefined;
           let reusedCompaction = false;
@@ -4022,8 +4131,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the fit path + final compaction check) — else a retained protected-
               // tail image counts as ~hundreds of k "text" tokens and would refuse
               // this reuse, re-summarizing the same prefix every turn.
-              const { messages: candidateForSum, nativeMediaTokens: candidateMediaTokens, branchMediaBytes: candidateMediaBytes } =
-                await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal);
+              const {
+                messages: candidateForSum,
+                nativeMediaTokens: candidateMediaTokens,
+                branchMediaBytes: candidateMediaBytes,
+              } = await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal);
               const reuseCheck = await shouldCompactAsync(
                 candidateForSum as Parameters<typeof shouldCompactAsync>[0],
                 modelEntry.modelConfig.modelName,
@@ -4104,11 +4216,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       effectiveSystemPrompt ?? '',
                     );
                     const gatedMsg = (gated.messages as Array<{ content?: unknown }> | undefined)?.[0];
-                    if (
-                      gated.suppressed ||
-                      !gatedMsg ||
-                      gatedMsg.content !== storedCompaction.summaryText
-                    ) {
+                    if (gated.suppressed || !gatedMsg || gatedMsg.content !== storedCompaction.summaryText) {
                       summarySafeToReuse = false;
                     }
                   } catch {
@@ -4129,8 +4237,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             : await (async () => {
                 // Same media-aware projection as the reuse check + fit path: charge
                 // retained media its native estimate, not its base64 text length.
-                const { messages: branchForCheck, nativeMediaTokens: checkMediaTokens, branchMediaBytes } =
-                  await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal);
+                const {
+                  messages: branchForCheck,
+                  nativeMediaTokens: checkMediaTokens,
+                  branchMediaBytes,
+                } = await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal);
                 const gate = await shouldCompactAsync(
                   branchForCheck as Parameters<typeof shouldCompactAsync>[0],
                   modelEntry.modelConfig.modelName,
@@ -4242,34 +4353,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             const compactionResult = proactiveHooksOk
               ? await compactConversationPrefix(
-              proactiveBranch as Parameters<typeof compactConversationPrefix>[0],
-              modelEntry.modelConfig,
-              config.compaction.conversation,
-              controller.signal,
-              // A provider override routes this turn through a plugin/gateway; the
-              // summarizer must NOT fall back to the ambient chain (which would send
-              // the prefix to the model's original provider). Parity with reactive
-              // recovery + /compact.
-              {
-                disableAmbientFallback: !!resolution.providerOverride,
-                // Hand the NEXT-turn static excess (instructions + tool schemas beyond
-                // the reserve) to compactConversationPrefix so the summary leaves room
-                // for it — otherwise on a small window with large static input the
-                // summary "fits" the raw window yet the real request overflows, forcing
-                // reactive recovery to summarize AGAIN (a second paid call). Parity with
-                // /compact + recovery, which already pass this.
-                externalPromptOverReserve: Math.max(
-                  0,
-                  (await getStaticInputTokens()) -
-                    Math.max(0, config.compaction.conversation.promptReserveTokens),
-                ),
-                // Honor a hook rewrite of the COMPACTION prompt (parity with recovery/compact).
-                protectNewestUser: true, // live proactive: never summarize away the current user turn
-                ...(proactiveCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
-                  ? { systemPromptOverride: proactiveCompactionPrompt }
-                  : {}),
-              },
-            )
+                  proactiveBranch as Parameters<typeof compactConversationPrefix>[0],
+                  modelEntry.modelConfig,
+                  config.compaction.conversation,
+                  controller.signal,
+                  // A provider override routes this turn through a plugin/gateway; the
+                  // summarizer must NOT fall back to the ambient chain (which would send
+                  // the prefix to the model's original provider). Parity with reactive
+                  // recovery + /compact.
+                  {
+                    disableAmbientFallback: !!resolution.providerOverride,
+                    // Hand the NEXT-turn static excess (instructions + tool schemas beyond
+                    // the reserve) to compactConversationPrefix so the summary leaves room
+                    // for it — otherwise on a small window with large static input the
+                    // summary "fits" the raw window yet the real request overflows, forcing
+                    // reactive recovery to summarize AGAIN (a second paid call). Parity with
+                    // /compact + recovery, which already pass this.
+                    externalPromptOverReserve: Math.max(
+                      0,
+                      (await getStaticInputTokens()) - Math.max(0, config.compaction.conversation.promptReserveTokens),
+                    ),
+                    // Honor a hook rewrite of the COMPACTION prompt (parity with recovery/compact).
+                    protectNewestUser: true, // live proactive: never summarize away the current user turn
+                    ...(proactiveCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
+                      ? { systemPromptOverride: proactiveCompactionPrompt }
+                      : {}),
+                  },
+                )
               : { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
             if (controller.signal.aborted) {
               emit({ conversationId, type: 'done' });
@@ -4884,327 +4994,385 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             messages,
             responseMessageId: currentResponseMessageId,
             config: configWithExecutionMode,
-          tools: activeCustomTools,
-          appHome,
-          cwd: effectiveCwd,
-          reasoningEffort,
-          abortSignal: controller.signal,
-          streamConfig: streamConfig ?? undefined,
-          primaryModel: modelEntry,
-          // Thread this turn's active profile/model so a sub_agent tool can
-          // inherit the parent's profile + fallback chain (see sub-agent.ts).
-          // Fall back to the global defaultProfileKey when the turn has no
-          // explicit profile — the turn ran under that default, so the sub-agent
-          // should inherit it rather than dropping to the single-model path.
-          parentProfileKey: profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
-          parentModelKey: modelEntry?.key ?? modelKey ?? null,
-          modelAuth: resolution.modelAuth,
-          conversationMetadata: convMetadata,
-          switchContext,
-          childEnv: confinedChildEnv,
-          confinedCwd: confinedCwdValue,
-          emitEvent: streamOptions.emitEvent,
-          onToolExecutionStart: streamOptions.onToolExecutionStart,
-          onToolExecutionEnd: streamOptions.onToolExecutionEnd,
-          augmentToolResult: streamOptions.augmentToolResult,
-        });
+            tools: activeCustomTools,
+            appHome,
+            cwd: effectiveCwd,
+            reasoningEffort,
+            abortSignal: controller.signal,
+            streamConfig: streamConfig ?? undefined,
+            primaryModel: modelEntry,
+            // Thread this turn's active profile/model so a sub_agent tool can
+            // inherit the parent's profile + fallback chain (see sub-agent.ts).
+            // Fall back to the global defaultProfileKey when the turn has no
+            // explicit profile — the turn ran under that default, so the sub-agent
+            // should inherit it rather than dropping to the single-model path.
+            parentProfileKey: profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
+            parentModelKey: modelEntry?.key ?? modelKey ?? null,
+            modelAuth: resolution.modelAuth,
+            conversationMetadata: convMetadata,
+            switchContext,
+            childEnv: confinedChildEnv,
+            confinedCwd: confinedCwdValue,
+            emitEvent: streamOptions.emitEvent,
+            onToolExecutionStart: streamOptions.onToolExecutionStart,
+            onToolExecutionEnd: streamOptions.onToolExecutionEnd,
+            augmentToolResult: streamOptions.augmentToolResult,
+          });
 
-        for await (const event of stream) {
-          // Track whether this turn produced any tool side effects or streamed
-          // output. The reactive context-overflow recovery only auto-retries when
-          // NOTHING ran yet (a pure over-context prompt on the first model call);
-          // once a tool executed or text streamed, replaying the turn could
-          // duplicate side effects or lose partial output, so we surface the
-          // /compact guidance instead of silently re-running.
-          if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'text-delta') {
-            sawToolOrTextThisTurn = true;
-            if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
-          }
-          // After a plan-related done event has been sent and the stream aborted,
-          // ignore any trailing events (especially the generator's final plain done).
-          if (planDoneSent || overflowRecoveryTookOver) {
-            ipcDebugLog(
-              `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=${planDoneSent ? 'planDoneSent' : 'overflowRecovery'}`,
-            );
-            continue;
-          }
-          if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
-            logToolCompactionDebug('stream-event', {
-              conversationId,
-              eventType: event.type,
-              toolCallId: event.toolCallId ?? null,
-              toolName: event.toolName ?? null,
-              hasCompaction: 'compaction' in event && Boolean(event.compaction),
-              compactionPhase:
-                event.type === 'tool-compaction'
-                  ? ((event.data as { phase?: string } | undefined)?.phase ?? null)
-                  : null,
-            });
-          }
-          if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
-            enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
-            pairExecuteAndStreamToolCallIds(event.toolName);
-            // Resolve rewritten args by this stream id OR the now-paired exec
-            // id (onToolExecutionStart may have run first and stored under the
-            // exec id before pairing existed).
-            const pairedExecId = execToolCallIdByStreamId.get(event.toolCallId);
-            const rewritten =
-              hookRewrittenArgs.get(event.toolCallId) ??
-              (pairedExecId ? hookRewrittenArgs.get(pairedExecId) : undefined);
-            if (rewritten !== undefined) {
-              // Hook already resolved — publish the sanitized args.
-              (event as Record<string, unknown>).args = rewritten;
-            } else if (
-              enforcingHooksActive &&
-              runtime.id === 'mastra' &&
-              !providerDefinedToolNames.has(event.toolName)
-            ) {
-              // Suppress raw args until the corrective re-broadcast fills them
-              // in — but ONLY under Mastra (which calls onToolExecutionStart)
-              // and NOT for provider-native tools (which execute in-provider
-              // and never un-suppress → would stick at {pending} forever).
-              (event as Record<string, unknown>).args = { pending: true };
-              (event as Record<string, unknown>).argsPending = true;
+          for await (const event of stream) {
+            // Track whether this turn produced any tool side effects or streamed
+            // output. The reactive context-overflow recovery only auto-retries when
+            // NOTHING ran yet (a pure over-context prompt on the first model call);
+            // once a tool executed or text streamed, replaying the turn could
+            // duplicate side effects or lose partial output, so we surface the
+            // /compact guidance instead of silently re-running.
+            if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'text-delta') {
+              sawToolOrTextThisTurn = true;
+              if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
             }
-          }
-          if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
-            // Plan mode was entered mid-stream. Abort this stream so the renderer
-            // can re-send with executionMode='plan-first' (correct system prompt + tool set).
-            console.info(
-              `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
-            );
-            emit(event);
-            planDoneSent = true;
-            emit({ conversationId, type: 'done', data: { planModeRestart: true } });
-            controller.abort();
-            return { conversationId };
-          }
-          if (event.type === 'tool-result' && event.toolCallId) {
-            observer?.onToolExecutionEnd(event.toolCallId);
-            // Inject compaction metadata into the event's data field
-            const execId = execToolCallIdByStreamId.get(event.toolCallId) ?? event.toolCallId;
-            const compaction = execId ? compactionByExecuteId.get(execId) : undefined;
-            if (compaction) {
-              compactionByExecuteId.delete(execId!);
-              // Attach as a data field the renderer will pick up
-              (event as Record<string, unknown>).compaction = compaction;
-              logToolCompactionDebug('attach-result-compaction', {
+            // After a plan-related done event has been sent and the stream aborted,
+            // ignore any trailing events (especially the generator's final plain done).
+            if (planDoneSent || overflowRecoveryTookOver) {
+              ipcDebugLog(
+                `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=${planDoneSent ? 'planDoneSent' : 'overflowRecovery'}`,
+              );
+              continue;
+            }
+            if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
+              logToolCompactionDebug('stream-event', {
                 conversationId,
-                toolCallId: event.toolCallId,
-                executeToolCallId: execId,
+                eventType: event.type,
+                toolCallId: event.toolCallId ?? null,
                 toolName: event.toolName ?? null,
-                extractionDurationMs: compaction.extractionDurationMs,
-                originalLength: compaction.originalContent.length,
+                hasCompaction: 'compaction' in event && Boolean(event.compaction),
+                compactionPhase:
+                  event.type === 'tool-compaction'
+                    ? ((event.data as { phase?: string } | undefined)?.phase ?? null)
+                    : null,
               });
             }
-            if (execId) {
-              streamToolCallIdByExecId.delete(execId);
+            if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
+              enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
+              pairExecuteAndStreamToolCallIds(event.toolName);
+              // Resolve rewritten args by this stream id OR the now-paired exec
+              // id (onToolExecutionStart may have run first and stored under the
+              // exec id before pairing existed).
+              const pairedExecId = execToolCallIdByStreamId.get(event.toolCallId);
+              const rewritten =
+                hookRewrittenArgs.get(event.toolCallId) ??
+                (pairedExecId ? hookRewrittenArgs.get(pairedExecId) : undefined);
+              if (rewritten !== undefined) {
+                // Hook already resolved — publish the sanitized args.
+                (event as Record<string, unknown>).args = rewritten;
+              } else if (
+                enforcingHooksActive &&
+                runtime.id === 'mastra' &&
+                !providerDefinedToolNames.has(event.toolName)
+              ) {
+                // Suppress raw args until the corrective re-broadcast fills them
+                // in — but ONLY under Mastra (which calls onToolExecutionStart)
+                // and NOT for provider-native tools (which execute in-provider
+                // and never un-suppress → would stick at {pending} forever).
+                (event as Record<string, unknown>).args = { pending: true };
+                (event as Record<string, unknown>).argsPending = true;
+              }
             }
-            execToolCallIdByStreamId.delete(event.toolCallId);
-            pendingToolCompactionByExecId.delete(execId);
-          }
-          if (event.type === 'done' && !controller.signal.aborted) {
-            observerLaunchesEnabled = false;
-            await waitForObserverToolExecutions();
-
-            // ── Lifecycle hook: AssistantMessage ────────────────────────
-            if (accumulatedResponseText.length > 0) {
-              void hookDispatcher.dispatch('AssistantMessage', {
-                conversationId,
-                text: accumulatedResponseText,
-              });
+            if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
+              // Plan mode was entered mid-stream. Abort this stream so the renderer
+              // can re-send with executionMode='plan-first' (correct system prompt + tool set).
+              console.info(
+                `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
+              );
+              emit(event);
+              planDoneSent = true;
+              emit({ conversationId, type: 'done', data: { planModeRestart: true } });
+              controller.abort();
+              return { conversationId };
             }
-
-            // Run post-receive hooks (e.g. plugin learning pipelines)
-            if (pluginManager && accumulatedResponseText.length > 0) {
-              try {
-                await pluginManager.runPostReceiveHooks({
-                  response: { role: 'assistant', content: accumulatedResponseText },
-                  messages: messages as HookMessage[],
-                  config,
+            if (event.type === 'tool-result' && event.toolCallId) {
+              observer?.onToolExecutionEnd(event.toolCallId);
+              // Inject compaction metadata into the event's data field
+              const execId = execToolCallIdByStreamId.get(event.toolCallId) ?? event.toolCallId;
+              const compaction = execId ? compactionByExecuteId.get(execId) : undefined;
+              if (compaction) {
+                compactionByExecuteId.delete(execId!);
+                // Attach as a data field the renderer will pick up
+                (event as Record<string, unknown>).compaction = compaction;
+                logToolCompactionDebug('attach-result-compaction', {
+                  conversationId,
+                  toolCallId: event.toolCallId,
+                  executeToolCallId: execId,
+                  toolName: event.toolName ?? null,
+                  extractionDurationMs: compaction.extractionDurationMs,
+                  originalLength: compaction.originalContent.length,
                 });
-              } catch (err) {
-                console.error('[Agent:stream] Post-receive hook error:', err);
+              }
+              if (execId) {
+                streamToolCallIdByExecId.delete(execId);
+              }
+              execToolCallIdByStreamId.delete(event.toolCallId);
+              pendingToolCompactionByExecId.delete(execId);
+            }
+            if (event.type === 'done' && !controller.signal.aborted) {
+              observerLaunchesEnabled = false;
+              await waitForObserverToolExecutions();
+
+              // ── Lifecycle hook: AssistantMessage ────────────────────────
+              if (accumulatedResponseText.length > 0) {
+                void hookDispatcher.dispatch('AssistantMessage', {
+                  conversationId,
+                  text: accumulatedResponseText,
+                });
+              }
+
+              // Run post-receive hooks (e.g. plugin learning pipelines)
+              if (pluginManager && accumulatedResponseText.length > 0) {
+                try {
+                  await pluginManager.runPostReceiveHooks({
+                    response: { role: 'assistant', content: accumulatedResponseText },
+                    messages: messages as HookMessage[],
+                    config,
+                  });
+                } catch (err) {
+                  console.error('[Agent:stream] Post-receive hook error:', err);
+                }
               }
             }
-          }
-          if (event.type === 'model-fallback') {
-            // A mid-stream fallback restarts the response on the next model —
-            // drop the failed partial so post-receive hooks / AssistantMessage
-            // don't get the failed + successful variants concatenated (matching
-            // the renderer + persistence + other collectors).
-            accumulatedResponseText = '';
-            // streamWithFallback restarts the next model from the ORIGINAL messages —
-            // the failed attempt's tool args/results are NOT in the new model's
-            // context. Reset the same-turn media budget accumulators so the fallback
-            // doesn't downscale/omit otherwise-fitting media against phantom usage.
-            committedMediaTokens = 0;
-            committedMediaBytes = 0;
-            committedNonMediaTokens = 0;
-            committedToolCallArgIds.clear();
-            // The fallback restarts from the ORIGINAL messages: the failed primary's partial
-            // TEXT is discarded (not in the new model's context), so a text-only primary can
-            // reset sawToolOrTextThisTurn — otherwise a content-filtered primary that emitted
-            // text would leave it TRUE, gating off the overflow compact-and-retry on a
-            // fallback that immediately overflows with NO retained output (safe overflow
-            // wrongly hard-failed). BUT if a TOOL actually EXECUTED, its SIDE EFFECT already
-            // happened — do NOT reset (a compact-and-retry could replay the mutation). Only
-            // reset when no tool executed.
-            if (!executedToolThisTurn) sawToolOrTextThisTurn = false;
-            // Invalidate the static-input memo so it recomputes under the FALLBACK
-            // model's tokenizer (a cross-provider fallback can tokenize the same
-            // system prompt / schemas very differently).
-            staticInputTokensMemo = -1;
-            const fbData = event.data as { toModelKey?: string } | undefined;
-            if (fbData?.toModelKey && streamConfig) {
-              fellBackThisStream = true;
-              const fallbackEntry = streamConfig.fallbackModels.find((m) => m.key === fbData.toModelKey);
-              if (fallbackEntry?.modelConfig) {
-                activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
-                activeModelDisplayName = fallbackEntry.displayName ?? null;
-                // Track the active model's config so overflow recovery compacts
-                // with the CURRENTLY-active model's tokenizer/window/creds (not the
-                // primary's, which may be unavailable or have a larger window).
-                activeModelEntryForRecovery = fallbackEntry;
-                // Re-point the provider-native exemption at the now-active
-                // fallback model so its provider tools aren't suppressed and,
-                // conversely, the previous model's local tools aren't wrongly
-                // exempted.
-                providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
+            if (event.type === 'model-fallback') {
+              // A mid-stream fallback restarts the response on the next model —
+              // drop the failed partial so post-receive hooks / AssistantMessage
+              // don't get the failed + successful variants concatenated (matching
+              // the renderer + persistence + other collectors).
+              accumulatedResponseText = '';
+              // streamWithFallback restarts the next model from the ORIGINAL messages —
+              // the failed attempt's tool args/results are NOT in the new model's
+              // context. Reset the same-turn media budget accumulators so the fallback
+              // doesn't downscale/omit otherwise-fitting media against phantom usage.
+              committedMediaTokens = 0;
+              committedMediaBytes = 0;
+              committedNonMediaTokens = 0;
+              committedToolCallArgIds.clear();
+              // The fallback restarts from the ORIGINAL messages: the failed primary's partial
+              // TEXT is discarded (not in the new model's context), so a text-only primary can
+              // reset sawToolOrTextThisTurn — otherwise a content-filtered primary that emitted
+              // text would leave it TRUE, gating off the overflow compact-and-retry on a
+              // fallback that immediately overflows with NO retained output (safe overflow
+              // wrongly hard-failed). BUT if a TOOL actually EXECUTED, its SIDE EFFECT already
+              // happened — do NOT reset (a compact-and-retry could replay the mutation). Only
+              // reset when no tool executed.
+              if (!executedToolThisTurn) sawToolOrTextThisTurn = false;
+              // Invalidate the static-input memo so it recomputes under the FALLBACK
+              // model's tokenizer (a cross-provider fallback can tokenize the same
+              // system prompt / schemas very differently).
+              staticInputTokensMemo = -1;
+              const fbData = event.data as { toModelKey?: string } | undefined;
+              if (fbData?.toModelKey && streamConfig) {
+                fellBackThisStream = true;
+                const fallbackEntry = streamConfig.fallbackModels.find((m) => m.key === fbData.toModelKey);
+                if (fallbackEntry?.modelConfig) {
+                  activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
+                  activeModelDisplayName = fallbackEntry.displayName ?? null;
+                  // Track the active model's config so overflow recovery compacts
+                  // with the CURRENTLY-active model's tokenizer/window/creds (not the
+                  // primary's, which may be unavailable or have a larger window).
+                  activeModelEntryForRecovery = fallbackEntry;
+                  // Re-point the provider-native exemption at the now-active
+                  // fallback model so its provider tools aren't suppressed and,
+                  // conversely, the previous model's local tools aren't wrongly
+                  // exempted.
+                  providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
+                }
               }
             }
-          }
-          if (event.type === 'text-delta') {
-            accumulatedResponseText += event.text ?? '';
-            (event as Record<string, unknown>).messageMeta = {
-              ...(((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined) ?? {}),
-              ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
-              ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
-              reasoningEffort: reasoningEffort ?? null,
-              runtimeId: runtime.id,
-              ...(resolution.providerOverride ? { providerKey: resolution.providerOverride } : {}),
-            };
-          }
-          if (activeObserverSessions.get(conversationId) !== observerSessionId) {
+            if (event.type === 'text-delta') {
+              accumulatedResponseText += event.text ?? '';
+              (event as Record<string, unknown>).messageMeta = {
+                ...(((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined) ?? {}),
+                ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
+                ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
+                reasoningEffort: reasoningEffort ?? null,
+                runtimeId: runtime.id,
+                ...(resolution.providerOverride ? { providerKey: resolution.providerOverride } : {}),
+              };
+            }
+            if (activeObserverSessions.get(conversationId) !== observerSessionId) {
+              ipcDebugLog(
+                `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=observerSessionMismatch current=${activeObserverSessions.get(conversationId)} expected=${observerSessionId}`,
+              );
+              continue;
+            }
             ipcDebugLog(
-              `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=observerSessionMismatch current=${activeObserverSessions.get(conversationId)} expected=${observerSessionId}`,
+              `[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`,
             );
-            continue;
-          }
-          ipcDebugLog(
-            `[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`,
-          );
-          // Intercept a context-overflow ERROR EVENT before emitting it. Mastra
-          // surfaces non-transient provider failures as an `error` event (then
-          // `done`), NOT a thrown error — so this branch, not the catch below, is
-          // where a typical overflow arrives. Compact and retry the model stream
-          // in place (see the do/while); if recoverable, swallow this error event
-          // (and the trailing `done`) so the UI sees only the retry. If not
-          // recoverable, upgrade the message with the /compact guidance.
-          // `errorCategory` is authoritative WHEN PRESENT — a structured non-
-          // overflow category (e.g. 'rate-limit' whose message happens to mention
-          // token limits) must NOT be reclassified as overflow. Only fall back to
-          // message-string classification when no category was provided.
-          const isOverflowEvent =
-            event.type === 'error' &&
-            (event.errorCategory
-              ? event.errorCategory === 'context-overflow'
-              : isContextOverflowError(event.error));
-          if (isOverflowEvent) {
-            // If streamWithFallback preserved a MASKED primary overflow across the
-            // fallback chain (the terminal error was actually an unrelated fallback
-            // failure), it tells us WHICH model overflowed. Recover THAT model — not the
-            // failed fallback that `activeModelEntryForRecovery` currently points at, or
-            // we'd retry the broken (e.g. 401) fallback summarizer and never recover.
-            const ovKey = (event as { overflowRecoveryModelKey?: string }).overflowRecoveryModelKey;
-            if (ovKey && streamConfig) {
-              const ovEntry =
-                (streamConfig.primaryModel?.key === ovKey ? streamConfig.primaryModel : undefined) ??
-                streamConfig.fallbackModels.find((m) => m.key === ovKey);
-              if (ovEntry?.modelConfig) activeModelEntryForRecovery = ovEntry;
-            }
-            const compacted = await computeOverflowCompaction(true);
-            if (compacted?.compactedMessages && compacted.compactedMessages.length > 0) {
-              overflowRecoveryUsed = true;
-              messages = compacted.compactedMessages as unknown as typeof messages;
-              retryAfterOverflow = true;
-              overflowRecoveryTookOver = true; // swallow this error + trailing done from the FAILED stream
-              // Emit a `compaction` event so persistence records the summary for
-              // REUSE on the next turn (else the next turn reloads the original
-              // branch, re-overflows, and re-summarizes). BUT skip persisting when
-              // the compacted ids include a synthetic `compaction-summary-*` id —
-              // that means the in-memory branch was ALREADY compacted this turn
-              // (pre-turn compaction / prior recovery), so the ids don't exist in
-              // the stored tree; persisting would overwrite a good record with one
-              // whose prefix check always fails. The in-place retry still uses the
-              // compacted messages directly regardless.
-              // If the recompacted prefix begins with a synthetic
-              // `compaction-summary-<id>` (the branch already reused a stored
-              // record this turn), COMPOSE it back to the underlying message ids the
-              // OLD summary covered (from the stored record) so the new record's ids
-              // are real disk-branch ids and REUSABLE next turn. Otherwise the retry
-              // lives only in memory and the next turn re-overflows + re-pays.
-              const composedCompactedIds: string[] = (() => {
-                const ids = compacted.compactedMessageIds;
-                if (ids.length === 0 || !syntheticSummaryIdsThisTurn.has(ids[0])) return ids;
-                // Resolve the synthetic id from the stored record on disk OR the
-                // pre-stream compaction emitted THIS turn (renderer persists it
-                // async, so it may not be on disk yet).
-                const candidates: Array<{ compactionId?: string; compactedMessageIds?: string[] } | null | undefined> =
-                  [];
-                if (pendingCompactionThisTurn) candidates.push(pendingCompactionThisTurn);
-                try {
-                  candidates.push(
-                    readConversation(appHome, conversationId)?.conversationCompaction as
-                      | { compactionId?: string; compactedMessageIds?: string[] }
-                      | null
-                      | undefined,
-                  );
-                } catch {
-                  /* disk read failed — rely on the in-memory pending record */
-                }
-                for (const rec of candidates) {
-                  if (
-                    rec &&
-                    `compaction-summary-${rec.compactionId}` === ids[0] &&
-                    Array.isArray(rec.compactedMessageIds) &&
-                    rec.compactedMessageIds.length > 0
-                  ) {
-                    return [...rec.compactedMessageIds, ...ids.slice(1)];
+            // Intercept a context-overflow ERROR EVENT before emitting it. Mastra
+            // surfaces non-transient provider failures as an `error` event (then
+            // `done`), NOT a thrown error — so this branch, not the catch below, is
+            // where a typical overflow arrives. Compact and retry the model stream
+            // in place (see the do/while); if recoverable, swallow this error event
+            // (and the trailing `done`) so the UI sees only the retry. If not
+            // recoverable, upgrade the message with the /compact guidance.
+            // `errorCategory` is authoritative WHEN PRESENT — a structured non-
+            // overflow category (e.g. 'rate-limit' whose message happens to mention
+            // token limits) must NOT be reclassified as overflow. Only fall back to
+            // message-string classification when no category was provided.
+            const isOverflowEvent =
+              event.type === 'error' &&
+              (event.errorCategory ? event.errorCategory === 'context-overflow' : isContextOverflowError(event.error));
+            if (isOverflowEvent) {
+              // If streamWithFallback preserved a MASKED primary overflow across the
+              // fallback chain (the terminal error was actually an unrelated fallback
+              // failure), it tells us WHICH model overflowed. Recover THAT model — not the
+              // failed fallback that `activeModelEntryForRecovery` currently points at, or
+              // we'd retry the broken (e.g. 401) fallback summarizer and never recover.
+              const ovKey = (event as { overflowRecoveryModelKey?: string }).overflowRecoveryModelKey;
+              if (ovKey && streamConfig) {
+                const ovEntry =
+                  (streamConfig.primaryModel?.key === ovKey ? streamConfig.primaryModel : undefined) ??
+                  streamConfig.fallbackModels.find((m) => m.key === ovKey);
+                if (ovEntry?.modelConfig) activeModelEntryForRecovery = ovEntry;
+              }
+              const compacted = await computeOverflowCompaction(true);
+              if (compacted?.compactedMessages && compacted.compactedMessages.length > 0) {
+                overflowRecoveryUsed = true;
+                messages = compacted.compactedMessages as unknown as typeof messages;
+                retryAfterOverflow = true;
+                overflowRecoveryTookOver = true; // swallow this error + trailing done from the FAILED stream
+                // Emit a `compaction` event so persistence records the summary for
+                // REUSE on the next turn (else the next turn reloads the original
+                // branch, re-overflows, and re-summarizes). BUT skip persisting when
+                // the compacted ids include a synthetic `compaction-summary-*` id —
+                // that means the in-memory branch was ALREADY compacted this turn
+                // (pre-turn compaction / prior recovery), so the ids don't exist in
+                // the stored tree; persisting would overwrite a good record with one
+                // whose prefix check always fails. The in-place retry still uses the
+                // compacted messages directly regardless.
+                // If the recompacted prefix begins with a synthetic
+                // `compaction-summary-<id>` (the branch already reused a stored
+                // record this turn), COMPOSE it back to the underlying message ids the
+                // OLD summary covered (from the stored record) so the new record's ids
+                // are real disk-branch ids and REUSABLE next turn. Otherwise the retry
+                // lives only in memory and the next turn re-overflows + re-pays.
+                const composedCompactedIds: string[] = (() => {
+                  const ids = compacted.compactedMessageIds;
+                  if (ids.length === 0 || !syntheticSummaryIdsThisTurn.has(ids[0])) return ids;
+                  // Resolve the synthetic id from the stored record on disk OR the
+                  // pre-stream compaction emitted THIS turn (renderer persists it
+                  // async, so it may not be on disk yet).
+                  const candidates: Array<
+                    { compactionId?: string; compactedMessageIds?: string[] } | null | undefined
+                  > = [];
+                  if (pendingCompactionThisTurn) candidates.push(pendingCompactionThisTurn);
+                  try {
+                    candidates.push(
+                      readConversation(appHome, conversationId)?.conversationCompaction as
+                        | { compactionId?: string; compactedMessageIds?: string[] }
+                        | null
+                        | undefined,
+                    );
+                  } catch {
+                    /* disk read failed — rely on the in-memory pending record */
                   }
-                }
-                return ids;
-              })();
-              // Whether the composed ids resolved to REAL disk-branch ids is decided by
-              // the strict-prefix disk check below — NOT by a name heuristic. (An earlier
-              // version rejected any id starting with `compaction-summary-`, but an
-              // imported/plugin conversation may legitimately carry such an id; a synthetic
-              // id that FAILED to expand simply isn't on disk, so isStrictPrefix rejects it
-              // anyway. Relying on the disk check avoids false-rejecting legit ids.)
-              const persistIsStrictPrefix = (() => {
-                try {
-                  const diskConv = readConversation(appHome, conversationId);
-                  if (!diskConv) return false;
-                  const { tree, headId } = ensureConversationTree(diskConv);
-                  const branchIds = getConversationBranch(tree, headId).map((m) => m.id);
-                  if (!isStrictPrefix(composedCompactedIds, branchIds)) return false;
-                  // Reject if a concurrent conversations:put edited a covered message's
-                  // CONTENT (same id) at ANY point since the turn's input branch was
-                  // established. Two baselines cover the composed ids:
-                  //  (1) preSig = the RAW in-memory branch THIS recovery summarized
-                  //      (captured at recovery start) — covers ids we summarized directly.
-                  //  (2) earlierSig = the baseline of the EARLIER same-turn record whose
-                  //      synthetic summary this recovery expanded (composedCompactedIds
-                  //      spliced its underlying ids in). Those ids are NOT in preSig; the
-                  //      earlier record signed them. If that earlier record's own persist
-                  //      was rejected due to a concurrent edit on one of them, trusting the
-                  //      expansion blindly would persist THIS summary over the changed
-                  //      content — so we re-verify them against fresh disk here too.
-                  const preSig = compacted.compactionId ? recoveryPreDiskSig.get(compacted.compactionId) : undefined;
+                  for (const rec of candidates) {
+                    if (
+                      rec &&
+                      `compaction-summary-${rec.compactionId}` === ids[0] &&
+                      Array.isArray(rec.compactedMessageIds) &&
+                      rec.compactedMessageIds.length > 0
+                    ) {
+                      return [...rec.compactedMessageIds, ...ids.slice(1)];
+                    }
+                  }
+                  return ids;
+                })();
+                // Whether the composed ids resolved to REAL disk-branch ids is decided by
+                // the strict-prefix disk check below — NOT by a name heuristic. (An earlier
+                // version rejected any id starting with `compaction-summary-`, but an
+                // imported/plugin conversation may legitimately carry such an id; a synthetic
+                // id that FAILED to expand simply isn't on disk, so isStrictPrefix rejects it
+                // anyway. Relying on the disk check avoids false-rejecting legit ids.)
+                const persistIsStrictPrefix = (() => {
+                  try {
+                    const diskConv = readConversation(appHome, conversationId);
+                    if (!diskConv) return false;
+                    const { tree, headId } = ensureConversationTree(diskConv);
+                    const branchIds = getConversationBranch(tree, headId).map((m) => m.id);
+                    if (!isStrictPrefix(composedCompactedIds, branchIds)) return false;
+                    // Reject if a concurrent conversations:put edited a covered message's
+                    // CONTENT (same id) at ANY point since the turn's input branch was
+                    // established. Two baselines cover the composed ids:
+                    //  (1) preSig = the RAW in-memory branch THIS recovery summarized
+                    //      (captured at recovery start) — covers ids we summarized directly.
+                    //  (2) earlierSig = the baseline of the EARLIER same-turn record whose
+                    //      synthetic summary this recovery expanded (composedCompactedIds
+                    //      spliced its underlying ids in). Those ids are NOT in preSig; the
+                    //      earlier record signed them. If that earlier record's own persist
+                    //      was rejected due to a concurrent edit on one of them, trusting the
+                    //      expansion blindly would persist THIS summary over the changed
+                    //      content — so we re-verify them against fresh disk here too.
+                    const preSig = compacted.compactionId ? recoveryPreDiskSig.get(compacted.compactionId) : undefined;
+                    const rawIds = compacted.compactedMessageIds;
+                    const expandedFromSynthetic = rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0]);
+                    let earlierSig: Record<string, string> | undefined;
+                    if (expandedFromSynthetic) {
+                      if (
+                        pendingCompactionThisTurn &&
+                        `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
+                      ) {
+                        earlierSig = pendingCompactionThisTurn.coveredContentSig;
+                      }
+                      if (!earlierSig) {
+                        try {
+                          const rec = readConversation(appHome, conversationId)?.conversationCompaction as
+                            | { compactionId?: string; coveredContentSig?: Record<string, string> }
+                            | null
+                            | undefined;
+                          if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) {
+                            earlierSig = rec.coveredContentSig;
+                          }
+                        } catch {
+                          /* disk read failed — handled by the missing-baseline check below */
+                        }
+                      }
+                    }
+                    if (preSig) {
+                      const nowSig = diskSigMap();
+                      // Every composed id must have a baseline (from preSig or the earlier
+                      // record) that MATCHES fresh disk. An id with NO baseline on an
+                      // expanded record means we can't prove it's unchanged → don't persist.
+                      for (const id of composedCompactedIds) {
+                        const base = preSig.has(id) ? preSig.get(id) : earlierSig?.[id];
+                        if (base === undefined) {
+                          // No baseline: only tolerated for the NON-expanded case (all ids in
+                          // preSig by construction). For an expanded record a missing earlier
+                          // signature is unsafe → reject.
+                          if (expandedFromSynthetic) return false;
+                          continue;
+                        }
+                        if (base !== nowSig.get(id)) return false;
+                      }
+                    }
+                    return true;
+                  } catch {
+                    return false;
+                  }
+                })();
+                if (
+                  compacted.compactionId &&
+                  compacted.summaryText &&
+                  composedCompactedIds.length > 0 &&
+                  persistIsStrictPrefix
+                ) {
+                  // Baseline signatures for the persisted record. For ids THIS recovery
+                  // summarized directly, use its own baseline (recoveryPreDiskSig). For ids
+                  // spliced in by expanding an earlier same-turn synthetic summary, carry
+                  // the EARLIER record's signatures so a chained future recovery can still
+                  // verify every composed id (persistIsStrictPrefix already required these
+                  // to match fresh disk, so they're current).
+                  const preSig = recoveryPreDiskSig.get(compacted.compactionId);
+                  const coveredContentSig: Record<string, string> = {};
                   const rawIds = compacted.compactedMessageIds;
-                  const expandedFromSynthetic = rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0]);
                   let earlierSig: Record<string, string> | undefined;
-                  if (expandedFromSynthetic) {
+                  if (rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0])) {
                     if (
                       pendingCompactionThisTurn &&
                       `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
@@ -5217,182 +5385,124 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                           | { compactionId?: string; coveredContentSig?: Record<string, string> }
                           | null
                           | undefined;
-                        if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) {
+                        if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0])
                           earlierSig = rec.coveredContentSig;
-                        }
                       } catch {
-                        /* disk read failed — handled by the missing-baseline check below */
+                        /* disk read failed — omit; a future expansion of this record then rejects */
                       }
                     }
                   }
-                  if (preSig) {
-                    const nowSig = diskSigMap();
-                    // Every composed id must have a baseline (from preSig or the earlier
-                    // record) that MATCHES fresh disk. An id with NO baseline on an
-                    // expanded record means we can't prove it's unchanged → don't persist.
-                    for (const id of composedCompactedIds) {
-                      const base = preSig.has(id) ? preSig.get(id) : earlierSig?.[id];
-                      if (base === undefined) {
-                        // No baseline: only tolerated for the NON-expanded case (all ids in
-                        // preSig by construction). For an expanded record a missing earlier
-                        // signature is unsafe → reject.
-                        if (expandedFromSynthetic) return false;
-                        continue;
-                      }
-                      if (base !== nowSig.get(id)) return false;
-                    }
+                  for (const id of composedCompactedIds) {
+                    const s = preSig?.get(id) ?? earlierSig?.[id];
+                    if (s !== undefined) coveredContentSig[id] = s;
                   }
-                  return true;
-                } catch {
-                  return false;
+                  emit({
+                    conversationId,
+                    type: 'compaction',
+                    data: {
+                      compactionId: compacted.compactionId,
+                      summaryText: compacted.summaryText,
+                      compactedMessageIds: composedCompactedIds,
+                      coveredContentSig,
+                      compactionRevision: nextCompactionRevision(),
+                    },
+                  });
                 }
-              })();
-              if (
-                compacted.compactionId &&
-                compacted.summaryText &&
-                composedCompactedIds.length > 0 &&
-                persistIsStrictPrefix
-              ) {
-                // Baseline signatures for the persisted record. For ids THIS recovery
-                // summarized directly, use its own baseline (recoveryPreDiskSig). For ids
-                // spliced in by expanding an earlier same-turn synthetic summary, carry
-                // the EARLIER record's signatures so a chained future recovery can still
-                // verify every composed id (persistIsStrictPrefix already required these
-                // to match fresh disk, so they're current).
-                const preSig = recoveryPreDiskSig.get(compacted.compactionId);
-                const coveredContentSig: Record<string, string> = {};
-                const rawIds = compacted.compactedMessageIds;
-                let earlierSig: Record<string, string> | undefined;
-                if (rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0])) {
-                  if (
-                    pendingCompactionThisTurn &&
-                    `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
-                  ) {
-                    earlierSig = pendingCompactionThisTurn.coveredContentSig;
-                  }
-                  if (!earlierSig) {
-                    try {
-                      const rec = readConversation(appHome, conversationId)?.conversationCompaction as
-                        | { compactionId?: string; coveredContentSig?: Record<string, string> }
-                        | null
-                        | undefined;
-                      if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) earlierSig = rec.coveredContentSig;
-                    } catch {
-                      /* disk read failed — omit; a future expansion of this record then rejects */
-                    }
-                  }
-                }
-                for (const id of composedCompactedIds) {
-                  const s = preSig?.get(id) ?? earlierSig?.[id];
-                  if (s !== undefined) coveredContentSig[id] = s;
-                }
+                // Informational "compacting + retrying" note. Emit as a `retry` (observer) event,
+                // NOT a `text-delta`: a text-delta has no responseMessageId here (the retry mints a
+                // FRESH id downstream), so the renderer would attach it to the PRIOR attempt's
+                // assistant — mis-attributed, and after a preserved fallback variant it can collide
+                // with a duplicate id. The retry/observer path attaches to the current assistant
+                // without responseMessageId keying, so it survives the id change cleanly.
                 emit({
                   conversationId,
-                  type: 'compaction',
+                  type: 'retry',
                   data: {
-                    compactionId: compacted.compactionId,
-                    summaryText: compacted.summaryText,
-                    compactedMessageIds: composedCompactedIds,
-                    coveredContentSig,
-                    compactionRevision: nextCompactionRevision(),
+                    reason: 'context-overflow',
+                    text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
                   },
                 });
+                continue; // drain the rest of the failed stream; the do/while re-runs it
               }
-              // Informational "compacting + retrying" note. Emit as a `retry` (observer) event,
-              // NOT a `text-delta`: a text-delta has no responseMessageId here (the retry mints a
-              // FRESH id downstream), so the renderer would attach it to the PRIOR attempt's
-              // assistant — mis-attributed, and after a preserved fallback variant it can collide
-              // with a duplicate id. The retry/observer path attaches to the current assistant
-              // without responseMessageId keying, so it survives the id change cleanly.
+              // Recovery declined/failed. If the turn was cancelled or superseded
+              // while recovery's compaction ran, don't emit a stale terminal error
+              // over a run that no longer owns the conversation.
+              if (controller.signal.aborted || activeStreams.get(conversationId)?.token !== streamToken) {
+                overflowRecoveryTookOver = true; // suppress this + trailing done
+                continue;
+              }
               emit({
-                conversationId,
-                type: 'retry',
-                data: {
-                  reason: 'context-overflow',
-                  text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
-                },
+                ...event,
+                // Recovery EXHAUSTED = it actually ran compaction (not gated off) and
+                // got nothing → `/compact` would also be a no-op, so give generic
+                // guidance. If recovery was merely SKIPPED (a tool/text/inject already
+                // happened this turn), `/compact` may still help next turn — keep it.
+                error: `${event.error ?? 'Context window exceeded.'}${overflowGuidance(!compacted && !recoveryGatedOffLast)}`,
+                errorCategory: 'context-overflow',
               });
-              continue; // drain the rest of the failed stream; the do/while re-runs it
-            }
-            // Recovery declined/failed. If the turn was cancelled or superseded
-            // while recovery's compaction ran, don't emit a stale terminal error
-            // over a run that no longer owns the conversation.
-            if (controller.signal.aborted || activeStreams.get(conversationId)?.token !== streamToken) {
-              overflowRecoveryTookOver = true; // suppress this + trailing done
+              // This terminal error is fully terminal for a GUI turn (the renderer's error
+              // handler deletes the accumulator + persists idle). Suppress the FAILED stream's
+              // trailing `done` (via overflowRecoveryTookOver) so it can't recreate the
+              // accumulator from stale tree state and overwrite the persisted overflow error
+              // (round-100/108 pattern). A serverPersisted (CLI/automation) turn KEEPS its
+              // accumulator on error and needs the trailing `done`, so leave it flowing there.
+              if (!serverPersistedRun) overflowRecoveryTookOver = true;
               continue;
             }
-            emit({
-              ...event,
-              // Recovery EXHAUSTED = it actually ran compaction (not gated off) and
-              // got nothing → `/compact` would also be a no-op, so give generic
-              // guidance. If recovery was merely SKIPPED (a tool/text/inject already
-              // happened this turn), `/compact` may still help next turn — keep it.
-              error: `${event.error ?? 'Context window exceeded.'}${overflowGuidance(!compacted && !recoveryGatedOffLast)}`,
-              errorCategory: 'context-overflow',
-            });
-            // This terminal error is fully terminal for a GUI turn (the renderer's error
-            // handler deletes the accumulator + persists idle). Suppress the FAILED stream's
-            // trailing `done` (via overflowRecoveryTookOver) so it can't recreate the
-            // accumulator from stale tree state and overwrite the persisted overflow error
-            // (round-100/108 pattern). A serverPersisted (CLI/automation) turn KEEPS its
-            // accumulator on error and needs the trailing `done`, so leave it flowing there.
-            if (!serverPersistedRun) overflowRecoveryTookOver = true;
-            continue;
+            // The stream yields a terminal `error` and THEN an unconditional `done`
+            // (mastra-agent). For a GUI turn the error is fully terminal (renderer deletes the
+            // accumulator); forwarding the trailing `done` would recreate it from stale state +
+            // supersede the error write (a provider failure would flash then vanish). Track the
+            // error and drop the following `done` for GUI turns. serverPersisted keeps its
+            // accumulator on error and needs the `done`.
+            if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
+            if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
+            emit(event);
           }
-          // The stream yields a terminal `error` and THEN an unconditional `done`
-          // (mastra-agent). For a GUI turn the error is fully terminal (renderer deletes the
-          // accumulator); forwarding the trailing `done` would recreate it from stale state +
-          // supersede the error write (a provider failure would flash then vanish). Track the
-          // error and drop the following `done` for GUI turns. serverPersisted keeps its
-          // accumulator on error and needs the `done`.
-          if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
-          if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
-          emit(event);
-        }
-        // If the just-drained stream was an overflow that we compacted, reset the
-        // per-stream suppression flag and re-run the model with the compacted
-        // `messages` (hooks/lifecycle/injects already ran and are NOT repeated).
-        if (retryAfterOverflow) {
-          overflowRecoveryTookOver = false;
-          // If this failed stream fell back to a fallback model, the renderer's
-          // model selector is now pinned to that fallback key. The retry restarts at
-          // the PRIMARY, so emit a restoration model-fallback (primary as the target)
-          // to un-pin the selector — otherwise a successful compacted retry on the
-          // primary would leave the selector (and subsequent bare-model turns) stuck
-          // on the fallback.
-          if (fellBackThisStream && modelEntry?.key) {
-            emit({
-              conversationId,
-              type: 'model-fallback',
-              data: {
-                fromModel: activeModelDisplayName ?? 'fallback model',
-                toModel: modelEntry.displayName ?? modelEntry.key,
-                toModelKey: modelEntry.key,
-                error: '',
-                reason: 'overflow-recovery-retry-primary',
-              },
-            });
+          // If the just-drained stream was an overflow that we compacted, reset the
+          // per-stream suppression flag and re-run the model with the compacted
+          // `messages` (hooks/lifecycle/injects already ran and are NOT repeated).
+          if (retryAfterOverflow) {
+            overflowRecoveryTookOver = false;
+            // If this failed stream fell back to a fallback model, the renderer's
+            // model selector is now pinned to that fallback key. The retry restarts at
+            // the PRIMARY, so emit a restoration model-fallback (primary as the target)
+            // to un-pin the selector — otherwise a successful compacted retry on the
+            // primary would leave the selector (and subsequent bare-model turns) stuck
+            // on the fallback.
+            if (fellBackThisStream && modelEntry?.key) {
+              emit({
+                conversationId,
+                type: 'model-fallback',
+                data: {
+                  fromModel: activeModelDisplayName ?? 'fallback model',
+                  toModel: modelEntry.displayName ?? modelEntry.key,
+                  toModelKey: modelEntry.key,
+                  error: '',
+                  reason: 'overflow-recovery-retry-primary',
+                },
+              });
+            }
+            // Reset per-model state to the PRIMARY before re-running. The failed
+            // stream may have fallen back to a fallback model before overflowing,
+            // mutating these; the retry restarts at the primary, so stale values
+            // would misattribute the reply's source model AND (critically) apply
+            // the fallback's provider-native tool exemptions to the primary —
+            // which could leak unsanitized local-tool args past a DLP hook or leave
+            // the primary's native-tool args stuck pending.
+            accumulatedResponseText = '';
+            activeSourceModel = modelEntry?.modelConfig
+              ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
+              : null;
+            activeModelDisplayName = modelEntry?.displayName ?? null;
+            providerDefinedToolNames = modelEntry?.modelConfig
+              ? getProviderDefinedToolNames(modelEntry.modelConfig)
+              : new Set<string>();
+            activeModelEntryForRecovery = modelEntry;
+            // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
+            // reply can't collide with a failed sibling preserved under the prior attempt's id.
+            currentResponseMessageId = undefined;
           }
-          // Reset per-model state to the PRIMARY before re-running. The failed
-          // stream may have fallen back to a fallback model before overflowing,
-          // mutating these; the retry restarts at the primary, so stale values
-          // would misattribute the reply's source model AND (critically) apply
-          // the fallback's provider-native tool exemptions to the primary —
-          // which could leak unsanitized local-tool args past a DLP hook or leave
-          // the primary's native-tool args stuck pending.
-          accumulatedResponseText = '';
-          activeSourceModel = modelEntry?.modelConfig
-            ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
-            : null;
-          activeModelDisplayName = modelEntry?.displayName ?? null;
-          providerDefinedToolNames = modelEntry?.modelConfig
-            ? getProviderDefinedToolNames(modelEntry.modelConfig)
-            : new Set<string>();
-          activeModelEntryForRecovery = modelEntry;
-          // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
-          // reply can't collide with a failed sibling preserved under the prior attempt's id.
-          currentResponseMessageId = undefined;
-        }
         } while (retryAfterOverflow);
       } catch (error) {
         ipcDebugLog(
@@ -5409,9 +5519,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           emit({
             conversationId,
             type: 'error',
-            error: overflow
-              ? `${baseMsg}${overflowGuidance()}`
-              : baseMsg,
+            error: overflow ? `${baseMsg}${overflowGuidance()}` : baseMsg,
             ...(overflow ? { errorCategory: 'context-overflow' } : {}),
           });
           // Only a serverPersisted (CLI/automation) turn needs a trailing `done`: its
@@ -5602,8 +5710,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 if (owner !== undefined && owner !== streamToken) return;
                 const updated = readConversation(appHome, conversationId);
                 if (updated) {
-                  const { tree: continuationTree, headId: continuationHead } =
-                    ensureConversationTree(updated);
+                  const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
                   const continuationBranch = getConversationBranch(continuationTree, continuationHead);
                   // Wait for the RENDERER to have finished persisting THIS turn's assistant reply
                   // before launching — else the continuation reads a branch missing the just-
@@ -6034,8 +6141,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const promptTree = Array.isArray(promptWrite.messageTree) ? promptWrite.messageTree : [];
       const promptUserId = promptWrite.headId ?? null;
       const promptUserParent =
-        (promptTree.find((m) => (m as { id?: unknown }).id === promptUserId) as { parentId?: string | null } | undefined)
-          ?.parentId ?? null;
+        (
+          promptTree.find((m) => (m as { id?: unknown }).id === promptUserId) as
+            | { parentId?: string | null }
+            | undefined
+        )?.parentId ?? null;
 
       // Broadcast the user turn so OTHER attached clients (e.g. the `kai` CLI
       // when this submit came from the GUI) render the prompt, not just the
@@ -6096,11 +6206,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // (mark automationStreams, don't persist), but a GUI in-flight turn has NO renderer persisting
   // it after the reload — the reconnecting renderer must ADOPT it (own its persistence), not
   // treat it as main-owned (which would discard its terminal output + leave it stuck running).
-  ipcMain.handle('agent:in-flight', (_event, conversationId: string): { inFlight: boolean; serverPersisted: boolean } => {
-    const inFlight = activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
-    const serverPersisted = serverPersistTokens.has(conversationId) || pendingServerPersist.has(conversationId);
-    return { inFlight, serverPersisted };
-  });
+  ipcMain.handle(
+    'agent:in-flight',
+    (_event, conversationId: string): { inFlight: boolean; serverPersisted: boolean } => {
+      const inFlight = activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
+      const serverPersisted = serverPersistTokens.has(conversationId) || pendingServerPersist.has(conversationId);
+      return { inFlight, serverPersisted };
+    },
+  );
 
   // Main-authoritative GUI continuation authorization. A renderer about to drive an auto-continue
   // (max-turns) or plan-restart asks main to authorize it for THIS turn (keyed by the run's stream
@@ -6448,7 +6561,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // { title: null, suppressed: true } so the renderer does NOT fall back to
       // deriving a title from the raw messages; a `modify` rewrites the messages
       // and/or the system prompt.
-      const gated = await gateTitleGenerationMessages(messages, config, conversationId ?? '', modelKey, CHAT_TITLE_PROMPT);
+      const gated = await gateTitleGenerationMessages(
+        messages,
+        config,
+        conversationId ?? '',
+        modelKey,
+        CHAT_TITLE_PROMPT,
+      );
       if (gated.suppressed) return { title: null, suppressed: true };
       const effectiveMessages = gated.messages;
 

@@ -471,13 +471,31 @@ describe('conversations IPC: pending-draft claim (atomic single-winner)', () => 
       removeIds: [],
     });
     // Client A reserves it (retained on disk, not removed).
-    const a = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'A');
+    const a = await harness.invoke<{ draft: { id: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'lease1',
+      'd',
+      'A',
+    );
     expect(a.draft?.id).toBe('d');
     // Another client B is denied while A's reservation is live.
-    const b = await harness.invoke<{ draft: unknown }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'B');
+    const b = await harness.invoke<{ draft: unknown }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'lease1',
+      'd',
+      'B',
+    );
     expect(b.draft).toBeNull();
     // A's OWN re-claim is allowed (idempotent for the holder) — proving the draft is still on disk.
-    const a2 = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease1', 'd', 'A');
+    const a2 = await harness.invoke<{ draft: { id: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'lease1',
+      'd',
+      'A',
+    );
     expect(a2.draft?.id).toBe('d');
   });
 
@@ -498,12 +516,24 @@ describe('conversations IPC: pending-draft claim (atomic single-winner)', () => 
     // Reserve + ack(false) → released, so a fresh claim by another client succeeds.
     await harness.invoke('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd1', 'A');
     await harness.invoke('conversations:ack-pending-draft', FAKE_EVENT, 'lease2', 'd1', false, 'A');
-    const reclaim = await harness.invoke<{ draft: { id: string } | null }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd1', 'B');
+    const reclaim = await harness.invoke<{ draft: { id: string } | null }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'lease2',
+      'd1',
+      'B',
+    );
     expect(reclaim.draft?.id).toBe('d1');
     // Reserve + ack(true) → hard-removed; a later claim of that id returns null.
     await harness.invoke('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd2', 'A');
     await harness.invoke('conversations:ack-pending-draft', FAKE_EVENT, 'lease2', 'd2', true, 'A');
-    const gone = await harness.invoke<{ draft: unknown }>('conversations:claim-pending-draft', FAKE_EVENT, 'lease2', 'd2', 'C');
+    const gone = await harness.invoke<{ draft: unknown }>(
+      'conversations:claim-pending-draft',
+      FAKE_EVENT,
+      'lease2',
+      'd2',
+      'C',
+    );
     expect(gone.draft).toBeNull();
   });
 });
@@ -755,7 +785,7 @@ describe('appendConversationMessages', () => {
     let big = '';
     let i = 0;
     while (big.length < 2_000_000) {
-      big += `seg-${i}-${(i * 2654435761 >>> 0).toString(36)} `;
+      big += `seg-${i}-${((i * 2654435761) >>> 0).toString(36)} `;
       i++;
     }
     const start = Date.now();
@@ -861,6 +891,43 @@ describe('reparentConversationMessage', () => {
     expect(reparentConversationMessage(appHome, 'c1', 'nope', 'u1')).toBeNull();
     expect(reparentConversationMessage(appHome, 'c1', 'u1', 'nope')).toBeNull();
     expect(reparentConversationMessage(appHome, 'c1', 'u1', 'u1')).toBeNull();
+  });
+
+  it('chains a multi-inject batch forward so ALL injected users stay on the active branch', () => {
+    // Regression for the batched-inject head bug: prepareStep drained THREE
+    // injects in one step. Only the first has prefix content; the loop must still
+    // thread inj2 under inj1 and inj3 under inj2, advancing the head each time, or
+    // inj2/inj3 dangle off the branch on a reload before continuation output.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'a1', parentId: 'u1', role: 'assistant', content: 'prefix' },
+        // All three injects landed as siblings under the prior head (a1) at enqueue.
+        { id: 'inj1', parentId: 'a1', role: 'user', content: 'first' },
+        { id: 'inj2', parentId: 'a1', role: 'user', content: 'second' },
+        { id: 'inj3', parentId: 'a1', role: 'user', content: 'third' },
+      ],
+      'a1',
+    );
+    // Simulate the broadcastStreamEvent loop's chain: prefixHead = a1 for inj1,
+    // then no intervening content so chainParent walks to the prior injected id.
+    let chainParent: string | null = 'a1';
+    for (const id of ['inj1', 'inj2', 'inj3']) {
+      reparentConversationMessage(appHome, 'c1', id, chainParent, { makeHead: true });
+      chainParent = id;
+    }
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'inj1')?.parentId).toBe('a1');
+    expect(conv.messageTree.find((m) => m.id === 'inj2')?.parentId).toBe('inj1');
+    expect(conv.messageTree.find((m) => m.id === 'inj3')?.parentId).toBe('inj2');
+    expect(conv.headId).toBe('inj3');
+    // The active branch must contain all three injects in order.
+    const ids = conv.messages.map((m) => m.id);
+    expect(ids).toEqual(['u1', 'a1', 'inj1', 'inj2', 'inj3']);
   });
 });
 
