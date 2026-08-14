@@ -498,4 +498,36 @@ describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', ()
   it('denies on an empty payload', () => {
     expect(resolveInjectedTextFromGatedPayload([])).toEqual({ allowed: false, text: '' });
   });
+
+  it('preserves multiline / spacing-sensitive text VERBATIM (no whitespace collapse)', () => {
+    const code = 'def f():\n    x = 1\n\n    return  x   # two spaces';
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: [{ type: 'text', text: code }] }]);
+    expect(res).toEqual({ allowed: true, text: code });
+  });
+
+  it('concatenates multiple text parts verbatim', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'line1\n' },
+          { type: 'text', text: 'line2' },
+        ],
+      },
+    ]);
+    expect(res).toEqual({ allowed: true, text: 'line1\nline2' });
+  });
+
+  it('denies when the surviving turn has a non-text part (hook rewrote to media/file)', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hi' },
+          { type: 'image', image: 'data:...' },
+        ],
+      },
+    ]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
 });

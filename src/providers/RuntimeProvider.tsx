@@ -1395,6 +1395,23 @@ export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: Store
   if (desiredId && acc.closedPrefixIds?.has(desiredId)) {
     desiredId = acc.injectContinuationId ?? `${desiredId}-cont`;
   }
+  // Cooperative-inject ordering guard: when an inject was broadcast mid-step, the
+  // `user-message` handler advanced acc.headId to the injected user BEFORE the
+  // prior step's remaining deltas arrived (the ordered `inject-consumed` marker
+  // that closes the prefix comes AFTER them). Those remainder deltas still belong
+  // to the STILL-OPEN prefix (desiredId not yet in closedPrefixIds), but the
+  // branch tail is now the user — so the tail check below would create a NEW
+  // assistant UNDER the user (`user → remainder`), corrupting order. If a message
+  // with desiredId already exists anywhere in the accumulator, update THAT node in
+  // place so the remainder stays in the prefix, before the user.
+  if (desiredId && !acc.closedPrefixIds?.has(acc.pendingAssistantId ?? '')) {
+    const existingIdx = acc.messages.findIndex((m) => m.id === desiredId && m.role === 'assistant');
+    if (existingIdx >= 0) {
+      const timed = withPendingAssistantTiming(acc.messages[existingIdx], acc);
+      if (timed !== acc.messages[existingIdx]) acc.messages[existingIdx] = timed;
+      return { msg: acc.messages[existingIdx], idx: existingIdx };
+    }
+  }
   const branch = getActiveBranch(acc.messages, acc.headId);
   const last = branch[branch.length - 1];
   if (last?.role === 'assistant' && (!desiredId || last.id === desiredId)) {

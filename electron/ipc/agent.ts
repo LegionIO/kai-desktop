@@ -202,13 +202,27 @@ function extractLastUserText(messages: unknown[]): string {
  * Map the post-enforcement payload of a mid-turn inject back to the text to
  * enqueue. Pure so the gate's decision (redaction vs. removal) is unit-testable
  * apart from the async hook orchestration. When a modify hook REMOVED the sole
- * user turn, there is nothing to inject → treat as a denial (`allowed:false`);
- * otherwise return the surviving turn's (possibly-redacted) text.
+ * user turn, there is nothing to inject → treat as a denial (`allowed:false`).
+ * Text is extracted VERBATIM (no whitespace normalization — an inject may be
+ * multiline / spacing-sensitive code, unlike extractMessageText's display
+ * projection). A surviving turn whose content is non-text (a hook rewrote it into
+ * file/image/tool parts) can't be spliced as a user-text inject → denial.
  */
 export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allowed: boolean; text: string } {
   const survivor = lastUserMessage(payload);
   if (!survivor) return { allowed: false, text: '' };
-  const text = typeof survivor.content === 'string' ? survivor.content : extractMessageText(survivor.content);
+  if (typeof survivor.content === 'string') return { allowed: true, text: survivor.content };
+  if (!Array.isArray(survivor.content)) return { allowed: false, text: '' };
+  // Concatenate text parts VERBATIM; reject if any non-text part is present (an
+  // inject is a plain user-text turn — a hook that introduced media/file parts
+  // produced something we can't faithfully splice, so fail closed).
+  let text = '';
+  for (const part of survivor.content) {
+    if (!part || typeof part !== 'object') return { allowed: false, text: '' };
+    const p = part as { type?: string; text?: string };
+    if (p.type !== 'text') return { allowed: false, text: '' };
+    text += p.text ?? '';
+  }
   return { allowed: true, text };
 }
 
@@ -1858,13 +1872,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
     pendingLocalReplace.delete(conversationId); // ensure cleared even if the branch above didn't run
     guiFallbackRemoteOrigin.delete(conversationId);
-    // Discard any half-accumulated server-persist buffer from a superseded run
-    // so its partial output can't merge into this fresh turn's assistant message.
-    discardPersistenceAccumulator(conversationId);
-    // Fresh turn → clear any consumed-inject marker from a prior turn (the flag is
-    // only meaningful within the turn that consumed the inject).
-    conversationsWithConsumedInject.delete(conversationId);
-    consumedInjectBytes.delete(conversationId);
     // Handle cooperative injects STRANDED by a just-superseded turn (queued but
     // not yet drained — e.g. a raced ask_user answer). They belonged to that turn;
     // carrying them into this fresh/superseding turn would splice an unrelated
@@ -1874,6 +1881,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // rest (GUI-owned, already persisted at injection by the renderer). No-op for
     // the drain-at-end continuation (it drainInjects() before re-invoking us → the
     // queue is already empty) and for a plain first turn.
+    //
+    // MUST run BEFORE discardPersistenceAccumulator: persistCooperativeInjectedUserTurn
+    // calls finalizeInterruptedTurn to save the superseded run's assistant PREFIX and
+    // parent the stranded inject on it. Discarding the accumulator first would leave
+    // no prefix to finalize, stranding the inject on the wrong head / off-branch.
     if (hasInjects(conversationId)) {
       if (serverPersistTokens.has(conversationId)) {
         const stranded = drainInjects(conversationId);
@@ -1883,6 +1895,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
       clearInjects(conversationId);
     }
+    // Discard any half-accumulated server-persist buffer from a superseded run
+    // so its partial output can't merge into this fresh turn's assistant message.
+    // (A stranded server-inject drain above already finalized+deleted it via
+    // persistCooperativeInjectedUserTurn — this is then a no-op for that path.)
+    discardPersistenceAccumulator(conversationId);
+    // Fresh turn → clear any consumed-inject marker from a prior turn (the flag is
+    // only meaningful within the turn that consumed the inject).
+    conversationsWithConsumedInject.delete(conversationId);
+    consumedInjectBytes.delete(conversationId);
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -6004,6 +6025,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         modelKey: runCtx?.modelKey,
         systemPrompt: runCtx?.systemPrompt,
         executionMode: runCtx?.executionMode,
+        // GUI mid-turn send always gates under the live run's model — revalidate
+        // against a mid-stream fallback that lands during the async gate.
+        revalidateLiveModel: true,
       });
       // A policy BLOCK is a handled, terminal outcome — the message was
       // intentionally rejected. Return blocked:true (NOT cooperative:false) so the
@@ -6106,7 +6130,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   const gateInjectedUserText = async (
     conversationId: string,
     userText: string,
-    ctx?: { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode },
+    ctx?: { modelKey?: string; systemPrompt?: string; executionMode?: ExecutionMode; revalidateLiveModel?: boolean },
   ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean }> => {
     const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
     const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
@@ -6193,6 +6217,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const resolved = resolveInjectedTextFromGatedPayload(payload);
     if (!resolved.allowed)
       return { allowed: false, text: userText, reason: 'A policy hook removed this message.', terminal: true };
+    // The gate awaited async hooks. If a mid-stream model-fallback changed the
+    // ACTIVE run's model during that await, the decision we just made was for the
+    // OLD model — a model-conditioned hook could allow text the new model should
+    // block. The stream token/runtime are unchanged by a fallback (same run), so
+    // the caller's token revalidation won't catch this. Only when we gated under
+    // the LIVE run's model (revalidateLiveModel — NOT a caller-forced model, e.g.
+    // an automation that intentionally pins a model): compare the model key we
+    // gated under against the current one and fail closed on a mismatch (the
+    // caller re-reads context + retries / falls back). Not terminal — a retry
+    // under the new model may pass.
+    if (ctx?.revalidateLiveModel && ctx.modelKey !== undefined) {
+      const currentModelKey = getActiveRunContext(conversationId)?.modelKey;
+      if (currentModelKey !== undefined && currentModelKey !== ctx.modelKey) {
+        return {
+          allowed: false,
+          text: userText,
+          reason: 'The active model changed during policy enforcement; re-evaluate under the new model.',
+        };
+      }
+    }
     return { allowed: true, text: resolved.text };
   };
 
@@ -6231,6 +6275,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         modelKey: opts?.modelKey ?? runCtx?.modelKey,
         systemPrompt: runCtx?.systemPrompt,
         executionMode: opts?.executionMode ?? runCtx?.executionMode,
+        // Only revalidate against a mid-stream model change when we gated under the
+        // LIVE run's model (no caller-forced modelKey — an automation that pins a
+        // model intends that model, so a fallback mismatch must not spuriously deny).
+        revalidateLiveModel: opts?.modelKey === undefined,
       });
       if (!gate.allowed)
         return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: gate.terminal };

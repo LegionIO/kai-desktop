@@ -309,8 +309,20 @@ describe('shared Kai/Mastra assistant ids', () => {
     const acc = {
       messages: [
         { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
-        { id: 'msg-shared', parentId: 'user-1', role: 'assistant', content: [{ type: 'text', text: 'prefix' }], createdAt: new Date() },
-        { id: 'user-inject', parentId: 'msg-shared', role: 'user', content: [{ type: 'text', text: 'answer' }], createdAt: new Date() },
+        {
+          id: 'msg-shared',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-shared',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
       ],
       headId: 'user-inject',
       pendingAssistantId: 'msg-shared',
@@ -325,6 +337,42 @@ describe('shared Kai/Mastra assistant ids', () => {
     // A second delta of the SAME reused id appends to the SAME continuation node.
     const second = getOrCreateAssistantInAcc(acc);
     expect(second.msg.id).toBe('user-inject-cont');
+  });
+
+  it('routes a prior-step remainder delta to the STILL-OPEN prefix, not under the injected user', () => {
+    // Mid-turn inject broadcast BEFORE the prior step finished: the user-message
+    // handler already advanced headId to the injected user, but the prefix
+    // (msg-prefix) is NOT yet closed (inject-consumed hasn't fired). A remaining
+    // old-step delta reuses the prefix's responseMessageId (pendingAssistantId).
+    // It must update the prefix IN PLACE (before the user), NOT create a new
+    // assistant under the user — otherwise ordering becomes `user → remainder`.
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        {
+          id: 'msg-prefix',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-prefix',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-inject', // advanced by user-message before the remainder arrived
+      pendingAssistantId: 'msg-prefix', // prefix still open (not in closedPrefixIds)
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const { msg } = getOrCreateAssistantInAcc(acc);
+    expect(msg.id).toBe('msg-prefix'); // updated the prefix in place
+    expect(msg.parentId).toBe('user-1'); // still before the injected user
+    // No new assistant node was created under the injected user.
+    expect(acc.messages.filter((m) => m.role === 'assistant')).toHaveLength(1);
   });
 
   it('creates the fallback retry as a sibling with its newly echoed id', () => {
