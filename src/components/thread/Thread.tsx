@@ -1815,7 +1815,7 @@ const Composer: FC<{
   const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
-  const { sendMidTurn } = useMidTurnComposer();
+  const { sendMidTurn, getActiveConversationId } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
 
   // Compose-while-running: send the current composer text into the live turn (the
@@ -1831,9 +1831,10 @@ const Composer: FC<{
     composerRuntime.setText('');
     setComposerText('');
     void sendMidTurn(t).then(({ status, reason, originConversationId }) => {
-      // If the user switched chats during the async check, the send was routed to
-      // `originConversationId` — don't resubmit/restore into the now-active chat.
-      if (originConversationId !== activeConversationId) return;
+      // Compare against the LIVE active conversation at resolution time — if the
+      // user switched chats during the async gate, don't resubmit/restore into the
+      // now-active chat.
+      if (originConversationId !== getActiveConversationId()) return;
       // Only fall back (superseding send) / restore when the composer is still
       // empty — the async check may have let the user type a new draft.
       const current = composerRuntime.getState().text ?? '';
@@ -1851,7 +1852,7 @@ const Composer: FC<{
         if (reason) console.warn(`[mid-turn-inject] blocked: ${reason}`);
       }
     });
-  }, [attachments.length, activeConversationId, composerRuntime, composerText, sendMidTurn]);
+  }, [attachments.length, composerRuntime, composerText, sendMidTurn, getActiveConversationId]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse

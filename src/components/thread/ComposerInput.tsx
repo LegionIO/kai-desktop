@@ -17,7 +17,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const { attachments, addAttachments } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
-  const { isRunning, sendMidTurn } = useMidTurnComposer();
+  const { isRunning, sendMidTurn, getActiveConversationId } = useMidTurnComposer();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   // /compact status is SCOPED to the conversation it belongs to. In-flight compactions
   // live in a MODULE-LEVEL store (compaction-ui-store) keyed by conversation id — NOT
@@ -186,13 +186,11 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       composerRuntime.setText('');
       resetHistoryNavigation('');
       void sendMidTurn(toSend).then(({ status, reason, originConversationId }) => {
-        // The async policy/enforcement check may have let the user SWITCH chats.
-        // This composer belongs to `conversationId`; if the send was routed to a
-        // DIFFERENT conversation (or this composer is no longer that chat's), do
-        // NOT resubmit/restore here — that would send into / clobber the wrong
-        // chat. Drop the old text (it wasn't sent; the switched-away chat keeps
-        // its own draft handling via the rejected-draft queue on the main side).
-        if (originConversationId !== conversationId) return;
+        // Compare against the LIVE active conversation at resolution time (not a
+        // value captured at render): if the user switched chats during the async
+        // gate, the send's originConversationId no longer matches the now-active
+        // chat — do NOT resubmit into / clobber the wrong chat. Drop the old text.
+        if (originConversationId !== getActiveConversationId()) return;
         // Only fall back / restore when the composer is still EMPTY — the user may
         // have typed a NEW draft during the async check; clobbering it is worse
         // than the (logged) loss of the old text.
@@ -226,6 +224,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     resetHistoryNavigation,
     runCompact,
     sendMidTurn,
+    getActiveConversationId,
     text,
   ]);
 

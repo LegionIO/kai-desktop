@@ -771,6 +771,11 @@ type MidTurnComposerState = {
   /** Cancel a queued inject by id. Returns its text (for the "edit" affordance,
    *  which cancels then pre-fills the composer), or null if already gone. */
   cancelInject: (id: string) => Promise<string | null>;
+  /** The CURRENT active conversation id, read LIVE (not captured at render). A
+   *  composer's post-await fallback callback uses this to confirm the user hasn't
+   *  switched chats since the send — resubmitting/restoring only when it still
+   *  matches the send's originConversationId. */
+  getActiveConversationId: () => string | null;
 };
 
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
@@ -779,6 +784,7 @@ const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   sendMidTurn: async () => ({ status: 'fallback' }),
   pendingInjects: [],
   cancelInject: async () => null,
+  getActiveConversationId: () => null,
 });
 
 export function useMidTurnComposer(): MidTurnComposerState {
@@ -6391,9 +6397,11 @@ export function RuntimeProvider({
     return () => clearInterval(iv);
   }, [isRunning, midTurnMode, refreshPendingInjects]);
 
+  const getActiveConversationId = useCallback(() => activeIdRef.current, []);
+
   const midTurnComposerState = useMemo<MidTurnComposerState>(
-    () => ({ isRunning, midTurnSend: midTurnMode, sendMidTurn, pendingInjects, cancelInject }),
-    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject],
+    () => ({ isRunning, midTurnSend: midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId }),
+    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId],
   );
   const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
     () => ({

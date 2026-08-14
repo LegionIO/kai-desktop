@@ -550,50 +550,75 @@ function timestampMs(value: string | null | undefined): number {
 }
 
 /**
- * On-disk mirror of the renderer's reorderPrefixBeforeInjectedUser repair, for the
- * GUI terminal-drain case: a cooperative inject arrived after the final
- * prepareStep, so no `inject-consumed` fired and the renderer persisted the turn's
- * assistant reply UNDER the injected user (user → assistant), making that assistant
- * the disk head. The model produced that assistant BEFORE seeing the inject, so the
- * order is wrong. If exactly one assistant node is parented on `injectedUserId`,
- * swap them (assistant takes the user's parent, user reparents onto the assistant)
- * and make the injected user the head — so a continuation launched on it sees the
- * correct `… → assistant → injectedUser` order and the head check matches. Returns
- * the injected user id when it is (now) the head, else the current head. No-op if
- * the injected user is missing or has no lone assistant child.
+ * On-disk mirror of the renderer's reorderPrefixBeforeInjectedUserChain repair,
+ * for the GUI terminal-drain case: one or more cooperative injects arrived after
+ * the final prepareStep, so no `inject-consumed` fired and the renderer persisted
+ * the turn's assistant reply UNDER the LAST injected user, making that assistant
+ * the disk head. The model produced that assistant BEFORE seeing any inject, so it
+ * belongs BEFORE the whole injected-user chain. If exactly one assistant node is
+ * parented on any of `injectedUserIds`, move it to that user's parent and reparent
+ * the FIRST injected user onto it — yielding `pre → assistant → u1 → u2 …` — and
+ * make the LAST injected user the head. `injectedUserIds` is in FIFO (chain) order.
+ * Returns the id that is (now) the head (the last injected user when a repair or
+ * chain exists), else the current head. No-op when no injected user is present.
  */
 export function reorderInjectPrefixOnDisk(
   appHome: string,
   conversationId: string,
-  injectedUserId: string,
+  injectedUserIds: string[],
 ): string | null {
+  if (injectedUserIds.length === 0) return null;
   const conv = readConversation(appHome, conversationId);
   if (!conv) return null;
   const { tree, headId } = ensureConversationTree(conv);
-  const user = tree.find((m) => m.id === injectedUserId);
-  if (!user) return headId;
-  const childAssistants = tree.filter((m) => m.parentId === injectedUserId && m.role === 'assistant');
-  if (childAssistants.length !== 1) return headId;
-  const prefix = childAssistants[0];
-  const userParent = user.parentId;
+  const present = injectedUserIds.filter((id) => tree.some((m) => m.id === id));
+  if (present.length === 0) return headId;
+  const lastInjected = present[present.length - 1];
+  const idSet = new Set(present);
+  // The misplaced prefix: a lone assistant whose parent is one of the injected users.
+  const prefixes = tree.filter(
+    (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId),
+  );
+  if (prefixes.length !== 1) {
+    // No misplaced prefix (assistant not yet persisted, or already correctly
+    // ordered). The last injected user should be the head so the continuation
+    // launches on the full chain; advance it only if it isn't already.
+    if (headId === lastInjected) return headId;
+    const branch = getConversationBranch(tree, lastInjected);
+    const next: ConversationRecord = {
+      ...conv,
+      messageTree: tree,
+      messages: branch,
+      headId: lastInjected,
+      updatedAt: new Date().toISOString(),
+      messageCount: branch.length,
+      userMessageCount: branch.filter((m) => m.role === 'user').length,
+    };
+    broadcastUpsert(appHome, writeConversation(appHome, next));
+    return lastInjected;
+  }
+  const prefix = prefixes[0];
+  const firstInjected = present[0];
+  const firstUser = tree.find((m) => m.id === firstInjected)!;
+  const chainParent = firstUser.parentId; // the pre-inject head
   const nextTree = tree.map((m) => {
-    if (m.id === prefix.id) return { ...m, parentId: userParent };
-    if (m.id === injectedUserId) return { ...m, parentId: prefix.id };
+    if (m.id === prefix.id) return { ...m, parentId: chainParent };
+    if (m.id === firstInjected) return { ...m, parentId: prefix.id };
     return m;
   });
-  const branch = getConversationBranch(nextTree, injectedUserId);
+  const branch = getConversationBranch(nextTree, lastInjected);
   const next: ConversationRecord = {
     ...conv,
     messageTree: nextTree,
     messages: branch,
-    headId: injectedUserId,
+    headId: lastInjected,
     updatedAt: new Date().toISOString(),
     messageCount: branch.length,
     userMessageCount: branch.filter((m) => m.role === 'user').length,
   };
   const written = writeConversation(appHome, next);
   broadcastUpsert(appHome, written);
-  return injectedUserId;
+  return lastInjected;
 }
 
 type ConversationMessageLike = {

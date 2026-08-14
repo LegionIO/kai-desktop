@@ -1956,7 +1956,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // active branch. Rebuild `messages` from the authoritative on-disk branch
         // (which now ends at the stranded inject) so the replacement turn runs WITH
         // it in context and persists onto it.
-        if (persistedAny) {
+        //
+        // BUT NOT for a fresh agent:submit (pendingServerPersist set): there the
+        // incoming `messages` already carries the NEWLY submitted prompt (persisted
+        // before this handler ran) that supersedes this run — rebuilding from the
+        // disk branch (which ends at the OLD stranded inject, before that new
+        // prompt) would DROP the new turn from model input, making the model answer
+        // the stranded inject while the renderer attributes the reply to the new
+        // prompt. Only a CONTINUATION (stale `messages`) needs the disk rebuild.
+        if (persistedAny && !pendingServerPersist.has(conversationId)) {
           const rebuilt = readConversation(appHome, conversationId);
           if (rebuilt) {
             const { tree, headId } = ensureConversationTree(rebuilt);
@@ -5893,6 +5901,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const stranded = drainInjects(conversationId);
           let lastInjectedHead: string | null = null;
           let lastInjectedText = '';
+          // GUI-injected ids (FIFO) whose prefix/user order may need on-disk repair
+          // AFTER the renderer persists the assistant — done in the poll below, not
+          // here (at drain time the renderer hasn't written the assistant yet, so a
+          // repair now would be a no-op — the R42 finding).
+          const guiInjectedIds: string[] = [];
           for (const entry of stranded) {
             if (serverPersistedRun) {
               const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
@@ -5901,15 +5914,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 lastInjectedText = entry.text;
               }
             } else {
-              // GUI turn: the inject was ALREADY persisted at injection. But if it
-              // arrived AFTER the final prepareStep, no inject-consumed fired and the
-              // renderer parented THIS turn's assistant UNDER the injected user
-              // (user → assistant), making the assistant the disk head — so `entry.id`
-              // is NOT the head and the continuation's head check would fail. Repair
-              // the order on disk (assistant → injectedUser) and take the injected
-              // user (now the head) as the continuation head.
-              const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, entry.id);
-              lastInjectedHead = repairedHead ?? entry.id;
+              // GUI turn: the inject was ALREADY persisted at injection. If it arrived
+              // AFTER the final prepareStep, the renderer will parent THIS turn's
+              // assistant UNDER the (last) injected user, making the assistant the
+              // disk head — so `entry.id` is NOT the head. The order repair is
+              // deferred to the post-idle poll (batch-aware); here just record the id
+              // + take the last as the provisional continuation head.
+              guiInjectedIds.push(entry.id);
+              lastInjectedHead = entry.id;
               lastInjectedText = entry.text;
             }
           }
@@ -6049,7 +6061,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // stale-context re-run. A renderer that never writes idle in the budget almost
                   // certainly crashed/reloaded (its runStatus is startup-swept).
                   if (updated.runStatus === 'idle') {
-                    launchContinuation(continuationBranch);
+                    // The renderer has now persisted this turn's assistant. If GUI
+                    // injects arrived after the final prepareStep, the renderer
+                    // parented that assistant UNDER the (last) injected user, making
+                    // it the head. Repair the order on disk NOW (batch-aware) so the
+                    // continuation launches on `pre → assistant → u1 … uN` with the
+                    // last injected user as the head — matching launchContinuation's
+                    // head check. No-op when nothing needs reordering.
+                    let launchBranch = continuationBranch;
+                    if (guiInjectedIds.length > 0) {
+                      const repairedHead = reorderInjectPrefixOnDisk(appHome, conversationId, guiInjectedIds);
+                      const reread = readConversation(appHome, conversationId);
+                      if (reread && repairedHead) {
+                        const { tree: rt, headId: rh } = ensureConversationTree(reread);
+                        launchBranch = getConversationBranch(rt, repairedHead ?? rh);
+                      }
+                    }
+                    launchContinuation(launchBranch);
                     return;
                   }
                   if (remaining <= 0) return; // budget exhausted, still running → abandon (don't re-run stale)
