@@ -765,16 +765,20 @@ function injectHeadStillOnBranch(
   if (headId === headBeforeGate) return true;
   // Walk up from the current head toward headBeforeGate. Same-branch advancement is
   // ONLY confirmed if we reach headBeforeGate AND crossed one of this run's own
-  // response nodes on the way — a sibling variant selected concurrently reaches
-  // headBeforeGate too, but never through a node this run produced. Bounded +
+  // response nodes STRICTLY BELOW it — a sibling variant selected concurrently
+  // reaches headBeforeGate too, but never through a node this run produced beneath
+  // it. Do NOT count headBeforeGate ITSELF as a crossed run node: when it is itself
+  // a recorded run-owned node (e.g. a prior inject's user id), counting the endpoint
+  // would let ANY descendant (including a failed fallback sibling selected during
+  // this gate) pass without crossing a live node below the gate head. Bounded +
   // cycle-guarded by the tree size.
   const byId = new Map(tree.map((m) => [m.id, m] as const));
   let cur: string | null = headId;
   const seen = new Set<string>();
   let crossedOwnResponse = false;
   while (cur && !seen.has(cur)) {
-    if (runResponseIds.has(cur)) crossedOwnResponse = true;
     if (cur === headBeforeGate) return crossedOwnResponse;
+    if (runResponseIds.has(cur)) crossedOwnResponse = true;
     seen.add(cur);
     cur = byId.get(cur)?.parentId ?? null;
   }
