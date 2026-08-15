@@ -830,6 +830,12 @@ type RacedAnswerState = {
    *  here) — then the claim stays permissive (any next turn may carry it). */
   expectedSuccessorToken?: string;
   expiresAt: number;
+  /** True while an async `deliver()` (which awaits the pre-send / UserPromptSubmit
+   *  policy gate) is in flight. If the successor turn completes ORDINARILY during
+   *  that await, the answer is genuinely still owed — so onFailure re-registers the
+   *  handoff even without a live replacement (an ordinary completion would otherwise
+   *  discard it, losing an answer that a slow gate simply hadn't finished delivering). */
+  deliveryInFlight?: boolean;
 };
 // PRE-successor holding map: keys registered by an aborting gate before the
 // successor turn starts. Transferred into a claimant on successor start.
@@ -964,10 +970,17 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // replacement — DISCARD, so an unrelated later turn can't claim the stale answer.
       const latestIssued = latestIssuedTurnToken.get(conversationId);
       const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== claimant.token;
+      // A delivery that was IN FLIGHT when the claimant was torn down means the answer
+      // is genuinely still owed: a slow policy gate simply hadn't finished delivering
+      // when the successor completed. In that case re-register even on ORDINARY
+      // completion (no live replacement) — the original expiry + cancelGen still bound
+      // it, so a Stop voids it and it ages out; without this the answer is silently
+      // lost. (A normal teardown with no in-flight delivery keeps the strict
+      // supersededByLiveReplacement gate so an unrelated later turn can't claim it.)
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
         !terminalAbortTokens.has(claimant.token) &&
-        supersededByLiveReplacement
+        (supersededByLiveReplacement || state.deliveryInFlight)
       ) {
         // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
         registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
@@ -985,9 +998,14 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     const onTerminal = (): void => {
       purgeRacedAnswerForKey(answerKey);
     };
+    // Mark the delivery in-flight so a claimant teardown DURING the (async policy
+    // gate) delivery re-registers the handoff even on ordinary completion (see
+    // onFailure) — the answer is genuinely still owed. Cleared when deliver settles.
+    state.deliveryInFlight = true;
     void claimant
       .deliver(text)
       .then((res) => {
+        state.deliveryInFlight = false;
         if (!res.ok) {
           if (res.terminal) onTerminal();
           else onFailure();
@@ -1001,7 +1019,10 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
           fields: { status: res.ok ? 'delivered' : res.terminal ? 'blocked-by-policy' : 'failed' },
         });
       })
-      .catch(() => onFailure());
+      .catch(() => {
+        state.deliveryInFlight = false;
+        onFailure();
+      });
   }
 }
 
@@ -2625,35 +2646,71 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       (racedAnswerHandoffs.has(conversationId) || liveRacedAnswerClaimant.has(conversationId))
     ) {
       if (runtime.id === 'mastra') {
-        // Bind an UNBOUND pending handoff (a plan-restart, whose successor token was
-        // unknown at abort) to THIS admitted successor, so that if this run dies
-        // before/without claiming (config/hook fail), its teardown
-        // (dropRacedAnswerClaimantForToken, expectedSuccessorToken === token) drops
-        // the handoff instead of leaving it claimable by a later unrelated turn.
-        const pending = racedAnswerHandoffs.get(conversationId);
-        if (pending && pending.expectedSuccessorToken === undefined) {
-          pending.expectedSuccessorToken = streamToken;
-        }
-        registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
-          const reinject = injectUserTurnAndRestart;
-          if (!reinject) return { ok: false };
-          try {
-            // COOPERATIVE-ONLY: a stale ask_user answer must splice into THIS live
-            // successor or fail — never abort a newer run / restart after Stop. Bind
-            // to streamToken so a supersession during the async policy gate fails
-            // (transient) rather than misdelivering.
-            const res = await reinject(conversationId, text, {
-              cooperativeOnly: true,
-              expectedToken: streamToken,
-            });
-            if (res?.ok && res.injectedCooperatively) return { ok: true };
-            // A policy block is permanent for this content — don't retry it.
-            // notCooperative (ownership changed / not injectable) is transient.
-            return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
-          } catch {
-            return { ok: false };
+        // A plugin INFERENCE PROVIDER resolves as runtime.id === 'mastra' but its
+        // `.stream()` path bypasses Mastra's prepareStep — so cooperative injection
+        // NEVER drains (the terminal inject-drain is Mastra-only). Registering a
+        // cooperative claimant for it would report delivery "success" on enqueue while
+        // the answer is never consumed (and lingers for a later turn). Detect that path
+        // HERE (same resolution the provider dispatch below uses) and treat it as
+        // NON-cooperative: invalidate the handoff so the answer stays in the bounded
+        // stash rather than being falsely claimed.
+        const claimantModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
+        const claimantProviderKey =
+          config.models.catalog.find((m) => m.key === claimantModelKey)?.provider ?? undefined;
+        const isBuiltInRuntimeId = (id: string): boolean =>
+          id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
+        const claimantPluginRuntimeId =
+          resolution.inferenceProviderRuntimeId ??
+          (!isBuiltInRuntimeId(resolution.runtimeId) ? resolution.runtimeId : undefined);
+        const willUseDirectInferenceProvider = Boolean(
+          pluginManager?.getInferenceProvider({
+            runtimeId: claimantPluginRuntimeId ?? resolution.runtimeId,
+            modelProviderKey: claimantProviderKey,
+          }),
+        );
+        if (willUseDirectInferenceProvider) {
+          // Non-cooperative: same handling as the non-Mastra branch below.
+          racedAnswerHandoffs.delete(conversationId);
+          liveRacedAnswerClaimant.delete(conversationId);
+          traceDiagnostic({
+            scope: 'agent',
+            event: 'question.answer-handoff-dropped-non-mastra',
+            level: 'warn',
+            conversationId,
+            toolName: 'ask_user',
+            fields: { reason: 'direct-inference-provider' },
+          });
+        } else {
+          // Bind an UNBOUND pending handoff (a plan-restart, whose successor token was
+          // unknown at abort) to THIS admitted successor, so that if this run dies
+          // before/without claiming (config/hook fail), its teardown
+          // (dropRacedAnswerClaimantForToken, expectedSuccessorToken === token) drops
+          // the handoff instead of leaving it claimable by a later unrelated turn.
+          const pending = racedAnswerHandoffs.get(conversationId);
+          if (pending && pending.expectedSuccessorToken === undefined) {
+            pending.expectedSuccessorToken = streamToken;
           }
-        });
+          registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
+            const reinject = injectUserTurnAndRestart;
+            if (!reinject) return { ok: false };
+            try {
+              // COOPERATIVE-ONLY: a stale ask_user answer must splice into THIS live
+              // successor or fail — never abort a newer run / restart after Stop. Bind
+              // to streamToken so a supersession during the async policy gate fails
+              // (transient) rather than misdelivering.
+              const res = await reinject(conversationId, text, {
+                cooperativeOnly: true,
+                expectedToken: streamToken,
+              });
+              if (res?.ok && res.injectedCooperatively) return { ok: true };
+              // A policy block is permanent for this content — don't retry it.
+              // notCooperative (ownership changed / not injectable) is transient.
+              return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
+            } catch {
+              return { ok: false };
+            }
+          });
+        }
       } else {
         // Non-Mastra successor can't cooperatively inject — invalidate the handoff
         // (answers stay in the bounded stash) so it can't attach to a later turn.
