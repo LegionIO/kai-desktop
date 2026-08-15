@@ -341,6 +341,45 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(second.msg.id).toBe('user-inject-cont');
   });
 
+  it('keeps the deterministic continuation id through a PRE-CONTENT model-fallback', () => {
+    // After the inject boundary, a model-fallback fires BEFORE any continuation
+    // content — rotating pendingAssistantId to the fallback model's FRESH id, which
+    // is NOT a closed prefix. Without the pending-continuation pin the renderer would
+    // create the continuation under that fresh id while main's fallback accumulator
+    // still uses `${injectedUser}-cont` → divergent ids → a duplicate sibling on a
+    // main finalize. The continuation node must still materialize under the
+    // deterministic injectContinuationId.
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        {
+          id: 'msg-shared',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-shared',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-inject',
+      // Pre-content fallback rotated the reused id to a FRESH fallback id (NOT closed).
+      pendingAssistantId: 'resp-fallback-2',
+      closedPrefixIds: new Set(['msg-shared']),
+      injectContinuationId: 'user-inject-cont',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const first = getOrCreateAssistantInAcc(acc);
+    // Pinned to the deterministic id — NOT the fresh fallback id — so main can upsert.
+    expect(first.msg.id).toBe('user-inject-cont');
+    expect(first.msg.parentId).toBe('user-inject');
+  });
+
   it('routes a prior-step remainder delta to the STILL-OPEN prefix, not under the injected user', () => {
     // Mid-turn inject broadcast BEFORE the prior step finished: the user-message
     // handler already advanced headId to the injected user, but the prefix

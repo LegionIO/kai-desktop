@@ -1529,6 +1529,18 @@ export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: Store
   if (desiredId && acc.closedPrefixIds?.has(desiredId)) {
     desiredId = acc.injectContinuationId ?? `${desiredId}-cont`;
   }
+  // A cooperative-inject continuation is PENDING (boundary set injectContinuationId)
+  // but hasn't materialized a node yet. A PRE-CONTENT model-fallback right after the
+  // boundary rotates acc.pendingAssistantId to the fallback model's FRESH id — which
+  // is NOT a closed prefix, so the branch above wouldn't redirect it, and the renderer
+  // would create the continuation under the fresh id while main's fallback accumulator
+  // still uses `${injectedUserId}-cont` → divergent ids → a duplicate sibling if main
+  // finalizes (reload/crash/passive continuation/web frame-cap). So while the
+  // continuation node has NOT yet materialized, pin desiredId to injectContinuationId
+  // regardless of the current pendingAssistantId — matching main's deterministic id.
+  if (acc.injectContinuationId && !acc.messages.some((m) => m.id === acc.injectContinuationId)) {
+    desiredId = acc.injectContinuationId;
+  }
   // Cooperative-inject ordering guard: when an inject was broadcast mid-step, the
   // `user-message` handler advanced acc.headId to the injected user BEFORE the
   // prior step's remaining deltas arrived (the ordered `inject-consumed` marker
