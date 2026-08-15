@@ -418,13 +418,17 @@ const activeStreamRuntime = new Map<
   }
 >();
 
-// Response node ids the CURRENT active run has streamed, token-scoped. Used by
-// injectHeadStillOnBranch to distinguish the run's OWN head advancement (from the
-// pre-inject head down to one of these assistant nodes) from a concurrent
+// Node ids that belong to the CURRENT active run's OWN lineage, token-scoped.
+// Used by injectHeadStillOnBranch to distinguish the run's OWN head advancement
+// (from the pre-inject head down to one of these nodes) from a concurrent
 // sibling-variant selection: a regenerated user node can have MANY assistant
 // variant children, so "current head descends from headBeforeGate" is true for a
 // sibling too. Requiring the descent path to pass through a node THIS run produced
-// rejects the sibling. Cleared on terminal cleanup (token-scoped).
+// rejects the sibling. Populated from BOTH the provider's streamed
+// `responseMessageId`s AND the cooperative-inject boundary nodes (the injected
+// user node + its deterministic `${id}-cont` continuation, which are this run's
+// own lineage but never carry a provider responseMessageId). Cleared on terminal
+// cleanup (token-scoped).
 const activeStreamResponseIds = new Map<string, { token: string; ids: Set<string> }>();
 function recordActiveRunResponseId(conversationId: string, token: string, responseId: string): void {
   if (activeStreams.get(conversationId)?.token !== token) return;
@@ -434,6 +438,16 @@ function recordActiveRunResponseId(conversationId: string, token: string, respon
   } else {
     activeStreamResponseIds.set(conversationId, { token, ids: new Set([responseId]) });
   }
+}
+/** Record a cooperative-inject boundary's nodes as this run's own lineage: the
+ *  injected user node AND its deterministic `${id}-cont` continuation. After a
+ *  splice, subsequent output persists under `-cont` (renderer) / after the
+ *  injected user (server) — NOT under the provider's original responseMessageId —
+ *  so without this a SECOND mid-turn send whose head advanced to the continuation
+ *  node would fail injectHeadStillOnBranch and wrongly supersede a healthy run. */
+function recordInjectBoundaryLineage(conversationId: string, token: string, injectedUserId: string): void {
+  recordActiveRunResponseId(conversationId, token, injectedUserId);
+  recordActiveRunResponseId(conversationId, token, `${injectedUserId}-cont`);
 }
 /** The response node ids the CURRENT active run has produced (empty if none/unknown). */
 function getActiveRunResponseIds(conversationId: string): Set<string> {
@@ -1887,6 +1901,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // it. Overflow recovery must not auto-retry from the outer `messages` (which
     // lacks the consumed inject) regardless of who owns persistence.
     if (entries.length > 0) conversationsWithConsumedInject.add(conversationId);
+    // Record each consumed inject's boundary nodes (injected user + `${id}-cont`)
+    // as THIS run's own lineage BEFORE the server-owner early return, so both a
+    // GUI-owned and a server-owned turn's continuation head passes
+    // injectHeadStillOnBranch (a later mid-turn send must not read a same-run
+    // continuation advancement as a branch switch). Token-scoped no-op if the run
+    // was superseded. `entry.id` is the id the renderer keys its continuation on.
+    {
+      const activeToken0 = activeStreams.get(conversationId)?.token;
+      if (activeToken0 !== undefined) {
+        for (const entry of entries) recordInjectBoundaryLineage(conversationId, activeToken0, entry.id);
+      }
+    }
     // Accumulate consumed-inject text bytes so the media budget can charge them
     // (they aren't in the outer `messages` branch it sums).
     if (entries.length > 0) {
@@ -1912,6 +1938,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
       if (persisted) {
         lastMessageId = persisted.messageId;
+        // The disk write may have assigned a DIFFERENT id than entry.id; record the
+        // authoritative persisted node (+ its `-cont`) as this run's lineage too.
+        {
+          const activeToken1 = activeStreams.get(conversationId)?.token;
+          if (activeToken1 !== undefined)
+            recordInjectBoundaryLineage(conversationId, activeToken1, persisted.messageId);
+        }
         traceDiagnostic({
           scope: 'agent',
           event: 'inject.boundary-persisted',
