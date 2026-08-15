@@ -975,7 +975,6 @@ function registerRacedAnswerHandoff(
   cancelGenAtAbort: number,
   sourceToken: string,
   expiresAtOverride?: number,
-  boundSuccessorTokenOverride?: string,
 ): void {
   const now = Date.now();
   // A carried-forward expiry that has ALREADY passed → don't resurrect (drop).
@@ -1008,12 +1007,7 @@ function registerRacedAnswerHandoff(
   // successor issued yet — e.g. a plan-mode restart minted asynchronously), leave
   // it unbound so that async successor may still claim it.
   const latestIssued = latestIssuedTurnToken.get(conversationId);
-  const expectedSuccessorToken =
-    boundSuccessorTokenOverride !== undefined
-      ? boundSuccessorTokenOverride
-      : latestIssued !== undefined && latestIssued !== sourceToken
-        ? latestIssued
-        : undefined;
+  const expectedSuccessorToken = latestIssued !== undefined && latestIssued !== sourceToken ? latestIssued : undefined;
   racedAnswerHandoffs.set(conversationId, {
     answerKeys: new Set([answerKey]),
     cancelGenAtAbort,
@@ -1087,49 +1081,35 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // replacement — DISCARD, so an unrelated later turn can't claim the stale answer.
       const latestIssued = latestIssuedTurnToken.get(conversationId);
       const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== claimant.token;
-      // Re-register the still-owed answer as a pre-successor handoff so a later turn
-      // can pick it up — but never as an UNBOUND handoff an unrelated turn could
-      // claim. Two cases (both gated on: no Stop bumped the generation, and the
-      // torn-down token wasn't a TERMINAL abort):
-      //   (a) SUPERSEDED by a live replacement → bind to that replacement (sourceToken
-      //       = claimant.token ≠ latestIssued, so registerRacedAnswerHandoff derives
-      //       expectedSuccessorToken = latestIssued).
-      //   (b) ORDINARY completion but a delivery was IN FLIGHT (a slow policy gate
-      //       hadn't finished when the successor completed): the answer is genuinely
-      //       still owed. Register it BOUND to the just-completed token — no NEW turn
-      //       will ever carry that token, so no unrelated turn can claim it, and it
-      //       ages out via TTL; but a genuine newer successor that starts within the
-      //       TTL rebinds + claims it (see the boundSuccessorSuperseded path in
-      //       registerLiveRacedAnswerClaimant / mergePendingHandoffIntoLiveClaimant).
-      //       Without this the R76 fix left the answer stranded in the stash with no
-      //       handoff referencing it — unrecoverable.
+      // Re-register the still-owed answer as a pre-successor handoff ONLY when a LIVE
+      // replacement actually superseded the claimant (latestIssuedTurnToken advanced
+      // past it) — plus the usual guards (no Stop bumped the generation; the
+      // torn-down token wasn't a TERMINAL abort). registerRacedAnswerHandoff then
+      // binds it to that live replacement (sourceToken = claimant.token ≠ latestIssued
+      // → expectedSuccessorToken = latestIssued), so a genuine successor claims it.
+      //
+      // We do NOT register on ORDINARY completion (this token is still the latest
+      // issued — NO successor exists), even when a delivery was in flight. There is no
+      // turn that legitimately owns this answer: the run that asked the question
+      // finished. The answer stays in the bounded stash and is recovered by id if that
+      // ask_user question is re-invoked (the tool's execute reads the stash by
+      // toolCallId — see waitForRacedAnswer/rekeyRacedAnswer). Registering a handoff
+      // here is unsound either way: UNBOUND lets an unrelated turn claim it (R76
+      // misdelivery); SELF-BOUND to the completed token is either unclaimable (dead
+      // token) or, via the superseded-successor rebind path, ALSO reaches an unrelated
+      // newer turn (R80 misdelivery). The stash is the correct resting place.
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
-        !terminalAbortTokens.has(claimant.token)
+        !terminalAbortTokens.has(claimant.token) &&
+        supersededByLiveReplacement
       ) {
-        if (supersededByLiveReplacement) {
-          // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
-          registerRacedAnswerHandoff(
-            conversationId,
-            answerKey,
-            state.cancelGenAtAbort,
-            claimant.token,
-            state.expiresAt,
-          );
-          mergePendingHandoffIntoLiveClaimant(conversationId);
-        } else if ((state.deliveryInFlightCount ?? 0) > 0) {
-          // Ordinary completion, delivery still in flight → bind to the completed
-          // token so no unrelated turn can claim it (a genuine successor rebinds).
-          registerRacedAnswerHandoff(
-            conversationId,
-            answerKey,
-            state.cancelGenAtAbort,
-            claimant.token,
-            state.expiresAt,
-            claimant.token, // boundSuccessorTokenOverride: never claimable by a new turn
-          );
-          mergePendingHandoffIntoLiveClaimant(conversationId);
-        }
+        // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
+        registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
+        // If a replacement claimant is ALREADY live (it passed its claim site before
+        // this teardown), MERGE the requeued key into it + deliver, so the answer
+        // isn't stuck until the next trigger. No-op if there's no live claimant yet
+        // (a later successor start transfers the handoff instead).
+        mergePendingHandoffIntoLiveClaimant(conversationId);
       }
     };
     // A TERMINAL outcome (policy hook blocked the answer / a hook errored) must

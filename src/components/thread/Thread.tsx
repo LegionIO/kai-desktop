@@ -1831,6 +1831,19 @@ const Composer: FC<{
       if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
     };
   }, []);
+  // Clear a lingering mid-turn block notice when the user switches conversations:
+  // Thread stays mounted across a chat switch, and the notice is scoped to the
+  // chat it was raised in — showing the originating chat's policy error in a
+  // newly-selected chat would misattribute it (a pending gate can also resolve
+  // AFTER the switch). Reset the notice + its timer on every activeConversationId
+  // change so it only ever displays in the chat that produced it.
+  useEffect(() => {
+    if (midTurnBlockTimerRef.current) {
+      clearTimeout(midTurnBlockTimerRef.current);
+      midTurnBlockTimerRef.current = null;
+    }
+    setMidTurnBlockNotice(null);
+  }, [activeConversationId]);
 
   // Compose-while-running: send the current composer text into the live turn (the
   // Send button rendered while running). Cooperatively spliced on Mastra; falls
@@ -1856,7 +1869,10 @@ const Composer: FC<{
       const hasLiveAttachment = getAttachmentCount() > 0;
       if (!stillHere || current.trim().length > 0 || hasLiveAttachment) {
         if (originConversationId) stashRejectedDraft(originConversationId, t);
-        if (status === 'blocked') showMidTurnBlock(reason);
+        // Only surface the block notice when we're STILL in the originating chat —
+        // showing it after a switch would misattribute the origin chat's policy
+        // error to the newly-selected chat (the notice state is Thread-scoped).
+        if (status === 'blocked' && stillHere) showMidTurnBlock(reason);
         return;
       }
       if (status === 'fallback') {
