@@ -1270,17 +1270,24 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
   }
 }
 
-/** Recovery TOMBSTONES: answerKey → {conversationId, expiresAt}. Recorded whenever a
- *  raced-answer handoff/claimant is dropped with NO viable successor (ordinary
- *  completion, non-Mastra takeover, dead bound successor). Keeps the
- *  answerKey→conversation association alive through the handoff TTL so a LATE-arriving
- *  answer (not yet stashed at drop time) can still be routed durably by
+/** Recovery TOMBSTONES: answerKey → {conversationId, expiresAt, cancelGenAtRecord}.
+ *  Recorded whenever a raced-answer handoff/claimant is dropped with NO viable
+ *  successor (ordinary completion, non-Mastra takeover, dead bound successor) AND
+ *  the answer hasn't arrived yet. Keeps the answerKey→conversation association alive
+ *  through the handoff TTL so a LATE-arriving answer can still be routed durably by
  *  agent:answer-tool-question, instead of being silently orphaned in the bounded
- *  stash under an obsolete id (R87). Bounded FIFO; entries are lazily expired. */
-const recoveryTombstones = new Map<string, { conversationId: string; expiresAt: number }>();
+ *  stash under an obsolete id (R87). Bounded FIFO; lazily expired. The captured
+ *  cancel generation invalidates the tombstone across an explicit Stop, so a stale
+ *  surface answering within the TTL can't start a recovered tool-capable turn after
+ *  the user stopped (R88). */
+const recoveryTombstones = new Map<string, { conversationId: string; expiresAt: number; cancelGenAtRecord: number }>();
 const MAX_RECOVERY_TOMBSTONES = 400;
 function recordRecoveryTombstone(conversationId: string, answerKey: string): void {
-  recoveryTombstones.set(answerKey, { conversationId, expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS });
+  recoveryTombstones.set(answerKey, {
+    conversationId,
+    expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+    cancelGenAtRecord: explicitCancelGeneration.get(conversationId) ?? 0,
+  });
   while (recoveryTombstones.size > MAX_RECOVERY_TOMBSTONES) {
     const oldest = recoveryTombstones.keys().next().value as string | undefined;
     if (oldest === undefined) break;
@@ -1288,11 +1295,13 @@ function recordRecoveryTombstone(conversationId: string, answerKey: string): voi
   }
 }
 /** The still-valid tombstone conversation for a key, or undefined (also purges an
- *  expired entry). */
+ *  expired / Stop-invalidated entry). Invalid when the TTL passed OR an explicit
+ *  cancel (Stop) bumped the conversation's generation since the tombstone was
+ *  recorded — a stale answer must not resurrect a stopped turn. */
 function recoveryTombstoneConversation(answerKey: string): string | undefined {
   const t = recoveryTombstones.get(answerKey);
   if (!t) return undefined;
-  if (Date.now() > t.expiresAt) {
+  if (Date.now() > t.expiresAt || (explicitCancelGeneration.get(t.conversationId) ?? 0) !== t.cancelGenAtRecord) {
     recoveryTombstones.delete(answerKey);
     return undefined;
   }
@@ -1312,19 +1321,25 @@ function recoveryTombstoneConversation(answerKey: string): string | undefined {
 function recoverOrphanedAnswerKeys(conversationId: string, keys: Iterable<string>): void {
   const deliverer = getRecoveredAnswerDeliverer();
   for (const key of keys) {
-    // Record a TTL-bound tombstone FIRST (even without a deliverer / a not-yet-arrived
-    // answer) so a late answer can be routed durably by agent:answer-tool-question.
-    recordRecoveryTombstone(conversationId, key);
-    if (!deliverer) continue;
     const answer = pendingQuestionAnswers.get(key);
-    if (!answer) continue;
-    void deliverer(conversationId, '', answer)
-      .then((res) => {
-        if (res.delivered) pendingQuestionAnswers.delete(key);
-      })
-      .catch(() => {
-        /* best-effort — the bounded stash copy remains as the last resort */
-      });
+    if (answer && deliverer) {
+      // The answer is ALREADY present — deliver it inline (one-shot) and do NOT
+      // leave a tombstone: a lingering tombstone would let ANOTHER surface submit
+      // the same card during/after delivery and queue a DUPLICATE recovered turn
+      // (R88). Clear any prior tombstone for this key too.
+      recoveryTombstones.delete(key);
+      void deliverer(conversationId, '', answer)
+        .then((res) => {
+          if (res.delivered) pendingQuestionAnswers.delete(key);
+        })
+        .catch(() => {
+          /* best-effort — the bounded stash copy remains as the last resort */
+        });
+    } else {
+      // Answer hasn't arrived (or no deliverer wired) — record a TTL-bound tombstone
+      // so a LATE answer can still be routed durably by agent:answer-tool-question.
+      recordRecoveryTombstone(conversationId, key);
+    }
   }
 }
 
@@ -1365,6 +1380,10 @@ function purgeRacedAnswerForKey(answerKey: string): void {
       racedAnswerHandoffs.delete(conversationId);
     }
   }
+  // Also drop any recovery tombstone for this key: an explicit reject/dismiss means a
+  // late answer from another open surface must NOT be routed through the durable
+  // recovered-answer path within the TTL, overriding the user's rejection (R88).
+  recoveryTombstones.delete(answerKey);
 }
 
 /** Tear down a successor's raced-answer state for this token: clear its claimant
