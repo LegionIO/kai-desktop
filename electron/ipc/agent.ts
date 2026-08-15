@@ -1076,20 +1076,27 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // replacement — DISCARD, so an unrelated later turn can't claim the stale answer.
       const latestIssued = latestIssuedTurnToken.get(conversationId);
       const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== claimant.token;
-      // A delivery that was IN FLIGHT when the claimant was torn down means the answer
-      // is genuinely still owed: a slow policy gate simply hadn't finished delivering
-      // when the successor completed. In that case re-register even on ORDINARY
-      // completion (no live replacement) — the original expiry + cancelGen still bound
-      // it, so a Stop voids it and it ages out; without this the answer is silently
-      // lost. (A normal teardown with no in-flight delivery keeps the strict
-      // supersededByLiveReplacement gate so an unrelated later turn can't claim it.)
-      // COUNTER not boolean: a parallel sibling delivery may still be awaiting its gate.
+      // Re-register the still-owed answer as a pre-successor handoff so a later turn
+      // can pick it up — but ONLY under the SAME conditions as claimant teardown
+      // (dropRacedAnswerClaimantForToken): (a) no explicit cancel (Stop) bumped the
+      // generation, (b) the torn-down token wasn't a TERMINAL abort, and (c) a LIVE
+      // replacement actually superseded it (latestIssuedTurnToken advanced past it).
+      //
+      // We must NOT register on ORDINARY completion (this token is still the latest
+      // issued — NO replacement), even when a delivery was in flight: with
+      // sourceToken === latestIssued, registerRacedAnswerHandoff would leave
+      // expectedSuccessorToken UNDEFINED (unbound), and any unrelated turn started
+      // within the 30s TTL could then claim + receive this stale answer (the R76
+      // misdelivery). The answer stays in the bounded stash (re-stashed above) and
+      // ages out; a genuine future successor recovers it via its own claim path.
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
         !terminalAbortTokens.has(claimant.token) &&
-        (supersededByLiveReplacement || (state.deliveryInFlightCount ?? 0) > 0)
+        supersededByLiveReplacement
       ) {
         // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
+        // sourceToken = claimant.token (≠ latestIssued here), so the handoff is bound
+        // to the live replacement — never unbound.
         registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
         // If a replacement claimant is ALREADY live (it passed its claim site before
         // this teardown), MERGE the requeued key into it + deliver, so the answer
@@ -1153,11 +1160,16 @@ function conversationForRacedAnswerKey(answerKey: string): string | undefined {
 /** Purge a specific answerKey from any pending handoff / live claimant (used when
  *  the user explicitly rejects/dismisses the question AFTER its turn aborted +
  *  registered a handoff — a delayed answer from another surface must then NOT be
- *  delivered). Drops the whole entry when it holds no other keys. */
+ *  delivered). Drops an emptied handoff. For a LIVE claimant, drops it only when it
+ *  no longer owns the active stream: a claimant that STILL owns its run must survive
+ *  empty (its run is ongoing and another parallel ask_user call may register a late
+ *  successor-bound handoff that needs a live claimant to merge into — deleting it
+ *  here would strand that answer). It is torn down on the run's teardown. */
 function purgeRacedAnswerForKey(answerKey: string): void {
   for (const [conversationId, c] of liveRacedAnswerClaimant) {
     if (c.state.answerKeys.delete(answerKey) && c.state.answerKeys.size === 0) {
-      liveRacedAnswerClaimant.delete(conversationId);
+      const stillOwnsRun = activeStreams.get(conversationId)?.token === c.token;
+      if (!stillOwnsRun) liveRacedAnswerClaimant.delete(conversationId);
     }
   }
   for (const [conversationId, h] of racedAnswerHandoffs) {
@@ -6823,6 +6835,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         persistedCreatedAt = persistedNode?.createdAt ?? persistedCreatedAt;
       }
 
+      // Record this inject's node ids as THIS run's own lineage IMMEDIATELY (not only
+      // at inject-consumed). A first accepted GUI inject advances the disk head to its
+      // (just-persisted) user node; a SECOND overlapping mid-turn send whose slow
+      // policy hook then resolves would otherwise walk from that head to headBeforeGate
+      // WITHOUT crossing a recorded lineage id and wrongly classify it a branch switch
+      // (forcing a superseding send that aborts the healthy Mastra turn instead of
+      // batching both injects). Record both the queue id and the persisted id (they can
+      // differ if the append reassigned) plus their `-cont` continuations.
+      if (activeToken !== undefined) {
+        recordInjectBoundaryLineage(conversationId, activeToken, id);
+        if (persistedMessageId !== id) recordInjectBoundaryLineage(conversationId, activeToken, persistedMessageId);
+      }
+
       broadcastStreamEvent({
         conversationId,
         type: 'user-message',
@@ -7171,6 +7196,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // is effectively gone; fall through to the abort+restart path which
             // re-reads + handles a missing conversation cleanly.
           } else {
+            // Record this inject's node ids as THIS run's own lineage immediately, so a
+            // SECOND overlapping mid-turn send whose head advanced to this inject node
+            // isn't misread as a branch switch (see the agent:inject-mid-turn handler).
+            if (activeToken !== undefined) {
+              recordInjectBoundaryLineage(conversationId, activeToken, injectId);
+              if (persistedMeta.messageId !== injectId)
+                recordInjectBoundaryLineage(conversationId, activeToken, persistedMeta.messageId);
+            }
             broadcastStreamEvent({
               conversationId,
               type: 'user-message',
