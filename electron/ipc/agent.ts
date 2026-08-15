@@ -642,6 +642,42 @@ const CONTINUATION_AUTH_MAX = 500; // bound the map (evict oldest) — conversat
 // active token + no record and be wrongly granted, relaunching stale history. Bounded like the auth
 // map; a missing entry (evicted) falls back to the other recency rules.
 const latestIssuedTurnToken = new Map<string, string>();
+// EXPLICIT supersession lineage: maps a superseded predecessor token → the successor
+// token that replaced it (recorded at stream admission when a new turn aborts a live
+// predecessor). Used by the raced-answer rebind path to decide whether a handoff
+// bound to token B may be transferred to the current turn C — ONLY when C is reachable
+// from B by following these edges (C genuinely superseded B). A recency-only check
+// (B older + inactive, C newer) can't distinguish that from B completing and C being
+// an UNRELATED later turn, which would misdeliver B's stale answer to C. Bounded.
+const supersededByToken = new Map<string, string>();
+const MAX_SUPERSEDED_BY_ENTRIES = 400;
+function recordSupersession(predecessorToken: string, successorToken: string): void {
+  if (predecessorToken === successorToken) return;
+  supersededByToken.set(predecessorToken, successorToken);
+  while (supersededByToken.size > MAX_SUPERSEDED_BY_ENTRIES) {
+    const oldest = supersededByToken.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    supersededByToken.delete(oldest);
+  }
+}
+/** True when `candidateSuccessor` is reachable from `boundToken` by following
+ *  recorded supersession edges (boundToken → … → candidateSuccessor) — i.e. the
+ *  candidate genuinely replaced the bound successor through a chain of aborts, not
+ *  merely started later. Cycle-guarded + depth-bounded. */
+function isSupersessionDescendant(boundToken: string, candidateSuccessor: string): boolean {
+  let cur: string | undefined = boundToken;
+  const seen = new Set<string>();
+  let hops = 0;
+  while (cur !== undefined && !seen.has(cur) && hops < MAX_SUPERSEDED_BY_ENTRIES) {
+    const next: string | undefined = supersededByToken.get(cur);
+    if (next === undefined) return false;
+    if (next === candidateSuccessor) return true;
+    seen.add(cur);
+    cur = next;
+    hops += 1;
+  }
+  return false;
+}
 // A grant is abandoned if its holder never launches within this window (crashed/reloaded after
 // authorization but before the continuation started). After it, another client (including the
 // reloaded one with a fresh clientId) may win the SAME turn — so a crash can't wedge continuation.
@@ -1326,25 +1362,21 @@ function registerLiveRacedAnswerClaimant(
   // the handoff in the pre-successor map so the real successor can still claim it,
   // or so it ages out if that successor died (the R27-P2b residual). Do NOT deliver.
   //
-  // EXCEPTION — the bound successor was ITSELF superseded: A bound the answer to B,
-  // but C superseded B before B reached this claim site. C arrives here with a
-  // mismatch, and if we just returned, B's teardown (expectedSuccessorToken === B)
-  // would delete the handoff and orphan the answer. So when the bound token is stale
-  // (no longer the active stream AND older-or-equal to the latest issued) AND THIS
-  // claim comes from the CURRENT active stream, REBIND to this live successor and
-  // proceed — C is the genuine successor now.
+  // EXCEPTION — the bound successor was ITSELF superseded BY THIS TURN's lineage: A
+  // bound the answer to B, but C superseded B before B reached this claim site. C
+  // arrives here with a mismatch, and if we just returned, B's teardown
+  // (expectedSuccessorToken === B) would delete the handoff and orphan the answer.
+  // REBIND to C ONLY when C genuinely superseded B — established by the recorded
+  // supersession lineage (B → … → C), NOT by token recency. A recency-only check
+  // (B inactive + C newer) would also match an UNRELATED later turn C that merely
+  // started within the TTL, misdelivering B's stale answer into it (R81).
   if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== token) {
     const boundToken = handoff.expectedSuccessorToken;
     const activeToken = activeStreams.get(conversationId)?.token;
-    const latestIssued = latestIssuedTurnToken.get(conversationId);
-    const boundSuccessorSuperseded =
-      activeToken !== boundToken &&
-      latestIssued !== undefined &&
-      turnTokenTime(boundToken) <= turnTokenTime(latestIssued) &&
-      turnTokenTime(boundToken) < turnTokenTime(token);
+    const boundSuccessorSuperseded = activeToken !== boundToken && isSupersessionDescendant(boundToken, token);
     const thisIsCurrentActive = activeToken === token;
     if (boundSuccessorSuperseded && thisIsCurrentActive) {
-      handoff.expectedSuccessorToken = token; // rebind to the live successor
+      handoff.expectedSuccessorToken = token; // rebind to the genuine successor in the chain
     } else {
       return;
     }
@@ -1379,18 +1411,15 @@ function mergePendingHandoffIntoLiveClaimant(conversationId: string): void {
   if (!handoff) return;
   // Honor the successor binding: only merge a handoff that this claimant is allowed
   // to claim (unbound, or bound to this claimant's token). EXCEPTION: if the bound
-  // successor was itself superseded (this claimant IS the current active stream and
-  // the bound token is stale/older), rebind to this live claimant — else the answer
-  // would be orphaned when the bound successor's teardown deletes the handoff.
+  // successor was itself superseded BY THIS claimant's lineage (established by the
+  // recorded supersession chain, NOT token recency — see registerLiveRacedAnswerClaimant),
+  // rebind to this live claimant — else the answer would be orphaned when the bound
+  // successor's teardown deletes the handoff. A recency-only check would misdeliver
+  // the stale answer to an unrelated later turn (R81).
   if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== claimant.token) {
     const boundToken = handoff.expectedSuccessorToken;
-    const latestIssued = latestIssuedTurnToken.get(conversationId);
-    const boundSuccessorSuperseded =
-      latestIssued !== undefined &&
-      turnTokenTime(boundToken) <= turnTokenTime(latestIssued) &&
-      turnTokenTime(boundToken) < turnTokenTime(claimant.token);
     // claimant already verified as the active stream above.
-    if (boundSuccessorSuperseded) {
+    if (isSupersessionDescendant(boundToken, claimant.token)) {
       handoff.expectedSuccessorToken = claimant.token;
     } else {
       return;
@@ -2165,6 +2194,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
+    const supersededPredecessorToken = existing?.token;
     if (existing) existing.abort();
     // Did this turn SUPERSEDE a live predecessor? If so, that predecessor may still
     // be awaiting a slow PreToolUse hook on an ask_user call and will register its
@@ -2428,6 +2458,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const oldest = latestIssuedTurnToken.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       latestIssuedTurnToken.delete(oldest);
+    }
+    // Record the EXPLICIT supersession edge (predecessor → this successor) when this
+    // turn aborted a live predecessor. The raced-answer rebind path consults this to
+    // transfer a handoff bound to the predecessor ONLY to a genuine successor in the
+    // chain — never to an unrelated later turn that merely started within the TTL.
+    if (supersededPredecessorToken !== undefined) {
+      recordSupersession(supersededPredecessorToken, streamToken);
     }
 
     // Bind an UNBOUND raced-answer handoff (a plan-mode restart, whose successor
