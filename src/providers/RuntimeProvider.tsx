@@ -3802,7 +3802,18 @@ export function RuntimeProvider({
         const msgText = e.text ?? '';
         if (msgText) {
           const branch = getActiveBranch(acc.messages, acc.headId);
-          const isDuplicate = isDuplicateLastUserMessage(branch, msgText);
+          // Dedup: prefer the AUTHORITATIVE messageId when main supplied one. Two
+          // distinct mid-turn injects with IDENTICAL text carry DIFFERENT persisted
+          // ids — text-only dedup would collapse the second, dropping an accepted
+          // user turn from the branch (main persists + sends both to the model, so
+          // the renderer must keep both). Dedup by id when present: skip only if a
+          // node with THIS id already exists. Fall back to text dedup for events
+          // WITHOUT an authoritative id (a peer GUI/CLI echo of our own submit).
+          const persistedForDedup = e.data as { messageId?: unknown } | undefined;
+          const authoritativeId = typeof persistedForDedup?.messageId === 'string' ? persistedForDedup.messageId : null;
+          const isDuplicate = authoritativeId
+            ? acc.messages.some((m) => m.id === authoritativeId)
+            : isDuplicateLastUserMessage(branch, msgText);
           if (!isDuplicate) {
             // `acc.headId` already points at the live assistant message during
             // streaming, so an incoming user turn (a follow-up injected mid-turn
@@ -3895,11 +3906,12 @@ export function RuntimeProvider({
             (en): en is { id: string } => typeof en?.id === 'string',
           );
           // Filter to ids that actually MATERIALIZED as a node in this accumulator.
-          // Two queued injects with identical post-policy text collapse to ONE node
-          // (the `user-message` text-dedup skips the 2nd), yet the inject-consumed
-          // batch carries BOTH ids — advancing headId to the absent 2nd id would
-          // parent later output on a missing node (branch diverges from disk). Only
-          // reorder/rotate around ids that have a real node here.
+          // With id-based dedup of authoritative injects (above), two identical-text
+          // injects now BOTH materialize (distinct persisted ids), so this no longer
+          // drops a legitimate second turn. It remains a safety net: an id that never
+          // produced a node (e.g. a non-authoritative echo collapsed by text dedup, or
+          // a race) must not become the head — advancing headId to an absent id would
+          // parent later output on a missing node (branch diverges from disk).
           const presentIds = new Set(acc2.messages.map((m) => m.id));
           const entries = rawEntries.filter((en) => presentIds.has(en.id));
           // ORDERING REPAIR (batch-aware) for the "inject(s) broadcast before the
