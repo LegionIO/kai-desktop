@@ -123,7 +123,50 @@ export async function deliverRecoveredAnswer(
       });
       return { delivered: true };
     } catch {
-      // fall through to the durable Alert fallback
+      // fall through to the durable Alert fallback — but first determine whether the
+      // failure was BEFORE or AFTER the user turn was committed to the branch.
+      // resumeConversationWithMessage persists the labeled user turn EARLY, then
+      // streams; a throw AFTER commit (generation/finalization failure) means the
+      // answer is ALREADY on-branch, so telling the user to re-send would DUPLICATE
+      // it (and repeat tool side effects). Detect the committed turn on disk and word
+      // the fallback accordingly (R90).
+      try {
+        const after = readConversation(deps.appHome, conversationId);
+        const committed =
+          !!after &&
+          Array.isArray((after as { messages?: Array<{ role?: unknown; content?: unknown }> }).messages) &&
+          (after as { messages: Array<{ role?: unknown; content?: unknown }> }).messages.some(
+            (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(`[Answering your earlier question`),
+          );
+        if (committed) {
+          // The answer IS on-branch; only the response generation failed. Do NOT invite
+          // a resend (it would duplicate). Surface an informational alert instead.
+          try {
+            const alert = createAlert(deps.appHome, {
+              kind: 'fyi',
+              title: `Answer applied, response incomplete: ${title}`,
+              body: `Your answer was recorded on the conversation, but generating the response failed. Continue in the conversation — do NOT re-send (that would duplicate it):\n${body}`,
+              conversationId,
+            });
+            notifyNewAlert(alert);
+            traceDiagnostic({
+              scope: 'alert',
+              event: 'recovered-answer.committed-response-failed',
+              correlationId,
+              conversationId,
+              alertId: alert.id,
+              fields: { answerCount: Object.keys(clean).length },
+            });
+          } catch {
+            /* best-effort */
+          }
+          // Committed = the answer reached the branch; report delivered so the caller
+          // consumes the stash and doesn't ALSO route it elsewhere.
+          return { delivered: true };
+        }
+      } catch {
+        /* fall through to the pre-commit "re-send" fallback below */
+      }
     }
   }
   // Durable fallback: raise a persistent `fyi` Alert that RECORDS the answer the

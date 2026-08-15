@@ -2589,9 +2589,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // reparent the first inject onto the prompt's parent, chain the rest in
             // FIFO order, then reparent the prompt onto the last inject. Head stays
             // at the (unchanged-id) superseding prompt so it remains the request.
-            const promptParent = headNode.parentId;
-            if (typeof promptParent === 'string' && promptParent) {
-              let chainTail = promptParent;
+            // The prompt's parent may be NULL — an edit of the FIRST user message is a
+            // root; then the first inject becomes the new root (parentId null) so the
+            // accepted inject isn't left hidden off-branch (R90).
+            const promptParent = headNode.parentId ?? null;
+            {
+              let chainTail: string | null = promptParent;
               let spliced = true;
               for (const entry of offBranch) {
                 const r = reparentConversationMessage(appHome, conversationId, entry.id, chainTail);
@@ -2601,7 +2604,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 }
                 chainTail = entry.id;
               }
-              if (spliced) {
+              if (spliced && chainTail) {
                 const r = reparentConversationMessage(appHome, conversationId, headNode.id, chainTail, {
                   makeHead: true,
                 });

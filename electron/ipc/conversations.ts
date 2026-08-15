@@ -503,19 +503,22 @@ export function reparentConversationMessage(
   appHome: string,
   conversationId: string,
   messageId: string,
-  newParentId: string,
+  newParentId: string | null,
   options: { makeHead?: boolean } = {},
 ): ConversationRecord | null {
-  if (!messageId || !newParentId || messageId === newParentId) return null;
+  // newParentId === null makes `messageId` a ROOT (parentId null) — used when the
+  // node it's being spliced before is itself a root (e.g. an edit of the first user
+  // message). messageId must still be non-empty and not self-parent.
+  if (!messageId || messageId === newParentId) return null;
   const conv = readConversation(appHome, conversationId);
   if (!conv) return null;
   const { tree, headId } = ensureConversationTree(conv);
   const node = tree.find((m) => m.id === messageId);
-  const newParent = tree.find((m) => m.id === newParentId);
-  if (!node || !newParent) return null;
+  const newParent = newParentId === null ? null : tree.find((m) => m.id === newParentId);
+  if (!node || (newParentId !== null && !newParent)) return null;
   const alreadyParented = node.parentId === newParentId;
   // Cycle guard: walk up from newParentId; if we reach messageId, reparenting
-  // would form a loop. Bounded by tree size.
+  // would form a loop. Bounded by tree size. (A null parent — root — can't cycle.)
   const byId = new Map(tree.map((m) => [m.id, m] as const));
   let cursor: string | null = newParentId;
   const seen = new Set<string>();
