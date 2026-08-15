@@ -835,12 +835,13 @@ type RacedAnswerState = {
    *  here) — then the claim stays permissive (any next turn may carry it). */
   expectedSuccessorToken?: string;
   expiresAt: number;
-  /** True while an async `deliver()` (which awaits the pre-send / UserPromptSubmit
-   *  policy gate) is in flight. If the successor turn completes ORDINARILY during
-   *  that await, the answer is genuinely still owed — so onFailure re-registers the
-   *  handoff even without a live replacement (an ordinary completion would otherwise
-   *  discard it, losing an answer that a slow gate simply hadn't finished delivering). */
-  deliveryInFlight?: boolean;
+  /** Count of async `deliver()` calls (each awaits the pre-send / UserPromptSubmit
+   *  policy gate) currently in flight. A COUNTER, not a boolean: parallel ask_user
+   *  answers deliver concurrently, and the first to settle must not clear the flag
+   *  while another is still awaiting its gate. onFailure re-registers the handoff on
+   *  ORDINARY completion only while a delivery is in flight (>0) — the answer a slow
+   *  gate hadn't finished delivering is genuinely still owed. */
+  deliveryInFlightCount?: number;
 };
 // PRE-successor holding map: keys registered by an aborting gate before the
 // successor turn starts. Transferred into a claimant on successor start.
@@ -982,10 +983,11 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // it, so a Stop voids it and it ages out; without this the answer is silently
       // lost. (A normal teardown with no in-flight delivery keeps the strict
       // supersededByLiveReplacement gate so an unrelated later turn can't claim it.)
+      // COUNTER not boolean: a parallel sibling delivery may still be awaiting its gate.
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
         !terminalAbortTokens.has(claimant.token) &&
-        (supersededByLiveReplacement || state.deliveryInFlight)
+        (supersededByLiveReplacement || (state.deliveryInFlightCount ?? 0) > 0)
       ) {
         // Carry the ORIGINAL expiry forward so repeated teardowns can't renew the TTL.
         registerRacedAnswerHandoff(conversationId, answerKey, state.cancelGenAtAbort, claimant.token, state.expiresAt);
@@ -1003,22 +1005,23 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     const onTerminal = (): void => {
       purgeRacedAnswerForKey(answerKey);
     };
-    // Mark the delivery in-flight so a claimant teardown DURING the (async policy
-    // gate) delivery re-registers the handoff even on ordinary completion (see
-    // onFailure) — the answer is genuinely still owed. Cleared when deliver settles.
-    state.deliveryInFlight = true;
+    // Mark the delivery in-flight (COUNTER — parallel sibling answers each track
+    // their own) so a claimant teardown DURING the (async policy gate) delivery
+    // re-registers the handoff even on ordinary completion (see onFailure) — the
+    // answer is genuinely still owed. Decremented when this deliver settles.
+    state.deliveryInFlightCount = (state.deliveryInFlightCount ?? 0) + 1;
     void claimant
       .deliver(text)
       .then((res) => {
-        // Run the failure handler BEFORE clearing deliveryInFlight: onFailure reads
-        // that flag to decide whether to re-register the handoff on an ordinary
-        // completion (see above). Clearing it first would make onFailure see `false`
-        // and drop the answer — the very bug this flag exists to prevent.
+        // Run the failure handler BEFORE decrementing the in-flight count: onFailure
+        // reads it (>0) to decide whether to re-register the handoff on an ordinary
+        // completion (see above). Decrementing first could drop it to 0 and make
+        // onFailure see "not in flight" — the very bug this counter exists to prevent.
         if (!res.ok) {
           if (res.terminal) onTerminal();
           else onFailure();
         }
-        state.deliveryInFlight = false;
+        state.deliveryInFlightCount = Math.max(0, (state.deliveryInFlightCount ?? 1) - 1);
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-claimed',
@@ -1030,7 +1033,7 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       })
       .catch(() => {
         onFailure();
-        state.deliveryInFlight = false;
+        state.deliveryInFlightCount = Math.max(0, (state.deliveryInFlightCount ?? 1) - 1);
       });
   }
 }
