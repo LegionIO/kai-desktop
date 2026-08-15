@@ -618,10 +618,15 @@ function recordIssuedTurnToken(token: string): void {
 // Recency of a turn token: prefer its monotonic ordinal (immune to clock jumps); fall back to the
 // wall-clock `${Date.now()}-…` prefix for a token not issued this session (e.g. a cross-session /
 // pre-restart token, which can't race a live turn anyway). Ordinals are offset above any plausible
-// ms epoch so an ordinal always outranks a wall-clock fallback (a live-session turn is newest).
+// ms epoch (ORDINAL_RECENCY_BASE ≫ Date.now(), which is ~1.7e12 and grows ~3e10/yr) so an ordinal
+// always outranks a wall-clock fallback (a live-session turn is newest) — while `base + ord` stays
+// comfortably within Number.MAX_SAFE_INTEGER (~9e15) for any realistic ordinal count, unlike the
+// old `MAX_SAFE_INTEGER - TURN_ORDINAL_MAX + ord`, which overflowed once ord exceeded the reserved
+// window (2000 stream starts) and rounded adjacent ordinals to equal values.
+const ORDINAL_RECENCY_BASE = 1e15;
 function turnTokenTime(token: string): number {
   const ord = turnOrdinalByToken.get(token);
-  if (ord !== undefined) return Number.MAX_SAFE_INTEGER - TURN_ORDINAL_MAX + ord;
+  if (ord !== undefined) return ORDINAL_RECENCY_BASE + ord;
   const dash = token.indexOf('-');
   const n = Number.parseInt(dash > 0 ? token.slice(0, dash) : token, 10);
   return Number.isFinite(n) ? n : 0;
@@ -1005,11 +1010,15 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     void claimant
       .deliver(text)
       .then((res) => {
-        state.deliveryInFlight = false;
+        // Run the failure handler BEFORE clearing deliveryInFlight: onFailure reads
+        // that flag to decide whether to re-register the handoff on an ordinary
+        // completion (see above). Clearing it first would make onFailure see `false`
+        // and drop the answer — the very bug this flag exists to prevent.
         if (!res.ok) {
           if (res.terminal) onTerminal();
           else onFailure();
         }
+        state.deliveryInFlight = false;
         traceDiagnostic({
           scope: 'agent',
           event: 'question.answer-handoff-claimed',
@@ -1020,8 +1029,8 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
         });
       })
       .catch(() => {
-        state.deliveryInFlight = false;
         onFailure();
+        state.deliveryInFlight = false;
       });
   }
 }
