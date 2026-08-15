@@ -5713,21 +5713,55 @@ export function RuntimeProvider({
       const liveAcc = streamAccumulators.get(convId);
       let baseTree: StoredMessage[] = liveAcc ? liveAcc.messages : tree;
       let baseHead: string | null = liveAcc ? liveAcc.headId : headId;
-      // A FORCE-NORMAL-SEND fallback (the composer's sendMidTurn reported the branch
-      // changed during the async gate) must NOT base the new turn on the still-live
-      // accumulator's OLD head — that would re-anchor the conversation on the abandoned
-      // branch. Reload the AUTHORITATIVE (newly-selected) disk branch so the superseding
-      // turn lands where the user is now, not where the aborted run was.
+      // A FORCE-NORMAL-SEND fallback (the composer's sendMidTurn reported the run
+      // wasn't cooperatively injectable — a CLI runtime, a run that ended during the
+      // policy gate, OR a genuine branch switch) must NOT blindly re-anchor on disk:
+      // renderer persistence is debounced, so disk can LAG the live/finalized
+      // accumulator. Reload disk, but only ADOPT the disk branch when it genuinely
+      // DIVERGES from the freshest in-memory branch (a real branch switch — the user
+      // selected a different lineage during the async gate). When disk is merely an
+      // older snapshot of the SAME branch (the live head descends from / is the disk
+      // head, or the disk head is still on the live branch), keep the fresher
+      // live/finalized tree so recent assistant output stays on-branch + in context.
       if (forceNormalSend) {
+        // First, prefer the FINALIZED snapshot over a bare live/closure tree when the
+        // run finalized during the await (same rationale as the non-force path below).
+        if (!liveAcc && wasRunningAtEntry) {
+          const finalized = lastFinalizedBranch.get(convId);
+          if (finalized && finalized.messages.length >= baseTree.length) {
+            baseTree = finalized.messages;
+            baseHead = finalized.headId;
+          }
+        }
         try {
           const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
           if (fresh) {
             const { tree: ft, headId: fh } = ensureTree(fresh);
-            baseTree = ft;
-            baseHead = fh;
+            const diskIds = new Set(ft.map((m) => m.id));
+            const liveBranchHasDiskHead = fh != null && getActiveBranch(baseTree, baseHead).some((m) => m.id === fh);
+            const diskHasLiveHead = baseHead != null && diskIds.has(baseHead);
+            // Genuine divergence: the live head is NOT anywhere on disk AND the disk
+            // head is NOT on the live branch — the two heads are on different lineages,
+            // so the user switched branches. Adopt disk. Otherwise keep the fresher
+            // in-memory tree (disk is just a debounced-older view of the same branch).
+            const branchDiverged = baseHead != null && !diskIds.has(baseHead) && !liveBranchHasDiskHead;
+            // Also adopt disk if the live tree is empty/degenerate (nothing to preserve)
+            // or disk strictly contains the live head yet is longer on that lineage.
+            const liveDegenerate = baseTree.length === 0;
+            if (branchDiverged || liveDegenerate) {
+              baseTree = ft;
+              baseHead = fh;
+            } else if (diskHasLiveHead && ft.length > baseTree.length) {
+              // Same branch, disk has MORE nodes than the live snapshot (a concurrent
+              // writer appended) — take disk so nothing is lost, but only when it still
+              // contains our live head (so it's the same lineage, not a switch).
+              baseTree = ft;
+              baseHead = fh;
+            }
+            // else: keep the fresher live/finalized baseTree/baseHead.
           }
         } catch {
-          /* disk read failed — fall back to the (stale) accumulator/closure tree */
+          /* disk read failed — fall back to the (fresher) accumulator/closure tree */
         }
       }
       if (!forceNormalSend && !liveAcc && wasRunningAtEntry) {

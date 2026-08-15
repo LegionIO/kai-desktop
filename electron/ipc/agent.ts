@@ -1236,10 +1236,23 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
  *  predecessor being superseded by THIS run whose async teardown will re-register
  *  a handoff shortly — register with EMPTY keys so that late handoff can merge in
  *  (mergePendingHandoffIntoLiveClaimant). No-op if neither condition holds. */
+/** Register the current Mastra turn as the live claimant: TRANSFER the pending
+ *  handoff keys into a token-scoped claimant record, then attempt delivery (the
+ *  answer may already be stashed). When there's no pending handoff YET but a prior
+ *  (different-token) claimant still owns this conversation's raced state — a
+ *  predecessor being superseded by THIS run whose async teardown will re-register
+ *  a handoff shortly — register with EMPTY keys so that late handoff can merge in
+ *  (mergePendingHandoffIntoLiveClaimant). `forceEmpty` ALSO registers an empty
+ *  claimant when there is neither a handoff nor a prior claimant: used when THIS
+ *  run superseded a live predecessor that may still be awaiting a slow ask_user
+ *  PreToolUse hook and will register its (successor-bound) handoff only AFTER this
+ *  claim site — the empty claimant gives that late handoff a live target to merge
+ *  into. No-op otherwise. */
 function registerLiveRacedAnswerClaimant(
   conversationId: string,
   token: string,
   deliver: (text: string) => Promise<RacedDeliverResult>,
+  opts?: { forceEmpty?: boolean },
 ): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
   if (!handoff) {
@@ -1265,6 +1278,26 @@ function registerLiveRacedAnswerClaimant(
       if (!racedStateInvalid(liveRacedAnswerClaimant.get(conversationId)!.state, conversationId)) {
         attemptRacedAnswerDelivery(conversationId);
       }
+      return;
+    }
+    // No handoff AND no prior claimant. Register an EMPTY claimant only when asked
+    // (forceEmpty): this run superseded a live predecessor whose still-pending
+    // ask_user hook may register a successor-bound handoff after this point. The
+    // empty claimant carries no keys (delivers nothing now) and is torn down on
+    // teardown; it exists purely so mergePendingHandoffIntoLiveClaimant / answer
+    // arrival has a live target when that late handoff lands.
+    if (opts?.forceEmpty && !prior) {
+      liveRacedAnswerClaimant.set(conversationId, {
+        token,
+        deliver,
+        state: {
+          answerKeys: new Set<string>(),
+          cancelGenAtAbort: explicitCancelGeneration.get(conversationId) ?? 0,
+          sourceToken: token,
+          deliveryRetries: 0,
+          expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
+        },
+      });
     }
     return;
   }
@@ -2077,6 +2110,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     if (existing) existing.abort();
+    // Did this turn SUPERSEDE a live predecessor? If so, that predecessor may still
+    // be awaiting a slow PreToolUse hook on an ask_user call and will register its
+    // raced-answer handoff (bound to THIS successor) only AFTER we pass the claimant
+    // registration below. We must register an (empty) claimant now so that late
+    // handoff has something to merge into — see the claim site + finding note there.
+    const supersededLivePredecessor = Boolean(existing);
     // A live GUI persistence FALLBACK for the PRIOR turn is about to be discarded by this new turn.
     // If main still holds the authoritative full copy and it hasn't been superseded on disk, FLUSH
     // it first — else the prior turn's complete reply is lost (e.g. a sole renderer reloaded after
@@ -2770,11 +2809,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Register when EITHER a pending handoff exists now, OR a prior claimant still
     // owns this conversation's raced state (a predecessor B being superseded by
     // THIS run C, whose async teardown may re-register a handoff AFTER we pass this
-    // point — see dropRacedAnswerClaimantForToken). Registering C now (even with no
-    // keys yet) lets that late handoff merge into C instead of sitting until TTL.
+    // point — see dropRacedAnswerClaimantForToken), OR this run SUPERSEDED a live
+    // predecessor that may still be awaiting a slow ask_user PreToolUse hook and
+    // will register its (successor-bound) handoff only AFTER this point — neither
+    // map is populated yet in that window, so without an empty claimant here the
+    // late handoff would have nothing to merge into and the answer would be lost.
+    // Registering C now (even with no keys yet) lets that late handoff merge into C
+    // instead of sitting until TTL.
     if (
       activeStreams.get(conversationId)?.token === streamToken &&
-      (racedAnswerHandoffs.has(conversationId) || liveRacedAnswerClaimant.has(conversationId))
+      (racedAnswerHandoffs.has(conversationId) ||
+        liveRacedAnswerClaimant.has(conversationId) ||
+        supersededLivePredecessor)
     ) {
       if (runtime.id === 'mastra') {
         // A plugin INFERENCE PROVIDER resolves as runtime.id === 'mastra' but its
@@ -2821,26 +2867,35 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (pending && pending.expectedSuccessorToken === undefined) {
             pending.expectedSuccessorToken = streamToken;
           }
-          registerLiveRacedAnswerClaimant(conversationId, streamToken, async (text) => {
-            const reinject = injectUserTurnAndRestart;
-            if (!reinject) return { ok: false };
-            try {
-              // COOPERATIVE-ONLY: a stale ask_user answer must splice into THIS live
-              // successor or fail — never abort a newer run / restart after Stop. Bind
-              // to streamToken so a supersession during the async policy gate fails
-              // (transient) rather than misdelivering.
-              const res = await reinject(conversationId, text, {
-                cooperativeOnly: true,
-                expectedToken: streamToken,
-              });
-              if (res?.ok && res.injectedCooperatively) return { ok: true };
-              // A policy block is permanent for this content — don't retry it.
-              // notCooperative (ownership changed / not injectable) is transient.
-              return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
-            } catch {
-              return { ok: false };
-            }
-          });
+          registerLiveRacedAnswerClaimant(
+            conversationId,
+            streamToken,
+            async (text) => {
+              const reinject = injectUserTurnAndRestart;
+              if (!reinject) return { ok: false };
+              try {
+                // COOPERATIVE-ONLY: a stale ask_user answer must splice into THIS live
+                // successor or fail — never abort a newer run / restart after Stop. Bind
+                // to streamToken so a supersession during the async policy gate fails
+                // (transient) rather than misdelivering.
+                const res = await reinject(conversationId, text, {
+                  cooperativeOnly: true,
+                  expectedToken: streamToken,
+                });
+                if (res?.ok && res.injectedCooperatively) return { ok: true };
+                // A policy block is permanent for this content — don't retry it.
+                // notCooperative (ownership changed / not injectable) is transient.
+                return { ok: false, terminal: Boolean(res?.blockedByPolicy) };
+              } catch {
+                return { ok: false };
+              }
+              // forceEmpty: even with no handoff/prior claimant yet, register an
+              // empty claimant when this run superseded a live predecessor — its
+              // still-pending ask_user hook may register a successor-bound handoff
+              // after this point, which then merges here instead of being lost.
+            },
+            { forceEmpty: supersededLivePredecessor },
+          );
         }
       } else {
         // Non-Mastra successor can't cooperatively inject — invalidate the handoff
