@@ -1303,11 +1303,32 @@ function registerLiveRacedAnswerClaimant(
   }
   // If the handoff is BOUND to a specific successor token (a supersession whose
   // successor was already issued at abort time), only that exact successor may
-  // transfer it. A mismatch means this is an unrelated later turn — leave the
-  // handoff in the pre-successor map so the real successor can still claim it, or
-  // so it ages out if that successor died (the R27-P2b residual). Do NOT deliver.
+  // transfer it. A mismatch normally means this is an unrelated later turn — leave
+  // the handoff in the pre-successor map so the real successor can still claim it,
+  // or so it ages out if that successor died (the R27-P2b residual). Do NOT deliver.
+  //
+  // EXCEPTION — the bound successor was ITSELF superseded: A bound the answer to B,
+  // but C superseded B before B reached this claim site. C arrives here with a
+  // mismatch, and if we just returned, B's teardown (expectedSuccessorToken === B)
+  // would delete the handoff and orphan the answer. So when the bound token is stale
+  // (no longer the active stream AND older-or-equal to the latest issued) AND THIS
+  // claim comes from the CURRENT active stream, REBIND to this live successor and
+  // proceed — C is the genuine successor now.
   if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== token) {
-    return;
+    const boundToken = handoff.expectedSuccessorToken;
+    const activeToken = activeStreams.get(conversationId)?.token;
+    const latestIssued = latestIssuedTurnToken.get(conversationId);
+    const boundSuccessorSuperseded =
+      activeToken !== boundToken &&
+      latestIssued !== undefined &&
+      turnTokenTime(boundToken) <= turnTokenTime(latestIssued) &&
+      turnTokenTime(boundToken) < turnTokenTime(token);
+    const thisIsCurrentActive = activeToken === token;
+    if (boundSuccessorSuperseded && thisIsCurrentActive) {
+      handoff.expectedSuccessorToken = token; // rebind to the live successor
+    } else {
+      return;
+    }
   }
   racedAnswerHandoffs.delete(conversationId); // transfer out of the pre-successor map
   if (racedStateInvalid(handoff, conversationId)) return; // expired / Stop → drop (answers stay stashed)
@@ -1338,8 +1359,24 @@ function mergePendingHandoffIntoLiveClaimant(conversationId: string): void {
   const handoff = racedAnswerHandoffs.get(conversationId);
   if (!handoff) return;
   // Honor the successor binding: only merge a handoff that this claimant is allowed
-  // to claim (unbound, or bound to this claimant's token).
-  if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== claimant.token) return;
+  // to claim (unbound, or bound to this claimant's token). EXCEPTION: if the bound
+  // successor was itself superseded (this claimant IS the current active stream and
+  // the bound token is stale/older), rebind to this live claimant — else the answer
+  // would be orphaned when the bound successor's teardown deletes the handoff.
+  if (handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken !== claimant.token) {
+    const boundToken = handoff.expectedSuccessorToken;
+    const latestIssued = latestIssuedTurnToken.get(conversationId);
+    const boundSuccessorSuperseded =
+      latestIssued !== undefined &&
+      turnTokenTime(boundToken) <= turnTokenTime(latestIssued) &&
+      turnTokenTime(boundToken) < turnTokenTime(claimant.token);
+    // claimant already verified as the active stream above.
+    if (boundSuccessorSuperseded) {
+      handoff.expectedSuccessorToken = claimant.token;
+    } else {
+      return;
+    }
+  }
   racedAnswerHandoffs.delete(conversationId);
   if (racedStateInvalid(handoff, conversationId)) return;
   for (const key of handoff.answerKeys) claimant.state.answerKeys.add(key);

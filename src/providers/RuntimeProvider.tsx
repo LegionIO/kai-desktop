@@ -5737,24 +5737,33 @@ export function RuntimeProvider({
           const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
           if (fresh) {
             const { tree: ft, headId: fh } = ensureTree(fresh);
-            const diskIds = new Set(ft.map((m) => m.id));
-            const liveBranchHasDiskHead = fh != null && getActiveBranch(baseTree, baseHead).some((m) => m.id === fh);
-            const diskHasLiveHead = baseHead != null && diskIds.has(baseHead);
-            // Genuine divergence: the live head is NOT anywhere on disk AND the disk
-            // head is NOT on the live branch — the two heads are on different lineages,
-            // so the user switched branches. Adopt disk. Otherwise keep the fresher
-            // in-memory tree (disk is just a debounced-older view of the same branch).
-            const branchDiverged = baseHead != null && !diskIds.has(baseHead) && !liveBranchHasDiskHead;
-            // Also adopt disk if the live tree is empty/degenerate (nothing to preserve)
-            // or disk strictly contains the live head yet is longer on that lineage.
+            // Compare ACTIVE ANCESTOR LINEAGES, not whole-tree membership. Inactive
+            // variants stay in the tree, so `ft` still contains the live head even
+            // after the user selected a SIBLING branch — a whole-tree membership test
+            // would miss that switch and append onto the abandoned lineage. The disk's
+            // active branch (walked from `fh`) is the user's CURRENTLY-selected
+            // lineage; the live branch (from `baseHead`) is where the aborted run was.
+            const diskActiveIds = new Set(getActiveBranch(ft, fh).map((m) => m.id));
+            const liveActiveBranch = getActiveBranch(baseTree, baseHead);
+            const liveActiveIds = new Set(liveActiveBranch.map((m) => m.id));
+            // The live head is on the disk's ACTIVE branch → same selected lineage
+            // (disk may just be debounced-older). The disk head is on the live ACTIVE
+            // branch → live is ahead of disk on the same lineage.
+            const liveHeadOnDiskActive = baseHead != null && diskActiveIds.has(baseHead);
+            const diskHeadOnLiveActive = fh != null && liveActiveIds.has(fh);
+            // Genuine branch switch: the live head is NOT on disk's active lineage AND
+            // the disk head is NOT on the live active lineage — different selected
+            // branches. Adopt disk (where the user is now). Otherwise keep the fresher
+            // in-memory tree.
+            const branchDiverged = baseHead != null && !liveHeadOnDiskActive && !diskHeadOnLiveActive;
+            // Adopt disk if the live tree is empty/degenerate (nothing to preserve).
             const liveDegenerate = baseTree.length === 0;
             if (branchDiverged || liveDegenerate) {
               baseTree = ft;
               baseHead = fh;
-            } else if (diskHasLiveHead && ft.length > baseTree.length) {
-              // Same branch, disk has MORE nodes than the live snapshot (a concurrent
-              // writer appended) — take disk so nothing is lost, but only when it still
-              // contains our live head (so it's the same lineage, not a switch).
+            } else if (liveHeadOnDiskActive && diskActiveIds.size > liveActiveIds.size) {
+              // Same selected lineage, but disk's active branch is LONGER than the live
+              // snapshot (a concurrent writer appended) — take disk so nothing is lost.
               baseTree = ft;
               baseHead = fh;
             }
