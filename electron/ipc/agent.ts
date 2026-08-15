@@ -173,6 +173,7 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   activeStreams.delete(conversationId);
   activeStreamModelKeys.delete(conversationId);
   activeStreamRuntime.delete(conversationId);
+  activeStreamResponseIds.delete(conversationId);
   activeObserverSessions.delete(conversationId);
   // Per-turn same-turn bookkeeping — clear on terminal cleanup so a one-off chat
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
@@ -417,6 +418,31 @@ const activeStreamRuntime = new Map<
   }
 >();
 
+// Response node ids the CURRENT active run has streamed, token-scoped. Used by
+// injectHeadStillOnBranch to distinguish the run's OWN head advancement (from the
+// pre-inject head down to one of these assistant nodes) from a concurrent
+// sibling-variant selection: a regenerated user node can have MANY assistant
+// variant children, so "current head descends from headBeforeGate" is true for a
+// sibling too. Requiring the descent path to pass through a node THIS run produced
+// rejects the sibling. Cleared on terminal cleanup (token-scoped).
+const activeStreamResponseIds = new Map<string, { token: string; ids: Set<string> }>();
+function recordActiveRunResponseId(conversationId: string, token: string, responseId: string): void {
+  if (activeStreams.get(conversationId)?.token !== token) return;
+  const entry = activeStreamResponseIds.get(conversationId);
+  if (entry && entry.token === token) {
+    entry.ids.add(responseId);
+  } else {
+    activeStreamResponseIds.set(conversationId, { token, ids: new Set([responseId]) });
+  }
+}
+/** The response node ids the CURRENT active run has produced (empty if none/unknown). */
+function getActiveRunResponseIds(conversationId: string): Set<string> {
+  const activeToken = activeStreams.get(conversationId)?.token;
+  if (activeToken === undefined) return new Set();
+  const entry = activeStreamResponseIds.get(conversationId);
+  return entry && entry.token === activeToken ? entry.ids : new Set();
+}
+
 /** The runtime id driving the current active stream for a conversation, if any.
  *  Returns undefined unless a runtime has been recorded FOR THE CURRENT active
  *  token — so a replacement whose runtime hasn't resolved yet reads as unknown
@@ -645,28 +671,47 @@ function turnTokenTime(token: string): number {
 /**
  * True when a conversation's CURRENT disk head is still on the branch a mid-turn
  * inject was composed against — i.e. the head is `headBeforeGate` itself OR a
- * DESCENDANT of it. A cooperative inject captures the head before its async policy
- * gate; during that await the SAME live run's debounced partial persist legitimately
- * advances the head from the user node to its assistant node (or a later step), which
- * is NOT a branch switch. Exact-equality would misread that same-run advancement as a
+ * DESCENDANT of it REACHED THROUGH ONE OF THE ACTIVE RUN'S OWN RESPONSE NODES. A
+ * cooperative inject captures the head before its async policy gate; during that
+ * await the SAME live run's debounced partial persist legitimately advances the
+ * head from the user node to its assistant node (or a later step), which is NOT a
+ * branch switch. Exact-equality would misread that same-run advancement as a
  * rewind/variant-switch and wrongly fall back to a superseding send (cancelling the
- * live run's in-flight tools). Only a head that does NOT descend from headBeforeGate
- * (a genuine rewind / sibling-variant selection) means the branch changed.
+ * live run's in-flight tools).
+ *
+ * A plain descendant check is too loose: `headBeforeGate` may be a REGENERATED user
+ * node with several assistant variant CHILDREN, so if another client selects a
+ * sibling variant during the gate await, that sibling also descends from
+ * headBeforeGate — but the running turn is on a DIFFERENT child. We therefore accept
+ * a descendant ONLY when the path from the current head up to headBeforeGate passes
+ * through a node THIS run produced (`runResponseIds`), which the sibling's lineage
+ * does not. When the run has produced no response node yet (head hasn't advanced
+ * past headBeforeGate), only exact equality is "on branch".
  * headBeforeGate === null (no prior head) → any current head is "on branch".
  */
-function injectHeadStillOnBranch(appHome: string, conversationId: string, headBeforeGate: string | null): boolean {
+function injectHeadStillOnBranch(
+  appHome: string,
+  conversationId: string,
+  headBeforeGate: string | null,
+  runResponseIds: Set<string>,
+): boolean {
   if (headBeforeGate === null) return true;
   const conv = readConversation(appHome, conversationId);
   if (!conv) return false;
   const { tree, headId } = ensureConversationTree(conv);
   if (headId === headBeforeGate) return true;
-  // Walk up from the current head; if we reach headBeforeGate it's a descendant
-  // (same-branch advancement). Bounded + cycle-guarded by the tree size.
+  // Walk up from the current head toward headBeforeGate. Same-branch advancement is
+  // ONLY confirmed if we reach headBeforeGate AND crossed one of this run's own
+  // response nodes on the way — a sibling variant selected concurrently reaches
+  // headBeforeGate too, but never through a node this run produced. Bounded +
+  // cycle-guarded by the tree size.
   const byId = new Map(tree.map((m) => [m.id, m] as const));
   let cur: string | null = headId;
   const seen = new Set<string>();
+  let crossedOwnResponse = false;
   while (cur && !seen.has(cur)) {
-    if (cur === headBeforeGate) return true;
+    if (runResponseIds.has(cur)) crossedOwnResponse = true;
+    if (cur === headBeforeGate) return crossedOwnResponse;
     seen.add(cur);
     cur = byId.get(cur)?.parentId ?? null;
   }
@@ -5387,6 +5432,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // stays stashed under `streamId`; the actual successor claims it
                 // (see registerRacedAnswerHandoff + the claim in streamHandler).
                 registerRacedAnswerHandoff(conversationId, streamId, cancelGenAtAbort, streamToken);
+                // A successor may have ALREADY started and passed its sole claim
+                // site (registerLiveRacedAnswerClaimant) before this gate — one of a
+                // turn's PARALLEL ask_user calls whose slow PreToolUse hook only just
+                // resolved — registered its handoff. That successor transferred the
+                // EARLIER-registered handoff into its live claimant and emptied the
+                // pre-successor map, so this key would sit unclaimed there: answer
+                // arrival scans the live claimant, and the successor's teardown drops
+                // this entry, losing the answer. Merge it into the live claimant NOW
+                // (no-op if there's no live+owning claimant, honoring the same
+                // successor-token binding as the claim site).
+                mergePendingHandoffIntoLiveClaimant(conversationId);
                 traceDiagnostic({
                   scope: 'agent',
                   event: 'question.answer-handoff-registered',
@@ -5666,6 +5722,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               event.responseMessageId
             ) {
               latestReplyResponseId = event.responseMessageId;
+              // Record this run's OWN response node id (token-scoped) so a
+              // concurrent mid-turn inject can tell the run's own head advancement
+              // apart from a sibling-variant selection under the same pre-inject
+              // user node (see injectHeadStillOnBranch).
+              recordActiveRunResponseId(conversationId, streamToken, event.responseMessageId);
             }
             // After a plan-related done event has been sent and the stream aborted,
             // ignore any trailing events (especially the generator's final plain done).
@@ -6593,7 +6654,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const runOwnershipIntact =
         activeStreams.get(conversationId)?.token === tokenBeforeGate &&
         getActiveStreamRuntime(conversationId) === 'mastra' &&
-        injectHeadStillOnBranch(appHome, conversationId, headBeforeGate);
+        injectHeadStillOnBranch(appHome, conversationId, headBeforeGate, getActiveRunResponseIds(conversationId));
       if (!gate.allowed) {
         return gate.terminal && runOwnershipIntact
           ? { ok: false, blocked: true, error: gate.reason ?? 'blocked-by-policy' }
@@ -6909,7 +6970,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
           getActiveStreamRuntime(conversationId) !== 'mastra' ||
           (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken) ||
-          !injectHeadStillOnBranch(appHome, conversationId, headBeforeGate);
+          !injectHeadStillOnBranch(appHome, conversationId, headBeforeGate, getActiveRunResponseIds(conversationId));
         let gateForcedFallthrough = false;
         if (!gate.allowed) {
           // A terminal block is only truly terminal if we STILL own the run it was
@@ -7379,6 +7440,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // WE still owned the token (don't clobber a replacement run's fresh entry).
       if (stillOwnedAtCancel && activeStreamRuntime.get(conversationId)?.token === controller.token) {
         activeStreamRuntime.delete(conversationId);
+      }
+      if (stillOwnedAtCancel && activeStreamResponseIds.get(conversationId)?.token === controller.token) {
+        activeStreamResponseIds.delete(conversationId);
       }
     }
     activeObserverSessions.delete(conversationId);
