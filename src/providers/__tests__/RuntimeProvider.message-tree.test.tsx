@@ -497,10 +497,12 @@ describe('reorderPrefixBeforeInjectedUser — inject broadcast before the prefix
       { id: 'asst-ok', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
     ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
     const out = reorderPrefixBeforeInjectedUser(messages, 'asst-ok', 'user-inject');
-    // The head-lineage variant (asst-ok) is threaded before the user; failed one untouched.
+    // The head-lineage variant (asst-ok) is threaded before the user; the failed
+    // sibling is ALSO moved back to the pre-inject head (a sibling of the active
+    // one), NOT left under the injected user where it'd group with the continuation.
     expect(out.messages.find((m) => m.id === 'asst-ok')?.parentId).toBe('user-1');
     expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('asst-ok');
-    expect(out.messages.find((m) => m.id === 'asst-failed')?.parentId).toBe('user-inject');
+    expect(out.messages.find((m) => m.id === 'asst-failed')?.parentId).toBe('user-1');
     expect(out.headId).toBe('user-inject');
   });
 });
@@ -804,5 +806,36 @@ describe('preserveErroredAssistantVariant — mid-stream fallback keeps the part
     const a = acc(messages, 'u1');
     expect(preserveErroredAssistantVariant(a, 'err')).toBe(false);
     expect(a.headId).toBe('u1'); // unchanged
+  });
+
+  it('closes the inject-continuation boundary when it seals the continuation node', () => {
+    // A POST-content transient fallback within a cooperative-inject continuation: the
+    // continuation node (user-inject-cont) has content, then errors. Sealing it must
+    // CLOSE the boundary (clear injectContinuationId, record it closed) so the retry
+    // is a fresh SIBLING — NOT another delta pinned onto the sealed errored node.
+    const messages = [
+      { id: 'user-inject', parentId: 'pre', role: 'user', content: [{ type: 'text', text: 'answer' }] },
+      {
+        id: 'user-inject-cont',
+        parentId: 'user-inject',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'partial' }],
+      },
+    ] as unknown as Msg[];
+    const a = {
+      messages,
+      headId: 'user-inject-cont',
+      injectContinuationId: 'user-inject-cont',
+      closedPrefixIds: new Set<string>(),
+    } as unknown as Parameters<typeof preserveErroredAssistantVariant>[0];
+    expect(preserveErroredAssistantVariant(a, 'boom')).toBe(true);
+    const acc2 = a as unknown as {
+      injectContinuationId: string | null;
+      closedPrefixIds: Set<string>;
+      headId: string | null;
+    };
+    expect(acc2.injectContinuationId).toBeNull(); // boundary closed
+    expect(acc2.closedPrefixIds.has('user-inject-cont')).toBe(true);
+    expect(acc2.headId).toBe('user-inject'); // rewound so the retry is a sibling
   });
 });

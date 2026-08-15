@@ -1448,8 +1448,18 @@ export function reorderPrefixBeforeInjectedUser(
   if (!prefix) return { messages, headId };
   const userParent = user.parentId;
   const prefixId = prefix.id;
+  // Move EVERY assistant variant under the injected user (not just the active one):
+  // a transient fallback can leave a failed partial + the successful reply as
+  // siblings there, both produced BEFORE the model saw the inject. Leaving the
+  // failed sibling under the injected user would group it with the eventual
+  // continuation in branch selection (and a renderer persist could undo the
+  // disk-side repair). Reparent all to the pre-inject head; attach the injected user
+  // only to the ACTIVE variant (prefix).
+  const variantIds = new Set(
+    messages.filter((m) => m.role === 'assistant' && m.parentId === injectedUserId).map((m) => m.id),
+  );
   const nextMessages = messages.map((m) => {
-    if (m.id === prefixId) return { ...m, parentId: userParent };
+    if (variantIds.has(m.id)) return { ...m, parentId: userParent };
     if (m.id === injectedUserId) return { ...m, parentId: prefixId };
     return m;
   });
@@ -1507,8 +1517,18 @@ export function reorderPrefixBeforeInjectedUserChain(
   if (!firstUser) return { messages, headId };
   const prefixId = prefix.id;
   const chainParent = firstUser.parentId; // the pre-inject head
+  // Move EVERY assistant variant that sits under the SAME injected user as the
+  // active prefix (a transient fallback can leave a failed partial + the successful
+  // reply as siblings there, both produced before the inject was consumed) back to
+  // the pre-inject head — attaching the first injected user only to the ACTIVE one.
+  // Leaving a failed sibling under the injected user would group it with the
+  // continuation in branch selection.
+  const variantParent = prefix.parentId;
+  const variantIds = new Set(
+    messages.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
+  );
   const nextMessages = messages.map((m) => {
-    if (m.id === prefixId) return { ...m, parentId: chainParent };
+    if (variantIds.has(m.id)) return { ...m, parentId: chainParent };
     if (m.id === injectedIds[0]) return { ...m, parentId: prefixId };
     return m;
   });
@@ -2178,6 +2198,16 @@ export function preserveErroredAssistantVariant(acc: MessageAccumulator, errorTe
   acc.messages[idx] = { ...last, content: toStoredContent(content) };
   // Rewind head to the errored variant's parent so the retry is a sibling.
   acc.headId = last.parentId ?? null;
+  // If the sealed variant IS this run's open inject-continuation node, the boundary
+  // is now closed for it: the retry must be a fresh SIBLING, not another delta on
+  // this (errored) continuation. Close it out (record it as a closed prefix and clear
+  // injectContinuationId) so getOrCreateAssistantInAcc no longer pins the retry's
+  // fresh response id onto the sealed node. A subsequent inject re-opens a boundary.
+  if (acc.injectContinuationId && last.id === acc.injectContinuationId) {
+    acc.closedPrefixIds ??= new Set();
+    acc.closedPrefixIds.add(acc.injectContinuationId);
+    acc.injectContinuationId = null;
+  }
   return true;
 }
 
@@ -3769,6 +3799,13 @@ export function RuntimeProvider({
             // for the new run (not from the old run's clock). Timing re-seeds on the next event.
             acc.deferredApprovals = undefined;
             acc.pendingAssistantTiming = undefined;
+            // Clear the PRIOR run's cooperative-inject boundary state too: these are
+            // run-scoped. Left set, the new generation's first assistant delta would be
+            // pinned onto the OLD run's continuation id (getOrCreateAssistantInAcc),
+            // updating a stale node off the new user's active branch and hiding the new
+            // turn's streamed response. A new inject in this generation re-opens them.
+            acc.injectContinuationId = null;
+            acc.closedPrefixIds = undefined;
             traceRuntime('stream.supersede-adopt-mirror', convId, { newGeneration: evGen });
             // fall through — render the new turn's user-message + subsequent events as a mirror
           } else {
