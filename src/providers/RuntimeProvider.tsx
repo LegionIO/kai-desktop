@@ -5751,6 +5751,18 @@ export function RuntimeProvider({
             // branch → live is ahead of disk on the same lineage.
             const liveHeadOnDiskActive = baseHead != null && diskActiveIds.has(baseHead);
             const diskHeadOnLiveActive = fh != null && liveActiveIds.has(fh);
+            // Distinguish an INTENTIONAL ancestor move (another client rewound /
+            // regenerated to an ancestor of baseHead during the gate) from mere
+            // debounced-persist lag. Both leave the disk head an ancestor of baseHead
+            // (diskHeadOnLiveActive true, fh !== baseHead). The tell: a rewind PERSISTS
+            // the tail nodes (they stay in the tree as an inactive branch) and moves the
+            // HEAD back, so baseHead still EXISTS in the disk tree `ft`. Debounced lag
+            // means the live tail simply hasn't been written yet, so baseHead is ABSENT
+            // from `ft`. When baseHead is present on disk but off disk's ACTIVE branch,
+            // the head was deliberately moved — adopt disk.
+            const diskHasLiveHeadNode = baseHead != null && ft.some((m) => m.id === baseHead);
+            const intentionalAncestorMove =
+              diskHeadOnLiveActive && fh !== baseHead && diskHasLiveHeadNode && !liveHeadOnDiskActive;
             // Genuine branch switch: the live head is NOT on disk's active lineage AND
             // the disk head is NOT on the live active lineage — different selected
             // branches. Adopt disk (where the user is now). Otherwise keep the fresher
@@ -5758,7 +5770,7 @@ export function RuntimeProvider({
             const branchDiverged = baseHead != null && !liveHeadOnDiskActive && !diskHeadOnLiveActive;
             // Adopt disk if the live tree is empty/degenerate (nothing to preserve).
             const liveDegenerate = baseTree.length === 0;
-            if (branchDiverged || liveDegenerate) {
+            if (branchDiverged || intentionalAncestorMove || liveDegenerate) {
               baseTree = ft;
               baseHead = fh;
             } else if (liveHeadOnDiskActive && diskActiveIds.size > liveActiveIds.size) {
