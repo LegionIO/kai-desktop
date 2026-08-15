@@ -1270,6 +1270,35 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
   }
 }
 
+/** Recovery TOMBSTONES: answerKey → {conversationId, expiresAt}. Recorded whenever a
+ *  raced-answer handoff/claimant is dropped with NO viable successor (ordinary
+ *  completion, non-Mastra takeover, dead bound successor). Keeps the
+ *  answerKey→conversation association alive through the handoff TTL so a LATE-arriving
+ *  answer (not yet stashed at drop time) can still be routed durably by
+ *  agent:answer-tool-question, instead of being silently orphaned in the bounded
+ *  stash under an obsolete id (R87). Bounded FIFO; entries are lazily expired. */
+const recoveryTombstones = new Map<string, { conversationId: string; expiresAt: number }>();
+const MAX_RECOVERY_TOMBSTONES = 400;
+function recordRecoveryTombstone(conversationId: string, answerKey: string): void {
+  recoveryTombstones.set(answerKey, { conversationId, expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS });
+  while (recoveryTombstones.size > MAX_RECOVERY_TOMBSTONES) {
+    const oldest = recoveryTombstones.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    recoveryTombstones.delete(oldest);
+  }
+}
+/** The still-valid tombstone conversation for a key, or undefined (also purges an
+ *  expired entry). */
+function recoveryTombstoneConversation(answerKey: string): string | undefined {
+  const t = recoveryTombstones.get(answerKey);
+  if (!t) return undefined;
+  if (Date.now() > t.expiresAt) {
+    recoveryTombstones.delete(answerKey);
+    return undefined;
+  }
+  return t.conversationId;
+}
+
 /** Route any ALREADY-STASHED answers for these keys through the durable
  *  recovered-answer path (re-inject into the ORIGIN conversation as a labeled turn,
  *  or persist as an Alert) instead of leaving them orphaned in the bounded stash
@@ -1277,13 +1306,16 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
  *  an ordinary-completion teardown, a non-Mastra successor takeover, or a handoff
  *  bound to an already-dead successor (R86). Best-effort + bounded; the stash copy
  *  remains as the last resort. Consumes the stash key on successful inline delivery.
- *  No-op for keys whose answer hasn't arrived yet (nothing to recover; the durable
- *  path is re-driven by agent:answer-tool-question when it does — but only if a
- *  handoff still references it, so callers should recover BEFORE dropping). */
+ *  ALSO records a TTL-bound recovery tombstone per key so a LATE-arriving answer
+ *  (not yet stashed here) is still routed by agent:answer-tool-question (R87), and
+ *  the durable path is re-driven when the late answer arrives. */
 function recoverOrphanedAnswerKeys(conversationId: string, keys: Iterable<string>): void {
   const deliverer = getRecoveredAnswerDeliverer();
-  if (!deliverer) return;
   for (const key of keys) {
+    // Record a TTL-bound tombstone FIRST (even without a deliverer / a not-yet-arrived
+    // answer) so a late answer can be routed durably by agent:answer-tool-question.
+    recordRecoveryTombstone(conversationId, key);
+    if (!deliverer) continue;
     const answer = pendingQuestionAnswers.get(key);
     if (!answer) continue;
     void deliverer(conversationId, '', answer)
@@ -1317,6 +1349,11 @@ function conversationForRacedAnswerKey(answerKey: string): string | undefined {
  *  successor-bound handoff that needs a live claimant to merge into — deleting it
  *  here would strand that answer). It is torn down on the run's teardown. */
 function purgeRacedAnswerForKey(answerKey: string): void {
+  // FIRST-SURFACE-WINS: if an answer for this key is ALREADY stashed, a surface
+  // answered and won the abort race — a LATER reject/dismiss from a DIFFERENT open
+  // surface must NOT purge the handoff (that would override the accepted answer and
+  // prevent its delivery to the successor). Only purge when no answer has won yet.
+  if (pendingQuestionAnswers.has(answerKey)) return;
   for (const [conversationId, c] of liveRacedAnswerClaimant) {
     if (c.state.answerKeys.delete(answerKey) && c.state.answerKeys.size === 0) {
       const stillOwnsRun = activeStreams.get(conversationId)?.token === c.token;
@@ -8067,7 +8104,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // once it registers). answer-tool-question only knows the answerKey
     // (=toolCallId), so locate the owning conversation by that key.
     const owningConv = conversationForRacedAnswerKey(toolCallId);
-    if (owningConv) attemptRacedAnswerDelivery(owningConv);
+    if (owningConv) {
+      attemptRacedAnswerDelivery(owningConv);
+    } else {
+      // No live handoff/claimant references this key — but a no-successor drop may
+      // have left a TTL-bound recovery tombstone. If so, this LATE-arriving answer is
+      // owed to that conversation; route it through the durable recovered-answer path
+      // (labeled re-inject / Alert) instead of leaving it orphaned in the stash (R87).
+      const tombstoneConv = recoveryTombstoneConversation(toolCallId);
+      if (tombstoneConv) {
+        recoveryTombstones.delete(toolCallId);
+        recoverOrphanedAnswerKeys(tombstoneConv, [toolCallId]);
+      }
+    }
     return { ok: true };
   });
 
