@@ -1115,25 +1115,33 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       // plan/dismiss), and (c) a LIVE replacement actually superseded it
       // (latestIssuedTurnToken advanced past it). On ordinary completion — no
       // replacement — DISCARD, so an unrelated later turn can't claim the stale answer.
-      const latestIssued = latestIssuedTurnToken.get(conversationId);
-      const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== claimant.token;
       // Re-register the still-owed answer as a pre-successor handoff ONLY when a LIVE
-      // replacement actually superseded the claimant (latestIssuedTurnToken advanced
-      // past it) — plus the usual guards (no Stop bumped the generation; the
-      // torn-down token wasn't a TERMINAL abort). registerRacedAnswerHandoff then
-      // binds it to that live replacement (sourceToken = claimant.token ≠ latestIssued
-      // → expectedSuccessorToken = latestIssued), so a genuine successor claims it.
+      // replacement GENUINELY superseded the claimant — established by the recorded
+      // supersession lineage (claimant.token → … → latestIssued), NOT mere token
+      // difference. A token-difference check (latestIssued !== claimant.token) also
+      // matches an UNRELATED turn C that merely started after claimant B completed
+      // (B's async delivery gate still pending): C would then claim B's stale answer
+      // (R82 misdelivery, the same recency-vs-lineage flaw R81 fixed at the rebind
+      // site). Plus the usual guards: no Stop bumped the generation; the torn-down
+      // token wasn't a TERMINAL abort. registerRacedAnswerHandoff binds the handoff to
+      // latestIssued (sourceToken = claimant.token ≠ latestIssued), the genuine
+      // successor in the chain.
       //
-      // We do NOT register on ORDINARY completion (this token is still the latest
-      // issued — NO successor exists), even when a delivery was in flight. There is no
-      // turn that legitimately owns this answer: the run that asked the question
-      // finished. The answer stays in the bounded stash and is recovered by id if that
-      // ask_user question is re-invoked (the tool's execute reads the stash by
-      // toolCallId — see waitForRacedAnswer/rekeyRacedAnswer). Registering a handoff
-      // here is unsound either way: UNBOUND lets an unrelated turn claim it (R76
-      // misdelivery); SELF-BOUND to the completed token is either unclaimable (dead
-      // token) or, via the superseded-successor rebind path, ALSO reaches an unrelated
-      // newer turn (R80 misdelivery). The stash is the correct resting place.
+      // We do NOT register on ORDINARY completion (no genuine successor supersedes the
+      // claimant), even when a delivery was in flight. There is no turn that
+      // legitimately owns this answer: the run that asked the question finished. The
+      // answer stays in the bounded stash and is recovered by id if that ask_user
+      // question is re-invoked (the tool's execute reads the stash by toolCallId — see
+      // waitForRacedAnswer/rekeyRacedAnswer). Registering a handoff here is unsound
+      // either way: UNBOUND lets an unrelated turn claim it (R76 misdelivery);
+      // SELF-BOUND to the completed token is either unclaimable (dead token) or, via
+      // the rebind path, ALSO reaches an unrelated newer turn (R80/R82 misdelivery).
+      // The stash is the correct resting place.
+      const latestIssued = latestIssuedTurnToken.get(conversationId);
+      const supersededByLiveReplacement =
+        latestIssued !== undefined &&
+        latestIssued !== claimant.token &&
+        isSupersessionDescendant(claimant.token, latestIssued);
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
         !terminalAbortTokens.has(claimant.token) &&
