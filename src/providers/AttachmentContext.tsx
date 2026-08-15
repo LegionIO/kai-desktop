@@ -36,23 +36,30 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
   const [attachments, setAttachments] = useState<AttachedFile[]>([]);
   const attachmentsRef = useRef<AttachedFile[]>([]);
 
-  // Keep ref in sync
+  // Keep the ref in sync at render too (covers an external/reset path), but every
+  // mutator below ALSO updates it SYNCHRONOUSLY — so getAttachmentCount() reflects
+  // an add/remove immediately, even before React flushes the state update (an
+  // add + a mid-turn gate resolving in the same batch must not read a stale zero).
   attachmentsRef.current = attachments;
 
   const addAttachments = useCallback((files: AttachedFile[]) => {
-    setAttachments((prev) => [...prev, ...files]);
+    attachmentsRef.current = [...attachmentsRef.current, ...files];
+    setAttachments(attachmentsRef.current);
   }, []);
 
   const removeAttachment = useCallback((index: number) => {
-    setAttachments((prev) => prev.filter((_, i) => i !== index));
+    attachmentsRef.current = attachmentsRef.current.filter((_, i) => i !== index);
+    setAttachments(attachmentsRef.current);
   }, []);
 
   const clearAttachments = useCallback(() => {
+    attachmentsRef.current = [];
     setAttachments([]);
   }, []);
 
   const consumeAttachments = useCallback((): AttachedFile[] => {
     const current = attachmentsRef.current;
+    attachmentsRef.current = [];
     setAttachments([]);
     return current;
   }, []);
