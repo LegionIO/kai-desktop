@@ -4479,7 +4479,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // sibling assistant under the pre-inject head, written by THIS run when the
       // renderer crashed before persisting — and DISTINGUISH it from a user-selected
       // historical sibling variant (whose id this run never produced).
-      const runReplyResponseIds = new Set<string>();
+      // The response id of this run's CURRENT (latest) reply variant — updated on
+      // each content event, so a transient model-fallback's FAILED partial variant
+      // (preserved as a sibling with its OWN id) is superseded by the retry's id.
+      // The terminal-drain repair uses THIS (not every id the run emitted) to
+      // recognize main's crash-backstop fallback reply — the accumulator finalizes
+      // under the latest id — and distinguish it from both a user-selected
+      // historical sibling AND a failed fallback variant the user might select.
+      let latestReplyResponseId: string | null = null;
 
       try {
         if (controller.signal.aborted) {
@@ -5530,11 +5537,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               sawToolOrTextThisTurn = true;
               if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
             }
-            // Record every response id this run emits so the terminal-drain repair
-            // can recognize main's crash-backstop fallback reply (written under one
-            // of these ids) vs. a user-selected historical sibling variant.
-            if (typeof event.responseMessageId === 'string' && event.responseMessageId) {
-              runReplyResponseIds.add(event.responseMessageId);
+            // Track the CURRENT reply variant's response id from CONTENT events only
+            // (text/tool — never `error`). A model-fallback preserves the failed
+            // partial under its own id, then the retry streams under a NEW id; taking
+            // the latest content id means a failed variant is superseded, so the
+            // terminal-drain repair won't mistake a user-selected failed sibling for
+            // main's crash-backstop reply (which finalizes under this latest id).
+            if (
+              (event.type === 'text-delta' || event.type === 'tool-call' || event.type === 'tool-result') &&
+              typeof event.responseMessageId === 'string' &&
+              event.responseMessageId
+            ) {
+              latestReplyResponseId = event.responseMessageId;
             }
             // After a plan-related done event has been sent and the stream aborted,
             // ignore any trailing events (especially the generator's final plain done).
@@ -6304,13 +6318,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       //      OR
                       //  (2) it is THIS run's crash-backstop fallback reply — a sibling
                       //      assistant under the pre-inject head that main persisted (when
-                      //      the renderer crashed before its own reorder), identified by an
-                      //      id THIS run actually streamed (runReplyResponseIds).
+                      //      the renderer crashed before its own reorder), identified as
+                      //      the run's FINALIZED reply id (latestReplyResponseId — the
+                      //      accumulator's current variant, NOT a failed fallback partial
+                      //      that this run also streamed under an earlier id).
                       // A user who switched to a historical SIBLING variant beneath the
-                      // pre-inject head reaches the common ancestor too, but neither passes
-                      // through an inject NOR carries an id this run produced — so it's
-                      // rejected. Otherwise abandon (the inject stays persisted-but-
-                      // unanswered — the user can resend; reactive recovery backstops it).
+                      // pre-inject head — or a FAILED fallback partial variant — reaches
+                      // the common ancestor too, but neither passes through an inject NOR
+                      // is the run's finalized reply id — so it's rejected. Otherwise
+                      // abandon (the inject stays persisted-but-unanswered — the user can
+                      // resend; reactive recovery backstops it).
                       const injectedSet = new Set(guiInjectedIds);
                       const byId = new Map(continuationTree.map((m) => [m.id, m] as const));
                       const firstInjected = guiInjectedIds.find((id) => byId.has(id));
@@ -6323,14 +6340,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                         while (cur && !seen.has(cur)) {
                           // (1) Head is (or descends from) an injected user.
                           if (injectedSet.has(cur)) return true;
-                          // (2) Head is (or descends from) THIS run's fallback reply — an
-                          // assistant this run streamed (id in runReplyResponseIds) that
-                          // sits directly under the pre-inject head (the crash-backstop
-                          // sibling shape reorderInjectPrefixOnDisk case (a) repairs).
+                          // (2) Head is (or descends from) THIS run's FINALIZED reply — the
+                          // accumulator's latest variant (latestReplyResponseId) — sitting
+                          // directly under the pre-inject head (the crash-backstop sibling
+                          // shape reorderInjectPrefixOnDisk case (a) repairs). A failed
+                          // fallback partial (earlier id) is NOT accepted.
                           const node = byId.get(cur);
                           if (
                             node?.role === 'assistant' &&
-                            runReplyResponseIds.has(cur) &&
+                            latestReplyResponseId !== null &&
+                            cur === latestReplyResponseId &&
                             (node.parentId ?? null) === (preInjectHead ?? null)
                           ) {
                             return true;
