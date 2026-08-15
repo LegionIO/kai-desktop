@@ -174,6 +174,7 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   activeStreamModelKeys.delete(conversationId);
   activeStreamRuntime.delete(conversationId);
   activeStreamResponseIds.delete(conversationId);
+  activeInjectContinuationId.delete(conversationId);
   activeObserverSessions.delete(conversationId);
   // Per-turn same-turn bookkeeping — clear on terminal cleanup so a one-off chat
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
@@ -451,6 +452,17 @@ function forgetActiveRunResponseId(conversationId: string, token: string, respon
   if (activeStreams.get(conversationId)?.token !== token) return;
   const entry = activeStreamResponseIds.get(conversationId);
   if (entry && entry.token === token) entry.ids.delete(responseId);
+}
+// The CURRENT cooperative-inject continuation node id (`${injectedUserId}-cont`) for
+// the active run, token-scoped. A continuation partial persists under this id (NOT
+// the provider's responseMessageId), so a model-fallback that SEALS it as an
+// inactive sibling must forget THIS id from the run lineage too (the provider id
+// forget alone misses it — R85). Set at each inject-consumed boundary; cleared on
+// terminal cleanup with the rest of the run lineage.
+const activeInjectContinuationId = new Map<string, { token: string; contId: string }>();
+function recordActiveInjectContinuationId(conversationId: string, token: string, contId: string): void {
+  if (activeStreams.get(conversationId)?.token !== token) return;
+  activeInjectContinuationId.set(conversationId, { token, contId });
 }
 /** Record a cooperative-inject boundary's nodes as this run's own lineage: the
  *  injected user node AND its deterministic `${id}-cont` continuation. After a
@@ -2078,6 +2090,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const activeToken0 = activeStreams.get(conversationId)?.token;
       if (activeToken0 !== undefined) {
         for (const entry of entries) recordInjectBoundaryLineage(conversationId, activeToken0, entry.id);
+        // Track the LATEST boundary's continuation id so a model-fallback that seals
+        // a failed continuation partial (persisted under `${id}-cont`, not the
+        // provider response id) can forget it from the run lineage too (R85).
+        const lastEntry = entries[entries.length - 1];
+        if (lastEntry) recordActiveInjectContinuationId(conversationId, activeToken0, `${lastEntry.id}-cont`);
       }
     }
     // Accumulate consumed-inject text bytes so the media budget can charge them
@@ -6098,6 +6115,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 forgetActiveRunResponseId(conversationId, streamToken, latestReplyResponseId);
                 latestReplyResponseId = null;
               }
+              // If the failed partial was an injected CONTINUATION, it persisted under
+              // `${injectedUserId}-cont` (NOT the provider id forgotten above) and the
+              // renderer seals it as an inactive sibling on preserveErroredVariant.
+              // Forget that continuation id too so a later gate can't accept a mid-turn
+              // inject onto the sealed continuation sibling (R85). The retry re-opens a
+              // fresh boundary / node, re-recorded when its events arrive.
+              {
+                const contEntry = activeInjectContinuationId.get(conversationId);
+                if (contEntry && contEntry.token === streamToken) {
+                  forgetActiveRunResponseId(conversationId, streamToken, contEntry.contId);
+                  activeInjectContinuationId.delete(conversationId);
+                }
+              }
               // NOTE: a just-consumed cooperative inject is NOT re-queued for the
               // fallback attempt. It's already PERSISTED on the branch (the
               // consumption handler wrote it) and IS in the messages the fallback
@@ -7721,6 +7751,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (stillOwnedAtCancel && activeStreamResponseIds.get(conversationId)?.token === controller.token) {
         activeStreamResponseIds.delete(conversationId);
       }
+      if (stillOwnedAtCancel && activeInjectContinuationId.get(conversationId)?.token === controller.token) {
+        activeInjectContinuationId.delete(conversationId);
+      }
     }
     activeObserverSessions.delete(conversationId);
     // Clear same-turn inject bookkeeping here too: deleteStreamIfOwned above removes
@@ -7907,16 +7940,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
-    // Stash the answers UNCONDITIONALLY, before resolving. A fully-submitted
-    // answer can race an abort (turn ended / superseded / plan-restart) that
-    // already settled + removed the pending approval a beat earlier — the old
-    // `if (pending)` guard dropped the answer in that window, and the tool then
-    // emitted "No user response received" even though the user DID answer. The
-    // stash is bounded (MAX_PENDING_QUESTION_ANSWERS FIFO), so an orphaned entry
-    // for a genuinely-dead turn can't leak. The ask_user gate + execute recover
-    // this entry by id; a still-live pending approval is resolved below.
-    stashQuestionAnswers(toolCallId, answers);
+    // Stash the answers before resolving. A fully-submitted answer can race an
+    // abort (turn ended / superseded / plan-restart) that already settled + removed
+    // the pending approval a beat earlier — the old `if (pending)` guard dropped the
+    // answer in that window, and the tool then emitted "No user response received"
+    // even though the user DID answer. The stash is bounded (MAX_PENDING_QUESTION_ANSWERS
+    // FIFO), so an orphaned entry for a genuinely-dead turn can't leak. The ask_user
+    // gate + execute recover this entry by id; a still-live pending approval is
+    // resolved below.
+    //
+    // FIRST-SURFACE-WINS: multiple surfaces (inline card / dedicated window / web /
+    // CLI) can answer the same question. Once the FIRST answer resolved the pending
+    // approval (entry deleted), a LATER differing answer must NOT overwrite the
+    // already-stashed first answer before a raced-abort handoff consumes it — that
+    // would deliver the second surface's answer even though the first already
+    // succeeded. So stash only when this is the first answer (no existing stash) OR a
+    // pending approval is still live (this IS the winning surface resolving it now).
     const pending = pendingToolApprovals.get(toolCallId);
+    const alreadyStashed = pendingQuestionAnswers.has(toolCallId);
+    if (pending || !alreadyStashed) {
+      stashQuestionAnswers(toolCallId, answers);
+    }
     traceDiagnostic({
       scope: 'agent',
       event: 'question.answer-received',

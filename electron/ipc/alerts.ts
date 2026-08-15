@@ -81,8 +81,21 @@ export async function deliverRecoveredAnswer(
   answers: Record<string, string>,
 ): Promise<{ delivered: boolean }> {
   if (!deps) return { delivered: false };
-  const clean = sanitizeAnswer(answers);
-  if (!clean) return { delivered: false };
+  // Recovery normalizer — NOT the strict alerts:answer sanitizeAnswer: ask_user
+  // permits question text > 200 chars and free-text ("Other") answers with no
+  // 2000-char cap, and this answer was ALREADY collected + accepted. Rejecting a
+  // valid long answer here would drop it to the evictable in-memory stash (lost on
+  // restart). So keep every string entry, truncating only pathological outliers to
+  // a generous bound (defensive against an unbounded value inflating the prompt).
+  const MAX_RECOVERY_VALUE = 16 * 1024;
+  const clean: Record<string, string> = {};
+  if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+    for (const [k, v] of Object.entries(answers)) {
+      if (typeof k !== 'string' || typeof v !== 'string') continue;
+      clean[k] = v.length > MAX_RECOVERY_VALUE ? `${v.slice(0, MAX_RECOVERY_VALUE)}…` : v;
+    }
+  }
+  if (Object.keys(clean).length === 0) return { delivered: false };
   const title = questionTitle.trim() || 'your earlier question';
   const lines = Object.entries(clean).map(([header, choice]) => `- ${header} → ${choice}`);
   const body = lines.length ? lines.join('\n') : '(no answer provided)';
