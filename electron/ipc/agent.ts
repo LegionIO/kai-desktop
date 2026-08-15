@@ -1094,13 +1094,26 @@ function registerRacedAnswerHandoff(
   // it unbound so that async successor may still claim it.
   const latestIssued = latestIssuedTurnToken.get(conversationId);
   const expectedSuccessorToken = latestIssued !== undefined && latestIssued !== sourceToken ? latestIssued : undefined;
+  // We're about to REPLACE an existing (different-source) handoff. If it's still
+  // valid, don't silently drop its answer keys: MERGE them into the new handoff when
+  // both target the SAME successor (out-of-order abort gates — A→B then X→B), else
+  // recover the displaced keys durably so they aren't orphaned (R89).
+  const displacedKeys = new Set<string>();
+  if (existing && !racedStateInvalid(existing, conversationId)) {
+    if (existing.expectedSuccessorToken === expectedSuccessorToken) {
+      for (const k of existing.answerKeys) displacedKeys.add(k);
+    } else {
+      recoverOrphanedAnswerKeys(conversationId, existing.answerKeys);
+    }
+  }
   racedAnswerHandoffs.set(conversationId, {
-    answerKeys: new Set([answerKey]),
+    answerKeys: new Set([answerKey, ...displacedKeys]),
     cancelGenAtAbort,
     sourceToken,
     deliveryRetries: 0,
     expectedSuccessorToken,
-    expiresAt,
+    // When merging same-successor keys, keep the EARLIER expiry (never extend TTL).
+    expiresAt: existing && displacedKeys.size > 0 ? Math.min(expiresAt, existing.expiresAt) : expiresAt,
   });
   while (racedAnswerHandoffs.size > MAX_RACED_ANSWER_HANDOFFS) {
     const oldest = racedAnswerHandoffs.keys().next().value;
@@ -1452,6 +1465,13 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
   // (plan-restart, no known successor) is never dropped here; it ages out via TTL.
   const handoff = racedAnswerHandoffs.get(conversationId);
   if (handoff && handoff.expectedSuccessorToken !== undefined && handoff.expectedSuccessorToken === token) {
+    // The intended successor died — recover any stashed answers durably + leave a
+    // TTL tombstone for a late arrival BEFORE dropping, so the answer isn't silently
+    // lost (R89). Only when not a terminal Stop (a Stop's cancel-gen invalidates the
+    // tombstone anyway) and the state is still valid.
+    if (!terminalAbortTokens.has(token) && !racedStateInvalid(handoff, conversationId)) {
+      recoverOrphanedAnswerKeys(conversationId, handoff.answerKeys);
+    }
     racedAnswerHandoffs.delete(conversationId);
   }
 }

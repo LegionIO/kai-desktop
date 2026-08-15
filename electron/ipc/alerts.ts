@@ -102,9 +102,18 @@ export async function deliverRecoveredAnswer(
   const text = `[Answering your earlier question "${title}"]\n${body}`;
   const correlationId = `recovered-answer-${conversationId}`;
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
-  if (readConversation(deps.appHome, conversationId)) {
+  const conv = readConversation(deps.appHome, conversationId);
+  if (conv) {
     try {
-      await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), { correlationId });
+      // Preserve the conversation's OWN model/profile so the recovered answer runs
+      // under the same context the question was asked in — not the global default
+      // (R89). (resumeConversationWithMessage → an existing-target agent action;
+      // cwd/executionMode follow the conversation's stored config on that path.)
+      await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
+        correlationId,
+        ...(conv.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
+        ...(conv.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
+      });
       traceDiagnostic({
         scope: 'alert',
         event: 'recovered-answer.delivered',
