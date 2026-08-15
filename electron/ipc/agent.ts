@@ -6535,6 +6535,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // model + system prompt so a conditioned hook sees the same context a normal
       // turn shows it.
       const tokenBeforeGate = activeStreams.get(conversationId)?.token;
+      // Capture the ORIGINATING branch head before the (async) gate. If the user
+      // switches to another branch WHILE a slow policy hook is pending, the disk head
+      // moves — and the stream token is UNCHANGED (a branch switch doesn't supersede
+      // the run), so the token check below wouldn't catch it. Splicing then would
+      // append the inject onto the newly-selected lineage while the running turn
+      // consumes it on the OLD branch → conflicting parents / the old head restored.
+      // Revalidate the head after the gate; on a mismatch, fall back to a normal turn.
+      const headBeforeGate = conv.headId ?? null;
       const runCtx = getActiveRunContext(conversationId);
       const gate = await gateInjectedUserText(conversationId, userText, {
         modelKey: runCtx?.modelKey,
@@ -6567,6 +6575,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         getActiveStreamRuntime(conversationId) !== 'mastra'
       ) {
         return { ok: false, cooperative: false, error: 'active run ended during policy enforcement' };
+      }
+      // Re-read the conversation AFTER the async gate: a branch switch / rewind during
+      // a slow hook moves the disk head without changing the stream token. If the head
+      // moved off the branch this inject was composed against, splicing would attach it
+      // to a divergent lineage (and the running turn would consume it on the old
+      // branch). Fall back to a normal turn so the user's message lands on the branch
+      // they're now viewing rather than being mis-parented.
+      const convAfterGate = readConversation(appHome, conversationId);
+      if (!convAfterGate) return { ok: false, error: 'conversation-not-found' };
+      if ((convAfterGate.headId ?? null) !== headBeforeGate) {
+        return { ok: false, cooperative: false, error: 'conversation branch changed during policy enforcement' };
       }
       const injectText = gate.text;
       const id = enqueueInject(conversationId, injectText);
@@ -6698,31 +6717,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     //     this message didn't cause a message-specific prompt change → allow.
     const hookInputPrompt = ctx?.preHookSystemPrompt ?? config.systemPrompt ?? '';
     const runPostHookPrompt = ctx?.systemPrompt ?? hookInputPrompt;
-    // Gate the injected turn WITH the active-branch HISTORY prepended, so a
-    // history-dependent hook (e.g. one deriving a prompt suffix from the first user
-    // turn, or a redaction that keys off prior context) sees the SAME message
-    // context a normal send shows it — not a lone synthetic turn (which would make
-    // such a hook produce a different prompt and terminally reject a valid inject).
-    // Only the injected turn (the LAST message) is extracted afterward; the history
-    // is read-only context. Shape prior messages to the hook role/content contract.
-    const historyMessages: Array<{ role: string; content: unknown }> = (() => {
-      try {
-        const conv = readConversation(appHome, conversationId);
-        if (!conv) return [];
-        const { tree, headId } = ensureConversationTree(conv);
-        const branch = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]) as Array<{
-          role?: unknown;
-          content?: unknown;
-        }>;
-        return branch
-          .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system' || m.role === 'tool'))
-          .map((m) => ({ role: String(m.role), content: m.content }));
-      } catch {
-        return []; // best-effort: fall back to gating the injected turn alone
-      }
-    })();
-    const historyLen = historyMessages.length;
-    let payload: unknown[] = [...historyMessages, { role: 'user', content: [{ type: 'text', text: userText }] }];
+    // Gate the injected turn ALONE (no history). Prepending the disk-read active
+    // branch (a prior attempt) was unsound: the disk snapshot lags Mastra's LIVE
+    // prepareStep transcript during CLI turns / the GUI persist-debounce window (so a
+    // history-dependent policy would gate against STALE context), and a same-length
+    // reordering hook could move the injected turn off the last position (so a
+    // position-based extract would enqueue the wrong text). The gate can't
+    // synchronously reach the run's live transcript from this IPC handler, so it
+    // enforces on the injected turn in isolation — a bounded, well-defined contract:
+    // a history-dependent hook sees only the new turn mid-inject (documented), which
+    // is strictly safer than enforcing against a stale/misordered reconstruction.
+    const historyLen = 0;
+    let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
     // Track any hook rewrite of the system prompt. A cooperative inject splices
     // into an ALREADY-RUNNING turn whose system prompt is fixed — we CANNOT honor
     // a content-dependent prompt rewrite for this message the way a normal
