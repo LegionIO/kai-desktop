@@ -5537,14 +5537,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               sawToolOrTextThisTurn = true;
               if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
             }
-            // Track the CURRENT reply variant's response id from CONTENT events only
-            // (text/tool — never `error`). A model-fallback preserves the failed
-            // partial under its own id, then the retry streams under a NEW id; taking
-            // the latest content id means a failed variant is superseded, so the
-            // terminal-drain repair won't mistake a user-selected failed sibling for
-            // main's crash-backstop reply (which finalizes under this latest id).
+            // Track the CURRENT reply variant's response id — the id under which
+            // the accumulator will finalize. Updated from text/tool AND `error`
+            // events: an error-ONLY reply (provider failed before any content) still
+            // finalizes an assistant node under the error's id, and the crash-backstop
+            // drain guard must recognize it. A transient model-fallback's FAILED
+            // partial sets this to its id, but the retry's later content event
+            // OVERWRITES it (the terminal-drain poll only runs at runStatus:'idle',
+            // by which point the retry finished), so a failed variant is never the
+            // value here at finalize — the guard won't mistake a user-selected failed
+            // sibling for the finalized reply.
             if (
-              (event.type === 'text-delta' || event.type === 'tool-call' || event.type === 'tool-result') &&
+              (event.type === 'text-delta' ||
+                event.type === 'tool-call' ||
+                event.type === 'tool-result' ||
+                event.type === 'error') &&
               typeof event.responseMessageId === 'string' &&
               event.responseMessageId
             ) {

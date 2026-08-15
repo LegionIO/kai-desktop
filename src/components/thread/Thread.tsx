@@ -1809,7 +1809,7 @@ const Composer: FC<{
   onToggleFallback,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments, removeAttachment } = useAttachments();
+  const { attachments, addAttachments, removeAttachment, getAttachmentCount } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -1850,7 +1850,11 @@ const Composer: FC<{
       // STASH the text for the ORIGINATING conversation rather than dropping it.
       const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
       const current = composerRuntime.getState().text ?? '';
-      if (!stillHere || current.trim().length > 0) {
+      // A LIVE attachment added during the async gate also blocks the resubmit:
+      // composerRuntime.send() consumes ALL current attachments, so a fallback
+      // resend of the OLD text would ship a file added for a different message.
+      const hasLiveAttachment = getAttachmentCount() > 0;
+      if (!stillHere || current.trim().length > 0 || hasLiveAttachment) {
         if (originConversationId) stashRejectedDraft(originConversationId, t);
         if (status === 'blocked') showMidTurnBlock(reason);
         return;
@@ -1871,6 +1875,7 @@ const Composer: FC<{
     composerText,
     sendMidTurn,
     getActiveConversationId,
+    getAttachmentCount,
     stashRejectedDraft,
     showMidTurnBlock,
   ]);

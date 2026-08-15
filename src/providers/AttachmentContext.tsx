@@ -17,6 +17,10 @@ type AttachmentContextValue = {
   clearAttachments: () => void;
   /** Called by RuntimeProvider to consume attachments when sending */
   consumeAttachments: () => AttachedFile[];
+  /** Live attachment count (ref-backed) for async closures that must not read
+   *  the stale render-time `attachments` — e.g. revalidating before a deferred
+   *  mid-turn fallback send that would otherwise consume a just-added attachment. */
+  getAttachmentCount: () => number;
 };
 
 const AttachmentContext = createContext<AttachmentContextValue>({
@@ -25,6 +29,7 @@ const AttachmentContext = createContext<AttachmentContextValue>({
   removeAttachment: () => {},
   clearAttachments: () => {},
   consumeAttachments: () => [],
+  getAttachmentCount: () => 0,
 });
 
 export function AttachmentProvider({ children }: { children: ReactNode }) {
@@ -52,8 +57,19 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
     return current;
   }, []);
 
+  const getAttachmentCount = useCallback((): number => attachmentsRef.current.length, []);
+
   return (
-    <AttachmentContext.Provider value={{ attachments, addAttachments, removeAttachment, clearAttachments, consumeAttachments }}>
+    <AttachmentContext.Provider
+      value={{
+        attachments,
+        addAttachments,
+        removeAttachment,
+        clearAttachments,
+        consumeAttachments,
+        getAttachmentCount,
+      }}
+    >
       {children}
     </AttachmentContext.Provider>
   );

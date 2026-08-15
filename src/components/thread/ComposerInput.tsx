@@ -14,7 +14,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   autoFocus,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments } = useAttachments();
+  const { attachments, addAttachments, getAttachmentCount } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
   const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
@@ -215,10 +215,16 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
         // ORIGINATING conversation so it resurfaces when the user returns there.
         const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
         const current = composerRuntime.getState().text ?? '';
-        if (!stillHere || current.trim().length > 0) {
-          // Switched away OR a new draft is present here — don't clobber; stash for
-          // the origin chat (dropped only if there's no origin id, which can't
-          // happen for a real send).
+        // A LIVE attachment added during the async gate must also block the
+        // resubmit: composerRuntime.send() → RuntimeProvider.onNew consumes ALL
+        // current attachments, so a fallback resend of the OLD text would ship a
+        // file the user added for a DIFFERENT (not-yet-sent) message. Read the
+        // ref-backed live count, not the stale render-time `attachments`.
+        const hasLiveAttachment = getAttachmentCount() > 0;
+        if (!stillHere || current.trim().length > 0 || hasLiveAttachment) {
+          // Switched away, a new draft is present, OR a new attachment was added —
+          // don't clobber/mis-send; stash the text for the origin chat (dropped only
+          // if there's no origin id, which can't happen for a real send).
           if (originConversationId) stashRejectedDraft(originConversationId, toSend);
           if (status === 'blocked') showSendBlock(originConversationId ?? null, reason);
           return;
@@ -251,6 +257,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     getActiveConversationId,
     stashRejectedDraft,
     showSendBlock,
+    getAttachmentCount,
     text,
   ]);
 
