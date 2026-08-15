@@ -6848,6 +6848,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // ACTIVE run's model + system prompt so a model/prompt-conditioned hook sees
       // the same context a normal turn shows it.
       const tokenBeforeGate = activeStreams.get(conversationId)?.token;
+      // Capture the disk head before the async gate: a rewind / variant switch during
+      // a slow policy hook moves the head WITHOUT changing the stream token, so the
+      // token check below wouldn't catch it and the splice would land on a divergent
+      // branch while the running turn consumes it on the old one (mirror of the
+      // renderer-facing agent:inject-mid-turn guard).
+      const headBeforeGate = readConversation(appHome, conversationId)?.headId ?? null;
       const runCtx = getActiveRunContext(conversationId);
       // A cooperative splice injects into the UNCHANGED live run — so it must be
       // gated (and will execute) under the LIVE run's model/mode, NOT a caller
@@ -6893,7 +6899,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           gateForcedFallthrough ||
           activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
           getActiveStreamRuntime(conversationId) !== 'mastra' ||
-          (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken);
+          (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken) ||
+          // Branch moved during the gate (rewind / variant switch) — the token is
+          // unchanged but the splice would target a divergent lineage. Treat as an
+          // ownership change (cooperative-only → notCooperative; normal → abort+restart).
+          (readConversation(appHome, conversationId)?.headId ?? null) !== headBeforeGate;
         if (ownershipChanged) {
           // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
           // stale answer can't restart a stopped run or abort a newer one.

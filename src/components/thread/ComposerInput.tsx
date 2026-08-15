@@ -17,7 +17,8 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const { attachments, addAttachments, getAttachmentCount } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
-  const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
+  const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } =
+    useMidTurnComposer();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   // /compact status is SCOPED to the conversation it belongs to. In-flight compactions
   // live in a MODULE-LEVEL store (compaction-ui-store) keyed by conversation id — NOT
@@ -230,6 +231,12 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
           return;
         }
         if (status === 'fallback') {
+          // Force a NORMAL superseding send — the run wasn't cooperatively
+          // injectable (branch changed / not Mastra). Mark the origin conv so onNew
+          // does NOT re-enter cooperative injection (re-running hooks / splicing onto
+          // the stale transcript); then send.
+          const target = originConversationId ?? getActiveConversationId();
+          if (target) markForceNormalSend(target);
           composerRuntime.setText(toSend);
           composerRuntime.send();
           composerRuntime.setText('');
@@ -258,6 +265,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     stashRejectedDraft,
     showSendBlock,
     getAttachmentCount,
+    markForceNormalSend,
     text,
   ]);
 

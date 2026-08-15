@@ -1815,7 +1815,7 @@ const Composer: FC<{
   const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
-  const { sendMidTurn, getActiveConversationId, stashRejectedDraft } = useMidTurnComposer();
+  const { sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
   // Transient status for a mid-turn send BLOCKED by a policy hook — packaged users
   // have no DevTools, so a console.warn is invisible and Send looks like a no-op.
@@ -1860,6 +1860,11 @@ const Composer: FC<{
         return;
       }
       if (status === 'fallback') {
+        // Force a NORMAL superseding send — mark the origin conv so onNew does NOT
+        // re-enter cooperative injection (re-running hooks / splicing onto the stale
+        // transcript after a branch change).
+        const target = originConversationId ?? getActiveConversationId();
+        if (target) markForceNormalSend(target);
         composerRuntime.setText(t);
         composerRuntime.send();
         composerRuntime.setText('');
@@ -1878,6 +1883,7 @@ const Composer: FC<{
     getAttachmentCount,
     stashRejectedDraft,
     showMidTurnBlock,
+    markForceNormalSend,
   ]);
 
   // Computer-use inline toggle state

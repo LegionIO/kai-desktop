@@ -781,6 +781,11 @@ type MidTurnComposerState = {
    *  typed a new draft — so the old text isn't silently dropped but resurfaces when
    *  the user returns to `convId`. */
   stashRejectedDraft: (convId: string, text: string) => void;
+  /** Mark a conversation so its NEXT onNew bypasses cooperative injection and does a
+   *  normal superseding send. A composer's `fallback` branch calls this right before
+   *  composerRuntime.send() so the forced normal send doesn't re-enter injectMidTurn
+   *  (re-running hooks / splicing onto the old transcript). One-shot; onNew consumes it. */
+  markForceNormalSend: (convId: string) => void;
 };
 
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
@@ -791,6 +796,7 @@ const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   cancelInject: async () => null,
   getActiveConversationId: () => null,
   stashRejectedDraft: () => {},
+  markForceNormalSend: () => {},
 });
 
 export function useMidTurnComposer(): MidTurnComposerState {
@@ -951,6 +957,13 @@ const IS_WEB_BRIDGE = Boolean((window as unknown as { app?: { __isWebBridge?: bo
 const automationSeedInProgress = new Set<string>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
+/** Conversations whose NEXT onNew must BYPASS cooperative mid-turn injection and go
+ *  straight to a normal (superseding) send. Set by a composer's `fallback` path
+ *  (sendMidTurn reported the branch changed / the run isn't injectable) right before
+ *  it calls composerRuntime.send(): without this, onNew sees the run still running
+ *  and re-enters injectMidTurn — re-running policy hooks and splicing onto the OLD
+ *  transcript, defeating the branch-safety fallback. Consumed (deleted) by onNew. */
+const forceNormalSendConvs = new Set<string>();
 /** Per-conversation persist version counter — incremented before each persist, checked before writing.
  *  Prevents stale async persists from overwriting newer data. */
 const persistVersions = new Map<string, number>();
@@ -5637,7 +5650,12 @@ export function RuntimeProvider({
       // the active run isn't cooperatively injectable (a CLI runtime), also fall
       // through to the normal supersede path.
       const wasRunningAtEntry = isRunningRef.current;
-      if (isRunningRef.current) {
+      // A composer fallback (sendMidTurn reported the branch changed / not injectable)
+      // marks this conversation to FORCE a normal superseding send — do NOT re-enter
+      // cooperative injection (which would re-run policy hooks + splice onto the old
+      // transcript). Consume the one-shot flag; the block below is skipped when set.
+      const forceNormalSend = forceNormalSendConvs.delete(convId);
+      if (isRunningRef.current && !forceNormalSend) {
         const onlyText = userContent.length > 0 && userContent.every((p) => p.type === 'text');
         if (onlyText) {
           const text = userContent
@@ -6520,6 +6538,9 @@ export function RuntimeProvider({
     if (!convId || !text.trim()) return;
     enqueueRejectedDraft(convId, { text, attachments: [] });
   }, []);
+  const markForceNormalSend = useCallback((convId: string) => {
+    if (convId) forceNormalSendConvs.add(convId);
+  }, []);
 
   const midTurnComposerState = useMemo<MidTurnComposerState>(
     () => ({
@@ -6530,8 +6551,18 @@ export function RuntimeProvider({
       cancelInject,
       getActiveConversationId,
       stashRejectedDraft,
+      markForceNormalSend,
     }),
-    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject, getActiveConversationId, stashRejectedDraft],
+    [
+      isRunning,
+      midTurnMode,
+      sendMidTurn,
+      pendingInjects,
+      cancelInject,
+      getActiveConversationId,
+      stashRejectedDraft,
+      markForceNormalSend,
+    ],
   );
   const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
     () => ({
