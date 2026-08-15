@@ -5713,7 +5713,24 @@ export function RuntimeProvider({
       const liveAcc = streamAccumulators.get(convId);
       let baseTree: StoredMessage[] = liveAcc ? liveAcc.messages : tree;
       let baseHead: string | null = liveAcc ? liveAcc.headId : headId;
-      if (!liveAcc && wasRunningAtEntry) {
+      // A FORCE-NORMAL-SEND fallback (the composer's sendMidTurn reported the branch
+      // changed during the async gate) must NOT base the new turn on the still-live
+      // accumulator's OLD head — that would re-anchor the conversation on the abandoned
+      // branch. Reload the AUTHORITATIVE (newly-selected) disk branch so the superseding
+      // turn lands where the user is now, not where the aborted run was.
+      if (forceNormalSend) {
+        try {
+          const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
+          if (fresh) {
+            const { tree: ft, headId: fh } = ensureTree(fresh);
+            baseTree = ft;
+            baseHead = fh;
+          }
+        } catch {
+          /* disk read failed — fall back to the (stale) accumulator/closure tree */
+        }
+      }
+      if (!forceNormalSend && !liveAcc && wasRunningAtEntry) {
         const finalized = lastFinalizedBranch.get(convId);
         if (finalized && finalized.messages.length >= baseTree.length) {
           baseTree = finalized.messages;

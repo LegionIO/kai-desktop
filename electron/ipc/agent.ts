@@ -641,6 +641,37 @@ function turnTokenTime(token: string): number {
   const n = Number.parseInt(dash > 0 ? token.slice(0, dash) : token, 10);
   return Number.isFinite(n) ? n : 0;
 }
+
+/**
+ * True when a conversation's CURRENT disk head is still on the branch a mid-turn
+ * inject was composed against — i.e. the head is `headBeforeGate` itself OR a
+ * DESCENDANT of it. A cooperative inject captures the head before its async policy
+ * gate; during that await the SAME live run's debounced partial persist legitimately
+ * advances the head from the user node to its assistant node (or a later step), which
+ * is NOT a branch switch. Exact-equality would misread that same-run advancement as a
+ * rewind/variant-switch and wrongly fall back to a superseding send (cancelling the
+ * live run's in-flight tools). Only a head that does NOT descend from headBeforeGate
+ * (a genuine rewind / sibling-variant selection) means the branch changed.
+ * headBeforeGate === null (no prior head) → any current head is "on branch".
+ */
+function injectHeadStillOnBranch(appHome: string, conversationId: string, headBeforeGate: string | null): boolean {
+  if (headBeforeGate === null) return true;
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return false;
+  const { tree, headId } = ensureConversationTree(conv);
+  if (headId === headBeforeGate) return true;
+  // Walk up from the current head; if we reach headBeforeGate it's a descendant
+  // (same-branch advancement). Bounded + cycle-guarded by the tree size.
+  const byId = new Map(tree.map((m) => [m.id, m] as const));
+  let cur: string | null = headId;
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur)) {
+    if (cur === headBeforeGate) return true;
+    seen.add(cur);
+    cur = byId.get(cur)?.parentId ?? null;
+  }
+  return false;
+}
 // Grant continuation-driver authorization for a turn to exactly ONE client. Rules:
 //  1. The turn must be the conversation's CURRENT active stream (activeStreams token) — a request
 //     for a turn that has already been superseded/ended is denied outright, so a delayed old-turn
@@ -6553,39 +6584,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // against a mid-stream fallback that lands during the async gate.
         revalidateLiveModel: true,
       });
-      // A TERMINAL policy BLOCK is a handled, permanent rejection — return
-      // blocked:true so the renderer surfaces it WITHOUT falling back to a normal
-      // superseding send that would re-run the blocked text (and, for a plugin
-      // pre-send abort, the raw user node may already be persisted). A NON-terminal
-      // denial (e.g. a mid-stream model-fallback changed the model during the async
-      // gate) is transient: fall back to a normal turn (cooperative:false) so it's
-      // re-evaluated under the new model rather than reported as a permanent block.
+      // Classify ownership FIRST (token/runtime unchanged AND head still on the
+      // composed-against branch, descendant-aware). A terminal policy block is only a
+      // true permanent rejection if we STILL own the run it was decided against — if
+      // ownership changed during the async gate, the block was against a STALE run, so
+      // fall back to a normal turn (which re-gates on the fresh turn) rather than
+      // surfacing a permanent block for a decision that no longer applies.
+      const runOwnershipIntact =
+        activeStreams.get(conversationId)?.token === tokenBeforeGate &&
+        getActiveStreamRuntime(conversationId) === 'mastra' &&
+        injectHeadStillOnBranch(appHome, conversationId, headBeforeGate);
       if (!gate.allowed) {
-        return gate.terminal
+        return gate.terminal && runOwnershipIntact
           ? { ok: false, blocked: true, error: gate.reason ?? 'blocked-by-policy' }
           : { ok: false, cooperative: false, error: gate.reason ?? 'gate-invalidated' };
       }
       // The gate awaited hooks; the cooperatively-injectable run may have finished
-      // or been superseded meanwhile. If the active token changed (or the run is no
-      // longer Mastra), enqueueing would strand the text (no prepareStep to drain
-      // it) or splice it into a DIFFERENT run. Tell the renderer to fall back to a
-      // normal turn instead (cooperative:false), same as the runtime pre-check.
-      if (
-        activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
-        getActiveStreamRuntime(conversationId) !== 'mastra'
-      ) {
+      // or been superseded meanwhile (token/runtime/branch changed). Tell the renderer
+      // to fall back to a normal turn instead (cooperative:false).
+      if (!runOwnershipIntact) {
         return { ok: false, cooperative: false, error: 'active run ended during policy enforcement' };
-      }
-      // Re-read the conversation AFTER the async gate: a branch switch / rewind during
-      // a slow hook moves the disk head without changing the stream token. If the head
-      // moved off the branch this inject was composed against, splicing would attach it
-      // to a divergent lineage (and the running turn would consume it on the old
-      // branch). Fall back to a normal turn so the user's message lands on the branch
-      // they're now viewing rather than being mis-parented.
-      const convAfterGate = readConversation(appHome, conversationId);
-      if (!convAfterGate) return { ok: false, error: 'conversation-not-found' };
-      if ((convAfterGate.headId ?? null) !== headBeforeGate) {
-        return { ok: false, cooperative: false, error: 'conversation branch changed during policy enforcement' };
       }
       const injectText = gate.text;
       const id = enqueueInject(conversationId, injectText);
@@ -6879,32 +6897,37 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Revalidate against a mid-stream model change during the async gate.
           revalidateLiveModel: true,
         });
-        // TERMINAL block → reject permanently. NON-terminal (model changed during the
-        // async gate) → for a cooperative-only raced answer, report transient
-        // (notCooperative) so it retries; for a normal caller, fall through to
-        // abort+restart with the gated text so the fresh turn re-gates under the
-        // now-active model.
+        // Compute ownership change FIRST — a terminal policy denial must be
+        // re-interpreted through it. If the run we gated for is GONE (token/runtime/
+        // branch changed during the async gate), a `terminal` block was decided
+        // against a STALE run: for a cooperative-only raced answer, treating it as
+        // terminal would PURGE the only copy of the answer instead of retrying it
+        // against the actual successor. So classify ownership before acting on the
+        // denial. (Branch check is descendant-aware: same-run debounced head
+        // advancement is NOT a switch — see injectHeadStillOnBranch.)
+        const ownershipChanged =
+          activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
+          getActiveStreamRuntime(conversationId) !== 'mastra' ||
+          (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken) ||
+          !injectHeadStillOnBranch(appHome, conversationId, headBeforeGate);
         let gateForcedFallthrough = false;
         if (!gate.allowed) {
-          if (gate.terminal) return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
+          // A terminal block is only truly terminal if we STILL own the run it was
+          // decided against. If ownership changed, report transient so a raced answer
+          // retries against the successor (cooperativeOnly) / a normal caller re-gates
+          // on the fresh turn — never purge the answer on a stale-run denial.
+          if (gate.terminal && !ownershipChanged) {
+            return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
+          }
           if (cooperativeOnly) return { ok: false, notCooperative: true };
           gateForcedFallthrough = true;
         }
         // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
-        // this conversation's active token changed (or the run ended), the run we
-        // resolved as cooperatively-injectable is gone — enqueueing now would strand
-        // the text (no prepareStep to drain it) or splice it into a DIFFERENT run
+        // this conversation's active token changed (or the run ended / branch diverged),
+        // the run we resolved as cooperatively-injectable is gone — enqueueing now would
+        // strand the text (no prepareStep to drain it) or splice it into a DIFFERENT run
         // than the one we gated for.
-        const ownershipChanged =
-          gateForcedFallthrough ||
-          activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
-          getActiveStreamRuntime(conversationId) !== 'mastra' ||
-          (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken) ||
-          // Branch moved during the gate (rewind / variant switch) — the token is
-          // unchanged but the splice would target a divergent lineage. Treat as an
-          // ownership change (cooperative-only → notCooperative; normal → abort+restart).
-          (readConversation(appHome, conversationId)?.headId ?? null) !== headBeforeGate;
-        if (ownershipChanged) {
+        if (gateForcedFallthrough || ownershipChanged) {
           // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
           // stale answer can't restart a stopped run or abort a newer one.
           if (cooperativeOnly) return { ok: false, notCooperative: true };
