@@ -203,21 +203,31 @@ function extractLastUserText(messages: unknown[]): string {
 /**
  * Map the post-enforcement payload of a mid-turn inject back to the text to
  * enqueue. Pure so the gate's decision (redaction vs. removal) is unit-testable
- * apart from the async hook orchestration. The input is a SINGLE text-only user
- * message; a hook may redact its text but must NOT restructure it — a cooperative
- * inject can only carry one plain user-text turn. So this DENIES (fail closed)
- * unless the payload is EXACTLY one text-only user message: an empty payload (hook
- * removed the turn), MORE than one message (hook added system/context messages we
- * can't faithfully splice), a non-user role, or any non-text part. Text is
- * extracted VERBATIM (no whitespace normalization — an inject may be multiline /
- * spacing-sensitive code, unlike extractMessageText's display projection).
+ * apart from the async hook orchestration.
+ *
+ * The gate runs hooks over the ACTIVE-BRANCH HISTORY plus the injected user turn
+ * (so a history-dependent hook sees the same context a normal send shows it), then
+ * this extracts ONLY the injected turn's (possibly-redacted) text. `historyLen` is
+ * the number of leading history messages the payload was built with (0 when the
+ * gate ran the injected turn alone — the legacy single-message shape).
+ *
+ * The injected turn is the message at index `historyLen` and MUST be the LAST one:
+ * a hook that ADDED messages after it (a system/context turn) can't be represented
+ * as a single user-text inject, so this DENIES (fail closed) unless the payload is
+ * EXACTLY `historyLen + 1` messages, the last is a user turn, and it is text-only.
+ * Text is extracted VERBATIM (no whitespace normalization — an inject may be
+ * multiline / spacing-sensitive code, unlike extractMessageText's projection).
  */
-export function resolveInjectedTextFromGatedPayload(payload: unknown[]): { allowed: boolean; text: string } {
-  // Exactly one message — a hook that ADDED messages (e.g. a system safety turn +
-  // the rewritten user turn) can't be represented as a single user-text inject, so
-  // fail closed rather than silently drop the added context while sending the text.
-  if (payload.length !== 1) return { allowed: false, text: '' };
-  const only = payload[0] as { role?: unknown; content?: unknown } | null;
+export function resolveInjectedTextFromGatedPayload(
+  payload: unknown[],
+  historyLen = 0,
+): { allowed: boolean; text: string } {
+  // The injected turn is the LAST message, appended after `historyLen` history
+  // messages. A hook that ADDED messages (extra system/context turns) makes the
+  // payload longer than expected — can't be spliced as one inject, so fail closed.
+  // A hook that REMOVED the injected turn makes it shorter → also fail closed.
+  if (payload.length !== historyLen + 1) return { allowed: false, text: '' };
+  const only = payload[historyLen] as { role?: unknown; content?: unknown } | null;
   if (!only || typeof only !== 'object' || only.role !== 'user') return { allowed: false, text: '' };
   // A hook that redacts the message to EMPTY text is effectively removing it — an
   // empty inject can't be enqueued (enqueueInject rejects it) and would otherwise
@@ -6688,7 +6698,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     //     this message didn't cause a message-specific prompt change → allow.
     const hookInputPrompt = ctx?.preHookSystemPrompt ?? config.systemPrompt ?? '';
     const runPostHookPrompt = ctx?.systemPrompt ?? hookInputPrompt;
-    let payload: unknown[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }];
+    // Gate the injected turn WITH the active-branch HISTORY prepended, so a
+    // history-dependent hook (e.g. one deriving a prompt suffix from the first user
+    // turn, or a redaction that keys off prior context) sees the SAME message
+    // context a normal send shows it — not a lone synthetic turn (which would make
+    // such a hook produce a different prompt and terminally reject a valid inject).
+    // Only the injected turn (the LAST message) is extracted afterward; the history
+    // is read-only context. Shape prior messages to the hook role/content contract.
+    const historyMessages: Array<{ role: string; content: unknown }> = (() => {
+      try {
+        const conv = readConversation(appHome, conversationId);
+        if (!conv) return [];
+        const { tree, headId } = ensureConversationTree(conv);
+        const branch = stripDisplayOnlyParts(getConversationBranch(tree, headId) as unknown[]) as Array<{
+          role?: unknown;
+          content?: unknown;
+        }>;
+        return branch
+          .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system' || m.role === 'tool'))
+          .map((m) => ({ role: String(m.role), content: m.content }));
+      } catch {
+        return []; // best-effort: fall back to gating the injected turn alone
+      }
+    })();
+    const historyLen = historyMessages.length;
+    let payload: unknown[] = [...historyMessages, { role: 'user', content: [{ type: 'text', text: userText }] }];
     // Track any hook rewrite of the system prompt. A cooperative inject splices
     // into an ALREADY-RUNNING turn whose system prompt is fixed — we CANNOT honor
     // a content-dependent prompt rewrite for this message the way a normal
@@ -6749,9 +6783,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         terminal: true,
       };
     }
-    // Extract the (possibly-redacted) text of the surviving user turn. If a hook
-    // REMOVED the user turn entirely, treat it as a denial (nothing to inject).
-    const resolved = resolveInjectedTextFromGatedPayload(payload);
+    // Extract the (possibly-redacted) text of the surviving INJECTED user turn (the
+    // last message, after `historyLen` history messages). If a hook REMOVED it or
+    // ADDED messages around it, treat as a denial (nothing faithfully injectable).
+    const resolved = resolveInjectedTextFromGatedPayload(payload, historyLen);
     if (!resolved.allowed)
       return { allowed: false, text: userText, reason: 'A policy hook removed this message.', terminal: true };
     // The gate awaited async hooks. If a mid-stream model-fallback changed the

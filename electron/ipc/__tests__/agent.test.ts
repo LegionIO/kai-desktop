@@ -550,4 +550,47 @@ describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', ()
     ]);
     expect(res).toEqual({ allowed: false, text: '' });
   });
+
+  describe('with history context (historyLen > 0)', () => {
+    it('extracts ONLY the injected turn (last message) after N history messages', () => {
+      // The gate ran hooks over [history…, injectedUser]; extract the last turn.
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'assistant', content: 'a reply' },
+          { role: 'user', content: [{ type: 'text', text: 'the injected answer' }] },
+        ],
+        2,
+      );
+      expect(res).toEqual({ allowed: true, text: 'the injected answer' });
+    });
+
+    it('denies when a hook ADDED a message AFTER the injected turn (payload too long)', () => {
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'user', content: [{ type: 'text', text: 'answer' }] },
+          { role: 'system', content: 'SAFETY appended' },
+        ],
+        1,
+      );
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+
+    it('denies when a hook REMOVED the injected turn (payload too short)', () => {
+      const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: 'first prompt' }], 1);
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+
+    it('denies when the message at the injected index is not a user turn', () => {
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'assistant', content: 'hook replaced the inject with an assistant turn' },
+        ],
+        1,
+      );
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+  });
 });
