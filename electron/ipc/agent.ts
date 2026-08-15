@@ -375,6 +375,7 @@ import {
   resolveAskUserGateOutcome,
   rekeyRacedAnswer,
   formatRacedAnswerAsUserTurn,
+  getRecoveredAnswerDeliverer,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -1154,6 +1155,30 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
         // isn't stuck until the next trigger. No-op if there's no live claimant yet
         // (a later successor start transfers the handoff instead).
         mergePendingHandoffIntoLiveClaimant(conversationId);
+      } else if (
+        (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
+        !terminalAbortTokens.has(claimant.token) &&
+        (state.deliveryInFlightCount ?? 0) > 0
+      ) {
+        // ORDINARY completion (no genuine successor) but a delivery was IN FLIGHT: the
+        // run finished before consuming an answer the user DID submit. A raced-answer
+        // handoff can't own this without misdelivery (see above), so hand it to the
+        // durable recovery path: re-inject into the ORIGIN conversation as a labeled
+        // turn, with a persistent Alert fallback (deliverRecoveredAnswer). On inline
+        // delivery, purge the stash copy (delivered elsewhere); otherwise the alert
+        // fallback / bounded stash retains it. Never registers a claimable handoff.
+        const deliverer = getRecoveredAnswerDeliverer();
+        if (deliverer) {
+          // We don't carry the original question title in the raced state; the
+          // deliverer falls back to a generic "your earlier question" label.
+          void deliverer(conversationId, '', answer)
+            .then((res) => {
+              if (res.delivered) pendingQuestionAnswers.delete(answerKey);
+            })
+            .catch(() => {
+              /* best-effort — the re-stashed copy above remains as the last resort */
+            });
+        }
       }
     };
     // A TERMINAL outcome (policy hook blocked the answer / a hook errored) must

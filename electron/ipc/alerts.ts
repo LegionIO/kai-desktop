@@ -27,6 +27,7 @@ import {
 import { readConversation } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
+import { setRecoveredAnswerDeliverer } from '../tools/ask-user.js';
 import { isGuiFocused } from '../agent/kai-presence.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
@@ -49,6 +50,90 @@ export function initializeAlerts(d: AlertsDeps): void {
   // Let the tools layer (request_review / ask_user fallback) trigger OS
   // notifications + UI broadcasts after it writes the alert store directly.
   setAlertCreatedHandler(notifyNewAlert);
+  // Let the ask_user raced-answer machinery deliver an answer whose run finished
+  // before consuming it (ordinary completion + in-flight delivery + no genuine
+  // successor) — into the ORIGIN conversation as a labeled turn, with a persistent
+  // Alert as the durable fallback (see deliverRecoveredAnswer). Wired here (not a
+  // direct import in agent.ts) so the tools/agent layers stay free of the
+  // automations/alerts graph — mirrors setAlertCreatedHandler.
+  setRecoveredAnswerDeliverer(deliverRecoveredAnswer);
+}
+
+/**
+ * Deliver an ALREADY-COLLECTED raced answer whose run finished before it could be
+ * consumed (the ordinary-completion / in-flight-delivery orphan case — see the
+ * ask_user raced-answer machinery in agent.ts). We already have the user's answer,
+ * so this does NOT re-ask: it re-injects the answer into the ORIGINATING
+ * conversation as a clearly-labeled `[Answering your earlier question …]` user turn
+ * (idle conv → fresh turn; busy conv → a follow-up in the SAME chat — a legitimate
+ * late user message, NOT a cross-turn splice). This is why it can't misdeliver the
+ * way the raced-answer HANDOFF could: the answer only ever reaches the origin
+ * conversation, never an unrelated turn's tool loop.
+ *
+ * If inline delivery isn't possible (conversation gone, or the resume throws /
+ * rejects busy), fall back to a persistent `question` Alert carrying the answer so
+ * it survives an app restart and the user can re-surface it — nothing is silently
+ * lost. Returns `{ delivered:true }` only when the inline re-inject was launched.
+ */
+export async function deliverRecoveredAnswer(
+  conversationId: string,
+  questionTitle: string,
+  answers: Record<string, string>,
+): Promise<{ delivered: boolean }> {
+  if (!deps) return { delivered: false };
+  const clean = sanitizeAnswer(answers);
+  if (!clean) return { delivered: false };
+  const title = questionTitle.trim() || 'your earlier question';
+  const lines = Object.entries(clean).map(([header, choice]) => `- ${header} → ${choice}`);
+  const body = lines.length ? lines.join('\n') : '(no answer provided)';
+  const text = `[Answering your earlier question "${title}"]\n${body}`;
+  const correlationId = `recovered-answer-${conversationId}`;
+  // Inline re-inject into the ORIGIN conversation when it still exists on disk.
+  if (readConversation(deps.appHome, conversationId)) {
+    try {
+      await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), { correlationId });
+      traceDiagnostic({
+        scope: 'alert',
+        event: 'recovered-answer.delivered',
+        correlationId,
+        conversationId,
+        fields: { answerCount: Object.keys(clean).length },
+      });
+      return { delivered: true };
+    } catch {
+      // fall through to the durable Alert fallback
+    }
+  }
+  // Durable fallback: raise a persistent `question` Alert carrying the answer so the
+  // user can re-surface it (survives restart). One synthesized question renders the
+  // already-collected answer as the body; answering it re-injects via alerts:answer.
+  try {
+    const alert = createAlert(deps.appHome, {
+      kind: 'question',
+      title,
+      body,
+      conversationId,
+      questions: [
+        {
+          question: `You answered "${title}" but the turn ended before it was received. Resend your answer?`,
+          header: 'Resend',
+          options: [{ label: 'Resend' }, { label: 'Discard' }],
+        },
+      ],
+    });
+    notifyNewAlert(alert);
+    traceDiagnostic({
+      scope: 'alert',
+      event: 'recovered-answer.alerted',
+      correlationId,
+      conversationId,
+      alertId: alert.id,
+      fields: { answerCount: Object.keys(clean).length },
+    });
+  } catch {
+    /* best-effort — the caller retains its bounded-stash copy as the last resort */
+  }
+  return { delivered: false };
 }
 
 /** Push an `alerts:changed` event to every window + web client (tab badge / modal host). */

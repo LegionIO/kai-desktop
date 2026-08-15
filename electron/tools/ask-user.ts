@@ -29,6 +29,34 @@ export function stashQuestionAnswers(toolCallId: string, answers: Record<string,
 }
 
 /**
+ * Deliver an already-collected raced answer that its run finished before consuming
+ * (ordinary completion with an in-flight delivery + no genuine successor — the
+ * misdelivery-vs-orphan case). Wired by the alerts layer (initializeAlerts →
+ * setRecoveredAnswerDeliverer) so the tools/agent layers don't import the
+ * automations/alerts graph directly (mirrors setAlertCreatedHandler). Delivers the
+ * answer to the ORIGINATING conversation as a labeled new user turn (or, on
+ * failure, raises a persistent Alert). Returns whether it was delivered inline.
+ * `null` deliverer (not yet wired / no alerts) → caller keeps the stash copy.
+ */
+export type RecoveredAnswerDeliverer = (
+  conversationId: string,
+  questionTitle: string,
+  answers: Record<string, string>,
+) => Promise<{ delivered: boolean }>;
+
+let recoveredAnswerDeliverer: RecoveredAnswerDeliverer | null = null;
+
+/** Wire the recovered-answer delivery path (called once from initializeAlerts). */
+export function setRecoveredAnswerDeliverer(fn: RecoveredAnswerDeliverer | null): void {
+  recoveredAnswerDeliverer = fn;
+}
+
+/** The wired recovered-answer deliverer, or null when the alerts layer isn't up. */
+export function getRecoveredAnswerDeliverer(): RecoveredAnswerDeliverer | null {
+  return recoveredAnswerDeliverer;
+}
+
+/**
  * The message the ask_user tool returns when its `execute` runs but no answers
  * were recorded. Distinct from a genuine dismiss (handled upstream in the gate,
  * which skips execution) — this only surfaces if execute runs with no stash,

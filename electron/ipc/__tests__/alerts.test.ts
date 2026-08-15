@@ -15,7 +15,13 @@ vi.mock('../../automations/actions.js', () => ({
   resumeConversationWithMessage: vi.fn(async () => undefined),
 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: vi.fn() }));
-vi.mock('../alert-notify.js', () => ({ setAlertCreatedHandler: vi.fn() }));
+vi.mock('../alert-notify.js', () => ({ setAlertCreatedHandler: vi.fn(), notifyAlertCreated: vi.fn() }));
+vi.mock('../conversation-store.js', () => ({ readConversation: vi.fn(() => ({ id: 'c1' })) }));
+vi.mock('../alert-store.js', async () => {
+  const actual = (await vi.importActual('../alert-store.js')) as Record<string, unknown>;
+  return { ...actual, createAlert: vi.fn(() => ({ id: 'alert-1', kind: 'question' })) };
+});
+vi.mock('../../tools/ask-user.js', () => ({ setRecoveredAnswerDeliverer: vi.fn() }));
 
 import { __internal } from '../alerts';
 import type { Alert } from '../alert-store';
@@ -98,5 +104,53 @@ describe('alerts IPC validators', () => {
     const many: Record<string, string> = {};
     for (let i = 0; i < 21; i++) many[`k${i}`] = 'v';
     expect(__internal.sanitizeAnswer(many)).toBeNull();
+  });
+});
+
+describe('deliverRecoveredAnswer (raced answer whose run finished before consuming it)', () => {
+  it('re-injects into the ORIGIN conversation as a labeled turn when it still exists', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    const actionDeps = {} as never;
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => actionDeps, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: true });
+    const call = (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+    expect(call?.[0]).toBe('c1');
+    expect(call?.[1]).toContain('[Answering your earlier question "Deploy target"]');
+    expect(call?.[1]).toContain('- Env → prod');
+  });
+
+  it('raises a persistent question Alert (delivered:false) when the conversation is gone', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { readConversation } = await import('../conversation-store.js');
+    const { createAlert } = await import('../alert-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('gone', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: false });
+    expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+  });
+
+  it('falls back to a generic label when no question title is provided', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    await deliverRecoveredAnswer('c1', '', { Env: 'prod' });
+    const call = (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+    expect(call?.[1]).toContain('your earlier question');
+  });
+
+  it('returns delivered:false for an empty/invalid answer (nothing to deliver)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+    expect(await deliverRecoveredAnswer('c1', 't', {})).toEqual({ delivered: false });
   });
 });
