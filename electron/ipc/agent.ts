@@ -860,7 +860,12 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       // the accumulator is empty.
       try {
         if (remoteOrigin) finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
-        else finalizeInterruptedTurn(fbAppHome, conversationId);
+        // LOCAL origin: upsert-by-id, not a plain append. The renderer's debounced
+        // persist may have landed the assistant node under this run's responseMessageId
+        // just before it reloaded/crashed (disk still 'running'); a plain append would
+        // id-collision-rename it to a bogus `auto-msg-*` sibling. replaceById upserts in
+        // place (falls back to append when no such node exists).
+        else finalizeInterruptedTurnUpsert(fbAppHome, conversationId);
       } catch {
         discardPersistenceAccumulator(conversationId);
       }
@@ -2196,7 +2201,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
       if (!rendererPersisted) {
         try {
-          finalizeInterruptedTurn(appHome, conversationId);
+          // Upsert-by-id (NOT a plain append): the local originator's renderer runs a
+          // ~300ms debounced stream-persist, so disk may ALREADY carry the assistant
+          // node under this run's responseMessageId even while runStatus is still
+          // 'running'. A plain finalizeInterruptedTurn would id-collision-rename it to a
+          // bogus `auto-msg-*` duplicate sibling AND move the head back to it, writing
+          // 'idle' over the just-admitted replacement turn (whose new prompt is already
+          // the disk head) — leaving that prompt off-branch if it produced no assistant
+          // node yet. replaceById upserts in place (falls back to append when absent).
+          finalizeInterruptedTurnUpsert(appHome, conversationId);
         } catch {
           /* fall through to the discard below */
         }
@@ -7708,7 +7721,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (remaining <= 0) {
             pendingLocalReplace.delete(conversationId);
             try {
-              finalizeInterruptedTurn(appHome, conversationId); // renderer never persisted → save main's partial
+              // Upsert-by-id: the renderer's debounced persist may have landed the
+              // assistant node under this run's responseMessageId just before it
+              // crashed/reloaded (disk still 'running'); a plain append would
+              // id-collision-rename it to a bogus `auto-msg-*` sibling. replaceById
+              // upserts in place (falls back to append when no such node exists).
+              finalizeInterruptedTurnUpsert(appHome, conversationId); // renderer never persisted → save main's partial
             } catch {
               discardPersistenceAccumulator(conversationId);
             }
