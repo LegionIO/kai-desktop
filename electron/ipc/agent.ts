@@ -163,6 +163,10 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // a stale `deliver` callback (or handoff) that a late answer could target at
   // the replacement turn. Token-scoped so a replacement's own claimant is intact.
   dropRacedAnswerClaimantForToken(conversationId, token);
+  // Record that THIS token's run has ended (whether or not it still owns the
+  // stream) so a later ask_user abort-site registration can tell a dead bound
+  // successor from a not-yet-started one (see recentlyEndedTokens).
+  markTokenEnded(token);
   if (activeStreams.get(conversationId)?.token !== token) return;
   // Finalize the GUI persistence fallback BEFORE dropping ownership: EVERY terminal path that
   // cleans up an owned stream — the main finally AND every early-exit (config error, hook denial,
@@ -978,6 +982,23 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
 const RACED_ANSWER_HANDOFF_TTL_MS = 30_000;
 const MAX_RACED_ANSWER_DELIVERY_RETRIES = 20;
 const RACED_ANSWER_RETRY_MS = 500;
+// Stream tokens whose run has FULLY ended (terminal cleanup ran), bounded FIFO.
+// Lets the ask_user abort-site handoff registration tell "the bound successor
+// already DIED synchronously" (token in this set) from "the successor hasn't
+// started yet" (token absent) — so it can durably recover an answer bound to a
+// dead successor without false-positive premature recovery of a still-starting
+// one (R86). Recorded in cleanupStreamIfOwned; a genuine successor that later
+// starts is never in here at its own registration time.
+const recentlyEndedTokens = new Set<string>();
+const MAX_RECENTLY_ENDED_TOKENS = 400;
+function markTokenEnded(token: string): void {
+  recentlyEndedTokens.add(token);
+  while (recentlyEndedTokens.size > MAX_RECENTLY_ENDED_TOKENS) {
+    const oldest = recentlyEndedTokens.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    recentlyEndedTokens.delete(oldest);
+  }
+}
 type RacedAnswerState = {
   /** Pending answer stash keys — a SET so parallel ask_user calls in one turn,
    *  which each register on the shared controller abort, don't overwrite. */
@@ -1249,6 +1270,32 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
   }
 }
 
+/** Route any ALREADY-STASHED answers for these keys through the durable
+ *  recovered-answer path (re-inject into the ORIGIN conversation as a labeled turn,
+ *  or persist as an Alert) instead of leaving them orphaned in the bounded stash
+ *  when their handoff/claimant is about to be dropped with NO viable successor —
+ *  an ordinary-completion teardown, a non-Mastra successor takeover, or a handoff
+ *  bound to an already-dead successor (R86). Best-effort + bounded; the stash copy
+ *  remains as the last resort. Consumes the stash key on successful inline delivery.
+ *  No-op for keys whose answer hasn't arrived yet (nothing to recover; the durable
+ *  path is re-driven by agent:answer-tool-question when it does — but only if a
+ *  handoff still references it, so callers should recover BEFORE dropping). */
+function recoverOrphanedAnswerKeys(conversationId: string, keys: Iterable<string>): void {
+  const deliverer = getRecoveredAnswerDeliverer();
+  if (!deliverer) return;
+  for (const key of keys) {
+    const answer = pendingQuestionAnswers.get(key);
+    if (!answer) continue;
+    void deliverer(conversationId, '', answer)
+      .then((res) => {
+        if (res.delivered) pendingQuestionAnswers.delete(key);
+      })
+      .catch(() => {
+        /* best-effort — the bounded stash copy remains as the last resort */
+      });
+  }
+}
+
 /** Find the conversation whose pending handoff OR live claimant holds `answerKey`
  *  (the answer-arrival side only knows the key). Bounded scan over small maps. */
 function conversationForRacedAnswerKey(answerKey: string): string | undefined {
@@ -1330,6 +1377,14 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
       // now so the requeued answer isn't stuck in the pre-successor map until TTL.
       mergePendingHandoffIntoLiveClaimant(conversationId);
       return;
+    }
+    // ORDINARY completion (no live replacement): don't re-register a claimable
+    // handoff (an unrelated later turn could grab it). But an answer already stashed
+    // for an undelivered key is owed to THIS conversation — route it through the
+    // durable recovered-answer path (labeled re-inject / Alert) BEFORE dropping, so
+    // it isn't orphaned in the bounded stash under an obsolete tool-call id (R86).
+    if (claimant.state.answerKeys.size > 0 && !racedStateInvalid(claimant.state, conversationId)) {
+      recoverOrphanedAnswerKeys(conversationId, claimant.state.answerKeys);
     }
     liveRacedAnswerClaimant.delete(conversationId);
   }
@@ -3022,6 +3077,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         );
         if (willUseDirectInferenceProvider) {
           // Non-cooperative: same handling as the non-Mastra branch below.
+          // Recover any stashed answers durably before dropping both maps (R86).
+          {
+            const h = racedAnswerHandoffs.get(conversationId);
+            if (h) recoverOrphanedAnswerKeys(conversationId, h.answerKeys);
+            const c = liveRacedAnswerClaimant.get(conversationId);
+            if (c) recoverOrphanedAnswerKeys(conversationId, c.state.answerKeys);
+          }
           racedAnswerHandoffs.delete(conversationId);
           liveRacedAnswerClaimant.delete(conversationId);
           traceDiagnostic({
@@ -3079,6 +3141,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // predecessor whose teardown is still pending: if THIS non-Mastra run
         // finishes first, its cleanup wouldn't touch that claimant (token mismatch),
         // and a subsequent Mastra turn could inherit + inject the stale answer.
+        // First route any ALREADY-STASHED answers through the durable recovered-answer
+        // path (labeled re-inject / Alert) so they aren't orphaned under an obsolete
+        // tool-call id once both maps are dropped (R86).
+        {
+          const h = racedAnswerHandoffs.get(conversationId);
+          if (h) recoverOrphanedAnswerKeys(conversationId, h.answerKeys);
+          const c = liveRacedAnswerClaimant.get(conversationId);
+          if (c) recoverOrphanedAnswerKeys(conversationId, c.state.answerKeys);
+        }
         racedAnswerHandoffs.delete(conversationId);
         liveRacedAnswerClaimant.delete(conversationId);
         traceDiagnostic({
@@ -5706,6 +5777,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // (no-op if there's no live+owning claimant, honoring the same
                 // successor-token binding as the claim site).
                 mergePendingHandoffIntoLiveClaimant(conversationId);
+                // If the handoff is bound to a successor that ALREADY ENDED
+                // synchronously (B aborted A, then config-failed + ran teardown
+                // BEFORE this gate registered — so B's own drop couldn't remove this
+                // A→B handoff), it would linger bound to a dead token until TTL with no
+                // turn able to claim it. recentlyEndedTokens tells a dead bound
+                // successor from a not-yet-started one; on a dead one, recover the
+                // stashed answer durably (labeled re-inject / Alert) and drop the
+                // handoff (R86).
+                {
+                  const h = racedAnswerHandoffs.get(conversationId);
+                  const bound = h?.expectedSuccessorToken;
+                  if (h && bound !== undefined && bound !== streamToken && recentlyEndedTokens.has(bound)) {
+                    recoverOrphanedAnswerKeys(conversationId, h.answerKeys);
+                    racedAnswerHandoffs.delete(conversationId);
+                  }
+                }
                 traceDiagnostic({
                   scope: 'agent',
                   event: 'question.answer-handoff-registered',
