@@ -1000,7 +1000,11 @@ describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user re
   it('selects the ACTIVE variant when a fallback left two assistants under the injected user', () => {
     // A transient model-fallback left both a failed partial (asst-failed) and the
     // successful reply (asst-ok) under the injected user; head = asst-ok (active).
-    // Repair must thread asst-ok (not asst-failed) before the user: u1 → asst-ok → inject.
+    // BOTH were produced BEFORE the model saw the inject, so BOTH move back onto the
+    // pre-inject head (u1) as siblings; only the ACTIVE one gets the injected user
+    // attached: u1 → {asst-failed, asst-ok}, asst-ok → inject. (Leaving asst-failed
+    // under inject would group a stale pre-inject reply with the post-inject
+    // continuation in variant selection.)
     seed(
       [
         { id: 'u1', parentId: null, role: 'user', content: 'q' },
@@ -1017,6 +1021,9 @@ describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user re
       messages: Array<{ id: string }>;
     };
     expect(conv.messageTree.find((m) => m.id === 'asst-ok')?.parentId).toBe('u1');
+    // The failed variant is ALSO moved back to the pre-inject head (a sibling of the
+    // active one), NOT left dangling under the injected user.
+    expect(conv.messageTree.find((m) => m.id === 'asst-failed')?.parentId).toBe('u1');
     expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst-ok');
     expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst-ok', 'inject']);
   });

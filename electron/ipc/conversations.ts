@@ -655,8 +655,23 @@ export function reorderInjectPrefixOnDisk(
   const firstInjected = present[0];
   const firstUser = tree.find((m) => m.id === firstInjected)!;
   const chainParent = firstUser.parentId; // the pre-inject head
+  // ALL assistant variants that sit under the SAME injected user as the active
+  // prefix were produced BEFORE the model saw the inject (a transient fallback can
+  // leave a failed partial + the successful reply as siblings there). Move EVERY
+  // such pre-consumption variant back to the pre-inject head (chainParent) so they
+  // stay siblings of each other on the PRE-inject branch — attaching the FIRST
+  // injected user only to the ACTIVE variant (prefix). Moving just the active one
+  // would leave the failed sibling(s) under the injected user, where the eventual
+  // continuation also lands → variant selection would group a stale pre-inject reply
+  // with the post-inject continuation. (Keyed on prefix.parentId, which in a
+  // multi-inject batch is the LAST injected user the renderer parented the reply
+  // under — not necessarily firstInjected.)
+  const variantParent = prefix.parentId;
+  const preConsumptionVariantIds = new Set(
+    tree.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
+  );
   const nextTree = tree.map((m) => {
-    if (m.id === prefix.id) return { ...m, parentId: chainParent };
+    if (preConsumptionVariantIds.has(m.id)) return { ...m, parentId: chainParent };
     if (m.id === firstInjected) return { ...m, parentId: prefix.id };
     return m;
   });

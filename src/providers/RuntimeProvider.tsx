@@ -1529,16 +1529,18 @@ export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: Store
   if (desiredId && acc.closedPrefixIds?.has(desiredId)) {
     desiredId = acc.injectContinuationId ?? `${desiredId}-cont`;
   }
-  // A cooperative-inject continuation is PENDING (boundary set injectContinuationId)
-  // but hasn't materialized a node yet. A PRE-CONTENT model-fallback right after the
-  // boundary rotates acc.pendingAssistantId to the fallback model's FRESH id — which
-  // is NOT a closed prefix, so the branch above wouldn't redirect it, and the renderer
-  // would create the continuation under the fresh id while main's fallback accumulator
-  // still uses `${injectedUserId}-cont` → divergent ids → a duplicate sibling if main
-  // finalizes (reload/crash/passive continuation/web frame-cap). So while the
-  // continuation node has NOT yet materialized, pin desiredId to injectContinuationId
-  // regardless of the current pendingAssistantId — matching main's deterministic id.
-  if (acc.injectContinuationId && !acc.messages.some((m) => m.id === acc.injectContinuationId)) {
+  // A cooperative-inject continuation boundary is OPEN (injectContinuationId is the
+  // CURRENT boundary's deterministic id; a new boundary rotates it and moves the old
+  // one into closedPrefixIds). ALL continuation content for this boundary must land on
+  // that id. A PRE-CONTENT model-fallback rotates acc.pendingAssistantId to the fallback
+  // model's FRESH id — which is NOT a closed prefix, so the branch above wouldn't
+  // redirect it; without this pin the renderer would create the continuation under the
+  // fresh id while main's fallback accumulator uses `${injectedUser}-cont` → divergent
+  // ids → a duplicate sibling on a main finalize. Pin the WHOLE boundary (not just until
+  // the node first materializes — else a fallback's SECOND delta, arriving after the
+  // deterministic node exists, would revert to the fresh id and fork a duplicate node):
+  // the reuse-in-place check below then reuses the materialized node, or creates it.
+  if (acc.injectContinuationId && desiredId !== acc.injectContinuationId) {
     desiredId = acc.injectContinuationId;
   }
   // Cooperative-inject ordering guard: when an inject was broadcast mid-step, the
