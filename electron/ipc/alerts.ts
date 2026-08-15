@@ -104,22 +104,19 @@ export async function deliverRecoveredAnswer(
       // fall through to the durable Alert fallback
     }
   }
-  // Durable fallback: raise a persistent `question` Alert carrying the answer so the
-  // user can re-surface it (survives restart). One synthesized question renders the
-  // already-collected answer as the body; answering it re-injects via alerts:answer.
+  // Durable fallback: raise a persistent `fyi` Alert that RECORDS the answer the
+  // user gave (in the body) so it's neither silently lost nor misdelivered — it
+  // survives an app restart and the user can re-send it manually from the
+  // conversation if still relevant. NOT a `question` alert: we already have the
+  // answer, so re-asking would be confusing, and an answerable synthetic question
+  // (`alerts:answer`) would re-inject the SYNTHETIC choice ("Resend"/"Discard"),
+  // not the saved answer — the wrong payload.
   try {
     const alert = createAlert(deps.appHome, {
-      kind: 'question',
-      title,
-      body,
+      kind: 'fyi',
+      title: `Answer not delivered: ${title}`,
+      body: `Your answer arrived after the turn ended, so it wasn't applied:\n${body}\n\nIf it's still relevant, re-send it in the conversation.`,
       conversationId,
-      questions: [
-        {
-          question: `You answered "${title}" but the turn ended before it was received. Resend your answer?`,
-          header: 'Resend',
-          options: [{ label: 'Resend' }, { label: 'Discard' }],
-        },
-      ],
     });
     notifyNewAlert(alert);
     traceDiagnostic({

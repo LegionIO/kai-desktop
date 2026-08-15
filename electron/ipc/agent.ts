@@ -440,6 +440,18 @@ function recordActiveRunResponseId(conversationId: string, token: string, respon
     activeStreamResponseIds.set(conversationId, { token, ids: new Set([responseId]) });
   }
 }
+/** Drop a response id from the run's active lineage — used when a model-fallback
+ *  SEALS the failed partial as an INACTIVE sibling variant and mints a fresh id for
+ *  the retry. The sealed id is no longer on the live branch, so it must not count as
+ *  same-run advancement in injectHeadStillOnBranch: if the user selected that failed
+ *  sibling during a mid-turn gate's await, the walk would otherwise cross the sealed
+ *  id and wrongly accept the inject onto the successful variant despite the user's
+ *  selection. Token-scoped no-op if superseded. */
+function forgetActiveRunResponseId(conversationId: string, token: string, responseId: string): void {
+  if (activeStreams.get(conversationId)?.token !== token) return;
+  const entry = activeStreamResponseIds.get(conversationId);
+  if (entry && entry.token === token) entry.ids.delete(responseId);
+}
 /** Record a cooperative-inject boundary's nodes as this run's own lineage: the
  *  injected user node AND its deterministic `${id}-cont` continuation. After a
  *  splice, subsequent output persists under `-cont` (renderer) / after the
@@ -2927,6 +2939,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         preHookSystemPrompt,
         executionMode: effectiveExecutionMode,
       });
+      // Seed the run's INITIAL response id into its lineage NOW, before any provider
+      // event. A GUI turn passes a caller-provided responseMessageId that the
+      // renderer persists a PRE-MODEL notice under (e.g. the provider-native-tool
+      // warning) before the first provider event carries an id — without seeding,
+      // injectHeadStillOnBranch would see that legitimate head advance as a branch
+      // switch and wrongly supersede the healthy run (a mid-turn send whose gate is
+      // still awaiting). Token-scoped no-op if superseded.
+      if (responseMessageId) recordActiveRunResponseId(conversationId, streamToken, responseMessageId);
     }
 
     // Raced-answer → successor rendezvous (see registerRacedAnswerHandoff): if a
@@ -6064,6 +6084,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // don't get the failed + successful variants concatenated (matching
               // the renderer + persistence + other collectors).
               accumulatedResponseText = '';
+              // The failed partial's response id is no longer the LIVE branch: it was
+              // either discarded or SEALED as an inactive sibling variant, and the
+              // retry continues under a FRESH id (recorded when its events arrive).
+              // Forget it from the run's active lineage so injectHeadStillOnBranch
+              // won't accept a mid-turn inject onto that failed sibling if the user
+              // selected it during a gate's await (R83). Token-scoped no-op if gone.
+              if (latestReplyResponseId) {
+                forgetActiveRunResponseId(conversationId, streamToken, latestReplyResponseId);
+                latestReplyResponseId = null;
+              }
               // NOTE: a just-consumed cooperative inject is NOT re-queued for the
               // fallback attempt. It's already PERSISTED on the branch (the
               // consumption handler wrote it) and IS in the messages the fallback
