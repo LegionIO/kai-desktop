@@ -30,6 +30,17 @@ export type PluginGenerateOptions = {
    *  mutating workspace tools). When set, the run honors the conversation's mode
    *  instead of the global config default. */
   executionMode?: ExecutionMode;
+  /** Per-thread setting overrides (temperature / systemPromptOverride / maxSteps /
+   *  maxRetries / runtimeOverride) forwarded to resolveStreamConfig, so a resumed
+   *  turn honors the CONVERSATION's persisted instructions + runtime rather than the
+   *  global/profile defaults (R92). */
+  threadOverrides?: {
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  };
   /** Cooperative injects consumed at a prepareStep boundary. */
   onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
 };
@@ -106,6 +117,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
     threadProfileKey: options.profileKey ?? null,
     reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
     fallbackEnabled: options.fallbackEnabled ?? false,
+    ...(options.threadOverrides ? { threadOverrides: options.threadOverrides } : {}),
   });
 
   if (!streamConfig?.primaryModel) {

@@ -7575,7 +7575,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       opts?.profileKey ?? updated.selectedProfileKey ?? undefined,
       updated.fallbackEnabled,
       opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
-      opts?.executionMode,
+      opts?.executionMode ?? (updated as { executionMode?: ExecutionMode }).executionMode,
     );
     return { ok: true };
   };

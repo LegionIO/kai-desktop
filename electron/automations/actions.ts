@@ -48,7 +48,13 @@ export type ActionDeps = {
   injectUserTurnAndRestart?: (
     conversationId: string,
     userText: string,
-    opts?: { modelKey?: string; reasoningEffort?: string; profileKey?: string; cwd?: string },
+    opts?: {
+      modelKey?: string;
+      reasoningEffort?: string;
+      profileKey?: string;
+      cwd?: string;
+      executionMode?: ExecutionMode;
+    },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
 };
 
@@ -144,6 +150,16 @@ export async function resumeConversationWithMessage(
     cwd?: string;
     executionMode?: ExecutionMode;
     fallbackEnabled?: boolean;
+    /** Reasoning effort + per-thread overrides so a resume honors the conversation's
+     *  persisted instructions/runtime (R92). */
+    reasoningEffort?: string;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
   },
 ): Promise<unknown> {
   const action: Extract<AutomationAction, { type: 'agent' }> = {
@@ -189,6 +205,8 @@ export async function resumeConversationWithMessage(
     ...(opts?.cwd ? { cwd: opts.cwd } : {}),
     ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
     ...(opts?.fallbackEnabled !== undefined ? { fallbackEnabled: opts.fallbackEnabled } : {}),
+    ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+    ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
   });
 }
 
@@ -361,6 +379,17 @@ async function runAgentAction(
     executionMode?: ExecutionMode;
     /** Explicit fallback toggle; overrides the default `Boolean(profileKey)`. */
     fallbackEnabled?: boolean;
+    /** Reasoning effort + per-thread overrides (temperature / systemPromptOverride /
+     *  maxSteps / maxRetries / runtimeOverride) for a resumed turn, so it honors the
+     *  conversation's persisted settings (R92). Forwarded to streamForPlugin. */
+    reasoningEffort?: string;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -534,6 +563,9 @@ async function runAgentAction(
     const res = await deps.injectUserTurnAndRestart!(targetConvId, prompt, {
       modelKey: action.modelKey,
       profileKey: action.profileKey,
+      ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+      ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.
@@ -1024,6 +1056,8 @@ async function runAgentAction(
         abortSignal: abortController.signal,
         ...(opts?.cwd ? { cwd: opts.cwd } : {}),
         ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+        ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort as never } : {}),
+        ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
         // prepareStep may fire this BEFORE the prior step's events reach this
         // loop; buffer, don't persist synchronously. Flushed at the top of each
         // iteration (below) once those events have been consumed.

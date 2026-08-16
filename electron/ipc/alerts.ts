@@ -59,6 +59,39 @@ export function initializeAlerts(d: AlertsDeps): void {
   setRecoveredAnswerDeliverer(deliverRecoveredAnswer);
 }
 
+/** Collect the conversation's persisted per-thread overrides into the shape
+ *  `resumeConversationWithMessage` forwards to the stream. Returns `undefined`
+ *  when none are set so callers can omit the field entirely (R92). */
+function buildThreadOverrides(conv: {
+  temperature?: number | null;
+  systemPromptOverride?: string | null;
+  maxSteps?: number | null;
+  maxRetries?: number | null;
+  runtimeOverride?: string | null;
+}):
+  | {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    }
+  | undefined {
+  const overrides: {
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  } = {};
+  if (typeof conv.temperature === 'number') overrides.temperature = conv.temperature;
+  if (typeof conv.systemPromptOverride === 'string') overrides.systemPromptOverride = conv.systemPromptOverride;
+  if (typeof conv.maxSteps === 'number') overrides.maxSteps = conv.maxSteps;
+  if (typeof conv.maxRetries === 'number') overrides.maxRetries = conv.maxRetries;
+  if (typeof conv.runtimeOverride === 'string') overrides.runtimeOverride = conv.runtimeOverride;
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
+}
+
 /**
  * Deliver an ALREADY-COLLECTED raced answer whose run finished before it could be
  * consumed (the ordinary-completion / in-flight-delivery orphan case — see the
@@ -113,14 +146,23 @@ export async function deliverRecoveredAnswer(
       currentWorkingDirectory?: string | null;
       fallbackEnabled?: boolean;
       executionMode?: 'auto' | 'plan-first' | null;
+      reasoningEffort?: string | null;
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
       messages?: unknown[];
     };
     const beforeMessageCount = Array.isArray(convBefore.messages) ? convBefore.messages.length : 0;
+    const threadOverrides = buildThreadOverrides(convBefore);
     try {
       // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
       // the recovered answer runs under the same context the question was asked in —
       // not the global default (R89/R90/R91). executionMode especially: a plan-first
       // conversation must NOT resume in auto and expose mutating workspace tools.
+      // reasoningEffort + per-thread overrides (temperature/systemPrompt/maxSteps/…)
+      // are threaded too so the resume honors the conversation's own runtime (R92).
       await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
         correlationId,
         ...(convBefore.selectedModelKey ? { modelKey: convBefore.selectedModelKey } : {}),
@@ -128,6 +170,8 @@ export async function deliverRecoveredAnswer(
         ...(convBefore.currentWorkingDirectory ? { cwd: convBefore.currentWorkingDirectory } : {}),
         ...(typeof convBefore.fallbackEnabled === 'boolean' ? { fallbackEnabled: convBefore.fallbackEnabled } : {}),
         ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
+        ...(convBefore.reasoningEffort ? { reasoningEffort: convBefore.reasoningEffort } : {}),
+        ...(threadOverrides ? { threadOverrides } : {}),
       });
       traceDiagnostic({
         scope: 'alert',
@@ -148,20 +192,18 @@ export async function deliverRecoveredAnswer(
       try {
         const after = readConversation(deps.appHome, conversationId);
         const afterMessages = (after as { messages?: Array<{ role?: unknown; content?: unknown }> } | null)?.messages;
-        // The CURRENT resume committed its user turn iff the message COUNT grew AND
-        // the branch tail is our labeled answer. Checking only "some message contains
-        // the label" would false-positive on an EARLIER recovered answer already on
-        // the branch when THIS resume failed pre-commit (busy timeout / deletion) —
-        // wrongly reporting delivered:true and dropping the stash (R91). Require both
-        // the count to have grown past the pre-resume snapshot and a labeled user
-        // turn to be present.
-        const tail = Array.isArray(afterMessages) ? afterMessages[afterMessages.length - 1] : undefined;
-        const committed =
-          Array.isArray(afterMessages) &&
-          afterMessages.length > beforeMessageCount &&
-          !!tail &&
-          tail.role === 'user' &&
-          JSON.stringify(tail.content ?? '').includes(`[Answering your earlier question`);
+        // The CURRENT resume committed its user turn iff the message COUNT grew AND a
+        // labeled user turn appears in the NEWLY-APPENDED suffix (since the pre-resume
+        // snapshot). Requiring it to be the branch TAIL was wrong: a post-commit
+        // generation failure persists a terminal assistant/error node AFTER the user
+        // turn, so the labeled turn is no longer the tail (R92). And "some message
+        // anywhere" was wrong the other way: it false-positived on an EARLIER recovered
+        // answer when THIS resume failed pre-commit (R91). Scanning only the appended
+        // suffix satisfies both.
+        const suffix = Array.isArray(afterMessages) ? afterMessages.slice(beforeMessageCount) : [];
+        const committed = suffix.some(
+          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(`[Answering your earlier question`),
+        );
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
           // a resend (it would duplicate). Surface an informational alert instead.
@@ -380,7 +422,14 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       currentWorkingDirectory?: string | null;
       fallbackEnabled?: boolean;
       executionMode?: 'auto' | 'plan-first' | null;
+      reasoningEffort?: string | null;
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
     } | null;
+    const threadOverrides = conv ? buildThreadOverrides(conv) : undefined;
     await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
       correlationId: `alert-${alert.id}`,
       ...(conv?.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
@@ -388,6 +437,8 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       ...(conv?.currentWorkingDirectory ? { cwd: conv.currentWorkingDirectory } : {}),
       ...(typeof conv?.fallbackEnabled === 'boolean' ? { fallbackEnabled: conv.fallbackEnabled } : {}),
       ...(conv?.executionMode ? { executionMode: conv.executionMode } : {}),
+      ...(conv?.reasoningEffort ? { reasoningEffort: conv.reasoningEffort } : {}),
+      ...(threadOverrides ? { threadOverrides } : {}),
     });
   } catch (err) {
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
