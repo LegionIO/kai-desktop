@@ -423,15 +423,68 @@ const activeStreamRuntime = new Map<
     // post-hook prompt even for an allow-only hook, wrongly blocking every inject.
     preHookSystemPrompt?: string;
     executionMode?: ExecutionMode;
-    // Also recorded so a mid-turn inject that pins a DIFFERENT profile / reasoning /
-    // cwd / runtime than the live run falls through to abort+restart instead of
-    // cooperatively splicing under the wrong context (R96).
-    profileKey?: string;
-    reasoningEffort?: string;
-    cwd?: string;
-    runtimeOverride?: string;
+    // Canonical fingerprint of the run's full EFFECTIVE context (resolved model /
+    // profile / temperature / systemPrompt / maxSteps / maxRetries / reasoning /
+    // fallback / runtime / cwd / executionMode). A mid-turn inject that would
+    // resolve to a DIFFERENT effective context falls through to abort+restart
+    // instead of cooperatively splicing under the wrong settings — comparing
+    // resolved values (not raw optional inputs) closes the default-vs-pinned hole
+    // and covers every behavior-affecting override (R97).
+    contextFingerprint?: string;
   }
 >();
+
+/** Canonical string of a turn's full EFFECTIVE run context, so a mid-turn inject
+ *  can decide cooperative-splice (same context) vs. abort+restart (different) by
+ *  comparing RESOLVED values rather than raw optional inputs. Resolving here means
+ *  a pinned profile B vs. a live default-profile-A run differ (both resolve to
+ *  their real profiles), and a changed temperature / prompt / step limit / fallback
+ *  is caught too (R97). Best-effort: a resolution failure yields a sentinel so an
+ *  inject conservatively restarts rather than splicing under an unknown context. */
+function computeRunContextFingerprint(
+  config: AppConfig,
+  runtimeId: string,
+  effectiveCwd: string | undefined,
+  effectiveExecutionMode: ExecutionMode,
+  opts: {
+    modelKey?: string;
+    profileKey?: string;
+    reasoningEffort?: ReasoningEffort;
+    fallbackEnabled?: boolean;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
+  },
+): string {
+  try {
+    const sc = resolveStreamConfig(config, {
+      threadModelKey: opts.modelKey ?? null,
+      threadProfileKey: opts.profileKey ?? null,
+      reasoningEffort: opts.reasoningEffort,
+      fallbackEnabled: opts.fallbackEnabled ?? false,
+      ...(opts.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+    });
+    return JSON.stringify({
+      model: sc?.primaryModel?.key ?? null,
+      profile: sc?.profileKey ?? null,
+      temperature: sc?.temperature ?? null,
+      maxSteps: sc?.maxSteps ?? null,
+      maxRetries: sc?.maxRetries ?? null,
+      reasoning: sc?.reasoningEffort ?? null,
+      systemPrompt: sc?.systemPrompt ?? null,
+      fallback: sc?.fallbackEnabled ?? false,
+      runtime: runtimeId,
+      cwd: effectiveCwd ?? null,
+      mode: effectiveExecutionMode,
+    });
+  } catch {
+    return '__unresolved__';
+  }
+}
 
 // Node ids that belong to the CURRENT active run's OWN lineage, token-scoped.
 // Used by injectHeadStillOnBranch to distinguish the run's OWN head advancement
@@ -527,10 +580,7 @@ function getActiveRunContext(conversationId: string):
       systemPrompt?: string;
       preHookSystemPrompt?: string;
       executionMode?: ExecutionMode;
-      profileKey?: string;
-      reasoningEffort?: string;
-      cwd?: string;
-      runtimeOverride?: string;
+      contextFingerprint?: string;
     }
   | undefined {
   const activeToken = activeStreams.get(conversationId)?.token;
@@ -542,10 +592,7 @@ function getActiveRunContext(conversationId: string):
     systemPrompt: entry.systemPrompt,
     preHookSystemPrompt: entry.preHookSystemPrompt,
     executionMode: entry.executionMode,
-    profileKey: entry.profileKey,
-    reasoningEffort: entry.reasoningEffort,
-    cwd: entry.cwd,
-    runtimeOverride: entry.runtimeOverride,
+    contextFingerprint: entry.contextFingerprint,
   };
 }
 
@@ -3212,10 +3259,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         systemPrompt: effectiveSystemPrompt,
         preHookSystemPrompt,
         executionMode: effectiveExecutionMode,
-        ...(profileKey !== undefined ? { profileKey } : {}),
-        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-        ...(cwd !== undefined ? { cwd } : {}),
-        ...(threadOverrides?.runtimeOverride ? { runtimeOverride: threadOverrides.runtimeOverride } : {}),
+        // Fingerprint of this run's full EFFECTIVE context so a mid-turn inject that
+        // would resolve differently falls through to abort+restart rather than
+        // splicing under the wrong settings (R97). Computed from the SAME config +
+        // inputs the run resolved, so it matches an identical-context inject.
+        contextFingerprint: computeRunContextFingerprint(config, runtime.id, effectiveCwd, effectiveExecutionMode, {
+          modelKey,
+          profileKey,
+          reasoningEffort,
+          fallbackEnabled,
+          threadOverrides,
+        }),
       });
       // Seed the run's INITIAL response id into its lineage NOW, before any provider
       // event. A GUI turn passes a caller-provided responseMessageId that the
@@ -7542,28 +7596,57 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const headBeforeGate = readConversation(appHome, conversationId)?.headId ?? null;
       const runCtx = getActiveRunContext(conversationId);
       // A cooperative splice injects into the UNCHANGED live run — so it must be
-      // gated (and will execute) under the LIVE run's model/mode, NOT a caller
-      // override. If the caller (e.g. a busy-target automation) pinned a DIFFERENT
-      // model / execution mode / profile / reasoning / cwd / runtime than the live
-      // run, cooperative splicing would run the text under the wrong context — fall
-      // through to abort+restart instead so the caller's override is honored on a
-      // fresh turn. Cooperative-only callers (raced-answer delivery) never pin an
-      // override, so they always splice. Each clause only compares when BOTH the
-      // caller pin and the live value are known (an unrecorded live field → we can't
-      // prove a difference → don't force a needless restart).
-      const overrideDiffersFromLive =
-        (opts?.modelKey !== undefined && runCtx?.modelKey !== undefined && opts.modelKey !== runCtx.modelKey) ||
-        (opts?.executionMode !== undefined &&
-          runCtx?.executionMode !== undefined &&
-          opts.executionMode !== runCtx.executionMode) ||
-        (opts?.profileKey !== undefined && runCtx?.profileKey !== undefined && opts.profileKey !== runCtx.profileKey) ||
-        (opts?.reasoningEffort !== undefined &&
-          runCtx?.reasoningEffort !== undefined &&
-          opts.reasoningEffort !== runCtx.reasoningEffort) ||
-        (opts?.cwd !== undefined && runCtx?.cwd !== undefined && opts.cwd !== runCtx.cwd) ||
-        (opts?.threadOverrides?.runtimeOverride != null &&
-          runCtx?.runtimeOverride !== undefined &&
-          opts.threadOverrides.runtimeOverride !== runCtx.runtimeOverride);
+      // gated (and will execute) under the LIVE run's full context, NOT a caller
+      // override. If the caller (e.g. a busy-target automation / recovered-answer
+      // resume) pinned overrides that would resolve to a DIFFERENT effective context
+      // than the live run, cooperative splicing would run the text under the wrong
+      // settings — fall through to abort+restart so the caller's context is honored
+      // on a fresh turn. Compare RESOLVED fingerprints (not raw optional inputs):
+      // that closes the default-vs-pinned hole (a pinned profile B vs a live
+      // default-profile-A run differ even though runCtx has no raw profileKey) and
+      // covers every behavior-affecting override — temperature / systemPrompt /
+      // maxSteps / maxRetries / reasoning / fallback / runtime / cwd / mode (R97).
+      // A caller that pinned NOTHING (all overrides undefined — a plain cooperative
+      // inject / raced-answer delivery) skips the check and always splices: it has no
+      // intent to change context, and a defaults-vs-live-nondefault fingerprint
+      // mismatch must not force a needless restart.
+      const callerPinnedAnyOverride =
+        opts?.modelKey !== undefined ||
+        opts?.profileKey !== undefined ||
+        opts?.reasoningEffort !== undefined ||
+        opts?.cwd !== undefined ||
+        opts?.executionMode !== undefined ||
+        (opts?.threadOverrides !== undefined &&
+          (opts.threadOverrides.temperature != null ||
+            opts.threadOverrides.systemPromptOverride != null ||
+            opts.threadOverrides.maxSteps != null ||
+            opts.threadOverrides.maxRetries != null ||
+            opts.threadOverrides.runtimeOverride != null));
+      let overrideDiffersFromLive = false;
+      if (callerPinnedAnyOverride && runCtx?.contextFingerprint !== undefined) {
+        // A caller-pinned runtimeOverride naming a non-Mastra runtime always differs
+        // (the live cooperative run is Mastra). Otherwise a cooperative splice would
+        // run in the live Mastra runtime, so compute the caller's would-be fingerprint
+        // under that same runtime and compare the rest of the effective context.
+        const pinnedRuntime = opts?.threadOverrides?.runtimeOverride ?? null;
+        if (pinnedRuntime && pinnedRuntime !== 'mastra' && pinnedRuntime !== 'auto') {
+          overrideDiffersFromLive = true;
+        } else {
+          const callerFingerprint = computeRunContextFingerprint(
+            readEffectiveConfig(appHome),
+            'mastra',
+            normalizeAgentCwd(opts?.cwd),
+            opts?.executionMode ?? runCtx.executionMode ?? 'auto',
+            {
+              modelKey: opts?.modelKey,
+              profileKey: opts?.profileKey,
+              reasoningEffort: opts?.reasoningEffort,
+              threadOverrides: opts?.threadOverrides,
+            },
+          );
+          overrideDiffersFromLive = callerFingerprint !== runCtx.contextFingerprint;
+        }
+      }
       if (overrideDiffersFromLive && !cooperativeOnly) {
         // Skip cooperative splice; fall through to abort+restart with the override.
       } else {
