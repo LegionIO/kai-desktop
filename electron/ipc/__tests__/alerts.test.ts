@@ -148,6 +148,98 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(call?.[1]).toContain('your earlier question');
   });
 
+  it('threads the conversation reasoningEffort + per-thread overrides into the resume (R92/R93)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'c1',
+      selectedModelKey: 'm1',
+      reasoningEffort: 'high',
+      temperature: 0.2,
+      systemPromptOverride: 'be terse',
+      maxSteps: 7,
+      runtimeOverride: 'codex-sdk',
+    });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    const call = (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+    const opts = call?.[3] as {
+      reasoningEffort?: string;
+      threadOverrides?: {
+        temperature?: number;
+        systemPromptOverride?: string;
+        maxSteps?: number;
+        runtimeOverride?: string;
+      };
+    };
+    expect(opts?.reasoningEffort).toBe('high');
+    expect(opts?.threadOverrides).toMatchObject({
+      temperature: 0.2,
+      systemPromptOverride: 'be terse',
+      maxSteps: 7,
+      runtimeOverride: 'codex-sdk',
+    });
+  });
+
+  it("does NOT report delivered when a CONCURRENT recovery's turn (not this one) is in the suffix (R93)", async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    const { createAlert } = await import('../alert-store.js');
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    // Pre-resume snapshot: 2 messages. After a pre-commit throw, the suffix contains
+    // ONLY a DIFFERENT recovery's labeled turn (recovery A committed "Env → staging"),
+    // never THIS recovery's exact text ("Env → prod"). A prefix match would
+    // false-positive; the exact-text match must not.
+    (readConversation as unknown as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({ id: 'c1', messages: [{ role: 'user' }, { role: 'assistant' }] })
+      .mockReturnValueOnce({
+        id: 'c1',
+        messages: [
+          { role: 'user' },
+          { role: 'assistant' },
+          { role: 'user', content: '[Answering your earlier question "Other"]\n- Env → staging' },
+        ],
+      });
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('busy'));
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    // Not committed → fall through to the durable re-send Alert (delivered:false) so
+    // THIS recovery's answer is NOT dropped as if it landed.
+    expect(res).toEqual({ delivered: false });
+    expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+  });
+
+  it("reports delivered when THIS recovery's exact labeled turn is in the suffix after a post-commit failure (R92/R93)", async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({ id: 'c1', messages: [{ role: 'user' }, { role: 'assistant' }] })
+      .mockReturnValueOnce({
+        id: 'c1',
+        messages: [
+          { role: 'user' },
+          { role: 'assistant' },
+          { role: 'user', content: '[Answering your earlier question "Deploy target"]\n- Env → prod' },
+          // A post-generation assistant/error node makes the labeled turn NOT the tail.
+          { role: 'assistant', content: 'partial' },
+        ],
+      });
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('gen failed'),
+    );
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    // Committed (answer on-branch) even though generation failed → delivered:true so
+    // the stash is consumed and the caller doesn't route it a second time.
+    expect(res).toEqual({ delivered: true });
+  });
+
   it('returns delivered:false for an empty/invalid answer (nothing to deliver)', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });

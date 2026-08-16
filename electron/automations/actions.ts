@@ -54,6 +54,13 @@ export type ActionDeps = {
       profileKey?: string;
       cwd?: string;
       executionMode?: ExecutionMode;
+      threadOverrides?: {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+      };
     },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
 };
@@ -162,6 +169,36 @@ export async function resumeConversationWithMessage(
     };
   },
 ): Promise<unknown> {
+  // Runtime-aware routing (R93): the plugin-generate stream path that
+  // runAgentAction uses for an idle conversation always drives the Mastra
+  // runtime — it never dispatches to the resolved AgentRuntime. So a
+  // conversation pinned to a CLI/plugin runtime (claude-agent-sdk / codex-sdk /
+  // a plugin runtime id) would resume under Mastra. injectUserTurnAndRestart
+  // routes through streamHandler, which DOES honor threadOverrides.runtimeOverride
+  // via resolveRuntimeForStream — for both a busy stream (abort+restart) and an
+  // idle conversation (no active stream → straight to streamHandler). Delegate to
+  // it when a non-Mastra runtime is pinned so the recovered turn runs on the
+  // conversation's own runtime.
+  const runtimeOverride = opts?.threadOverrides?.runtimeOverride ?? undefined;
+  const needsNonMastraRuntime =
+    typeof runtimeOverride === 'string' &&
+    runtimeOverride !== '' &&
+    runtimeOverride !== 'mastra' &&
+    runtimeOverride !== 'auto';
+  if (needsNonMastraRuntime && typeof deps.injectUserTurnAndRestart === 'function') {
+    const res = await deps.injectUserTurnAndRestart(conversationId, promptText, {
+      ...(opts?.modelKey ? { modelKey: opts.modelKey } : {}),
+      ...(opts?.profileKey ? { profileKey: opts.profileKey } : {}),
+      ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+      ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+      ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+    });
+    if (!res.ok) {
+      throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);
+    }
+    return { resumedInto: conversationId, ok: true };
+  }
   const action: Extract<AutomationAction, { type: 'agent' }> = {
     type: 'agent',
     mode: 'conversation',
@@ -566,6 +603,7 @@ async function runAgentAction(
       ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
       ...(opts?.cwd ? { cwd: opts.cwd } : {}),
       ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+      ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.

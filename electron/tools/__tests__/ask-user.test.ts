@@ -14,7 +14,18 @@ import { join } from 'path';
 // tool only needs the store write to happen, so stub the notify seam.
 vi.mock('../../ipc/alert-notify.js', () => ({ notifyAlertCreated: vi.fn() }));
 
-import { pendingQuestionAnswers, stashQuestionAnswers, createAskUserTool, resolveAskUserGateOutcome, ASK_USER_NO_ANSWER_ERROR, waitForRacedAnswer, rekeyRacedAnswer, formatRacedAnswerAsUserTurn } from '../ask-user.js';
+import {
+  pendingQuestionAnswers,
+  stashQuestionAnswers,
+  createAskUserTool,
+  resolveAskUserGateOutcome,
+  ASK_USER_NO_ANSWER_ERROR,
+  waitForRacedAnswer,
+  rekeyRacedAnswer,
+  formatRacedAnswerAsUserTurn,
+  setAskUserRecoveryRouter,
+  getAskUserRecoveryRouter,
+} from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
@@ -78,6 +89,25 @@ describe('formatRacedAnswerAsUserTurn', () => {
 
   it('falls back to a placeholder when there are no answers', () => {
     expect(formatRacedAnswerAsUserTurn({})).toContain('(no answer provided)');
+  });
+});
+
+describe('AskUserRecoveryRouter wiring (R93)', () => {
+  afterEach(() => setAskUserRecoveryRouter(null));
+
+  it('starts null and is invoked with (conversationId, answerKey) once wired', () => {
+    expect(getAskUserRecoveryRouter()).toBeNull();
+    const router = vi.fn();
+    setAskUserRecoveryRouter(router);
+    expect(getAskUserRecoveryRouter()).toBe(router);
+    getAskUserRecoveryRouter()?.('conv-1', 'sdk-ask-123');
+    expect(router).toHaveBeenCalledWith('conv-1', 'sdk-ask-123');
+  });
+
+  it('can be unwired back to null', () => {
+    setAskUserRecoveryRouter(vi.fn());
+    setAskUserRecoveryRouter(null);
+    expect(getAskUserRecoveryRouter()).toBeNull();
   });
 });
 

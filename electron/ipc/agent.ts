@@ -381,6 +381,7 @@ import {
   rekeyRacedAnswer,
   formatRacedAnswerAsUserTurn,
   getRecoveredAnswerDeliverer,
+  setAskUserRecoveryRouter,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -1356,6 +1357,21 @@ function recoverOrphanedAnswerKeys(conversationId: string, keys: Iterable<string
   }
 }
 
+/** Public hook for a non-Mastra runtime (e.g. the Claude Agent SDK ask_user
+ *  handler) to route a raced/aborted ask_user answer through the SAME durable
+ *  recovered-answer path the Mastra drop-sites use. When abort settles the SDK's
+ *  ask_user before its answer is consumed, the SDK tears down its query()
+ *  subprocess and can't return the answer inline, and its randomly-minted
+ *  `sdk-ask-*` id has no conversation binding — so without this the answer would be
+ *  orphaned in the bounded stash and eventually FIFO-evicted / lost on restart
+ *  (R93). Calling this at SDK abort delivers an already-arrived answer inline
+ *  (labeled re-inject / Alert) and, for a not-yet-arrived one, records a TTL-bound
+ *  tombstone so agent:answer-tool-question routes the late answer durably. */
+export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey: string): void {
+  if (!conversationId || !answerKey) return;
+  recoverOrphanedAnswerKeys(conversationId, [answerKey]);
+}
+
 /** Find the conversation whose pending handoff OR live claimant holds `answerKey`
  *  (the answer-arrival side only knows the key). Bounded scan over small maps. */
 function conversationForRacedAnswerKey(answerKey: string): string | undefined {
@@ -1645,6 +1661,17 @@ export type InjectUserTurnFn = (
      *  plan-first turn (e.g. an ask_user answer recovered after a plan-mode
      *  restart) does NOT silently resume in `auto` with mutating tools enabled. */
     executionMode?: ExecutionMode;
+    /** Per-thread overrides (temperature / systemPromptOverride / maxSteps /
+     *  maxRetries / runtimeOverride) so an abort+restart re-injection honors the
+     *  conversation's own runtime instead of reverting to global/profile values
+     *  (R93). Forwarded to streamHandler on the restart path. */
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
     /** COOPERATIVE-ONLY: never fall through to abort+restart. Used by raced-answer
      *  delivery — a stale ask_user answer must splice into the LIVE successor turn
      *  or fail; it must NEVER abort a newer run or restart after a Stop. When set
@@ -7362,6 +7389,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { allowed: true, text: resolved.text };
   };
 
+  // Wire the raced/aborted ask_user recovery router so a non-Mastra runtime (the
+  // Claude Agent SDK ask_user handler) can route a late answer through the durable
+  // recovered-answer path instead of orphaning it in the bounded stash (R93).
+  setAskUserRecoveryRouter(recoverAskUserAnswerForRuntime);
+
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
@@ -7566,6 +7598,29 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     pendingServerPersist.add(conversationId);
     pendingServerPersistParent.set(conversationId, headId);
 
+    // Honor the conversation's own per-thread overrides on the restart (R93): the
+    // caller may pin them (recovered/alert answer), otherwise fall back to the
+    // values persisted on the conversation so an abort+restart doesn't revert to
+    // global/profile defaults for temperature / prompt / step limits / runtime.
+    const updatedOverrides = updated as {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
+    const restartThreadOverrides = opts?.threadOverrides ?? {
+      ...(typeof updatedOverrides.temperature === 'number' ? { temperature: updatedOverrides.temperature } : {}),
+      ...(typeof updatedOverrides.systemPromptOverride === 'string'
+        ? { systemPromptOverride: updatedOverrides.systemPromptOverride }
+        : {}),
+      ...(typeof updatedOverrides.maxSteps === 'number' ? { maxSteps: updatedOverrides.maxSteps } : {}),
+      ...(typeof updatedOverrides.maxRetries === 'number' ? { maxRetries: updatedOverrides.maxRetries } : {}),
+      ...(typeof updatedOverrides.runtimeOverride === 'string'
+        ? { runtimeOverride: updatedOverrides.runtimeOverride }
+        : {}),
+    };
+
     await streamHandler(
       undefined,
       conversationId,
@@ -7576,6 +7631,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       updated.fallbackEnabled,
       opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
       opts?.executionMode ?? (updated as { executionMode?: ExecutionMode }).executionMode,
+      Object.keys(restartThreadOverrides).length > 0 ? restartThreadOverrides : undefined,
     );
     return { ok: true };
   };

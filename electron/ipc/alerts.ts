@@ -201,8 +201,15 @@ export async function deliverRecoveredAnswer(
         // answer when THIS resume failed pre-commit (R91). Scanning only the appended
         // suffix satisfies both.
         const suffix = Array.isArray(afterMessages) ? afterMessages.slice(beforeMessageCount) : [];
+        // Match THIS resume's EXACT labeled text, not just the generic
+        // `[Answering your earlier question` prefix. Two concurrent recoveries into
+        // the same conversation snapshot the same beforeMessageCount; if recovery A
+        // commits and this one (B) then fails pre-commit, A's turn lands in B's
+        // suffix. A prefix match would false-positive → B's stash deleted while B's
+        // answer never reached the branch (data loss). The full `text` embeds B's
+        // own answer body, so it only matches B's genuinely-committed turn (R93).
         const committed = suffix.some(
-          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(`[Answering your earlier question`),
+          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(JSON.stringify(text).slice(1, -1)),
         );
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite

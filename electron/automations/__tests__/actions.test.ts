@@ -12,7 +12,10 @@ vi.mock('electron', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
+vi.mock('../../ipc/agent.js', () => ({
+  broadcastAgentStreamEvent: vi.fn(),
+  isConversationTurnActive: vi.fn(() => false),
+}));
 vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: 'AGENT SAYS HI', modelKey: 'test', toolCalls: [] })),
   // Conversation-mode runs stream; yield a text delta then done carrying modelKey.
@@ -70,7 +73,10 @@ vi.mock('../../ipc/conversations.js', () => ({
   }),
   registerAutomationAborter: vi.fn(),
 }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
+vi.mock('../../ipc/agent.js', () => ({
+  broadcastAgentStreamEvent: vi.fn(),
+  isConversationTurnActive: vi.fn(() => false),
+}));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readIndex: vi.fn(() => ({
     conversations: mockStore.conversations,
@@ -822,7 +828,9 @@ describe('agent conversationTarget', () => {
 
     await executeActions(agentAction({ type: 'existing', conversationId: 'convThrow' }), evt, deps()).catch(() => {});
 
-    const users = (mockStore.conversations.convThrow.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+    const users = (
+      mockStore.conversations.convThrow.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>
+    )
       .filter((m) => m.role === 'user')
       .map((m) => m.content?.[0]?.text);
     expect(users).toContain('lost follow-up');
@@ -860,7 +868,9 @@ describe('agent conversationTarget', () => {
 
     // The follow-up must have been re-queued (with a fresh id, since it was never
     // persisted) so the restarted attempt could consume + persist it.
-    const users = (mockStore.conversations.convRetry.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+    const users = (
+      mockStore.conversations.convRetry.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>
+    )
       .filter((m) => m.role === 'user')
       .map((m) => m.content?.[0]?.text);
     expect(users).toContain('the follow-up');
@@ -1232,5 +1242,63 @@ describe('agent conversationTarget', () => {
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, false), evt, deps());
     const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
     expect(call.messages).toEqual([{ role: 'user', content: 'do the thing' }]);
+  });
+});
+
+describe('resumeConversationWithMessage runtime-aware routing (R93)', () => {
+  beforeEach(() => {
+    vi.mocked(streamForPlugin).mockReset();
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'done' } as never;
+    });
+  });
+
+  it('delegates to injectUserTurnAndRestart (NOT the Mastra streamForPlugin path) when a non-Mastra runtimeOverride is pinned', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const res = await resumeConversationWithMessage('convX', 'the answer', deps({ injectUserTurnAndRestart }), {
+      executionMode: 'plan-first',
+      reasoningEffort: 'high',
+      threadOverrides: { runtimeOverride: 'codex-sdk', temperature: 0.3 },
+    });
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    const [convId, text, opts] = injectUserTurnAndRestart.mock.calls.at(-1) as unknown as [
+      string,
+      string,
+      { executionMode?: string; reasoningEffort?: string; threadOverrides?: { runtimeOverride?: string } },
+    ];
+    expect(convId).toBe('convX');
+    expect(text).toBe('the answer');
+    expect(opts.executionMode).toBe('plan-first');
+    expect(opts.reasoningEffort).toBe('high');
+    expect(opts.threadOverrides?.runtimeOverride).toBe('codex-sdk');
+    // The recovered turn must run on its own (CLI) runtime, not the Mastra stream.
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ ok: true });
+  });
+
+  it('uses the ordinary streamForPlugin path when the runtime is Mastra/auto/absent', async () => {
+    resetMockStore({
+      convA: {
+        id: 'convA',
+        messageTree: [{ id: 'm1', parentId: null, role: 'user', content: 'earlier', createdAt: 'x' }],
+        headId: 'm1',
+        metadata: {},
+      },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    await resumeConversationWithMessage('convA', 'the answer', deps({ injectUserTurnAndRestart }), {
+      threadOverrides: { runtimeOverride: 'mastra' },
+    });
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
+  });
+
+  it('throws when the runtime-aware delegation fails so the answer is not silently dropped', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: false, error: 'conversation-busy' }));
+    await expect(
+      resumeConversationWithMessage('convX', 'a', deps({ injectUserTurnAndRestart }), {
+        threadOverrides: { runtimeOverride: 'codex-sdk' },
+      }),
+    ).rejects.toThrow(/conversation-busy/);
   });
 });

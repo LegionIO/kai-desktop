@@ -57,6 +57,30 @@ export function getRecoveredAnswerDeliverer(): RecoveredAnswerDeliverer | null {
 }
 
 /**
+ * Router a non-Mastra runtime (Claude Agent SDK ask_user handler) calls when abort
+ * settles an ask_user before its answer is consumed, so the answer takes the SAME
+ * durable recovered-answer path the Mastra drop-sites use (inline labeled re-inject
+ * for an already-arrived answer, else a TTL-bound tombstone so a LATE answer is
+ * routed by agent:answer-tool-question). Wired by agent.ts (setAskUserRecoveryRouter)
+ * to keep the runtime layer free of the ipc/agent import graph — mirrors
+ * setRecoveredAnswerDeliverer. `null` router (not yet wired) → the caller keeps the
+ * bounded stash copy as the last resort (prior behavior). R93.
+ */
+export type AskUserRecoveryRouter = (conversationId: string, answerKey: string) => void;
+
+let askUserRecoveryRouter: AskUserRecoveryRouter | null = null;
+
+/** Wire the raced/aborted ask_user recovery router (called once from agent.ts). */
+export function setAskUserRecoveryRouter(fn: AskUserRecoveryRouter | null): void {
+  askUserRecoveryRouter = fn;
+}
+
+/** The wired ask_user recovery router, or null when agent.ts hasn't wired it. */
+export function getAskUserRecoveryRouter(): AskUserRecoveryRouter | null {
+  return askUserRecoveryRouter;
+}
+
+/**
  * The message the ask_user tool returns when its `execute` runs but no answers
  * were recorded. Distinct from a genuine dismiss (handled upstream in the gate,
  * which skips execution) — this only surfaces if execute runs with no stash,

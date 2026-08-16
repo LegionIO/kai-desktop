@@ -34,7 +34,7 @@ import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
-import { pendingQuestionAnswers } from '../../tools/ask-user.js';
+import { pendingQuestionAnswers, getAskUserRecoveryRouter } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -1210,18 +1210,23 @@ function createAskUserHandler(
     });
 
     if (approved !== true) {
-      // NOTE: unlike the Mastra gate, the SDK runtime canNOT recover a raced
-      // answer inline. When abort wins, the abortSignal has already torn down
-      // the `query()` subprocess and its stream loop has exited — returning a
-      // result here goes into a dead call. And a replacement turn mints a fresh
-      // random `sdk-ask-*` id, so an answer stashed under THIS id can't be
-      // matched later either. So we deliberately do NOT grace-poll or consume
-      // the stash here: leave any late answer in the bounded (FIFO-evicted)
-      // stash rather than delete it into a canceled query. (Delivering a
-      // post-abort answer to the SDK runtime would require re-injecting it as a
-      // new user turn in the restart orchestration — out of scope here and not
-      // the GUI/Mastra race this change targets.)
+      // Abort/dismiss won the race. The SDK runtime can't recover the answer
+      // INLINE — the abortSignal has already torn down the `query()` subprocess and
+      // its stream loop has exited, so returning a result here goes into a dead
+      // call; and a replacement turn mints a fresh random `sdk-ask-*` id, so an
+      // answer stashed under THIS id can't be matched by a later query either.
+      // But we CAN route it durably: hand this id + conversation to the shared
+      // recovery router (wired by agent.ts). If the answer already arrived it's
+      // re-injected into the ORIGIN conversation as a labeled turn (or raised as an
+      // Alert); if it hasn't, a TTL-bound tombstone lets agent:answer-tool-question
+      // route the LATE answer the same way — instead of it being silently orphaned
+      // in the bounded (FIFO-evicted) stash and lost on restart (R93).
       debugLog(`[ASK_USER] User dismissed/rejected (or aborted) toolCallId=${toolCallId}`);
+      try {
+        getAskUserRecoveryRouter()?.(conversationId, toolCallId);
+      } catch {
+        /* best-effort — the bounded stash copy remains as the last resort */
+      }
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],
         isError: true,
