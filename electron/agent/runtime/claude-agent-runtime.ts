@@ -35,7 +35,11 @@ import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
 import type { ApprovalSettleSource } from '../../ipc/tool-approval.js';
-import { pendingQuestionAnswers, getAskUserRecoveryRouter } from '../../tools/ask-user.js';
+import {
+  pendingQuestionAnswers,
+  getAskUserRecoveryRouter,
+  getActiveStreamTokenForConversation,
+} from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -1191,6 +1195,13 @@ function createAskUserHandler(
   return async (args: unknown): Promise<CallToolResult> => {
     const toolCallId = `sdk-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+    // Capture the stream token WHILE the stream is live (before we await the
+    // answer). An abort-driven recovery below uses it to classify the abort as
+    // terminal (Stop / dismiss → no recovery) vs. a recoverable supersession
+    // (R95). Captured now because the agent.ts-side stream entry may be torn down
+    // by the time the abort callback runs.
+    const streamTokenAtAsk = getActiveStreamTokenForConversation(conversationId);
+
     debugLog(`[ASK_USER] Broadcasting question toolCallId=${toolCallId}`);
 
     // 1. Broadcast to renderer — shows question UI
@@ -1236,7 +1247,7 @@ function createAskUserHandler(
       debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
       if (settleSource === 'abort') {
         try {
-          getAskUserRecoveryRouter()?.(conversationId, toolCallId);
+          getAskUserRecoveryRouter()?.(conversationId, toolCallId, streamTokenAtAsk);
         } catch {
           /* best-effort — the bounded stash copy remains as the last resort */
         }

@@ -25,6 +25,8 @@ import {
   formatRacedAnswerAsUserTurn,
   setAskUserRecoveryRouter,
   getAskUserRecoveryRouter,
+  setActiveStreamTokenAccessor,
+  getActiveStreamTokenForConversation,
 } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
@@ -95,19 +97,32 @@ describe('formatRacedAnswerAsUserTurn', () => {
 describe('AskUserRecoveryRouter wiring (R93)', () => {
   afterEach(() => setAskUserRecoveryRouter(null));
 
-  it('starts null and is invoked with (conversationId, answerKey) once wired', () => {
+  it('starts null and is invoked with (conversationId, answerKey, streamToken) once wired', () => {
     expect(getAskUserRecoveryRouter()).toBeNull();
     const router = vi.fn();
     setAskUserRecoveryRouter(router);
     expect(getAskUserRecoveryRouter()).toBe(router);
-    getAskUserRecoveryRouter()?.('conv-1', 'sdk-ask-123');
-    expect(router).toHaveBeenCalledWith('conv-1', 'sdk-ask-123');
+    getAskUserRecoveryRouter()?.('conv-1', 'sdk-ask-123', 'tok-9');
+    expect(router).toHaveBeenCalledWith('conv-1', 'sdk-ask-123', 'tok-9');
   });
 
   it('can be unwired back to null', () => {
     setAskUserRecoveryRouter(vi.fn());
     setAskUserRecoveryRouter(null);
     expect(getAskUserRecoveryRouter()).toBeNull();
+  });
+});
+
+describe('ActiveStreamTokenAccessor wiring (R95)', () => {
+  afterEach(() => setActiveStreamTokenAccessor(null));
+
+  it('returns undefined when unwired, then delegates to the wired accessor', () => {
+    expect(getActiveStreamTokenForConversation('conv-1')).toBeUndefined();
+    const accessor = vi.fn((cid: string) => (cid === 'conv-1' ? 'tok-1' : undefined));
+    setActiveStreamTokenAccessor(accessor);
+    expect(getActiveStreamTokenForConversation('conv-1')).toBe('tok-1');
+    expect(getActiveStreamTokenForConversation('other')).toBeUndefined();
+    expect(accessor).toHaveBeenCalled();
   });
 });
 

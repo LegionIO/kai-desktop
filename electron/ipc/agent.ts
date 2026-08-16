@@ -382,6 +382,7 @@ import {
   formatRacedAnswerAsUserTurn,
   getRecoveredAnswerDeliverer,
   setAskUserRecoveryRouter,
+  setActiveStreamTokenAccessor,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -496,6 +497,15 @@ export function getActiveStreamRuntime(conversationId: string): string | undefin
   if (activeToken === undefined) return undefined;
   const entry = activeStreamRuntime.get(conversationId);
   return entry && entry.token === activeToken ? entry.runtimeId : undefined;
+}
+
+/** The active stream's token for a conversation, or undefined when idle. A
+ *  non-Mastra runtime (SDK ask_user handler) captures this while its stream is
+ *  live so a later abort-driven recovery can classify the abort via
+ *  terminalAbortTokens (Stop / genuine dismiss = terminal → no recovery) rather
+ *  than resurrecting a stopped turn (R95). */
+export function getActiveStreamToken(conversationId: string): string | undefined {
+  return activeStreams.get(conversationId)?.token;
 }
 
 /** The active run's model + system prompt + execution mode (for the CURRENT
@@ -1366,9 +1376,30 @@ function recoverOrphanedAnswerKeys(conversationId: string, keys: Iterable<string
  *  orphaned in the bounded stash and eventually FIFO-evicted / lost on restart
  *  (R93). Calling this at SDK abort delivers an already-arrived answer inline
  *  (labeled re-inject / Alert) and, for a not-yet-arrived one, records a TTL-bound
- *  tombstone so agent:answer-tool-question routes the late answer durably. */
-export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey: string): void {
+ *  tombstone so agent:answer-tool-question routes the late answer durably.
+ *
+ *  `streamToken` is the SDK stream's token, captured while the stream was live. A
+ *  TERMINAL abort — explicit user Stop or a genuine plan dismiss — marks that token
+ *  in terminalAbortTokens BEFORE aborting. An abort settle-source alone can't tell a
+ *  Stop from a supersession (both abort the signal), and on Stop the cancel
+ *  generation is ALREADY bumped, so a freshly-recorded tombstone would capture the
+ *  post-Stop generation as valid and let a late answer resurrect the stopped turn.
+ *  So when the token is terminal, skip recovery entirely: the answer stays in the
+ *  bounded stash, never routed into a new turn (R95). Mirrors the Mastra gate's
+ *  `terminalAbortTokens.has(streamToken)` check. */
+export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey: string, streamToken?: string): void {
   if (!conversationId || !answerKey) return;
+  if (streamToken !== undefined && terminalAbortTokens.has(streamToken)) {
+    traceDiagnostic({
+      scope: 'agent',
+      event: 'question.answer-dropped-on-terminal-abort',
+      level: 'warn',
+      conversationId,
+      toolName: 'ask_user',
+      fields: { toolCallId: answerKey, streamToken, runtime: 'non-mastra' },
+    });
+    return;
+  }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
 }
 
@@ -7428,6 +7459,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // Claude Agent SDK ask_user handler) can route a late answer through the durable
   // recovered-answer path instead of orphaning it in the bounded stash (R93).
   setAskUserRecoveryRouter(recoverAskUserAnswerForRuntime);
+  setActiveStreamTokenAccessor(getActiveStreamToken);
   // Capture appHome so resolveEffectiveRuntimeId can read config lazily (R94).
   appHomeForRuntimeResolve = appHome;
 

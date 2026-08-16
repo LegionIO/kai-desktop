@@ -66,7 +66,7 @@ export function getRecoveredAnswerDeliverer(): RecoveredAnswerDeliverer | null {
  * setRecoveredAnswerDeliverer. `null` router (not yet wired) → the caller keeps the
  * bounded stash copy as the last resort (prior behavior). R93.
  */
-export type AskUserRecoveryRouter = (conversationId: string, answerKey: string) => void;
+export type AskUserRecoveryRouter = (conversationId: string, answerKey: string, streamToken?: string) => void;
 
 let askUserRecoveryRouter: AskUserRecoveryRouter | null = null;
 
@@ -78,6 +78,26 @@ export function setAskUserRecoveryRouter(fn: AskUserRecoveryRouter | null): void
 /** The wired ask_user recovery router, or null when agent.ts hasn't wired it. */
 export function getAskUserRecoveryRouter(): AskUserRecoveryRouter | null {
   return askUserRecoveryRouter;
+}
+
+/** Accessor a non-Mastra runtime uses to capture the CURRENT active stream token
+ *  for a conversation while its stream is live, so an abort-driven recovery can
+ *  classify the abort as terminal (Stop / dismiss) vs. recoverable supersession
+ *  (R95). Wired by agent.ts (setActiveStreamTokenAccessor → getActiveStreamToken).
+ *  `null` accessor → the caller passes no token and recovery is unconditional
+ *  (prior behavior). */
+export type ActiveStreamTokenAccessor = (conversationId: string) => string | undefined;
+
+let activeStreamTokenAccessor: ActiveStreamTokenAccessor | null = null;
+
+/** Wire the active-stream-token accessor (called once from agent.ts). */
+export function setActiveStreamTokenAccessor(fn: ActiveStreamTokenAccessor | null): void {
+  activeStreamTokenAccessor = fn;
+}
+
+/** The current active stream token for a conversation, or undefined (idle / not wired). */
+export function getActiveStreamTokenForConversation(conversationId: string): string | undefined {
+  return activeStreamTokenAccessor?.(conversationId);
 }
 
 /**
