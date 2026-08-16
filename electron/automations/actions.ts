@@ -63,6 +63,22 @@ export type ActionDeps = {
       };
     },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
+  /**
+   * Resolve the EFFECTIVE runtime id for a turn (accounting for global
+   * agent.runtime, any thread runtimeOverride, and the selected model), e.g.
+   * 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | a plugin runtime id. Injected
+   * from main.ts (which owns the runtime graph) so the automations layer doesn't
+   * import it directly. When absent (tests / early init) a resume falls back to
+   * the ordinary Mastra streamForPlugin path. Used ONLY to decide whether an
+   * alert/recovered-answer resume must be dispatched through the runtime-resolving
+   * injectUserTurnAndRestart path instead of the Mastra-only streamForPlugin path
+   * (R94).
+   */
+  resolveEffectiveRuntimeId?: (opts: {
+    modelKey?: string;
+    profileKey?: string;
+    runtimeOverride?: string | null;
+  }) => Promise<string> | string;
 };
 
 type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
@@ -169,36 +185,6 @@ export async function resumeConversationWithMessage(
     };
   },
 ): Promise<unknown> {
-  // Runtime-aware routing (R93): the plugin-generate stream path that
-  // runAgentAction uses for an idle conversation always drives the Mastra
-  // runtime — it never dispatches to the resolved AgentRuntime. So a
-  // conversation pinned to a CLI/plugin runtime (claude-agent-sdk / codex-sdk /
-  // a plugin runtime id) would resume under Mastra. injectUserTurnAndRestart
-  // routes through streamHandler, which DOES honor threadOverrides.runtimeOverride
-  // via resolveRuntimeForStream — for both a busy stream (abort+restart) and an
-  // idle conversation (no active stream → straight to streamHandler). Delegate to
-  // it when a non-Mastra runtime is pinned so the recovered turn runs on the
-  // conversation's own runtime.
-  const runtimeOverride = opts?.threadOverrides?.runtimeOverride ?? undefined;
-  const needsNonMastraRuntime =
-    typeof runtimeOverride === 'string' &&
-    runtimeOverride !== '' &&
-    runtimeOverride !== 'mastra' &&
-    runtimeOverride !== 'auto';
-  if (needsNonMastraRuntime && typeof deps.injectUserTurnAndRestart === 'function') {
-    const res = await deps.injectUserTurnAndRestart(conversationId, promptText, {
-      ...(opts?.modelKey ? { modelKey: opts.modelKey } : {}),
-      ...(opts?.profileKey ? { profileKey: opts.profileKey } : {}),
-      ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
-      ...(opts?.cwd ? { cwd: opts.cwd } : {}),
-      ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
-      ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
-    });
-    if (!res.ok) {
-      throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);
-    }
-    return { resumedInto: conversationId, ok: true };
-  }
   const action: Extract<AutomationAction, { type: 'agent' }> = {
     type: 'agent',
     mode: 'conversation',
@@ -234,6 +220,10 @@ export async function resumeConversationWithMessage(
     literalPrompt: true,
     strictExistingTarget: true,
     forceFreshTurn: true,
+    // Marks this as an alert/recovered-answer resume so the runtime-aware dispatch
+    // fires even after the ordered barrier re-enters with forceFreshTurn:false —
+    // it must run on the SERIALIZED slot, not the pre-barrier call (R94).
+    isAlertResume: true,
     // Thread the alert's stable correlation id so the resumed agent turn's traces
     // share the alert's `alert-<id>` id (creation → answer → resume all correlate).
     ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
@@ -427,6 +417,11 @@ async function runAgentAction(
       maxRetries?: number | null;
       runtimeOverride?: string | null;
     };
+    /** Set by resumeConversationWithMessage: this is an alert/recovered-answer
+     *  resume. Survives the ordered-barrier re-entry (unlike forceFreshTurn, which
+     *  is reset to false), so the runtime-aware dispatch fires on the serialized
+     *  slot (R94). */
+    isAlertResume?: boolean;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -628,6 +623,63 @@ async function runAgentAction(
   const target = resolved && 'targetId' in resolved ? resolved : null;
   let conversationId = target?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
   let created = target ? (target.created ?? false) : true;
+
+  // Runtime-aware resume dispatch (R94): the streamForPlugin path below always
+  // drives the Mastra runtime — it never dispatches to the resolved AgentRuntime.
+  // So an alert/recovered-answer resume of a conversation whose EFFECTIVE runtime
+  // is a CLI/plugin runtime (claude-agent-sdk / codex-sdk / plugin id — whether
+  // pinned via runtimeOverride OR selected by global agent.runtime='auto' + model)
+  // would run under Mastra, losing that runtime's session semantics. Delegate to
+  // injectUserTurnAndRestart, which routes through streamHandler → resolveRuntimeForStream
+  // (the single authoritative resolver) and honors the runtime for both an idle
+  // conversation (no active stream → straight to streamHandler) and a busy one
+  // (abort+restart). This runs INSIDE the ordered fresh-turn barrier + after
+  // waitForAutomationRunToSettle (a forceFreshTurn resume only reaches here on its
+  // serialized slot), so it can NOT race a concurrent automation run on the same
+  // conversation the way a pre-barrier fast path could. Scoped to isAlertResume
+  // (alert/recovered resumes only — it survives the barrier re-entry) + an
+  // EXISTING (not newly-created) target.
+  if (
+    opts?.isAlertResume &&
+    !created &&
+    target &&
+    typeof deps.injectUserTurnAndRestart === 'function' &&
+    typeof deps.resolveEffectiveRuntimeId === 'function'
+  ) {
+    let effectiveRuntime: string | undefined;
+    try {
+      effectiveRuntime = await deps.resolveEffectiveRuntimeId({
+        modelKey: action.modelKey,
+        profileKey: action.profileKey,
+        runtimeOverride: opts?.threadOverrides?.runtimeOverride ?? undefined,
+      });
+    } catch {
+      effectiveRuntime = undefined; // resolver failure → fall back to the Mastra path
+    }
+    if (effectiveRuntime && effectiveRuntime !== 'mastra') {
+      traceDiagnostic({
+        scope: 'automation',
+        event: 'turn.resume-runtime-dispatch',
+        correlationId,
+        conversationId,
+        ruleId: rule.id,
+        fields: { runtime: effectiveRuntime },
+      });
+      const res = await deps.injectUserTurnAndRestart(conversationId, prompt, {
+        ...(action.modelKey ? { modelKey: action.modelKey } : {}),
+        ...(action.profileKey ? { profileKey: action.profileKey } : {}),
+        ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+        ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+      });
+      if (!res.ok) {
+        throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);
+      }
+      return { resumedInto: conversationId, ok: true };
+    }
+  }
+
   inFlightAutomationTargets.add(conversationId);
   traceDiagnostic({
     scope: 'automation',

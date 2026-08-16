@@ -84,6 +84,61 @@ describe('registerPendingApproval', () => {
     expect(pendingToolApprovals.has('c-pending')).toBe(true);
   });
 
+  it('onSettle delivers the CATEGORICAL source: abort distinct from reject/dismiss/answered (R94)', async () => {
+    // The SDK ask_user handler routes recovery ONLY on a genuine abort — it must be
+    // able to tell abort ('dismiss' VALUE) apart from a real user reject/dismiss.
+    const abortCtrl = new AbortController();
+    let abortSource: string | undefined;
+    const pAbort = registerPendingApproval('c-src-abort', abortCtrl.signal, {
+      onSettle: (s) => {
+        abortSource = s;
+      },
+    });
+    abortCtrl.abort();
+    await pAbort;
+    expect(abortSource).toBe('abort');
+
+    let rejectSource: string | undefined;
+    const pReject = registerPendingApproval('c-src-reject', undefined, {
+      onSettle: (s) => {
+        rejectSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-reject')!.resolve(false, 'reject');
+    await pReject;
+    expect(rejectSource).toBe('reject');
+
+    let dismissSource: string | undefined;
+    const pDismiss = registerPendingApproval('c-src-dismiss', undefined, {
+      onSettle: (s) => {
+        dismissSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-dismiss')!.resolve('dismiss', 'dismiss');
+    await pDismiss;
+    expect(dismissSource).toBe('dismiss');
+
+    let answeredSource: string | undefined;
+    const pAns = registerPendingApproval('c-src-answered', undefined, {
+      onSettle: (s) => {
+        answeredSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-answered')!.resolve(true, 'answered');
+    await pAns;
+    expect(answeredSource).toBe('answered');
+  });
+
+  it('onSettle that throws does not break the settle path (R94)', async () => {
+    const p = registerPendingApproval('c-src-throw', undefined, {
+      onSettle: () => {
+        throw new Error('observer boom');
+      },
+    });
+    pendingToolApprovals.get('c-src-throw')!.resolve(true, 'answered');
+    await expect(p).resolves.toBe(true);
+  });
+
   it('removes the abort listener when resolved via approve/deny (no leak on the normal path)', async () => {
     // The leak fix: resolving through the map entry (user approve/reject) must
     // remove the {once} abort listener that was attached to the (turn-scoped,

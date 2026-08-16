@@ -1698,6 +1698,41 @@ export function getInjectUserTurnAndRestart(): InjectUserTurnFn | null {
   return injectUserTurnAndRestart;
 }
 
+/** Resolve the EFFECTIVE runtime id a turn WOULD use (mirrors the streamHandler
+ *  resolution: resolveStreamConfig → primaryModel → resolveRuntimeForStream, with a
+ *  thread runtimeOverride overlaid onto agent.runtime exactly as the stream path
+ *  does). Returns e.g. 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | a plugin
+ *  runtime id. Used by the automations layer to decide whether an alert/recovered
+ *  resume must dispatch through the runtime-resolving injectUserTurnAndRestart path
+ *  rather than the Mastra-only streamForPlugin path — accounting for BOTH an
+ *  explicit override AND global agent.runtime='auto' + model selection (R94). Falls
+ *  back to 'mastra' on any resolution error. */
+export async function resolveEffectiveRuntimeId(opts: {
+  modelKey?: string;
+  profileKey?: string;
+  runtimeOverride?: string | null;
+}): Promise<string> {
+  try {
+    const config = readEffectiveConfig(appHomeForRuntimeResolve);
+    const streamConfig = resolveStreamConfig(config, {
+      threadModelKey: opts.modelKey ?? null,
+      threadProfileKey: opts.profileKey ?? null,
+      fallbackEnabled: false,
+    });
+    const modelEntry = streamConfig?.primaryModel ?? null;
+    const runtimeConfig = opts.runtimeOverride
+      ? ({ ...config, agent: { ...config.agent, runtime: opts.runtimeOverride } } as AppConfig)
+      : config;
+    const { resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
+    return resolution.runtimeId ?? 'mastra';
+  } catch {
+    return 'mastra';
+  }
+}
+/** Captured at registerAgentHandlers so resolveEffectiveRuntimeId can read config
+ *  without threading appHome through the automations layer. */
+let appHomeForRuntimeResolve = '';
+
 /** True if the given conversation's active stream is the server-persist owner. */
 function isServerPersistOwner(conversationId: string, activeToken: string | undefined): boolean {
   const owner = serverPersistTokens.get(conversationId);
@@ -7393,6 +7428,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // Claude Agent SDK ask_user handler) can route a late answer through the durable
   // recovered-answer path instead of orphaning it in the bounded stash (R93).
   setAskUserRecoveryRouter(recoverAskUserAnswerForRuntime);
+  // Capture appHome so resolveEffectiveRuntimeId can read config lazily (R94).
+  appHomeForRuntimeResolve = appHome;
 
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);

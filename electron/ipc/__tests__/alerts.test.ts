@@ -213,25 +213,32 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
   });
 
-  it("reports delivered when THIS recovery's exact labeled turn is in the suffix after a post-commit failure (R92/R93)", async () => {
+  it("reports delivered when THIS recovery's committed turn is in the suffix after a post-commit failure (R92/R93/R94)", async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');
     const { readConversation } = await import('../conversation-store.js');
+    // Capture the exact labeled text (with its unique per-delivery id) the resume
+    // was asked to persist, then have the "after" read echo it back as a committed
+    // turn — so the committed-check matches THIS delivery's own id, not a guess.
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+        throw new Error('gen failed'); // fail AFTER the (simulated) commit
+      },
+    );
     (readConversation as unknown as ReturnType<typeof vi.fn>)
       .mockReturnValueOnce({ id: 'c1', messages: [{ role: 'user' }, { role: 'assistant' }] })
-      .mockReturnValueOnce({
+      .mockImplementationOnce(() => ({
         id: 'c1',
         messages: [
           { role: 'user' },
           { role: 'assistant' },
-          { role: 'user', content: '[Answering your earlier question "Deploy target"]\n- Env → prod' },
+          { role: 'user', content: persistedText },
           // A post-generation assistant/error node makes the labeled turn NOT the tail.
           { role: 'assistant', content: 'partial' },
         ],
-      });
-    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error('gen failed'),
-    );
+      }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });

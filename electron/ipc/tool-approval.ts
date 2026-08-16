@@ -50,6 +50,12 @@ export type ApprovalTraceContext = {
   toolName?: string;
   /** The renderer-facing id, when it differs from the map key (exec id). */
   execToolCallId?: string;
+  /** Optional settle observer: invoked once with the CATEGORICAL settle source
+   *  (answered / approve / reject / dismiss / abort / duplicate-evict) the instant
+   *  the approval resolves. A caller (e.g. the SDK ask_user handler) uses this to
+   *  distinguish a recoverable ABORT — turn torn down while an answer raced — from
+   *  a deliberate reject/dismiss, so it only routes recovery for the former (R94). */
+  onSettle?: (source: ApprovalSettleSource) => void;
 };
 
 /** Derive a categorical settle reason from the resolved value + abort flag,
@@ -128,6 +134,11 @@ export function registerPendingApproval(
           execToolCallId: trace?.execToolCallId,
         },
       });
+      try {
+        trace?.onSettle?.(reason);
+      } catch {
+        /* observer must never break the settle path */
+      }
       resolve(value);
     };
 

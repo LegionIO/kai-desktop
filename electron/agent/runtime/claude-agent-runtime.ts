@@ -34,6 +34,7 @@ import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
+import type { ApprovalSettleSource } from '../../ipc/tool-approval.js';
 import { pendingQuestionAnswers, getAskUserRecoveryRouter } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1204,28 +1205,41 @@ function createAskUserHandler(
     // 2. Wait for user response via shared pending-approval infrastructure.
     //    The IPC handler (agent:answer-tool-question) stores answers in
     //    pendingQuestionAnswers and resolves the approval promise.
+    //    Capture the CATEGORICAL settle source: abort resolves with the same
+    //    'dismiss' VALUE as a real user dismiss, so only onSettle can tell a
+    //    recoverable abort (turn torn down mid-answer) apart from a deliberate
+    //    reject/dismiss (user said no — must NOT be resurrected). R94.
+    let settleSource: ApprovalSettleSource | undefined;
     const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined, {
       conversationId,
       toolName: 'ask_user',
+      onSettle: (source) => {
+        settleSource = source;
+      },
     });
 
     if (approved !== true) {
-      // Abort/dismiss won the race. The SDK runtime can't recover the answer
-      // INLINE — the abortSignal has already torn down the `query()` subprocess and
-      // its stream loop has exited, so returning a result here goes into a dead
-      // call; and a replacement turn mints a fresh random `sdk-ask-*` id, so an
-      // answer stashed under THIS id can't be matched by a later query either.
-      // But we CAN route it durably: hand this id + conversation to the shared
-      // recovery router (wired by agent.ts). If the answer already arrived it's
-      // re-injected into the ORIGIN conversation as a labeled turn (or raised as an
-      // Alert); if it hasn't, a TTL-bound tombstone lets agent:answer-tool-question
-      // route the LATE answer the same way — instead of it being silently orphaned
-      // in the bounded (FIFO-evicted) stash and lost on restart (R93).
-      debugLog(`[ASK_USER] User dismissed/rejected (or aborted) toolCallId=${toolCallId}`);
-      try {
-        getAskUserRecoveryRouter()?.(conversationId, toolCallId);
-      } catch {
-        /* best-effort — the bounded stash copy remains as the last resort */
+      // The SDK runtime can't recover the answer INLINE — the abortSignal has
+      // already torn down the `query()` subprocess and its stream loop has exited,
+      // so returning a result here goes into a dead call; and a replacement turn
+      // mints a fresh random `sdk-ask-*` id, so an answer stashed under THIS id
+      // can't be matched by a later query either.
+      //
+      // Route the durable recovered-answer path ONLY for a genuine ABORT (the turn
+      // was superseded / torn down while an answer raced in). A deliberate
+      // reject/dismiss means the user declined THIS question — resurrecting a late
+      // answer would override that choice; and on an explicit Stop the abort's
+      // cancel-generation bump would let a stale surface's answer restart a stopped
+      // turn. So for reject/dismiss (and any non-abort settle) leave the stash
+      // untouched: the answer stays in the bounded (FIFO-evicted) stash, not routed
+      // into a new turn. (R93 introduced the routing; R94 scopes it to abort.)
+      debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
+      if (settleSource === 'abort') {
+        try {
+          getAskUserRecoveryRouter()?.(conversationId, toolCallId);
+        } catch {
+          /* best-effort — the bounded stash copy remains as the last resort */
+        }
       }
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],

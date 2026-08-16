@@ -43,6 +43,7 @@ import {
   hasActiveStreams,
   isConversationTurnActive,
   getInjectUserTurnAndRestart,
+  resolveEffectiveRuntimeId,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js';
@@ -2063,6 +2064,11 @@ if (gotSingleInstanceLock) {
         if (!fn) return Promise.resolve({ ok: false, error: 'inject-unavailable' });
         return fn(conversationId, userText, o as never);
       },
+      // Effective-runtime resolver so an alert/recovered-answer resume of a
+      // non-Mastra-runtime conversation dispatches through the runtime-resolving
+      // inject path instead of the Mastra-only streamForPlugin path (R94).
+      resolveEffectiveRuntimeId: (o: { modelKey?: string; profileKey?: string; runtimeOverride?: string | null }) =>
+        resolveEffectiveRuntimeId(o),
     };
     const automationEngine = initializeAutomationEngine(automationDeps);
     registerAutomationsHandlers(ipcMain, automationEngine, eventBus);

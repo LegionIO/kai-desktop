@@ -1245,38 +1245,12 @@ describe('agent conversationTarget', () => {
   });
 });
 
-describe('resumeConversationWithMessage runtime-aware routing (R93)', () => {
+describe('resumeConversationWithMessage runtime-aware routing (R94)', () => {
   beforeEach(() => {
     vi.mocked(streamForPlugin).mockReset();
     vi.mocked(streamForPlugin).mockImplementation(async function* () {
       yield { type: 'done' } as never;
     });
-  });
-
-  it('delegates to injectUserTurnAndRestart (NOT the Mastra streamForPlugin path) when a non-Mastra runtimeOverride is pinned', async () => {
-    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
-    const res = await resumeConversationWithMessage('convX', 'the answer', deps({ injectUserTurnAndRestart }), {
-      executionMode: 'plan-first',
-      reasoningEffort: 'high',
-      threadOverrides: { runtimeOverride: 'codex-sdk', temperature: 0.3 },
-    });
-    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
-    const [convId, text, opts] = injectUserTurnAndRestart.mock.calls.at(-1) as unknown as [
-      string,
-      string,
-      { executionMode?: string; reasoningEffort?: string; threadOverrides?: { runtimeOverride?: string } },
-    ];
-    expect(convId).toBe('convX');
-    expect(text).toBe('the answer');
-    expect(opts.executionMode).toBe('plan-first');
-    expect(opts.reasoningEffort).toBe('high');
-    expect(opts.threadOverrides?.runtimeOverride).toBe('codex-sdk');
-    // The recovered turn must run on its own (CLI) runtime, not the Mastra stream.
-    expect(streamForPlugin).not.toHaveBeenCalled();
-    expect(res).toMatchObject({ ok: true });
-  });
-
-  it('uses the ordinary streamForPlugin path when the runtime is Mastra/auto/absent', async () => {
     resetMockStore({
       convA: {
         id: 'convA',
@@ -1285,20 +1259,89 @@ describe('resumeConversationWithMessage runtime-aware routing (R93)', () => {
         metadata: {},
       },
     });
+  });
+
+  it('delegates to injectUserTurnAndRestart (NOT streamForPlugin) when the effective runtime is non-Mastra', async () => {
     const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
-    await resumeConversationWithMessage('convA', 'the answer', deps({ injectUserTurnAndRestart }), {
-      threadOverrides: { runtimeOverride: 'mastra' },
-    });
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'codex-sdk');
+    const res = await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+      {
+        executionMode: 'plan-first',
+        reasoningEffort: 'high',
+        threadOverrides: { runtimeOverride: 'codex-sdk', temperature: 0.3 },
+      },
+    );
+    expect(resolveEffectiveRuntimeId).toHaveBeenCalled();
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    const [convId, text, opts] = injectUserTurnAndRestart.mock.calls.at(-1) as unknown as [
+      string,
+      string,
+      { executionMode?: string; reasoningEffort?: string; threadOverrides?: { runtimeOverride?: string } },
+    ];
+    expect(convId).toBe('convA');
+    expect(text).toBe('the answer');
+    expect(opts.executionMode).toBe('plan-first');
+    expect(opts.reasoningEffort).toBe('high');
+    expect(opts.threadOverrides?.runtimeOverride).toBe('codex-sdk');
+    // The recovered turn runs on its own (CLI) runtime, not the Mastra stream path.
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ ok: true });
+  });
+
+  it('resolves the effective runtime even with NO runtimeOverride (auto → non-Mastra) and delegates', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    // Global agent.runtime='auto' + an Anthropic model resolves to claude-agent-sdk.
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'claude-agent-sdk');
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    expect(streamForPlugin).not.toHaveBeenCalled();
+  });
+
+  it('uses the ordinary streamForPlugin path when the effective runtime is Mastra', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'mastra');
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
+  });
+
+  it('uses streamForPlugin when no runtime resolver is wired (tests / early init)', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    await resumeConversationWithMessage('convA', 'the answer', deps({ injectUserTurnAndRestart }));
     expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
     expect(streamForPlugin).toHaveBeenCalled();
   });
 
   it('throws when the runtime-aware delegation fails so the answer is not silently dropped', async () => {
     const injectUserTurnAndRestart = vi.fn(async () => ({ ok: false, error: 'conversation-busy' }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'codex-sdk');
     await expect(
-      resumeConversationWithMessage('convX', 'a', deps({ injectUserTurnAndRestart }), {
-        threadOverrides: { runtimeOverride: 'codex-sdk' },
-      }),
+      resumeConversationWithMessage('convA', 'a', deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId })),
     ).rejects.toThrow(/conversation-busy/);
+  });
+
+  it('falls back to streamForPlugin when the runtime resolver throws', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => {
+      throw new Error('resolver boom');
+    });
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
   });
 });

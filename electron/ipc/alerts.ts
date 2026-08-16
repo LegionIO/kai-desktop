@@ -132,7 +132,14 @@ export async function deliverRecoveredAnswer(
   const title = questionTitle.trim() || 'your earlier question';
   const lines = Object.entries(clean).map(([header, choice]) => `- ${header} → ${choice}`);
   const body = lines.length ? lines.join('\n') : '(no answer provided)';
-  const text = `[Answering your earlier question "${title}"]\n${body}`;
+  // Unique per-delivery id embedded in the labeled turn. The post-failure
+  // committed-check matches THIS exact id, so two concurrent recoveries into the
+  // same conversation can't be confused — even when one's answer text is a prefix
+  // of the other's, or when both carry identical answers (R94). Rendered as a
+  // trailing HTML comment so it doesn't clutter the visible turn but survives the
+  // JSON round-trip on disk.
+  const deliveryId = `rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const text = `[Answering your earlier question "${title}"]\n${body}\n<!-- ${deliveryId} -->`;
   const correlationId = `recovered-answer-${conversationId}`;
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
@@ -201,15 +208,16 @@ export async function deliverRecoveredAnswer(
         // answer when THIS resume failed pre-commit (R91). Scanning only the appended
         // suffix satisfies both.
         const suffix = Array.isArray(afterMessages) ? afterMessages.slice(beforeMessageCount) : [];
-        // Match THIS resume's EXACT labeled text, not just the generic
-        // `[Answering your earlier question` prefix. Two concurrent recoveries into
-        // the same conversation snapshot the same beforeMessageCount; if recovery A
-        // commits and this one (B) then fails pre-commit, A's turn lands in B's
-        // suffix. A prefix match would false-positive → B's stash deleted while B's
-        // answer never reached the branch (data loss). The full `text` embeds B's
-        // own answer body, so it only matches B's genuinely-committed turn (R93).
+        // Match THIS resume's UNIQUE deliveryId, not the generic
+        // `[Answering your earlier question` prefix or even the full answer text.
+        // Two concurrent recoveries into the same conversation snapshot the same
+        // beforeMessageCount; if recovery A commits and this one (B) then fails
+        // pre-commit, A's turn lands in B's suffix. Neither a prefix match nor an
+        // exact-text match is safe (B's text can be a prefix of A's, and identical
+        // answers collide). The per-delivery `deliveryId` appears ONLY in this
+        // recovery's turn, so it matches iff B's own turn is on-branch (R94).
         const committed = suffix.some(
-          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(JSON.stringify(text).slice(1, -1)),
+          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId),
         );
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
