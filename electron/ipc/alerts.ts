@@ -144,9 +144,6 @@ export async function deliverRecoveredAnswer(
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
   if (conv) {
-    // Snapshot the message count BEFORE the resume so a post-failure check can tell
-    // whether THIS resume's user turn was committed (count grew) vs. an earlier
-    // recovered answer already on the branch (R91).
     const convBefore = conv as {
       selectedModelKey?: string | null;
       selectedProfileKey?: string | null;
@@ -161,7 +158,6 @@ export async function deliverRecoveredAnswer(
       runtimeOverride?: string | null;
       messages?: unknown[];
     };
-    const beforeMessageCount = Array.isArray(convBefore.messages) ? convBefore.messages.length : 0;
     const threadOverrides = buildThreadOverrides(convBefore);
     try {
       // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
@@ -197,28 +193,23 @@ export async function deliverRecoveredAnswer(
       // it (and repeat tool side effects). Detect the committed turn on disk and word
       // the fallback accordingly (R90).
       try {
-        const after = readConversation(deps.appHome, conversationId);
-        const afterMessages = (after as { messages?: Array<{ role?: unknown; content?: unknown }> } | null)?.messages;
-        // The CURRENT resume committed its user turn iff the message COUNT grew AND a
-        // labeled user turn appears in the NEWLY-APPENDED suffix (since the pre-resume
-        // snapshot). Requiring it to be the branch TAIL was wrong: a post-commit
-        // generation failure persists a terminal assistant/error node AFTER the user
-        // turn, so the labeled turn is no longer the tail (R92). And "some message
-        // anywhere" was wrong the other way: it false-positived on an EARLIER recovered
-        // answer when THIS resume failed pre-commit (R91). Scanning only the appended
-        // suffix satisfies both.
-        const suffix = Array.isArray(afterMessages) ? afterMessages.slice(beforeMessageCount) : [];
-        // Match THIS resume's UNIQUE deliveryId, not the generic
-        // `[Answering your earlier question` prefix or even the full answer text.
-        // Two concurrent recoveries into the same conversation snapshot the same
-        // beforeMessageCount; if recovery A commits and this one (B) then fails
-        // pre-commit, A's turn lands in B's suffix. Neither a prefix match nor an
-        // exact-text match is safe (B's text can be a prefix of A's, and identical
-        // answers collide). The per-delivery `deliveryId` appears ONLY in this
-        // recovery's turn, so it matches iff B's own turn is on-branch (R94).
-        const committed = suffix.some(
-          (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId),
-        );
+        const after = readConversation(deps.appHome, conversationId) as {
+          messages?: Array<{ role?: unknown; content?: unknown }>;
+          messageTree?: Array<{ role?: unknown; content?: unknown }>;
+        } | null;
+        // The CURRENT resume committed its user turn iff a message carrying THIS
+        // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
+        // active branch), NOT a count-based suffix: a count-relative slice breaks if
+        // the branch was rewound to a shorter one while the resume was queued (the
+        // committed turn then sits outside `slice(beforeMessageCount)` and is missed,
+        // wrongly reporting delivered:false → duplicate resend). The deliveryId is
+        // globally unique and appears ONLY in this recovery's turn, so a full-set scan
+        // can't false-positive on a concurrent/earlier recovery either (R94/R96).
+        const nodes: Array<{ role?: unknown; content?: unknown }> = [
+          ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+          ...(Array.isArray(after?.messages) ? after!.messages : []),
+        ];
+        const committed = nodes.some((m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId));
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
           // a resend (it would duplicate). Surface an informational alert instead.

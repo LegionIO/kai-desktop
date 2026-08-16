@@ -247,6 +247,40 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(res).toEqual({ delivered: true });
   });
 
+  it('finds the committed turn via a full messageTree scan even after a rewind to a SHORTER branch (R96)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+        throw new Error('gen failed'); // fail AFTER commit
+      },
+    );
+    // The pre-resume snapshot had many messages, but by the time we re-read after the
+    // failure the ACTIVE branch (messages) was rewound to just 1 node — the committed
+    // recovered turn lives on the messageTree, NOT within a count-relative suffix of
+    // `messages`. A count-based slice would miss it; the full-tree scan must not.
+    (readConversation as unknown as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce({
+        id: 'c1',
+        messages: [{ role: 'user' }, { role: 'assistant' }, { role: 'user' }, { role: 'assistant' }],
+      })
+      .mockImplementationOnce(() => ({
+        id: 'c1',
+        messages: [{ role: 'user', content: 'unrelated rewound head' }],
+        messageTree: [
+          { role: 'user', content: 'old' },
+          { role: 'user', content: persistedText },
+        ],
+      }));
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: true });
+  });
+
   it('returns delivered:false for an empty/invalid answer (nothing to deliver)', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });

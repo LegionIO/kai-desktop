@@ -423,6 +423,13 @@ const activeStreamRuntime = new Map<
     // post-hook prompt even for an allow-only hook, wrongly blocking every inject.
     preHookSystemPrompt?: string;
     executionMode?: ExecutionMode;
+    // Also recorded so a mid-turn inject that pins a DIFFERENT profile / reasoning /
+    // cwd / runtime than the live run falls through to abort+restart instead of
+    // cooperatively splicing under the wrong context (R96).
+    profileKey?: string;
+    reasoningEffort?: string;
+    cwd?: string;
+    runtimeOverride?: string;
   }
 >();
 
@@ -514,10 +521,17 @@ export function getActiveStreamToken(conversationId: string): string | undefined
  *  uses — a model/prompt/mode-conditioned hook must see what the running turn
  *  shows it, or it could allow an injected message it would block. Undefined
  *  fields when unrecorded (caller falls back to defaults). */
-function getActiveRunContext(
-  conversationId: string,
-):
-  | { modelKey?: string; systemPrompt?: string; preHookSystemPrompt?: string; executionMode?: ExecutionMode }
+function getActiveRunContext(conversationId: string):
+  | {
+      modelKey?: string;
+      systemPrompt?: string;
+      preHookSystemPrompt?: string;
+      executionMode?: ExecutionMode;
+      profileKey?: string;
+      reasoningEffort?: string;
+      cwd?: string;
+      runtimeOverride?: string;
+    }
   | undefined {
   const activeToken = activeStreams.get(conversationId)?.token;
   if (activeToken === undefined) return undefined;
@@ -528,6 +542,10 @@ function getActiveRunContext(
     systemPrompt: entry.systemPrompt,
     preHookSystemPrompt: entry.preHookSystemPrompt,
     executionMode: entry.executionMode,
+    profileKey: entry.profileKey,
+    reasoningEffort: entry.reasoningEffort,
+    cwd: entry.cwd,
+    runtimeOverride: entry.runtimeOverride,
   };
 }
 
@@ -1398,6 +1416,14 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
       toolName: 'ask_user',
       fields: { toolCallId: answerKey, streamToken, runtime: 'non-mastra' },
     });
+    return;
+  }
+  // A mass-delete (deleteMany/clear) aborts SDK questions in a synchronous loop; the
+  // FIFO terminalAbortTokens set (bounded) could evict this run's token before the
+  // check above under a >100-conversation delete. The conversation's file is already
+  // gone by then, so don't route recovery for a conversation that no longer exists —
+  // it would record a tombstone / raise an Alert pointing at a deleted chat (R96).
+  if (!readConversation(appHomeForRuntimeResolve, conversationId)) {
     return;
   }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
@@ -3186,6 +3212,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         systemPrompt: effectiveSystemPrompt,
         preHookSystemPrompt,
         executionMode: effectiveExecutionMode,
+        ...(profileKey !== undefined ? { profileKey } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(threadOverrides?.runtimeOverride ? { runtimeOverride: threadOverrides.runtimeOverride } : {}),
       });
       // Seed the run's INITIAL response id into its lineage NOW, before any provider
       // event. A GUI turn passes a caller-provided responseMessageId that the
@@ -5868,7 +5898,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // abort (a superseding turn), where a successor DOES exist and a
                   // parallel ask_user's answer should still hand off to it. Guard on
                   // !aborted so a superseded exit_plan_mode doesn't wrongly strand it.
-                  if (!controller.signal.aborted) markTokenTerminalAbort(streamToken);
+                  if (!controller.signal.aborted) {
+                    markTokenTerminalAbort(streamToken);
+                    // Bump the per-conversation cancel generation too: a genuine
+                    // dismiss is terminal-with-no-successor exactly like a Stop, so a
+                    // raced-answer tombstone recorded by a DIFFERENT (already-superseded)
+                    // run for this conversation must be invalidated — otherwise a late
+                    // answer to that earlier run could resurrect a tool-enabled turn
+                    // after the user dismissed. markTokenTerminalAbort only covers the
+                    // dismissed run's OWN token; the cancel-gen bump covers cross-run
+                    // tombstones the same way Stop does (R96).
+                    bumpExplicitCancelGeneration(conversationId);
+                  }
                   controller.abort();
                   return;
                 }
@@ -7503,15 +7544,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // A cooperative splice injects into the UNCHANGED live run — so it must be
       // gated (and will execute) under the LIVE run's model/mode, NOT a caller
       // override. If the caller (e.g. a busy-target automation) pinned a DIFFERENT
-      // model or execution mode than the live run, cooperative splicing would run
-      // the text under the wrong context — fall through to abort+restart instead so
-      // the caller's override is honored on a fresh turn. Cooperative-only callers
-      // (raced-answer delivery) never pin an override, so they always splice.
+      // model / execution mode / profile / reasoning / cwd / runtime than the live
+      // run, cooperative splicing would run the text under the wrong context — fall
+      // through to abort+restart instead so the caller's override is honored on a
+      // fresh turn. Cooperative-only callers (raced-answer delivery) never pin an
+      // override, so they always splice. Each clause only compares when BOTH the
+      // caller pin and the live value are known (an unrecorded live field → we can't
+      // prove a difference → don't force a needless restart).
       const overrideDiffersFromLive =
         (opts?.modelKey !== undefined && runCtx?.modelKey !== undefined && opts.modelKey !== runCtx.modelKey) ||
         (opts?.executionMode !== undefined &&
           runCtx?.executionMode !== undefined &&
-          opts.executionMode !== runCtx.executionMode);
+          opts.executionMode !== runCtx.executionMode) ||
+        (opts?.profileKey !== undefined && runCtx?.profileKey !== undefined && opts.profileKey !== runCtx.profileKey) ||
+        (opts?.reasoningEffort !== undefined &&
+          runCtx?.reasoningEffort !== undefined &&
+          opts.reasoningEffort !== runCtx.reasoningEffort) ||
+        (opts?.cwd !== undefined && runCtx?.cwd !== undefined && opts.cwd !== runCtx.cwd) ||
+        (opts?.threadOverrides?.runtimeOverride != null &&
+          runCtx?.runtimeOverride !== undefined &&
+          opts.threadOverrides.runtimeOverride !== runCtx.runtimeOverride);
       if (overrideDiffersFromLive && !cooperativeOnly) {
         // Skip cooperative splice; fall through to abort+restart with the override.
       } else {
