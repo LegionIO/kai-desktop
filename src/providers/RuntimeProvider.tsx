@@ -1540,9 +1540,22 @@ export function reorderPrefixBeforeInjectedUserChain(
   const variantIds = new Set(
     messages.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
   );
+  // Rechain EVERY injected user in FIFO order after the prefix, not just the first.
+  // The batch can interleave as `pre → u1 → prefix → u2` (prefix landed under u1,
+  // u2 under prefix) — not only the documented `pre → u1 → u2 → … → prefix`. Simply
+  // reparenting u1 onto prefix would then leave u2 still parented on prefix, making
+  // u1 an inactive SIBLING of u2 → u1 (a turn the model actually consumed) drops off
+  // the active branch and disappears from persisted history. Force the linear chain
+  // prefix → u1 → u2 → … so every consumed inject stays on-branch (R99 finding-3).
+  const chainParentOf = new Map<string, string>();
+  chainParentOf.set(injectedIds[0], prefixId);
+  for (let i = 1; i < injectedIds.length; i++) {
+    chainParentOf.set(injectedIds[i], injectedIds[i - 1]);
+  }
   const nextMessages = messages.map((m) => {
     if (variantIds.has(m.id)) return { ...m, parentId: chainParent };
-    if (m.id === injectedIds[0]) return { ...m, parentId: prefixId };
+    const rechainTo = chainParentOf.get(m.id);
+    if (rechainTo !== undefined) return { ...m, parentId: rechainTo };
     return m;
   });
   // If the head was the misplaced prefix, advance it to the tail of the user chain.

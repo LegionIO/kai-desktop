@@ -536,6 +536,29 @@ describe('reorderPrefixBeforeInjectedUserChain — batched multi-inject before t
     expect(out.messages.find((m) => m.id === 'prefix')?.parentId).toBe('user-1');
     expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
   });
+
+  it('rechains ALL injected users after the prefix for the INTERLEAVED shape pre → u1 → prefix → u2 (R99)', () => {
+    // The batch interleaved so the prefix landed under u1 and u2 under the prefix.
+    // The old per-first-user repair left `u2` parented on `prefix`, making u1 an
+    // inactive SIBLING of u2 → u1 (consumed by the model) dropped off-branch. The
+    // fix must yield the linear chain pre → prefix → u1 → u2.
+    const messages = [
+      { id: 'pre', parentId: null, role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u1', parentId: 'pre', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'u1', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u2', parentId: 'prefix', role: 'user', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'u2', ['u1', 'u2']);
+    const byId = Object.fromEntries(out.messages.map((m) => [m.id, m.parentId]));
+    expect(byId['prefix']).toBe('pre'); // prefix before the chain
+    expect(byId['u1']).toBe('prefix'); // first user after the prefix
+    expect(byId['u2']).toBe('u1'); // u2 rechained onto u1 (NOT left under prefix)
+    // Both injected users are now on the active branch from the head.
+    const active = getActiveBranch(out.messages as never, out.headId);
+    const activeIds = active.map((m: { id: string }) => m.id);
+    expect(activeIds).toContain('u1');
+    expect(activeIds).toContain('u2');
+  });
 });
 
 describe('ensureTree', () => {

@@ -7425,7 +7425,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       executionMode?: ExecutionMode;
       revalidateLiveModel?: boolean;
     },
-  ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean }> => {
+  ): Promise<{ allowed: boolean; text: string; reason?: string; terminal?: boolean; requiresRestart?: boolean }> => {
     const hasPluginHooks = Boolean(pluginManager?.hasPreSendHooks());
     const hasPromptHooks = hookDispatcher.hasEnforcingHooksFor('UserPromptSubmit');
     if (!hasPluginHooks && !hasPromptHooks) return { allowed: true, text: userText };
@@ -7524,24 +7524,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (typeof gated.systemPrompt === 'string') effectivePrompt = gated.systemPrompt;
     }
     // A message-specific prompt rewrite can't be applied to the running turn a
-    // cooperative inject splices into — fail closed so the text isn't sent under a
-    // prompt the policy didn't intend. Compare the gate's hook output against the
-    // ACTIVE run's post-hook baseline (NOT the hook INPUT — a content-independent
-    // hook reproduces the run's prompt from the same base, which must be allowed).
+    // cooperative inject splices into — but this is NOT a DENIAL: a fresh
+    // abort+restart turn WOULD honor the content-dependent rewrite. So flag it as
+    // requiresRestart (cooperatively unrepresentable) rather than terminal (blocked),
+    // so a normal caller restarts and a cooperative-only raced answer is RETAINED for
+    // its successor instead of being purged as policy-blocked (R99 finding-2).
     if (effectivePrompt !== runPostHookPrompt) {
       return {
         allowed: false,
         text: userText,
         reason: 'A policy hook changed the system prompt for this message; it cannot be injected mid-turn.',
-        terminal: true,
+        requiresRestart: true,
       };
     }
     // Extract the (possibly-redacted) text of the surviving INJECTED user turn (the
     // last message, after `historyLen` history messages). If a hook REMOVED it or
-    // ADDED messages around it, treat as a denial (nothing faithfully injectable).
+    // ADDED messages around it, treat as cooperatively-unrepresentable (requiresRestart),
+    // NOT a denial — a fresh turn re-runs the hooks and can honor the reshaping (R99).
     const resolved = resolveInjectedTextFromGatedPayload(payload, historyLen);
     if (!resolved.allowed)
-      return { allowed: false, text: userText, reason: 'A policy hook removed this message.', terminal: true };
+      return {
+        allowed: false,
+        text: userText,
+        reason: 'A policy hook reshaped this message; it cannot be injected mid-turn.',
+        requiresRestart: true,
+      };
     // The gate awaited async hooks. If a mid-stream model-fallback changed the
     // ACTIVE run's model during that await, the decision we just made was for the
     // OLD model — a model-conditioned hook could allow text the new model should
@@ -7646,8 +7653,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // run that inherited the conversation's cwd and needlessly abort in-flight
         // tool work (R98 finding-1). fallbackEnabled comes from the conversation the
         // same way the restart reads updated.fallbackEnabled (R98 finding-2).
-        const callerCfg = readEffectiveConfig(appHome);
-        const convForMerge = existingConv as {
+        type ConvMerge = {
           selectedModelKey?: string | null;
           selectedProfileKey?: string | null;
           currentWorkingDirectory?: string | null;
@@ -7659,22 +7665,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           maxRetries?: number | null;
           runtimeOverride?: string | null;
         };
-        const mergedThreadOverrides = opts?.threadOverrides ?? {
-          ...(typeof convForMerge.temperature === 'number' ? { temperature: convForMerge.temperature } : {}),
-          ...(typeof convForMerge.systemPromptOverride === 'string'
-            ? { systemPromptOverride: convForMerge.systemPromptOverride }
-            : {}),
-          ...(typeof convForMerge.maxSteps === 'number' ? { maxSteps: convForMerge.maxSteps } : {}),
-          ...(typeof convForMerge.maxRetries === 'number' ? { maxRetries: convForMerge.maxRetries } : {}),
-          ...(typeof convForMerge.runtimeOverride === 'string'
-            ? { runtimeOverride: convForMerge.runtimeOverride }
-            : {}),
-        };
-        const mergedModelKey = opts?.modelKey ?? convForMerge.selectedModelKey ?? undefined;
-        const mergedProfileKey = opts?.profileKey ?? convForMerge.selectedProfileKey ?? undefined;
-        const mergedCwd = normalizeAgentCwd(opts?.cwd ?? convForMerge.currentWorkingDirectory ?? undefined);
-        const mergedMode = opts?.executionMode ?? convForMerge.executionMode ?? runCtx.executionMode ?? 'auto';
-        const mergedFallback = convForMerge.fallbackEnabled ?? false;
+        const mergeThreadOverrides = (c: ConvMerge) =>
+          opts?.threadOverrides ?? {
+            ...(typeof c.temperature === 'number' ? { temperature: c.temperature } : {}),
+            ...(typeof c.systemPromptOverride === 'string' ? { systemPromptOverride: c.systemPromptOverride } : {}),
+            ...(typeof c.maxSteps === 'number' ? { maxSteps: c.maxSteps } : {}),
+            ...(typeof c.maxRetries === 'number' ? { maxRetries: c.maxRetries } : {}),
+            ...(typeof c.runtimeOverride === 'string' ? { runtimeOverride: c.runtimeOverride } : {}),
+          };
+        const cfgBefore = readEffectiveConfig(appHome);
+        const convBefore = existingConv as ConvMerge;
+        const toBefore = mergeThreadOverrides(convBefore);
+        const modelBefore = opts?.modelKey ?? convBefore.selectedModelKey ?? undefined;
+        const profileBefore = opts?.profileKey ?? convBefore.selectedProfileKey ?? undefined;
+        const fallbackBefore = convBefore.fallbackEnabled ?? false;
         // Resolve the caller's EFFECTIVE runtime the same authoritative way streamHandler
         // does (resolveRuntimeForStream, honoring a thread runtimeOverride overlay +
         // model-based auto resolution) — NOT a hardcoded 'mastra', which would let an
@@ -7682,37 +7686,48 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // run and splice under the wrong runtime (R98 finding-3).
         let callerRuntimeId = 'mastra';
         try {
-          const sc = resolveStreamConfig(callerCfg, {
-            threadModelKey: mergedModelKey ?? null,
-            threadProfileKey: mergedProfileKey ?? null,
+          const sc = resolveStreamConfig(cfgBefore, {
+            threadModelKey: modelBefore ?? null,
+            threadProfileKey: profileBefore ?? null,
             reasoningEffort: opts?.reasoningEffort,
-            fallbackEnabled: mergedFallback,
-            ...(mergedThreadOverrides ? { threadOverrides: mergedThreadOverrides } : {}),
+            fallbackEnabled: fallbackBefore,
+            ...(toBefore ? { threadOverrides: toBefore } : {}),
           });
-          const runtimeCfg = mergedThreadOverrides.runtimeOverride
-            ? ({
-                ...callerCfg,
-                agent: { ...callerCfg.agent, runtime: mergedThreadOverrides.runtimeOverride },
-              } as AppConfig)
-            : callerCfg;
+          const runtimeCfg = toBefore.runtimeOverride
+            ? ({ ...cfgBefore, agent: { ...cfgBefore.agent, runtime: toBefore.runtimeOverride } } as AppConfig)
+            : cfgBefore;
           const { resolution } = await resolveRuntimeForStream(runtimeCfg, sc?.primaryModel ?? null);
           callerRuntimeId = resolution.runtimeId ?? 'mastra';
         } catch {
           callerRuntimeId = '__unresolved__';
         }
-        // Ownership can change during the awaited runtime resolution above — re-read
-        // the live run's fingerprint so we compare against the CURRENT run, not a stale
-        // one (a superseding run would carry its own fingerprint / no longer be Mastra).
+        // Re-read config + conversation AFTER the await and compute the caller
+        // fingerprint from those CURRENT values. A metadata-only settings/conversation
+        // update during resolveRuntimeForStream changes neither the stream token nor the
+        // head (so the post-gate ownership check wouldn't catch it), but it DOES change
+        // what a fresh restart would run under — so computing the fingerprint from the
+        // post-await state makes such drift produce a mismatch and force restart, rather
+        // than cooperatively splicing under a now-stale context (R99 finding-1). Also
+        // re-read the live fingerprint: a supersession during the await would carry its
+        // own fingerprint / no longer be Mastra.
+        const cfgNow = readEffectiveConfig(appHome);
+        const convNow = (readConversation(appHome, conversationId) ?? convBefore) as ConvMerge;
+        const toNow = mergeThreadOverrides(convNow);
+        const mergedModelKey = opts?.modelKey ?? convNow.selectedModelKey ?? undefined;
+        const mergedProfileKey = opts?.profileKey ?? convNow.selectedProfileKey ?? undefined;
+        const mergedCwd = normalizeAgentCwd(opts?.cwd ?? convNow.currentWorkingDirectory ?? undefined);
+        const mergedMode = opts?.executionMode ?? convNow.executionMode ?? runCtx.executionMode ?? 'auto';
+        const mergedFallback = convNow.fallbackEnabled ?? false;
         const liveCtxNow = getActiveRunContext(conversationId);
         const callerFingerprint =
           callerRuntimeId === '__unresolved__'
             ? '__unresolved__'
-            : computeRunContextFingerprint(callerCfg, callerRuntimeId, mergedCwd, mergedMode, {
+            : computeRunContextFingerprint(cfgNow, callerRuntimeId, mergedCwd, mergedMode, {
                 modelKey: mergedModelKey,
                 profileKey: mergedProfileKey,
                 reasoningEffort: opts?.reasoningEffort,
                 fallbackEnabled: mergedFallback,
-                threadOverrides: mergedThreadOverrides,
+                threadOverrides: toNow,
               });
         // An unresolved fingerprint on EITHER side is not trustworthy for equality
         // (both could be the '__unresolved__' sentinel and spuriously match) — treat
