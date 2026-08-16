@@ -604,6 +604,21 @@ function updateActiveRunModelKey(conversationId: string, token: string, modelKey
   const entry = activeStreamRuntime.get(conversationId);
   if (entry && entry.token === token && activeStreams.get(conversationId)?.token === token) {
     entry.modelKey = modelKey;
+    // Keep the effective-context fingerprint in sync with the model actually in use
+    // after a mid-stream fallback (R97/R98): otherwise a later mid-turn inject would
+    // compare against the stale PRIMARY-model fingerprint — an inject pinning the
+    // now-active fallback model would spuriously restart, and one pinning the primary
+    // would spuriously splice under the wrong (fallback) model. Only the `model`
+    // dimension changes on a fallback, so patch it in place.
+    if (entry.contextFingerprint !== undefined && entry.contextFingerprint !== '__unresolved__') {
+      try {
+        const fp = JSON.parse(entry.contextFingerprint) as { model?: unknown };
+        fp.model = modelKey;
+        entry.contextFingerprint = JSON.stringify(fp);
+      } catch {
+        /* leave the fingerprint as-is; a mismatch just fails safe toward restart */
+      }
+    }
   }
 }
 
@@ -7624,28 +7639,89 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             opts.threadOverrides.runtimeOverride != null));
       let overrideDiffersFromLive = false;
       if (callerPinnedAnyOverride && runCtx?.contextFingerprint !== undefined) {
-        // A caller-pinned runtimeOverride naming a non-Mastra runtime always differs
-        // (the live cooperative run is Mastra). Otherwise a cooperative splice would
-        // run in the live Mastra runtime, so compute the caller's would-be fingerprint
-        // under that same runtime and compare the rest of the effective context.
-        const pinnedRuntime = opts?.threadOverrides?.runtimeOverride ?? null;
-        if (pinnedRuntime && pinnedRuntime !== 'mastra' && pinnedRuntime !== 'auto') {
-          overrideDiffersFromLive = true;
-        } else {
-          const callerFingerprint = computeRunContextFingerprint(
-            readEffectiveConfig(appHome),
-            'mastra',
-            normalizeAgentCwd(opts?.cwd),
-            opts?.executionMode ?? runCtx.executionMode ?? 'auto',
-            {
-              modelKey: opts?.modelKey,
-              profileKey: opts?.profileKey,
-              reasoningEffort: opts?.reasoningEffort,
-              threadOverrides: opts?.threadOverrides,
-            },
-          );
-          overrideDiffersFromLive = callerFingerprint !== runCtx.contextFingerprint;
+        // Build the caller's would-be EFFECTIVE context EXACTLY as the abort+restart
+        // path (below) merges it: caller opts take precedence, omitted fields fall
+        // back to the conversation's persisted values — NOT global defaults. Using
+        // globals for an omitted field (e.g. cwd) would spuriously mismatch a live
+        // run that inherited the conversation's cwd and needlessly abort in-flight
+        // tool work (R98 finding-1). fallbackEnabled comes from the conversation the
+        // same way the restart reads updated.fallbackEnabled (R98 finding-2).
+        const callerCfg = readEffectiveConfig(appHome);
+        const convForMerge = existingConv as {
+          selectedModelKey?: string | null;
+          selectedProfileKey?: string | null;
+          currentWorkingDirectory?: string | null;
+          fallbackEnabled?: boolean;
+          executionMode?: ExecutionMode | null;
+          temperature?: number | null;
+          systemPromptOverride?: string | null;
+          maxSteps?: number | null;
+          maxRetries?: number | null;
+          runtimeOverride?: string | null;
+        };
+        const mergedThreadOverrides = opts?.threadOverrides ?? {
+          ...(typeof convForMerge.temperature === 'number' ? { temperature: convForMerge.temperature } : {}),
+          ...(typeof convForMerge.systemPromptOverride === 'string'
+            ? { systemPromptOverride: convForMerge.systemPromptOverride }
+            : {}),
+          ...(typeof convForMerge.maxSteps === 'number' ? { maxSteps: convForMerge.maxSteps } : {}),
+          ...(typeof convForMerge.maxRetries === 'number' ? { maxRetries: convForMerge.maxRetries } : {}),
+          ...(typeof convForMerge.runtimeOverride === 'string'
+            ? { runtimeOverride: convForMerge.runtimeOverride }
+            : {}),
+        };
+        const mergedModelKey = opts?.modelKey ?? convForMerge.selectedModelKey ?? undefined;
+        const mergedProfileKey = opts?.profileKey ?? convForMerge.selectedProfileKey ?? undefined;
+        const mergedCwd = normalizeAgentCwd(opts?.cwd ?? convForMerge.currentWorkingDirectory ?? undefined);
+        const mergedMode = opts?.executionMode ?? convForMerge.executionMode ?? runCtx.executionMode ?? 'auto';
+        const mergedFallback = convForMerge.fallbackEnabled ?? false;
+        // Resolve the caller's EFFECTIVE runtime the same authoritative way streamHandler
+        // does (resolveRuntimeForStream, honoring a thread runtimeOverride overlay +
+        // model-based auto resolution) — NOT a hardcoded 'mastra', which would let an
+        // auto+Anthropic-model caller (→ claude-agent-sdk) spuriously match a live Mastra
+        // run and splice under the wrong runtime (R98 finding-3).
+        let callerRuntimeId = 'mastra';
+        try {
+          const sc = resolveStreamConfig(callerCfg, {
+            threadModelKey: mergedModelKey ?? null,
+            threadProfileKey: mergedProfileKey ?? null,
+            reasoningEffort: opts?.reasoningEffort,
+            fallbackEnabled: mergedFallback,
+            ...(mergedThreadOverrides ? { threadOverrides: mergedThreadOverrides } : {}),
+          });
+          const runtimeCfg = mergedThreadOverrides.runtimeOverride
+            ? ({
+                ...callerCfg,
+                agent: { ...callerCfg.agent, runtime: mergedThreadOverrides.runtimeOverride },
+              } as AppConfig)
+            : callerCfg;
+          const { resolution } = await resolveRuntimeForStream(runtimeCfg, sc?.primaryModel ?? null);
+          callerRuntimeId = resolution.runtimeId ?? 'mastra';
+        } catch {
+          callerRuntimeId = '__unresolved__';
         }
+        // Ownership can change during the awaited runtime resolution above — re-read
+        // the live run's fingerprint so we compare against the CURRENT run, not a stale
+        // one (a superseding run would carry its own fingerprint / no longer be Mastra).
+        const liveCtxNow = getActiveRunContext(conversationId);
+        const callerFingerprint =
+          callerRuntimeId === '__unresolved__'
+            ? '__unresolved__'
+            : computeRunContextFingerprint(callerCfg, callerRuntimeId, mergedCwd, mergedMode, {
+                modelKey: mergedModelKey,
+                profileKey: mergedProfileKey,
+                reasoningEffort: opts?.reasoningEffort,
+                fallbackEnabled: mergedFallback,
+                threadOverrides: mergedThreadOverrides,
+              });
+        // An unresolved fingerprint on EITHER side is not trustworthy for equality
+        // (both could be the '__unresolved__' sentinel and spuriously match) — treat
+        // it as a difference so the inject fails safe toward abort+restart (R98).
+        overrideDiffersFromLive =
+          liveCtxNow?.contextFingerprint === undefined ||
+          callerFingerprint === '__unresolved__' ||
+          liveCtxNow.contextFingerprint === '__unresolved__' ||
+          callerFingerprint !== liveCtxNow.contextFingerprint;
       }
       if (overrideDiffersFromLive && !cooperativeOnly) {
         // Skip cooperative splice; fall through to abort+restart with the override.
