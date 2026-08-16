@@ -104,23 +104,30 @@ export async function deliverRecoveredAnswer(
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
   if (conv) {
+    // Snapshot the message count BEFORE the resume so a post-failure check can tell
+    // whether THIS resume's user turn was committed (count grew) vs. an earlier
+    // recovered answer already on the branch (R91).
+    const convBefore = conv as {
+      selectedModelKey?: string | null;
+      selectedProfileKey?: string | null;
+      currentWorkingDirectory?: string | null;
+      fallbackEnabled?: boolean;
+      executionMode?: 'auto' | 'plan-first' | null;
+      messages?: unknown[];
+    };
+    const beforeMessageCount = Array.isArray(convBefore.messages) ? convBefore.messages.length : 0;
     try {
-      // Preserve the conversation's OWN model/profile/cwd/fallback so the recovered
-      // answer runs under the same context the question was asked in — not the global
-      // default (R89/R90). executionMode isn't persisted per-conversation, so it can't
-      // be recovered here; model/profile/cwd/fallback are.
-      const convRec = conv as {
-        selectedModelKey?: string | null;
-        selectedProfileKey?: string | null;
-        currentWorkingDirectory?: string | null;
-        fallbackEnabled?: boolean;
-      };
+      // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
+      // the recovered answer runs under the same context the question was asked in —
+      // not the global default (R89/R90/R91). executionMode especially: a plan-first
+      // conversation must NOT resume in auto and expose mutating workspace tools.
       await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
         correlationId,
-        ...(convRec.selectedModelKey ? { modelKey: convRec.selectedModelKey } : {}),
-        ...(convRec.selectedProfileKey ? { profileKey: convRec.selectedProfileKey } : {}),
-        ...(convRec.currentWorkingDirectory ? { cwd: convRec.currentWorkingDirectory } : {}),
-        ...(typeof convRec.fallbackEnabled === 'boolean' ? { fallbackEnabled: convRec.fallbackEnabled } : {}),
+        ...(convBefore.selectedModelKey ? { modelKey: convBefore.selectedModelKey } : {}),
+        ...(convBefore.selectedProfileKey ? { profileKey: convBefore.selectedProfileKey } : {}),
+        ...(convBefore.currentWorkingDirectory ? { cwd: convBefore.currentWorkingDirectory } : {}),
+        ...(typeof convBefore.fallbackEnabled === 'boolean' ? { fallbackEnabled: convBefore.fallbackEnabled } : {}),
+        ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
       });
       traceDiagnostic({
         scope: 'alert',
@@ -140,12 +147,21 @@ export async function deliverRecoveredAnswer(
       // the fallback accordingly (R90).
       try {
         const after = readConversation(deps.appHome, conversationId);
+        const afterMessages = (after as { messages?: Array<{ role?: unknown; content?: unknown }> } | null)?.messages;
+        // The CURRENT resume committed its user turn iff the message COUNT grew AND
+        // the branch tail is our labeled answer. Checking only "some message contains
+        // the label" would false-positive on an EARLIER recovered answer already on
+        // the branch when THIS resume failed pre-commit (busy timeout / deletion) —
+        // wrongly reporting delivered:true and dropping the stash (R91). Require both
+        // the count to have grown past the pre-resume snapshot and a labeled user
+        // turn to be present.
+        const tail = Array.isArray(afterMessages) ? afterMessages[afterMessages.length - 1] : undefined;
         const committed =
-          !!after &&
-          Array.isArray((after as { messages?: Array<{ role?: unknown; content?: unknown }> }).messages) &&
-          (after as { messages: Array<{ role?: unknown; content?: unknown }> }).messages.some(
-            (m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(`[Answering your earlier question`),
-          );
+          Array.isArray(afterMessages) &&
+          afterMessages.length > beforeMessageCount &&
+          !!tail &&
+          tail.role === 'user' &&
+          JSON.stringify(tail.content ?? '').includes(`[Answering your earlier question`);
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
           // a resend (it would duplicate). Surface an informational alert instead.
@@ -355,13 +371,15 @@ async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
   try {
     // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
-    // fallback) rather than the global default (R90). executionMode isn't persisted
-    // per-conversation, so it can't be recovered.
+    // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
+    // conversation must resume in plan-first, not auto (which would expose mutating
+    // tools).
     const conv = readConversation(deps.appHome, alert.conversationId) as {
       selectedModelKey?: string | null;
       selectedProfileKey?: string | null;
       currentWorkingDirectory?: string | null;
       fallbackEnabled?: boolean;
+      executionMode?: 'auto' | 'plan-first' | null;
     } | null;
     await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
       correlationId: `alert-${alert.id}`,
@@ -369,6 +387,7 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       ...(conv?.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
       ...(conv?.currentWorkingDirectory ? { cwd: conv.currentWorkingDirectory } : {}),
       ...(typeof conv?.fallbackEnabled === 'boolean' ? { fallbackEnabled: conv.fallbackEnabled } : {}),
+      ...(conv?.executionMode ? { executionMode: conv.executionMode } : {}),
     });
   } catch (err) {
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
