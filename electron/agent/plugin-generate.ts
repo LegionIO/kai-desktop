@@ -1,4 +1,5 @@
 import type { AppConfig } from '../config/schema.js';
+import type { ExecutionMode } from '../config/schema.js';
 import { resolveModelCatalog, resolveStreamConfig } from './model-catalog.js';
 import type { ReasoningEffort, ResolvedStreamConfig } from './model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
@@ -21,6 +22,14 @@ export type PluginGenerateOptions = {
   systemPrompt?: string;
   tools?: ToolDefinition[];
   abortSignal?: AbortSignal;
+  /** Working directory for this run's workspace tools (relative-path resolution +
+   *  shell cwd). When set, forwarded to the underlying stream's executionContext so
+   *  a resumed/recovered turn runs in the CONVERSATION's cwd, not the home default. */
+  cwd?: string;
+  /** Execution mode overlaid onto config for this run (e.g. `plan-first` filters
+   *  mutating workspace tools). When set, the run honors the conversation's mode
+   *  instead of the global config default. */
+  executionMode?: ExecutionMode;
   /** Cooperative injects consumed at a prepareStep boundary. */
   onInjected?: (entries: Array<{ id: string; text: string; at: number }>) => void;
 };
@@ -83,7 +92,14 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   stream: AsyncGenerator<StreamEvent>;
   modelKey: string;
 }> {
-  const { config, appHome, messages, systemPrompt, tools: pluginTools } = options;
+  const { appHome, messages, systemPrompt, tools: pluginTools } = options;
+  // Overlay the run's execution mode (e.g. the conversation's `plan-first`) onto the
+  // config so streamAgentResponse's workspace-tool filtering honors it — otherwise a
+  // recovered/resumed turn would use the GLOBAL executionMode and could expose
+  // mutating tools plan mode normally filters out (R90).
+  const config: AppConfig = options.executionMode
+    ? { ...options.config, tools: { ...options.config.tools, executionMode: options.executionMode } }
+    : options.config;
 
   const streamConfig = resolveStreamConfig(config, {
     threadModelKey: options.modelKey ?? null,
@@ -118,6 +134,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
         abortSignal: options.abortSignal,
         reasoningEffort: options.reasoningEffort as ReasoningEffort | undefined,
         isHeadless: true,
+        ...(options.cwd ? { cwd: options.cwd } : {}),
         onInjected: options.onInjected,
       },
     );
@@ -146,6 +163,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       isHeadless: true,
       parentProfileKey,
       parentModelKey,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
       onInjected: options.onInjected,
     });
   } else {
@@ -155,6 +173,7 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       isHeadless: true,
       parentProfileKey,
       parentModelKey,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
       onInjected: options.onInjected,
     });
   }

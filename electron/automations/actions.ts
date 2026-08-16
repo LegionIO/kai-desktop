@@ -5,9 +5,15 @@ import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js'
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { broadcastAgentStreamEvent, isConversationTurnActive } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
+import {
+  enqueueInject,
+  hasInjects,
+  drainInjects,
+  reenqueueInject,
+  reenqueueFreshAtFront,
+} from '../agent/inject-queue.js';
 import { isCompacting } from '../agent/compaction-lock.js';
-import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
+import type { AppConfig, AutomationAction, AutomationRule, ExecutionMode } from '../config/schema.js';
 import {
   appendConversationMessages,
   broadcastUpsert,
@@ -128,7 +134,17 @@ export async function resumeConversationWithMessage(
   conversationId: string,
   promptText: string,
   deps: ActionDeps,
-  opts?: { modelKey?: string; profileKey?: string; tools?: boolean; correlationId?: string },
+  opts?: {
+    modelKey?: string;
+    profileKey?: string;
+    tools?: boolean;
+    correlationId?: string;
+    /** The conversation's own cwd / execution mode / fallback, so the resumed turn
+     *  runs in its context (not the global config default) — R90. */
+    cwd?: string;
+    executionMode?: ExecutionMode;
+    fallbackEnabled?: boolean;
+  },
 ): Promise<unknown> {
   const action: Extract<AutomationAction, { type: 'agent' }> = {
     type: 'agent',
@@ -168,6 +184,11 @@ export async function resumeConversationWithMessage(
     // Thread the alert's stable correlation id so the resumed agent turn's traces
     // share the alert's `alert-<id>` id (creation → answer → resume all correlate).
     ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
+    // Run in the CONVERSATION's own context (cwd / execution mode / fallback) so a
+    // resume doesn't stream at the home dir / global mode (R90).
+    ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+    ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+    ...(opts?.fallbackEnabled !== undefined ? { fallbackEnabled: opts.fallbackEnabled } : {}),
   });
 }
 
@@ -333,6 +354,13 @@ async function runAgentAction(
     /** Internal: this invocation already owns its slot in orderedConversationTails. */
     orderedExecution?: boolean;
     correlationId?: string;
+    /** Working directory + execution mode for the streamed turn, so a resume
+     *  (alert answer / recovered raced answer) runs in the CONVERSATION's context
+     *  rather than the global config default (R90). Forwarded to streamForPlugin. */
+    cwd?: string;
+    executionMode?: ExecutionMode;
+    /** Explicit fallback toggle; overrides the default `Boolean(profileKey)`. */
+    fallbackEnabled?: boolean;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -991,9 +1019,11 @@ async function runAgentAction(
         conversationId,
         modelKey: action.modelKey,
         profileKey: action.profileKey,
-        fallbackEnabled: Boolean(action.profileKey),
+        fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
         tools,
         abortSignal: abortController.signal,
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
         // prepareStep may fire this BEFORE the prior step's events reach this
         // loop; buffer, don't persist synchronously. Flushed at the top of each
         // iteration (below) once those events have been consumed.
@@ -1225,9 +1255,9 @@ async function runAgentAction(
     // already-committed id, else append; best-effort.
     for (const entry of failedBoundaryUsers) {
       try {
-        const onDisk = ((readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>).some(
-          (m) => m.id === entry.id,
-        );
+        const onDisk = (
+          (readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>
+        ).some((m) => m.id === entry.id);
         if (onDisk) continue;
         const userMsg = {
           id: entry.id,
@@ -1354,7 +1384,11 @@ async function runAgentAction(
   // drains the queue so a transiently-failed follow-up still gets consumed +
   // persisted). Bounded to avoid loops.
   const continueBudget = opts?.continueBudget ?? 3;
-  if (turnSucceeded && continueBudget > 0 && (strandedInjects.length > 0 || (drainRequeued && hasInjects(conversationId)))) {
+  if (
+    turnSucceeded &&
+    continueBudget > 0 &&
+    (strandedInjects.length > 0 || (drainRequeued && hasInjects(conversationId)))
+  ) {
     try {
       // Force the SAME conversation (not per-invocation/singleton re-resolution)
       // and continue on its current branch without appending a new prompt.

@@ -105,14 +105,22 @@ export async function deliverRecoveredAnswer(
   const conv = readConversation(deps.appHome, conversationId);
   if (conv) {
     try {
-      // Preserve the conversation's OWN model/profile so the recovered answer runs
-      // under the same context the question was asked in — not the global default
-      // (R89). (resumeConversationWithMessage → an existing-target agent action;
-      // cwd/executionMode follow the conversation's stored config on that path.)
+      // Preserve the conversation's OWN model/profile/cwd/fallback so the recovered
+      // answer runs under the same context the question was asked in — not the global
+      // default (R89/R90). executionMode isn't persisted per-conversation, so it can't
+      // be recovered here; model/profile/cwd/fallback are.
+      const convRec = conv as {
+        selectedModelKey?: string | null;
+        selectedProfileKey?: string | null;
+        currentWorkingDirectory?: string | null;
+        fallbackEnabled?: boolean;
+      };
       await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
         correlationId,
-        ...(conv.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
-        ...(conv.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
+        ...(convRec.selectedModelKey ? { modelKey: convRec.selectedModelKey } : {}),
+        ...(convRec.selectedProfileKey ? { profileKey: convRec.selectedProfileKey } : {}),
+        ...(convRec.currentWorkingDirectory ? { cwd: convRec.currentWorkingDirectory } : {}),
+        ...(typeof convRec.fallbackEnabled === 'boolean' ? { fallbackEnabled: convRec.fallbackEnabled } : {}),
       });
       traceDiagnostic({
         scope: 'alert',
@@ -346,8 +354,21 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
   try {
+    // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
+    // fallback) rather than the global default (R90). executionMode isn't persisted
+    // per-conversation, so it can't be recovered.
+    const conv = readConversation(deps.appHome, alert.conversationId) as {
+      selectedModelKey?: string | null;
+      selectedProfileKey?: string | null;
+      currentWorkingDirectory?: string | null;
+      fallbackEnabled?: boolean;
+    } | null;
     await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
       correlationId: `alert-${alert.id}`,
+      ...(conv?.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
+      ...(conv?.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
+      ...(conv?.currentWorkingDirectory ? { cwd: conv.currentWorkingDirectory } : {}),
+      ...(typeof conv?.fallbackEnabled === 'boolean' ? { fallbackEnabled: conv.fallbackEnabled } : {}),
     });
   } catch (err) {
     const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
