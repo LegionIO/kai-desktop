@@ -1,9 +1,8 @@
 import { z } from 'zod';
-import { BrowserWindow } from 'electron';
 import { mkdirSync, openSync, writeSync, closeSync, constants as fsConstants } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import type { ToolDefinition } from './types.js';
 
 const ADJECTIVES = [
@@ -96,10 +95,10 @@ function slugifyPlanTitle(planTitle: string | undefined): string {
 }
 
 function broadcastModeChange(mode: string): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:execution-mode-changed', mode);
-  }
-  broadcastToWebClients('agent:execution-mode-changed', mode);
+  // Guarded, non-throwing fan-out (mirrors agent.ts broadcastExecutionMode): a
+  // navigating window's send throwing must not interrupt the plan-mode transition
+  // sequence around it (R107 finding-4 class).
+  broadcastToAllWindows('agent:execution-mode-changed', mode);
 }
 
 export function createEnterPlanModeTool(): ToolDefinition {
