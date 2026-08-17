@@ -3798,6 +3798,28 @@ export function RuntimeProvider({
             acc.locallyOriginated === true &&
             !supersededGenerations.get(convId)?.has(evGen);
           if (isServerPersistTakeover) {
+            // The GUI submission this accumulator optimistically showed is being
+            // DISPLACED by the accepted server-owned run. Capture the user's consumed
+            // prompt text so we can inject it INTO that run (user decision) — otherwise
+            // it's lost off-branch (R111 finding-1). The displaced prompt is the newest
+            // user node in acc.messages; skip if it's the SAME text as the takeover's own
+            // user-message (nothing displaced).
+            const takeoverText = typeof (e as { text?: string }).text === 'string' ? (e as { text: string }).text : '';
+            let displacedText = '';
+            for (let i = acc.messages.length - 1; i >= 0; i--) {
+              const m = acc.messages[i];
+              if (m.role !== 'user') continue;
+              const t = Array.isArray(m.content)
+                ? (m.content as ContentPart[])
+                    .filter((p) => (p as { type?: string }).type === 'text')
+                    .map((p) => (p as { text?: string }).text ?? '')
+                    .join('')
+                : typeof m.content === 'string'
+                  ? m.content
+                  : '';
+              displacedText = t.trim();
+              break;
+            }
             acc.runGeneration = evGen;
             acc.locallyOriginated = false;
             acc.pendingAssistantId = (e as { data?: { messageId?: string } }).data?.messageId ?? acc.pendingAssistantId;
@@ -3810,7 +3832,20 @@ export function RuntimeProvider({
             acc.pendingAssistantTiming = undefined;
             acc.injectContinuationId = null;
             acc.closedPrefixIds = undefined;
-            traceRuntime('stream.supersede-adopt-mirror-prelock', convId, { newGeneration: evGen });
+            // Inject the displaced GUI prompt into the accepted run (fire-and-forget;
+            // the inject path re-gates policy + splices/queues it). Only when it's real
+            // and DIFFERENT from the takeover turn's own text (R111 finding-1).
+            if (displacedText && displacedText !== takeoverText.trim()) {
+              void app.agent.injectMidTurn(convId, displacedText).catch(() => {
+                // If the inject can't land (run ended / policy denied), preserve the
+                // user's input non-destructively rather than lose it silently.
+                enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+              });
+            }
+            traceRuntime('stream.supersede-adopt-mirror-prelock', convId, {
+              newGeneration: evGen,
+              displacedInjected: Boolean(displacedText && displacedText !== takeoverText.trim()),
+            });
             // fall through — render the takeover turn as a passive mirror.
           } else {
             // Lock to the first REAL-run event — BUT if this accumulator already knows its run
