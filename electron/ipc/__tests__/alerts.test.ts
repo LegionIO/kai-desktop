@@ -16,7 +16,10 @@ vi.mock('../../automations/actions.js', () => ({
 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: vi.fn() }));
 vi.mock('../alert-notify.js', () => ({ setAlertCreatedHandler: vi.fn(), notifyAlertCreated: vi.fn() }));
-vi.mock('../conversation-store.js', () => ({ readConversation: vi.fn(() => ({ id: 'c1' })) }));
+vi.mock('../conversation-store.js', () => ({
+  readConversation: vi.fn(() => ({ id: 'c1' })),
+  isRecentlyDeleted: vi.fn(() => false),
+}));
 vi.mock('../alert-store.js', async () => {
   const actual = (await vi.importActual('../alert-store.js')) as Record<string, unknown>;
   return { ...actual, createAlert: vi.fn(() => ({ id: 'alert-1', kind: 'question' })), dismissAlert: vi.fn() };
@@ -166,30 +169,50 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
   });
 
-  it('abandons delivery + dismisses the pending alert when the conversation is DELETED during the resume wait (R133)', async () => {
+  it('abandons delivery + dismisses the pending alert when the conversation is DELETED during the resume wait (R133/R134)', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');
-    const { readConversation } = await import('../conversation-store.js');
+    const { readConversation, isRecentlyDeleted } = await import('../conversation-store.js');
     const { createAlert, dismissAlert } = await import('../alert-store.js');
     (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
     (dismissAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
-    // The conversation EXISTS through entry + the resume (so the resume proceeds + a pending
-    // alert is created), then is DELETED — readConversation returns the record until the resume
-    // has run, and null afterward (the reconcile loop / catch sees it gone).
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({ id: 'c1', messages: [] }));
+    // Deletion is signaled by the EXPLICIT tombstone (isRecentlyDeleted), NOT a null read.
+    // The conversation is live at entry, then the resume marks it deleted.
     let deleted = false;
-    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() =>
-      deleted ? null : { id: 'c1', messages: [] },
-    );
+    (isRecentlyDeleted as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => deleted);
     (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
-      deleted = true; // the chat is deleted during/right after the resume
+      deleted = true;
     });
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
-    // Abandoned (not delivered), and the durable pending alert was DISMISSED — no FYI record
-    // is left referencing the deleted chat.
     expect(res).toEqual({ delivered: false });
     expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
+    (isRecentlyDeleted as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => false); // reset for later tests
+  });
+
+  it('does NOT abandon on a TRANSIENT null read (I/O error) — only an explicit delete tombstone abandons (R134)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation, isRecentlyDeleted } = await import('../conversation-store.js');
+    (isRecentlyDeleted as unknown as ReturnType<typeof vi.fn>).mockReturnValue(false); // never deleted
+    // The resume commits the turn; isRecentlyDeleted is false so delivery is treated as
+    // committed/normal — NOT abandoned as if deleted.
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_c: string, t: string) => {
+        persistedText = t;
+      },
+    );
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: persistedText ? [{ role: 'user', content: persistedText }] : [],
+    }));
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: true });
   });
 
   it('raises a persistent question Alert (delivered:false) when the conversation is gone', async () => {

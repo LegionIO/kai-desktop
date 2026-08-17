@@ -24,7 +24,7 @@ import {
   type Alert,
   type CreateAlertInput,
 } from './alert-store.js';
-import { readConversation } from './conversation-store.js';
+import { readConversation, isRecentlyDeleted } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
 import { setRecoveredAnswerDeliverer } from '../tools/ask-user.js';
@@ -292,9 +292,11 @@ export async function deliverRecoveredAnswer(
       let inactiveGrace = 3;
       // If the conversation is DELETED during the resume wait (another client/window),
       // abandon the delivery: dismiss the durable pending alert (a FYI record referencing a
-      // deleted chat is worse than nothing) and stop reconciling. Deletion removes the record,
-      // so readConversation returning null after we already saw it exist == deleted (R133 f-1).
-      const conversationGone = () => readConversation(alertsAppHome, conversationId) == null;
+      // deleted chat is worse than nothing) and stop reconciling. Use the EXPLICIT deletion
+      // tombstone (isRecentlyDeleted), NOT a null read — readConversation returns null for a
+      // transient EMFILE/JSON error too, and abandoning on that would drop a live answer with
+      // no other copy (R133 f-1 / R134 f-1). Only a confirmed delete sets the tombstone.
+      const conversationGone = () => isRecentlyDeleted(conversationId);
       // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
       // leak this loop forever — far above any real tool timeout. Reaching it keeps the
       // alert (uncommitted), which is the safe outcome.
@@ -337,8 +339,10 @@ export async function deliverRecoveredAnswer(
         } | null;
         // Conversation DELETED during the (failed) resume → abandon: dismiss the durable
         // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
-        // R133 f-1). A null record here means the chat is gone (delete removes the file).
-        if (after == null) {
+        // R133 f-1). Use the EXPLICIT tombstone (isRecentlyDeleted), NOT `after == null` — a
+        // null read can be a transient I/O error, and abandoning then would suppress a real
+        // "not delivered" alert for a live conversation (R134 f-1).
+        if (isRecentlyDeleted(conversationId)) {
           dismissPendingAlert();
           return { delivered: false };
         }

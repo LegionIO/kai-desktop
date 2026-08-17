@@ -1390,9 +1390,11 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     const onFailure = (): void => {
       // If the conversation was DELETED while this delivery was in flight,
       // invalidateConversationRecovery already purged its recovery state — do NOT re-stash
-      // (that would resurrect an answer for a deleted chat, R133 f-1). isRecentlyDeleted
-      // catches the just-deleted window; a null record is the durable signal.
-      if (isRecentlyDeleted(conversationId) || readConversation(appHomeForRuntimeResolve, conversationId) == null) {
+      // (that would resurrect an answer for a deleted chat, R133 f-1). Use the EXPLICIT
+      // deletion tombstone (isRecentlyDeleted), NOT a null read — readConversation returns
+      // null on a transient I/O error too, and skipping the re-stash then would DROP a live
+      // answer with no other copy (R134 f-1).
+      if (isRecentlyDeleted(conversationId)) {
         return;
       }
       // Always put the answer back in the stash.
@@ -1636,10 +1638,12 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
   }
   // A mass-delete (deleteMany/clear) aborts SDK questions in a synchronous loop; the
   // FIFO terminalAbortTokens set (bounded) could evict this run's token before the
-  // check above under a >100-conversation delete. The conversation's file is already
-  // gone by then, so don't route recovery for a conversation that no longer exists —
-  // it would record a tombstone / raise an Alert pointing at a deleted chat (R96).
-  if (!readConversation(appHomeForRuntimeResolve, conversationId)) {
+  // check above under a >100-conversation delete. Don't route recovery for a DELETED
+  // conversation — it would record a tombstone / raise an Alert pointing at a deleted chat
+  // (R96). Use the EXPLICIT deletion tombstone (isRecentlyDeleted), NOT a null read: a
+  // transient I/O error also reads null, and skipping recovery then would silently drop a
+  // live answer (R134 f-1). All delete paths set the tombstone.
+  if (isRecentlyDeleted(conversationId)) {
     return;
   }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);

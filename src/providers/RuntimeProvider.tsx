@@ -885,11 +885,36 @@ const deletedConversationIds = new Set<string>();
 const DELETED_CONVERSATION_IDS_MAX = 1000;
 function tombstoneDeletedConversation(id: string): void {
   deletedConversationIds.add(id);
+  cancelInFlightDisplacedInjects(id); // flip any in-flight inject cancellation flag for this conv
   while (deletedConversationIds.size > DELETED_CONVERSATION_IDS_MAX) {
     const oldest = deletedConversationIds.values().next().value as string | undefined;
     if (oldest === undefined) break;
     deletedConversationIds.delete(oldest);
   }
+}
+
+// In-flight displaced-prompt injections. Each is registered before its injectMidTurn await and
+// removed when the then/catch settles. A conversation DELETE (per-id) or a global RESET flips
+// the matching entries' `cancelled` flag; the settle callback consults its OWN token, so it
+// won't re-enqueue a draft for a conversation cleared while it was pending — closing the gaps a
+// per-id tombstone set alone can't: a `reset` carries no ids (R134 f-2), and a bulk delete could
+// evict a tombstone before a slow callback settles (R134 f-4). The registry is retained until
+// the producer finishes, so the signal always outlives the async producer.
+type DisplacedInjectToken = { conversationId: string; cancelled: boolean };
+const inFlightDisplacedInjects = new Set<DisplacedInjectToken>();
+function registerDisplacedInject(conversationId: string): DisplacedInjectToken {
+  const token: DisplacedInjectToken = { conversationId, cancelled: false };
+  inFlightDisplacedInjects.add(token);
+  return token;
+}
+function settleDisplacedInject(token: DisplacedInjectToken): void {
+  inFlightDisplacedInjects.delete(token);
+}
+function cancelInFlightDisplacedInjects(conversationId: string): void {
+  for (const t of inFlightDisplacedInjects) if (t.conversationId === conversationId) t.cancelled = true;
+}
+function cancelAllInFlightDisplacedInjects(): void {
+  for (const t of inFlightDisplacedInjects) t.cancelled = true;
 }
 let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 
@@ -1151,6 +1176,7 @@ function dropRejectedDraftLocal(convId: string, id: string): void {
 // durable re-add would duplicate the on-disk copy; we only need it back in this session's queue.
 function requeueRejectedDraftLocalOnly(convId: string, entry: RejectedDraft): void {
   if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  if (deletedConversationIds.has(convId)) return; // deleted after the claim → don't recreate the queue (R134 f-3)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
   rejectedDrafts.set(convId, q);
@@ -3139,6 +3165,7 @@ export function RuntimeProvider({
         for (const t of lateCompactionHandoffTimers.values()) clearTimeout(t);
         lateCompactionHandoffTimers.clear();
         rejectedDrafts.clear();
+        cancelAllInFlightDisplacedInjects(); // a global clear cancels every in-flight displaced inject (R134 f-2)
         persistVersions.clear();
         lastRetitleCount.clear();
         for (const id of [...lastFinalizedBranch.keys()]) clearFinalizedBranch(id);
@@ -3884,20 +3911,28 @@ export function RuntimeProvider({
                 const noticeText = displacedText ? `${displacedText}\n\n${reattachNotice}` : reattachNotice;
                 enqueueRejectedDraft(convId, { text: noticeText, attachments: [] });
               } else if (displacedText) {
+                // Register the in-flight inject so a delete/reset during the await cancels it;
+                // the settle callbacks consult the token before re-enqueuing (R134 f-2/f-4).
+                const injectToken = registerDisplacedInject(convId);
                 void app.agent
                   .injectMidTurn(convId, displacedText, displacedGeneration)
                   .then((res) => {
                     // Delivered ONLY if it spliced cooperatively into the generation we
                     // pinned (expectedGeneration guards a wrong-run splice — R113 f-3).
                     // Any other outcome (ok:false, non-cooperative, expected-generation-
-                    // superseded, reject) preserves the user's input (R112 f-1).
-                    if (!res?.ok || !res.cooperative) {
+                    // superseded, reject) preserves the user's input (R112 f-1) — UNLESS the
+                    // conversation was deleted/cleared while the inject was in flight, in which
+                    // case re-enqueuing would leave an unflushable draft (R133 f-2 / R134).
+                    if ((!res?.ok || !res.cooperative) && !injectToken.cancelled) {
                       enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
                     }
                   })
                   .catch(() => {
-                    enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
-                  });
+                    if (!injectToken.cancelled) {
+                      enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+                    }
+                  })
+                  .finally(() => settleDisplacedInject(injectToken));
               }
             }
             traceRuntime('stream.supersede-adopt-mirror-prelock', convId, {
