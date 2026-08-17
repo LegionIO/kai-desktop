@@ -1241,20 +1241,23 @@ function AppShell() {
     // the loaded model/profile/overrides are applied; writing here would clobber
     // the saved values with the previous conversation's stale state.
     if (hydratedSettingsConvIdRef.current !== activeConversationId) return;
+    // executionMode is MAIN-authoritative and must NOT ride the generic put (a delayed put
+    // would clobber a plan-mode transition MAIN wrote). Drive the dedicated authoritative
+    // setter directly off the LIVE desired mode — NOT off a conversations.get snapshot: two
+    // rapid toggles (Auto then Plan-First) both reading the same stale record would let the
+    // FIRST win (the second sees its stale snapshot already matching and skips), and the
+    // first write's broadcast would revert the UI (R126). The setter is itself a fresh
+    // read-modify-write with a no-op guard against CURRENT disk, and ipcMain handlers don't
+    // interleave, so firing it per effect-run with the live mode is idempotent + last-write-
+    // wins by effect order. Normalize 'auto' → null to match on-disk storage.
+    const targetConvId = activeConversationId;
+    const desiredMode = executionMode === 'auto' ? null : executionMode;
+    void app.conversations.setExecutionMode?.(targetConvId, desiredMode).catch(() => {});
     app.conversations
       .get(activeConversationId)
       .then((conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
-        const targetConvId = activeConversationId;
-        // executionMode is MAIN-authoritative and must NOT ride the generic put (a delayed
-        // put would clobber a plan-mode transition MAIN wrote). Route a DELIBERATE toggle
-        // through the dedicated authoritative setter instead. Normalize 'auto' → null to
-        // match on-disk storage.
-        const desiredMode = executionMode === 'auto' ? null : executionMode;
-        if ((record.executionMode ?? null) !== desiredMode) {
-          void app.conversations.setExecutionMode?.(targetConvId, desiredMode).catch(() => {});
-        }
         // Skip the generic put if the OTHER (put-owned) values haven't changed — executionMode
         // is handled above and intentionally excluded from this comparison + the payload.
         if (
