@@ -183,6 +183,9 @@ export async function resumeConversationWithMessage(
       maxRetries?: number | null;
       runtimeOverride?: string | null;
     };
+    /** Caller-allocated STABLE id for the persisted user turn, so a post-failure
+     *  commit check can look for THIS exact turn (R103 finding-2). */
+    userTurnId?: string;
   },
 ): Promise<unknown> {
   const action: Extract<AutomationAction, { type: 'agent' }> = {
@@ -234,6 +237,7 @@ export async function resumeConversationWithMessage(
     ...(opts?.fallbackEnabled !== undefined ? { fallbackEnabled: opts.fallbackEnabled } : {}),
     ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
     ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+    ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
   });
 }
 
@@ -422,6 +426,9 @@ async function runAgentAction(
      *  is reset to false), so the runtime-aware dispatch fires on the serialized
      *  slot (R94). */
     isAlertResume?: boolean;
+    /** Caller-allocated stable id for the persisted user turn (alert resume) so a
+     *  post-failure commit check can find THIS exact turn (R103 finding-2). */
+    userTurnId?: string;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
@@ -766,7 +773,17 @@ async function runAgentAction(
       const promptWrite = appendConversationMessages(
         deps.appHome,
         conversationId,
-        [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+        [
+          {
+            // Caller-supplied STABLE id (alert resume) so a post-failure commit check
+            // can look for THIS exact turn — durable against a content-rewriting hook
+            // and immune to a concurrent unrelated user turn (R103 finding-2).
+            ...(opts?.userTurnId ? { id: opts.userTurnId } : {}),
+            role: 'user',
+            content: [{ type: 'text', text: prompt }],
+            createdAt: new Date().toISOString(),
+          },
+        ],
         // A resume (strictExistingTarget) MUST land in the alert's own
         // conversation — never skip-if-busy (which would then divert to a NEW
         // chat, so the answer vanishes from the thread the user is watching).

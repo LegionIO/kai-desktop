@@ -69,6 +69,18 @@ export function clearInFlightAnswer(toolCallId: string): void {
   inFlightAnswers.delete(toolCallId);
 }
 
+/** Clear the in-flight answers owned by a stream token — used when agent.ts observes
+ *  a NON-superseded ask_user tool-result for that run. The SDK runtime emits the
+ *  tool-result under its REAL tool_use_id, which never matches the synthetic sdk-ask-*
+ *  ledger key, so clearInFlightAnswer(id) can't clear it; a committed ask_user result
+ *  for a run means its answer is durably on-branch, so clear that token's entries
+ *  (R103 finding-1). Harmless for the Mastra path (its id-match clear already ran). */
+export function clearInFlightAnswersForToken(token: string | undefined): void {
+  for (const [toolCallId, entry] of [...inFlightAnswers]) {
+    if (entry.owningToken === token) inFlightAnswers.delete(toolCallId);
+  }
+}
+
 /** Drain (and remove) the in-flight answers owned by a specific stream token — used
  *  by that run's cleanup on a NON-terminal abort to recover answers whose tool-result
  *  never committed. Token-scoped so a superseded predecessor recovers only ITS OWN

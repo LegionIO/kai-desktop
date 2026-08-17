@@ -426,24 +426,16 @@ async function resume(alert: Alert, userText: string): Promise<void> {
   // deliverRecoveredAnswer's committed-check.
   const deliveryId = `alert-rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const markedText = `${userText}\n<!-- ${deliveryId} -->`;
-  // Snapshot the pre-resume user-message ids. A post-failure commit check on the
-  // in-content marker ALONE is fragile: an enforcing UserPromptSubmit hook can strip
-  // the HTML comment before persisting, so the marker search would miss a genuinely-
-  // committed turn and wrongly reopen → duplicate delivery (R102 finding-3). Message
-  // IDS are assigned by the store and NOT rewritten by content hooks, so a NEW user
-  // id appearing is a durable commit signal. The resume holds the conversation
-  // (strictExistingTarget + running), so no unrelated user turn can land concurrently.
-  const priorUserIds = new Set<string>();
-  try {
-    const before = readConversation(deps.appHome, alert.conversationId) as {
-      messageTree?: Array<{ id?: unknown; role?: unknown }>;
-    } | null;
-    for (const m of before?.messageTree ?? []) {
-      if (m?.role === 'user' && typeof m.id === 'string') priorUserIds.add(m.id);
-    }
-  } catch {
-    /* best-effort snapshot; marker match is the fallback signal */
-  }
+  // Allocate a STABLE id for the resumed user turn and thread it through so the
+  // idle-resume append persists the turn under EXACTLY this id. A post-failure commit
+  // check then looks for THIS id (durable against a content-rewriting hook, and immune
+  // to a CONCURRENT unrelated GUI/CLI user turn — the ordered barrier serializes only
+  // automation turns, so "any new user id = committed" would false-positive and leave
+  // the alert wrongly resolved with its answer never delivered, R103 finding-2). The
+  // in-content marker stays as a fallback for the cooperative-inject path (which mints
+  // its own id): if BOTH are absent we conservatively reopen (re-answerable) rather
+  // than silently drop.
+  const userTurnId = `alert-turn-${alert.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
     // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
@@ -472,6 +464,7 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       ...(conv?.executionMode ? { executionMode: conv.executionMode } : {}),
       ...(conv?.reasoningEffort ? { reasoningEffort: conv.reasoningEffort } : {}),
       ...(threadOverrides ? { threadOverrides } : {}),
+      userTurnId,
     });
   } catch (err) {
     // Only reopen (invite a re-answer) when the answer's user turn is NOT already on
@@ -486,13 +479,15 @@ async function resume(alert: Alert, userText: string): Promise<void> {
         ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
         ...(Array.isArray(after?.messages) ? after!.messages : []),
       ];
-      // Committed iff EITHER the in-content marker survived (fast path) OR a NEW user
-      // message id appeared that wasn't present before the resume (durable path that
-      // survives a hook stripping the marker) (R102 finding-3).
+      // Committed iff a user node carrying THIS resume's exact stable userTurnId is
+      // on the tree (durable, hook-proof, and can't match a concurrent unrelated turn)
+      // OR — for the cooperative-inject path, which mints its own id — the in-content
+      // marker survived (fast path). NOT "any new user id": a concurrent GUI/CLI turn
+      // would false-positive and leave the alert wrongly resolved (R103 finding-2).
       committed = nodes.some((m) => {
         if (m?.role !== 'user') return false;
-        if (JSON.stringify(m.content ?? '').includes(deliveryId)) return true;
-        return typeof m.id === 'string' && !priorUserIds.has(m.id);
+        if (m.id === userTurnId) return true;
+        return JSON.stringify(m.content ?? '').includes(deliveryId);
       });
     } catch {
       /* if we can't read, fall through to reopen (safer to let the user retry) */

@@ -403,6 +403,7 @@ import {
   setAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
   clearInFlightAnswer,
+  clearInFlightAnswersForToken,
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
 } from '../tools/ask-user.js';
@@ -2114,7 +2115,16 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // losing the answer (R101 finding-1). A live/owning run's tool-result IS
       // persisted, so clearing is correct then.
       const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
-      if (!isSupersededRunEvent(emittingToken, activeTok)) clearInFlightAnswer(event.toolCallId);
+      if (!isSupersededRunEvent(emittingToken, activeTok)) {
+        clearInFlightAnswer(event.toolCallId);
+        // The SDK runtime emits ask_user tool-results under the SDK's REAL tool_use_id,
+        // which never matches the synthetic sdk-ask-* ledger key — so the id-match clear
+        // above can't reach it. A committed ask_user result means its answer is durably
+        // on-branch, so clear the emitting run's token-scoped entries too (R103 f-1).
+        if (event.toolName === 'ask_user' && emittingToken !== undefined) {
+          clearInFlightAnswersForToken(emittingToken);
+        }
+      }
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the

@@ -39,8 +39,6 @@ import {
   pendingQuestionAnswers,
   getAskUserRecoveryRouter,
   getActiveStreamTokenForConversation,
-  moveAnswerToInFlight,
-  clearInFlightAnswer,
 } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1280,35 +1278,28 @@ function createAskUserHandler(
       };
     }
 
-    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler).
-    //    Move to the in-flight ledger so that if the SDK query() is aborted (non-
-    //    terminal supersession) WHILE this handler is still resolving, the approved
-    //    answer is recoverable on the owning run's token-scoped cleanup drain (the
-    //    entry is stamped with owningStreamToken). The SDK's own tool-result emits its
-    //    real tool_use_id — NOT this synthetic sdk-ask-* id — so the tool-result-emit
-    //    clearInFlightAnswer can't match it; instead we clear HERE the moment the
-    //    answer is safely built into the returned result (below), leaving the ledger
-    //    entry ONLY for the genuine abort-mid-handler window. Without this the entry
-    //    would linger and normal cleanup would re-deliver an already-consumed answer,
-    //    repeating tool effects (R101 finding-3 / R102 finding-1).
+    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler) and
+    //    embed them in the tool result handed back to the SDK query(), which
+    //    translates + commits the user/tool_result. The answer is consumed here.
+    //    We deliberately do NOT ledger the APPROVED answer for the SDK path: the SDK
+    //    emits its tool-result under its own real tool_use_id (not this synthetic
+    //    sdk-ask-* id) and provides no reliable correlation, so a ledger entry could
+    //    neither be cleared on commit (→ re-delivery, R102 f-1) nor cleared without
+    //    losing it on a mid-commit supersession (→ loss, R103 f-1). The recoverable
+    //    window (this synchronous return → the SDK's own commit) is sub-millisecond;
+    //    the raced/aborted-BEFORE-approval case is handled separately by the
+    //    recovery router above. Net: consume it plainly, matching the pre-R101 SDK
+    //    behavior (R103 finding-1 — revert the fragile approved-path ledger).
     const answers = pendingQuestionAnswers.get(toolCallId);
     pendingQuestionAnswers.delete(toolCallId);
-    if (answers) moveAnswerToInFlight(toolCallId, answers, conversationId, owningStreamToken);
 
     debugLog(
       `[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`,
     );
 
-    const result: CallToolResult = {
+    return {
       content: [{ type: 'text', text: JSON.stringify({ success: true, answers: answers ?? {} }) }],
     };
-    // The answer is now embedded in the result being handed back to query(). Unless
-    // this run was aborted while we resolved (in which case the token-scoped ledger
-    // entry is the ONLY copy and cleanup must recover it), the answer is committed
-    // into the tool result — drop the ledger entry so normal completion doesn't
-    // re-deliver it (R102 finding-1).
-    if (!abortSignal?.aborted) clearInFlightAnswer(toolCallId);
-    return result;
   };
 }
 
