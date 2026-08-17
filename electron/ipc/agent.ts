@@ -753,7 +753,16 @@ const MAX_TERMINAL_ABORT_TOKENS = 100;
 const explicitCancelGeneration = new Map<string, number>();
 const MAX_EXPLICIT_CANCEL_GEN_ENTRIES = 500;
 function bumpExplicitCancelGeneration(conversationId: string): void {
-  explicitCancelGeneration.set(conversationId, (explicitCancelGeneration.get(conversationId) ?? 0) + 1);
+  // Re-insert (delete → set) so a bumped entry becomes the NEWEST in Map iteration order.
+  // Eviction below is FIFO by iteration order; without the re-insert a long-lived
+  // conversation that is bumped repeatedly stays "oldest" and would be evicted FIRST even
+  // while actively relevant — then a deferred op that captured its (pre-Stop) generation
+  // would re-read the default 0 after eviction and MISS the Stop (an ABA reset, R131
+  // finding-1). Making bump touch recency means the most-recently-Stopped conversations —
+  // exactly the ones a pending deferred op might re-check — are the LAST evicted.
+  const next = (explicitCancelGeneration.get(conversationId) ?? 0) + 1;
+  explicitCancelGeneration.delete(conversationId);
+  explicitCancelGeneration.set(conversationId, next);
   while (explicitCancelGeneration.size > MAX_EXPLICIT_CANCEL_GEN_ENTRIES) {
     const oldest = explicitCancelGeneration.keys().next().value;
     if (oldest === undefined) break;
@@ -8865,7 +8874,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // An explicit user Stop for this conversation — bump the cancel generation so
     // any deferred raced-answer re-injection scheduled before now aborts at fire
     // time (covers a Stop on a SUCCESSOR turn during the re-inject delay).
-    bumpExplicitCancelGeneration(conversationId);
+    // Only bump for a REAL conversation (has an active stream, a pending submit, or a
+    // persisted record). A cancel-stream for an arbitrary/bogus id would otherwise create
+    // a spurious entry and, in bulk, FIFO-evict the entries of genuine conversations that
+    // a deferred op still needs to re-check (R131 finding-1 — the flood vector).
+    const isRealConversation =
+      activeStreams.has(conversationId) ||
+      currentPendingSubmit.has(conversationId) ||
+      readConversation(appHome, conversationId) != null;
+    if (isRealConversation) {
+      bumpExplicitCancelGeneration(conversationId);
+    }
     // Cancel a submit still waiting on toolsReady (no activeStreams entry yet)
     // so it bails after the await instead of starting a run for a gone client.
     const pendingSubmitId = currentPendingSubmit.get(conversationId);

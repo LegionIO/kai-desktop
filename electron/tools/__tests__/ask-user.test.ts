@@ -77,6 +77,19 @@ describe('stashQuestionAnswers', () => {
     expect(pendingQuestionAnswers.has('ok')).toBe(true);
   });
 
+  it('counts the toolCallId KEY toward the per-entry cap (bulk hidden in a giant id — R131)', () => {
+    const giantId = 'z'.repeat(64 * 1024 + 1);
+    expect(stashQuestionAnswers(giantId, { Q: 'tiny' })).toBe(false);
+    expect(pendingQuestionAnswers.has(giantId)).toBe(false);
+  });
+
+  it('measures non-string / nested answer values by serialized size, not as 0 (R131)', () => {
+    // An untyped web frame could smuggle a huge nested object past a string-only measure.
+    const nested = { deep: 'w'.repeat(64 * 1024 + 1) } as unknown as string;
+    expect(stashQuestionAnswers('nested', { Q: nested })).toBe(false);
+    expect(pendingQuestionAnswers.has('nested')).toBe(false);
+  });
+
   it('evicts oldest to stay under the aggregate byte budget, keeping the newest (R130)', () => {
     // Entries UNDER the 64 KiB per-entry cap (~50 KiB) but numerous enough to exceed the
     // 4 MiB aggregate budget (~84 × 50 KiB > 4 MiB) → oldest evicted, newest retained.

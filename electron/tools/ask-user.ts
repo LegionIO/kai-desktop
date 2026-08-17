@@ -17,20 +17,28 @@ export const pendingQuestionAnswers = new Map<string, Record<string, string>>();
  *  the codebase (loginAttempts, exitCodes). */
 const MAX_PENDING_QUESTION_ANSWERS = 100;
 
-/** Per-entry + aggregate BYTE bounds on the stash (R130 finding-2). The count cap alone lets a
- *  client flood distinct toolCallIds with large answer frames (~4 MiB each × 100 = ~400 MiB
- *  retained) AND FIFO-evict legitimate raced-answer recovery entries. An answer is user-typed
- *  text (a handful of short strings); a genuine one is well under 64 KiB. Reject an oversized
- *  single entry outright (never stash it) and evict oldest until the aggregate is under budget. */
+/** Per-entry + aggregate BYTE bounds on the stash (R130 finding-2 / R131 finding-2). The count
+ *  cap alone lets a client flood distinct toolCallIds with large frames (~400 MiB retained) AND
+ *  FIFO-evict legitimate recovery entries. A genuine answer is a handful of short user-typed
+ *  strings, well under 64 KiB. The byte accounting includes BOTH the toolCallId KEY (a client
+ *  can hide the bulk in a ~4 MiB id with a tiny answer body) AND every answer value MEASURED BY
+ *  ITS ACTUAL SERIALIZED SIZE (not assumed to be a string — a nested/non-string value is common
+ *  from an untyped web frame). Reject an oversized single entry outright; evict oldest until the
+ *  aggregate is under budget. */
 const MAX_ANSWER_ENTRY_BYTES = 64 * 1024;
 const MAX_PENDING_ANSWERS_TOTAL_BYTES = 4 * 1024 * 1024;
 
-function answersByteSize(answers: Record<string, string>): number {
-  let n = 0;
-  for (const [k, v] of Object.entries(answers ?? {})) {
-    n += k.length + (typeof v === 'string' ? v.length : 0);
+/** Serialized byte size of ONE stashed entry: the toolCallId key + the answers object measured
+ *  robustly (JSON) so non-string / nested values are counted, not silently treated as 0. */
+function entryByteSize(toolCallId: string, answers: unknown): number {
+  let answersBytes: number;
+  try {
+    answersBytes = JSON.stringify(answers ?? {}).length;
+  } catch {
+    // Circular / unserializable → treat as over-cap so it's rejected below.
+    answersBytes = MAX_ANSWER_ENTRY_BYTES + 1;
   }
-  return n;
+  return (toolCallId?.length ?? 0) + answersBytes;
 }
 
 /** Stash user answers under `toolCallId`, evicting the oldest entries so an
@@ -39,7 +47,9 @@ function answersByteSize(answers: Record<string, string>): number {
  *  legitimate answer is short text, so an oversized frame is discarded rather than
  *  allowed to retain memory / evict real recovery entries. */
 export function stashQuestionAnswers(toolCallId: string, answers: Record<string, string>): boolean {
-  if (answersByteSize(answers) > MAX_ANSWER_ENTRY_BYTES) return false;
+  // Per-entry cap includes the toolCallId key + the serialized answers (R131 f-2): reject an
+  // oversized single frame outright rather than retain it / let it evict real entries.
+  if (entryByteSize(toolCallId, answers) > MAX_ANSWER_ENTRY_BYTES) return false;
   pendingQuestionAnswers.set(toolCallId, answers);
   // Count cap.
   while (pendingQuestionAnswers.size > MAX_PENDING_QUESTION_ANSWERS) {
@@ -47,15 +57,16 @@ export function stashQuestionAnswers(toolCallId: string, answers: Record<string,
     if (oldest === undefined) break;
     pendingQuestionAnswers.delete(oldest);
   }
-  // Aggregate byte cap: evict oldest (never the entry just added) until under budget.
+  // Aggregate byte cap: evict oldest (never the entry just added) until under budget. Each
+  // entry's size counts its key too — a client can hide the bulk in a giant toolCallId.
   let total = 0;
-  for (const v of pendingQuestionAnswers.values()) total += answersByteSize(v);
+  for (const [k, v] of pendingQuestionAnswers.entries()) total += entryByteSize(k, v);
   while (total > MAX_PENDING_ANSWERS_TOTAL_BYTES && pendingQuestionAnswers.size > 1) {
     const oldestKey = pendingQuestionAnswers.keys().next().value;
     if (oldestKey === undefined || oldestKey === toolCallId) break;
     const evicted = pendingQuestionAnswers.get(oldestKey);
     pendingQuestionAnswers.delete(oldestKey);
-    if (evicted) total -= answersByteSize(evicted);
+    if (evicted) total -= entryByteSize(oldestKey, evicted);
   }
   return true;
 }
