@@ -112,7 +112,18 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');
     const { readConversation } = await import('../conversation-store.js');
-    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    // Echo the persisted turn back on the post-resume read so the R118 disk-commit
+    // confirmation passes immediately (no ~3s poll).
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+      },
+    );
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: persistedText ? [{ role: 'user', content: persistedText }] : [],
+    }));
     const actionDeps = {} as never;
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => actionDeps, alertSurface: () => 'off' });
 
@@ -124,20 +135,34 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(call?.[1]).toContain('- Env → prod');
   });
 
-  it('records a durable pending-delivery alert before the resume and dismisses it on success (R117)', async () => {
+  it('records a durable pending-delivery alert before the resume and dismisses it once committed on disk (R117/R118)', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
     const { readConversation } = await import('../conversation-store.js');
     const { createAlert, dismissAlert } = await import('../alert-store.js');
     (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
     (dismissAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
-    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    // Capture the persisted text (with its unique deliveryId) and, after the resume,
+    // have readConversation return a tree containing THIS turn — so the disk-commit
+    // confirmation (R118: server-owned cooperative persist may be deferred) passes and
+    // the pending durability alert is dismissed.
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+      },
+    );
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: persistedText ? [{ role: 'user', content: persistedText }] : [],
+    }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
     expect(res).toEqual({ delivered: true });
-    // A durable pending-delivery record was created BEFORE the (successful) resume...
+    // A durable pending-delivery record was created BEFORE the resume...
     expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
-    // ...and dismissed once the resume launched (id from the mocked createAlert).
+    // ...and dismissed once the turn was confirmed committed on disk (id from mock).
     expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
   });
 
@@ -157,7 +182,16 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');
     const { readConversation } = await import('../conversation-store.js');
-    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+      },
+    );
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: persistedText ? [{ role: 'user', content: persistedText }] : [],
+    }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     await deliverRecoveredAnswer('c1', '', { Env: 'prod' });
@@ -169,7 +203,13 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');
     const { readConversation } = await import('../conversation-store.js');
-    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+    let persistedText = '';
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (_conv: string, promptText: string) => {
+        persistedText = promptText;
+      },
+    );
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       id: 'c1',
       selectedModelKey: 'm1',
       reasoningEffort: 'high',
@@ -177,7 +217,9 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
       systemPromptOverride: 'be terse',
       maxSteps: 7,
       runtimeOverride: 'codex-sdk',
-    });
+      // Echo the committed turn post-resume so the R118 disk-commit check passes fast.
+      messages: persistedText ? [{ role: 'user', content: persistedText }] : [],
+    }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });

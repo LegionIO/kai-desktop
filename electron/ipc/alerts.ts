@@ -245,7 +245,37 @@ export async function deliverRecoveredAnswer(
         conversationId,
         fields: { answerCount: Object.keys(clean).length },
       });
-      dismissPendingAlert(); // resume launched successfully — durability record no longer needed
+      // "resume succeeded" does NOT mean the user turn is on disk: a SERVER-OWNED
+      // COOPERATIVE splice (CLI/headless Mastra) defers persistence to the next
+      // prepareStep, so the turn may not be committed the instant the await resolves.
+      // Poll disk briefly for the deferred commit; dismiss the durable pending alert
+      // once the userTurnId lands. If it never lands within the window (a Kai exit
+      // before the drain, or a genuinely stuck run), KEEP the pending alert as the
+      // recoverable record (R118 — extends R117 past the await). A non-cooperative
+      // abort+restart persists synchronously, so the first poll passes immediately.
+      const isCommittedOnDisk = () => {
+        try {
+          const after = readConversation(alertsAppHome, conversationId) as {
+            messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+            messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+          } | null;
+          const nodes = [
+            ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+            ...(Array.isArray(after?.messages) ? after!.messages : []),
+          ];
+          return nodes.some(
+            (m) => m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
+          );
+        } catch {
+          return false;
+        }
+      };
+      let committedOnDisk = isCommittedOnDisk();
+      for (let i = 0; i < 20 && !committedOnDisk; i++) {
+        await new Promise((r) => setTimeout(r, 150)); // ~3s total; prepareStep drains in ms
+        committedOnDisk = isCommittedOnDisk();
+      }
+      if (committedOnDisk) dismissPendingAlert();
       return { delivered: true };
     } catch {
       // fall through to the durable Alert fallback — but first determine whether the
