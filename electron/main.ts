@@ -2085,6 +2085,9 @@ if (gotSingleInstanceLock) {
       appHome: APP_HOME,
       getActionDeps: () => automationDeps,
       alertSurface: () => resolveAlertSurface(getConfig().automations ?? {}),
+      // Lets the recovered-answer durability alert reconcile against the run lifecycle
+      // (dismiss on deferred commit; keep once the run ends uncommitted) — R119.
+      isConversationTurnActive,
     });
     registerAlertsHandlers(ipcMain);
 

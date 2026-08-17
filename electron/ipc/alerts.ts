@@ -40,6 +40,13 @@ export interface AlertsDeps {
   getActionDeps: () => ActionDeps;
   /** Effective alert surface (mutually exclusive): 'off' | 'modal' | 'window'. */
   alertSurface: () => 'off' | 'modal' | 'window';
+  /** Whether a stream/run is still active for a conversation. Injected (not a direct
+   *  agent.js import) so the alerts layer stays out of agent.ts's heavy module graph.
+   *  Used to reconcile the recovered-answer durability alert against the run lifecycle
+   *  (dismiss on commit; keep once the run ends uncommitted) rather than a fixed poll
+   *  timeout that a long tool step would outlive (R119). Optional: absent → the poll
+   *  falls back to its bounded ceiling. */
+  isConversationTurnActive?: (conversationId: string) => boolean;
 }
 
 let deps: AlertsDeps | null = null;
@@ -247,12 +254,14 @@ export async function deliverRecoveredAnswer(
       });
       // "resume succeeded" does NOT mean the user turn is on disk: a SERVER-OWNED
       // COOPERATIVE splice (CLI/headless Mastra) defers persistence to the next
-      // prepareStep, so the turn may not be committed the instant the await resolves.
-      // Poll disk briefly for the deferred commit; dismiss the durable pending alert
-      // once the userTurnId lands. If it never lands within the window (a Kai exit
-      // before the drain, or a genuinely stuck run), KEEP the pending alert as the
-      // recoverable record (R118 — extends R117 past the await). A non-cooperative
-      // abort+restart persists synchronously, so the first poll passes immediately.
+      // prepareStep, which lands only AFTER the current (possibly long-running) tool
+      // step. Reconcile against the RUN LIFECYCLE, not a fixed timeout: dismiss the
+      // durable pending alert the moment the userTurnId commits; keep polling WHILE the
+      // run is still active (a long tool step must not orphan the alert — R119); and
+      // stop (KEEPING the alert as the recoverable record) once the run is no longer
+      // active without having committed (a Kai exit before drain, or an aborted/stuck
+      // run). A non-cooperative abort+restart persists synchronously → first check
+      // passes. Bounded ceiling backstops a run whose active-state signal never clears.
       const isCommittedOnDisk = () => {
         try {
           const after = readConversation(alertsAppHome, conversationId) as {
@@ -271,8 +280,20 @@ export async function deliverRecoveredAnswer(
         }
       };
       let committedOnDisk = isCommittedOnDisk();
-      for (let i = 0; i < 20 && !committedOnDisk; i++) {
-        await new Promise((r) => setTimeout(r, 150)); // ~3s total; prepareStep drains in ms
+      // Grace iterations after the run goes inactive: the terminal persist may land a
+      // beat after activeStreams clears, so don't give up the instant it's inactive.
+      // If no run-activity signal is wired, fall back to a bounded fixed poll.
+      const runActive = deps?.isConversationTurnActive;
+      let inactiveGrace = 3;
+      for (let i = 0; i < 4000 && !committedOnDisk; i++) {
+        if (runActive) {
+          // Stop once the run is no longer streaming AND a short grace has elapsed —
+          // whatever was going to commit has; keep the alert if it still hasn't.
+          if (!runActive(conversationId) && inactiveGrace-- <= 0) break;
+        } else if (i >= 20) {
+          break; // no lifecycle signal → bounded ~3s fallback (R118 behavior)
+        }
+        await new Promise((r) => setTimeout(r, 150));
         committedOnDisk = isCommittedOnDisk();
       }
       if (committedOnDisk) dismissPendingAlert();
