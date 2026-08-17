@@ -3002,17 +3002,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const isSelfMirrored = serverPersistSelfMirrored.has(conversationId);
     serverPersistSelfMirrored.delete(conversationId);
 
-    // Mirror the newest user turn to OTHER attached clients (e.g. a `kai` CLI
-    // viewing this same conversation) so a GUI-driven turn shows the prompt there
-    // too. Skipped for agent:submit turns (they broadcast their own, nonced).
-    // No submitNonce here — a GUI turn's peers never submitted it, and the
-    // originating renderer ignores user-message (manages its own tree).
-    if (!isSelfMirrored) {
-      const lastUserText = extractLastUserText(messages);
-      if (lastUserText) {
-        broadcastStreamEvent({ conversationId, type: 'user-message', text: lastUserText }, streamToken);
-      }
-    }
+    // (The user-message mirror is emitted AFTER server-persist ownership is bound
+    // below — see the isSelfMirrored block after the binding. Emitting it here, before
+    // the binding, meant the mirror carried neither serverPersisted tagging nor the
+    // authoritative user-node id, so a delayed GUI launch racing an automation restart
+    // could keep local ownership, abort the accepted turn, and fabricate a duplicate
+    // user node (R109 finding-1).)
     // If agent:submit flagged this turn for server-side persistence, bind that
     // ownership to THIS run's token (so a later superseding run doesn't inherit
     // or clobber it). Consume the one-shot pending marker.
@@ -3048,6 +3043,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         else guiFallbackRemoteOrigin.delete(conversationId);
       }
     }
+
+    // Mirror the newest user turn to OTHER attached clients so a GUI/automation-driven
+    // turn shows the prompt (skipped for agent:submit — it self-broadcast a nonced copy).
+    // Emitted AFTER the server-persist binding above so it carries this run's
+    // serverPersisted tagging AND the AUTHORITATIVE persisted user-node metadata: a
+    // receiving renderer inserts the turn under the DISK id (never fabricates one) and,
+    // for a server-persist restart takeover, adopts this generation as main-owned —
+    // invalidating a pending local launch rather than aborting the accepted turn
+    // (R108 f-1 / R109 f-1). Token-tagged so the renderer attributes it to this run.
+    if (!isSelfMirrored) {
+      const lastUserText = extractLastUserText(messages);
+      if (lastUserText) {
+        const branchArr = messages as Array<{ id?: unknown }>;
+        const lastNode = branchArr[branchArr.length - 1];
+        const authoritativeUserId = typeof lastNode?.id === 'string' ? lastNode.id : undefined;
+        broadcastStreamEvent(
+          {
+            conversationId,
+            type: 'user-message',
+            text: lastUserText,
+            // serverPersisted runs carry the authoritative id so the renderer inserts
+            // under it (no fabricated duplicate). A plain GUI mirror keeps prior
+            // behavior (no data) — the originating renderer manages its own tree.
+            ...(serverPersistedRun && authoritativeUserId
+              ? { serverPersisted: true, data: { messageId: authoritativeUserId } }
+              : {}),
+          },
+          streamToken,
+        );
+      }
+    }
+
     const randomBytes = new Uint8Array(4);
     crypto.getRandomValues(randomBytes);
     const observerSessionId = `${Date.now()}-${Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
