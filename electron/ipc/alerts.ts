@@ -280,12 +280,23 @@ export async function deliverRecoveredAnswer(
         }
       };
       let committedOnDisk = isCommittedOnDisk();
-      // Grace iterations after the run goes inactive: the terminal persist may land a
-      // beat after activeStreams clears, so don't give up the instant it's inactive.
-      // If no run-activity signal is wired, fall back to a bounded fixed poll.
+      // Reconcile against the run lifecycle with NO fixed time ceiling when lifecycle
+      // tracking is available: a server-owned Mastra run can hold a single tool step
+      // (e.g. a long shell timeout) for far longer than any fixed budget, and the
+      // recovered answer only commits at the NEXT prepareStep after it. So loop until
+      // the answer commits OR the run actually terminates (then a short grace for the
+      // terminal persist) — a fixed ceiling would abandon the alert mid-run and leave
+      // it stale (R119→R120). Back off the poll interval so a multi-minute tool step
+      // isn't polled tightly. Without a lifecycle signal, keep the bounded ~3s fallback.
       const runActive = deps?.isConversationTurnActive;
       let inactiveGrace = 3;
-      for (let i = 0; i < 4000 && !committedOnDisk; i++) {
+      // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
+      // leak this loop forever — far above any real tool timeout. Reaching it keeps the
+      // alert (uncommitted), which is the safe outcome.
+      const MAX_RECONCILE_MS = 6 * 60 * 60 * 1000; // 6h
+      const startedAt = Date.now();
+      for (let i = 0; !committedOnDisk; i++) {
+        if (Date.now() - startedAt > MAX_RECONCILE_MS) break;
         if (runActive) {
           // Stop once the run is no longer streaming AND a short grace has elapsed —
           // whatever was going to commit has; keep the alert if it still hasn't.
@@ -293,7 +304,10 @@ export async function deliverRecoveredAnswer(
         } else if (i >= 20) {
           break; // no lifecycle signal → bounded ~3s fallback (R118 behavior)
         }
-        await new Promise((r) => setTimeout(r, 150));
+        // 150ms while the commit is imminent (first ~3s / after the run goes inactive),
+        // then back off to 1s so a long-running tool step doesn't tight-loop for minutes.
+        const stillRunning = runActive ? runActive(conversationId) : false;
+        await new Promise((r) => setTimeout(r, i < 20 || !stillRunning ? 150 : 1000));
         committedOnDisk = isCommittedOnDisk();
       }
       if (committedOnDisk) dismissPendingAlert();
