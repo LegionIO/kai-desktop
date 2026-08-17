@@ -5,6 +5,8 @@ import type { ReasoningEffort, ResolvedStreamConfig } from './model-catalog.js';
 import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
+import { toolsForExecutionMode } from './plan-mode-tools.js';
+import { readConversation } from '../ipc/conversation-store.js';
 import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
@@ -103,14 +105,36 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   stream: AsyncGenerator<StreamEvent>;
   modelKey: string;
 }> {
-  const { appHome, messages, systemPrompt, tools: pluginTools } = options;
+  const { appHome, messages, systemPrompt, tools: pluginToolsRaw } = options;
+  // Reconcile the passed executionMode against the PERSISTED (MAIN-authoritative) mode
+  // (R129 finding-2). A queued/alert resume snapshots executionMode, then may WAIT up to
+  // ~60s before dispatch; MAIN could switch the conversation to plan-first (or back to auto)
+  // in that window. This path bypasses the stream handler's reconciliation, so redo it HERE
+  // with the SAME rule (R129 f-3): the persisted mode is authoritative (only user intent /
+  // plan transitions write it), so TRUST DISK when the conversation has a record; fall back
+  // to the snapshot only for a synthetic/recordless id.
+  let effectiveMode = options.executionMode;
+  if (options.conversationId) {
+    try {
+      const rec = readConversation(appHome, options.conversationId) as { executionMode?: ExecutionMode } | null;
+      if (rec != null) effectiveMode = rec.executionMode ?? 'auto';
+    } catch {
+      /* best-effort: keep the passed mode */
+    }
+  }
   // Overlay the run's execution mode (e.g. the conversation's `plan-first`) onto the
   // config so streamAgentResponse's workspace-tool filtering honors it — otherwise a
   // recovered/resumed turn would use the GLOBAL executionMode and could expose
   // mutating tools plan mode normally filters out (R90).
-  const config: AppConfig = options.executionMode
-    ? { ...options.config, tools: { ...options.config.tools, executionMode: options.executionMode } }
+  const config: AppConfig = effectiveMode
+    ? { ...options.config, tools: { ...options.config.tools, executionMode: effectiveMode } }
     : options.config;
+  // Config-overlay only gates the WORKSPACE tools built downstream. The explicitly-passed
+  // registered tools (custom/MCP/skill/plugin) are NOT re-filtered by the config, so in
+  // plan-first they'd stay available and an idle/alert-recovery resume in a plan-mode
+  // conversation could run mutations (R129 finding-1). Apply the SAME plan-mode filter the
+  // main GUI/CLI stream path uses so a recovered turn is exactly as read-only.
+  const pluginTools = effectiveMode ? toolsForExecutionMode(pluginToolsRaw ?? [], effectiveMode) : pluginToolsRaw;
 
   const streamConfig = resolveStreamConfig(config, {
     threadModelKey: options.modelKey ?? null,

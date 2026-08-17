@@ -5,6 +5,7 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
 import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
+import { toolsForExecutionMode as filterToolsForExecutionMode } from '../agent/plan-mode-tools.js';
 import {
   createWorkspaceToolDefinitions,
   normalizeAgentCwd,
@@ -206,7 +207,6 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   consumedInjectBytes.delete(conversationId);
 }
 const activeObserverSessions = new Map<string, string>();
-const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
 
 /** The last user message object from a flat message list, or null. */
 function lastUserMessage(messages: unknown[]): { role?: unknown; content?: unknown } | null {
@@ -2361,26 +2361,32 @@ function mergeAbortSignals(primary?: AbortSignal, secondary?: AbortSignal): Abor
 }
 
 function toolsForExecutionMode(tools: ToolDefinition[], executionMode: ExecutionMode): ToolDefinition[] {
-  if (executionMode === 'plan-first') {
-    return tools.filter((tool) => PLAN_MODE_CUSTOM_TOOLS.has(tool.name));
-  }
-
-  return tools;
+  return filterToolsForExecutionMode(tools, executionMode);
 }
 
 /**
- * Reconcile a GUI-submitted executionMode against the persisted (MAIN-authoritative) mode
- * (R128 finding-1). The renderer's submitted mode can be STALE — a reconciliation may have
- * reset it to 'auto' after MAIN persisted 'plan-first'. FAIL-SAFE: if EITHER is 'plan-first',
- * the turn runs plan-first (read-only). This never wrongly exposes mutating tools; the only
- * cost is that a genuine plan→auto toggle whose (async) disk write hasn't landed runs one extra
- * turn read-only — strictly safer than the inverse. Pure for focused unit coverage.
+ * Reconcile a GUI-submitted executionMode against the persisted (MAIN-authoritative) mode.
+ *
+ * executionMode is MAIN-authoritative: the ONLY writers are genuine user intent (the composer
+ * toggle / settings modal via the dedicated setter) and plan-mode transitions — reconciliation
+ * paths (hydration, broadcasts) never write it (R127). So the PERSISTED mode is the true intended
+ * mode, and the renderer-submitted value can be STALE in EITHER direction:
+ *   - stale 'auto' submitted, disk 'plan-first' (R128 f-1) → must run plan-first (not expose tools)
+ *   - stale 'plan-first' submitted, disk 'auto' (R129 f-3) → must run auto (a latched OR would
+ *     pin plan-first forever after a plan→auto toggle on another client)
+ * BOTH want the persisted value. So: trust disk whenever the conversation HAS a persisted record;
+ * fall back to the submitted mode only when there is no persisted mode to consult (`persistedKnown`
+ * false — a brand-new conversation whose first turn is dispatching before any record/mode exists).
+ * A single renderer's set-execution-mode IPC precedes its submit IPC, so a toggle-then-send lands
+ * the disk write first; `persistedKnown` guards the genuinely-recordless first-turn case.
+ * Pure for focused unit coverage.
  */
 function reconcileExecutionMode(
   submitted: ExecutionMode | undefined,
   persisted: ExecutionMode | undefined,
+  persistedKnown: boolean,
 ): ExecutionMode {
-  if (submitted === 'plan-first' || persisted === 'plan-first') return 'plan-first';
+  if (persistedKnown) return persisted ?? 'auto';
   return submitted ?? 'auto';
 }
 
@@ -2736,9 +2742,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // still in flight runs one extra turn read-only — strictly safer than the inverse.
     let effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
     try {
-      const persistedMode = (readConversation(appHome, conversationId) as { executionMode?: ExecutionMode } | null)
-        ?.executionMode;
-      effectiveExecutionMode = reconcileExecutionMode(executionMode, persistedMode);
+      const persistedConv = readConversation(appHome, conversationId) as { executionMode?: ExecutionMode } | null;
+      // `persistedKnown` = the conversation HAS a record: its executionMode (present or absent
+      // → 'auto') is authoritative. Only a genuinely recordless conversation (first turn before
+      // any record exists) falls back to the submitted mode.
+      effectiveExecutionMode = reconcileExecutionMode(
+        executionMode,
+        persistedConv?.executionMode,
+        persistedConv != null,
+      );
     } catch {
       /* best-effort: fall back to the submitted mode */
     }
