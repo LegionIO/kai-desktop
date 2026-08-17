@@ -7433,59 +7433,84 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const injectText = gate.text;
       const id = enqueueInject(conversationId, injectText);
       if (!id) return { ok: false, error: 'failed-to-enqueue' };
-      const activeToken = activeStreams.get(conversationId)?.token;
-      const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+      // Failure-atomic acceptance (R105 finding-2): the entry is live in the queue the
+      // instant it's enqueued, so a throw from persist/broadcast must NOT surface a
+      // plain failure — the renderer would then fallback-send a duplicate while the
+      // running turn drains this same inject. On any throw: if the id is already
+      // on-tree (drained + committed) report success; else remove the queued entry and
+      // report a non-cooperative failure so the renderer's fallback is safe.
+      try {
+        const activeToken = activeStreams.get(conversationId)?.token;
+        const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
 
-      // For a server-owned turn, display immediately with the stable queue id but
-      // DO NOT persist/split yet. prepareStep consumes this entry only after the
-      // prior step's tool results have arrived; the consumption hook above then
-      // persists the partial assistant + user boundary without losing tool state.
-      let persistedMessageId = id;
-      let persistedParentId: string | null | undefined = serverOwnsPersistence ? undefined : (conv.headId ?? null);
-      let persistedCreatedAt: string | undefined = new Date().toISOString();
-      if (!serverOwnsPersistence) {
-        const write = appendConversationMessages(
-          appHome,
-          conversationId,
-          [{ id, role: 'user', content: [{ type: 'text', text: injectText }], createdAt: persistedCreatedAt }],
-          { runStatus: 'running' },
-        );
-        if (!write) {
-          removeInject(conversationId, id);
-          return { ok: false, error: 'conversation-not-found' };
+        // For a server-owned turn, display immediately with the stable queue id but
+        // DO NOT persist/split yet. prepareStep consumes this entry only after the
+        // prior step's tool results have arrived; the consumption hook above then
+        // persists the partial assistant + user boundary without losing tool state.
+        let persistedMessageId = id;
+        let persistedParentId: string | null | undefined = serverOwnsPersistence ? undefined : (conv.headId ?? null);
+        let persistedCreatedAt: string | undefined = new Date().toISOString();
+        if (!serverOwnsPersistence) {
+          const write = appendConversationMessages(
+            appHome,
+            conversationId,
+            [{ id, role: 'user', content: [{ type: 'text', text: injectText }], createdAt: persistedCreatedAt }],
+            { runStatus: 'running' },
+          );
+          if (!write) {
+            removeInject(conversationId, id);
+            return { ok: false, error: 'conversation-not-found' };
+          }
+          persistedMessageId = write.headId ?? id;
+          const persistedNode = (
+            (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+          ).find((message) => message.id === persistedMessageId);
+          persistedParentId = persistedNode?.parentId ?? null;
+          persistedCreatedAt = persistedNode?.createdAt ?? persistedCreatedAt;
         }
-        persistedMessageId = write.headId ?? id;
-        const persistedNode = (
-          (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
-        ).find((message) => message.id === persistedMessageId);
-        persistedParentId = persistedNode?.parentId ?? null;
-        persistedCreatedAt = persistedNode?.createdAt ?? persistedCreatedAt;
-      }
 
-      // Record this inject's node ids as THIS run's own lineage IMMEDIATELY (not only
-      // at inject-consumed). A first accepted GUI inject advances the disk head to its
-      // (just-persisted) user node; a SECOND overlapping mid-turn send whose slow
-      // policy hook then resolves would otherwise walk from that head to headBeforeGate
-      // WITHOUT crossing a recorded lineage id and wrongly classify it a branch switch
-      // (forcing a superseding send that aborts the healthy Mastra turn instead of
-      // batching both injects). Record both the queue id and the persisted id (they can
-      // differ if the append reassigned) plus their `-cont` continuations.
-      if (activeToken !== undefined) {
-        recordInjectBoundaryLineage(conversationId, activeToken, id);
-        if (persistedMessageId !== id) recordInjectBoundaryLineage(conversationId, activeToken, persistedMessageId);
-      }
+        // Record this inject's node ids as THIS run's own lineage IMMEDIATELY (not only
+        // at inject-consumed). A first accepted GUI inject advances the disk head to its
+        // (just-persisted) user node; a SECOND overlapping mid-turn send whose slow
+        // policy hook then resolves would otherwise walk from that head to headBeforeGate
+        // WITHOUT crossing a recorded lineage id and wrongly classify it a branch switch
+        // (forcing a superseding send that aborts the healthy Mastra turn instead of
+        // batching both injects). Record both the queue id and the persisted id (they can
+        // differ if the append reassigned) plus their `-cont` continuations.
+        if (activeToken !== undefined) {
+          recordInjectBoundaryLineage(conversationId, activeToken, id);
+          if (persistedMessageId !== id) recordInjectBoundaryLineage(conversationId, activeToken, persistedMessageId);
+        }
 
-      broadcastStreamEvent({
-        conversationId,
-        type: 'user-message',
-        text: injectText,
-        data: {
-          messageId: persistedMessageId,
-          parentId: persistedParentId,
-          createdAt: persistedCreatedAt,
-        },
-      });
-      return { ok: true, cooperative: true, id: id ?? undefined };
+        // Broadcast is best-effort: the inject is already enqueued + persisted, so a
+        // broadcast throw must NOT unwind acceptance.
+        try {
+          broadcastStreamEvent({
+            conversationId,
+            type: 'user-message',
+            text: injectText,
+            data: {
+              messageId: persistedMessageId,
+              parentId: persistedParentId,
+              createdAt: persistedCreatedAt,
+            },
+          });
+        } catch {
+          /* best-effort mirror; acceptance already succeeded */
+        }
+        return { ok: true, cooperative: true, id: id ?? undefined };
+      } catch {
+        // persist threw. If the running turn already drained + committed this inject
+        // (its id is on the tree), acceptance genuinely succeeded — report ok so the
+        // renderer does NOT fallback-send a duplicate. Otherwise remove the still-queued
+        // entry and tell the renderer to fall back to a normal turn.
+        const tree = (readConversation(appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>;
+        if (tree.some((m) => m?.id === id)) {
+          return { ok: true, cooperative: true, id };
+        }
+        removeInject(conversationId, id);
+        return { ok: false, cooperative: false, error: 'inject persistence failed' };
+      }
     },
   );
 
@@ -7692,6 +7717,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
+    // Cancel generation at ENTRY. The abort+restart path below awaits a policy gate;
+    // if the user presses Stop during that await, the generation bumps. Revalidated
+    // immediately before the restart launches so a durable-recovery re-injection (a
+    // late ask_user answer) can NOT start a new tool-enabled turn after an explicit
+    // Stop landed mid-gate (R105 finding-3). Cooperative splice has its own
+    // terminalAbortTokens/ownership guards; this covers the fresh-turn restart.
+    const cancelGenAtEntry = explicitCancelGeneration.get(conversationId) ?? 0;
 
     // COOPERATIVE mid-turn injection (Mastra runtime only): if a Mastra turn is
     // still generating, splice the follow-up into the RUNNING turn at its next
@@ -8062,6 +8094,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
+    // Revalidate the cancel generation before we abort+restart: if an explicit Stop
+    // bumped it since entry (e.g. while a durable-recovery re-injection awaited its
+    // policy gate), the user ended this conversation's turn — do NOT abort a run and
+    // launch a fresh tool-enabled turn for a now-stopped conversation (R105 finding-3).
+    if ((explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtEntry) {
+      return { ok: false, error: 'conversation-stopped-during-injection' };
+    }
+
     // If a turn is still generating into this conversation, PRESERVE its
     // in-progress reply as its own (interrupted) turn before we abort + restart.
     // Without this, the fresh run's discardPersistenceAccumulator (in
@@ -8089,8 +8129,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (!promptWrite) return { ok: false, error: 'conversation-not-found' };
 
     // Mirror the injected prompt to any attached clients (GUI/CLI viewing this
-    // conversation) so the turn renders, not just the streamed reply.
-    broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+    // conversation) so the turn renders, not just the streamed reply. Best-effort: a
+    // broadcast throw here must NOT abort the restart — the user node + runStatus
+    // 'running' are already written, so bailing would leave the conversation stuck
+    // 'running' with an unanswered turn, and the alert commit-check (which finds the
+    // committed id) would refuse to reopen it (R105 finding-4). Streaming proceeds.
+    try {
+      broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+    } catch {
+      /* best-effort mirror; the turn is persisted and will stream below */
+    }
 
     const updated = readConversation(appHome, conversationId);
     if (!updated) return { ok: false, error: 'conversation-not-found' };

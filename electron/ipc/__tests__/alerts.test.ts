@@ -227,18 +227,19 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
         throw new Error('gen failed'); // fail AFTER the (simulated) commit
       },
     );
-    (readConversation as unknown as ReturnType<typeof vi.fn>)
-      .mockReturnValueOnce({ id: 'c1', messages: [{ role: 'user' }, { role: 'assistant' }] })
-      .mockImplementationOnce(() => ({
-        id: 'c1',
-        messages: [
-          { role: 'user' },
-          { role: 'assistant' },
-          { role: 'user', content: persistedText },
-          // A post-generation assistant/error node makes the labeled turn NOT the tail.
-          { role: 'assistant', content: 'partial' },
-        ],
-      }));
+    // Read-count-independent: every readConversation returns a conv whose tree carries
+    // THIS resume's committed labeled turn (persistedText, captured above). Covers the
+    // pre-resume read, the fresh-id-allocation read, and the post-failure check read.
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: [
+        { role: 'user' },
+        { role: 'assistant' },
+        { role: 'user', content: persistedText },
+        // A post-generation assistant/error node makes the labeled turn NOT the tail.
+        { role: 'assistant', content: 'partial' },
+      ],
+    }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
@@ -258,23 +259,18 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
         throw new Error('gen failed'); // fail AFTER commit
       },
     );
-    // The pre-resume snapshot had many messages, but by the time we re-read after the
-    // failure the ACTIVE branch (messages) was rewound to just 1 node — the committed
-    // recovered turn lives on the messageTree, NOT within a count-relative suffix of
-    // `messages`. A count-based slice would miss it; the full-tree scan must not.
-    (readConversation as unknown as ReturnType<typeof vi.fn>)
-      .mockReturnValueOnce({
-        id: 'c1',
-        messages: [{ role: 'user' }, { role: 'assistant' }, { role: 'user' }, { role: 'assistant' }],
-      })
-      .mockImplementationOnce(() => ({
-        id: 'c1',
-        messages: [{ role: 'user', content: 'unrelated rewound head' }],
-        messageTree: [
-          { role: 'user', content: 'old' },
-          { role: 'user', content: persistedText },
-        ],
-      }));
+    // The ACTIVE branch (messages) is rewound to 1 node — the committed recovered turn
+    // lives on the messageTree, NOT within a count-relative suffix of `messages`. A
+    // count-based slice would miss it; the full-tree scan must not. Read-count-independent
+    // (covers the pre-resume, fresh-id-allocation, and post-failure reads).
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      id: 'c1',
+      messages: [{ role: 'user', content: 'unrelated rewound head' }],
+      messageTree: [
+        { role: 'user', content: 'old' },
+        { role: 'user', content: persistedText },
+      ],
+    }));
     initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
 
     const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });

@@ -59,6 +59,28 @@ export function initializeAlerts(d: AlertsDeps): void {
   setRecoveredAnswerDeliverer(deliverRecoveredAnswer);
 }
 
+/** Allocate a stable user-turn id GUARANTEED not to collide with an existing node in
+ *  the conversation tree. A colliding id would be reminted by appendConversationMessages,
+ *  so the persisted node's id would differ from the requested one and the commit-check
+ *  by-id would false-negative (→ reopen → duplicate). Random ids make a collision
+ *  astronomically unlikely, but verify against the current tree and regenerate to be
+ *  safe (R105 finding-1). */
+function allocateFreshTurnId(appHome: string, conversationId: string, prefix: string): string {
+  let existing: Set<string>;
+  try {
+    const conv = readConversation(appHome, conversationId) as { messageTree?: Array<{ id?: unknown }> } | null;
+    existing = new Set((conv?.messageTree ?? []).map((m) => (typeof m?.id === 'string' ? m.id : '')).filter(Boolean));
+  } catch {
+    existing = new Set();
+  }
+  for (let i = 0; i < 8; i++) {
+    const id = `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    if (!existing.has(id)) return id;
+  }
+  // Astronomically unreachable; fall back to a highly-entropic id.
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 /** Collect the conversation's persisted per-thread overrides into the shape
  *  `resumeConversationWithMessage` forwards to the stream. Returns `undefined`
  *  when none are set so callers can omit the field entirely (R92). */
@@ -141,9 +163,9 @@ export async function deliverRecoveredAnswer(
   const deliveryId = `rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const text = `[Answering your earlier question "${title}"]\n${body}\n<!-- ${deliveryId} -->`;
   // Stable id for the persisted user turn so the post-failure commit-check finds it
-  // by EXACT id even if a policy hook strips the in-content marker (R104). Threaded
-  // through resumeConversationWithMessage → the persist/inject path.
-  const userTurnId = `rcv-turn-${deliveryId}`;
+  // by EXACT id even if a policy hook strips the in-content marker (R104). Collision-
+  // free vs the current tree so appendConversationMessages won't remint it (R105 f-1).
+  const userTurnId = allocateFreshTurnId(deps.appHome, conversationId, `rcv-turn-${deliveryId}`);
   const correlationId = `recovered-answer-${conversationId}`;
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
@@ -445,7 +467,7 @@ async function resume(alert: Alert, userText: string): Promise<void> {
   // in-content marker stays as a fallback for the cooperative-inject path (which mints
   // its own id): if BOTH are absent we conservatively reopen (re-answerable) rather
   // than silently drop.
-  const userTurnId = `alert-turn-${alert.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const userTurnId = allocateFreshTurnId(deps.appHome, alert.conversationId, `alert-turn-${alert.id}`);
   try {
     // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
     // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
