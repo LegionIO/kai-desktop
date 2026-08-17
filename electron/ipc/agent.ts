@@ -9109,14 +9109,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // pending approval is still live (this IS the winning surface resolving it now).
     const pending = pendingToolApprovals.get(toolCallId);
     const alreadyStashed = pendingQuestionAnswers.has(toolCallId);
+    let stashed = true;
     if (pending || !alreadyStashed) {
-      stashQuestionAnswers(toolCallId, answers);
+      // stashQuestionAnswers rejects an oversized single entry (byte cap) — a legitimate
+      // answer is short typed text; an oversized frame is discarded rather than allowed to
+      // retain memory / FIFO-evict real recovery entries (R130 finding-2). A live pending
+      // approval is still resolved below (don't wedge a genuine turn), but there's no stash
+      // to recover from on a raced abort — acceptable, since a 64 KiB+ "answer" is abuse.
+      stashed = stashQuestionAnswers(toolCallId, answers);
     }
     traceDiagnostic({
       scope: 'agent',
       event: 'question.answer-received',
       toolName: 'ask_user',
-      fields: { toolCallId, hadPending: Boolean(pending), answerCount: Object.keys(answers ?? {}).length },
+      fields: {
+        toolCallId,
+        hadPending: Boolean(pending),
+        answerCount: Object.keys(answers ?? {}).length,
+        stashRejectedOversize: !stashed,
+      },
     });
     if (pending) {
       // Resolve with the explicit `answered` source so the trace distinguishes a

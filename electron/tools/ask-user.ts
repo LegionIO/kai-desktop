@@ -17,15 +17,47 @@ export const pendingQuestionAnswers = new Map<string, Record<string, string>>();
  *  the codebase (loginAttempts, exitCodes). */
 const MAX_PENDING_QUESTION_ANSWERS = 100;
 
+/** Per-entry + aggregate BYTE bounds on the stash (R130 finding-2). The count cap alone lets a
+ *  client flood distinct toolCallIds with large answer frames (~4 MiB each × 100 = ~400 MiB
+ *  retained) AND FIFO-evict legitimate raced-answer recovery entries. An answer is user-typed
+ *  text (a handful of short strings); a genuine one is well under 64 KiB. Reject an oversized
+ *  single entry outright (never stash it) and evict oldest until the aggregate is under budget. */
+const MAX_ANSWER_ENTRY_BYTES = 64 * 1024;
+const MAX_PENDING_ANSWERS_TOTAL_BYTES = 4 * 1024 * 1024;
+
+function answersByteSize(answers: Record<string, string>): number {
+  let n = 0;
+  for (const [k, v] of Object.entries(answers ?? {})) {
+    n += k.length + (typeof v === 'string' ? v.length : 0);
+  }
+  return n;
+}
+
 /** Stash user answers under `toolCallId`, evicting the oldest entries so an
- *  orphaned (never-consumed) entry can't grow the map without bound. */
-export function stashQuestionAnswers(toolCallId: string, answers: Record<string, string>): void {
+ *  orphaned (never-consumed) entry can't grow the map without bound. Returns false
+ *  (and stashes nothing) if the single entry exceeds the per-entry byte cap — a
+ *  legitimate answer is short text, so an oversized frame is discarded rather than
+ *  allowed to retain memory / evict real recovery entries. */
+export function stashQuestionAnswers(toolCallId: string, answers: Record<string, string>): boolean {
+  if (answersByteSize(answers) > MAX_ANSWER_ENTRY_BYTES) return false;
   pendingQuestionAnswers.set(toolCallId, answers);
+  // Count cap.
   while (pendingQuestionAnswers.size > MAX_PENDING_QUESTION_ANSWERS) {
     const oldest = pendingQuestionAnswers.keys().next().value;
     if (oldest === undefined) break;
     pendingQuestionAnswers.delete(oldest);
   }
+  // Aggregate byte cap: evict oldest (never the entry just added) until under budget.
+  let total = 0;
+  for (const v of pendingQuestionAnswers.values()) total += answersByteSize(v);
+  while (total > MAX_PENDING_ANSWERS_TOTAL_BYTES && pendingQuestionAnswers.size > 1) {
+    const oldestKey = pendingQuestionAnswers.keys().next().value;
+    if (oldestKey === undefined || oldestKey === toolCallId) break;
+    const evicted = pendingQuestionAnswers.get(oldestKey);
+    pendingQuestionAnswers.delete(oldestKey);
+    if (evicted) total -= answersByteSize(evicted);
+  }
+  return true;
 }
 
 /**

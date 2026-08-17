@@ -106,34 +106,37 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
   modelKey: string;
 }> {
   const { appHome, messages, systemPrompt, tools: pluginToolsRaw } = options;
-  // Reconcile the passed executionMode against the PERSISTED (MAIN-authoritative) mode
-  // (R129 finding-2). A queued/alert resume snapshots executionMode, then may WAIT up to
-  // ~60s before dispatch; MAIN could switch the conversation to plan-first (or back to auto)
-  // in that window. This path bypasses the stream handler's reconciliation, so redo it HERE
-  // with the SAME rule (R129 f-3): the persisted mode is authoritative (only user intent /
-  // plan transitions write it), so TRUST DISK when the conversation has a record; fall back
-  // to the snapshot only for a synthetic/recordless id.
-  let effectiveMode = options.executionMode;
+  // Determine the effective execution mode, then filter registered tools + overlay config.
+  // Priority: an explicit conversation record (MAIN-authoritative — R129 f-2/f-3) > the
+  // passed snapshot > the GLOBAL config.tools.executionMode. The global fallback matters for
+  // RECORDLESS calls (background automations / plugin agent.generate|stream) that pass no
+  // executionMode and no real conversation but run under a globally plan-first config — those
+  // must be read-only too (R130 finding-1), not just the workspace tools.
+  const globalMode = (options.config.tools as { executionMode?: ExecutionMode } | undefined)?.executionMode;
+  let effectiveMode: ExecutionMode | undefined = options.executionMode ?? globalMode;
   if (options.conversationId) {
     try {
       const rec = readConversation(appHome, options.conversationId) as { executionMode?: ExecutionMode } | null;
+      // A conversation record is authoritative: its mode (present, or ABSENT → auto) wins over
+      // both the snapshot and the global default. TRUST DISK (R129 f-3). Recordless → keep the
+      // snapshot/global fallback computed above.
       if (rec != null) effectiveMode = rec.executionMode ?? 'auto';
     } catch {
-      /* best-effort: keep the passed mode */
+      /* best-effort: keep the passed / global mode */
     }
   }
-  // Overlay the run's execution mode (e.g. the conversation's `plan-first`) onto the
-  // config so streamAgentResponse's workspace-tool filtering honors it — otherwise a
-  // recovered/resumed turn would use the GLOBAL executionMode and could expose
-  // mutating tools plan mode normally filters out (R90).
-  const config: AppConfig = effectiveMode
-    ? { ...options.config, tools: { ...options.config.tools, executionMode: effectiveMode } }
-    : options.config;
+  // Overlay the run's execution mode onto the config so streamAgentResponse's workspace-tool
+  // filtering honors it (R90). Only overlay when we resolved a mode DIFFERENT from the global
+  // (a record/snapshot) — otherwise leave config untouched (it already carries the global).
+  const config: AppConfig =
+    effectiveMode && effectiveMode !== globalMode
+      ? { ...options.config, tools: { ...options.config.tools, executionMode: effectiveMode } }
+      : options.config;
   // Config-overlay only gates the WORKSPACE tools built downstream. The explicitly-passed
   // registered tools (custom/MCP/skill/plugin) are NOT re-filtered by the config, so in
-  // plan-first they'd stay available and an idle/alert-recovery resume in a plan-mode
-  // conversation could run mutations (R129 finding-1). Apply the SAME plan-mode filter the
-  // main GUI/CLI stream path uses so a recovered turn is exactly as read-only.
+  // plan-first they'd stay available and a resume / recordless-but-globally-plan-first run
+  // could execute mutations (R129 f-1, R130 f-1). Apply the SAME plan-mode filter the main
+  // GUI/CLI stream path uses so any plan-first run is read-only for these tools too.
   const pluginTools = effectiveMode ? toolsForExecutionMode(pluginToolsRaw ?? [], effectiveMode) : pluginToolsRaw;
 
   const streamConfig = resolveStreamConfig(config, {

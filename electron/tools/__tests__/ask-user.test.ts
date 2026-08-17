@@ -67,6 +67,28 @@ describe('stashQuestionAnswers', () => {
     expect(pendingQuestionAnswers.size).toBe(1);
     expect(pendingQuestionAnswers.get('dup')).toEqual({ v: '2' });
   });
+
+  it('rejects an oversized single entry (byte cap) and stashes nothing (R130)', () => {
+    const huge = 'x'.repeat(64 * 1024 + 1);
+    expect(stashQuestionAnswers('big', { Q: huge })).toBe(false);
+    expect(pendingQuestionAnswers.has('big')).toBe(false);
+    // A normal-sized answer still stashes and returns true.
+    expect(stashQuestionAnswers('ok', { Q: 'small' })).toBe(true);
+    expect(pendingQuestionAnswers.has('ok')).toBe(true);
+  });
+
+  it('evicts oldest to stay under the aggregate byte budget, keeping the newest (R130)', () => {
+    // Entries UNDER the 64 KiB per-entry cap (~50 KiB) but numerous enough to exceed the
+    // 4 MiB aggregate budget (~84 × 50 KiB > 4 MiB) → oldest evicted, newest retained.
+    const chunk = 'y'.repeat(50 * 1024);
+    for (let i = 0; i < 100; i++) stashQuestionAnswers(`b-${i}`, { n: chunk });
+    let total = 0;
+    for (const v of pendingQuestionAnswers.values()) total += (v.n as string).length + 1; // +key 'n'
+    expect(total).toBeLessThanOrEqual(4 * 1024 * 1024);
+    // The most recent entry is retained (never self-evicted); an old one is gone.
+    expect(pendingQuestionAnswers.has('b-99')).toBe(true);
+    expect(pendingQuestionAnswers.has('b-0')).toBe(false);
+  });
 });
 
 describe('rekeyRacedAnswer', () => {
