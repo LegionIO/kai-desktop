@@ -3782,20 +3782,52 @@ export function RuntimeProvider({
         // seeded by an untagged external user-message.
         lastLiveGeneration.set(convId, evGen);
         if (acc.runGeneration == null) {
-          // Lock to the first REAL-run event — BUT if this accumulator already knows its run
-          // (pendingAssistantId set by a local onNew/onEdit/onReload) and this event belongs to
-          // a DIFFERENT run (its responseMessageId doesn't match), do NOT let it lock. That
-          // guards the window where a superseded CLI/mirror run (whose responseMessageId was
-          // never blacklisted — its old accumulator had no pendingAssistantId to record) has a
-          // queued event arriving after a GUI turn replaced the accumulator; locking to the CLI
-          // generation would then drop the GUI run's own events (GUI response stranded).
-          const evRidForLock = (e as { responseMessageId?: string }).responseMessageId;
-          const foreignRun =
-            acc.pendingAssistantId != null && evRidForLock != null && evRidForLock !== acc.pendingAssistantId;
-          if (e.type !== 'compaction' && foreignRun) {
-            return; // event from a different (superseded) run — don't lock, don't mutate
+          // EXPLICIT TAKEOVER before this accumulator ever locked a generation: a
+          // token-tagged serverPersisted `user-message` is main-owned (an automation /
+          // recovery / CLI restart that already persisted the turn). A GUI submit that
+          // installed a locally-originated accumulator and is still awaiting persistence
+          // (no generation yet) must RELINQUISH ownership here — otherwise its delayed
+          // launch still passes ownsNew() and aborts the accepted server-owned run
+          // (R110 finding-1). Clear local ownership + the pending launch id + run-scoped
+          // state (mirrors the already-locked takeover path below), then lock to the
+          // new generation and fall through to render the mirrored turn.
+          const isServerPersistTakeover =
+            e.type === 'user-message' &&
+            (e as { serverPersisted?: boolean }).serverPersisted === true &&
+            evGen != null &&
+            acc.locallyOriginated === true &&
+            !supersededGenerations.get(convId)?.has(evGen);
+          if (isServerPersistTakeover) {
+            acc.runGeneration = evGen;
+            acc.locallyOriginated = false;
+            acc.pendingAssistantId = (e as { data?: { messageId?: string } }).data?.messageId ?? acc.pendingAssistantId;
+            acc.runConfig = undefined;
+            acc.pendingCompaction = undefined;
+            acc.seededBackground = undefined;
+            acc.seededDiskHeadId = undefined;
+            acc.awaitingApproval = undefined;
+            acc.deferredApprovals = undefined;
+            acc.pendingAssistantTiming = undefined;
+            acc.injectContinuationId = null;
+            acc.closedPrefixIds = undefined;
+            traceRuntime('stream.supersede-adopt-mirror-prelock', convId, { newGeneration: evGen });
+            // fall through — render the takeover turn as a passive mirror.
+          } else {
+            // Lock to the first REAL-run event — BUT if this accumulator already knows its run
+            // (pendingAssistantId set by a local onNew/onEdit/onReload) and this event belongs to
+            // a DIFFERENT run (its responseMessageId doesn't match), do NOT let it lock. That
+            // guards the window where a superseded CLI/mirror run (whose responseMessageId was
+            // never blacklisted — its old accumulator had no pendingAssistantId to record) has a
+            // queued event arriving after a GUI turn replaced the accumulator; locking to the CLI
+            // generation would then drop the GUI run's own events (GUI response stranded).
+            const evRidForLock = (e as { responseMessageId?: string }).responseMessageId;
+            const foreignRun =
+              acc.pendingAssistantId != null && evRidForLock != null && evRidForLock !== acc.pendingAssistantId;
+            if (e.type !== 'compaction' && foreignRun) {
+              return; // event from a different (superseded) run — don't lock, don't mutate
+            }
+            if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
           }
-          if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
         } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
           // Event from a DIFFERENT generation than this accumulator is locked to. Normally this is
           // a superseded (older) run's late event → drop it. BUT a `user-message` under a different
