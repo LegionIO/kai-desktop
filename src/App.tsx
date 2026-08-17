@@ -1246,15 +1246,23 @@ function AppShell() {
       .then((conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
-        // Skip if values haven't actually changed to avoid unnecessary writes
-        // that could race with concurrent stream persistence.
+        const targetConvId = activeConversationId;
+        // executionMode is MAIN-authoritative and must NOT ride the generic put (a delayed
+        // put would clobber a plan-mode transition MAIN wrote). Route a DELIBERATE toggle
+        // through the dedicated authoritative setter instead. Normalize 'auto' → null to
+        // match on-disk storage.
+        const desiredMode = executionMode === 'auto' ? null : executionMode;
+        if ((record.executionMode ?? null) !== desiredMode) {
+          void app.conversations.setExecutionMode?.(targetConvId, desiredMode).catch(() => {});
+        }
+        // Skip the generic put if the OTHER (put-owned) values haven't changed — executionMode
+        // is handled above and intentionally excluded from this comparison + the payload.
         if (
           record.selectedModelKey === selectedModelKey &&
           record.selectedProfileKey === selectedProfileKey &&
           record.fallbackEnabled === fallbackEnabled &&
           record.profilePrimaryModelKey === profilePrimaryModelKey &&
           (record.reasoningEffort ?? null) === (reasoningEffort === 'medium' ? null : reasoningEffort) &&
-          (record.executionMode ?? null) === (executionMode === 'auto' ? null : executionMode) &&
           (record.temperature ?? null) === (threadOverrides?.temperature ?? null) &&
           (record.systemPromptOverride ?? null) === (threadOverrides?.systemPromptOverride ?? null) &&
           (record.maxSteps ?? null) === (threadOverrides?.maxSteps ?? null) &&
@@ -1269,7 +1277,6 @@ function AppShell() {
           fallbackEnabled,
           profilePrimaryModelKey,
           reasoningEffort: reasoningEffort === 'medium' ? null : reasoningEffort,
-          executionMode: executionMode === 'auto' ? null : executionMode,
           temperature: threadOverrides?.temperature ?? null,
           systemPromptOverride: threadOverrides?.systemPromptOverride ?? null,
           maxSteps: threadOverrides?.maxSteps ?? null,

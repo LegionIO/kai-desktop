@@ -179,6 +179,13 @@ const appAPI = {
       ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
         ok: boolean;
       }>,
+    // Authoritative writer for per-conversation executionMode (the composer Plan-First/Auto
+    // toggle). The generic put never writes executionMode (MAIN-authoritative); deliberate
+    // changes go through here so a delayed generic put can't clobber a plan-mode transition.
+    setExecutionMode: (conversationId: string, mode: 'auto' | 'plan-first' | null) =>
+      ipcRenderer.invoke('conversations:set-execution-mode', conversationId, mode) as Promise<{
+        ok: boolean;
+      }>,
     // Soft-reserve + return one draft (lease+ACK): the draft is RETAINED (marked reserved), so a
     // crash before ack doesn't lose it. `draft: null` means reserved by another client / none.
     claimPendingDraft: (conversationId: string, id?: string, clientId?: string) =>

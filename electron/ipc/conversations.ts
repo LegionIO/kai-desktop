@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
@@ -1538,6 +1539,34 @@ export function registerConversationHandlers(
       return { ok: true };
     },
   );
+
+  // Dedicated, AUTHORITATIVE writer for per-conversation executionMode (R125 finding-2).
+  // executionMode is MAIN-authoritative (the plan-mode tools / stream path persist it as the
+  // source of truth), so a GENERIC conversations:put must NEVER write it — a delayed put carries
+  // a STALE mode from its get-time snapshot and would clobber a plan-mode transition MAIN just
+  // wrote. But the composer's Plan-First/Auto toggle is a DELIBERATE user change that must land.
+  // This channel is the renderer's ONLY authoritative mode writer: a small read-modify-write on
+  // the current disk record (so it can't carry stale sibling fields), broadcast like the plan-mode
+  // path. The generic put keeps prev-disk-mode unconditionally; deliberate changes come HERE.
+  ipcMain.handle('conversations:set-execution-mode', (_event, conversationId: string, mode: unknown) => {
+    if (typeof conversationId !== 'string' || !conversationId) return { ok: false };
+    if (mode !== 'auto' && mode !== 'plan-first' && mode !== null) return { ok: false };
+    const conv = readConversation(appHome, conversationId);
+    if (!conv) return { ok: false };
+    const prevMode = (conv as { executionMode?: ExecutionMode | null }).executionMode ?? null;
+    // Normalize: 'auto' is the default and is stored as ABSENT (null), matching the composer's
+    // `executionMode === 'auto' ? null` convention — so a no-op toggle doesn't churn the record.
+    const nextMode = mode === 'auto' ? null : (mode as ExecutionMode | null);
+    if (prevMode === nextMode) return { ok: true }; // no-op: avoid a needless write/broadcast
+    const updated: ConversationRecord = { ...conv };
+    if (nextMode === null) delete (updated as { executionMode?: unknown }).executionMode;
+    else (updated as { executionMode?: ExecutionMode }).executionMode = nextMode;
+    // Metadata-only change (tree/head/runStatus untouched). Persist, then broadcast the same
+    // payload shape as broadcastExecutionMode so every window/web client reconciles its toggle.
+    writeConversation(appHome, updated);
+    broadcastToAllWindows('agent:execution-mode-changed', { conversationId, mode: nextMode ?? 'auto' });
+    return { ok: true };
+  });
 
   // Soft-RESERVE + return ONE pending draft on main (lease+ACK), so that when multiple clients have
   // hydrated the same durable pendingDrafts, only ONE restores it. Unlike a remove-and-return, the

@@ -431,6 +431,7 @@ export function getBridgeScript(): string {
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       compact: function(id) { return invoke('conversations:compact', id, { __timeoutMs: 300000 }); },
       setPendingDrafts: function(id, delta) { return invoke('conversations:set-pending-drafts', id, delta); },
+      setExecutionMode: function(id, mode) { return invoke('conversations:set-execution-mode', id, mode); },
       claimPendingDraft: function(id, draftId, clientId) { return invoke('conversations:claim-pending-draft', id, draftId, clientId); },
       ackPendingDraft: function(id, draftId, restored, clientId) { return invoke('conversations:ack-pending-draft', id, draftId, restored, clientId); },
       compactingIds: function() { return invoke('conversations:compacting-ids'); },

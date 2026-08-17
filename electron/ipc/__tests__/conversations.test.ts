@@ -241,6 +241,37 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(after?.executionMode).toBe('plan-first');
   });
 
+  it('conversations:set-execution-mode is the authoritative writer for a deliberate toggle (R125)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    writeConversation(appHome, makeConversation('c', {}) as never);
+    // Deliberate Plan-First toggle lands (unlike a generic put, which keeps prev).
+    const r1 = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'plan-first');
+    expect((r1 as { ok?: boolean }).ok).toBe(true);
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBe('plan-first');
+    // Selecting Auto reverts to the default, stored as ABSENT (not the literal 'auto').
+    await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'auto');
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBeUndefined();
+  });
+
+  it('conversations:set-execution-mode rejects an invalid mode and a missing conversation (R125)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    writeConversation(appHome, makeConversation('c', { executionMode: 'plan-first' }) as never);
+    const bad = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'garbage');
+    expect((bad as { ok?: boolean }).ok).toBe(false);
+    // The invalid write must not have altered the persisted mode.
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBe('plan-first');
+    const missing = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'nope', 'auto');
+    expect((missing as { ok?: boolean }).ok).toBe(false);
+  });
+
   it('conversations:put preserves a redactedByHook user turn against a raw same-id rewrite', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {

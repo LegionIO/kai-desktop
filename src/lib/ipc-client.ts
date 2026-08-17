@@ -161,6 +161,7 @@ type AppAPI = {
         removeIds?: string[];
       },
     ) => Promise<{ ok: boolean }>;
+    setExecutionMode: (conversationId: string, mode: 'auto' | 'plan-first' | null) => Promise<{ ok: boolean }>;
     claimPendingDraft: (
       conversationId: string,
       id?: string,

@@ -6247,7 +6247,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     bumpExplicitCancelGeneration(conversationId);
                   }
                   controller.abort();
-                  return;
+                  // SKIP the tool — returning undefined here lets mastra-agent.ts fall
+                  // through to tool.execute (it only skips on `{skip:true}`), which would
+                  // WRITE the plan file + persist 'auto' via applyModeChange despite the
+                  // dismiss (R125 finding-1). Return an explicit skip so exit_plan_mode's
+                  // execute never runs.
+                  return {
+                    skip: true as const,
+                    result: { isError: true, error: 'User dismissed the plan. Exiting plan mode.' },
+                  };
                 }
                 // User clicked "No, keep planning" — stay in plan-first mode.
                 // Re-broadcast plan-first mode so the UI toggle stays in plan mode
@@ -6264,7 +6272,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 }
                 emit({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
                 controller.abort();
-                return;
+                // SKIP the tool (see the dismiss branch): a plain return would let
+                // exit_plan_mode's execute write the plan + persist 'auto', accepting the
+                // very plan the user rejected (R125 finding-1). Return an explicit skip so
+                // the tool never runs; the restart re-enters plan-first to keep planning.
+                return {
+                  skip: true as const,
+                  result: {
+                    isError: true,
+                    error:
+                      "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
+                  },
+                };
               }
             }
 
