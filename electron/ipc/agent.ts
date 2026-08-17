@@ -403,6 +403,7 @@ import {
   getRecoveredAnswerDeliverer,
   setAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
+  setPlanModeDismissHandler,
   clearInFlightAnswer,
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
@@ -5501,6 +5502,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // under the latest id — and distinguish it from both a user-selected
       // historical sibling AND a failed fallback variant the user might select.
       let latestReplyResponseId: string | null = null;
+      // R122 finding-5: set true when a plan-mode transition (enter_plan_mode mid-stream,
+      // or a "keep planning" reject of exit_plan_mode) aborts a SERVER-PERSISTED run. A GUI
+      // renderer drives the plan-first restart for GUI turns, but a `kai`/web submit has no
+      // renderer that will (the renderer path skips main-owned runs), so the finally block
+      // drives a MAIN-side plan-first continuation. Declared out here so the finally sees it.
+      let serverPersistPlanRestart = false;
 
       try {
         if (controller.signal.aborted) {
@@ -6244,6 +6251,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // mode so the agent can continue planning with the user.
                 console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
                 planDoneSent = true;
+                if (serverPersistedRun) {
+                  // No GUI renderer will restart this run — MAIN must (finding-5). The
+                  // reject means "keep planning"; re-run the branch in plan-first mode.
+                  serverPersistPlanRestart = true;
+                }
                 emit({ conversationId, type: 'done', data: { planModeRejectRestart: true } });
                 controller.abort();
                 return;
@@ -6669,6 +6681,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               );
               emit(event);
               planDoneSent = true;
+              if (serverPersistedRun) {
+                // No GUI renderer will restart this server-persisted run — MAIN must
+                // (finding-5). enter_plan_mode leaves the user's original request on the
+                // branch; re-run it in plan-first so the agent produces the plan under
+                // the read-only tool set.
+                serverPersistPlanRestart = true;
+              }
               emit({ conversationId, type: 'done', data: { planModeRestart: true } });
               controller.abort();
               return { conversationId };
@@ -7495,6 +7514,62 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           }
           emit({ conversationId, type: 'done' }); // settle clients (CLI/GUI) — no `done` came from the stream
         }
+        // R122 finding-5: MAIN-side plan-first continuation for a server-persisted run.
+        // A plan-mode transition aborted THIS run (so controller.signal.aborted is true)
+        // and emitted a plan-restart `done`, but no GUI renderer will relaunch it. Drive
+        // the restart here: re-read the finalized branch (the terminal finalize above has
+        // written any partial + the user's request is already on the branch) and re-run it
+        // in plan-first mode so the agent produces the plan under the read-only tool set.
+        if (serverPersistPlanRestart) {
+          // Superseded by a newer turn? A different active token means someone else owns
+          // the conversation now; don't relaunch a stale planning turn over it. Our own
+          // token was removed by cleanupStreamIfOwned (absent === we still own it).
+          const currentOwner = activeStreams.get(conversationId)?.token;
+          if (
+            (currentOwner === undefined || currentOwner === streamToken) &&
+            readConversation(appHome, conversationId) &&
+            !isRecentlyDeleted(conversationId)
+          ) {
+            queueMicrotask(() => {
+              void (async () => {
+                const updated = readConversation(appHome, conversationId);
+                if (!updated || isRecentlyDeleted(conversationId)) return;
+                // Re-check ownership at fire time (a turn may have started in the gap).
+                const owner = activeStreams.get(conversationId)?.token;
+                if (owner !== undefined && owner !== streamToken) return;
+                const { tree, headId } = ensureConversationTree(updated);
+                const branch = getConversationBranch(tree, headId);
+                pendingServerPersist.add(conversationId);
+                pendingServerPersistParent.set(conversationId, headId);
+                // Persist plan-first as the authoritative mode for the restarted turn so
+                // the continuation (and any of ITS continuations) runs read-only.
+                broadcastExecutionMode('plan-first', conversationId);
+                // Re-run the branch verbatim in plan-first (parity with the renderer path,
+                // which appends no synthetic nudge). `null` event = no renderer sender.
+                const res = await streamHandler(
+                  null,
+                  conversationId,
+                  branch,
+                  modelKey,
+                  reasoningEffort,
+                  profileKey,
+                  fallbackEnabled,
+                  effectiveCwd ?? undefined,
+                  'plan-first',
+                  threadOverrides,
+                );
+                // On a busy rejection (compaction lock) the marker would leak → clear it if
+                // still ours (mirrors launchContinuation's busy handling).
+                if (res && (res as { busy?: boolean }).busy) {
+                  if (pendingServerPersistParent.get(conversationId) === headId) {
+                    pendingServerPersist.delete(conversationId);
+                    pendingServerPersistParent.delete(conversationId);
+                  }
+                }
+              })();
+            });
+          }
+        }
         // NOTE: the GUI-turn persistence fallback (finalizeGuiFallbackIfOwned) is invoked by
         // cleanupStreamIfOwned at the TOP of this finally (and on every early-exit path), so it
         // is NOT re-invoked here — it's idempotent, but the single cleanup call covers all paths.
@@ -7875,6 +7950,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // recovered-answer path instead of orphaning it in the bounded stash (R93).
   setAskUserRecoveryRouter(recoverAskUserAnswerForRuntime);
   setActiveStreamTokenAccessor(getActiveStreamToken);
+  // Wire the plan-mode DISMISS handler so the SDK runtime's exit_plan_mode dismiss
+  // (R122 finding-4) leaves plan mode authoritatively in MAIN. The SDK worker can
+  // only return an MCP error; MAIN must persist+broadcast `auto`, mark the turn
+  // terminal (a late raced answer/inject must not resurrect a dismissed planning
+  // turn), and abort the still-running SDK query — there is no plan to execute, so
+  // the turn is done. Token-scoped: a stale dismiss (the run was already superseded
+  // by the time the user tapped "exit plan mode") only persists+broadcasts the mode
+  // and does NOT abort/mark-terminal a DIFFERENT owning run.
+  setPlanModeDismissHandler((conversationId, streamToken) => {
+    // Persisting+broadcasting `auto` is safe regardless of which run is active —
+    // the user asked to leave plan mode for this conversation.
+    broadcastExecutionMode('auto', conversationId);
+    // Only tear down the query when the dismiss still owns the active run. If a
+    // successor already replaced it, its token no longer matches and we must not
+    // abort/terminal-mark the successor's run.
+    const entry = activeStreams.get(conversationId);
+    if (streamToken !== undefined && entry?.token !== streamToken) return;
+    if (streamToken !== undefined) markTokenTerminalAbort(streamToken);
+    bumpExplicitCancelGeneration(conversationId);
+    entry?.abort();
+  });
   // Capture appHome so resolveEffectiveRuntimeId can read config lazily (R94).
   appHomeForRuntimeResolve = appHome;
 

@@ -180,6 +180,33 @@ export function getActiveStreamTokenForConversation(conversationId: string): str
 }
 
 /**
+ * Seam for the Claude-SDK runtime to hand a plan-mode DISMISS back to MAIN.
+ *
+ * The SDK's `exit_plan_mode` MCP tool runs inside the query worker. On APPROVE
+ * it already routes through the tool's own `execute`, which persists+broadcasts
+ * `auto` via the MAIN executionMode persister (see the SETTLED DECISION on
+ * MAIN-authoritative executionMode) and lets the query proceed to execute the
+ * plan. But a DISMISS ("exit plan mode without accepting a plan") only returns
+ * an MCP error — it never leaves plan mode and never stops the query.
+ *
+ * This seam closes that: on dismiss MAIN persists+broadcasts `auto`, marks the
+ * turn terminal so a late raced answer/inject can't resurrect the planning turn,
+ * and aborts the still-running SDK query (there is no plan to execute, so the
+ * turn is done). Wired by agent.ts (setPlanModeDismissHandler).
+ */
+export type PlanModeDismissHandler = (conversationId: string, streamToken?: string) => void;
+
+let planModeDismissHandler: PlanModeDismissHandler | null = null;
+
+export function setPlanModeDismissHandler(fn: PlanModeDismissHandler | null): void {
+  planModeDismissHandler = fn;
+}
+
+export function getPlanModeDismissHandler(): PlanModeDismissHandler | null {
+  return planModeDismissHandler;
+}
+
+/**
  * The message the ask_user tool returns when its `execute` runs but no answers
  * were recorded. Distinct from a genuine dismiss (handled upstream in the gate,
  * which skips execution) — this only surfaces if execute runs with no stash,

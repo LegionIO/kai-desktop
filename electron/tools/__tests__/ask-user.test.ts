@@ -27,6 +27,8 @@ import {
   getAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
   getActiveStreamTokenForConversation,
+  setPlanModeDismissHandler,
+  getPlanModeDismissHandler,
   moveAnswerToInFlight,
   clearInFlightAnswer,
   drainInFlightAnswers,
@@ -129,6 +131,24 @@ describe('ActiveStreamTokenAccessor wiring (R95)', () => {
     expect(getActiveStreamTokenForConversation('conv-1')).toBe('tok-1');
     expect(getActiveStreamTokenForConversation('other')).toBeUndefined();
     expect(accessor).toHaveBeenCalled();
+  });
+});
+
+describe('PlanModeDismissHandler wiring (R123 finding-4)', () => {
+  afterEach(() => setPlanModeDismissHandler(null));
+
+  it('is null until wired, then invokes the wired handler with conv + token', () => {
+    expect(getPlanModeDismissHandler()).toBeNull();
+    const handler = vi.fn();
+    setPlanModeDismissHandler(handler);
+    getPlanModeDismissHandler()?.('conv-1', 'tok-1');
+    expect(handler).toHaveBeenCalledWith('conv-1', 'tok-1');
+  });
+
+  it('clears back to null', () => {
+    setPlanModeDismissHandler(vi.fn());
+    setPlanModeDismissHandler(null);
+    expect(getPlanModeDismissHandler()).toBeNull();
   });
 });
 

@@ -39,6 +39,7 @@ import {
   pendingQuestionAnswers,
   getAskUserRecoveryRouter,
   getActiveStreamTokenForConversation,
+  getPlanModeDismissHandler,
 } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1343,6 +1344,10 @@ function createExitPlanModeHandler(
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
   return async (args: unknown): Promise<CallToolResult> => {
     const toolCallId = `sdk-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Capture the owning stream token at ask time (mirrors createAskUserHandler):
+    // the plan-exit seam must target the run that raised the plan, not whatever
+    // run happens to be active when the user finally answers the modal.
+    const streamTokenAtAsk = getActiveStreamTokenForConversation(conversationId);
 
     debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallId=${toolCallId}`);
 
@@ -1363,6 +1368,14 @@ function createExitPlanModeHandler(
 
     if (approved === 'dismiss') {
       debugLog(`[EXIT_PLAN_MODE] User dismissed plan toolCallId=${toolCallId}`);
+      // Dismiss = "exit plan mode without accepting a plan." The run is leaving
+      // plan mode, so hand the exit back to MAIN: it persists+broadcasts `auto`
+      // (MAIN owns the authoritative executionMode), marks the turn terminal so
+      // a late raced answer/inject can't resurrect the planning turn, and aborts
+      // the still-running SDK query (there is no plan to execute — the turn is
+      // done). The MCP error result below is what Claude sees, but the query is
+      // torn down by MAIN before it can act on it.
+      getPlanModeDismissHandler()?.(conversationId, streamTokenAtAsk);
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the plan. Exiting plan mode.' }) }],
         isError: true,
