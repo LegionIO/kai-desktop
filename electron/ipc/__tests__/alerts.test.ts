@@ -19,7 +19,7 @@ vi.mock('../alert-notify.js', () => ({ setAlertCreatedHandler: vi.fn(), notifyAl
 vi.mock('../conversation-store.js', () => ({ readConversation: vi.fn(() => ({ id: 'c1' })) }));
 vi.mock('../alert-store.js', async () => {
   const actual = (await vi.importActual('../alert-store.js')) as Record<string, unknown>;
-  return { ...actual, createAlert: vi.fn(() => ({ id: 'alert-1', kind: 'question' })) };
+  return { ...actual, createAlert: vi.fn(() => ({ id: 'alert-1', kind: 'question' })), dismissAlert: vi.fn() };
 });
 vi.mock('../../tools/ask-user.js', () => ({ setRecoveredAnswerDeliverer: vi.fn() }));
 
@@ -122,6 +122,23 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(call?.[0]).toBe('c1');
     expect(call?.[1]).toContain('[Answering your earlier question "Deploy target"]');
     expect(call?.[1]).toContain('- Env → prod');
+  });
+
+  it('records a durable pending-delivery alert before the resume and dismisses it on success (R117)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { readConversation } = await import('../conversation-store.js');
+    const { createAlert, dismissAlert } = await import('../alert-store.js');
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (dismissAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'c1' });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: true });
+    // A durable pending-delivery record was created BEFORE the (successful) resume...
+    expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+    // ...and dismissed once the resume launched (id from the mocked createAlert).
+    expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
   });
 
   it('raises a persistent question Alert (delivered:false) when the conversation is gone', async () => {

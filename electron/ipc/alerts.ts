@@ -167,6 +167,21 @@ export async function deliverRecoveredAnswer(
   // free vs the current tree so appendConversationMessages won't remint it (R105 f-1).
   const userTurnId = allocateFreshTurnId(deps.appHome, conversationId, `rcv-turn-${deliveryId}`);
   const correlationId = `recovered-answer-${conversationId}`;
+  // Function-scoped so the durable pending-delivery alert (created before the resume
+  // await, below) can be dismissed from BOTH the inline-resume paths and the final
+  // fallback path (which is outside the `if (conv)` block) (R117).
+  let pendingAlertId: string | null = null;
+  const alertsAppHome = deps.appHome;
+  const dismissPendingAlert = () => {
+    if (pendingAlertId) {
+      try {
+        dismissAlert(alertsAppHome, pendingAlertId);
+      } catch {
+        /* best-effort cleanup */
+      }
+      pendingAlertId = null;
+    }
+  };
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
   if (conv) {
@@ -185,6 +200,26 @@ export async function deliverRecoveredAnswer(
       messages?: unknown[];
     };
     const threadOverrides = buildThreadOverrides(convBefore);
+    // DURABILITY BEFORE THE AWAIT (R117): the resume can wait up to ~60s behind an
+    // automation turn in the ordered barrier. The recovered answer lives only in the
+    // in-memory stash (and its tombstone was cleared), so if Kai EXITS during that wait
+    // the answer is lost with no user-visible trace. Record a durable pending-delivery
+    // Alert NOW; it survives a restart so the user can re-surface the answer. Dismiss it
+    // once we CONFIRM the turn committed (delivered / committed-in-catch); KEEP it only
+    // on a genuine pre-commit failure (replaced by the accurate "not delivered" record).
+    try {
+      const pendingAlert = createAlert(deps.appHome, {
+        kind: 'fyi',
+        title: `Delivering your answer: ${title}`,
+        body: `Recording your answer to continue the conversation:\n${body}`,
+        conversationId,
+      });
+      pendingAlertId = pendingAlert.id;
+      // Do NOT notifyNewAlert here — this is a transient durability record dismissed on
+      // success; surfacing it would flash a notification for the normal (fast) path.
+    } catch {
+      /* best-effort durability; the resume + failure-path alert still cover most cases */
+    }
     try {
       // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
       // the recovered answer runs under the same context the question was asked in —
@@ -210,6 +245,7 @@ export async function deliverRecoveredAnswer(
         conversationId,
         fields: { answerCount: Object.keys(clean).length },
       });
+      dismissPendingAlert(); // resume launched successfully — durability record no longer needed
       return { delivered: true };
     } catch {
       // fall through to the durable Alert fallback — but first determine whether the
@@ -245,6 +281,7 @@ export async function deliverRecoveredAnswer(
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
           // a resend (it would duplicate). Surface an informational alert instead.
+          dismissPendingAlert(); // replaced by the accurate "response incomplete" alert
           try {
             const alert = createAlert(deps.appHome, {
               kind: 'fyi',
@@ -280,6 +317,7 @@ export async function deliverRecoveredAnswer(
   // answer, so re-asking would be confusing, and an answerable synthetic question
   // (`alerts:answer`) would re-inject the SYNTHETIC choice ("Resend"/"Discard"),
   // not the saved answer — the wrong payload.
+  dismissPendingAlert(); // replaced by the accurate "not delivered" record below
   try {
     const alert = createAlert(deps.appHome, {
       kind: 'fyi',
