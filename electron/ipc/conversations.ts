@@ -32,7 +32,12 @@ import {
   WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
   serializeToolSchemasForStatic,
 } from '../agent/static-tokens.js';
-import { getRegisteredTools, whenToolsReady, cancelConversationStream } from './agent.js';
+import {
+  getRegisteredTools,
+  whenToolsReady,
+  cancelConversationStream,
+  invalidateConversationRecovery,
+} from './agent.js';
 import { resolveHeaderTemplates } from '../agent/header-templates.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import { markCompacting, clearCompacting, isCompacting } from '../agent/compaction-lock.js';
@@ -1277,6 +1282,10 @@ export function registerConversationHandlers(
     // Abort any live stream/submit for the (now-deleted) conversation so its tools and
     // side effects don't keep running. No await between delete and cancel, so no tool runs.
     cancelConversationStream(id);
+    // Deletion removed the record before cancel, so cancelConversationStream's "real
+    // conversation" guard skips the cancel-gen bump — purge recovery state directly so a
+    // late stale answer can't raise a FYI alert for the deleted chat (R132 finding-3).
+    invalidateConversationRecovery(id);
     abortAutomationForConversation(id); // standalone automations use a separate abort registry
     abortActiveCompact(id); // stop a running /compact summarizer (not in activeStreams)
     broadcastDelete(appHome, id);
@@ -1305,6 +1314,7 @@ export function registerConversationHandlers(
     // (deleteConversations preserves such a conversation) — a surviving chat with a dead run.
     for (const id of removed) {
       cancelConversationStream(id);
+      invalidateConversationRecovery(id); // purge recovery state for the deleted chat (R132 f-3)
       abortAutomationForConversation(id);
       abortActiveCompact(id);
     }
@@ -1338,6 +1348,7 @@ export function registerConversationHandlers(
     const { cleared, fullyCleared } = clearAllConversations(appHome);
     for (const conversationId of cleared) {
       cancelConversationStream(conversationId);
+      invalidateConversationRecovery(conversationId); // purge recovery state (R132 f-3)
       abortAutomationForConversation(conversationId);
       abortActiveCompact(conversationId);
     }

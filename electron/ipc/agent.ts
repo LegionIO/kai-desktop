@@ -750,24 +750,46 @@ const MAX_TERMINAL_ABORT_TOKENS = 100;
 // deferred raced-answer re-injection captures this at schedule time and re-checks
 // it at fire time: if it advanced, the user pressed Stop (on this turn OR a
 // successor) during the delay, so the re-injection must NOT start a new run.
+// Per-conversation STOP marker. The value is a process-wide MONOTONIC sequence (never a
+// per-conversation count), assigned on every explicit Stop. A deferred raced-answer /
+// plan re-injection captures this at schedule time and re-checks at fire time; a change
+// means the user Stopped during the delay, so the re-injection must NOT start a new run.
+//
+// ABA-SAFETY (R132 finding-1): the map is bounded + evictable, so an entry can be evicted
+// under memory pressure (500 other conversations Stopped). The capture stores the RAW value
+// (which may be `undefined` = "never Stopped") and comparisons use undefined-aware strict
+// inequality — NOT `?? 0`. That way an evicted-after-Stop entry re-reads as `undefined`,
+// which differs from the captured POSITIVE sequence → the re-injection correctly treats it
+// as "state changed" (fail-safe deny) instead of colliding with a `0` that also meant "never
+// Stopped". A conversation that was never Stopped has no entry to evict, so its `undefined`
+// capture stays `undefined`. Monotonic global seq (vs per-conv count) also means a re-Stop
+// always yields a strictly different value.
 const explicitCancelGeneration = new Map<string, number>();
 const MAX_EXPLICIT_CANCEL_GEN_ENTRIES = 500;
+let globalStopSequence = 0;
 function bumpExplicitCancelGeneration(conversationId: string): void {
-  // Re-insert (delete → set) so a bumped entry becomes the NEWEST in Map iteration order.
-  // Eviction below is FIFO by iteration order; without the re-insert a long-lived
-  // conversation that is bumped repeatedly stays "oldest" and would be evicted FIRST even
-  // while actively relevant — then a deferred op that captured its (pre-Stop) generation
-  // would re-read the default 0 after eviction and MISS the Stop (an ABA reset, R131
-  // finding-1). Making bump touch recency means the most-recently-Stopped conversations —
-  // exactly the ones a pending deferred op might re-check — are the LAST evicted.
-  const next = (explicitCancelGeneration.get(conversationId) ?? 0) + 1;
+  // Re-insert (delete → set) so a bumped entry becomes the NEWEST in iteration order (LRU):
+  // the most-recently-Stopped conversations — the ones a pending deferred op is most likely
+  // to re-check — are the LAST evicted. (Eviction is still ABA-safe on its own via the
+  // undefined-aware capture above; recency just reduces how often it happens.)
+  globalStopSequence += 1;
   explicitCancelGeneration.delete(conversationId);
-  explicitCancelGeneration.set(conversationId, next);
+  explicitCancelGeneration.set(conversationId, globalStopSequence);
   while (explicitCancelGeneration.size > MAX_EXPLICIT_CANCEL_GEN_ENTRIES) {
     const oldest = explicitCancelGeneration.keys().next().value;
     if (oldest === undefined) break;
     explicitCancelGeneration.delete(oldest);
   }
+}
+/** Capture the current stop marker for a conversation (RAW — `undefined` when never Stopped).
+ *  Pair with {@link cancelGenerationChanged} for an ABA-safe re-check. */
+function captureCancelGeneration(conversationId: string): number | undefined {
+  return explicitCancelGeneration.get(conversationId);
+}
+/** True when the stop marker has CHANGED since `captured` — undefined-aware so an evicted
+ *  (previously-Stopped) entry re-reading as `undefined` counts as changed, not as a `0` match. */
+function cancelGenerationChanged(conversationId: string, captured: number | undefined): boolean {
+  return explicitCancelGeneration.get(conversationId) !== captured;
 }
 function markTokenTerminalAbort(token: string): void {
   terminalAbortTokens.add(token);
@@ -1188,8 +1210,9 @@ type RacedAnswerState = {
   /** Pending answer stash keys — a SET so parallel ask_user calls in one turn,
    *  which each register on the shared controller abort, don't overwrite. */
   answerKeys: Set<string>;
-  /** explicit-cancel generation at abort; the rendezvous is void if it advanced. */
-  cancelGenAtAbort: number;
+  /** explicit-cancel marker at abort (RAW — `undefined` = never Stopped); the rendezvous is
+   *  void if it changed (undefined-aware, ABA-safe — R132). */
+  cancelGenAtAbort: number | undefined;
   /** The PREDECESSOR run's stream token (the aborting run that registered this).
    *  Its OWN cleanupStreamIfOwned must NOT consume the handoff it just created
    *  (that would delete it before the successor transfers it); only a LATER
@@ -1243,7 +1266,7 @@ const liveRacedAnswerClaimant = new Map<
 function registerRacedAnswerHandoff(
   conversationId: string,
   answerKey: string,
-  cancelGenAtAbort: number,
+  cancelGenAtAbort: number | undefined,
   sourceToken: string,
   expiresAtOverride?: number,
 ): void {
@@ -1262,7 +1285,7 @@ function registerRacedAnswerHandoff(
   if (
     existing &&
     existing.sourceToken === sourceToken &&
-    (explicitCancelGeneration.get(conversationId) ?? 0) === existing.cancelGenAtAbort &&
+    !cancelGenerationChanged(conversationId, existing.cancelGenAtAbort) &&
     now <= existing.expiresAt
   ) {
     existing.answerKeys.add(answerKey);
@@ -1330,7 +1353,7 @@ function registerRacedAnswerHandoff(
 }
 
 function racedStateInvalid(state: RacedAnswerState, conversationId: string): boolean {
-  return Date.now() > state.expiresAt || (explicitCancelGeneration.get(conversationId) ?? 0) !== state.cancelGenAtAbort;
+  return Date.now() > state.expiresAt || cancelGenerationChanged(conversationId, state.cancelGenAtAbort);
 }
 
 /**
@@ -1418,7 +1441,7 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
         !recentlyEndedTokens.has(latestIssued) &&
         isSupersessionDescendant(claimant.token, latestIssued);
       if (
-        (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
+        !cancelGenerationChanged(conversationId, state.cancelGenAtAbort) &&
         !terminalAbortTokens.has(claimant.token) &&
         supersededByLiveReplacement
       ) {
@@ -1430,7 +1453,7 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
         // (a later successor start transfers the handoff instead).
         mergePendingHandoffIntoLiveClaimant(conversationId);
       } else if (
-        (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
+        !cancelGenerationChanged(conversationId, state.cancelGenAtAbort) &&
         !terminalAbortTokens.has(claimant.token) &&
         (state.deliveryInFlightCount ?? 0) > 0
       ) {
@@ -1505,13 +1528,16 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
  *  cancel generation invalidates the tombstone across an explicit Stop, so a stale
  *  surface answering within the TTL can't start a recovered tool-capable turn after
  *  the user stopped (R88). */
-const recoveryTombstones = new Map<string, { conversationId: string; expiresAt: number; cancelGenAtRecord: number }>();
+const recoveryTombstones = new Map<
+  string,
+  { conversationId: string; expiresAt: number; cancelGenAtRecord: number | undefined }
+>();
 const MAX_RECOVERY_TOMBSTONES = 400;
 function recordRecoveryTombstone(conversationId: string, answerKey: string): void {
   recoveryTombstones.set(answerKey, {
     conversationId,
     expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
-    cancelGenAtRecord: explicitCancelGeneration.get(conversationId) ?? 0,
+    cancelGenAtRecord: captureCancelGeneration(conversationId),
   });
   while (recoveryTombstones.size > MAX_RECOVERY_TOMBSTONES) {
     const oldest = recoveryTombstones.keys().next().value as string | undefined;
@@ -1526,7 +1552,7 @@ function recordRecoveryTombstone(conversationId: string, answerKey: string): voi
 function recoveryTombstoneConversation(answerKey: string): string | undefined {
   const t = recoveryTombstones.get(answerKey);
   if (!t) return undefined;
-  if (Date.now() > t.expiresAt || (explicitCancelGeneration.get(t.conversationId) ?? 0) !== t.cancelGenAtRecord) {
+  if (Date.now() > t.expiresAt || cancelGenerationChanged(t.conversationId, t.cancelGenAtRecord)) {
     recoveryTombstones.delete(answerKey);
     return undefined;
   }
@@ -1655,6 +1681,42 @@ function purgeRacedAnswerForKey(answerKey: string): void {
   recoveryTombstones.delete(answerKey);
 }
 
+/**
+ * Invalidate ALL recovery state for a conversation on confirmed DELETE (R132 finding-3).
+ * Deletion removes the on-disk record BEFORE cancelConversationStream runs, so the
+ * cancel-stream "real conversation" guard (which reads the record) skips the generation bump
+ * for an idle deleted chat — leaving its recovery tombstones valid. A later stale answer from
+ * another surface would then route through the durable recovered-answer path and raise a
+ * persistent FYI Alert referencing the already-deleted conversation. Purge directly (no record
+ * needed): tombstones + handoffs + live claimants + pending/in-flight answers for its keys, so
+ * nothing can resurrect or surface an answer for a chat the user deleted.
+ */
+export function invalidateConversationRecovery(conversationId: string): void {
+  // Tombstones + handoffs + claimants are keyed/tagged by conversationId — drop them, and
+  // collect the answer keys they referenced so their stashed answers go too.
+  const keys = new Set<string>();
+  for (const [answerKey, t] of recoveryTombstones) {
+    if (t.conversationId === conversationId) {
+      keys.add(answerKey);
+      recoveryTombstones.delete(answerKey);
+    }
+  }
+  const handoff = racedAnswerHandoffs.get(conversationId);
+  if (handoff) {
+    for (const k of handoff.answerKeys) keys.add(k);
+    racedAnswerHandoffs.delete(conversationId);
+  }
+  const claimant = liveRacedAnswerClaimant.get(conversationId);
+  if (claimant) {
+    for (const k of claimant.state.answerKeys) keys.add(k);
+    liveRacedAnswerClaimant.delete(conversationId);
+  }
+  for (const k of keys) {
+    pendingQuestionAnswers.delete(k);
+    clearInFlightAnswer(k);
+  }
+}
+
 /** Tear down a successor's raced-answer state for this token: clear its claimant
  *  AND drop a pre-successor holding entry ONLY when THIS token was its intended
  *  (now-dead) successor. Called on every terminal/early-exit path (from
@@ -1707,7 +1769,7 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
         registerRacedAnswerHandoff(
           conversationId,
           key,
-          explicitCancelGeneration.get(conversationId) ?? 0,
+          captureCancelGeneration(conversationId),
           token, // sourceToken = this finished successor; a later DIFFERENT run claims it
           claimant.state.expiresAt, // carry ORIGINAL expiry — repeated successors can't renew the TTL
         );
@@ -1817,7 +1879,7 @@ function registerLiveRacedAnswerClaimant(
         deliver,
         state: {
           answerKeys: new Set<string>(),
-          cancelGenAtAbort: explicitCancelGeneration.get(conversationId) ?? 0,
+          cancelGenAtAbort: captureCancelGeneration(conversationId),
           sourceToken: token,
           deliveryRetries: 0,
           expiresAt: Date.now() + RACED_ANSWER_HANDOFF_TTL_MS,
@@ -6374,7 +6436,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // no await. A TERMINAL abort (Stop / genuine plan dismiss) registers
               // nothing — the answer just stays in the bounded stash.
               if (outcome.skip && outcome.reason === 'abort') {
-                const cancelGenAtAbort = explicitCancelGeneration.get(conversationId) ?? 0;
+                const cancelGenAtAbort = captureCancelGeneration(conversationId);
                 if (terminalAbortTokens.has(streamToken)) {
                   traceDiagnostic({
                     scope: 'agent',
@@ -7617,7 +7679,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           //    owner/recency check alone would run the user's abandoned branch + move the
           //    head (finding-4). If it moved, abandon (the plan simply isn't produced; the
           //    user's selection wins).
-          const planStartCancelGen = explicitCancelGeneration.get(conversationId) ?? 0;
+          const planStartCancelGen = captureCancelGeneration(conversationId);
           const planFinalized = readConversation(appHome, conversationId);
           const plannedHead = planFinalized ? ensureConversationTree(planFinalized).headId : undefined;
           if (
@@ -7647,7 +7709,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 }
                 // A Stop landed during the gap (terminal on our token, or cancel-gen bumped).
                 if (terminalAbortTokens.has(streamToken)) return;
-                if ((explicitCancelGeneration.get(conversationId) ?? 0) !== planStartCancelGen) return;
+                if (cancelGenerationChanged(conversationId, planStartCancelGen)) return;
                 // The head must still be the finalized head we captured — else the user
                 // rewound/switched branches; abandon rather than clobber their selection.
                 const { tree, headId } = ensureConversationTree(updated);
@@ -8097,7 +8159,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // late ask_user answer) can NOT start a new tool-enabled turn after an explicit
     // Stop landed mid-gate (R105 finding-3). Cooperative splice has its own
     // terminalAbortTokens/ownership guards; this covers the fresh-turn restart.
-    const cancelGenAtEntry = explicitCancelGeneration.get(conversationId) ?? 0;
+    const cancelGenAtEntry = captureCancelGeneration(conversationId);
 
     // COOPERATIVE mid-turn injection (Mastra runtime only): if a Mastra turn is
     // still generating, splice the follow-up into the RUNNING turn at its next
@@ -8482,7 +8544,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // bumped it since entry (e.g. while a durable-recovery re-injection awaited its
     // policy gate), the user ended this conversation's turn — do NOT abort a run and
     // launch a fresh tool-enabled turn for a now-stopped conversation (R105 finding-3).
-    if ((explicitCancelGeneration.get(conversationId) ?? 0) !== cancelGenAtEntry) {
+    if (cancelGenerationChanged(conversationId, cancelGenAtEntry)) {
       return { ok: false, error: 'conversation-stopped-during-injection' };
     }
 
@@ -9110,6 +9172,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
+    // Runtime type-guard (R132 finding-2): the web/WebSocket boundary is UNTYPED, so a client
+    // can send a non-string toolCallId (e.g. a ~4 MiB object used as the Map key, whose bulk
+    // slips past a length-based byte measure) or non-string answer values. Coerce/reject here
+    // so downstream (stash byte-accounting, id equality, recovery routing) only ever sees the
+    // declared shape: a string id and a flat Record<string,string>. Reject a malformed frame.
+    if (typeof toolCallId !== 'string' || toolCallId.length === 0 || toolCallId.length > 4096) {
+      return { ok: false, error: 'invalid-tool-call-id' };
+    }
+    if (answers === null || typeof answers !== 'object' || Array.isArray(answers)) {
+      return { ok: false, error: 'invalid-answers' };
+    }
+    for (const v of Object.values(answers)) {
+      if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
+    }
     // Stash the answers before resolving. A fully-submitted answer can race an
     // abort (turn ended / superseded / plan-restart) that already settled + removed
     // the pending approval a beat earlier — the old `if (pending)` guard dropped the
@@ -9342,4 +9418,9 @@ export const __internal = {
   recordSupersession,
   isSupersessionDescendant,
   reconcileExecutionMode,
+  // Cancel-generation ABA-safety primitives (R132): capture RAW (undefined = never Stopped),
+  // compare undefined-aware so an evicted-after-Stop entry counts as changed (fail-safe).
+  bumpExplicitCancelGeneration,
+  captureCancelGeneration,
+  cancelGenerationChanged,
 };

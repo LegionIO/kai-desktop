@@ -286,6 +286,33 @@ describe('agent IPC: tool approval channels', () => {
     expect(pendingQuestionAnswers.get('tc-raced')).toEqual({ q1: 'The answer I submitted' });
   });
 
+  it('rejects a malformed answer frame from the untyped web boundary and stashes nothing (R132)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+    // A non-string toolCallId (e.g. a huge object used as the Map key) is rejected.
+    const objId = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      { big: 'x'.repeat(10) } as unknown as string,
+      { q: 'a' },
+    );
+    expect(objId.ok).toBe(false);
+    expect(objId.error).toBe('invalid-tool-call-id');
+    // Non-string answer values are rejected (not silently counted as 0 bytes downstream).
+    const badVal = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      'tc-badval',
+      { q: { nested: 'y' } } as unknown as Record<string, string>,
+    );
+    expect(badVal.ok).toBe(false);
+    expect(badVal.error).toBe('invalid-answers');
+    expect(pendingQuestionAnswers.has('tc-badval')).toBe(false);
+  });
+
   it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
@@ -449,6 +476,36 @@ describe('observer workspace tool registry', () => {
     );
 
     expect(active.map((entry) => entry.name)).toEqual(['web_search', 'mastra_workspace_list_files']);
+  });
+});
+
+describe('cancel-generation ABA-safety (evicted-after-Stop must count as changed — R132)', () => {
+  const { bumpExplicitCancelGeneration, captureCancelGeneration, cancelGenerationChanged } = __internal;
+
+  it('a Stop after capture is detected as changed', () => {
+    const captured = captureCancelGeneration('aba-conv-1'); // never Stopped → undefined
+    expect(captured).toBeUndefined();
+    bumpExplicitCancelGeneration('aba-conv-1'); // Stop
+    expect(cancelGenerationChanged('aba-conv-1', captured)).toBe(true);
+  });
+
+  it('no Stop since capture is NOT changed', () => {
+    bumpExplicitCancelGeneration('aba-conv-2');
+    const captured = captureCancelGeneration('aba-conv-2'); // a positive sequence
+    expect(captured).toBeGreaterThan(0);
+    expect(cancelGenerationChanged('aba-conv-2', captured)).toBe(false);
+  });
+
+  it('an evicted-after-Stop entry re-reads as undefined and counts as CHANGED (no ABA to 0)', () => {
+    bumpExplicitCancelGeneration('aba-conv-3'); // Stop → positive sequence
+    const captured = captureCancelGeneration('aba-conv-3');
+    expect(captured).toBeGreaterThan(0);
+    // Simulate eviction under memory pressure: flood distinct ids past the 500 cap so the
+    // oldest (aba-conv-3) is evicted. Its re-read is now undefined — which must NOT collide
+    // with the captured positive sequence (the pre-R132 `?? 0` bug matched 0).
+    for (let i = 0; i < 600; i++) bumpExplicitCancelGeneration(`flood-${i}`);
+    expect(captureCancelGeneration('aba-conv-3')).toBeUndefined();
+    expect(cancelGenerationChanged('aba-conv-3', captured)).toBe(true);
   });
 });
 
