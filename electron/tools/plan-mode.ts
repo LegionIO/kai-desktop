@@ -94,6 +94,31 @@ function slugifyPlanTitle(planTitle: string | undefined): string {
   return slug || generatePlanName();
 }
 
+/** Persist the authoritative per-conversation executionMode in the MAIN process
+ *  BEFORE broadcasting, wired from the IPC layer (setExecutionModePersister). The
+ *  broadcast is fire-and-forget and the renderer normally persists the mode via its
+ *  next submit — but if the window is reloading when the (guarded) broadcast skips
+ *  it, the renderer never learns the change and the next turn runs under the stale
+ *  mode's tool policy. Persisting in main makes the broadcast a notification/reconcile
+ *  rather than the source of truth (R108 finding-4). No-op until wired. */
+type ExecutionModePersister = (conversationId: string, mode: 'auto' | 'plan-first') => void;
+let executionModePersister: ExecutionModePersister | null = null;
+export function setExecutionModePersister(fn: ExecutionModePersister | null): void {
+  executionModePersister = fn;
+}
+
+function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'plan-first'): void {
+  // Persist FIRST (authoritative), then broadcast (notify/reconcile).
+  if (conversationId && executionModePersister) {
+    try {
+      executionModePersister(conversationId, mode);
+    } catch {
+      /* best-effort persist; the broadcast + renderer submit still carry the mode */
+    }
+  }
+  broadcastModeChange(mode);
+}
+
 function broadcastModeChange(mode: string): void {
   // Guarded, non-throwing fan-out (mirrors agent.ts broadcastExecutionMode): a
   // navigating window's send throwing must not interrupt the plan-mode transition
@@ -115,7 +140,7 @@ export function createEnterPlanModeTool(): ToolDefinition {
     }),
     execute: async (input, context) => {
       const { reason } = input as { reason?: string };
-      broadcastModeChange('plan-first');
+      applyModeChange(context.conversationId, 'plan-first');
       const cwd = context.cwd;
       return {
         success: true,
@@ -159,7 +184,7 @@ export function createExitPlanModeTool(): ToolDefinition {
         .describe('Short title for the plan file (e.g. "add-dark-mode"). If omitted, a random name is generated.'),
       summary: z.string().optional().describe('Brief summary of the plan that was produced'),
     }),
-    execute: async (input) => {
+    execute: async (input, context) => {
       const { planContent, planTitle, summary } = input as {
         planContent: string;
         planTitle?: string;
@@ -200,7 +225,7 @@ export function createExitPlanModeTool(): ToolDefinition {
         return { success: false, error: `Failed to save plan: ${err instanceof Error ? err.message : String(err)}` };
       }
 
-      broadcastModeChange('auto');
+      applyModeChange(context.conversationId, 'auto');
       return {
         success: true,
         mode: 'auto',

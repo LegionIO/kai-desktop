@@ -46,7 +46,13 @@ import {
   resolveEffectiveRuntimeId,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
-import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js';
+import {
+  resetStaleRunStatus,
+  reindexIfStale,
+  readConversation as readConversationRecord,
+  writeConversation as writeConversationRecord,
+} from './ipc/conversation-store.js';
+import { setExecutionModePersister } from './tools/plan-mode.js';
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { buildCliTools } from './tools/cli-tools.js';
@@ -2081,6 +2087,19 @@ if (gotSingleInstanceLock) {
       alertSurface: () => resolveAlertSurface(getConfig().automations ?? {}),
     });
     registerAlertsHandlers(ipcMain);
+
+    // Persist the authoritative per-conversation executionMode in MAIN when a
+    // plan-mode tool switches it, BEFORE its (fire-and-forget) renderer broadcast — so
+    // a window reloading during the transition doesn't leave the conversation on the
+    // stale mode for its next turn (R108 finding-4).
+    setExecutionModePersister((conversationId, mode) => {
+      try {
+        const conv = readConversationRecord(APP_HOME, conversationId);
+        if (conv) writeConversationRecord(APP_HOME, { ...conv, executionMode: mode } as never);
+      } catch {
+        /* best-effort; the renderer submit still carries the mode */
+      }
+    });
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());

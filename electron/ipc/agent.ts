@@ -7816,6 +7816,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         opts?.reasoningEffort !== undefined ||
         opts?.cwd !== undefined ||
         opts?.executionMode !== undefined ||
+        // A fallback-only caller (e.g. an automation whose fresh semantics set
+        // fallbackEnabled:false vs a live fallback-enabled run) must also trigger the
+        // fingerprint comparison — otherwise it would cooperatively splice and run
+        // through a fallback model contrary to its config (R108 finding-2).
+        opts?.fallbackEnabled !== undefined ||
         (opts?.threadOverrides !== undefined &&
           (opts.threadOverrides.temperature != null ||
             opts.threadOverrides.systemPromptOverride != null ||
