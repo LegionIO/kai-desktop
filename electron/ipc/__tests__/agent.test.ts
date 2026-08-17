@@ -452,6 +452,28 @@ describe('observer workspace tool registry', () => {
   });
 });
 
+describe('reconcileExecutionMode (GUI submit vs MAIN-authoritative disk mode — R128)', () => {
+  const { reconcileExecutionMode } = __internal;
+
+  it('runs plan-first when disk is plan-first even if the submit is stale auto', () => {
+    // The dangerous case: a stale reconciliation reset the renderer to auto AFTER MAIN
+    // persisted plan-first; the submit must NOT expose mutating tools.
+    expect(reconcileExecutionMode('auto', 'plan-first')).toBe('plan-first');
+    expect(reconcileExecutionMode(undefined, 'plan-first')).toBe('plan-first');
+  });
+
+  it('runs plan-first when the submit is plan-first even if the disk write has not landed', () => {
+    expect(reconcileExecutionMode('plan-first', undefined)).toBe('plan-first');
+    expect(reconcileExecutionMode('plan-first', 'auto')).toBe('plan-first');
+  });
+
+  it('runs auto only when neither side is plan-first', () => {
+    expect(reconcileExecutionMode('auto', 'auto')).toBe('auto');
+    expect(reconcileExecutionMode(undefined, undefined)).toBe('auto');
+    expect(reconcileExecutionMode('auto', undefined)).toBe('auto');
+  });
+});
+
 describe("isSupersededRunEvent (mid-turn inject: drop the aborted run's stale events)", () => {
   it('suppresses a token-stamped event whose token no longer matches the active run', () => {
     // The prior run (token A) was superseded by a new run (token B); A's trailing

@@ -1240,12 +1240,19 @@ function AppShell() {
   // state ONLY via plain setExecutionMode and never write back — so a stale hydration can't
   // clobber a newer MAIN plan-mode transition (R127). Rapid toggles are last-write-wins: the
   // main setter is a fresh read-modify-write and ipcMain handlers don't interleave.
-  const persistExecutionMode = useCallback((mode: ExecutionMode) => {
-    setExecutionMode(mode);
-    const convId = activeConversationIdRef.current;
-    if (!convId) return;
-    void app.conversations.setExecutionMode?.(convId, mode === 'auto' ? null : mode).catch(() => {});
-  }, []);
+  const persistExecutionMode = useCallback(
+    (mode: ExecutionMode) => {
+      setExecutionMode(mode);
+      // Target activeConversationId STATE (not the ref): the ref is updated by a passive
+      // effect and can lag a switch to B (B renders + the user toggles before the ref
+      // replaces A → the write would land on A, or nothing when the ref is still null).
+      // The state is what drove this render, so a callback closing over it targets the
+      // conversation the toggle actually belongs to (R128 finding-4).
+      if (!activeConversationId) return;
+      void app.conversations.setExecutionMode?.(activeConversationId, mode === 'auto' ? null : mode).catch(() => {});
+    },
+    [activeConversationId],
+  );
 
   // Persist per-conversation settings whenever they change
   useEffect(() => {

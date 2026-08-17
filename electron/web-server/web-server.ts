@@ -402,7 +402,7 @@ export function getBridgeScript(): string {
       inFlight: function(cId) { return invoke('agent:in-flight', cId); },
       authorizeContinuation: function(cId, clientId, turnToken) { return invoke('agent:authorize-continuation', cId, clientId, turnToken); },
       finalizeGuiFallback: function(cId, turnToken) { return invoke('agent:finalize-gui-fallback', cId, turnToken); },
-      injectMidTurn: function(cId, text) { return invoke('agent:inject-mid-turn', cId, text); },
+      injectMidTurn: function(cId, text, expectedGeneration) { return invoke('agent:inject-mid-turn', cId, text, expectedGeneration); },
       listInjects: function(cId) { return invoke('agent:list-injects', cId); },
       cancelInject: function(cId, id) { return invoke('agent:cancel-inject', cId, id); },
       approveToolCall: function(id) { return invoke('agent:approve-tool', id); },

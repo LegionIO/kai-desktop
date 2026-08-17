@@ -1344,6 +1344,22 @@ function createExitPlanModeHandler(
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
   return async (args: unknown): Promise<CallToolResult> => {
     const toolCallId = `sdk-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // If THIS run was already aborted (a superseding GUI/CLI run replaced it) before the
+    // queued exit_plan_mode callback fires, do NOT broadcast an approval request (R128
+    // finding-3). The broadcast is UNTAGGED (no owning stream token), so the renderer would
+    // apply it to the SUCCESSOR run — setting awaitingApproval on a run that has no pending
+    // approval to resolve, wedging it at 'awaiting-approval'. registerPendingApproval would
+    // itself immediately settle 'dismiss' on the already-aborted signal, but only AFTER the
+    // stray broadcast landed. Bail before broadcasting — the aborted run's turn is over.
+    if (abortSignal?.aborted) {
+      debugLog(`[EXIT_PLAN_MODE] run already aborted before approval broadcast toolCallId=${toolCallId}`);
+      return {
+        content: [
+          { type: 'text', text: JSON.stringify({ error: 'The turn was stopped before the plan was reviewed.' }) },
+        ],
+        isError: true,
+      };
+    }
     // Capture the owning stream token at ask time (mirrors createAskUserHandler):
     // the plan-exit seam must target the run that raised the plan, not whatever
     // run happens to be active when the user finally answers the modal.

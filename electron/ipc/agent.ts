@@ -2368,6 +2368,22 @@ function toolsForExecutionMode(tools: ToolDefinition[], executionMode: Execution
   return tools;
 }
 
+/**
+ * Reconcile a GUI-submitted executionMode against the persisted (MAIN-authoritative) mode
+ * (R128 finding-1). The renderer's submitted mode can be STALE — a reconciliation may have
+ * reset it to 'auto' after MAIN persisted 'plan-first'. FAIL-SAFE: if EITHER is 'plan-first',
+ * the turn runs plan-first (read-only). This never wrongly exposes mutating tools; the only
+ * cost is that a genuine plan→auto toggle whose (async) disk write hasn't landed runs one extra
+ * turn read-only — strictly safer than the inverse. Pure for focused unit coverage.
+ */
+function reconcileExecutionMode(
+  submitted: ExecutionMode | undefined,
+  persisted: ExecutionMode | undefined,
+): ExecutionMode {
+  if (submitted === 'plan-first' || persisted === 'plan-first') return 'plan-first';
+  return submitted ?? 'auto';
+}
+
 function observerToolsForExecutionMode(
   customTools: ToolDefinition[],
   workspaceTools: ToolDefinition[],
@@ -2707,7 +2723,25 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
     const effectiveCwd = normalizeAgentCwd(cwd);
-    const effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
+    // executionMode reconciliation (R128 finding-1): the renderer-supplied `executionMode` can be
+    // STALE — a reconciliation (loadConversationState hydration / a background-conv broadcast) may
+    // have reset the renderer's in-memory mode to 'auto' AFTER MAIN persisted 'plan-first', and the
+    // next GUI turn then submits that stale 'auto'. Trusting it verbatim would run a plan-mode
+    // conversation with MUTATING tools. executionMode is MAIN-authoritative (persisted on disk by
+    // the dedicated setter / plan-mode transitions), so reconcile against the persisted value —
+    // FAIL-SAFE: if EITHER the submitted OR the persisted mode is 'plan-first', run plan-first.
+    // This never wrongly exposes mutating tools: a stale 'auto' submit is overridden by disk
+    // 'plan-first', and a just-toggled 'plan-first' submit still wins even if its (async) disk
+    // write hasn't landed. The only cost is that a genuine plan→auto toggle whose setter write is
+    // still in flight runs one extra turn read-only — strictly safer than the inverse.
+    let effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
+    try {
+      const persistedMode = (readConversation(appHome, conversationId) as { executionMode?: ExecutionMode } | null)
+        ?.executionMode;
+      effectiveExecutionMode = reconcileExecutionMode(executionMode, persistedMode);
+    } catch {
+      /* best-effort: fall back to the submitted mode */
+    }
 
     // An on-demand `/compact` is summarizing this conversation right now (a paid,
     // slow op). Don't start a concurrent turn — it would race + force /compact to
@@ -9265,4 +9299,5 @@ export const __internal = {
   // inherit/strand a stale answer (R81 / R115). Exposed for focused unit coverage.
   recordSupersession,
   isSupersessionDescendant,
+  reconcileExecutionMode,
 };
