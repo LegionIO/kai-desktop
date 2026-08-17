@@ -3058,23 +3058,27 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const submitMirrorNonce = pendingSubmitMirrorNonce.get(conversationId);
       pendingSubmitMirrorNonce.delete(conversationId);
       if (lastUserText) {
-        const branchArr = messages as Array<{ id?: unknown }>;
+        const branchArr = messages as Array<{ id?: unknown; parentId?: unknown }>;
         const lastNode = branchArr[branchArr.length - 1];
         const authoritativeUserId = typeof lastNode?.id === 'string' ? lastNode.id : undefined;
+        const authoritativeParentId = typeof lastNode?.parentId === 'string' ? lastNode.parentId : null;
         broadcastStreamEvent(
           {
             conversationId,
             type: 'user-message',
             text: lastUserText,
-            // serverPersisted runs carry the authoritative id so the renderer inserts
-            // under it (no fabricated duplicate) and adopts the takeover. A plain GUI
-            // mirror keeps prior behavior. The submitNonce (agent:submit origin) rides
-            // in data so the originating client skips its own optimistic echo.
+            // serverPersisted runs carry the authoritative id + PARENT so the renderer
+            // inserts under them (no fabricated duplicate, correct ordering) and adopts
+            // the takeover. Without parentId a takeover parented the accepted turn under
+            // the displaced optimistic node → transient A→B→A misorder (R112 f-4). A
+            // plain GUI mirror keeps prior behavior. The submitNonce rides in data so
+            // the originating client skips its own optimistic echo.
             ...(serverPersistedRun && authoritativeUserId
               ? {
                   serverPersisted: true,
                   data: {
                     messageId: authoritativeUserId,
+                    parentId: authoritativeParentId,
                     ...(submitMirrorNonce ? { submitNonce: submitMirrorNonce } : {}),
                   },
                 }

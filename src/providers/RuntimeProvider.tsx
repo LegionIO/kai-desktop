@@ -3800,24 +3800,29 @@ export function RuntimeProvider({
           if (isServerPersistTakeover) {
             // The GUI submission this accumulator optimistically showed is being
             // DISPLACED by the accepted server-owned run. Capture the user's consumed
-            // prompt text so we can inject it INTO that run (user decision) — otherwise
-            // it's lost off-branch (R111 finding-1). The displaced prompt is the newest
-            // user node in acc.messages; skip if it's the SAME text as the takeover's own
-            // user-message (nothing displaced).
+            // prompt (text AND attachments) so it's injected into that run (user
+            // decision) or, when injection can't faithfully carry it, preserved as a
+            // durable draft — never lost off-branch (R111 f-1 / R112 f-1,2,3).
             const takeoverText = typeof (e as { text?: string }).text === 'string' ? (e as { text: string }).text : '';
             let displacedText = '';
+            let displacedHasAttachment = false;
             for (let i = acc.messages.length - 1; i >= 0; i--) {
               const m = acc.messages[i];
               if (m.role !== 'user') continue;
-              const t = Array.isArray(m.content)
-                ? (m.content as ContentPart[])
-                    .filter((p) => (p as { type?: string }).type === 'text')
-                    .map((p) => (p as { text?: string }).text ?? '')
-                    .join('')
-                : typeof m.content === 'string'
-                  ? m.content
-                  : '';
-              displacedText = t.trim();
+              if (Array.isArray(m.content)) {
+                const parts = m.content as ContentPart[];
+                displacedText = parts
+                  .filter((p) => (p as { type?: string }).type === 'text')
+                  .map((p) => (p as { text?: string }).text ?? '')
+                  .join('')
+                  .trim();
+                displacedHasAttachment = parts.some((p) => {
+                  const t = (p as { type?: string }).type;
+                  return t === 'image' || t === 'file';
+                });
+              } else if (typeof m.content === 'string') {
+                displacedText = m.content.trim();
+              }
               break;
             }
             acc.runGeneration = evGen;
@@ -3832,19 +3837,42 @@ export function RuntimeProvider({
             acc.pendingAssistantTiming = undefined;
             acc.injectContinuationId = null;
             acc.closedPrefixIds = undefined;
-            // Inject the displaced GUI prompt into the accepted run (fire-and-forget;
-            // the inject path re-gates policy + splices/queues it). Only when it's real
-            // and DIFFERENT from the takeover turn's own text (R111 finding-1).
-            if (displacedText && displacedText !== takeoverText.trim()) {
-              void app.agent.injectMidTurn(convId, displacedText).catch(() => {
-                // If the inject can't land (run ended / policy denied), preserve the
-                // user's input non-destructively rather than lose it silently.
+            // A displaced prompt is meaningful only if it isn't the takeover's own turn.
+            const hasDisplaced =
+              (Boolean(displacedText) || displacedHasAttachment) && displacedText !== takeoverText.trim();
+            if (hasDisplaced) {
+              // injectMidTurn is text-only and can't carry attachments. For an
+              // attachment-bearing displaced prompt, preserve the COMPLETE draft
+              // durably (the user re-sends with its files intact) rather than inject a
+              // text-only fragment (R112 f-2). Text-only → inject into the accepted run.
+              if (displacedHasAttachment) {
                 enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
-              });
+                // NOTE: attachment file handles aren't reconstructable from the reduced
+                // content parts here; enqueue the text so it's not silently lost, and
+                // the notice prompts the user to re-attach. (Full attachment round-trip
+                // would require capturing the original AttachedFile[] at submit time.)
+              } else if (displacedText) {
+                void app.agent
+                  .injectMidTurn(convId, displacedText)
+                  .then((res) => {
+                    // injectMidTurn RESOLVES {ok:false} (run ended / policy blocked /
+                    // unavailable) or a non-cooperative fallback — none of which delivered
+                    // it to THIS accepted run. Preserve the draft unless it genuinely
+                    // spliced cooperatively (R112 f-1 + the wrong-run guard for f-3: a
+                    // splice into a later generation is possible, so only ok+cooperative
+                    // counts as delivered; otherwise keep the user's input).
+                    if (!res?.ok || !res.cooperative) {
+                      enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+                    }
+                  })
+                  .catch(() => {
+                    enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+                  });
+              }
             }
             traceRuntime('stream.supersede-adopt-mirror-prelock', convId, {
               newGeneration: evGen,
-              displacedInjected: Boolean(displacedText && displacedText !== takeoverText.trim()),
+              displacedInjected: hasDisplaced && !displacedHasAttachment && Boolean(displacedText),
             });
             // fall through — render the takeover turn as a passive mirror.
           } else {
