@@ -167,6 +167,25 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // stream) so a later ask_user abort-site registration can tell a dead bound
   // successor from a not-yet-started one (see recentlyEndedTokens).
   markTokenEnded(token);
+  // Recover any answer THIS token's run CONSUMED via ask_user.execute but whose
+  // tool-result never committed (a supersession/abort during the PostToolUse window)
+  // — BEFORE the ownership guard below, because on supersession/Stop this run may no
+  // longer own the stream, and the ledger entry is TOKEN-scoped to THIS run. Draining
+  // it here (not after the guard) means a superseded predecessor recovers ITS OWN
+  // answer instead of leaking it for a later unrelated run to mis-recover (R101 f-2).
+  // Only for a NON-terminal abort: on an explicit Stop / genuine dismiss (terminal
+  // token) the user ended the turn, so drop the token's entries without resurrecting.
+  const inFlight = drainInFlightAnswersForToken(token);
+  if (inFlight.length > 0 && !terminalAbortTokens.has(token)) {
+    const deliverer = getRecoveredAnswerDeliverer();
+    if (deliverer) {
+      for (const { answers } of inFlight) {
+        void deliverer(conversationId, '', answers).catch(() => {
+          /* best-effort durable recovery; nothing else holds this answer */
+        });
+      }
+    }
+  }
   if (activeStreams.get(conversationId)?.token !== token) return;
   // Finalize the GUI persistence fallback BEFORE dropping ownership: EVERY terminal path that
   // cleans up an owned stream — the main finally AND every early-exit (config error, hook denial,
@@ -180,22 +199,6 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   activeStreamResponseIds.delete(conversationId);
   activeInjectContinuationId.delete(conversationId);
   activeObserverSessions.delete(conversationId);
-  // Recover any answer CONSUMED by ask_user.execute but whose tool-result never
-  // committed (a supersession/abort during the PostToolUse window) — otherwise it's
-  // silently lost (execute already removed it from pendingQuestionAnswers) (R100
-  // finding-7). Only for a NON-terminal abort: on an explicit Stop / genuine dismiss
-  // (terminal token) the user ended the turn, so drain-and-drop without resurrecting.
-  const inFlight = drainInFlightAnswers(conversationId);
-  if (inFlight.length > 0 && !terminalAbortTokens.has(token)) {
-    const deliverer = getRecoveredAnswerDeliverer();
-    if (deliverer) {
-      for (const { answers } of inFlight) {
-        void deliverer(conversationId, '', answers).catch(() => {
-          /* best-effort durable recovery; nothing else holds this answer */
-        });
-      }
-    }
-  }
   // Per-turn same-turn bookkeeping — clear on terminal cleanup so a one-off chat
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
@@ -400,7 +403,8 @@ import {
   setAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
   clearInFlightAnswer,
-  drainInFlightAnswers,
+  drainInFlightAnswersForToken,
+  dropInFlightAnswersForToken,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -458,16 +462,35 @@ const activeStreamRuntime = new Map<
   }
 >();
 
+/** Canonical dispatch descriptor from a RuntimeResolution — folds runtimeId together
+ *  with providerOverride + inferenceProviderRuntimeId so plain Mastra, a Mastra run
+ *  with a provider override, and a plugin-inference-provider run are DISTINCT (all
+ *  three otherwise resolve to bare 'mastra'). Used in the run-context fingerprint on
+ *  BOTH the live and caller sides so a config/provider change while a Mastra run is
+ *  active forces a mid-turn inject to restart under the newly-selected provider
+ *  instead of splicing into the old one (R101 finding-5). */
+function runtimeDispatchDescriptor(resolution: {
+  runtimeId?: string;
+  providerOverride?: string;
+  inferenceProviderRuntimeId?: string;
+}): string {
+  const base = resolution.runtimeId ?? 'mastra';
+  if (!resolution.providerOverride && !resolution.inferenceProviderRuntimeId) return base;
+  return `${base}|prov:${resolution.providerOverride ?? ''}|inf:${resolution.inferenceProviderRuntimeId ?? ''}`;
+}
+
 /** Canonical string of a turn's full EFFECTIVE run context, so a mid-turn inject
  *  can decide cooperative-splice (same context) vs. abort+restart (different) by
  *  comparing RESOLVED values rather than raw optional inputs. Resolving here means
  *  a pinned profile B vs. a live default-profile-A run differ (both resolve to
  *  their real profiles), and a changed temperature / prompt / step limit / fallback
- *  is caught too (R97). Best-effort: a resolution failure yields a sentinel so an
- *  inject conservatively restarts rather than splicing under an unknown context. */
+ *  is caught too (R97). `runtimeDescriptor` is the canonical dispatch descriptor
+ *  (runtimeDispatchDescriptor), NOT a bare runtimeId (R101 f-5). Best-effort: a
+ *  resolution failure yields a sentinel so an inject conservatively restarts rather
+ *  than splicing under an unknown context. */
 function computeRunContextFingerprint(
   config: AppConfig,
-  runtimeId: string,
+  runtimeDescriptor: string,
   effectiveCwd: string | undefined,
   effectiveExecutionMode: ExecutionMode,
   opts: {
@@ -501,7 +524,7 @@ function computeRunContextFingerprint(
       reasoning: sc?.reasoningEffort ?? null,
       systemPrompt: sc?.systemPrompt ?? null,
       fallback: sc?.fallbackEnabled ?? false,
-      runtime: runtimeId,
+      runtime: runtimeDescriptor,
       cwd: effectiveCwd ?? null,
       mode: effectiveExecutionMode,
     });
@@ -1893,14 +1916,10 @@ export async function resolveEffectiveRuntimeId(opts: {
       ? ({ ...config, agent: { ...config.agent, runtime: opts.runtimeOverride } } as AppConfig)
       : config;
     const { resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
-    const base = resolution.runtimeId ?? 'mastra';
     // Canonical descriptor: plain 'mastra' ONLY when there's no provider override and
     // no plugin inference runtime; otherwise a distinct string so the caller doesn't
     // treat it as ordinary (streamForPlugin-safe) Mastra.
-    if (!resolution.providerOverride && !resolution.inferenceProviderRuntimeId) {
-      return base;
-    }
-    return `${base}|prov:${resolution.providerOverride ?? ''}|inf:${resolution.inferenceProviderRuntimeId ?? ''}`;
+    return runtimeDispatchDescriptor(resolution);
   } catch {
     return 'mastra';
   }
@@ -2088,7 +2107,14 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // The tool-result committed — an ask_user answer consumed by execute() is now
       // on the branch, so drop its in-flight ledger entry (no recovery needed). No-op
       // for non-ask_user ids (the ledger only holds ask_user answers) (R100 finding-7).
-      clearInFlightAnswer(event.toolCallId);
+      // BUT only when this event is NOT from a SUPERSEDED run: a stale predecessor can
+      // emit its tool-result AFTER a successor took the stream, and that event is
+      // suppressed (dropped, never persisted) below — clearing the ledger here would
+      // discard the entry the predecessor's cleanup must still recover, silently
+      // losing the answer (R101 finding-1). A live/owning run's tool-result IS
+      // persisted, so clearing is correct then.
+      const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
+      if (!isSupersededRunEvent(emittingToken, activeTok)) clearInFlightAnswer(event.toolCallId);
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the
@@ -3339,13 +3365,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // would resolve differently falls through to abort+restart rather than
         // splicing under the wrong settings (R97). Computed from the SAME config +
         // inputs the run resolved, so it matches an identical-context inject.
-        contextFingerprint: computeRunContextFingerprint(config, runtime.id, effectiveCwd, effectiveExecutionMode, {
-          modelKey,
-          profileKey,
-          reasoningEffort,
-          fallbackEnabled,
-          threadOverrides,
-        }),
+        contextFingerprint: computeRunContextFingerprint(
+          config,
+          runtimeDispatchDescriptor(resolution),
+          effectiveCwd,
+          effectiveExecutionMode,
+          {
+            modelKey,
+            profileKey,
+            reasoningEffort,
+            fallbackEnabled,
+            threadOverrides,
+          },
+        ),
         // Optimistically cooperative for a Mastra runtime; the inference-provider
         // branch below CLEARS this before its first await if it takes the direct
         // (non-prepareStep) path (R100).
@@ -7773,7 +7805,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             ? ({ ...cfgBefore, agent: { ...cfgBefore.agent, runtime: toBefore.runtimeOverride } } as AppConfig)
             : cfgBefore;
           const { resolution } = await resolveRuntimeForStream(runtimeCfg, sc?.primaryModel ?? null);
-          callerRuntimeId = resolution.runtimeId ?? 'mastra';
+          // Canonical descriptor (with provider/inference overrides), matching what
+          // the live run's fingerprint records — bare runtimeId would conflate a
+          // provider-override run with plain Mastra (R101 finding-5).
+          callerRuntimeId = runtimeDispatchDescriptor(resolution);
         } catch {
           callerRuntimeId = '__unresolved__';
         }
@@ -7839,14 +7874,30 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           const cfg2 = readEffectiveConfig(appHome);
           const conv2 = (readConversation(appHome, conversationId) ?? convNow) as ConvMerge;
           const to2 = mergeThreadOverrides(conv2);
+          const model2 = opts?.modelKey ?? conv2.selectedModelKey ?? undefined;
+          const profile2 = opts?.profileKey ?? conv2.selectedProfileKey ?? undefined;
+          // callerRuntimeId was resolved from the PRE-gate snapshot. If any
+          // runtime-determining input changed during the gate — global agent.runtime,
+          // the merged runtimeOverride, the model, or the profile — that descriptor is
+          // stale and computeRunContextFingerprint below would embed the WRONG runtime
+          // (possibly matching the live run and splicing into the obsolete runtime).
+          // Fail safe: force restart on any such drift (R101 finding-6).
+          if (
+            (cfg2.agent?.runtime ?? 'auto') !== (cfgBefore.agent?.runtime ?? 'auto') ||
+            (to2.runtimeOverride ?? null) !== (toBefore.runtimeOverride ?? null) ||
+            model2 !== modelBefore ||
+            profile2 !== profileBefore
+          ) {
+            return true;
+          }
           const fp2 = computeRunContextFingerprint(
             cfg2,
             callerRuntimeId,
             normalizeAgentCwd(opts?.cwd ?? conv2.currentWorkingDirectory ?? undefined),
             opts?.executionMode ?? conv2.executionMode ?? getActiveRunContext(conversationId)?.executionMode ?? 'auto',
             {
-              modelKey: opts?.modelKey ?? conv2.selectedModelKey ?? undefined,
-              profileKey: opts?.profileKey ?? conv2.selectedProfileKey ?? undefined,
+              modelKey: model2,
+              profileKey: profile2,
               reasoningEffort: opts?.reasoningEffort,
               fallbackEnabled: conv2.fallbackEnabled ?? false,
               threadOverrides: to2,
@@ -8373,6 +8424,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // does NOT hand a raced answer to the replacement coordinator — an explicit
       // Stop has no successor and must not restart the agent.
       markTokenTerminalAbort(controller.token);
+      // Synchronously DROP (no recovery) any answer this stopped run consumed but
+      // hadn't committed — the user explicitly Stopped, so it must not be resurrected
+      // or mis-attributed to a later run (R101 finding-2). Token-scoped to the run
+      // being stopped.
+      dropInFlightAnswersForToken(controller.token);
       controller.abort();
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).

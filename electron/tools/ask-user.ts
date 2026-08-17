@@ -34,21 +34,28 @@ export function stashQuestionAnswers(toolCallId: string, answers: Record<string,
  * deleting) so that if the turn is superseded/aborted during the window between
  * execute returning and the tool-result being emitted (e.g. a slow PostToolUse hook
  * awaiting), the answer is NOT lost — a non-terminal abort recovers it and a genuine
- * commit clears it. Keyed by toolCallId. Bounded like pendingQuestionAnswers (R100
- * finding-7).
+ * commit clears it. Keyed by toolCallId; each entry is stamped with the OWNING run's
+ * stream token so drain/drop is TOKEN-scoped: a superseded predecessor's cleanup
+ * recovers/drops ITS OWN entries (not a later unrelated run's), and an explicit Stop
+ * drops exactly the stopped token's entries — so a stale answer can't be resurrected
+ * by, or attributed to, a different run (R100 finding-7 / R101 finding-2). Bounded.
  */
-const inFlightAnswers = new Map<string, { conversationId?: string; answers: Record<string, string> }>();
+const inFlightAnswers = new Map<
+  string,
+  { conversationId?: string; owningToken?: string; answers: Record<string, string> }
+>();
 const MAX_IN_FLIGHT_ANSWERS = 100;
 
 /** Move a consumed answer into the in-flight ledger (execute path). Removes it from
  *  pendingQuestionAnswers so a duplicate consume can't re-read it, but keeps it
- *  recoverable until the tool-result commits. */
+ *  recoverable (under its owning token) until the tool-result commits. */
 export function moveAnswerToInFlight(
   toolCallId: string,
   answers: Record<string, string>,
   conversationId?: string,
+  owningToken?: string,
 ): void {
-  inFlightAnswers.set(toolCallId, { conversationId, answers });
+  inFlightAnswers.set(toolCallId, { conversationId, owningToken, answers });
   while (inFlightAnswers.size > MAX_IN_FLIGHT_ANSWERS) {
     const oldest = inFlightAnswers.keys().next().value;
     if (oldest === undefined) break;
@@ -62,9 +69,32 @@ export function clearInFlightAnswer(toolCallId: string): void {
   inFlightAnswers.delete(toolCallId);
 }
 
-/** Drain the in-flight answers for a conversation (or all, if no id) — used on a
- *  non-terminal abort to recover answers whose tool-result never committed. Returns
- *  and removes the matching entries. */
+/** Drain (and remove) the in-flight answers owned by a specific stream token — used
+ *  by that run's cleanup on a NON-terminal abort to recover answers whose tool-result
+ *  never committed. Token-scoped so a superseded predecessor recovers only ITS OWN
+ *  entries, never a later run's (R101 finding-2). Entries with no owning token match
+ *  only the `undefined` token (legacy / non-token callers). */
+export function drainInFlightAnswersForToken(
+  token: string | undefined,
+): Array<{ toolCallId: string; answers: Record<string, string> }> {
+  const out: Array<{ toolCallId: string; answers: Record<string, string> }> = [];
+  for (const [toolCallId, entry] of inFlightAnswers) {
+    if (entry.owningToken === token) out.push({ toolCallId, answers: entry.answers });
+  }
+  for (const { toolCallId } of out) inFlightAnswers.delete(toolCallId);
+  return out;
+}
+
+/** Drop (discard, no recovery) the in-flight answers owned by a stream token — used
+ *  on an explicit terminal Stop of that token, so a stopped answer is neither
+ *  resurrected nor mis-attributed to a later run (R101 finding-2). */
+export function dropInFlightAnswersForToken(token: string | undefined): void {
+  for (const [toolCallId, entry] of [...inFlightAnswers]) {
+    if (entry.owningToken === token) inFlightAnswers.delete(toolCallId);
+  }
+}
+
+/** Drain ALL in-flight answers (test cleanup only). */
 export function drainInFlightAnswers(
   conversationId?: string,
 ): Array<{ toolCallId: string; answers: Record<string, string> }> {
@@ -304,7 +334,15 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
       // it on a non-terminal abort (R100 finding-7).
       const answers = pendingQuestionAnswers.get(context.toolCallId);
       pendingQuestionAnswers.delete(context.toolCallId);
-      if (answers) moveAnswerToInFlight(context.toolCallId, answers, context.conversationId);
+      if (answers)
+        moveAnswerToInFlight(
+          context.toolCallId,
+          answers,
+          context.conversationId,
+          // Stamp the OWNING run's token so drain/drop is token-scoped (R101 f-2).
+          // execute runs INSIDE the live run, so the current active token is ours.
+          context.conversationId ? getActiveStreamTokenForConversation(context.conversationId) : undefined,
+        );
 
       if (!answers) {
         // Headless / automation run: no live user gated this call, so there are

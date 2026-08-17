@@ -417,6 +417,15 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
  *  user's answer isn't silently lost and they can retry. */
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
+  // Unique per-delivery marker (trailing HTML comment) so a post-failure check can
+  // tell whether THIS answer's user turn was committed to the branch. A resume can
+  // persist the user turn EARLY, run tools, then throw during finalization — blindly
+  // reopening the alert on ANY failure then lets the user re-answer, appending the
+  // turn again and repeating tool side effects. Search the full tree for the marker;
+  // reopen ONLY when the turn was not committed (R101 finding-4). Mirrors
+  // deliverRecoveredAnswer's committed-check.
+  const deliveryId = `alert-rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const markedText = `${userText}\n<!-- ${deliveryId} -->`;
   try {
     // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
     // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
@@ -436,7 +445,7 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       runtimeOverride?: string | null;
     } | null;
     const threadOverrides = conv ? buildThreadOverrides(conv) : undefined;
-    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
+    await resumeConversationWithMessage(alert.conversationId, markedText, deps.getActionDeps(), {
       correlationId: `alert-${alert.id}`,
       ...(conv?.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
       ...(conv?.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
@@ -447,8 +456,26 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       ...(threadOverrides ? { threadOverrides } : {}),
     });
   } catch (err) {
-    const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
-    if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
+    // Only reopen (invite a re-answer) when the answer's user turn is NOT already on
+    // the branch — otherwise re-answering would duplicate it + repeat tool effects.
+    let committed = false;
+    try {
+      const after = readConversation(deps.appHome, alert.conversationId) as {
+        messages?: Array<{ role?: unknown; content?: unknown }>;
+        messageTree?: Array<{ role?: unknown; content?: unknown }>;
+      } | null;
+      const nodes: Array<{ role?: unknown; content?: unknown }> = [
+        ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+        ...(Array.isArray(after?.messages) ? after!.messages : []),
+      ];
+      committed = nodes.some((m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId));
+    } catch {
+      /* if we can't read, fall through to reopen (safer to let the user retry) */
+    }
+    if (!committed) {
+      const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
+      if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
+    }
     throw err;
   }
 }

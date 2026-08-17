@@ -30,6 +30,8 @@ import {
   moveAnswerToInFlight,
   clearInFlightAnswer,
   drainInFlightAnswers,
+  drainInFlightAnswersForToken,
+  dropInFlightAnswersForToken,
 } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
@@ -158,6 +160,25 @@ describe('in-flight answer ledger (R100 finding-7)', () => {
     const all = drainInFlightAnswers();
     expect(all.map((e) => e.toolCallId).sort()).toEqual(['tc-4', 'tc-5']);
     expect(drainInFlightAnswers()).toEqual([]);
+  });
+
+  it("drainForToken recovers ONLY the owning token's entries (R101 token-scoping)", () => {
+    moveAnswerToInFlight('tc-a', { Q: 'A' }, 'conv-x', 'tok-1');
+    moveAnswerToInFlight('tc-b', { Q: 'B' }, 'conv-x', 'tok-2');
+    const drained = drainInFlightAnswersForToken('tok-1');
+    expect(drained).toEqual([{ toolCallId: 'tc-a', answers: { Q: 'A' } }]);
+    // tok-1 consumed; tok-2 remains (a later run's entry is NOT mis-recovered).
+    expect(drainInFlightAnswersForToken('tok-1')).toEqual([]);
+    expect(drainInFlightAnswersForToken('tok-2')).toEqual([{ toolCallId: 'tc-b', answers: { Q: 'B' } }]);
+  });
+
+  it("dropForToken discards a stopped token's entries without recovery (R101)", () => {
+    moveAnswerToInFlight('tc-c', { Q: 'C' }, 'conv-y', 'tok-3');
+    moveAnswerToInFlight('tc-d', { Q: 'D' }, 'conv-y', 'tok-4');
+    dropInFlightAnswersForToken('tok-3');
+    expect(drainInFlightAnswersForToken('tok-3')).toEqual([]);
+    // tok-4 untouched.
+    expect(drainInFlightAnswersForToken('tok-4')).toEqual([{ toolCallId: 'tc-d', answers: { Q: 'D' } }]);
   });
 });
 

@@ -39,6 +39,7 @@ import {
   pendingQuestionAnswers,
   getAskUserRecoveryRouter,
   getActiveStreamTokenForConversation,
+  moveAnswerToInFlight,
 } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -1278,9 +1279,15 @@ function createAskUserHandler(
       };
     }
 
-    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
+    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler).
+    //    Move to the in-flight ledger (don't hard-delete) so that if a non-terminal
+    //    supersession aborts the SDK query() BEFORE this result's user/tool_result
+    //    message is translated + committed, the approved answer is still recoverable
+    //    on the owning run's cleanup (mirrors the Mastra execute path). Cleared on
+    //    the tool-result emit; recovered on non-terminal abort (R101 finding-3).
     const answers = pendingQuestionAnswers.get(toolCallId);
     pendingQuestionAnswers.delete(toolCallId);
+    if (answers) moveAnswerToInFlight(toolCallId, answers, conversationId, owningStreamToken);
 
     debugLog(
       `[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`,
