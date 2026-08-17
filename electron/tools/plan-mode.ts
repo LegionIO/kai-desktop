@@ -116,14 +116,17 @@ function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'pla
       /* best-effort persist; the broadcast + renderer submit still carry the mode */
     }
   }
-  broadcastModeChange(mode);
+  broadcastModeChange(mode, conversationId);
 }
 
-function broadcastModeChange(mode: string): void {
+function broadcastModeChange(mode: string, conversationId?: string): void {
   // Guarded, non-throwing fan-out (mirrors agent.ts broadcastExecutionMode): a
   // navigating window's send throwing must not interrupt the plan-mode transition
-  // sequence around it (R107 finding-4 class).
-  broadcastToAllWindows('agent:execution-mode-changed', mode);
+  // sequence around it (R107 finding-4 class). Carry conversationId so the renderer
+  // applies the mode ONLY when it matches the DISPLAYED conversation — a background
+  // conversation exiting plan mode must not flip the viewed conversation to `auto`
+  // and expose mutating tools there (R121 finding-1).
+  broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
 }
 
 export function createEnterPlanModeTool(): ToolDefinition {

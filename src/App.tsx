@@ -1132,7 +1132,12 @@ function AppShell() {
   // Listen for AI-initiated execution mode changes (enter/exit plan mode)
   useEffect(() => {
     if (!window.app?.onExecutionModeChanged) return;
-    const cleanup = window.app.onExecutionModeChanged((mode) => {
+    const cleanup = window.app.onExecutionModeChanged(({ conversationId: evConvId, mode }) => {
+      // Apply ONLY when the event targets the DISPLAYED conversation (or is
+      // unscoped/legacy) — a BACKGROUND conversation exiting plan mode must not flip
+      // the viewed conversation's mode (which would enable mutating tools there). Main
+      // has already persisted the authoritative per-conversation mode (R121 finding-1).
+      if (evConvId != null && evConvId !== activeConversationIdRef.current) return;
       if (mode === 'plan-first' || mode === 'auto') {
         setExecutionMode(mode as ExecutionMode);
       }

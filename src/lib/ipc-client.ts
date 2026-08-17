@@ -668,7 +668,7 @@ type AppAPI = {
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
-  onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
+  onExecutionModeChanged: (callback: (payload: { conversationId: string | null; mode: string }) => void) => () => void;
   dictation: {
     toggle: () => Promise<DictationRuntimeState>;
     stop: () => Promise<DictationRuntimeState>;

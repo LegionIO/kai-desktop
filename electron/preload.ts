@@ -959,8 +959,15 @@ const appAPI = {
     return () => ipcRenderer.removeListener('agent:model-switched', handler);
   },
 
-  onExecutionModeChanged: (callback: (mode: string) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
+  onExecutionModeChanged: (callback: (payload: { conversationId: string | null; mode: string }) => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      payload: { conversationId: string | null; mode: string } | string,
+    ) => {
+      // Back-compat: tolerate a bare mode string, though emitters now send {conversationId, mode}.
+      if (typeof payload === 'string') callback({ conversationId: null, mode: payload });
+      else callback(payload);
+    };
     ipcRenderer.on('agent:execution-mode-changed', handler);
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
   },

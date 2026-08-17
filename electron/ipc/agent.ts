@@ -2386,12 +2386,22 @@ function observerToolsForExecutionMode(
  */
 const resolveHeaderTemplates = resolveHeaderTemplatesShared;
 
-function broadcastExecutionMode(mode: ExecutionMode): void {
-  // Route through the guarded, non-throwing broadcaster: an unguarded fan-out that
-  // threw (a navigating window) during an exit_plan_mode dismissal would skip the
-  // terminal marking / cancel-gen bump / done / abort that follow, letting the
-  // dismissed turn continue and a raced answer recover afterward (R107 finding-4).
-  broadcastToAllWindows('agent:execution-mode-changed', mode);
+function broadcastExecutionMode(mode: ExecutionMode, conversationId?: string): void {
+  // Persist the authoritative per-conversation mode FIRST (the exit_plan_mode dismiss
+  // path previously failed to persist it — R121 finding-1), then broadcast. Carry
+  // conversationId so the renderer applies the mode ONLY to the DISPLAYED conversation
+  // — a background conversation's plan-mode transition must not flip the viewed
+  // conversation (and expose mutating tools there). Route through the guarded,
+  // non-throwing broadcaster (R107 finding-4).
+  if (conversationId) {
+    try {
+      const conv = readConversation(appHomeForRuntimeResolve, conversationId);
+      if (conv) writeConversation(appHomeForRuntimeResolve, { ...conv, executionMode: mode } as never);
+    } catch {
+      /* best-effort persist */
+    }
+  }
+  broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
 }
 
 function withObserverAugmentation(result: unknown, augmentation: Record<string, unknown> | undefined): unknown {
@@ -6203,7 +6213,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 if (approved === 'dismiss') {
                   // User clicked X — exit plan mode entirely and stop the stream.
                   console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
-                  broadcastExecutionMode('auto');
+                  broadcastExecutionMode('auto', conversationId);
                   planDoneSent = true;
                   emit({ conversationId, type: 'done', data: { planDismissed: true } });
                   // Mark terminal (no successor) ONLY for a GENUINE user dismiss —
@@ -6229,7 +6239,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 // User clicked "No, keep planning" — stay in plan-first mode.
                 // Re-broadcast plan-first mode so the UI toggle stays in plan mode
                 // even if a race with the tool's execute() emitted 'auto'.
-                broadcastExecutionMode('plan-first');
+                broadcastExecutionMode('plan-first', conversationId);
                 // Abort the stream and signal the renderer to restart in plan-first
                 // mode so the agent can continue planning with the user.
                 console.info(`[Agent:stream] exit_plan_mode rejected by user, aborting to restart in plan-first mode`);
@@ -8271,11 +8281,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Without this, the fresh run's discardPersistenceAccumulator (in
     // streamHandler) would throw the partial away, the model wouldn't see the
     // work it had already started, and the two runs' deltas would concatenate in
-    // the renderer. finalizeInterruptedTurn writes the partial (text + any tool
-    // calls) and clears the accumulator, so the new user turn parents cleanly on
-    // top of it: …user1 → assistant1(interrupted) → user2 → assistant2.
+    // the renderer. UPSERT-by-id (not a plain append): a GUI turn's ~300ms debounced
+    // stream-persist may ALREADY have written this run's assistant node (still
+    // 'running') to disk, so a plain finalize would id-collision-remint it into a
+    // duplicate `auto-msg-*` sibling that the resumed prompt then parents onto
+    // (R121 finding-2). Upsert replaces by id, or falls through to a normal append
+    // when no such node exists yet. So the new user turn parents cleanly on top:
+    // …user1 → assistant1(interrupted) → user2 → assistant2.
     if (activeStreams.has(conversationId)) {
-      finalizeInterruptedTurn(appHome, conversationId);
+      finalizeInterruptedTurnUpsert(appHome, conversationId);
     }
 
     const promptWrite = appendConversationMessages(
