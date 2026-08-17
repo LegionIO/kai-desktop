@@ -186,8 +186,21 @@ export function setServerPersistTagger(fn: (event: StreamEvent) => StreamEvent):
  */
 export function broadcastStreamEventRaw(event: StreamEvent): void {
   const tagged = serverPersistTagger ? serverPersistTagger(event) : event;
+  // Per-recipient guarded fan-out: one window's send throwing must not abort delivery
+  // to the rest or propagate to the caller — a raw loop that threw here could drop the
+  // event on the run-owning renderer and leave a turn stuck (R106 finding-1).
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:stream-event', tagged);
+    try {
+      if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
+        win.webContents.send('agent:stream-event', tagged);
+      }
+    } catch {
+      /* window disappeared between check and send; keep fanning out */
+    }
   }
-  broadcastToWebClients('agent:stream-event', tagged);
+  try {
+    broadcastToWebClients('agent:stream-event', tagged);
+  } catch {
+    /* best-effort remote fan-out */
+  }
 }

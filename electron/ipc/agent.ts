@@ -2154,13 +2154,29 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     eventToBroadcast = { ...eventToBroadcast, runGeneration: emittingToken } as StreamEvent;
   }
 
+  // Per-recipient guarded fan-out: a throw from ONE window's send (destroyed /
+  // navigating mid-send) must NOT abort delivery to the remaining healthy windows,
+  // nor propagate to the caller — a raw loop that threw here left the local
+  // persistence-owning renderer without its user node (→ discards the later
+  // inject-consumed id, persists the continuation on the wrong branch) and could
+  // leave agent:submit stuck 'running' before stream launch (R106 finding-1).
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:stream-event', eventToBroadcast);
+    try {
+      if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
+        win.webContents.send('agent:stream-event', eventToBroadcast);
+      }
+    } catch {
+      /* window disappeared between the check and send; skip it, keep fanning out */
+    }
   }
   // REMOTE clients are frame-capped (web WS 4 MiB / CLI local-bridge 8 MiB) — strip oversized
   // media/originals from the copy fanned out to them (local Electron windows keep the full event).
   // Shared with the sub-agent broadcast (electron/agent/remote-frame-cap.ts).
-  broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
+  try {
+    broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
+  } catch {
+    /* web-client fan-out is best-effort; never abort the caller (R106 finding-1) */
+  }
 }
 
 /**
@@ -7504,8 +7520,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // (its id is on the tree), acceptance genuinely succeeded — report ok so the
         // renderer does NOT fallback-send a duplicate. Otherwise remove the still-queued
         // entry and tell the renderer to fall back to a normal turn.
-        const tree = (readConversation(appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>;
+        const tree = (readConversation(appHome, conversationId)?.messageTree ?? []) as Array<{
+          id?: unknown;
+        }>;
         if (tree.some((m) => m?.id === id)) {
+          // The inject IS committed but the throw skipped the normal lineage record;
+          // record it now so an overlapping slow-gated inject doesn't see the advanced
+          // head as a branch switch and needlessly abort the healthy turn (R106 f-2).
+          const tok = activeStreams.get(conversationId)?.token;
+          if (tok !== undefined) recordInjectBoundaryLineage(conversationId, tok, id);
           return { ok: true, cooperative: true, id };
         }
         removeInject(conversationId, id);
@@ -8086,6 +8109,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // queued entry so nothing drains it, and fall through to abort+restart.
             const tree = (readConversation(appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>;
             if (tree.some((m) => m?.id === injectId)) {
+              // Committed despite the throw — record the boundary lineage the normal
+              // path would have, so an overlapping slow-gated inject doesn't misread
+              // the advanced head as a branch switch (R106 finding-2).
+              const tok = activeStreams.get(conversationId)?.token;
+              if (tok !== undefined) recordInjectBoundaryLineage(conversationId, tok, injectId);
               return { ok: true, injectedCooperatively: true };
             }
             removeInject(conversationId, injectId);

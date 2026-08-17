@@ -25,6 +25,12 @@ export function broadcastToAllWindows(channel: string, data?: unknown): number {
       sentCount += 1;
     }
   }
-  broadcastToWebClients(channel, data);
+  // Best-effort remote fan-out: a throw here must not abort the caller after the
+  // windows were already notified (R106 finding-1).
+  try {
+    broadcastToWebClients(channel, data);
+  } catch {
+    /* web-client fan-out is best-effort */
+  }
   return sentCount;
 }

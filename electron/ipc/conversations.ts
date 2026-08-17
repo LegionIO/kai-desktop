@@ -121,10 +121,22 @@ function broadcastChange(change: ConversationChange): void {
   // cap but also re-fetch, so stripping uniformly is safe + simplest.)
   const outgoing: ConversationChange =
     change.kind === 'upsert' ? { ...change, conversation: stripBroadcastMedia(change.conversation) } : change;
+  // Per-recipient guarded fan-out: one window's send throwing (destroyed / navigating)
+  // must not abort delivery to the rest or propagate to the caller (R106 finding-1).
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('conversations:changed', outgoing);
+    try {
+      if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
+        win.webContents.send('conversations:changed', outgoing);
+      }
+    } catch {
+      /* window disappeared between check and send; keep fanning out */
+    }
   }
-  broadcastToWebClients('conversations:changed', outgoing);
+  try {
+    broadcastToWebClients('conversations:changed', outgoing);
+  } catch {
+    /* best-effort remote fan-out */
+  }
 }
 
 export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {

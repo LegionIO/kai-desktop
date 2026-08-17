@@ -9,11 +9,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const sent: Array<{ channel: string; event: unknown }> = [];
 const webSent: Array<{ channel: string; event: unknown }> = [];
+const mockWindows: Array<{ isDestroyed?: () => boolean; webContents: { send: (c: string, e: unknown) => void } }> = [
+  { webContents: { send: (channel: string, event: unknown) => sent.push({ channel, event }) } },
+];
 vi.mock('electron', () => ({
   BrowserWindow: {
-    getAllWindows: () => [
-      { webContents: { send: (channel: string, event: unknown) => sent.push({ channel, event }) } },
-    ],
+    getAllWindows: () => mockWindows,
   },
 }));
 vi.mock('../../web-server/web-clients.js', () => ({
@@ -179,5 +180,25 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
     broadcastStreamEventRaw(event);
     expect(sent[0].event).toMatchObject({ type: 'text', serverPersisted: true });
     expect(webSent[0].event).toMatchObject({ serverPersisted: true });
+  });
+
+  it('continues fan-out to healthy windows + web clients when one window send throws (R106)', () => {
+    // Insert a throwing window BEFORE the healthy one; a raw loop would abort here and
+    // the healthy window + web clients would miss the event.
+    mockWindows.unshift({
+      webContents: {
+        send: () => {
+          throw new Error('window navigating');
+        },
+      },
+    });
+    try {
+      broadcastStreamEventRaw(event);
+      // The healthy window still received it, and web-client fan-out still ran.
+      expect(sent).toEqual([{ channel: 'agent:stream-event', event }]);
+      expect(webSent).toEqual([{ channel: 'agent:stream-event', event }]);
+    } finally {
+      mockWindows.shift(); // restore the single-window default for later tests
+    }
   });
 });
