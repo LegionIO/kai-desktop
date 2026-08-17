@@ -121,6 +121,18 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
   const persistSetting = useCallback(
     async (field: string, value: unknown) => {
       if (!conversationId) return;
+      // executionMode is MAIN-authoritative: the generic conversations:put keeps the prev-disk
+      // mode unconditionally (so a stale put can't clobber a plan-mode transition), so writing it
+      // through the put would be silently dropped. Route it through the dedicated authoritative
+      // setter instead (R127) — the same channel the composer toggle uses.
+      if (field === 'executionMode') {
+        try {
+          await app.conversations.setExecutionMode?.(conversationId, value as 'auto' | 'plan-first' | null);
+        } catch {
+          // Persist failed silently
+        }
+        return;
+      }
       try {
         const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
         if (!conv) return;

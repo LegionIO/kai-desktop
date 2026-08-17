@@ -1233,6 +1233,20 @@ function AppShell() {
     [],
   );
 
+  // USER-originated executionMode change (the composer Plan-First/Auto toggle + the settings
+  // modal). This is the ONLY path that WRITES the mode: it updates local state for immediate UI
+  // feedback AND calls the dedicated authoritative main-side setter. Reconciliation paths
+  // (loadConversationState hydration, the onExecutionModeChanged broadcast, new-chat reset) set
+  // state ONLY via plain setExecutionMode and never write back — so a stale hydration can't
+  // clobber a newer MAIN plan-mode transition (R127). Rapid toggles are last-write-wins: the
+  // main setter is a fresh read-modify-write and ipcMain handlers don't interleave.
+  const persistExecutionMode = useCallback((mode: ExecutionMode) => {
+    setExecutionMode(mode);
+    const convId = activeConversationIdRef.current;
+    if (!convId) return;
+    void app.conversations.setExecutionMode?.(convId, mode === 'auto' ? null : mode).catch(() => {});
+  }, []);
+
   // Persist per-conversation settings whenever they change
   useEffect(() => {
     if (!activeConversationId) return;
@@ -1241,25 +1255,21 @@ function AppShell() {
     // the loaded model/profile/overrides are applied; writing here would clobber
     // the saved values with the previous conversation's stale state.
     if (hydratedSettingsConvIdRef.current !== activeConversationId) return;
-    // executionMode is MAIN-authoritative and must NOT ride the generic put (a delayed put
-    // would clobber a plan-mode transition MAIN wrote). Drive the dedicated authoritative
-    // setter directly off the LIVE desired mode — NOT off a conversations.get snapshot: two
-    // rapid toggles (Auto then Plan-First) both reading the same stale record would let the
-    // FIRST win (the second sees its stale snapshot already matching and skips), and the
-    // first write's broadcast would revert the UI (R126). The setter is itself a fresh
-    // read-modify-write with a no-op guard against CURRENT disk, and ipcMain handlers don't
-    // interleave, so firing it per effect-run with the live mode is idempotent + last-write-
-    // wins by effect order. Normalize 'auto' → null to match on-disk storage.
-    const targetConvId = activeConversationId;
-    const desiredMode = executionMode === 'auto' ? null : executionMode;
-    void app.conversations.setExecutionMode?.(targetConvId, desiredMode).catch(() => {});
+    // NOTE: executionMode is deliberately NOT written here. It is MAIN-authoritative and is
+    // persisted ONLY on a genuine USER action (persistExecutionMode — the composer toggle /
+    // settings modal), never from this effect. Driving it from here off the live `executionMode`
+    // state would write back a value that ORIGINATED from a stale reconciliation: e.g.
+    // loadConversationState snapshots 'auto', awaits its probes, MAIN enters plan mode +
+    // persists 'plan-first', then the stale hydration sets state to 'auto' → this effect would
+    // authoritatively clobber the newer plan transition (R127). The generic put below also
+    // excludes executionMode, and the main-side put keeps prev-disk mode unconditionally.
     app.conversations
       .get(activeConversationId)
       .then((conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
         // Skip the generic put if the OTHER (put-owned) values haven't changed — executionMode
-        // is handled above and intentionally excluded from this comparison + the payload.
+        // is handled by persistExecutionMode and intentionally excluded from this comparison + payload.
         if (
           record.selectedModelKey === selectedModelKey &&
           record.selectedProfileKey === selectedProfileKey &&
@@ -1296,7 +1306,6 @@ function AppShell() {
     fallbackEnabled,
     profilePrimaryModelKey,
     reasoningEffort,
-    executionMode,
     threadOverrides,
   ]);
 
@@ -2875,7 +2884,7 @@ function AppShell() {
                                 reasoningEffort={reasoningEffort}
                                 onChangeReasoningEffort={setReasoningEffort}
                                 executionMode={executionMode}
-                                onChangeExecutionMode={setExecutionMode}
+                                onChangeExecutionMode={persistExecutionMode}
                                 selectedProfileKey={selectedProfileKey}
                                 onSelectProfile={handleSelectProfile}
                                 fallbackEnabled={fallbackEnabled}
