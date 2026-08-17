@@ -1231,6 +1231,23 @@ export function registerConversationHandlers(
       }
     }
 
+    // executionMode is MAIN-authoritative: it's persisted by the plan-mode tools /
+    // stream path (setExecutionModePersister, broadcastExecutionMode) as the source of
+    // truth. A conversations:put from the renderer carries whatever executionMode was on
+    // disk at its get-time — a DELAYED put can thus clobber a plan-mode transition MAIN
+    // just wrote with a stale `auto` (re-exposing mutating tools). Always keep the
+    // CURRENT disk value (prev) over the incoming record's, same as pendingDrafts
+    // (R122 finding-3 — CAS-free: MAIN never loses its authoritative mode to a stale put).
+    {
+      const prevMode = prev ? (prev as { executionMode?: unknown }).executionMode : undefined;
+      if (prevMode !== undefined) {
+        nextConversation = { ...nextConversation, executionMode: prevMode } as typeof nextConversation;
+      } else if ((nextConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        nextConversation = { ...nextConversation };
+        delete (nextConversation as { executionMode?: unknown }).executionMode;
+      }
+    }
+
     const written = writeConversation(appHome, nextConversation);
     // If the id is tombstoned (deleted), writeConversation SUPPRESSES the write (returns the record
     // unchanged, nothing hits disk). Do NOT broadcast a phantom upsert or emit ConversationStart or

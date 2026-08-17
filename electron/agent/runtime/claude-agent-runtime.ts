@@ -360,7 +360,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
     // Kai manages its own UX — bypass Claude Code's permission prompts entirely.
     // Without this, the SDK blocks on interactive approval for writes/bash/etc.
-    const permissionMode = 'bypassPermissions';
+    // EXCEPT in plan-first mode: a planning turn must be read-only (parity with the
+    // Mastra path's executionMode tool filtering). Both narrow the SDK built-in tool
+    // list to read-only AND request the SDK's 'plan' permission mode, so a restarted
+    // planning turn can't mutate files/run shell (R122 finding-1).
+    const isPlanFirst = (config as { tools?: { executionMode?: string } }).tools?.executionMode === 'plan-first';
+    const permissionMode = isPlanFirst ? 'plan' : 'bypassPermissions';
     const maxTurns = (agentConfig?.maxTurns as number) ?? (sdkConfig.maxTurns as number) ?? 25;
     const thinkingConfig = (sdkConfig.thinking as { type: string; budgetTokens?: number }) ?? { type: 'adaptive' };
 
@@ -492,9 +497,13 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
       includePartialMessages: true,
       persistSession: true,
-      // Use specific Claude Code tools — SDK's built-in file/code tools.
-      // Kai's custom tools are available via the MCP bridge above.
-      tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch', 'Agent', 'Monitor'],
+      // Use specific Claude Code tools — SDK's built-in file/code tools. In plan-first
+      // mode, expose ONLY read-only built-ins (drop Write/Edit/Bash) so a planning turn
+      // can't mutate the workspace (R122 finding-1). Kai's custom tools are gated
+      // separately by executionMode via the MCP bridge above.
+      tools: isPlanFirst
+        ? ['Read', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch']
+        : ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch', 'Agent', 'Monitor'],
       // Expose Kai's custom tools via in-process MCP server
       ...(mcpServers ? { mcpServers } : {}),
       // Pass Kai's system prompt appended to Claude Code's default.

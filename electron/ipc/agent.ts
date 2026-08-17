@@ -8557,7 +8557,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         opts?.profileKey ?? updated.selectedProfileKey ?? undefined,
         opts?.fallbackEnabled ?? updated.fallbackEnabled,
         opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
-        opts?.executionMode,
+        // Fall back to the conversation's PERSISTED executionMode when the CLI submit
+        // doesn't pin one — otherwise a plan-first conversation would silently run as
+        // auto (exposing mutating tools) for a `kai` submit (R122 finding-2).
+        opts?.executionMode ?? (updated as { executionMode?: ExecutionMode }).executionMode,
         opts?.runtimeOverride ? { runtimeOverride: opts.runtimeOverride } : undefined,
       );
       return { ok: true, conversationId };

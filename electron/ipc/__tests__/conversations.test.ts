@@ -225,6 +225,22 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(merged.headId).toBe('streamA');
   });
 
+  it('conversations:put keeps MAIN-authoritative executionMode against a stale incoming record (R122)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    // MAIN persisted plan-first directly (a plan-mode transition writes the record).
+    writeConversation(appHome, makeConversation('c', { executionMode: 'plan-first' }) as never);
+    // A DELAYED renderer put (snapshotted before the transition) carries stale 'auto'.
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('c', { executionMode: 'auto' } as never));
+
+    const after = readConversation(appHome, 'c') as { executionMode?: string } | null;
+    // MAIN's plan-first must NOT be clobbered by the stale put (would re-expose mutating tools).
+    expect(after?.executionMode).toBe('plan-first');
+  });
+
   it('conversations:put preserves a redactedByHook user turn against a raw same-id rewrite', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
