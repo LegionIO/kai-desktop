@@ -1281,15 +1281,23 @@ function createAskUserHandler(
     // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler) and
     //    embed them in the tool result handed back to the SDK query(), which
     //    translates + commits the user/tool_result. The answer is consumed here.
-    //    We deliberately do NOT ledger the APPROVED answer for the SDK path: the SDK
-    //    emits its tool-result under its own real tool_use_id (not this synthetic
-    //    sdk-ask-* id) and provides no reliable correlation, so a ledger entry could
-    //    neither be cleared on commit (→ re-delivery, R102 f-1) nor cleared without
-    //    losing it on a mid-commit supersession (→ loss, R103 f-1). The recoverable
-    //    window (this synchronous return → the SDK's own commit) is sub-millisecond;
-    //    the raced/aborted-BEFORE-approval case is handled separately by the
-    //    recovery router above. Net: consume it plainly, matching the pre-R101 SDK
-    //    behavior (R103 finding-1 — revert the fragile approved-path ledger).
+    //
+    // ┌─ SETTLED DECISION (do not re-open without a NEW argument) ──────────────────┐
+    // │ We deliberately do NOT ledger the APPROVED SDK answer for recovery. This was │
+    // │ tried (R101 f-3) and it spawned a P1 EITHER way, because the SDK emits its    │
+    // │ tool-result under its own real tool_use_id (NOT this synthetic sdk-ask-* id)  │
+    // │ and exposes no reliable correlation:                                         │
+    // │   • clear-on-commit can't match the id  → ledger lingers → re-delivery (R102 f-1) │
+    // │   • clear-on-return  → lost on a mid-commit supersession (R103 f-1)           │
+    // │ R103 f-1 DIRECTED removing the ledger (commit 855881e0). R108 f-3 asked to    │
+    // │ re-add it — that is CIRCULAR and is intentionally NOT actioned. The genuine   │
+    // │ fix would require correlating the synthetic id with the SDK tool_use_id (the  │
+    // │ MCP `extra` arg does not currently carry it); until that correlation exists a │
+    // │ ledger is strictly worse than consuming plainly. The recoverable window (this │
+    // │ synchronous return → the SDK's own commit) is sub-millisecond, and the        │
+    // │ raced/aborted-BEFORE-approval case is already handled by the recovery router  │
+    // │ above. So: consume plainly (pre-R101 behavior).                              │
+    // └──────────────────────────────────────────────────────────────────────────────┘
     const answers = pendingQuestionAnswers.get(toolCallId);
     pendingQuestionAnswers.delete(toolCallId);
 

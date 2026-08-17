@@ -710,6 +710,14 @@ function updateActiveRunModelKey(conversationId: string, token: string, modelKey
 // thisRunToken` once it mints the token. broadcastStreamEvent only acts when
 // the conversation's CURRENT active stream token matches the persist owner.
 const pendingServerPersist = new Set<string>();
+// Conversations whose caller ALREADY broadcast the turn's user-message itself (with a
+// submitNonce + authoritative data) BEFORE calling streamHandler — currently only the
+// agent:submit path. streamHandler must skip its own user-message mirror for these to
+// avoid a double render. A server-persist turn that did NOT self-broadcast (e.g. the
+// injectUserTurnAndRestart abort+restart) is NOT in this set, so streamHandler emits
+// the token-tagged user-message — which the renderer needs (its runGeneration) to
+// adopt the successor as a takeover instead of rejecting its events (R108 finding-1).
+const serverPersistSelfMirrored = new Set<string>();
 const serverPersistTokens = new Map<string, string>();
 // A submit that is still awaiting toolsReady (before any activeStreams entry
 // exists) is otherwise uncancellable. Each submit mints a unique id and records
@@ -2985,20 +2993,21 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
-    // Is this run driven by agent:submit (CLI/headless)? That path ALREADY
-    // broadcast the user-message (with a submitNonce for dedup) before calling us
-    // — so we must NOT broadcast it again here, or a co-viewing CLI renders the
-    // turn twice (the second, un-nonced copy escapes the dedup). Only a GUI
-    // (agent:stream) turn needs us to mirror the prompt to peers. The
-    // pendingServerPersist marker is set by agent:submit and consumed just below.
-    const isFromSubmit = pendingServerPersist.has(conversationId);
+    // Did THIS turn's caller already broadcast the user-message itself (agent:submit,
+    // which sends a nonced + serverPersisted copy)? Then we must NOT broadcast it again
+    // (a co-viewing CLI would render it twice — the second, un-nonced copy escapes
+    // dedup). A server-persist turn that did NOT self-broadcast (injectUserTurnAndRestart
+    // abort+restart) IS mirrored here, TOKEN-TAGGED, so a renderer locked to the aborted
+    // predecessor can adopt this run's generation as a takeover (R108 finding-1).
+    const isSelfMirrored = serverPersistSelfMirrored.has(conversationId);
+    serverPersistSelfMirrored.delete(conversationId);
 
     // Mirror the newest user turn to OTHER attached clients (e.g. a `kai` CLI
     // viewing this same conversation) so a GUI-driven turn shows the prompt there
     // too. Skipped for agent:submit turns (they broadcast their own, nonced).
     // No submitNonce here — a GUI turn's peers never submitted it, and the
     // originating renderer ignores user-message (manages its own tree).
-    if (!isFromSubmit) {
+    if (!isSelfMirrored) {
       const lastUserText = extractLastUserText(messages);
       if (lastUserText) {
         broadcastStreamEvent({ conversationId, type: 'user-message', text: lastUserText }, streamToken);
@@ -8175,36 +8184,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     );
     if (!promptWrite) return { ok: false, error: 'conversation-not-found' };
 
-    // Mirror the injected prompt to any attached clients (GUI/CLI viewing this
-    // conversation) so the turn renders, not just the streamed reply. Carry the
-    // AUTHORITATIVE persisted-node metadata (messageId/parentId/createdAt) so a
-    // renderer doesn't FABRICATE a duplicate user node under a guessed id (which
-    // would then reject the restarted run's tagged events as foreign and strand the
-    // renderer on the old branch) (R107 finding-3). Best-effort: a throw must NOT
-    // abort the restart (the node + runStatus:running are already written; bailing
-    // would leave the conversation stuck 'running', R105 finding-4).
-    const restartUserNodeId = promptWrite.headId ?? opts?.userTurnId;
-    const restartUserNode = (
-      (promptWrite.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
-    ).find((m) => m.id === restartUserNodeId);
-    try {
-      broadcastStreamEvent({
-        conversationId,
-        type: 'user-message',
-        text: userText,
-        ...(restartUserNodeId
-          ? {
-              data: {
-                messageId: restartUserNodeId,
-                parentId: restartUserNode?.parentId ?? null,
-                createdAt: restartUserNode?.createdAt,
-              },
-            }
-          : {}),
-      });
-    } catch {
-      /* best-effort mirror; the turn is persisted and will stream below */
-    }
+    // NOTE: we intentionally do NOT broadcast the user-message here. streamHandler
+    // below emits it TOKEN-TAGGED with the restarted run's generation (this turn is
+    // NOT in serverPersistSelfMirrored), which a renderer locked to the aborted
+    // predecessor needs to adopt the successor as a takeover instead of rejecting its
+    // events (R108 finding-1). An untagged pre-stream mirror (the earlier R107 fix)
+    // carried no generation and so couldn't drive that takeover.
 
     const updated = readConversation(appHome, conversationId);
     if (!updated) return { ok: false, error: 'conversation-not-found' };
@@ -8446,6 +8431,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // mid-run branch change doesn't reparent it.
       pendingServerPersist.add(conversationId);
       pendingServerPersistParent.set(conversationId, headId);
+      // agent:submit already broadcast its own nonced + serverPersisted user-message
+      // above — tell streamHandler to skip its mirror so peers don't render it twice
+      // (R108 finding-1: this marker replaces the old pendingServerPersist-based skip).
+      serverPersistSelfMirrored.add(conversationId);
 
       await streamHandler(
         event,
