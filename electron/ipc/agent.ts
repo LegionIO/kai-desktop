@@ -1268,7 +1268,29 @@ function registerRacedAnswerHandoff(
   // successor issued yet — e.g. a plan-mode restart minted asynchronously), leave
   // it unbound so that async successor may still claim it.
   const latestIssued = latestIssuedTurnToken.get(conversationId);
-  const expectedSuccessorToken = latestIssued !== undefined && latestIssued !== sourceToken ? latestIssued : undefined;
+  // A newer token than ours counts as our successor ONLY when it's a genuine
+  // supersession descendant that hasn't already ended. A merely-latest-issued but
+  // UNRELATED later turn D (no sourceToken→…→D lineage) or a DEAD successor must NOT
+  // be bound: binding to D would let D claim + inject our stale answer, and binding to
+  // a dead successor strands it. In either case route the key(s) through durable
+  // recovery instead of registering a claimable handoff (R115/R116 finding-1).
+  const genuineSuccessor =
+    latestIssued !== undefined &&
+    latestIssued !== sourceToken &&
+    !recentlyEndedTokens.has(latestIssued) &&
+    isSupersessionDescendant(sourceToken, latestIssued);
+  const nonGenuineLaterToken = latestIssued !== undefined && latestIssued !== sourceToken && !genuineSuccessor;
+  if (nonGenuineLaterToken) {
+    // No genuine live successor to hand off to (unrelated or dead) — recover durably.
+    const keysToRecover = new Set<string>([answerKey]);
+    if (existing && !racedStateInvalid(existing, conversationId)) {
+      for (const k of existing.answerKeys) keysToRecover.add(k);
+      racedAnswerHandoffs.delete(conversationId);
+    }
+    recoverOrphanedAnswerKeys(conversationId, keysToRecover);
+    return;
+  }
+  const expectedSuccessorToken = genuineSuccessor ? latestIssued : undefined;
   // We're about to REPLACE an existing (different-source) handoff. If it's still
   // valid, don't silently drop its answer keys: MERGE them into the new handoff when
   // both target the SAME successor (out-of-order abort gates — A→B then X→B), else
@@ -1379,6 +1401,11 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
       const supersededByLiveReplacement =
         latestIssued !== undefined &&
         latestIssued !== claimant.token &&
+        // Must not have already ENDED — a dead successor (registered its supersession
+        // edge, then config-failed + cleaned up) would otherwise get a handoff no
+        // claimant/tombstone ever recovers, losing the answer (R116 finding-2). The
+        // else-branch below then performs durable recovery instead.
+        !recentlyEndedTokens.has(latestIssued) &&
         isSupersessionDescendant(claimant.token, latestIssued);
       if (
         (explicitCancelGeneration.get(conversationId) ?? 0) === state.cancelGenAtAbort &&
