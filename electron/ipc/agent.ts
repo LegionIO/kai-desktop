@@ -6218,17 +6218,23 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (approved !== true) {
                 state.cancel();
                 if (approved === 'dismiss') {
-                  // User clicked X — exit plan mode entirely and stop the stream.
-                  console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
-                  broadcastExecutionMode('auto', conversationId);
+                  // registerPendingApproval resolves 'dismiss' for BOTH a genuine user
+                  // dismiss AND a controller abort (Stop / a superseding turn). Only a
+                  // GENUINE dismiss (!aborted) actually leaves plan mode — an abort means
+                  // a successor exists (or the user Stopped), and persisting 'auto' here
+                  // would strip plan-first from that successor / the next turn (finding-2).
+                  const genuineDismiss = !controller.signal.aborted;
+                  if (genuineDismiss) {
+                    // User clicked X — exit plan mode entirely and stop the stream.
+                    console.info(`[Agent:stream] exit_plan_mode dismissed by user, exiting plan mode and stopping`);
+                    broadcastExecutionMode('auto', conversationId);
+                  }
                   planDoneSent = true;
                   emit({ conversationId, type: 'done', data: { planDismissed: true } });
-                  // Mark terminal (no successor) ONLY for a GENUINE user dismiss —
-                  // registerPendingApproval also resolves 'dismiss' on a controller
-                  // abort (a superseding turn), where a successor DOES exist and a
-                  // parallel ask_user's answer should still hand off to it. Guard on
-                  // !aborted so a superseded exit_plan_mode doesn't wrongly strand it.
-                  if (!controller.signal.aborted) {
+                  // Mark terminal (no successor) ONLY for a GENUINE user dismiss — on an
+                  // abort a successor DOES exist and a parallel ask_user's answer should
+                  // still hand off to it.
+                  if (genuineDismiss) {
                     markTokenTerminalAbort(streamToken);
                     // Bump the per-conversation cancel generation too: a genuine
                     // dismiss is terminal-with-no-successor exactly like a Stop, so a
@@ -7521,23 +7527,57 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // written any partial + the user's request is already on the branch) and re-run it
         // in plan-first mode so the agent produces the plan under the read-only tool set.
         if (serverPersistPlanRestart) {
-          // Superseded by a newer turn? A different active token means someone else owns
-          // the conversation now; don't relaunch a stale planning turn over it. Our own
-          // token was removed by cleanupStreamIfOwned (absent === we still own it).
-          const currentOwner = activeStreams.get(conversationId)?.token;
+          // Guard the restart against every way THIS run may no longer be the
+          // authoritative owner by the time the continuation would launch (findings 3&4):
+          //  - stillOwnsRun (captured BEFORE cleanupStreamIfOwned): an ABSENT activeStreams
+          //    entry is ambiguous — it happens on a clean finish (we own it) AND after Stop
+          //    deleted our entry AND after a successor started+finished. Only stillOwnsRun
+          //    (token matched pre-cleanup) means we genuinely owned the run at teardown.
+          //  - not terminal-aborted: a Stop/dismiss on THIS token marks it terminal — never
+          //    resurrect a stopped planning turn.
+          //  - cancel-generation unchanged from teardown: a Stop DURING the microtask gap
+          //    bumps it (like the raced-answer re-injection guard) → abandon.
+          //  - head-bound: capture the finalized head NOW and re-run ONLY if it is still the
+          //    current head at fire time. A viewer rewind / sibling-select during the
+          //    (async) observer cleanup moves the head WITHOUT minting a newer token, so an
+          //    owner/recency check alone would run the user's abandoned branch + move the
+          //    head (finding-4). If it moved, abandon (the plan simply isn't produced; the
+          //    user's selection wins).
+          const planStartCancelGen = explicitCancelGeneration.get(conversationId) ?? 0;
+          const planFinalized = readConversation(appHome, conversationId);
+          const plannedHead = planFinalized ? ensureConversationTree(planFinalized).headId : undefined;
           if (
-            (currentOwner === undefined || currentOwner === streamToken) &&
-            readConversation(appHome, conversationId) &&
+            stillOwnsRun &&
+            !terminalAbortTokens.has(streamToken) &&
+            plannedHead !== undefined &&
             !isRecentlyDeleted(conversationId)
           ) {
             queueMicrotask(() => {
               void (async () => {
+                if (isRecentlyDeleted(conversationId)) return;
                 const updated = readConversation(appHome, conversationId);
-                if (!updated || isRecentlyDeleted(conversationId)) return;
-                // Re-check ownership at fire time (a turn may have started in the gap).
+                if (!updated) return;
+                // A newer turn took over (present entry, different token). Our own token was
+                // removed by cleanupStreamIfOwned — absent means we still own the slot.
                 const owner = activeStreams.get(conversationId)?.token;
                 if (owner !== undefined && owner !== streamToken) return;
+                // A strictly-newer turn was ISSUED (started+finished in the gap, leaving the
+                // map empty) — mirrors authorizeContinuation / the inject-drain recency guard.
+                const latestIssued = latestIssuedTurnToken.get(conversationId);
+                if (
+                  latestIssued !== undefined &&
+                  latestIssued !== streamToken &&
+                  turnTokenTime(streamToken) < turnTokenTime(latestIssued)
+                ) {
+                  return;
+                }
+                // A Stop landed during the gap (terminal on our token, or cancel-gen bumped).
+                if (terminalAbortTokens.has(streamToken)) return;
+                if ((explicitCancelGeneration.get(conversationId) ?? 0) !== planStartCancelGen) return;
+                // The head must still be the finalized head we captured — else the user
+                // rewound/switched branches; abandon rather than clobber their selection.
                 const { tree, headId } = ensureConversationTree(updated);
+                if (headId !== plannedHead) return;
                 const branch = getConversationBranch(tree, headId);
                 pendingServerPersist.add(conversationId);
                 pendingServerPersistParent.set(conversationId, headId);

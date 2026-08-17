@@ -1368,14 +1368,25 @@ function createExitPlanModeHandler(
 
     if (approved === 'dismiss') {
       debugLog(`[EXIT_PLAN_MODE] User dismissed plan toolCallId=${toolCallId}`);
-      // Dismiss = "exit plan mode without accepting a plan." The run is leaving
-      // plan mode, so hand the exit back to MAIN: it persists+broadcasts `auto`
-      // (MAIN owns the authoritative executionMode), marks the turn terminal so
-      // a late raced answer/inject can't resurrect the planning turn, and aborts
-      // the still-running SDK query (there is no plan to execute — the turn is
-      // done). The MCP error result below is what Claude sees, but the query is
-      // torn down by MAIN before it can act on it.
-      getPlanModeDismissHandler()?.(conversationId, streamTokenAtAsk);
+      // registerPendingApproval resolves 'dismiss' for BOTH a genuine user dismiss
+      // AND a controller abort (a superseding turn / Stop). Only a GENUINE dismiss
+      // (the run's signal is NOT aborted) actually leaves plan mode. On an abort a
+      // successor already owns the conversation — routing the seam then would let
+      // MAIN persist 'auto' + terminal-mark/abort the SUCCESSOR run using this
+      // (superseded) run's captured token (finding-1). The MAIN handler is itself
+      // token-scoped, but the definitive signal that this is NOT a user decision is
+      // the run's own aborted signal — so gate here and never hand a superseded
+      // abort to the seam.
+      if (!abortSignal?.aborted) {
+        // Dismiss = "exit plan mode without accepting a plan." The run is leaving
+        // plan mode, so hand the exit back to MAIN: it persists+broadcasts `auto`
+        // (MAIN owns the authoritative executionMode), marks the turn terminal so
+        // a late raced answer/inject can't resurrect the planning turn, and aborts
+        // the still-running SDK query (there is no plan to execute — the turn is
+        // done). The MCP error result below is what Claude sees, but the query is
+        // torn down by MAIN before it can act on it.
+        getPlanModeDismissHandler()?.(conversationId, streamTokenAtAsk);
+      }
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the plan. Exiting plan mode.' }) }],
         isError: true,
