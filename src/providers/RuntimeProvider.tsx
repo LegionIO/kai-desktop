@@ -3852,12 +3852,13 @@ export function RuntimeProvider({
               // user re-sends with its files) rather than inject a text-only fragment
               // (R112 f-2). Text-only → inject into the accepted run.
               if (displacedHasAttachment) {
-                // enqueueRejectedDraft rejects an empty draft — always save a NON-EMPTY
-                // notice (an attachment-only prompt has no text) so it isn't silently
-                // dropped, and the user is prompted to re-attach (R113 f-2).
-                const noticeText =
-                  displacedText ||
-                  '[Your attachment(s) from a message that was interrupted by another turn were not delivered — please re-attach and resend.]';
+                // enqueueRejectedDraft rejects an empty draft. ALWAYS include the
+                // re-attach notice when there were attachments — appended to the text
+                // if any (so a text+attachment prompt isn't silently restored as
+                // text-only, R114 f-1), or used alone when text is empty (R113 f-2).
+                const reattachNotice =
+                  '[Attachment(s) from a message interrupted by another turn were not delivered — please re-attach and resend.]';
+                const noticeText = displacedText ? `${displacedText}\n\n${reattachNotice}` : reattachNotice;
                 enqueueRejectedDraft(convId, { text: noticeText, attachments: [] });
               } else if (displacedText) {
                 void app.agent
