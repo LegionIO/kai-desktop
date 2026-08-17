@@ -229,6 +229,13 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
     const { conversationId, config, tools, cwd, reasoningEffort, abortSignal } = options;
+    // Capture the OWNING run's stream token NOW, at stream start — activeStreams
+    // holds this run's token here (streamHandler set it before calling us). Binding
+    // the token to the run (not re-reading it when a queued tool callback later
+    // fires) is essential for ask_user recovery classification: a callback that runs
+    // after Stop removed activeStreams would otherwise read `undefined` and treat a
+    // terminal Stop as recoverable, resurrecting the stopped turn (R100 finding-6).
+    const owningStreamToken = getActiveStreamTokenForConversation(conversationId);
 
     // -----------------------------------------------------------------------
     // 1. Dynamic SDK import
@@ -323,7 +330,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
             safeName,
             t.description ?? '',
             rawShape,
-            createToolHandler(t, conversationId, cwd, abortSignal),
+            createToolHandler(t, conversationId, cwd, abortSignal, owningStreamToken),
           );
         });
 
@@ -1120,9 +1127,10 @@ function createToolHandler(
   conversationId: string,
   cwd: string | undefined,
   abortSignal: AbortSignal | undefined,
+  owningStreamToken: string | undefined,
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
   if (toolDef.name === 'ask_user') {
-    return createAskUserHandler(conversationId, abortSignal);
+    return createAskUserHandler(conversationId, abortSignal, owningStreamToken);
   }
   if (toolDef.name === 'exit_plan_mode') {
     return createExitPlanModeHandler(toolDef, conversationId, cwd, abortSignal);
@@ -1191,16 +1199,28 @@ function createToolHandler(
 function createAskUserHandler(
   conversationId: string,
   abortSignal: AbortSignal | undefined,
+  owningStreamToken: string | undefined,
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
   return async (args: unknown): Promise<CallToolResult> => {
+    // Reject a callback that fires AFTER this run was already aborted/stopped: the
+    // SDK may invoke a queued tool callback post-abort, which would broadcast a stale
+    // question card and (worse) record a post-Stop recovery tombstone that a later
+    // answer could use to resurrect the stopped conversation. Bail before any
+    // broadcast/stash (R100 finding-6).
+    if (abortSignal?.aborted) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'The turn was stopped before this question ran.' }) }],
+        isError: true,
+      };
+    }
     const toolCallId = `sdk-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Capture the stream token WHILE the stream is live (before we await the
-    // answer). An abort-driven recovery below uses it to classify the abort as
-    // terminal (Stop / dismiss → no recovery) vs. a recoverable supersession
-    // (R95). Captured now because the agent.ts-side stream entry may be torn down
-    // by the time the abort callback runs.
-    const streamTokenAtAsk = getActiveStreamTokenForConversation(conversationId);
+    // The OWNING run's token, captured at stream start (bound to THIS run). Used to
+    // classify an abort-driven recovery as terminal (Stop / dismiss → no recovery)
+    // vs. a recoverable supersession (R95). Binding at creation — not re-reading
+    // activeStreams here — is what makes a post-Stop callback classify correctly
+    // (activeStreams may already be torn down, reading undefined) (R100 finding-6).
+    const streamTokenAtAsk = owningStreamToken;
 
     debugLog(`[ASK_USER] Broadcasting question toolCallId=${toolCallId}`);
 

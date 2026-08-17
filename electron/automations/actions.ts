@@ -656,14 +656,23 @@ async function runAgentAction(
     } catch {
       effectiveRuntime = undefined; // resolver failure → fall back to the Mastra path
     }
-    if (effectiveRuntime && effectiveRuntime !== 'mastra') {
+    // Delegate to injectUserTurnAndRestart when EITHER the effective runtime is
+    // non-Mastra (must run on its own runtime), OR a turn became ACTIVE on this
+    // conversation DURING the awaited resolveEffectiveRuntimeId (a GUI/CLI turn
+    // started after our pre-await idle check). Falling through to the streamForPlugin
+    // path in the now-busy case would append + stream CONCURRENTLY with that turn —
+    // forking history and duplicating tool side effects. injectUserTurnAndRestart
+    // handles the busy conversation correctly (cooperative splice or abort+restart)
+    // and honors runtime for the idle case (R94/R100 finding-3).
+    const becameBusy = isConversationTurnActive(conversationId) || isAutomationRunInFlight(conversationId);
+    if ((effectiveRuntime && effectiveRuntime !== 'mastra') || becameBusy) {
       traceDiagnostic({
         scope: 'automation',
         event: 'turn.resume-runtime-dispatch',
         correlationId,
         conversationId,
         ruleId: rule.id,
-        fields: { runtime: effectiveRuntime },
+        fields: { runtime: effectiveRuntime ?? 'mastra', becameBusy },
       });
       const res = await deps.injectUserTurnAndRestart(conversationId, prompt, {
         ...(action.modelKey ? { modelKey: action.modelKey } : {}),

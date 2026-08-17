@@ -29,12 +29,61 @@ export function stashQuestionAnswers(toolCallId: string, answers: Record<string,
 }
 
 /**
+ * In-flight ledger for answers CONSUMED by ask_user.execute but not yet committed
+ * as a tool-result on the branch. execute() moves the answer here (instead of hard-
+ * deleting) so that if the turn is superseded/aborted during the window between
+ * execute returning and the tool-result being emitted (e.g. a slow PostToolUse hook
+ * awaiting), the answer is NOT lost — a non-terminal abort recovers it and a genuine
+ * commit clears it. Keyed by toolCallId. Bounded like pendingQuestionAnswers (R100
+ * finding-7).
+ */
+const inFlightAnswers = new Map<string, { conversationId?: string; answers: Record<string, string> }>();
+const MAX_IN_FLIGHT_ANSWERS = 100;
+
+/** Move a consumed answer into the in-flight ledger (execute path). Removes it from
+ *  pendingQuestionAnswers so a duplicate consume can't re-read it, but keeps it
+ *  recoverable until the tool-result commits. */
+export function moveAnswerToInFlight(
+  toolCallId: string,
+  answers: Record<string, string>,
+  conversationId?: string,
+): void {
+  inFlightAnswers.set(toolCallId, { conversationId, answers });
+  while (inFlightAnswers.size > MAX_IN_FLIGHT_ANSWERS) {
+    const oldest = inFlightAnswers.keys().next().value;
+    if (oldest === undefined) break;
+    inFlightAnswers.delete(oldest);
+  }
+}
+
+/** Clear an in-flight answer once its tool-result is committed/emitted (agent.ts's
+ *  tool-result handler) — the answer is now on the branch, no recovery needed. */
+export function clearInFlightAnswer(toolCallId: string): void {
+  inFlightAnswers.delete(toolCallId);
+}
+
+/** Drain the in-flight answers for a conversation (or all, if no id) — used on a
+ *  non-terminal abort to recover answers whose tool-result never committed. Returns
+ *  and removes the matching entries. */
+export function drainInFlightAnswers(
+  conversationId?: string,
+): Array<{ toolCallId: string; answers: Record<string, string> }> {
+  const out: Array<{ toolCallId: string; answers: Record<string, string> }> = [];
+  for (const [toolCallId, entry] of inFlightAnswers) {
+    if (conversationId === undefined || entry.conversationId === conversationId) {
+      out.push({ toolCallId, answers: entry.answers });
+    }
+  }
+  for (const { toolCallId } of out) inFlightAnswers.delete(toolCallId);
+  return out;
+}
+
+/**
  * Deliver an already-collected raced answer that its run finished before consuming
  * (ordinary completion with an in-flight delivery + no genuine successor — the
  * misdelivery-vs-orphan case). Wired by the alerts layer (initializeAlerts →
- * setRecoveredAnswerDeliverer) so the tools/agent layers don't import the
- * automations/alerts graph directly (mirrors setAlertCreatedHandler). Delivers the
- * answer to the ORIGINATING conversation as a labeled new user turn (or, on
+ * setRecoveredAnswerDeliverer). Delivers the answer to the ORIGINATING conversation
+ * as a labeled new user turn (or, on
  * failure, raises a persistent Alert). Returns whether it was delivered inline.
  * `null` deliverer (not yet wired / no alerts) → caller keeps the stash copy.
  */
@@ -248,9 +297,14 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
       questions: z.array(questionSchema).min(1).max(4).describe('Questions to ask (1-4)'),
     }),
     execute: async (input, context) => {
-      // By the time execute runs, agent.ts has already stored the user's answers
+      // By the time execute runs, agent.ts has already stored the user's answers.
+      // Move (don't hard-delete) into the in-flight ledger so the answer survives a
+      // supersession/abort during the window before the tool-result commits (e.g. a
+      // slow PostToolUse hook). agent.ts clears it on tool-result emit and recovers
+      // it on a non-terminal abort (R100 finding-7).
       const answers = pendingQuestionAnswers.get(context.toolCallId);
       pendingQuestionAnswers.delete(context.toolCallId);
+      if (answers) moveAnswerToInFlight(context.toolCallId, answers, context.conversationId);
 
       if (!answers) {
         // Headless / automation run: no live user gated this call, so there are

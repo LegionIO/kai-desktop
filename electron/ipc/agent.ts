@@ -180,6 +180,22 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   activeStreamResponseIds.delete(conversationId);
   activeInjectContinuationId.delete(conversationId);
   activeObserverSessions.delete(conversationId);
+  // Recover any answer CONSUMED by ask_user.execute but whose tool-result never
+  // committed (a supersession/abort during the PostToolUse window) — otherwise it's
+  // silently lost (execute already removed it from pendingQuestionAnswers) (R100
+  // finding-7). Only for a NON-terminal abort: on an explicit Stop / genuine dismiss
+  // (terminal token) the user ended the turn, so drain-and-drop without resurrecting.
+  const inFlight = drainInFlightAnswers(conversationId);
+  if (inFlight.length > 0 && !terminalAbortTokens.has(token)) {
+    const deliverer = getRecoveredAnswerDeliverer();
+    if (deliverer) {
+      for (const { answers } of inFlight) {
+        void deliverer(conversationId, '', answers).catch(() => {
+          /* best-effort durable recovery; nothing else holds this answer */
+        });
+      }
+    }
+  }
   // Per-turn same-turn bookkeeping — clear on terminal cleanup so a one-off chat
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
@@ -383,6 +399,8 @@ import {
   getRecoveredAnswerDeliverer,
   setAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
+  clearInFlightAnswer,
+  drainInFlightAnswers,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -431,6 +449,12 @@ const activeStreamRuntime = new Map<
     // resolved values (not raw optional inputs) closes the default-vs-pinned hole
     // and covers every behavior-affecting override (R97).
     contextFingerprint?: string;
+    // TRUE only for a genuine Mastra prepareStep-driven run that can DRAIN the inject
+    // queue at a step boundary. A direct plugin-inference-provider run is recorded
+    // with runtimeId 'mastra' but streams OUTSIDE prepareStep, so a cooperative splice
+    // into it is acknowledged yet never consumed (and could leak into a later turn).
+    // The cooperative-inject path gates on THIS flag, not runtimeId === 'mastra' (R100).
+    cooperativelyInjectable?: boolean;
   }
 >();
 
@@ -483,6 +507,28 @@ function computeRunContextFingerprint(
     });
   } catch {
     return '__unresolved__';
+  }
+}
+
+/** True only when the conversation's CURRENT active run is a genuine Mastra
+ *  prepareStep-driven run that can drain the inject queue — i.e. cooperative
+ *  mid-turn splicing is actually honored. A direct plugin-inference-provider run
+ *  (recorded runtimeId 'mastra' but streaming outside prepareStep) returns FALSE, so
+ *  the inject path force-restarts instead of stranding the message (R100). */
+function isCooperativelyInjectable(conversationId: string): boolean {
+  const activeToken = activeStreams.get(conversationId)?.token;
+  if (activeToken === undefined) return false;
+  const entry = activeStreamRuntime.get(conversationId);
+  return Boolean(entry && entry.token === activeToken && entry.cooperativelyInjectable);
+}
+
+/** Mark the CURRENT active run as NOT cooperatively injectable (token-scoped no-op if
+ *  superseded) — called when a run takes the direct plugin-inference-provider path,
+ *  which bypasses Mastra's prepareStep inject drain (R100). */
+function markRunNotCooperativelyInjectable(conversationId: string, token: string): void {
+  const entry = activeStreamRuntime.get(conversationId);
+  if (entry && entry.token === token && activeStreams.get(conversationId)?.token === token) {
+    entry.cooperativelyInjectable = false;
   }
 }
 
@@ -1817,15 +1863,19 @@ export function getInjectUserTurnAndRestart(): InjectUserTurnFn | null {
   return injectUserTurnAndRestart;
 }
 
-/** Resolve the EFFECTIVE runtime id a turn WOULD use (mirrors the streamHandler
- *  resolution: resolveStreamConfig → primaryModel → resolveRuntimeForStream, with a
- *  thread runtimeOverride overlaid onto agent.runtime exactly as the stream path
- *  does). Returns e.g. 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | a plugin
- *  runtime id. Used by the automations layer to decide whether an alert/recovered
- *  resume must dispatch through the runtime-resolving injectUserTurnAndRestart path
- *  rather than the Mastra-only streamForPlugin path — accounting for BOTH an
- *  explicit override AND global agent.runtime='auto' + model selection (R94). Falls
- *  back to 'mastra' on any resolution error. */
+/** Resolve the EFFECTIVE canonical DISPATCH DESCRIPTOR a turn WOULD use (mirrors the
+ *  streamHandler resolution: resolveStreamConfig → primaryModel → resolveRuntimeForStream,
+ *  with a thread runtimeOverride overlaid onto agent.runtime). The descriptor folds
+ *  in NOT JUST resolution.runtimeId but ALSO providerOverride and
+ *  inferenceProviderRuntimeId — because a run recorded with runtimeId 'mastra' can
+ *  still route through a plugin provider override (e.g. legionio) or a plugin
+ *  inference runtime, which streamForPlugin would IGNORE. Returning the bare
+ *  runtimeId conflated those with plain Mastra, so an alert/recovered resume of such
+ *  a conversation ran under ordinary Mastra and sent to the wrong provider (R100
+ *  finding-4). The automations layer compares this to the plain-Mastra descriptor to
+ *  decide whether to delegate to the runtime-resolving injectUserTurnAndRestart path.
+ *  Falls back to the plain-Mastra descriptor on any resolution error. */
+export const PLAIN_MASTRA_DISPATCH = 'mastra';
 export async function resolveEffectiveRuntimeId(opts: {
   modelKey?: string;
   profileKey?: string;
@@ -1843,7 +1893,14 @@ export async function resolveEffectiveRuntimeId(opts: {
       ? ({ ...config, agent: { ...config.agent, runtime: opts.runtimeOverride } } as AppConfig)
       : config;
     const { resolution } = await resolveRuntimeForStream(runtimeConfig, modelEntry);
-    return resolution.runtimeId ?? 'mastra';
+    const base = resolution.runtimeId ?? 'mastra';
+    // Canonical descriptor: plain 'mastra' ONLY when there's no provider override and
+    // no plugin inference runtime; otherwise a distinct string so the caller doesn't
+    // treat it as ordinary (streamForPlugin-safe) Mastra.
+    if (!resolution.providerOverride && !resolution.inferenceProviderRuntimeId) {
+      return base;
+    }
+    return `${base}|prov:${resolution.providerOverride ?? ''}|inf:${resolution.inferenceProviderRuntimeId ?? ''}`;
   } catch {
     return 'mastra';
   }
@@ -2028,6 +2085,10 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       }
     } else if (event.type === 'tool-result' && event.toolCallId) {
       closeApprovalWindow(event.toolCallId);
+      // The tool-result committed — an ask_user answer consumed by execute() is now
+      // on the branch, so drop its in-flight ledger entry (no recovery needed). No-op
+      // for non-ask_user ids (the ledger only holds ask_user answers) (R100 finding-7).
+      clearInFlightAnswer(event.toolCallId);
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the
@@ -3285,6 +3346,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           fallbackEnabled,
           threadOverrides,
         }),
+        // Optimistically cooperative for a Mastra runtime; the inference-provider
+        // branch below CLEARS this before its first await if it takes the direct
+        // (non-prepareStep) path (R100).
+        cooperativelyInjectable: runtime.id === 'mastra',
       });
       // Seed the run's INITIAL response id into its lineage NOW, before any provider
       // event. A GUI turn passes a caller-provided responseMessageId that the
@@ -3477,6 +3542,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         return;
       }
       if (inferenceProvider) {
+        // A direct inference-provider stream bypasses Mastra's prepareStep, so it
+        // canNOT drain the inject queue — a cooperative mid-turn splice would be
+        // acknowledged but never consumed. Mark this run non-cooperative so the
+        // inject path force-restarts instead (R100). Done BEFORE the first await.
+        markRunNotCooperativelyInjectable(conversationId, streamToken);
         console.info(
           `[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`,
         );
@@ -7269,11 +7339,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
-      // Cooperative splice only works on the Mastra runtime (prepareStep). If the
-      // live run is a CLI runtime (or nothing is running), tell the renderer so it
-      // can fall back to a normal turn (abort+restart) instead of stranding the
-      // message in a queue no prepareStep will drain.
-      if (getActiveStreamRuntime(conversationId) !== 'mastra') {
+      // Cooperative splice only works on a genuine Mastra prepareStep run. If the
+      // live run is a CLI runtime, a direct plugin-inference-provider stream (which
+      // bypasses prepareStep — recorded runtimeId 'mastra' but non-draining), or
+      // nothing is running, tell the renderer so it can fall back to a normal turn
+      // (abort+restart) instead of stranding the message in a queue no prepareStep
+      // will drain (R100).
+      if (!isCooperativelyInjectable(conversationId)) {
         return { ok: false, cooperative: false, error: 'active run is not cooperatively injectable' };
       }
       // Enforce plugin pre-send + UserPromptSubmit policy before the text is
@@ -7308,7 +7380,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // surfacing a permanent block for a decision that no longer applies.
       const runOwnershipIntact =
         activeStreams.get(conversationId)?.token === tokenBeforeGate &&
-        getActiveStreamRuntime(conversationId) === 'mastra' &&
+        isCooperativelyInjectable(conversationId) &&
         injectHeadStillOnBranch(appHome, conversationId, headBeforeGate, getActiveRunResponseIds(conversationId));
       if (!gate.allowed) {
         return gate.terminal && runOwnershipIntact
@@ -7597,12 +7669,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // or restart after a Stop. Fail delivery instead (the answer stays stashed).
     if (
       cooperativeOnly &&
-      (getActiveStreamRuntime(conversationId) !== 'mastra' ||
+      (!isCooperativelyInjectable(conversationId) ||
         (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken))
     ) {
       return { ok: false, notCooperative: true };
     }
-    if (getActiveStreamRuntime(conversationId) === 'mastra') {
+    if (isCooperativelyInjectable(conversationId)) {
       // Enforce the same plugin pre-send + UserPromptSubmit policy a normal turn
       // applies before this text is spliced into the running turn (prepareStep
       // does NOT re-gate spliced text). A DENY rejects the inject; a redaction
@@ -7645,6 +7717,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             opts.threadOverrides.maxRetries != null ||
             opts.threadOverrides.runtimeOverride != null));
       let overrideDiffersFromLive = false;
+      // Set inside the fingerprint block below when the caller pinned overrides:
+      // recomputes the caller-vs-live fingerprint AFTER the async policy gate to catch
+      // a mid-gate context drift the token/head ownership check can't see (R100 f-2).
+      let recheckContextAfterGate: (() => boolean) | null = null;
       if (callerPinnedAnyOverride && runCtx?.contextFingerprint !== undefined) {
         // Build the caller's would-be EFFECTIVE context EXACTLY as the abort+restart
         // path (below) merges it: caller opts take precedence, omitted fields fall
@@ -7718,6 +7794,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const mergedCwd = normalizeAgentCwd(opts?.cwd ?? convNow.currentWorkingDirectory ?? undefined);
         const mergedMode = opts?.executionMode ?? convNow.executionMode ?? runCtx.executionMode ?? 'auto';
         const mergedFallback = convNow.fallbackEnabled ?? false;
+        // The runtime was resolved from the PRE-await snapshot (cfgBefore/toBefore).
+        // If any runtime-determining input drifted during the await — global
+        // agent.runtime, the merged runtimeOverride, the model, or the profile — that
+        // resolution is stale, so a fresh restart could pick a DIFFERENT runtime.
+        // Invalidate it (→ '__unresolved__' → forced restart) rather than compare a
+        // fingerprint built on a stale runtime (R100 finding-1).
+        const runtimeInputsDrifted =
+          (cfgNow.agent?.runtime ?? 'auto') !== (cfgBefore.agent?.runtime ?? 'auto') ||
+          (toNow.runtimeOverride ?? null) !== (toBefore.runtimeOverride ?? null) ||
+          mergedModelKey !== modelBefore ||
+          mergedProfileKey !== profileBefore ||
+          mergedFallback !== fallbackBefore;
+        if (runtimeInputsDrifted) callerRuntimeId = '__unresolved__';
         const liveCtxNow = getActiveRunContext(conversationId);
         const callerFingerprint =
           callerRuntimeId === '__unresolved__'
@@ -7737,6 +7826,35 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           callerFingerprint === '__unresolved__' ||
           liveCtxNow.contextFingerprint === '__unresolved__' ||
           callerFingerprint !== liveCtxNow.contextFingerprint;
+        // Post-gate drift recheck (R100 finding-2): the policy gate below is a SECOND
+        // await; the conversation's context can drift during it WITHOUT changing the
+        // token/head (so the ownership check misses it). Recompute the caller
+        // fingerprint synchronously from the CURRENT conversation + config after the
+        // gate (reusing the pre-gate resolved runtime — a runtime flip mid-gate is a
+        // far narrower window and still fails safe) and, if it no longer equals the
+        // live run's fingerprint, force abort+restart so the splice can't run under a
+        // now-stale context.
+        recheckContextAfterGate = () => {
+          if (callerRuntimeId === '__unresolved__') return true;
+          const cfg2 = readEffectiveConfig(appHome);
+          const conv2 = (readConversation(appHome, conversationId) ?? convNow) as ConvMerge;
+          const to2 = mergeThreadOverrides(conv2);
+          const fp2 = computeRunContextFingerprint(
+            cfg2,
+            callerRuntimeId,
+            normalizeAgentCwd(opts?.cwd ?? conv2.currentWorkingDirectory ?? undefined),
+            opts?.executionMode ?? conv2.executionMode ?? getActiveRunContext(conversationId)?.executionMode ?? 'auto',
+            {
+              modelKey: opts?.modelKey ?? conv2.selectedModelKey ?? undefined,
+              profileKey: opts?.profileKey ?? conv2.selectedProfileKey ?? undefined,
+              reasoningEffort: opts?.reasoningEffort,
+              fallbackEnabled: conv2.fallbackEnabled ?? false,
+              threadOverrides: to2,
+            },
+          );
+          const liveFp2 = getActiveRunContext(conversationId)?.contextFingerprint;
+          return liveFp2 === undefined || fp2 === '__unresolved__' || liveFp2 === '__unresolved__' || fp2 !== liveFp2;
+        };
       }
       if (overrideDiffersFromLive && !cooperativeOnly) {
         // Skip cooperative splice; fall through to abort+restart with the override.
@@ -7760,7 +7878,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // advancement is NOT a switch — see injectHeadStillOnBranch.)
         const ownershipChanged =
           activeStreams.get(conversationId)?.token !== tokenBeforeGate ||
-          getActiveStreamRuntime(conversationId) !== 'mastra' ||
+          !isCooperativelyInjectable(conversationId) ||
           (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken) ||
           !injectHeadStillOnBranch(appHome, conversationId, headBeforeGate, getActiveRunResponseIds(conversationId));
         let gateForcedFallthrough = false;
@@ -7779,8 +7897,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // this conversation's active token changed (or the run ended / branch diverged),
         // the run we resolved as cooperatively-injectable is gone — enqueueing now would
         // strand the text (no prepareStep to drain it) or splice it into a DIFFERENT run
-        // than the one we gated for.
-        if (gateForcedFallthrough || ownershipChanged) {
+        // than the one we gated for. Also fall through if the caller's effective context
+        // drifted DURING the gate (R100 finding-2): a splice would run under a now-stale
+        // context a fresh restart wouldn't. cooperativeOnly callers pin nothing, so
+        // recheckContextAfterGate is null for them (never forces a needless fallthrough).
+        const contextDriftedDuringGate = recheckContextAfterGate?.() ?? false;
+        if (gateForcedFallthrough || ownershipChanged || contextDriftedDuringGate) {
           // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
           // stale answer can't restart a stopped run or abort a newer one.
           if (cooperativeOnly) return { ok: false, notCooperative: true };

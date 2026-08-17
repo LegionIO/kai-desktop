@@ -27,12 +27,16 @@ import {
   getAskUserRecoveryRouter,
   setActiveStreamTokenAccessor,
   getActiveStreamTokenForConversation,
+  moveAnswerToInFlight,
+  clearInFlightAnswer,
+  drainInFlightAnswers,
 } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
 
 beforeEach(() => {
   pendingQuestionAnswers.clear();
+  drainInFlightAnswers(); // also clear the in-flight ledger between tests (R100)
 });
 
 const ctx = (toolCallId: string): ToolExecutionContext => ({ toolCallId }) as ToolExecutionContext;
@@ -123,6 +127,37 @@ describe('ActiveStreamTokenAccessor wiring (R95)', () => {
     expect(getActiveStreamTokenForConversation('conv-1')).toBe('tok-1');
     expect(getActiveStreamTokenForConversation('other')).toBeUndefined();
     expect(accessor).toHaveBeenCalled();
+  });
+});
+
+describe('in-flight answer ledger (R100 finding-7)', () => {
+  afterEach(() => {
+    // Drain everything so entries don't leak across tests.
+    drainInFlightAnswers();
+  });
+
+  it('move → drain recovers a consumed-but-uncommitted answer for its conversation', () => {
+    moveAnswerToInFlight('tc-1', { Q: 'A' }, 'conv-1');
+    moveAnswerToInFlight('tc-2', { Q: 'B' }, 'conv-2');
+    const drained = drainInFlightAnswers('conv-1');
+    expect(drained).toEqual([{ toolCallId: 'tc-1', answers: { Q: 'A' } }]);
+    // conv-1 entry consumed; conv-2 remains.
+    expect(drainInFlightAnswers('conv-1')).toEqual([]);
+    expect(drainInFlightAnswers('conv-2')).toEqual([{ toolCallId: 'tc-2', answers: { Q: 'B' } }]);
+  });
+
+  it('clear removes the entry so a later drain finds nothing (committed tool-result)', () => {
+    moveAnswerToInFlight('tc-3', { Q: 'C' }, 'conv-3');
+    clearInFlightAnswer('tc-3');
+    expect(drainInFlightAnswers('conv-3')).toEqual([]);
+  });
+
+  it('drain with no conversation id returns ALL entries', () => {
+    moveAnswerToInFlight('tc-4', { Q: 'D' }, 'conv-4');
+    moveAnswerToInFlight('tc-5', { Q: 'E' }, 'conv-5');
+    const all = drainInFlightAnswers();
+    expect(all.map((e) => e.toolCallId).sort()).toEqual(['tc-4', 'tc-5']);
+    expect(drainInFlightAnswers()).toEqual([]);
   });
 });
 
