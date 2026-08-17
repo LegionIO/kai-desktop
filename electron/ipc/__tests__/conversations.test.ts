@@ -1052,6 +1052,33 @@ describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user re
     expect(conv.messageTree.find((m) => m.id === 'u2')?.parentId).toBe('u1');
     expect(conv.messages.map((m) => m.id)).toEqual(['pre', 'asst', 'u1', 'u2']);
   });
+
+  it('rechains ALL injected users for the INTERLEAVED batch shape pre → u1 → prefix → u2 (R102)', () => {
+    // The prefix landed under u1 and u2 under the prefix. Reparenting only the FIRST
+    // injected user would leave u2 under the prefix → u1 becomes an inactive sibling
+    // and drops off the active branch on disk. Repair → pre → prefix → u1 → u2.
+    seed(
+      [
+        { id: 'pre', parentId: null, role: 'user', content: 'q' },
+        { id: 'u1', parentId: 'pre', role: 'user', content: 'first' },
+        { id: 'prefix', parentId: 'u1', role: 'assistant', content: 'reply' },
+        { id: 'u2', parentId: 'prefix', role: 'user', content: 'second' },
+      ],
+      'u2',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['u1', 'u2']);
+    expect(head).toBe('u2');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'prefix')?.parentId).toBe('pre');
+    expect(conv.messageTree.find((m) => m.id === 'u1')?.parentId).toBe('prefix');
+    expect(conv.messageTree.find((m) => m.id === 'u2')?.parentId).toBe('u1');
+    // Both injected users are on the active branch from the head.
+    expect(conv.messages.map((m) => m.id)).toEqual(['pre', 'prefix', 'u1', 'u2']);
+  });
 });
 
 describe('ensureConversationTree / getConversationBranch', () => {

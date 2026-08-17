@@ -1379,7 +1379,7 @@ async function runAgentAction(
     }
     turnSucceeded = true;
     const resultText = committedText && text ? `${committedText}\n\n${text}` : committedText || text;
-    turnResult = { text: resultText, modelKey, toolCalls, conversationId };
+    turnResult = { text: resultText, modelKey, toolCalls, conversationId, userTurnId: userTurnHeadId ?? undefined };
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);

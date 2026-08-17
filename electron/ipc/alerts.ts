@@ -426,6 +426,24 @@ async function resume(alert: Alert, userText: string): Promise<void> {
   // deliverRecoveredAnswer's committed-check.
   const deliveryId = `alert-rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const markedText = `${userText}\n<!-- ${deliveryId} -->`;
+  // Snapshot the pre-resume user-message ids. A post-failure commit check on the
+  // in-content marker ALONE is fragile: an enforcing UserPromptSubmit hook can strip
+  // the HTML comment before persisting, so the marker search would miss a genuinely-
+  // committed turn and wrongly reopen → duplicate delivery (R102 finding-3). Message
+  // IDS are assigned by the store and NOT rewritten by content hooks, so a NEW user
+  // id appearing is a durable commit signal. The resume holds the conversation
+  // (strictExistingTarget + running), so no unrelated user turn can land concurrently.
+  const priorUserIds = new Set<string>();
+  try {
+    const before = readConversation(deps.appHome, alert.conversationId) as {
+      messageTree?: Array<{ id?: unknown; role?: unknown }>;
+    } | null;
+    for (const m of before?.messageTree ?? []) {
+      if (m?.role === 'user' && typeof m.id === 'string') priorUserIds.add(m.id);
+    }
+  } catch {
+    /* best-effort snapshot; marker match is the fallback signal */
+  }
   try {
     // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
     // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
@@ -461,14 +479,21 @@ async function resume(alert: Alert, userText: string): Promise<void> {
     let committed = false;
     try {
       const after = readConversation(deps.appHome, alert.conversationId) as {
-        messages?: Array<{ role?: unknown; content?: unknown }>;
-        messageTree?: Array<{ role?: unknown; content?: unknown }>;
+        messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+        messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
       } | null;
-      const nodes: Array<{ role?: unknown; content?: unknown }> = [
+      const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
         ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
         ...(Array.isArray(after?.messages) ? after!.messages : []),
       ];
-      committed = nodes.some((m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId));
+      // Committed iff EITHER the in-content marker survived (fast path) OR a NEW user
+      // message id appeared that wasn't present before the resume (durable path that
+      // survives a hook stripping the marker) (R102 finding-3).
+      committed = nodes.some((m) => {
+        if (m?.role !== 'user') return false;
+        if (JSON.stringify(m.content ?? '').includes(deliveryId)) return true;
+        return typeof m.id === 'string' && !priorUserIds.has(m.id);
+      });
     } catch {
       /* if we can't read, fall through to reopen (safer to let the user retry) */
     }

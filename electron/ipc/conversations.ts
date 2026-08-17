@@ -655,8 +655,7 @@ export function reorderInjectPrefixOnDisk(
     return lastInjected;
   }
   const prefix = prefixes[0];
-  const firstInjected = present[0];
-  const firstUser = tree.find((m) => m.id === firstInjected)!;
+  const firstUser = tree.find((m) => m.id === present[0])!;
   const chainParent = firstUser.parentId; // the pre-inject head
   // ALL assistant variants that sit under the SAME injected user as the active
   // prefix were produced BEFORE the model saw the inject (a transient fallback can
@@ -673,9 +672,19 @@ export function reorderInjectPrefixOnDisk(
   const preConsumptionVariantIds = new Set(
     tree.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
   );
+  // Rechain EVERY injected user in FIFO order after the prefix, not just the first.
+  // The batch can interleave as `pre → u1 → prefix → u2` (prefix under u1, u2 under
+  // prefix), not only the canonical `pre → u1 → u2 → … → prefix`. Reparenting only
+  // firstInjected would leave u2 under the prefix, making u1 an inactive sibling → u1
+  // (consumed by the model) drops off the active branch on disk. Force the linear
+  // chain prefix → u1 → u2 → … (mirrors the renderer repair, R99/R102 finding-2).
+  const rechainParentOf = new Map<string, string>();
+  rechainParentOf.set(present[0], prefix.id);
+  for (let i = 1; i < present.length; i++) rechainParentOf.set(present[i], present[i - 1]);
   const nextTree = tree.map((m) => {
     if (preConsumptionVariantIds.has(m.id)) return { ...m, parentId: chainParent };
-    if (m.id === firstInjected) return { ...m, parentId: prefix.id };
+    const rechainTo = rechainParentOf.get(m.id);
+    if (rechainTo !== undefined) return { ...m, parentId: rechainTo };
     return m;
   });
   const branch = getConversationBranch(nextTree, lastInjected);
