@@ -717,8 +717,14 @@ const pendingServerPersist = new Set<string>();
 // injectUserTurnAndRestart abort+restart) is NOT in this set, so streamHandler emits
 // the token-tagged user-message — which the renderer needs (its runGeneration) to
 // adopt the successor as a takeover instead of rejecting its events (R108 finding-1).
-const serverPersistSelfMirrored = new Set<string>();
 const serverPersistTokens = new Map<string, string>();
+// agent:submit's one-shot submitNonce, handed to streamHandler so ITS token-tagged
+// user-message mirror carries the nonce (the originating client dedups its optimistic
+// echo). agent:submit no longer self-broadcasts before the token exists — an untagged
+// early mirror let a pre-lock GUI accumulator ignore the submit + drop the CLI run's
+// tagged deltas as foreign, then launch its own stream and abort the accepted CLI turn
+// (R111 finding-2). Consumed once in streamHandler's mirror.
+const pendingSubmitMirrorNonce = new Map<string, string>();
 // A submit that is still awaiting toolsReady (before any activeStreams entry
 // exists) is otherwise uncancellable. Each submit mints a unique id and records
 // it as the conversation's current pending submit; agent:cancel-stream marks it
@@ -2993,17 +2999,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
-    // Did THIS turn's caller already broadcast the user-message itself (agent:submit,
-    // which sends a nonced + serverPersisted copy)? Then we must NOT broadcast it again
-    // (a co-viewing CLI would render it twice — the second, un-nonced copy escapes
-    // dedup). A server-persist turn that did NOT self-broadcast (injectUserTurnAndRestart
-    // abort+restart) IS mirrored here, TOKEN-TAGGED, so a renderer locked to the aborted
-    // predecessor can adopt this run's generation as a takeover (R108 finding-1).
-    const isSelfMirrored = serverPersistSelfMirrored.has(conversationId);
-    serverPersistSelfMirrored.delete(conversationId);
-
     // (The user-message mirror is emitted AFTER server-persist ownership is bound
-    // below — see the isSelfMirrored block after the binding. Emitting it here, before
+    // below — see the block after the binding. Emitting it here, before
     // the binding, meant the mirror carried neither serverPersisted tagging nor the
     // authoritative user-node id, so a delayed GUI launch racing an automation restart
     // could keep local ownership, abort the accepted turn, and fabricate a duplicate
@@ -3052,8 +3049,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // for a server-persist restart takeover, adopts this generation as main-owned —
     // invalidating a pending local launch rather than aborting the accepted turn
     // (R108 f-1 / R109 f-1). Token-tagged so the renderer attributes it to this run.
-    if (!isSelfMirrored) {
+    // Every server-persist / GUI turn's user-message goes through THIS single path now
+    // (no caller self-broadcasts before the token exists — R111 f-2).
+    {
       const lastUserText = extractLastUserText(messages);
+      // agent:submit's one-shot nonce (if this run came from a submit) — included so
+      // the originating client dedups its optimistic echo. Consumed here (R111 f-2).
+      const submitMirrorNonce = pendingSubmitMirrorNonce.get(conversationId);
+      pendingSubmitMirrorNonce.delete(conversationId);
       if (lastUserText) {
         const branchArr = messages as Array<{ id?: unknown }>;
         const lastNode = branchArr[branchArr.length - 1];
@@ -3064,11 +3067,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             type: 'user-message',
             text: lastUserText,
             // serverPersisted runs carry the authoritative id so the renderer inserts
-            // under it (no fabricated duplicate). A plain GUI mirror keeps prior
-            // behavior (no data) — the originating renderer manages its own tree.
+            // under it (no fabricated duplicate) and adopts the takeover. A plain GUI
+            // mirror keeps prior behavior. The submitNonce (agent:submit origin) rides
+            // in data so the originating client skips its own optimistic echo.
             ...(serverPersistedRun && authoritativeUserId
-              ? { serverPersisted: true, data: { messageId: authoritativeUserId } }
-              : {}),
+              ? {
+                  serverPersisted: true,
+                  data: {
+                    messageId: authoritativeUserId,
+                    ...(submitMirrorNonce ? { submitNonce: submitMirrorNonce } : {}),
+                  },
+                }
+              : submitMirrorNonce
+                ? { data: { submitNonce: submitMirrorNonce } }
+                : {}),
           },
           streamToken,
         );
@@ -8427,24 +8439,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             | undefined
         )?.parentId ?? null;
 
-      // Broadcast the user turn so OTHER attached clients (e.g. the `kai` CLI
-      // when this submit came from the GUI) render the prompt, not just the
-      // streamed reply. The originating client passes a submitNonce and skips
-      // its own echo (it already showed the turn optimistically). Tag serverPersisted:true +
-      // the authoritative messageId/parentId — the user turn is ALREADY persisted (appended
-      // above) and this whole turn is server-persist owned (bound just below), so a receiving
-      // renderer must insert it with the DISK id and NOT persist a fabricated duplicate node.
-      broadcastStreamEvent({
-        conversationId,
-        type: 'user-message',
-        text: userText,
-        serverPersisted: true,
-        data: {
-          ...(opts?.submitNonce ? { submitNonce: opts.submitNonce } : {}),
-          ...(promptUserId ? { messageId: promptUserId } : {}),
-          parentId: promptUserParent,
-        },
-      });
+      // Defer the user-message mirror to streamHandler so it is emitted TOKEN-TAGGED
+      // (with this run's generation + the authoritative disk id), AFTER server-persist
+      // ownership is bound — a pre-lock GUI accumulator needs the generation to adopt
+      // the submit as a takeover instead of dropping the CLI run's tagged deltas as
+      // foreign and launching its own stream (R111 finding-2). Hand streamHandler the
+      // one-shot submitNonce so the originating client still dedups its optimistic echo.
+      // (promptUserId/promptUserParent are recomputed by streamHandler from the branch.)
+      void promptUserId;
+      void promptUserParent;
 
       const updated = readConversation(appHome, conversationId);
       if (!updated) return { ok: false, error: 'conversation-not-found' };
@@ -8458,10 +8461,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // mid-run branch change doesn't reparent it.
       pendingServerPersist.add(conversationId);
       pendingServerPersistParent.set(conversationId, headId);
-      // agent:submit already broadcast its own nonced + serverPersisted user-message
-      // above — tell streamHandler to skip its mirror so peers don't render it twice
-      // (R108 finding-1: this marker replaces the old pendingServerPersist-based skip).
-      serverPersistSelfMirrored.add(conversationId);
+      // NOT serverPersistSelfMirrored: we deferred the mirror to streamHandler (above),
+      // so streamHandler SHOULD emit the token-tagged mirror. Pass the nonce through.
+      if (opts?.submitNonce) pendingSubmitMirrorNonce.set(conversationId, opts.submitNonce);
 
       await streamHandler(
         event,
