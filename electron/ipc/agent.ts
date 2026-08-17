@@ -1388,6 +1388,13 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     state.answerKeys.delete(answerKey);
     const text = formatRacedAnswerAsUserTurn(answer);
     const onFailure = (): void => {
+      // If the conversation was DELETED while this delivery was in flight,
+      // invalidateConversationRecovery already purged its recovery state — do NOT re-stash
+      // (that would resurrect an answer for a deleted chat, R133 f-1). isRecentlyDeleted
+      // catches the just-deleted window; a null record is the durable signal.
+      if (isRecentlyDeleted(conversationId) || readConversation(appHomeForRuntimeResolve, conversationId) == null) {
+        return;
+      }
       // Always put the answer back in the stash.
       stashQuestionAnswers(answerKey, answer);
       if (liveRacedAnswerClaimant.get(conversationId) === claimant) {

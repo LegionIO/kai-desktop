@@ -875,6 +875,22 @@ function tombstoneDeletedSubAgent(id: string): void {
     deletedSubAgentIds.delete(oldest);
   }
 }
+
+// Tombstone of DELETED conversation ids. A displaced-prompt injectMidTurn awaits a policy
+// gate; if the conversation is deleted during that await, the delete handler clears
+// rejectedDrafts — but the injection's later then/catch would re-enqueue a draft under the
+// dead id (never flushable → lost + retained, R133 f-2). The failure callbacks consult this
+// so they SKIP re-enqueuing for a conversation that was deleted while the inject was in flight.
+const deletedConversationIds = new Set<string>();
+const DELETED_CONVERSATION_IDS_MAX = 1000;
+function tombstoneDeletedConversation(id: string): void {
+  deletedConversationIds.add(id);
+  while (deletedConversationIds.size > DELETED_CONVERSATION_IDS_MAX) {
+    const oldest = deletedConversationIds.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    deletedConversationIds.delete(oldest);
+  }
+}
 let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 
 // --- Stream accumulator functions ---
@@ -1077,6 +1093,11 @@ const draftClaimInFlight = new Set<string>();
 const MAX_REJECTED_DRAFTS_PER_CONV = 200; // pathological safety valve only
 function enqueueRejectedDraft(convId: string, draft: { text: string; attachments: AttachedFile[] }): void {
   if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
+  // Skip a conversation that was DELETED while an async producer (e.g. a displaced-prompt
+  // injectMidTurn awaiting a policy gate) was in flight: re-enqueuing under the dead id would
+  // leave an unflushable draft retained forever (its durable persist returns ok:false and the
+  // flusher ignores it), R133 f-2. The delete handler already cleared any existing drafts.
+  if (deletedConversationIds.has(convId)) return;
   const q = rejectedDrafts.get(convId) ?? [];
   const entry: RejectedDraft = { id: msgId(), ...draft, stashedAt: Date.now() };
   q.push(entry);
@@ -1095,6 +1116,7 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
 // to the FRONT so it's the next one restored, and re-ADD it durably so it survives across reload.
 function enqueueRejectedDraftEntry(convId: string, entry: RejectedDraft): void {
   if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  if (deletedConversationIds.has(convId)) return; // deleted mid-flight → don't resurrect (R133 f-2)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
   const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.pop() : undefined; // drop NEWEST on overflow (keep this requeued one)
@@ -3094,6 +3116,7 @@ export function RuntimeProvider({
           pendingCompactionHandoff.delete(deletedId);
           clearLateCompactionHandoffTimer(deletedId);
           rejectedDrafts.delete(deletedId);
+          tombstoneDeletedConversation(deletedId); // so an in-flight inject's callback won't re-enqueue (R133 f-2)
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
           clearFinalizedBranch(deletedId);

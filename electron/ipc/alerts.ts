@@ -290,6 +290,11 @@ export async function deliverRecoveredAnswer(
       // isn't polled tightly. Without a lifecycle signal, keep the bounded ~3s fallback.
       const runActive = deps?.isConversationTurnActive;
       let inactiveGrace = 3;
+      // If the conversation is DELETED during the resume wait (another client/window),
+      // abandon the delivery: dismiss the durable pending alert (a FYI record referencing a
+      // deleted chat is worse than nothing) and stop reconciling. Deletion removes the record,
+      // so readConversation returning null after we already saw it exist == deleted (R133 f-1).
+      const conversationGone = () => readConversation(alertsAppHome, conversationId) == null;
       // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
       // leak this loop forever — far above any real tool timeout. Reaching it keeps the
       // alert (uncommitted), which is the safe outcome.
@@ -297,6 +302,11 @@ export async function deliverRecoveredAnswer(
       const startedAt = Date.now();
       for (let i = 0; !committedOnDisk; i++) {
         if (Date.now() - startedAt > MAX_RECONCILE_MS) break;
+        // Deleted mid-wait → abandon: drop the durable alert (no FYI for a deleted chat).
+        if (conversationGone()) {
+          dismissPendingAlert();
+          return { delivered: false };
+        }
         if (runActive) {
           // Stop once the run is no longer streaming AND a short grace has elapsed —
           // whatever was going to commit has; keep the alert if it still hasn't.
@@ -325,6 +335,13 @@ export async function deliverRecoveredAnswer(
           messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
           messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
         } | null;
+        // Conversation DELETED during the (failed) resume → abandon: dismiss the durable
+        // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
+        // R133 f-1). A null record here means the chat is gone (delete removes the file).
+        if (after == null) {
+          dismissPendingAlert();
+          return { delivered: false };
+        }
         // The CURRENT resume committed its user turn iff a message carrying THIS
         // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
         // active branch), NOT a count-based suffix: a count-relative slice breaks if

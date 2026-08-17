@@ -166,6 +166,32 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
   });
 
+  it('abandons delivery + dismisses the pending alert when the conversation is DELETED during the resume wait (R133)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    const { createAlert, dismissAlert } = await import('../alert-store.js');
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (dismissAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    // The conversation EXISTS through entry + the resume (so the resume proceeds + a pending
+    // alert is created), then is DELETED — readConversation returns the record until the resume
+    // has run, and null afterward (the reconcile loop / catch sees it gone).
+    let deleted = false;
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() =>
+      deleted ? null : { id: 'c1', messages: [] },
+    );
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      deleted = true; // the chat is deleted during/right after the resume
+    });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    // Abandoned (not delivered), and the durable pending alert was DISMISSED — no FYI record
+    // is left referencing the deleted chat.
+    expect(res).toEqual({ delivered: false });
+    expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
+  });
+
   it('raises a persistent question Alert (delivered:false) when the conversation is gone', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { readConversation } = await import('../conversation-store.js');
