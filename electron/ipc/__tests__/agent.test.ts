@@ -594,3 +594,35 @@ describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', ()
     });
   });
 });
+
+describe('isSupersessionDescendant (raced-answer handoff lineage guard — R81/R115)', () => {
+  const { recordSupersession, isSupersessionDescendant } = __internal;
+
+  it('follows a recorded supersession chain (A→B→C) but rejects unrelated tokens', () => {
+    recordSupersession('A', 'B');
+    recordSupersession('B', 'C');
+    // C genuinely superseded A through the chain.
+    expect(isSupersessionDescendant('A', 'C')).toBe(true);
+    expect(isSupersessionDescendant('A', 'B')).toBe(true);
+    // D never entered A's chain — an unrelated later turn must NOT inherit A's answer.
+    expect(isSupersessionDescendant('A', 'D')).toBe(false);
+    // Reverse direction is not a descendant.
+    expect(isSupersessionDescendant('C', 'A')).toBe(false);
+  });
+
+  it('returns false when there is no recorded edge (a successor that died before admission)', () => {
+    // 'X' was issued as latest but its supersession edge was never recorded (config
+    // threw before stream admission), so a predecessor teardown must NOT treat it as a
+    // live replacement — the R115 guard falls through to durable recovery.
+    expect(isSupersessionDescendant('pred-no-edge', 'X')).toBe(false);
+  });
+
+  it('does not infinite-loop on a supersession cycle (corrupt lineage)', () => {
+    recordSupersession('cyc1', 'cyc2');
+    recordSupersession('cyc2', 'cyc1');
+    // Cycle-guarded: terminates and does not match an unrelated token.
+    expect(isSupersessionDescendant('cyc1', 'nope')).toBe(false);
+    // Still finds a real descendant within the cycle.
+    expect(isSupersessionDescendant('cyc1', 'cyc2')).toBe(true);
+  });
+});

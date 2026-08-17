@@ -1644,7 +1644,23 @@ function dropRacedAnswerClaimantForToken(conversationId: string, token: string):
     // alive would let an unrelated turn C started within the 30s TTL claim + inject
     // A's stale answer. (The answer stays in the bounded stash either way.)
     const latestIssued = latestIssuedTurnToken.get(conversationId);
-    const supersededByLiveReplacement = latestIssued !== undefined && latestIssued !== token;
+    // A newer token was issued for a genuine SUPERSESSION of this run, and that
+    // replacement has not already ENDED. Two guards beyond "a newer token exists":
+    //   • recentlyEndedTokens: the replacement (e.g. C) may have FAILED to register —
+    //     config load threw before its claimant/stream came up — and be marked ended.
+    //     Binding a handoff to a dead successor strands the answer (no claimant ever
+    //     consumes it; its handoff reference also bypasses tombstone recovery) (R115).
+    //   • isSupersessionDescendant: the newer token must be in THIS run's supersession
+    //     lineage — not an UNRELATED later turn D that happens to be latest-issued
+    //     (which would otherwise inherit + inject A's stale answer without a B→D edge).
+    // A not-yet-registered but alive successor in the chain still qualifies (that's
+    // what the pre-successor handoff is FOR). A dead/unrelated replacement → treat as
+    // ordinary completion below (recover the keys durably).
+    const supersededByLiveReplacement =
+      latestIssued !== undefined &&
+      latestIssued !== token &&
+      !recentlyEndedTokens.has(latestIssued) &&
+      isSupersessionDescendant(token, latestIssued);
     if (
       supersededByLiveReplacement &&
       claimant.state.answerKeys.size > 0 &&
@@ -1727,7 +1743,13 @@ function registerLiveRacedAnswerClaimant(
     // fresh claimant bound to THIS token, and attempt delivery — so a supersession
     // in the delivery window doesn't drop the predecessor's undelivered answer.
     const prior = liveRacedAnswerClaimant.get(conversationId);
-    if (prior && prior.token !== token) {
+    // Inherit a prior claimant's pending keys ONLY when THIS run genuinely superseded
+    // it (recorded supersession lineage prior.token → … → token). Without this an
+    // UNRELATED later turn D that merely started while B's teardown lagged would
+    // inherit B's claimant and receive B's stale answer (no B→D edge) (R115). A true
+    // successor in the chain still inherits; an unrelated run leaves B's keys for B's
+    // own teardown to recover durably.
+    if (prior && prior.token !== token && isSupersessionDescendant(prior.token, token)) {
       const inheritedKeys = new Set(prior.state.answerKeys);
       liveRacedAnswerClaimant.set(conversationId, {
         token,
@@ -9039,4 +9061,9 @@ export const __internal = {
   extractLastUserText,
   observerToolsForExecutionMode,
   resolveInjectedTextFromGatedPayload,
+  // Supersession-lineage primitives — the raced-answer handoff/claimant transfer
+  // sites gate on isSupersessionDescendant so a DEAD or UNRELATED replacement can't
+  // inherit/strand a stale answer (R81 / R115). Exposed for focused unit coverage.
+  recordSupersession,
+  isSupersessionDescendant,
 };
