@@ -1,6 +1,7 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
 import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
@@ -1875,6 +1876,12 @@ export type InjectUserTurnFn = (
      *  content-rewriting policy hook (R104). Applied to BOTH the cooperative enqueue
      *  and the abort+restart append. */
     userTurnId?: string;
+    /** Resolved fallback-enabled for THIS caller's semantics (e.g. an automation's
+     *  `opts.fallbackEnabled ?? Boolean(action.profileKey)`). Used in the cooperative
+     *  fingerprint + the abort+restart so a profile-pinned action doesn't splice into
+     *  / restart a no-fallback run when its fresh semantics enable fallback (R107 f-5).
+     *  Falls back to the conversation's persisted toggle when omitted. */
+    fallbackEnabled?: boolean;
   },
 ) => Promise<{
   ok: boolean;
@@ -2118,8 +2125,14 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // discard the entry the predecessor's cleanup must still recover, silently
       // losing the answer (R101 finding-1). A live/owning run's tool-result IS
       // persisted, so clearing is correct then.
+      // Only clear when the emitting run STILL OWNS the active stream (strict
+      // same-token). isSupersededRunEvent returns false when there's NO active token
+      // (a delayed tool-result from run A arriving AFTER successor B finished), which
+      // would wrongly clear A's uncommitted ledger entry so A's cleanup recovers
+      // nothing (R107 finding-1). A live/owning run's tool-result IS persisted, so
+      // clearing is correct then; anything else leaves recovery to A's cleanup.
       const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
-      if (!isSupersededRunEvent(emittingToken, activeTok)) clearInFlightAnswer(event.toolCallId);
+      if (emittingToken !== undefined && emittingToken === activeTok) clearInFlightAnswer(event.toolCallId);
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the
@@ -2311,10 +2324,11 @@ function observerToolsForExecutionMode(
 const resolveHeaderTemplates = resolveHeaderTemplatesShared;
 
 function broadcastExecutionMode(mode: ExecutionMode): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:execution-mode-changed', mode);
-  }
-  broadcastToWebClients('agent:execution-mode-changed', mode);
+  // Route through the guarded, non-throwing broadcaster: an unguarded fan-out that
+  // threw (a navigating window) during an exit_plan_mode dismissal would skip the
+  // terminal marking / cancel-gen bump / done / abort that follow, letting the
+  // dismissed turn continue and a raced answer recover afterward (R107 finding-4).
+  broadcastToAllWindows('agent:execution-mode-changed', mode);
 }
 
 function withObserverAugmentation(result: unknown, augmentation: Record<string, unknown> | undefined): unknown {
@@ -7846,7 +7860,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const toBefore = mergeThreadOverrides(convBefore);
         const modelBefore = opts?.modelKey ?? convBefore.selectedModelKey ?? undefined;
         const profileBefore = opts?.profileKey ?? convBefore.selectedProfileKey ?? undefined;
-        const fallbackBefore = convBefore.fallbackEnabled ?? false;
+        const fallbackBefore = opts?.fallbackEnabled ?? convBefore.fallbackEnabled ?? false;
         // Resolve the caller's EFFECTIVE runtime the same authoritative way streamHandler
         // does (resolveRuntimeForStream, honoring a thread runtimeOverride overlay +
         // model-based auto resolution) — NOT a hardcoded 'mastra', which would let an
@@ -7888,7 +7902,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const mergedProfileKey = opts?.profileKey ?? convNow.selectedProfileKey ?? undefined;
         const mergedCwd = normalizeAgentCwd(opts?.cwd ?? convNow.currentWorkingDirectory ?? undefined);
         const mergedMode = opts?.executionMode ?? convNow.executionMode ?? runCtx.executionMode ?? 'auto';
-        const mergedFallback = convNow.fallbackEnabled ?? false;
+        const mergedFallback = opts?.fallbackEnabled ?? convNow.fallbackEnabled ?? false;
         // The runtime was resolved from the PRE-await snapshot (cfgBefore/toBefore).
         // If any runtime-determining input drifted during the await — global
         // agent.runtime, the merged runtimeOverride, the model, or the profile — that
@@ -7959,7 +7973,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               modelKey: model2,
               profileKey: profile2,
               reasoningEffort: opts?.reasoningEffort,
-              fallbackEnabled: conv2.fallbackEnabled ?? false,
+              fallbackEnabled: opts?.fallbackEnabled ?? conv2.fallbackEnabled ?? false,
               threadOverrides: to2,
             },
           );
@@ -8157,13 +8171,32 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (!promptWrite) return { ok: false, error: 'conversation-not-found' };
 
     // Mirror the injected prompt to any attached clients (GUI/CLI viewing this
-    // conversation) so the turn renders, not just the streamed reply. Best-effort: a
-    // broadcast throw here must NOT abort the restart — the user node + runStatus
-    // 'running' are already written, so bailing would leave the conversation stuck
-    // 'running' with an unanswered turn, and the alert commit-check (which finds the
-    // committed id) would refuse to reopen it (R105 finding-4). Streaming proceeds.
+    // conversation) so the turn renders, not just the streamed reply. Carry the
+    // AUTHORITATIVE persisted-node metadata (messageId/parentId/createdAt) so a
+    // renderer doesn't FABRICATE a duplicate user node under a guessed id (which
+    // would then reject the restarted run's tagged events as foreign and strand the
+    // renderer on the old branch) (R107 finding-3). Best-effort: a throw must NOT
+    // abort the restart (the node + runStatus:running are already written; bailing
+    // would leave the conversation stuck 'running', R105 finding-4).
+    const restartUserNodeId = promptWrite.headId ?? opts?.userTurnId;
+    const restartUserNode = (
+      (promptWrite.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+    ).find((m) => m.id === restartUserNodeId);
     try {
-      broadcastStreamEvent({ conversationId, type: 'user-message', text: userText });
+      broadcastStreamEvent({
+        conversationId,
+        type: 'user-message',
+        text: userText,
+        ...(restartUserNodeId
+          ? {
+              data: {
+                messageId: restartUserNodeId,
+                parentId: restartUserNode?.parentId ?? null,
+                createdAt: restartUserNode?.createdAt,
+              },
+            }
+          : {}),
+      });
     } catch {
       /* best-effort mirror; the turn is persisted and will stream below */
     }
@@ -8209,7 +8242,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       opts?.modelKey ?? updated.selectedModelKey ?? undefined,
       opts?.reasoningEffort,
       opts?.profileKey ?? updated.selectedProfileKey ?? undefined,
-      updated.fallbackEnabled,
+      opts?.fallbackEnabled ?? updated.fallbackEnabled,
       opts?.cwd ?? updated.currentWorkingDirectory ?? undefined,
       opts?.executionMode ?? (updated as { executionMode?: ExecutionMode }).executionMode,
       Object.keys(restartThreadOverrides).length > 0 ? restartThreadOverrides : undefined,

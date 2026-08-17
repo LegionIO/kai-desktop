@@ -30,7 +30,7 @@ import { setAlertCreatedHandler } from './alert-notify.js';
 import { setRecoveredAnswerDeliverer } from '../tools/ask-user.js';
 import { isGuiFocused } from '../agent/kai-presence.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
-import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
 /** Deps the alerts layer needs: where alerts live + how to resume a conversation. */
@@ -316,10 +316,11 @@ function broadcastAlertsChanged(payload: {
   if ((payload.reason === 'resolved' || payload.reason === 'dismissed') && payload.alert) {
     closeNotificationWindow(payload.alert.id);
   }
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('alerts:changed', payload);
-  }
-  broadcastToWebClients('alerts:changed', payload);
+  // Guarded, non-throwing fan-out: a navigating window's send throwing here must not
+  // propagate — the alerts:answer/decide handler broadcasts BEFORE resume(), so a
+  // throw would leave the alert persisted-as-answered but never resumed (its answer
+  // never injected, and non-retryable) (R107 finding-2).
+  broadcastToAllWindows('alerts:changed', payload);
 }
 
 /** Bring the main window front-most + focused (used when surfaceAlertsAsModal is on). */
@@ -397,10 +398,7 @@ export function notifyNewAlert(alert: Alert): void {
         const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
         n.on('click', () => {
           focusMainWindowForModal();
-          for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send('alerts:navigate', { alertId: alert.id });
-          }
-          broadcastToWebClients('alerts:navigate', { alertId: alert.id });
+          broadcastToAllWindows('alerts:navigate', { alertId: alert.id });
         });
         n.show();
       }

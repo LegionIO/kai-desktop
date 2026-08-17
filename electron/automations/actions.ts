@@ -64,6 +64,9 @@ export type ActionDeps = {
       /** Stable id for the persisted/spliced user turn (alert resume) so a commit
        *  check can find it by exact id even if a hook rewrote the content (R104). */
       userTurnId?: string;
+      /** Resolved fallback-enabled for this dispatch so the inject fingerprint/restart
+       *  match the fresh-execution semantics, not the conversation's toggle (R107). */
+      fallbackEnabled?: boolean;
     },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
   /**
@@ -610,6 +613,9 @@ async function runAgentAction(
       ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
       ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
       ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
+      // Match the fresh-execution fallback resolution so the inject fingerprint/restart
+      // don't diverge from what a fresh turn would use (R107 finding-5).
+      fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.
@@ -693,6 +699,7 @@ async function runAgentAction(
         ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
         ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
         ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
+        fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
       });
       if (!res.ok) {
         throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);
