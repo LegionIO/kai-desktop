@@ -3800,15 +3800,17 @@ export function RuntimeProvider({
           if (isServerPersistTakeover) {
             // The GUI submission this accumulator optimistically showed is being
             // DISPLACED by the accepted server-owned run. Capture the user's consumed
-            // prompt (text AND attachments) so it's injected into that run (user
-            // decision) or, when injection can't faithfully carry it, preserved as a
-            // durable draft — never lost off-branch (R111 f-1 / R112 f-1,2,3).
-            const takeoverText = typeof (e as { text?: string }).text === 'string' ? (e as { text: string }).text : '';
+            // prompt (text AND whether it had attachments) + its node id, so it's
+            // injected into that run (user decision) or preserved as a durable draft —
+            // never lost off-branch (R111 f-1 / R112 f-1,2,3 / R113 f-1,2,3).
+            const takeoverId = (e as { data?: { messageId?: string } }).data?.messageId;
             let displacedText = '';
             let displacedHasAttachment = false;
+            let displacedNodeId: string | undefined;
             for (let i = acc.messages.length - 1; i >= 0; i--) {
               const m = acc.messages[i];
               if (m.role !== 'user') continue;
+              displacedNodeId = typeof m.id === 'string' ? m.id : undefined;
               if (Array.isArray(m.content)) {
                 const parts = m.content as ContentPart[];
                 displacedText = parts
@@ -3825,6 +3827,7 @@ export function RuntimeProvider({
               }
               break;
             }
+            const displacedGeneration = evGen;
             acc.runGeneration = evGen;
             acc.locallyOriginated = false;
             acc.pendingAssistantId = (e as { data?: { messageId?: string } }).data?.messageId ?? acc.pendingAssistantId;
@@ -3837,30 +3840,33 @@ export function RuntimeProvider({
             acc.pendingAssistantTiming = undefined;
             acc.injectContinuationId = null;
             acc.closedPrefixIds = undefined;
-            // A displaced prompt is meaningful only if it isn't the takeover's own turn.
-            const hasDisplaced =
-              (Boolean(displacedText) || displacedHasAttachment) && displacedText !== takeoverText.trim();
+            // A displaced prompt is meaningful only if it's a DIFFERENT turn than the
+            // takeover's own. Compare NODE IDS, not text: two distinct concurrent
+            // submissions with identical text are still distinct turns (R113 f-1). When
+            // the displaced node has no id, fall back to "has content" (still displaced).
+            const isSameTurn = displacedNodeId != null && takeoverId != null && displacedNodeId === takeoverId;
+            const hasDisplaced = (Boolean(displacedText) || displacedHasAttachment) && !isSameTurn;
             if (hasDisplaced) {
               // injectMidTurn is text-only and can't carry attachments. For an
-              // attachment-bearing displaced prompt, preserve the COMPLETE draft
-              // durably (the user re-sends with its files intact) rather than inject a
-              // text-only fragment (R112 f-2). Text-only → inject into the accepted run.
+              // attachment-bearing displaced prompt, preserve the draft durably (the
+              // user re-sends with its files) rather than inject a text-only fragment
+              // (R112 f-2). Text-only → inject into the accepted run.
               if (displacedHasAttachment) {
-                enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
-                // NOTE: attachment file handles aren't reconstructable from the reduced
-                // content parts here; enqueue the text so it's not silently lost, and
-                // the notice prompts the user to re-attach. (Full attachment round-trip
-                // would require capturing the original AttachedFile[] at submit time.)
+                // enqueueRejectedDraft rejects an empty draft — always save a NON-EMPTY
+                // notice (an attachment-only prompt has no text) so it isn't silently
+                // dropped, and the user is prompted to re-attach (R113 f-2).
+                const noticeText =
+                  displacedText ||
+                  '[Your attachment(s) from a message that was interrupted by another turn were not delivered — please re-attach and resend.]';
+                enqueueRejectedDraft(convId, { text: noticeText, attachments: [] });
               } else if (displacedText) {
                 void app.agent
-                  .injectMidTurn(convId, displacedText)
+                  .injectMidTurn(convId, displacedText, displacedGeneration)
                   .then((res) => {
-                    // injectMidTurn RESOLVES {ok:false} (run ended / policy blocked /
-                    // unavailable) or a non-cooperative fallback — none of which delivered
-                    // it to THIS accepted run. Preserve the draft unless it genuinely
-                    // spliced cooperatively (R112 f-1 + the wrong-run guard for f-3: a
-                    // splice into a later generation is possible, so only ok+cooperative
-                    // counts as delivered; otherwise keep the user's input).
+                    // Delivered ONLY if it spliced cooperatively into the generation we
+                    // pinned (expectedGeneration guards a wrong-run splice — R113 f-3).
+                    // Any other outcome (ok:false, non-cooperative, expected-generation-
+                    // superseded, reject) preserves the user's input (R112 f-1).
                     if (!res?.ok || !res.cooperative) {
                       enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
                     }

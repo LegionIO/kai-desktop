@@ -69,8 +69,8 @@ const appAPI = {
       }>,
     /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
      *  running turn (spliced at its next step boundary) instead of a new turn. */
-    injectMidTurn: (conversationId: string, userText: string) =>
-      ipcRenderer.invoke('agent:inject-mid-turn', conversationId, userText) as Promise<{
+    injectMidTurn: (conversationId: string, userText: string, expectedGeneration?: string) =>
+      ipcRenderer.invoke('agent:inject-mid-turn', conversationId, userText, expectedGeneration) as Promise<{
         ok: boolean;
         cooperative?: boolean;
         id?: string;

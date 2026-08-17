@@ -90,6 +90,7 @@ type AppAPI = {
     injectMidTurn: (
       conversationId: string,
       userText: string,
+      expectedGeneration?: string,
     ) => Promise<{ ok: boolean; cooperative?: boolean; blocked?: boolean; id?: string; error?: string }>;
     listInjects: (conversationId: string) => Promise<Array<{ id: string; text: string; at: number }>>;
     cancelInject: (conversationId: string, id: string) => Promise<{ ok: boolean; text?: string }>;

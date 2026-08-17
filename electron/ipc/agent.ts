@@ -3057,11 +3057,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // the originating client dedups its optimistic echo. Consumed here (R111 f-2).
       const submitMirrorNonce = pendingSubmitMirrorNonce.get(conversationId);
       pendingSubmitMirrorNonce.delete(conversationId);
-      if (lastUserText) {
-        const branchArr = messages as Array<{ id?: unknown; parentId?: unknown }>;
-        const lastNode = branchArr[branchArr.length - 1];
-        const authoritativeUserId = typeof lastNode?.id === 'string' ? lastNode.id : undefined;
-        const authoritativeParentId = typeof lastNode?.parentId === 'string' ? lastNode.parentId : null;
+      const branchArr = messages as Array<{ id?: unknown; parentId?: unknown; role?: unknown }>;
+      const lastNode = branchArr[branchArr.length - 1];
+      const authoritativeUserId = typeof lastNode?.id === 'string' ? lastNode.id : undefined;
+      const authoritativeParentId = typeof lastNode?.parentId === 'string' ? lastNode.parentId : null;
+      // Emit the mirror when there's user TEXT, OR when this is a server-persist run
+      // with an authoritative user node even if the text is EMPTY (an image-only CLI
+      // submission) — a pending GUI accumulator needs this token-tagged takeover to
+      // adopt it; without it the delayed GUI launch could run over the accepted run
+      // (R113 finding-4).
+      const shouldMirror = Boolean(lastUserText) || (serverPersistedRun && authoritativeUserId != null);
+      if (shouldMirror) {
         broadcastStreamEvent(
           {
             conversationId,
@@ -7454,8 +7460,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       _event,
       conversationId: string,
       userText: string,
+      expectedGeneration?: string,
     ): Promise<{ ok: boolean; cooperative?: boolean; blocked?: boolean; id?: string; error?: string }> => {
       if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
+      // Caller may pin the generation (active stream token, echoed as runGeneration on
+      // stream events) it INTENDS to inject into — e.g. the renderer routing a displaced
+      // GUI prompt into a specific accepted run. If the run was already superseded by a
+      // LATER run before this IPC landed, refuse rather than splice into the wrong run;
+      // the caller then preserves the prompt (R113 finding-3). The subsequent post-gate
+      // ownership check also revalidates it (a supersession during the async policy gate).
+      if (expectedGeneration !== undefined && activeStreams.get(conversationId)?.token !== expectedGeneration) {
+        return { ok: false, cooperative: false, error: 'expected-generation-superseded' };
+      }
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
       // Cooperative splice only works on a genuine Mastra prepareStep run. If the
