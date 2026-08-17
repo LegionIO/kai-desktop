@@ -61,6 +61,9 @@ export type ActionDeps = {
         maxRetries?: number | null;
         runtimeOverride?: string | null;
       };
+      /** Stable id for the persisted/spliced user turn (alert resume) so a commit
+       *  check can find it by exact id even if a hook rewrote the content (R104). */
+      userTurnId?: string;
     },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
   /**
@@ -606,6 +609,7 @@ async function runAgentAction(
       ...(opts?.cwd ? { cwd: opts.cwd } : {}),
       ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
       ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+      ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.
@@ -688,6 +692,7 @@ async function runAgentAction(
         ...(opts?.cwd ? { cwd: opts.cwd } : {}),
         ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
         ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+        ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
       });
       if (!res.ok) {
         throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);

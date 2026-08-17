@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { enqueueInject, drainInjects, hasInjects, clearInjects, listInjects, removeInject, reenqueueInject, reenqueueFreshAtFront } from '../inject-queue.js';
+import {
+  enqueueInject,
+  drainInjects,
+  hasInjects,
+  clearInjects,
+  listInjects,
+  removeInject,
+  reenqueueInject,
+  reenqueueFreshAtFront,
+} from '../inject-queue.js';
 
 describe('inject-queue (cooperative mid-turn injection)', () => {
   beforeEach(() => {
@@ -30,6 +39,16 @@ describe('inject-queue (cooperative mid-turn injection)', () => {
     expect(listed.map((e) => e.text)).toEqual(['a', 'b']);
     // listInjects is a snapshot — does not drain.
     expect(hasInjects('c1')).toBe(true);
+  });
+
+  it('honors a caller-supplied stable id (alert resume) so the persisted turn keeps it (R104)', () => {
+    const id = enqueueInject('c1', 'answer', 'stable-turn-id');
+    expect(id).toBe('stable-turn-id');
+    expect(listInjects('c1').map((e) => e.id)).toEqual(['stable-turn-id']);
+    // A minted id is used when none is supplied (or it's empty).
+    const minted = enqueueInject('c2', 'x', '');
+    expect(minted).not.toBe('');
+    expect(minted).toBeTruthy();
   });
 
   it('removeInject drops one entry by id and returns its text', () => {

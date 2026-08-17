@@ -140,6 +140,10 @@ export async function deliverRecoveredAnswer(
   // JSON round-trip on disk.
   const deliveryId = `rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const text = `[Answering your earlier question "${title}"]\n${body}\n<!-- ${deliveryId} -->`;
+  // Stable id for the persisted user turn so the post-failure commit-check finds it
+  // by EXACT id even if a policy hook strips the in-content marker (R104). Threaded
+  // through resumeConversationWithMessage → the persist/inject path.
+  const userTurnId = `rcv-turn-${deliveryId}`;
   const correlationId = `recovered-answer-${conversationId}`;
   // Inline re-inject into the ORIGIN conversation when it still exists on disk.
   const conv = readConversation(deps.appHome, conversationId);
@@ -175,6 +179,7 @@ export async function deliverRecoveredAnswer(
         ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
         ...(convBefore.reasoningEffort ? { reasoningEffort: convBefore.reasoningEffort } : {}),
         ...(threadOverrides ? { threadOverrides } : {}),
+        userTurnId,
       });
       traceDiagnostic({
         scope: 'alert',
@@ -194,8 +199,8 @@ export async function deliverRecoveredAnswer(
       // the fallback accordingly (R90).
       try {
         const after = readConversation(deps.appHome, conversationId) as {
-          messages?: Array<{ role?: unknown; content?: unknown }>;
-          messageTree?: Array<{ role?: unknown; content?: unknown }>;
+          messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+          messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
         } | null;
         // The CURRENT resume committed its user turn iff a message carrying THIS
         // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
@@ -205,11 +210,16 @@ export async function deliverRecoveredAnswer(
         // wrongly reporting delivered:false → duplicate resend). The deliveryId is
         // globally unique and appears ONLY in this recovery's turn, so a full-set scan
         // can't false-positive on a concurrent/earlier recovery either (R94/R96).
-        const nodes: Array<{ role?: unknown; content?: unknown }> = [
+        const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
           ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
           ...(Array.isArray(after?.messages) ? after!.messages : []),
         ];
-        const committed = nodes.some((m) => m?.role === 'user' && JSON.stringify(m.content ?? '').includes(deliveryId));
+        // Committed iff a user node carries THIS resume's exact userTurnId (durable
+        // against a content-rewriting policy hook, R104) OR the in-content marker
+        // survived (fast path / cooperative-inject where the id may differ).
+        const committed = nodes.some(
+          (m) => m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
+        );
         if (committed) {
           // The answer IS on-branch; only the response generation failed. Do NOT invite
           // a resend (it would duplicate). Surface an informational alert instead.

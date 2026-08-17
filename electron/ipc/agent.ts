@@ -1870,6 +1870,11 @@ export type InjectUserTurnFn = (
      *  cooperativeOnly, enqueue only proceeds while this token is active — so a
      *  supersession that lands during the async policy gate can't misdeliver. */
     expectedToken?: string;
+    /** Caller-allocated STABLE id for the persisted/spliced user turn (alert resume),
+     *  so a post-failure commit check can find THIS exact turn regardless of a
+     *  content-rewriting policy hook (R104). Applied to BOTH the cooperative enqueue
+     *  and the abort+restart append. */
+    userTurnId?: string;
   },
 ) => Promise<{
   ok: boolean;
@@ -7965,67 +7970,93 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // (userText is left unchanged — just fall through.)
         } else {
           const injectText = gate.text;
-          const injectId = enqueueInject(conversationId, injectText);
+          const injectId = enqueueInject(conversationId, injectText, opts?.userTurnId);
           if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
-          const activeToken = activeStreams.get(conversationId)?.token;
-          const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
-          let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
-            messageId: injectId,
-            // For deferred server-owned persistence, omit the stale disk parent so a
-            // co-viewing renderer keeps its current live assistant head.
-            ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
-            createdAt: new Date().toISOString(),
-          };
-          if (!serverOwnsPersistence) {
-            const write = appendConversationMessages(
-              appHome,
-              conversationId,
-              [
-                {
-                  id: injectId,
-                  role: 'user',
-                  content: [{ type: 'text', text: injectText }],
-                  createdAt: persistedMeta.createdAt,
-                },
-              ],
-              // Keep runStatus 'running' — the turn is still live; we're extending it.
-              { runStatus: 'running' },
-            );
-            if (write?.headId) {
-              const messageId = write.headId;
-              const node = (
-                (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
-              ).find((message) => message.id === messageId);
-              persistedMeta = {
-                messageId,
-                parentId: node?.parentId ?? null,
-                createdAt: node?.createdAt ?? persistedMeta.createdAt,
-              };
+          // Make acceptance FAILURE-ATOMIC (R104 finding-1): the entry is live in the
+          // queue the moment it's enqueued, so if persist/broadcast throws we must not
+          // return a plain failure (the renderer would then fallback-send a duplicate
+          // while the running turn drains this same inject). On any throw: if the entry
+          // was ALREADY drained/committed (on-branch by id), report success; else
+          // remove the queued entry so no duplicate can drain, then fall through to the
+          // abort+restart path.
+          try {
+            const activeToken = activeStreams.get(conversationId)?.token;
+            const serverOwnsPersistence = isServerPersistOwner(conversationId, activeToken);
+            let persistedMeta: { messageId: string; parentId?: string | null; createdAt?: string } | null = {
+              messageId: injectId,
+              // For deferred server-owned persistence, omit the stale disk parent so a
+              // co-viewing renderer keeps its current live assistant head.
+              ...(serverOwnsPersistence ? {} : { parentId: existingConv.headId ?? null }),
+              createdAt: new Date().toISOString(),
+            };
+            if (!serverOwnsPersistence) {
+              const write = appendConversationMessages(
+                appHome,
+                conversationId,
+                [
+                  {
+                    id: injectId,
+                    role: 'user',
+                    content: [{ type: 'text', text: injectText }],
+                    createdAt: persistedMeta.createdAt,
+                  },
+                ],
+                // Keep runStatus 'running' — the turn is still live; we're extending it.
+                { runStatus: 'running' },
+              );
+              if (write?.headId) {
+                const messageId = write.headId;
+                const node = (
+                  (write.messageTree ?? []) as Array<{ id?: string; parentId?: string | null; createdAt?: string }>
+                ).find((message) => message.id === messageId);
+                persistedMeta = {
+                  messageId,
+                  parentId: node?.parentId ?? null,
+                  createdAt: node?.createdAt ?? persistedMeta.createdAt,
+                };
+              } else {
+                persistedMeta = null;
+              }
+            }
+            if (!persistedMeta) {
+              removeInject(conversationId, injectId);
+              // Conversation vanished between the runtime check and the write — the run
+              // is effectively gone; fall through to the abort+restart path which
+              // re-reads + handles a missing conversation cleanly.
             } else {
-              persistedMeta = null;
+              // Record this inject's node ids as THIS run's own lineage immediately, so a
+              // SECOND overlapping mid-turn send whose head advanced to this inject node
+              // isn't misread as a branch switch (see the agent:inject-mid-turn handler).
+              if (activeToken !== undefined) {
+                recordInjectBoundaryLineage(conversationId, activeToken, injectId);
+                if (persistedMeta.messageId !== injectId)
+                  recordInjectBoundaryLineage(conversationId, activeToken, persistedMeta.messageId);
+              }
+              // Broadcast is best-effort: the inject is already enqueued + persisted, so a
+              // broadcast throw must NOT unwind acceptance (that would drop a co-viewer's
+              // render but the turn still consumes the inject) — swallow it.
+              try {
+                broadcastStreamEvent({
+                  conversationId,
+                  type: 'user-message',
+                  text: injectText,
+                  data: persistedMeta,
+                });
+              } catch {
+                /* best-effort mirror; acceptance already succeeded */
+              }
+              return { ok: true, injectedCooperatively: true };
             }
-          }
-          if (!persistedMeta) {
+          } catch {
+            // persist threw. If the running turn ALREADY drained + committed this inject
+            // (its node id is on the tree), acceptance genuinely succeeded — report ok so
+            // the caller does NOT fallback-send a duplicate. Otherwise remove the still-
+            // queued entry so nothing drains it, and fall through to abort+restart.
+            const tree = (readConversation(appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>;
+            if (tree.some((m) => m?.id === injectId)) {
+              return { ok: true, injectedCooperatively: true };
+            }
             removeInject(conversationId, injectId);
-            // Conversation vanished between the runtime check and the write — the run
-            // is effectively gone; fall through to the abort+restart path which
-            // re-reads + handles a missing conversation cleanly.
-          } else {
-            // Record this inject's node ids as THIS run's own lineage immediately, so a
-            // SECOND overlapping mid-turn send whose head advanced to this inject node
-            // isn't misread as a branch switch (see the agent:inject-mid-turn handler).
-            if (activeToken !== undefined) {
-              recordInjectBoundaryLineage(conversationId, activeToken, injectId);
-              if (persistedMeta.messageId !== injectId)
-                recordInjectBoundaryLineage(conversationId, activeToken, persistedMeta.messageId);
-            }
-            broadcastStreamEvent({
-              conversationId,
-              type: 'user-message',
-              text: injectText,
-              data: persistedMeta,
-            });
-            return { ok: true, injectedCooperatively: true };
           }
         }
       }
@@ -8046,7 +8077,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const promptWrite = appendConversationMessages(
       appHome,
       conversationId,
-      [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+      [
+        {
+          ...(opts?.userTurnId ? { id: opts.userTurnId } : {}),
+          role: 'user',
+          content: [{ type: 'text', text: userText }],
+        },
+      ],
       { runStatus: 'running' },
     );
     if (!promptWrite) return { ok: false, error: 'conversation-not-found' };
