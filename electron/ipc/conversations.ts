@@ -59,6 +59,7 @@ import {
   nextCompactionRevision,
   isRecentlyDeleted,
   isWriteTombstoned,
+  consumeWriteWasSuppressed,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -1267,18 +1268,13 @@ export function registerConversationHandlers(
     const written = writeConversation(appHome, nextConversation);
     // If the id is tombstoned (deleted), writeConversation SUPPRESSES the write (returns the record
     // unchanged, nothing hits disk). Do NOT broadcast a phantom upsert or emit ConversationStart or
-    // report success in that case — signal conversation-deleted so the client rolls back its
-    // optimistic state (matching the renderer's persistConversation deleted-rollback contract).
-    // Throw-safe (R147): a lookup throw here defaults to REJECT (don't broadcast) — the write
-    // may have been suppressed for a tombstoned id, so a phantom upsert of a deleted chat is the
-    // worse outcome; a false reject of a live chat is recoverable (the client retries).
-    let writeTombstoned = true;
-    try {
-      writeTombstoned = isWriteTombstoned(appHome, conversation.id);
-    } catch {
-      writeTombstoned = true;
-    }
-    if (writeTombstoned) {
+    // report success in that case — signal conversation-deleted so the client rolls back. Use the
+    // AUTHORITATIVE one-shot suppression flag writeConversation just set (R148), NOT a second
+    // isWriteTombstoned lookup: that re-lookup can THROW *after* the write already committed, and
+    // defaulting that to the PERMANENT conversation-deleted signal (R147) left a ghost running turn
+    // on disk with no stream (the renderer treats conversation-deleted as non-retryable). The flag
+    // never throws and reflects exactly whether THIS write hit disk.
+    if (consumeWriteWasSuppressed(conversation.id)) {
       return { rejected: 'conversation-deleted' as const };
     }
     broadcastUpsert(appHome, written);

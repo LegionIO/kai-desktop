@@ -206,6 +206,18 @@ describe('per-file read/write', () => {
     expect(readIndex(appHome).deletedIds).toContain('d1');
   });
 
+  it('consumeWriteWasSuppressed reports whether the LAST write hit disk, one-shot + throw-free (R148)', async () => {
+    const { consumeWriteWasSuppressed } = await import('../conversation-store.js');
+    // A normal write is NOT suppressed.
+    writeConversation(appHome, makeConv('live-w'));
+    expect(consumeWriteWasSuppressed('live-w')).toBe(false);
+    // Delete it, then a stale re-put is SUPPRESSED (tombstoned) → flag true, and one-shot.
+    deleteConversation(appHome, 'live-w');
+    writeConversation(appHome, makeConv('live-w'));
+    expect(consumeWriteWasSuppressed('live-w')).toBe(true);
+    expect(consumeWriteWasSuppressed('live-w')).toBe(false); // consumed (one-shot)
+  });
+
   it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4 / R136 f-3)', () => {
     // A confirmed delete records the durable ring; then the index file is corrupted (e.g. a
     // truncated write on crash). readIndex must rebuild from live files BUT preserve deletedIds
