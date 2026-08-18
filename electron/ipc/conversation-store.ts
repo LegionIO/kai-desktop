@@ -145,6 +145,13 @@ export type ConversationIndex = {
   // (DURABLE_DELETED_MAX) so it never grows unboundedly; the oldest ids age out, which is safe
   // because a genuinely-stale persist for a long-ago-deleted id is not a realistic occurrence.
   deletedIds?: string[];
+  // Watermark (ms epoch) of the last clear-all. A clear-all can wipe MORE conversations than the
+  // durable deletedIds ring holds (>10k), evicting the earliest ids from both tombstone layers —
+  // then a delayed create-shaped put for an early-cleared id would pass the per-id resurrection
+  // guard. writeConversation additionally rejects a create-shaped write whose record predates this
+  // watermark (a stale put for a wiped chat), so a bulk clear can't be defeated by ring eviction
+  // (R142 f-3). A legitimate NEW conversation created after the clear has a newer createdAt.
+  lastClearedAt?: number;
 };
 
 // ── paths ────────────────────────────────────────────────────────────────────
@@ -296,6 +303,7 @@ export function readIndex(appHome: string): ConversationIndex {
       deletedIds: Array.isArray(parsed.deletedIds)
         ? parsed.deletedIds.filter((x): x is string => typeof x === 'string')
         : [],
+      ...(typeof parsed.lastClearedAt === 'number' ? { lastClearedAt: parsed.lastClearedAt } : {}),
     };
   } catch {
     // Corrupt/truncated index — the per-file conversation records are the source
@@ -307,9 +315,11 @@ export function readIndex(appHome: string): ConversationIndex {
     // Recover it leniently from the corrupt text (a trailing truncation usually leaves the
     // earlier deletedIds array intact) before rebuilding.
     const salvagedDeletedIds = salvageDeletedIdsFromCorruptIndex(p);
+    const salvagedLastClearedAt = salvageLastClearedAtFromCorruptIndex(p);
     const rebuilt = rebuildIndexFromConversationFiles(appHome);
     if (rebuilt) {
       if (salvagedDeletedIds.length > 0) rebuilt.deletedIds = salvagedDeletedIds;
+      if (salvagedLastClearedAt !== undefined) rebuilt.lastClearedAt = salvagedLastClearedAt;
       return rebuilt;
     }
     return {
@@ -317,7 +327,23 @@ export function readIndex(appHome: string): ConversationIndex {
       activeConversationId: null,
       settings: {},
       ...(salvagedDeletedIds.length > 0 ? { deletedIds: salvagedDeletedIds } : {}),
+      ...(salvagedLastClearedAt !== undefined ? { lastClearedAt: salvagedLastClearedAt } : {}),
     };
+  }
+}
+
+/** Best-effort recover the numeric `lastClearedAt` watermark from a corrupt index's raw text —
+ *  it can't be rebuilt from live files, and losing it would let a stale put resurrect an
+ *  early-cleared chat after a corrupt-index restart (R142 f-3, R143). */
+function salvageLastClearedAtFromCorruptIndex(indexFilePath: string): number | undefined {
+  try {
+    const raw = readFileSync(indexFilePath, 'utf-8');
+    const m = raw.match(/"lastClearedAt"\s*:\s*(\d{6,})/);
+    if (!m) return undefined;
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -440,6 +466,8 @@ export function reindexIfStale(appHome: string): number {
     // recreate one). rebuildIndexFromConversationFiles never carries them (it scans data files),
     // so take them from the prior index.
     deletedIds: Array.isArray(index.deletedIds) ? [...index.deletedIds] : [],
+    // Preserve the clear-all watermark across a schema reindex too (R142 f-3).
+    ...(typeof index.lastClearedAt === 'number' ? { lastClearedAt: index.lastClearedAt } : {}),
   });
   console.info(`[conversation-store] reindexed ${count} conversation(s) to schema v${INDEX_SCHEMA_VERSION}`);
   return count;
@@ -1263,6 +1291,19 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   } else {
     const idx = readIndex(appHome);
     if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) return sanitized;
+    // CLEAR-ALL watermark guard (R142 f-3): a bulk clear can wipe MORE ids than the durable ring
+    // holds, evicting the earliest from the tombstone layers. Reject a create-shaped write (id
+    // absent from the index) whose record was CREATED before the last clear-all — it's a stale
+    // put for a wiped chat. A legitimately-new conversation created after the clear has a newer
+    // createdAt and writes normally.
+    if (
+      !idx.conversations[sanitized.id] &&
+      typeof idx.lastClearedAt === 'number' &&
+      typeof sanitized.createdAt === 'string'
+    ) {
+      const createdMs = Date.parse(sanitized.createdAt);
+      if (Number.isFinite(createdMs) && createdMs <= idx.lastClearedAt) return sanitized;
+    }
   }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
   const index = readIndex(appHome);
@@ -1407,6 +1448,9 @@ export function clearAllConversations(appHome: string): { cleared: string[]; ful
         : null,
     settings: priorIndex.settings,
     deletedIds: Array.isArray(priorIndex.deletedIds) ? [...priorIndex.deletedIds] : [],
+    // Watermark so a delayed create-shaped put for an early-cleared id (evicted from the ring)
+    // is still rejected by writeConversation (R142 f-3). Preserve the prior watermark if newer.
+    lastClearedAt: Math.max(priorIndex.lastClearedAt ?? 0, Date.now()),
   };
   for (const id of cleared) pushDurableDeletedId(nextIndex, id);
   writeIndex(appHome, nextIndex);

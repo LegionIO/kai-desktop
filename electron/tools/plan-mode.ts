@@ -281,7 +281,21 @@ export function createExitPlanModeTool(): ToolDefinition {
         return { success: false, error: `Failed to save plan: ${err instanceof Error ? err.message : String(err)}` };
       }
 
-      applyModeChange(context.conversationId, 'auto');
+      // Flip to auto (implementation mode). If the auto persist FAILS (conversation record
+      // temporarily unwritable), do NOT report mode:auto — disk + UI stay plan-first and the
+      // next trust-disk turn would remain read-only, so a success:true/mode:auto here is FALSE
+      // (R142 f-2). The plan file DID save, so surface that but report the mode is unchanged.
+      const switchedToAuto = applyModeChange(context.conversationId, 'auto');
+      if (!switchedToAuto) {
+        return {
+          success: false,
+          mode: 'plan-first',
+          planFilePath,
+          planName: `${planName}.md`,
+          error:
+            'Plan saved, but could not switch to implementation mode (failed to persist). The conversation is still in plan mode; retry exit_plan_mode.',
+        };
+      }
       return {
         success: true,
         mode: 'auto',

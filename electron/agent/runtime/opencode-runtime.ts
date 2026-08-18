@@ -137,15 +137,20 @@ export class OpencodeRuntime implements AgentRuntime {
       }
     };
 
+    const planFirst = options.config.tools?.executionMode === 'plan-first';
     if (customTools.length > 0) {
       try {
         bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal);
         const token = bridge.getAuthToken();
         opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
         opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');
-        writeFileSync(opencodeConfigPath, JSON.stringify(buildOpencodeMcpConfig(bridgeUrl, token), null, 2), {
-          mode: 0o600,
-        });
+        writeFileSync(
+          opencodeConfigPath,
+          JSON.stringify(buildOpencodeMcpConfig(bridgeUrl, token, planFirst), null, 2),
+          {
+            mode: 0o600,
+          },
+        );
         promptText = buildOpencodeMcpPrompt(promptText, customTools);
         console.info(`[opencode-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
       } catch (err) {
@@ -155,6 +160,22 @@ export class OpencodeRuntime implements AgentRuntime {
         opencodeConfigDir = undefined;
         opencodeConfigPath = undefined;
         // bridgeCleanedUp stays true: nothing remains, so the outer finally no-ops.
+      }
+    }
+    // PLAN-FIRST with no bridge config written above: still write a permission-only config so
+    // opencode's native write/edit/bash are denied (R142 f-1). Without this, a plan-first turn
+    // with no bridged Kai tools would run opencode unrestricted.
+    if (planFirst && !opencodeConfigPath) {
+      try {
+        opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
+        opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');
+        writeFileSync(opencodeConfigPath, JSON.stringify(buildOpencodeMcpConfig(null, null, true), null, 2), {
+          mode: 0o600,
+        });
+      } catch (err) {
+        console.warn('[opencode-runtime] Failed to write plan-first permission config:', err);
+        opencodeConfigDir = undefined;
+        opencodeConfigPath = undefined;
       }
     }
 
@@ -381,17 +402,31 @@ function describeOpencodeError(evt: OpencodeEvent): string {
  *   { "mcp": { "<name>": { "type": "remote", "url", "headers": { ... } } } }
  * The bearer token is per-run; only this child (via OPENCODE_CONFIG) sees it.
  */
-export function buildOpencodeMcpConfig(url: string, token: string | null): Record<string, unknown> {
+export function buildOpencodeMcpConfig(
+  url: string | null,
+  token: string | null,
+  planFirst = false,
+): Record<string, unknown> {
   return {
     $schema: 'https://opencode.ai/config.json',
-    mcp: {
-      kai: {
-        type: 'remote',
-        url,
-        enabled: true,
-        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
-      },
-    },
+    // Only include the Kai MCP bridge block when a bridge URL exists (a plan-first turn with no
+    // bridged Kai tools still needs the permission block below, but no mcp block).
+    ...(url
+      ? {
+          mcp: {
+            kai: {
+              type: 'remote',
+              url,
+              enabled: true,
+              ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+            },
+          },
+        }
+      : {}),
+    // PLAN-FIRST (R142 f-1): opencode's native write/edit/bash tools aren't Kai tools, so scope
+    // them to read-only via opencode's permission block — a plan-first turn must not let opencode
+    // mutate the workspace. (read/grep/list stay allowed; the Kai MCP tools are gated separately.)
+    ...(planFirst ? { permission: { edit: 'deny', write: 'deny', bash: 'deny' } } : {}),
   };
 }
 

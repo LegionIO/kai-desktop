@@ -242,6 +242,23 @@ describe('per-file read/write', () => {
     expect(recovered.deletedIds ?? []).not.toContain('fresh-id');
   });
 
+  it('rejects a create-shaped put for a chat CREATED BEFORE the last clear-all, even if its tombstone evicted (R142 f-3)', () => {
+    // A bulk clear set a watermark but this id evicted from the durable ring.
+    writeIndex(appHome, {
+      conversations: {},
+      activeConversationId: null,
+      settings: {},
+      deletedIds: [],
+      lastClearedAt: Date.parse('2026-06-01T00:00:00.000Z'),
+    });
+    // A delayed put for a chat created BEFORE the clear → rejected (not resurrected).
+    writeConversation(appHome, makeConv('stale-cleared', { createdAt: '2026-05-01T00:00:00.000Z' }));
+    expect(readIndex(appHome).conversations['stale-cleared']).toBeUndefined();
+    // A genuinely-new chat created AFTER the clear writes normally.
+    writeConversation(appHome, makeConv('fresh-after', { createdAt: '2026-07-01T00:00:00.000Z' }));
+    expect(readIndex(appHome).conversations['fresh-after']).toBeDefined();
+  });
+
   it('conversationExistenceState is a fail-closed tri-state (R136 f-2)', async () => {
     const { conversationExistenceState } = await import('../conversation-store.js');
     writeConversation(appHome, makeConv('here1'));

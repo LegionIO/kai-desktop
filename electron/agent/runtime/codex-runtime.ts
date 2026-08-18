@@ -424,6 +424,10 @@ export class CodexRuntime implements AgentRuntime {
         modelReasoningEffort: modelEffort,
         approvalPolicy,
         skipGitRepoCheck: true,
+        // PLAN-FIRST (R142 f-1): Codex's native write/apply-patch/shell tools aren't Kai tools,
+        // so scope the SANDBOX to read-only at thread start — a plan-first turn must not let
+        // Codex mutate the workspace. Overrides any configured sandbox for this turn.
+        ...(options.config.tools?.executionMode === 'plan-first' ? { sandboxMode: 'read-only' } : {}),
       };
 
       // Resume or start new thread.

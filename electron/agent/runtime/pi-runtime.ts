@@ -243,7 +243,13 @@ export class PiRuntime implements AgentRuntime {
     // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
     // Passed the bridged tool names so a restrictive --tools allowlist keeps the
     // Kai tools enabled (pi's allowlist covers extension tools too).
-    args.push(...buildToolScopingArgs(piConfig, piBridge ? bridgeableTools.map((t) => t.name) : []));
+    args.push(
+      ...buildToolScopingArgs(
+        piConfig,
+        piBridge ? bridgeableTools.map((t) => t.name) : [],
+        options.config.tools?.executionMode === 'plan-first',
+      ),
+    );
 
     // -----------------------------------------------------------------------
     // 5. Spawn + stream
@@ -490,7 +496,11 @@ function extractLastUserText(messages: unknown[]): string | null {
 // Helper: Kai approval mode → pi spawn-time tool scoping
 // ---------------------------------------------------------------------------
 
-function buildToolScopingArgs(piConfig: Record<string, unknown>, bridgedToolNames: string[] = []): string[] {
+export function buildToolScopingArgs(
+  piConfig: Record<string, unknown>,
+  bridgedToolNames: string[] = [],
+  planFirst = false,
+): string[] {
   // pi has NO --exclude-tools; it only supports an ALLOWLIST via --tools, or
   // --no-tools / --no-builtin-tools. pi's built-in tools are: read, write, edit,
   // bash. Map Kai's approval mode to the allowed built-in set. Default full-auto
@@ -505,6 +515,14 @@ function buildToolScopingArgs(piConfig: Record<string, unknown>, bridgedToolName
   const approval = (piConfig.approval as string) ?? 'full-auto';
   const BUILTINS = ['read', 'write', 'edit', 'bash'];
   const withBridged = (allowed: string[]): string[] => ['--tools', [...allowed, ...bridgedToolNames].join(',')];
+
+  // PLAN-FIRST (R142 f-1): pi has no mid-stream gating and its NATIVE write/edit/bash tools
+  // aren't Kai tools, so Kai can't self-guard them — scope pi to READ-ONLY at spawn (read +
+  // bridged Kai tools only). This overrides approval/excludeTools: a plan-first turn must never
+  // let pi's built-ins mutate the workspace.
+  if (planFirst) {
+    return withBridged(['read']);
+  }
 
   // An explicit excludeTools list (Kai config semantics: "deny these") is
   // translated to pi's allowlist = the built-ins NOT excluded.
