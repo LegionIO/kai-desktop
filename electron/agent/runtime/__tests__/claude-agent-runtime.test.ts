@@ -250,6 +250,9 @@ describe('ClaudeAgentRuntime', () => {
       const tr = toolResults[0];
       if (tr.type === 'tool-result') {
         expect(tr.toolCallId).toBe('toolu_2');
+        // The tool NAME recorded at the tool-CALL block is stamped onto the result event so
+        // MAIN's mid-stream enter_plan_mode/exit_plan_mode interception fires for SDK runs (R138 f-4).
+        expect(tr.toolName).toBe('read_file');
         // Result content should reach the renderer verbatim.
         const resultStr = typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result);
         expect(resultStr).toContain('Hello world');

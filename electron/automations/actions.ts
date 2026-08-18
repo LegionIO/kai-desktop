@@ -141,6 +141,19 @@ registerAutomationAborter(abortAutomationRun);
  * the Alerts tab for retry rather than being silently dropped. The cap is
  * generous (long tools) but bounded so a wedged run can't pin the queue forever.
  */
+/**
+ * Strip the interactive plan-mode TRANSITION tools from a headless/automation/plugin tool set
+ * (R138 f-5). enter_plan_mode/exit_plan_mode drive an INTERACTIVE plan-review flow (mid-stream
+ * tool-refiltering + a GUI approval on exit) that the streamForPlugin path can't perform — it
+ * forwards the stream linearly and never restarts, so an automation that entered plan mode
+ * mid-run would keep its pre-transition MUTATING tool set. A plan-first conversation resumed
+ * via alert-recovery still runs read-only (mode is filtered at run START by executionMode); it
+ * simply can't mid-stream TOGGLE plan mode, which is meaningless without an interactive user.
+ */
+function withoutMidStreamPlanTools(tools: ToolDefinition[]): ToolDefinition[] {
+  return tools.filter((t) => t.name !== 'enter_plan_mode' && t.name !== 'exit_plan_mode');
+}
+
 async function waitForAutomationRunToSettle(conversationId: string, timeoutMs = 30 * 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (isAutomationRunInFlight(conversationId)) {
@@ -441,7 +454,7 @@ async function runAgentAction(
   const correlationId =
     opts?.correlationId ?? newDiagnosticCorrelationId(opts?.forceFreshTurn ? 'alert-resume' : 'automation');
   const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
-  const tools = action.tools ? deps.getRegisteredTools() : [];
+  const tools = action.tools ? withoutMidStreamPlanTools(deps.getRegisteredTools()) : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
   // Background mode has no conversation to stream into — keep the simple

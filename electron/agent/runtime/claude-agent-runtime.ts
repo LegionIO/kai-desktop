@@ -766,9 +766,24 @@ function rewriteSdkError(text: string): string {
     .replace(/Run `claude login`[^.]*/gi, 'Check your API key in Settings → Model Providers.');
 }
 
+// The SDK reports a tool RESULT with only its tool_use_id (no name), but MAIN's mid-stream
+// enter_plan_mode interception (agent.ts) matches on toolName. Record tool_use_id → name at the
+// tool-CALL block so the result event can be stamped with the real name (R138 f-4) — otherwise
+// an SDK enter_plan_mode never triggers the plan-first restart and the query keeps its mutating
+// tools. Bounded: tool_use_ids are unique + short-lived (one turn); evict oldest.
+const sdkToolNameById = new Map<string, string>();
+const SDK_TOOL_NAME_MAP_MAX = 500;
+function recordSdkToolName(toolUseId: string, name: string): void {
+  sdkToolNameById.set(toolUseId, name);
+  while (sdkToolNameById.size > SDK_TOOL_NAME_MAP_MAX) {
+    const oldest = sdkToolNameById.keys().next().value;
+    if (oldest === undefined) break;
+    sdkToolNameById.delete(oldest);
+  }
+}
+
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
   const events: StreamEvent[] = [];
-
   switch (msg.type) {
     // ---------------------------------------------------------------
     // Streaming text deltas (partial assistant messages)
@@ -806,11 +821,14 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
       // content_block_start with tool_use — signal start of tool call
       if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
         const block = event.content_block;
+        const toolCallId = (block.id as string) ?? `tool-${Date.now()}`;
+        const toolName = normalizeToolName((block.name as string) ?? 'unknown');
+        recordSdkToolName(toolCallId, toolName); // so the later result event can carry the name
         events.push({
           conversationId,
           type: 'tool-call',
-          toolCallId: (block.id as string) ?? `tool-${Date.now()}`,
-          toolName: normalizeToolName((block.name as string) ?? 'unknown'),
+          toolCallId,
+          toolName,
           args: block.input ?? {},
           startedAt: new Date().toISOString(),
         });
@@ -858,11 +876,14 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
       for (const block of betaMessage.content) {
         if (block.type === 'tool_use') {
           // Complete tool call from assistant message
+          const toolCallId = block.id ?? `tool-${Date.now()}`;
+          const toolName = normalizeToolName(block.name ?? 'unknown');
+          recordSdkToolName(toolCallId, toolName);
           events.push({
             conversationId,
             type: 'tool-call',
-            toolCallId: block.id ?? `tool-${Date.now()}`,
-            toolName: normalizeToolName(block.name ?? 'unknown'),
+            toolCallId,
+            toolName,
             args: block.input ?? {},
             startedAt: new Date().toISOString(),
           });
@@ -1054,7 +1075,9 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
             conversationId,
             type: 'tool-result',
             toolCallId: block.tool_use_id,
-            toolName: '', // SDK doesn't include tool name in result; UI can match by toolCallId
+            // Recover the tool name recorded at the tool-CALL block so MAIN's mid-stream
+            // enter_plan_mode / exit_plan_mode interception fires for SDK runs too (R138 f-4).
+            toolName: sdkToolNameById.get(block.tool_use_id) ?? '',
             result: isError ? { isError: true, error: resultText } : resultText,
             finishedAt,
           });

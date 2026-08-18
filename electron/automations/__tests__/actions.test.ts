@@ -331,6 +331,32 @@ describe('agent conversationTarget', () => {
     );
   });
 
+  it('strips the interactive plan-mode tools from a headless automation tool set (R138 f-5)', async () => {
+    const t = (name: string) => ({ name, description: name, inputSchema: {}, execute: vi.fn() }) as never;
+    const planRule = rule([
+      {
+        type: 'agent',
+        mode: 'conversation',
+        prompt: 'do the thing',
+        tools: true,
+        conversationTarget: { type: 'per-invocation' },
+        includeHistory: true,
+        onBusyTarget: 'inject',
+      },
+    ]);
+    await executeActions(
+      planRule,
+      evt,
+      deps({ getRegisteredTools: () => [t('enter_plan_mode'), t('exit_plan_mode'), t('read_file')] }),
+    );
+    const forwardedTools = (vi.mocked(streamForPlugin).mock.calls.at(-1)![0] as { tools?: Array<{ name: string }> })
+      .tools;
+    const names = (forwardedTools ?? []).map((x) => x.name);
+    expect(names).toContain('read_file');
+    expect(names).not.toContain('enter_plan_mode');
+    expect(names).not.toContain('exit_plan_mode');
+  });
+
   it('busy target (existing or singleton) diverts before generation, skipping history', async () => {
     resetMockStore({
       convA: {
