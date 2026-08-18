@@ -120,7 +120,12 @@ function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'pla
       persisted = false;
     }
   }
-  broadcastModeChange(mode, conversationId);
+  // Only broadcast when the authoritative disk state MATCHES what we'd announce. Broadcasting
+  // plan-first after a FAILED persist would make the UI show Plan-First while disk stays 'auto',
+  // and the next submit (trust-disk) would run mutating tools despite the displayed mode (R137
+  // f-3). On a failed plan-first persist, suppress the broadcast (the tool also returns
+  // success:false). A failed 'auto' persist is less critical but treat it the same for symmetry.
+  if (persisted) broadcastModeChange(mode, conversationId);
   return persisted;
 }
 

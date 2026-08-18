@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
@@ -347,8 +347,14 @@ function salvageDeletedIdsFromCorruptIndex(indexFilePath: string): string[] {
         continue;
       }
       if (ch === '"') {
-        // A key/string starts here. At depth 1, check if it's exactly "deletedIds".
-        if (depth === 1 && raw.startsWith('"deletedIds"', i)) keyStart = i;
+        // A key/string starts here. At depth 1, record it ONLY if it is exactly "deletedIds"
+        // AND is used as a KEY (followed by `:`), so a depth-1 VALUE string "deletedIds" (e.g.
+        // "activeConversationId":"deletedIds") can't overwrite the real key location (R137 f-6).
+        if (depth === 1 && raw.startsWith('"deletedIds"', i)) {
+          let k = i + '"deletedIds"'.length;
+          while (k < raw.length && /\s/.test(raw[k])) k++;
+          if (raw[k] === ':') keyStart = i;
+        }
         inStr = true;
         continue;
       }
@@ -356,8 +362,17 @@ function salvageDeletedIdsFromCorruptIndex(indexFilePath: string): string[] {
       else if (ch === '}' || ch === ']') depth--;
     }
     if (keyStart === -1) return [];
-    const openBracket = raw.indexOf('[', keyStart);
-    if (openBracket === -1) return [];
+    // Verify the value is actually an ARRAY: after the key + `:` + whitespace the next char must
+    // be `[`. Otherwise (`"deletedIds":null`, a number, a truncation right after the key) do NOT
+    // grab a later unrelated `[` (e.g. settings.pendingConversationIds) and mis-salvage its ids
+    // as deleted (R137 f-6). The key literal is 12 chars ("deletedIds" + the 2 quotes).
+    let j = keyStart + '"deletedIds"'.length;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (raw[j] !== ':') return [];
+    j++;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (raw[j] !== '[') return []; // value isn't an array → nothing to salvage from this key
+    const openBracket = j;
     // Slice to the array's close `]` if present, else to EOF — a truncation mid-array still
     // yields the complete quoted ids that precede the cut (no closing `]` required).
     const closeBracket = raw.indexOf(']', openBracket);
@@ -1175,20 +1190,20 @@ function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
 export function conversationExistsInIndex(appHome: string, id: string): boolean {
   return Boolean(readIndex(appHome).conversations[id]);
 }
-// TRI-STATE existence for a fail-closed decision (R136 f-2): 'exists' | 'absent' | 'unknown'.
-// A plain boolean fails OPEN when the record can't be read (EMFILE/EACCES/truncated JSON) — the
-// caller would treat an existing plan-first chat as recordless and run mutating tools. Probe the
-// record FILE directly (independent of the index, which itself can fail to read / be rebuilt
-// omitting unreadable records): no file → 'absent'; file present + reads OK → 'exists'; file
-// present but UNREADABLE, or the existence probe itself throws → 'unknown' (caller fails closed).
+// TRI-STATE existence for a fail-closed decision (R136 f-2 / R137 f-2): 'exists' | 'absent' |
+// 'unknown'. A plain boolean fails OPEN when the record can't be read (EMFILE/EACCES/truncated
+// JSON) — the caller would treat an existing plan-first chat as recordless and run mutating
+// tools. Probe the record FILE with statSync (NOT existsSync, which returns false for EACCES
+// instead of throwing → would mis-classify an unsearchable dir as 'absent', R137 f-2): ENOENT →
+// 'absent'; any other stat error → 'unknown'; file present + reads OK → 'exists'; present but
+// UNREADABLE → 'unknown' (caller fails closed to plan-first).
 export function conversationExistenceState(appHome: string, id: string): 'exists' | 'absent' | 'unknown' {
-  let fileThere: boolean;
   try {
-    fileThere = existsSync(conversationPath(appHome, id));
-  } catch {
-    return 'unknown';
+    statSync(conversationPath(appHome, id));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return 'absent';
+    return 'unknown'; // EACCES / EMFILE / any other stat failure → can't rule out an existing record
   }
-  if (!fileThere) return 'absent';
   try {
     return readConversation(appHome, id) != null ? 'exists' : 'unknown';
   } catch {

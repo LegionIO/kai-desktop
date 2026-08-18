@@ -232,6 +232,14 @@ describe('per-file read/write', () => {
     );
     recovered = readIndex(appHome);
     expect(recovered.deletedIds).toContain('realGone');
+    // (d) A non-array deletedIds value must NOT grab a later unrelated array (R137 f-6).
+    writeFileSync(
+      idxPath,
+      '{"deletedIds":null,"settings":{"pendingConversationIds":["fresh-id"]},"conversations":{"trunc',
+      'utf-8',
+    );
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds ?? []).not.toContain('fresh-id');
   });
 
   it('conversationExistenceState is a fail-closed tri-state (R136 f-2)', async () => {

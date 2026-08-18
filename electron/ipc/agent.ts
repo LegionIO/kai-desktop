@@ -2546,7 +2546,12 @@ function broadcastExecutionMode(mode: ExecutionMode, conversationId?: string): b
       persisted = false;
     }
   }
-  broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
+  // Only broadcast when the persist succeeded (R137 f-3): announcing a mode the disk doesn't
+  // hold makes the UI show it while the next (trust-disk) turn runs the OTHER mode's tool set.
+  // A conversationId-less broadcast (global default change) has nothing to persist → still send.
+  if (persisted) {
+    broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
+  }
   return persisted;
 }
 
@@ -6877,13 +6882,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Only restart into plan-first if the tool actually ENTERED plan mode. On a
               // fail-closed persist failure (R136 f-1) it returns success:false — restarting
               // then would run a "planning" turn that the trust-disk reconcile sees as auto
-              // (mutating tools). Detect the failure in the result and skip the restart.
+              // (mutating tools). Detect the failure in the result and skip the restart. The
+              // result may be an OBJECT (Mastra) or a STRINGIFIED object (Pi always stringifies
+              // tool results — R137 f-1), so check both shapes for success:false.
               const planResult = (event as { result?: unknown }).result;
-              const planEntered = !(
-                planResult &&
-                typeof planResult === 'object' &&
-                (planResult as { success?: unknown }).success === false
-              );
+              const planEntryFailed =
+                (planResult != null &&
+                  typeof planResult === 'object' &&
+                  (planResult as { success?: unknown }).success === false) ||
+                (typeof planResult === 'string' && /"success"\s*:\s*false/.test(planResult));
+              const planEntered = !planEntryFailed;
               if (!planEntered) {
                 emit(event);
                 // Not entering plan mode — let the turn continue normally (no abort/restart).
@@ -9288,7 +9296,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (typeof toolCallId !== 'string' || toolCallId.length === 0 || toolCallId.length > 4096) {
       return { ok: false, error: 'invalid-tool-call-id' };
     }
+    // Must be a PLAIN object (R137 f-7): a Map / ArrayBuffer / class instance passes a bare
+    // `typeof === 'object'` + `Object.values()` (which is empty for them) so byte-accounting
+    // would measure it as `{}` while structured-clone still retains its (large) internal
+    // payload in MAIN — defeating the 64 KiB/4 MiB bounds. Require Object/null prototype.
     if (answers === null || typeof answers !== 'object' || Array.isArray(answers)) {
+      return { ok: false, error: 'invalid-answers' };
+    }
+    const proto = Object.getPrototypeOf(answers);
+    if (proto !== Object.prototype && proto !== null) {
       return { ok: false, error: 'invalid-answers' };
     }
     for (const v of Object.values(answers)) {

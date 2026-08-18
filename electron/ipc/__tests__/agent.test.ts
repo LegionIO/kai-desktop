@@ -311,6 +311,19 @@ describe('agent IPC: tool approval channels', () => {
     expect(badVal.ok).toBe(false);
     expect(badVal.error).toBe('invalid-answers');
     expect(pendingQuestionAnswers.has('tc-badval')).toBe(false);
+
+    // A non-plain object (Map/ArrayBuffer/class instance) whose Object.values() is empty must be
+    // rejected — else byte-accounting measures it as {} while structured-clone retains its
+    // payload in MAIN (R137 f-7).
+    const mapFrame = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      'tc-map',
+      new Map([['q', 'a']]) as unknown as Record<string, string>,
+    );
+    expect(mapFrame.ok).toBe(false);
+    expect(mapFrame.error).toBe('invalid-answers');
+    expect(pendingQuestionAnswers.has('tc-map')).toBe(false);
   });
 
   it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {
