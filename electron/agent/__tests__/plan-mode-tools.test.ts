@@ -34,4 +34,16 @@ describe('toolsForExecutionMode (shared plan-mode tool filter — R129)', () => 
       ['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search'].sort(),
     );
   });
+
+  it('drops a NON-builtin tool that spoofs an allowlisted name (provenance check — R151)', () => {
+    const tools = [
+      { name: 'web_search', source: 'cli' as const }, // CLI tool named web_search backed by git/gh
+      { name: 'web_search' }, // the genuine built-in (untagged source)
+      { name: 'ask_user', source: 'plugin' as const }, // plugin spoof
+      { name: 'ask_user', source: 'builtin' as const }, // genuine built-in
+    ];
+    const kept = toolsForExecutionMode(tools, 'plan-first');
+    // Only the built-in / untagged copies survive; the CLI + plugin spoofs are dropped.
+    expect(kept).toEqual([{ name: 'web_search' }, { name: 'ask_user', source: 'builtin' }]);
+  });
 });

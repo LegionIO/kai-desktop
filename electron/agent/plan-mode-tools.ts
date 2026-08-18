@@ -1,4 +1,5 @@
 import type { ExecutionMode } from '../config/schema.js';
+import type { ToolSource } from '../tools/types.js';
 
 /**
  * The ONLY custom/registered tools allowed in plan-first (plan) mode. Plan mode is a
@@ -9,6 +10,12 @@ import type { ExecutionMode } from '../config/schema.js';
  * Shared so EVERY stream entry point applies the same filter — the main GUI/CLI stream path
  * AND the plugin-generate path used by idle/automation/alert-recovery resumes (a recovered
  * turn in a plan-first conversation must be just as read-only as an interactive one; R129).
+ *
+ * These are all BUILT-IN tools. The allowlist is matched by name AND provenance (R151): a
+ * CLI/plugin/MCP/skill tool can register ANY name — a CLI tool named `web_search` backed by
+ * `git`/`gh` would otherwise keep the allowlisted name (CLI tools register before built-ins, and
+ * dedup keeps the first) and slip a mutating executor into the "read-only" set. Only a built-in
+ * (source 'builtin' or untagged) with an allowlisted name is kept.
  */
 export const PLAN_MODE_CUSTOM_TOOLS = new Set([
   'ask_user',
@@ -18,10 +25,21 @@ export const PLAN_MODE_CUSTOM_TOOLS = new Set([
   'web_search',
 ]);
 
+/** A tool is plan-mode-safe only if its name is allowlisted AND it is a BUILT-IN (source
+ *  'builtin' or undefined — the built-in default). A same-named CLI/plugin/MCP/skill tool is a
+ *  spoof and must be dropped in plan-first (R151). */
+function isPlanModeSafe(tool: { name: string; source?: ToolSource }): boolean {
+  if (!PLAN_MODE_CUSTOM_TOOLS.has(tool.name)) return false;
+  return tool.source === undefined || tool.source === 'builtin';
+}
+
 /** Filter a tool list down to the plan-mode-safe set when in plan-first; identity otherwise. */
-export function toolsForExecutionMode<T extends { name: string }>(tools: T[], executionMode: ExecutionMode): T[] {
+export function toolsForExecutionMode<T extends { name: string; source?: ToolSource }>(
+  tools: T[],
+  executionMode: ExecutionMode,
+): T[] {
   if (executionMode === 'plan-first') {
-    return tools.filter((tool) => PLAN_MODE_CUSTOM_TOOLS.has(tool.name));
+    return tools.filter(isPlanModeSafe);
   }
   return tools;
 }
