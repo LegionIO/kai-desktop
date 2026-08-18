@@ -450,6 +450,53 @@ export function writeIndex(appHome: string, index: ConversationIndex): void {
   atomicWriteFileSync(indexPath(appHome), JSON.stringify(index, null, 2));
 }
 
+/** Startup reconciliation for the delete/clear durable-write-failure gap (R165 f-2). A best-effort
+ *  index write that FAILED after a conversation's file was already removed leaves a GHOST index
+ *  entry (file gone) with NO durable deleted-id — the in-memory tombstone + ghost flag that guarded
+ *  it are process-local and vanish on restart, so the deleted chat would REAPPEAR in the list AND be
+ *  resurrectable by a stale writer. Run ONCE at backend startup: scan every indexed id, and for each
+ *  whose record FILE is definitively gone (ENOENT), drop the entry AND push its id into the DURABLE
+ *  deletedIds ring so it survives as a tombstone. Fail-OPEN per entry (only a definite ENOENT drops
+ *  it — a transient stat error keeps it) so a readable chat is never lost. Returns the number
+ *  reconciled. Cheap enough for startup (one O(N) statSync pass; startup already does a full sweep). */
+export function reconcileGhostIndexEntries(appHome: string): number {
+  if (monolithMigrationPending(appHome)) return 0;
+  let index: ConversationIndex;
+  try {
+    index = readIndex(appHome);
+  } catch {
+    return 0; // a corrupt index is handled by readIndex's own rebuild path
+  }
+  const ghostIds: string[] = [];
+  for (const id of Object.keys(index.conversations)) {
+    let missing = false;
+    try {
+      statSync(conversationPath(appHome, id));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') missing = true;
+      // any other stat error → keep the entry (fail open)
+    }
+    if (missing) ghostIds.push(id);
+  }
+  if (ghostIds.length === 0) return 0;
+  for (const id of ghostIds) {
+    delete index.conversations[id];
+    if (index.activeConversationId === id) index.activeConversationId = null;
+    pushDurableDeletedId(index, id); // durable tombstone so a stale writer can't resurrect it
+  }
+  try {
+    writeIndex(appHome, index);
+  } catch (err) {
+    // If even this reconcile write fails, leave the ghost flag set so the list-filter still hides
+    // the entries for this session; a later successful write reconciles.
+    console.error('[conversation-store] reconcileGhostIndexEntries: index write failed', err);
+    markIndexMayHaveGhosts();
+    return 0;
+  }
+  console.info(`[conversation-store] reconciled ${ghostIds.length} ghost index entr(y|ies) at startup`);
+  return ghostIds.length;
+}
+
 // ── conversation read/write ───────────────────────────────────────────────────
 
 export function readConversation(appHome: string, id: string): ConversationRecord | null {

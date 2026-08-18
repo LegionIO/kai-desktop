@@ -324,12 +324,16 @@ export class PiRuntime implements AgentRuntime {
       // spawn), `{ once: true }` won't fire — reap immediately.
       if (abortSignal?.aborted) onAbort();
 
-      // Send the prompt via stdin, then close it so pi runs single-shot.
-      try {
-        spawned.stdin.write(promptText);
-        spawned.stdin.end();
-      } catch {
-        /* if the process already failed to spawn, the error path below handles it */
+      // Send the prompt via stdin, then close it so pi runs single-shot — UNLESS a Stop already
+      // aborted (onAbort above killed the child): writing would still deliver the prompt to a
+      // not-yet-dead / SIGTERM-ignoring pi and let it execute tools after Stop (R165 f-1).
+      if (!abortSignal?.aborted) {
+        try {
+          spawned.stdin.write(promptText);
+          spawned.stdin.end();
+        } catch {
+          /* if the process already failed to spawn, the error path below handles it */
+        }
       }
 
       let buf = '';
@@ -460,10 +464,16 @@ function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
       process.kill(-child.pid, 'SIGTERM');
       const pid = child.pid;
       const timer = setTimeout(() => {
-        try {
-          process.kill(-pid, 'SIGKILL');
-        } catch {
-          /* group already gone (ESRCH) */
+        // Only escalate to a GROUP SIGKILL while the LEADER is still alive (R165 f-3): once it has
+        // exited, its numeric pid can be RECYCLED by the OS and a `-pid` SIGKILL could hit an
+        // unrelated process group. A live leader holds its pid (not recyclable), so the group kill
+        // is safe; if it already exited, forgo the (rare) backgrounded-survivor kill.
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            /* group already gone (ESRCH) */
+          }
         }
       }, 2000);
       timer.unref?.();

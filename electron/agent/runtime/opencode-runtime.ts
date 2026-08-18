@@ -549,11 +549,16 @@ function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
   // First TERM. Do NOT early-return on child.exitCode — the LEADER may have exited while backgrounded
   // group members live on; the group-directed signal still reaches them.
   groupKill('SIGTERM');
-  // Escalate to SIGKILL after a grace period. Unconditional (NOT cancelled on leader-close): a
-  // backgrounded group member can outlive the leader, and a group SIGKILL to an already-dead group
-  // is a harmless ESRCH (swallowed). unref so the timer never keeps the event loop / process alive.
+  // Escalate to SIGKILL after a grace period — but ONLY if the LEADER is still alive at fire time
+  // (R165 f-3): once the leader has exited, its numeric pid can be RECYCLED by the OS, so a
+  // `-pid` group SIGKILL could hit an unrelated process group. While the leader is alive its pid is
+  // held (not recyclable), so the group signal is safe. If the leader already exited, its own
+  // children are reparented/reaped by the OS; we forgo the (rare) backgrounded-survivor kill rather
+  // than risk killing a recycled pid. unref so the timer never keeps the event loop / process alive.
   const killTimer = setTimeout(() => {
-    groupKill('SIGKILL');
+    if (child.exitCode === null && child.signalCode === null) {
+      groupKill('SIGKILL');
+    }
   }, 2000);
   if (typeof killTimer.unref === 'function') killTimer.unref();
 }

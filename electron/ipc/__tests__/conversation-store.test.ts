@@ -16,6 +16,7 @@ import {
   deleteConversations,
   clearAllConversations,
   reindexIfStale,
+  reconcileGhostIndexEntries,
   writeIndex,
   toIndexEntry,
   migrateMonolithIfNeeded,
@@ -191,6 +192,33 @@ describe('per-file read/write', () => {
 
     // Second call is a no-op (version now current).
     expect(reindexIfStale(appHome)).toBe(0);
+  });
+
+  it('reconcileGhostIndexEntries drops entries whose file is gone and durably tombstones them', () => {
+    // Two real chats, then remove ONE file out-of-band leaving its index entry — the exact ghost
+    // state a delete whose durable index write failed leaves across a restart.
+    writeConversation(appHome, makeConv('keep'));
+    writeConversation(appHome, makeConv('ghost'));
+    rmSync(join(appHome, 'data', 'conversations', 'ghost.json'), { force: true });
+    expect(readIndex(appHome).conversations.ghost).toBeDefined(); // ghost still indexed
+
+    const reconciled = reconcileGhostIndexEntries(appHome);
+    expect(reconciled).toBe(1);
+
+    const after = readIndex(appHome);
+    expect(after.conversations.ghost).toBeUndefined(); // dropped
+    expect(after.conversations.keep).toBeDefined(); // live chat retained
+    expect(Array.isArray(after.deletedIds) ? after.deletedIds : []).toContain('ghost'); // durable tombstone
+
+    // A stale writer can no longer resurrect the ghost: the durable ring suppresses the write.
+    // (Clear the in-memory tombstone first so ONLY the durable ring is under test.)
+    __resetDeleteTombstonesForTests();
+    writeConversation(appHome, makeConv('ghost', { title: 'resurrect attempt' }));
+    expect(readConversation(appHome, 'ghost')).toBeNull();
+    expect(readIndex(appHome).conversations.ghost).toBeUndefined();
+
+    // No-op when the index is already consistent.
+    expect(reconcileGhostIndexEntries(appHome)).toBe(0);
   });
 
   it('deleteConversation removes the file and index entry', () => {

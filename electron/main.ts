@@ -49,6 +49,7 @@ import { registerConversationHandlers } from './ipc/conversations.js';
 import {
   resetStaleRunStatus,
   reindexIfStale,
+  reconcileGhostIndexEntries,
   readConversation as readConversationRecord,
   writeConversation as writeConversationRecord,
 } from './ipc/conversation-store.js';
@@ -1882,6 +1883,15 @@ if (gotSingleInstanceLock) {
       reindexIfStale(APP_HOME);
     } catch (err) {
       console.warn(`[${__BRAND_PRODUCT_NAME}] conversation reindex failed (non-fatal):`, err);
+    }
+
+    // Reconcile GHOST index entries left by a delete/clear whose durable index write failed before
+    // this process started (R165 f-2): drop entries whose record file is gone and durably tombstone
+    // their ids, so a deleted chat can't reappear or be resurrected after restart.
+    try {
+      reconcileGhostIndexEntries(APP_HOME);
+    } catch (err) {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] ghost-index reconcile failed (non-fatal):`, err);
     }
 
     // Start the local IPC socket EARLY — as soon as the conversation/agent IPC
