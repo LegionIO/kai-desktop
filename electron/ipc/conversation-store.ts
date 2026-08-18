@@ -1260,13 +1260,13 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
   if (isRecentlyDeleted(sanitized.id)) {
     const idx = readIndex(appHome);
     if (!idx.conversations[sanitized.id]) {
-      lastWriteSuppressed.add(sanitized.id);
+      markWriteSuppressed(sanitized.id);
       return sanitized;
     }
   } else {
     const idx = readIndex(appHome);
     if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) {
-      lastWriteSuppressed.add(sanitized.id);
+      markWriteSuppressed(sanitized.id);
       return sanitized;
     }
   }
@@ -1282,20 +1282,25 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
 // Lets a caller learn suppression WITHOUT a second (throwable) isWriteTombstoned lookup after the
 // write — the R147-f-1 fix's post-write re-lookup could throw AFTER the write already committed,
 // and defaulting that to the PERMANENT conversation-deleted signal left a ghost running turn
-// (R148). Bounded; an entry is only read immediately after its write on the same tick.
+// (R148). Bounded at ADD time (not only on consume) so a non-consuming caller — e.g. the plugin
+// upsert, which reads suppression via isWriteTombstoned, not consumeWriteWasSuppressed — can't
+// grow it without bound via repeated stale writes after a clear (R149).
 const lastWriteSuppressed = new Set<string>();
 const MAX_WRITE_SUPPRESSED = 500;
-/** True iff the most recent {@link writeConversation} for `id` suppressed the write (tombstoned).
- *  Consumes the flag (one-shot) so a stale later read can't misreport. Never throws. */
-export function consumeWriteWasSuppressed(id: string): boolean {
-  const was = lastWriteSuppressed.delete(id);
-  // Bound the set (it only grows on suppressed writes that were never consumed — rare).
+function markWriteSuppressed(id: string): void {
+  // Re-insert at the back (delete → add) so recency reflects usefulness, then evict oldest.
+  lastWriteSuppressed.delete(id);
+  lastWriteSuppressed.add(id);
   while (lastWriteSuppressed.size > MAX_WRITE_SUPPRESSED) {
     const oldest = lastWriteSuppressed.values().next().value;
     if (oldest === undefined) break;
     lastWriteSuppressed.delete(oldest);
   }
-  return was;
+}
+/** True iff the most recent {@link writeConversation} for `id` suppressed the write (tombstoned).
+ *  Consumes the flag (one-shot) so a stale later read can't misreport. Never throws. */
+export function consumeWriteWasSuppressed(id: string): boolean {
+  return lastWriteSuppressed.delete(id);
 }
 
 /** Delete a single conversation. Returns true iff the data file is GONE (removed now, or

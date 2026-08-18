@@ -218,6 +218,24 @@ describe('per-file read/write', () => {
     expect(consumeWriteWasSuppressed('live-w')).toBe(false); // consumed (one-shot)
   });
 
+  it('the suppression flag set stays bounded even when writes are NEVER consumed (R149)', async () => {
+    const { consumeWriteWasSuppressed } = await import('../conversation-store.js');
+    // Simulate a bulk clear + a flood of stale re-puts that are all suppressed and NEVER consumed
+    // (the plugin-upsert path reads via isWriteTombstoned, not consumeWriteWasSuppressed).
+    // Pre-seed ALL the tombstone ids in ONE index write (avoid per-iteration read/write I/O so the
+    // loop stays fast under parallel full-suite load), then flood suppressed writes.
+    const N = 560; // just past the 500 cap
+    const ids = Array.from({ length: N }, (_, i) => `flood-${i}`);
+    writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: {}, deletedIds: ids });
+    for (const id of ids) writeConversation(appHome, makeConv(id)); // each suppressed (tombstoned)
+    // The newest id is still tracked (add-time eviction keeps the most-recent). And an id from
+    // the very START of the flood — well past the 500 cap — was evicted. (We avoid asserting an
+    // exact boundary id: eviction is recency-ordered and other tests in this file share the
+    // module-level set, so only "newest kept, ancient evicted" is a stable invariant.)
+    expect(consumeWriteWasSuppressed(`flood-${N - 1}`)).toBe(true);
+    expect(consumeWriteWasSuppressed('flood-0')).toBe(false);
+  });
+
   it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4 / R136 f-3)', () => {
     // A confirmed delete records the durable ring; then the index file is corrupted (e.g. a
     // truncated write on crash). readIndex must rebuild from live files BUT preserve deletedIds
