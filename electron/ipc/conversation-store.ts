@@ -1323,17 +1323,30 @@ export function deleteConversation(appHome: string, id: string): boolean {
   // Tombstone only once the file is actually gone, so a stale in-flight persist can't
   // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
   // (Deleting an already-absent id is a benign idempotent success — returns true.)
+  // The in-memory tombstone is set BEFORE the index read/write below so that even if the durable
+  // index update THROWS (readIndex/writeIndex EMFILE/EACCES), this session is still protected from
+  // resurrection AND the caller still learns the file is GONE (R161 f-1): the index update is a
+  // best-effort DURABILITY step, not a precondition for the delete having happened. Letting an
+  // index-write throw propagate here would (a) skip the caller's stream/tool teardown + broadcast
+  // and (b) leave the stale index entry able to resurrect the conversation on the NEXT persist —
+  // strictly worse than swallowing and returning the truth: the record file is gone.
   tombstoneConversation(id);
-  const index = readIndex(appHome);
-  if (index.conversations[id]) {
-    delete index.conversations[id];
-    if (index.activeConversationId === id) index.activeConversationId = null;
+  try {
+    const index = readIndex(appHome);
+    if (index.conversations[id]) {
+      delete index.conversations[id];
+      if (index.activeConversationId === id) index.activeConversationId = null;
+    }
+    // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was
+    // already absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone
+    // and a stale client could resurrect the just-deleted conversation.
+    pushDurableDeletedId(index, id);
+    writeIndex(appHome, index);
+  } catch {
+    // Durable index update failed AFTER the file was removed. The in-memory tombstone (above) still
+    // guards this session; the caller must still tear down streams + broadcast the delete. A later
+    // successful index write (or the salvage-on-corrupt-index path) re-drops the durable id.
   }
-  // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was already
-  // absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone and a
-  // stale client could resurrect the just-deleted conversation.
-  pushDurableDeletedId(index, id);
-  writeIndex(appHome, index);
   return true;
 }
 
@@ -1381,7 +1394,18 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     // effects and must get the same teardown.
     removed.push(id);
   }
-  if (removed.length > 0) writeIndex(appHome, index);
+  if (removed.length > 0) {
+    // Durable index write is best-effort: every removed id ALREADY has its file gone + an in-memory
+    // tombstone (set in the loop), so a writeIndex throw here must NOT prevent the caller from
+    // tearing down streams/tools + broadcasting the deletes for ids we've committed to (R161 f-1).
+    // Swallow and return `removed`; the stale index entries are re-dropped by a later successful
+    // write or the salvage-on-corrupt-index path, and this session is resurrection-guarded.
+    try {
+      writeIndex(appHome, index);
+    } catch {
+      /* durable persist failed after removal — in-memory tombstones still guard this session */
+    }
+  }
   return removed;
 }
 
@@ -1441,7 +1465,16 @@ export function clearAllConversations(appHome: string): { cleared: string[]; ful
     deletedIds: Array.isArray(priorIndex.deletedIds) ? [...priorIndex.deletedIds] : [],
   };
   for (const id of cleared) pushDurableDeletedId(nextIndex, id);
-  writeIndex(appHome, nextIndex);
+  // Durable index write is best-effort: every cleared id ALREADY has its file gone + an in-memory
+  // tombstone (set in the loop), so a writeIndex throw here must NOT prevent the caller from tearing
+  // down streams/tools + broadcasting the deletes/reset for the ids we've committed to (R161 f-1).
+  // Swallow and return the computed result; this session is resurrection-guarded and a later
+  // successful write (or salvage-on-corrupt-index) re-persists the durable ring.
+  try {
+    writeIndex(appHome, nextIndex);
+  } catch {
+    /* durable persist failed after removal — in-memory tombstones still guard this session */
+  }
   return { cleared, fullyCleared: !anySurvived };
 }
 
