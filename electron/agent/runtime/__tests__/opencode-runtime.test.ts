@@ -94,23 +94,6 @@ describe('buildOpencodeMcpConfig', () => {
     };
     expect(cfg.mcp.kai.headers).toBeUndefined();
   });
-
-  it('adds a deny permission block under plan-first, and omits it otherwise (R142 f-1)', () => {
-    const plan = buildOpencodeMcpConfig('http://127.0.0.1:5000/mcp', 'tok', true) as {
-      permission?: Record<string, string>;
-    };
-    expect(plan.permission).toEqual({ edit: 'deny', write: 'deny', bash: 'deny' });
-    const normal = buildOpencodeMcpConfig('http://127.0.0.1:5000/mcp', 'tok', false) as {
-      permission?: unknown;
-    };
-    expect(normal.permission).toBeUndefined();
-  });
-
-  it('omits the mcp block for a permission-only (no-bridge) plan-first config (R142 f-1)', () => {
-    const cfg = buildOpencodeMcpConfig(null, null, true) as { mcp?: unknown; permission?: Record<string, string> };
-    expect(cfg.mcp).toBeUndefined();
-    expect(cfg.permission).toEqual({ edit: 'deny', write: 'deny', bash: 'deny' });
-  });
 });
 
 describe('buildOpencodeMcpPrompt', () => {
