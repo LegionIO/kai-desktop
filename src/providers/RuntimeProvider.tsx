@@ -1301,8 +1301,15 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
       let ok = false;
       for (let attempt = 0; attempt < 4 && !ok; attempt++) {
         try {
-          await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
-          ok = true;
+          // Honor the main-side result (R153 f-2): set-pending-drafts returns {ok:false} when it
+          // can't read the conversation (a transient EMFILE/read failure — or a genuine delete).
+          // Treating the resolved promise as success discarded the ONLY durable-write delta on a
+          // transient blip → the displaced prompt is lost if the user switched away + Kai exits
+          // before local restore. Retry on {ok:false}; the bounded budget + re-fold below give up
+          // (a genuinely-deleted conversation has no draft to preserve anyway).
+          const res = await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
+          ok = res ? res.ok !== false : true; // older bridge (undefined) → treat resolve as success
+          if (!ok && attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
         } catch {
           if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
         }

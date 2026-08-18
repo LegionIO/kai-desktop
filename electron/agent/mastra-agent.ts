@@ -1305,7 +1305,13 @@ export async function* streamAgentResponse(
       planModeGateable: options?.planModeGateable,
     },
   );
-  const providerDefinedTools = buildProviderDefinedTools(modelConfig);
+  // Provider-DEFINED tools (server-side web_search / code_interpreter / bash / computer, from
+  // modelConfig.providerTools) execute INSIDE the provider — they never flow through Kai's tool
+  // wrapper, can't be gated, and a config-controlled name could even collide with a built-in.
+  // In PLAN-FIRST they must be dropped entirely (R153 f-3): Kai can't guarantee a provider tool
+  // is read-only (code_interpreter/bash mutate), and it bypasses the allowlist/provenance filter
+  // applied to custom tools above. A plan-first turn keeps only Kai's own read-only tools.
+  const providerDefinedTools = executionMode === 'plan-first' ? {} : buildProviderDefinedTools(modelConfig);
 
   // Merge: workspace tools (native Mastra) + custom tools (bridged)
   const allTools = { ...mastraCustomTools, ...providerDefinedTools, ...workspaceTools };

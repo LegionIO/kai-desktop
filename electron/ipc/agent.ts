@@ -112,7 +112,7 @@ function ipcDebugLog(msg: string): void {
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ChatMessage as ChatMessageForCompaction } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
-import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
+import { ensureSafeToolDefinitions, findToolByName, dedupeToolNames } from '../tools/naming.js';
 import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import { buildAgentChildEnv, resolveConfinedCwd, providerKeyEnv } from '../agent/runtime/confinement.js';
 import {
@@ -2747,25 +2747,28 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
 /** Hot-swap MCP tools without touching built-in, skill, or plugin tools */
 export function updateMcpTools(mcpTools: ToolDefinition[]): void {
   const nonMcp = registeredTools.filter((t) => t.source !== 'mcp');
-  registeredTools = [...nonMcp, ...ensureSafeToolDefinitions(mcpTools)];
+  // Re-run dedup after every hot-swap (R153 f-1): appending safe-but-not-deduped names lets a
+  // reloaded tool SHADOW a built-in in the name-keyed tool map (a CLI/MCP `enter_plan_mode` would
+  // execute instead of entering plan mode). dedupeToolNames reserves built-in names + disambiguates.
+  registeredTools = dedupeToolNames([...nonMcp, ...ensureSafeToolDefinitions(mcpTools)]);
 }
 
 /** Hot-swap skill tools without touching built-in or MCP tools */
 export function updateSkillTools(skillTools: ToolDefinition[]): void {
   const nonSkill = registeredTools.filter((t) => t.source !== 'skill');
-  registeredTools = [...nonSkill, ...ensureSafeToolDefinitions(skillTools)];
+  registeredTools = dedupeToolNames([...nonSkill, ...ensureSafeToolDefinitions(skillTools)]);
 }
 
 /** Hot-swap plugin tools without touching built-in, MCP, or skill tools */
 export function updatePluginTools(pluginTools: ToolDefinition[]): void {
   const nonPlugin = registeredTools.filter((t) => t.source !== 'plugin');
-  registeredTools = [...nonPlugin, ...ensureSafeToolDefinitions(pluginTools)];
+  registeredTools = dedupeToolNames([...nonPlugin, ...ensureSafeToolDefinitions(pluginTools)]);
 }
 
 /** Hot-swap CLI tools without touching built-in, MCP, skill, or plugin tools */
 export function updateCliTools(cliTools: ToolDefinition[]): void {
   const nonCli = registeredTools.filter((t) => t.source !== 'cli');
-  registeredTools = [...nonCli, ...ensureSafeToolDefinitions(cliTools)];
+  registeredTools = dedupeToolNames([...nonCli, ...ensureSafeToolDefinitions(cliTools)]);
 }
 
 export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
