@@ -10,7 +10,12 @@ import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { capRemoteEvent } from './remote-frame-cap.js';
 import { z } from 'zod';
-import { streamAgentResponse, streamWithFallback, getProviderDefinedToolNames, buildAgentInstructions } from './mastra-agent.js';
+import {
+  streamAgentResponse,
+  streamWithFallback,
+  getProviderDefinedToolNames,
+  buildAgentInstructions,
+} from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import { hookDispatcher } from './hooks/dispatcher.js';
 import type { LLMModelConfig, ResolvedStreamConfig } from './model-catalog.js';
@@ -517,7 +522,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // un-suppress them → stuck {pending}).
     // Recomputed on model-fallback (a cross-provider fallback changes which
     // tools are provider-defined vs wrapped-local).
-    let subProviderToolNames = getProviderDefinedToolNames(modelConfig);
+    let subProviderToolNames = getProviderDefinedToolNames(modelConfig, subAgentConfig.tools?.executionMode);
     const subHookRewrittenArgs = new Map<string, unknown>();
     // Sub-agent runtime has no exec/stream id pairing map. To reconcile a
     // possible id mismatch, the stream loop records suppressed stream ids per
@@ -906,7 +911,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
               (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
             : undefined;
-          if (nextEntry) subProviderToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
+          if (nextEntry)
+            subProviderToolNames = getProviderDefinedToolNames(
+              nextEntry.modelConfig,
+              subAgentConfig.tools?.executionMode,
+            );
           // streamWithFallback restarts the next model from the original messages —
           // reset the same-turn media budget so the discarded attempt's committed
           // args/text/media don't phantom-charge the fallback's budget, and recompute
@@ -1066,9 +1075,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       // No control signal and no follow-up — brief window then auto-complete.
       if (!signal) {
         // Only wait if a turn remains to process anything that arrives.
-        const lateFollowUp = hasTurnForFollowUp()
-          ? await waitForFollowUp(getFollowUp, abortSignal, 5000)
-          : null;
+        const lateFollowUp = hasTurnForFollowUp() ? await waitForFollowUp(getFollowUp, abortSignal, 5000) : null;
         if (lateFollowUp) {
           const fu = await addFollowUpMessage(lateFollowUp);
           if ('deniedReason' in fu) {
@@ -1104,12 +1111,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       yield emitStatus(undefined as never, 'stopped', fullResponseText.slice(0, 500));
     } else if (terminalOutcome === null) {
       terminalOutcome = 'awaiting-timeout';
-      yield emitStatus(
-        undefined as never,
-        'paused',
-        `Paused — reached the turn limit (${maxTurns}).`,
-        'turn-limit',
-      );
+      yield emitStatus(undefined as never, 'paused', `Paused — reached the turn limit (${maxTurns}).`, 'turn-limit');
     }
 
     // Refresh the final GATED snapshot (message history + system prompt). The
