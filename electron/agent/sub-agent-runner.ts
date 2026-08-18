@@ -632,6 +632,12 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       if (abortSignal?.aborted) break;
       turnCount++;
       controlSignal.current = null; // reset for this turn
+      // Reset the provider-tool exemption set to THIS turn's starting (primary) model each turn
+      // (R156 f-1): the set is recomputed within a turn on model-fallback, so if turn N ended on
+      // a fallback model whose provider had a native web_search, turn N+1 (which restarts on the
+      // primary) would otherwise keep that stale exemption and skip DLP arg-suppression for a
+      // LOCAL primary web_search. A turn that itself falls back re-recomputes it (line ~909).
+      subProviderToolNames = getProviderDefinedToolNames(modelConfig, subAgentConfig.tools?.executionMode);
 
       // The initial prompt was gated up front; each follow-up is gated inside
       // addFollowUpMessage before it's added/broadcast. So no per-turn gate here.

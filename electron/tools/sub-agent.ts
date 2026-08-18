@@ -19,6 +19,7 @@ import {
 } from '../agent/sub-agent-runner.js';
 import type { SubAgentEvent } from '../agent/sub-agent-runner.js';
 import type { LLMModelConfig, ResolvedStreamConfig } from '../agent/model-catalog.js';
+import { readConversation } from '../ipc/conversation-store.js';
 import { resolveModelForThread, resolveStreamConfig } from '../agent/model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from './types.js';
@@ -537,8 +538,7 @@ async function correctIfAbortedAfterFinalize(opts: {
   const { subAgentConversationId, aborted, ownerGeneration, config, dbPath, routing } = opts;
   if (!aborted) return false;
   const stillCurrent = subAgentRunGeneration.get(subAgentConversationId) === ownerGeneration;
-  const hadResumable =
-    subAgentState.has(subAgentConversationId) || pendingResumeQueues.has(subAgentConversationId);
+  const hadResumable = subAgentState.has(subAgentConversationId) || pendingResumeQueues.has(subAgentConversationId);
   if (!stillCurrent || !hadResumable) return false;
   subAgentState.delete(subAgentConversationId);
   pendingResumeQueues.delete(subAgentConversationId);
@@ -685,6 +685,27 @@ async function resumeSubAgent(
     task,
     systemPrompt: persistedSystemPrompt,
   } = state;
+
+  // Re-derive the PARENT CONVERSATION's CURRENT executionMode at RESUME time (R156 f-2): the
+  // persisted state.config captured the mode at SPAWN, so an auto child paused while its parent
+  // switched to plan-first would otherwise resume with mutating auto tools. Read the parent's
+  // live mode and overlay it onto the resume config. appHome is derivable from dbPath
+  // (<appHome>/data/memory.db). Best-effort: fall back to the snapshot on any read failure.
+  let resumeConfig = config;
+  try {
+    const appHomeForResume = join(dbPath, '..', '..');
+    const parentConv = parentConversationId
+      ? (readConversation(appHomeForResume, parentConversationId) as {
+          executionMode?: 'auto' | 'plan-first';
+        } | null)
+      : null;
+    const parentMode = parentConv?.executionMode;
+    if (parentMode && parentMode !== config.tools?.executionMode) {
+      resumeConfig = { ...config, tools: { ...config.tools, executionMode: parentMode } };
+    }
+  } catch {
+    /* best-effort: keep the persisted snapshot's mode */
+  }
 
   const localController = new AbortController();
   // Admission check FIRST, before takeover. A resume must respect the same caps
@@ -846,7 +867,7 @@ async function resumeSubAgent(
       parentToolCallId,
       task,
       depth,
-      config,
+      config: resumeConfig,
       modelConfig,
       ...(streamConfig ? { streamConfig } : {}),
       profileKey: profileKey ?? null,
@@ -1179,7 +1200,25 @@ export function createSubAgentTool(
         profile?: string;
         context?: string;
       };
-      const config = getConfig();
+      const globalConfig = getConfig();
+      // Inherit the PARENT CONVERSATION's effective executionMode, NOT the global config's
+      // (R156 f-2): a sub-agent spawned from a plan-first conversation (where the CONVERSATION is
+      // plan-first but the global default is auto) must run read-only too. Read it live at
+      // spawn/resume time (not a stale snapshot) so a parent that switched to plan-first WHILE an
+      // auto child was paused resumes the child in plan-first. Overlay onto config so every
+      // downstream use (tool filtering, provider-tool drop, DLP names) sees the right mode.
+      let config = globalConfig;
+      try {
+        const parentConv = ctx.conversationId
+          ? (readConversation(appHome, ctx.conversationId) as { executionMode?: 'auto' | 'plan-first' } | null)
+          : null;
+        const parentMode = parentConv?.executionMode;
+        if (parentMode && parentMode !== globalConfig.tools?.executionMode) {
+          config = { ...globalConfig, tools: { ...globalConfig.tools, executionMode: parentMode } };
+        }
+      } catch {
+        /* best-effort: fall back to the global config's mode */
+      }
       const subAgentConfig = config.tools?.subAgents ?? {
         enabled: true,
         maxDepth: 3,
