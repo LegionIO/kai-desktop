@@ -690,18 +690,29 @@ async function resumeSubAgent(
   // persisted state.config captured the mode at SPAWN, so an auto child paused while its parent
   // switched to plan-first would otherwise resume with mutating auto tools. Read the parent's
   // live mode and overlay it onto the resume config. appHome is derivable from dbPath
-  // (<appHome>/data/memory.db). Best-effort: fall back to the snapshot on any read failure.
+  // (<appHome>/data/memory.db). NOTE the resumable state's field NAMED `parentConversationId`
+  // actually holds the TOOL-CALL id per the resume-routing convention — the real parent CONVERSATION
+  // id is `parentThreadId` (R157 f-1); reading the tool-call id would always miss. An existing
+  // conversation stores auto by OMITTING executionMode (conversations.ts deletes it), so a present
+  // parent record means mode = executionMode ?? 'auto' and we ALWAYS overlay that (R157 f-2) — a
+  // missing field must not be read as "no opinion" (that would retain a stale plan-first snapshot
+  // after the parent switched back to auto, or run plan-first under a plan-first GLOBAL when the
+  // parent conversation is really auto). We overlay only when the parent record was READ (exists);
+  // a null/throw read keeps the snapshot mode. Best-effort.
   let resumeConfig = config;
   try {
     const appHomeForResume = join(dbPath, '..', '..');
-    const parentConv = parentConversationId
-      ? (readConversation(appHomeForResume, parentConversationId) as {
+    const parentConvId = parentThreadId ?? null;
+    const parentConv = parentConvId
+      ? (readConversation(appHomeForResume, parentConvId) as {
           executionMode?: 'auto' | 'plan-first';
         } | null)
       : null;
-    const parentMode = parentConv?.executionMode;
-    if (parentMode && parentMode !== config.tools?.executionMode) {
-      resumeConfig = { ...config, tools: { ...config.tools, executionMode: parentMode } };
+    if (parentConv) {
+      const parentMode: 'auto' | 'plan-first' = parentConv.executionMode ?? 'auto';
+      if (parentMode !== (config.tools?.executionMode ?? 'auto')) {
+        resumeConfig = { ...config, tools: { ...config.tools, executionMode: parentMode } };
+      }
     }
   } catch {
     /* best-effort: keep the persisted snapshot's mode */
@@ -1206,15 +1217,22 @@ export function createSubAgentTool(
       // plan-first but the global default is auto) must run read-only too. Read it live at
       // spawn/resume time (not a stale snapshot) so a parent that switched to plan-first WHILE an
       // auto child was paused resumes the child in plan-first. Overlay onto config so every
-      // downstream use (tool filtering, provider-tool drop, DLP names) sees the right mode.
+      // downstream use (tool filtering, provider-tool drop, DLP names) sees the right mode. An
+      // existing conversation stores auto by OMITTING executionMode (conversations.ts deletes it),
+      // so a present parent record means mode = executionMode ?? 'auto' and we ALWAYS overlay that
+      // (R157 f-2): a missing field is auto, NOT "no opinion" — otherwise a plan-first GLOBAL would
+      // leak into an auto parent conversation's child. Overlay only when the parent record was READ
+      // (ctx.conversationId here is the LIVE parent conversation id, not the resume-state field).
       let config = globalConfig;
       try {
         const parentConv = ctx.conversationId
           ? (readConversation(appHome, ctx.conversationId) as { executionMode?: 'auto' | 'plan-first' } | null)
           : null;
-        const parentMode = parentConv?.executionMode;
-        if (parentMode && parentMode !== globalConfig.tools?.executionMode) {
-          config = { ...globalConfig, tools: { ...globalConfig.tools, executionMode: parentMode } };
+        if (parentConv) {
+          const parentMode: 'auto' | 'plan-first' = parentConv.executionMode ?? 'auto';
+          if (parentMode !== (globalConfig.tools?.executionMode ?? 'auto')) {
+            config = { ...globalConfig, tools: { ...globalConfig.tools, executionMode: parentMode } };
+          }
         }
       } catch {
         /* best-effort: fall back to the global config's mode */
