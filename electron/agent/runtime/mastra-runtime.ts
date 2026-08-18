@@ -123,6 +123,13 @@ export class MastraRuntime implements AgentRuntime {
       onToolExecutionStart,
       onToolExecutionEnd,
       augmentToolResult,
+      // This runtime adapter drives the INTERACTIVE streamHandler turn — the one path that gates
+      // exit_plan_mode (approval hook) and restarts on enter_plan_mode. So plan-mode tools may
+      // run here. Non-interactive Mastra callers (sub-agent-runner, task agents, plugin-generate)
+      // invoke streamAgentResponse directly WITHOUT this flag, so the plan tools self-guard there
+      // (R141). Sub-agents/tasks also pass onToolExecutionStart, which is why gateability is an
+      // explicit flag, not inferred from that hook.
+      planModeGateable: true,
     };
 
     if (streamConfig.fallbackEnabled && streamConfig.fallbackModels.length > 0) {

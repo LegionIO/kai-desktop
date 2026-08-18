@@ -277,7 +277,10 @@ function toMastraTools(
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
-  executionContext?: Pick<ToolExecutionContext, 'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey'>,
+  executionContext?: Pick<
+    ToolExecutionContext,
+    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'planModeGateable'
+  >,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
   // tool named "__proto__"/"constructor" must create a plain entry, not invoke a
@@ -332,11 +335,12 @@ function toMastraTools(
             isHeadless: executionContext?.isHeadless,
             parentProfileKey: executionContext?.parentProfileKey,
             parentModelKey: executionContext?.parentModelKey,
-            // Plan-mode is gateable iff this run has the interactive interceptor hook — it's
-            // exactly what approves exit_plan_mode + restarts on enter_plan_mode. The
-            // plugin/task/sub-agent Mastra paths pass no onToolExecutionStart, so the plan
-            // tools self-guard and refuse there (R141).
-            planModeGateable: Boolean(hooks?.onToolExecutionStart),
+            // Plan-mode is gateable only for the INTERACTIVE streamHandler run (threaded
+            // explicitly via executionContext.planModeGateable). NOT keyed on the presence of
+            // onToolExecutionStart — a sub-agent/observer/task also passes that hook (for
+            // arg-charging/PreToolUse) but can't gate/restart plan mode, so the plan tools must
+            // still self-guard-refuse there (R141 fix).
+            planModeGateable: executionContext?.planModeGateable,
             abortSignal: mergedAbortSignal,
             onProgress: (progress: ToolProgressEvent) => {
               hooks?.emitEvent?.({
@@ -1225,6 +1229,12 @@ export async function* streamAgentResponse(
     parentModelKey?: string | null;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
+    /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
+     *  onToolExecutionStart approves exit_plan_mode + it restarts on enter_plan_mode). Threaded
+     *  to the tool ctx as planModeGateable so the plan tools self-guard everywhere else — a
+     *  sub-agent / observer / task also passes onToolExecutionStart (for arg-charging/PreToolUse)
+     *  but is NOT plan-gateable, so the hook's mere presence is NOT a valid proxy (R141 fix). */
+    planModeGateable?: boolean;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const msgArray = messages as Array<{ role?: string; content?: unknown }>;
@@ -1292,6 +1302,7 @@ export async function* streamAgentResponse(
       isHeadless: options?.isHeadless,
       parentProfileKey: options?.parentProfileKey,
       parentModelKey: options?.parentModelKey,
+      planModeGateable: options?.planModeGateable,
     },
   );
   const providerDefinedTools = buildProviderDefinedTools(modelConfig);
@@ -2100,6 +2111,12 @@ export async function* streamWithFallback(
     parentModelKey?: string | null;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
+    /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
+     *  onToolExecutionStart approves exit_plan_mode + it restarts on enter_plan_mode). Threaded
+     *  to the tool ctx as planModeGateable so the plan tools self-guard everywhere else — a
+     *  sub-agent / observer / task also passes onToolExecutionStart (for arg-charging/PreToolUse)
+     *  but is NOT plan-gateable, so the hook's mere presence is NOT a valid proxy (R141 fix). */
+    planModeGateable?: boolean;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const modelChain: ModelCatalogEntry[] = [
