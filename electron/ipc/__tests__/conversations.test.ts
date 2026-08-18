@@ -48,6 +48,9 @@ import {
   writeIndex,
   setActiveConversationId,
   __resetMigrationGuardForTests,
+  __resetDeleteTombstonesForTests,
+  markIndexMayHaveGhosts,
+  clearIndexGhostFlag,
   type ConversationRecord,
 } from '../conversation-store.js';
 
@@ -127,6 +130,8 @@ beforeEach(() => {
   // The per-file store guards migration with a module-level flag; reset it so
   // each fresh temp appHome is evaluated independently.
   __resetMigrationGuardForTests();
+  __resetDeleteTombstonesForTests();
+  clearIndexGhostFlag();
 });
 
 afterEach(() => {
@@ -148,6 +153,30 @@ describe('conversations IPC: list / get / put round-trip', () => {
     const list = await harness.invoke<unknown[]>('conversations:list', FAKE_EVENT);
     expect(Array.isArray(list)).toBe(true);
     expect(list).toHaveLength(0);
+  });
+
+  it('conversations:list filters a ghost (index entry, missing file) ONLY when the ghost flag is set', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    // Persist a real conversation, then remove its FILE out-of-band while leaving the index entry —
+    // exactly the "ghost" state a failed durable index write during delete/clear leaves behind.
+    writeConversation(appHome, makeConversation('ghost-1', { title: 'Ghost' }) as ConversationRecord);
+    expect(readIndex(appHome).conversations['ghost-1']).toBeDefined();
+    rmSync(join(appHome, 'data', 'conversations', 'ghost-1.json'), { force: true });
+
+    // Flag OFF (steady state): the list does NOT pay the per-entry stat filter, so the stale index
+    // entry is still returned (cheap hot path). This is the O(N) steady-state guarantee (R163 f-2).
+    clearIndexGhostFlag();
+    const beforeFlag = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
+    expect(beforeFlag.map((e) => e.id)).toContain('ghost-1');
+
+    // Flag ON (a durable write failed): the list filters out the ghost whose file is gone.
+    markIndexMayHaveGhosts();
+    const afterFlag = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
+    expect(afterFlag.map((e) => e.id)).not.toContain('ghost-1');
   });
 
   it('persists a conversations:put and reflects it in conversations:get and conversations:list', async () => {

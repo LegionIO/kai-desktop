@@ -61,6 +61,7 @@ import {
   isWriteTombstoned,
   consumeWriteWasSuppressed,
   conversationFileExists,
+  getIndexMayHaveGhosts,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -159,7 +160,12 @@ export function broadcastUpsert(appHome: string, conversation: ConversationRecor
   broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
 }
 function broadcastDelete(appHome: string, id: string): void {
-  broadcastChange({ kind: 'delete', id, activeConversationId: getActiveConversationId(appHome) });
+  // If the DURABLE index write during delete/clear FAILED, the on-disk index still lists this id as
+  // the active conversation (R163 f-1); getActiveConversationId would echo the just-deleted id and
+  // other windows would retain it as active despite the list filtering it out. A deleted conversation
+  // can never be active — override to null when the stale active id IS the id we're deleting.
+  const active = getActiveConversationId(appHome);
+  broadcastChange({ kind: 'delete', id, activeConversationId: active === id ? null : active });
 }
 
 // Standalone automations run their agent turns via a SEPARATE registry (automations/actions.ts
@@ -880,12 +886,17 @@ export function registerConversationHandlers(
   ipcMain.handle('conversations:list', () => {
     // Reads only the lightweight index — no message bodies loaded.
     const index = readIndex(appHome);
-    // Filter GHOST entries whose record file is gone (R162 f-2): a failed durable index write during
-    // delete/clear can leave an index entry pointing at a removed file. statSync fails OPEN (only a
-    // definite ENOENT drops the entry) so a transiently-unreadable real chat is never hidden.
-    const entries: ConversationIndexEntry[] = Object.values(index.conversations).filter((entry) =>
-      conversationFileExists(appHome, entry.id),
-    );
+    const all = Object.values(index.conversations);
+    // Filter GHOST entries whose record file is gone (R162 f-2) ONLY when a durable index write is
+    // known to have failed (getIndexMayHaveGhosts) — a failed delete/clear can leave an index entry
+    // pointing at a removed file. Gating on the flag keeps the STEADY-STATE list path O(N) with NO
+    // per-entry statSync (R163 f-2): the O(N) missing-file filter runs only inside the rare
+    // failure window, bounding the earlier O(N²) refresh storm (N list refreshes × N stats). statSync
+    // fails OPEN (only a definite ENOENT drops an entry) so a transiently-unreadable real chat is
+    // never hidden.
+    const entries: ConversationIndexEntry[] = getIndexMayHaveGhosts()
+      ? all.filter((entry) => conversationFileExists(appHome, entry.id))
+      : all;
     entries.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;

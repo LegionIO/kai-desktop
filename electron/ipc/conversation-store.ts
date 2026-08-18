@@ -1122,6 +1122,22 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
  * NEW conversation is never tombstoned.
  */
 const recentlyDeletedConversations = new Map<string, number>();
+// Set true when a durable index write FAILS after files were already removed (delete/clear), which
+// can leave GHOST index entries whose record file is gone (R163 f-2). conversations:list consults
+// this to decide whether to pay the per-entry missing-file statSync filter — so the steady-state
+// (no failure) list path stays O(N) with NO per-entry stat, and the O(N) filter only runs while a
+// known ghost window is open. Cleared by the next SUCCESSFUL index write (writeConversation or a
+// delete/clear whose write landed), which reconciles the on-disk index.
+let indexMayHaveGhosts = false;
+export function markIndexMayHaveGhosts(): void {
+  indexMayHaveGhosts = true;
+}
+export function clearIndexGhostFlag(): void {
+  indexMayHaveGhosts = false;
+}
+export function getIndexMayHaveGhosts(): boolean {
+  return indexMayHaveGhosts;
+}
 // 10 minutes: comfortably outlasts any single in-flight persist/turn (a stream that was mid
 // -flight at delete time, or a slow write) so a late persist can't resurrect a deleted
 // conversation after the tombstone expired.
@@ -1360,6 +1376,7 @@ export function deleteConversation(appHome: string, id: string): boolean {
     // and a stale client could resurrect the just-deleted conversation.
     pushDurableDeletedId(index, id);
     writeIndex(appHome, index);
+    clearIndexGhostFlag(); // a full index rewrite without the removed entry reconciles any ghosts
   } catch (err) {
     // Durable index update failed AFTER the file was removed. The in-memory tombstone (above) still
     // guards this session (the write-path resurrection guard is tombstone-authoritative — R162 f-1);
@@ -1367,6 +1384,7 @@ export function deleteConversation(appHome: string, id: string): boolean {
     // (or the salvage-on-corrupt-index path) re-drops the durable id. Log so a systematic durable
     // failure is visible rather than silently swallowed (R162).
     console.error('[conversation-store] deleteConversation: durable index write failed', err);
+    markIndexMayHaveGhosts();
   }
   return true;
 }
@@ -1423,11 +1441,13 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     // write or the salvage-on-corrupt-index path, and this session is resurrection-guarded.
     try {
       writeIndex(appHome, index);
+      clearIndexGhostFlag(); // full index rewrite without the removed entries reconciles any ghosts
     } catch (err) {
       // durable persist failed after removal — in-memory tombstones (set per id in the loop) still
       // guard this session via the tombstone-authoritative write-path guard (R162 f-1). Log so a
       // systematic durable failure is visible rather than silently swallowed (R162).
       console.error('[conversation-store] deleteConversations: durable index write failed', err);
+      markIndexMayHaveGhosts();
     }
   }
   return removed;
@@ -1501,9 +1521,11 @@ export function clearAllConversations(appHome: string): { cleared: string[]; ful
   let durablyPersisted = true;
   try {
     writeIndex(appHome, nextIndex);
+    clearIndexGhostFlag(); // full index rewrite (only surviving entries) reconciles any ghosts
   } catch (err) {
     durablyPersisted = false;
     console.error('[conversation-store] clearAllConversations: durable index write failed', err);
+    markIndexMayHaveGhosts();
   }
   return { cleared, fullyCleared: !anySurvived && durablyPersisted };
 }
