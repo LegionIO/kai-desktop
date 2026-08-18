@@ -34,6 +34,7 @@ import {
   drainInFlightAnswers,
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
+  dropInFlightAnswersForConversation,
 } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
@@ -215,6 +216,15 @@ describe('in-flight answer ledger (R100 finding-7)', () => {
     const all = drainInFlightAnswers();
     expect(all.map((e) => e.toolCallId).sort()).toEqual(['tc-4', 'tc-5']);
     expect(drainInFlightAnswers()).toEqual([]);
+  });
+
+  it('dropInFlightAnswersForConversation removes a deleted chat’s in-flight answers only (R139 f-3)', () => {
+    moveAnswerToInFlight('tc-6', { Q: 'F' }, 'conv-del');
+    moveAnswerToInFlight('tc-7', { Q: 'G' }, 'conv-keep');
+    dropInFlightAnswersForConversation('conv-del');
+    // The deleted conversation's in-flight answer is gone; the other survives.
+    expect(drainInFlightAnswers('conv-del')).toEqual([]);
+    expect(drainInFlightAnswers('conv-keep')).toEqual([{ toolCallId: 'tc-7', answers: { Q: 'G' } }]);
   });
 
   it("drainForToken recovers ONLY the owning token's entries (R101 token-scoping)", () => {

@@ -112,6 +112,13 @@ export function setExecutionModePersister(fn: ExecutionModePersister | null): vo
  *  doesn't restart into a plan-first the trust-disk reconcile can't see. `auto` exits and the
  *  unwired case return true (best-effort is fine when leaving plan mode / no persister). */
 function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'plan-first'): boolean {
+  // A plan-first ENTER with NO conversationId (e.g. a direct `tool` automation action) can't be
+  // persisted anywhere — treat it as a FAILED entry (R139 f-2), not a silent success, so it can't
+  // broadcast an unscoped Plan-First that shows in the UI while disk stays 'auto' (next turn then
+  // runs mutating tools). enter_plan_mode is meaningless without a conversation to scope it to.
+  if (mode === 'plan-first' && (!conversationId || !executionModePersister)) {
+    return false;
+  }
   let persisted = true;
   if (conversationId && executionModePersister) {
     try {

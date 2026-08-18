@@ -409,6 +409,7 @@ import {
   clearInFlightAnswer,
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
+  dropInFlightAnswersForConversation,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -1756,6 +1757,11 @@ export function invalidateConversationRecovery(conversationId: string): void {
     pendingQuestionAnswers.delete(k);
     clearInFlightAnswer(k);
   }
+  // Also drop any in-flight answer tagged with THIS conversation but held under a key the maps
+  // above didn't reference (a consumed answer on a superseded predecessor awaiting PostToolUse —
+  // invisible to the tombstone/handoff/claimant scan). Otherwise the predecessor's later cleanup
+  // would start a recovery delivery for the deleted chat (R139 f-3).
+  dropInFlightAnswersForConversation(conversationId);
 }
 
 /** Tear down a successor's raced-answer state for this token: clear its claimant

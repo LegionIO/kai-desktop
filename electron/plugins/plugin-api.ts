@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { URL } from 'url';
 import { z } from 'zod';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
+import { withoutMidStreamPlanTools } from '../agent/plan-mode-tools.js';
 import { getRegisteredTools } from '../ipc/agent.js';
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -1473,7 +1474,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       generate: async (options) => {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? getRegisteredTools() : [];
+        const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
         return generateForPlugin({
           messages: options.messages,
           config,
@@ -1491,7 +1492,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       stream: async function* (options) {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? getRegisteredTools() : [];
+        const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
         for await (const ev of streamForPlugin({
           messages: options.messages,
           config,

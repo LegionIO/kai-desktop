@@ -137,6 +137,17 @@ export function dropInFlightAnswersForToken(token: string | undefined): void {
   }
 }
 
+/** Drop every in-flight answer tagged with `conversationId` — used when the conversation is
+ *  DELETED (R139 f-3): a consumed answer that lives ONLY in this ledger (awaiting a PostToolUse
+ *  hook on a superseded predecessor) is otherwise invisible to invalidateConversationRecovery
+ *  (which scans tombstones/handoffs/claimants/pending, not this ledger), so the predecessor's
+ *  later cleanup would start a recovery delivery for the deleted chat. */
+export function dropInFlightAnswersForConversation(conversationId: string): void {
+  for (const [toolCallId, entry] of [...inFlightAnswers]) {
+    if (entry.conversationId === conversationId) inFlightAnswers.delete(toolCallId);
+  }
+}
+
 /** Drain ALL in-flight answers (test cleanup only). */
 export function drainInFlightAnswers(
   conversationId?: string,

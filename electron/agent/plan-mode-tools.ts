@@ -25,3 +25,18 @@ export function toolsForExecutionMode<T extends { name: string }>(tools: T[], ex
   }
   return tools;
 }
+
+/**
+ * Strip the INTERACTIVE plan-mode TRANSITION tools (enter_plan_mode/exit_plan_mode) from a
+ * headless tool set — automation runs AND plugin agent.generate|stream (R138 f-5 / R139 f-1).
+ * These drive an interactive plan-review flow (mid-stream tool-refiltering + a GUI approval on
+ * exit) that the linear streamForPlugin/generateForPlugin path can't perform — it never restarts,
+ * so a run that entered plan mode mid-stream would keep its pre-transition MUTATING tools, and
+ * exit_plan_mode would write ~/.kai/plans/<title>.md without the GUI approval gate. A plan-first
+ * conversation resumed headlessly still runs read-only (mode is filtered at run START by
+ * executionMode); it simply can't mid-stream TOGGLE plan mode, which is meaningless without an
+ * interactive user.
+ */
+export function withoutMidStreamPlanTools<T extends { name: string }>(tools: T[]): T[] {
+  return tools.filter((t) => t.name !== 'enter_plan_mode' && t.name !== 'exit_plan_mode');
+}
