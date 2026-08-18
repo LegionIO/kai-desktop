@@ -2096,11 +2096,17 @@ if (gotSingleInstanceLock) {
     // a window reloading during the transition doesn't leave the conversation on the
     // stale mode for its next turn (R108 finding-4).
     setExecutionModePersister((conversationId, mode) => {
+      // Return whether the authoritative disk write SUCCEEDED so a plan-first enter can FAIL
+      // CLOSED (R136 f-1): if plan-first can't be persisted, the tool must not let the renderer
+      // restart into a plan-first the trust-disk reconcile can't see (it would read stale 'auto'
+      // and run mutating tools).
       try {
         const conv = readConversationRecord(APP_HOME, conversationId);
-        if (conv) writeConversationRecord(APP_HOME, { ...conv, executionMode: mode } as never);
+        if (!conv) return false;
+        writeConversationRecord(APP_HOME, { ...conv, executionMode: mode } as never);
+        return true;
       } catch {
-        /* best-effort; the renderer submit still carries the mode */
+        return false;
       }
     });
 

@@ -323,15 +323,47 @@ export function readIndex(appHome: string): ConversationIndex {
 
 /** Best-effort recover the `deletedIds` array from a CORRUPT index file's raw text. A
  *  full JSON.parse already failed (truncation/corruption), but the deletedIds array — a
- *  flat list of string ids — usually sits intact earlier in the file. Extract it with a
- *  tolerant regex so the durable deletion ring survives corrupt-index recovery (R135 f-4).
- *  Returns [] when nothing recoverable. */
+ *  flat list of string ids — usually sits intact earlier in the file. Extract it TOLERANTLY
+ *  (R135 f-4 / R136 f-3): do NOT require a closing `]` (truncation INSIDE the array must still
+ *  recover every complete id before the cut), and anchor on the TOP-LEVEL `deletedIds` key
+ *  (`{"deletedIds"` or `,"deletedIds"` at the object root) so a nested conversation field named
+ *  deletedIds can't shadow it. Returns [] when nothing recoverable. */
 function salvageDeletedIdsFromCorruptIndex(indexFilePath: string): string[] {
   try {
     const raw = readFileSync(indexFilePath, 'utf-8');
-    const m = raw.match(/"deletedIds"\s*:\s*\[([^\]]*)\]/);
-    if (!m) return [];
-    const ids = m[1].match(/"([^"]+)"/g);
+    // Locate the TOP-LEVEL (object depth 1) "deletedIds" key by a string-aware brace-depth
+    // walk, so a NESTED conversation field of the same name can't shadow it (R136 f-3). Track
+    // depth outside of JSON strings; record the index of a `"deletedIds"` seen at depth 1.
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let keyStart = -1;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') {
+        // A key/string starts here. At depth 1, check if it's exactly "deletedIds".
+        if (depth === 1 && raw.startsWith('"deletedIds"', i)) keyStart = i;
+        inStr = true;
+        continue;
+      }
+      if (ch === '{' || ch === '[') depth++;
+      else if (ch === '}' || ch === ']') depth--;
+    }
+    if (keyStart === -1) return [];
+    const openBracket = raw.indexOf('[', keyStart);
+    if (openBracket === -1) return [];
+    // Slice to the array's close `]` if present, else to EOF — a truncation mid-array still
+    // yields the complete quoted ids that precede the cut (no closing `]` required).
+    const closeBracket = raw.indexOf(']', openBracket);
+    const end = closeBracket === -1 ? raw.length : closeBracket;
+    const segment = raw.slice(openBracket + 1, end);
+    const ids = segment.match(/"((?:[^"\\]|\\.)*)"/g);
     if (!ids) return [];
     return ids.map((s) => s.slice(1, -1)).filter((s) => s.length > 0);
   } catch {
@@ -1143,6 +1175,27 @@ function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
 export function conversationExistsInIndex(appHome: string, id: string): boolean {
   return Boolean(readIndex(appHome).conversations[id]);
 }
+// TRI-STATE existence for a fail-closed decision (R136 f-2): 'exists' | 'absent' | 'unknown'.
+// A plain boolean fails OPEN when the record can't be read (EMFILE/EACCES/truncated JSON) — the
+// caller would treat an existing plan-first chat as recordless and run mutating tools. Probe the
+// record FILE directly (independent of the index, which itself can fail to read / be rebuilt
+// omitting unreadable records): no file → 'absent'; file present + reads OK → 'exists'; file
+// present but UNREADABLE, or the existence probe itself throws → 'unknown' (caller fails closed).
+export function conversationExistenceState(appHome: string, id: string): 'exists' | 'absent' | 'unknown' {
+  let fileThere: boolean;
+  try {
+    fileThere = existsSync(conversationPath(appHome, id));
+  } catch {
+    return 'unknown';
+  }
+  if (!fileThere) return 'absent';
+  try {
+    return readConversation(appHome, id) != null ? 'exists' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+// (was: an index-only existence probe that could fail open on an index read failure)
 // Public tombstone check: is this id currently blocked from a create-shaped write (recently
 // deleted in-memory, OR durably deleted and absent from the index)? Callers that BROADCAST a write
 // (conversations:put) use this to avoid emitting a phantom upsert / false success for a write that

@@ -17,7 +17,6 @@ import {
   clearAllConversations,
   reindexIfStale,
   writeIndex,
-  conversationExistsInIndex,
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
@@ -207,27 +206,43 @@ describe('per-file read/write', () => {
     expect(readIndex(appHome).deletedIds).toContain('d1');
   });
 
-  it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4)', () => {
+  it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4 / R136 f-3)', () => {
     // A confirmed delete records the durable ring; then the index file is corrupted (e.g. a
     // truncated write on crash). readIndex must rebuild from live files BUT preserve deletedIds
     // (lost otherwise → a stale put could recreate the deleted chat).
     writeConversation(appHome, makeConv('live1'));
-    writeConversation(appHome, makeConv('gone1'));
-    deleteConversation(appHome, 'gone1');
-    expect(readIndex(appHome).deletedIds).toContain('gone1');
-    // Corrupt the index: keep a valid deletedIds array earlier in the text, then truncate.
     const idxPath = join(appHome, 'data', 'index.json');
-    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["gone1"],"settings":{"trunc', 'utf-8');
-    const recovered = readIndex(appHome);
-    // Live conversation summaries are rebuilt AND the durable tombstone survives.
+    // (a) Truncation AFTER the deletedIds array closes — recover the whole array.
+    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["gone1","gone2"],"settings":{"trunc', 'utf-8');
+    let recovered = readIndex(appHome);
     expect(recovered.conversations.live1).toBeDefined();
     expect(recovered.deletedIds).toContain('gone1');
+    expect(recovered.deletedIds).toContain('gone2');
+    // (b) Truncation INSIDE the array (no closing `]`) — recover the complete ids before the cut.
+    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["keptA","keptB","partia', 'utf-8');
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds).toContain('keptA');
+    expect(recovered.deletedIds).toContain('keptB');
+    expect(recovered.deletedIds).not.toContain('partia'); // incomplete trailing id dropped
+    // (c) A nested conversation field named deletedIds must NOT shadow the top-level ring.
+    writeFileSync(
+      idxPath,
+      '{"conversations":{"c":{"deletedIds":["nestedDecoy"]}},"deletedIds":["realGone"],"settings":{"x',
+      'utf-8',
+    );
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds).toContain('realGone');
   });
 
-  it('conversationExistsInIndex distinguishes an existing record from a genuinely-absent one', () => {
-    writeConversation(appHome, makeConv('exists1'));
-    expect(conversationExistsInIndex(appHome, 'exists1')).toBe(true);
-    expect(conversationExistsInIndex(appHome, 'never-created')).toBe(false);
+  it('conversationExistenceState is a fail-closed tri-state (R136 f-2)', async () => {
+    const { conversationExistenceState } = await import('../conversation-store.js');
+    writeConversation(appHome, makeConv('here1'));
+    expect(conversationExistenceState(appHome, 'here1')).toBe('exists');
+    expect(conversationExistenceState(appHome, 'never-created')).toBe('absent');
+    // A present-but-unreadable record file → 'unknown' (caller fails closed to plan-first).
+    const badPath = join(appHome, 'data', 'conversations', 'corrupt1.json');
+    writeFileSync(badPath, '{not valid json', 'utf-8');
+    expect(conversationExistenceState(appHome, 'corrupt1')).toBe('unknown');
   });
 
   it('records the durable tombstone even when the file exists but the index entry is absent (rebuilt index)', () => {

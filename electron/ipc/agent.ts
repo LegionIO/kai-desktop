@@ -31,7 +31,7 @@ import {
   nextCompactionRevision,
   isRecentlyDeleted,
   isWriteTombstoned,
-  conversationExistsInIndex,
+  conversationExistenceState,
 } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
@@ -2869,19 +2869,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (persistedConv != null) {
         // Record read OK — its executionMode (present, or absent → 'auto') is authoritative.
         effectiveExecutionMode = reconcileExecutionMode(executionMode, persistedConv.executionMode, true);
-      } else if (conversationExistsInIndex(appHome, conversationId)) {
-        // The record EXISTS (index entry) but couldn't be read — a transient EMFILE/truncated-
-        // JSON failure, NOT a first turn (R135 f-3). We can't rule out plan-first, so FAIL
-        // CLOSED to plan-first (read-only) rather than trust the possibly-stale submitted mode
-        // and expose mutating tools. Worst case: one turn of an auto conversation runs read-only
-        // during a disk blip — strictly safer than the inverse.
-        effectiveExecutionMode = 'plan-first';
       } else {
-        // Genuinely recordless (first turn before any record exists) → trust the submitted mode.
-        effectiveExecutionMode = reconcileExecutionMode(executionMode, undefined, false);
+        // Couldn't read the record. Distinguish genuinely-absent (first turn → trust submitted)
+        // from present-but-unreadable / unknown (transient I/O) via a TRI-STATE probe that fails
+        // CLOSED (R135 f-3 / R136 f-2): 'exists' or 'unknown' → run plan-first (read-only) rather
+        // than trust a possibly-stale submitted 'auto' and expose mutating tools; only a
+        // definitively 'absent' record falls back to the submitted mode.
+        const state = conversationExistenceState(appHome, conversationId);
+        effectiveExecutionMode =
+          state === 'absent' ? reconcileExecutionMode(executionMode, undefined, false) : 'plan-first';
       }
     } catch {
-      /* best-effort: fall back to the submitted mode */
+      // Even the probe path threw — fail CLOSED to plan-first rather than the submitted mode.
+      effectiveExecutionMode = 'plan-first';
     }
 
     // An on-demand `/compact` is summarizing this conversation right now (a paid,
@@ -6874,23 +6874,38 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               }
             }
             if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
-              // Plan mode was entered mid-stream. Abort this stream so the renderer
-              // can re-send with executionMode='plan-first' (correct system prompt + tool set).
-              console.info(
-                `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
+              // Only restart into plan-first if the tool actually ENTERED plan mode. On a
+              // fail-closed persist failure (R136 f-1) it returns success:false — restarting
+              // then would run a "planning" turn that the trust-disk reconcile sees as auto
+              // (mutating tools). Detect the failure in the result and skip the restart.
+              const planResult = (event as { result?: unknown }).result;
+              const planEntered = !(
+                planResult &&
+                typeof planResult === 'object' &&
+                (planResult as { success?: unknown }).success === false
               );
-              emit(event);
-              planDoneSent = true;
-              if (serverPersistedRun) {
-                // No GUI renderer will restart this server-persisted run — MAIN must
-                // (finding-5). enter_plan_mode leaves the user's original request on the
-                // branch; re-run it in plan-first so the agent produces the plan under
-                // the read-only tool set.
-                serverPersistPlanRestart = true;
+              if (!planEntered) {
+                emit(event);
+                // Not entering plan mode — let the turn continue normally (no abort/restart).
+              } else {
+                // Plan mode was entered mid-stream. Abort this stream so the renderer
+                // can re-send with executionMode='plan-first' (correct system prompt + tool set).
+                console.info(
+                  `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
+                );
+                emit(event);
+                planDoneSent = true;
+                if (serverPersistedRun) {
+                  // No GUI renderer will restart this server-persisted run — MAIN must
+                  // (finding-5). enter_plan_mode leaves the user's original request on the
+                  // branch; re-run it in plan-first so the agent produces the plan under
+                  // the read-only tool set.
+                  serverPersistPlanRestart = true;
+                }
+                emit({ conversationId, type: 'done', data: { planModeRestart: true } });
+                controller.abort();
+                return { conversationId };
               }
-              emit({ conversationId, type: 'done', data: { planModeRestart: true } });
-              controller.abort();
-              return { conversationId };
             }
             if (event.type === 'tool-result' && event.toolCallId) {
               observer?.onToolExecutionEnd(event.toolCallId);

@@ -6,7 +6,7 @@ import { streamAgentResponse, streamWithFallback } from './mastra-agent.js';
 import type { StreamEvent } from './mastra-agent.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { toolsForExecutionMode } from './plan-mode-tools.js';
-import { readConversation, conversationExistsInIndex } from '../ipc/conversation-store.js';
+import { readConversation, conversationExistenceState } from '../ipc/conversation-store.js';
 import { sanitizePluginMessages } from './plugin-message-sanitizer.js';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
@@ -122,11 +122,12 @@ async function preparePluginStream(options: PluginGenerateOptions): Promise<{
       // snapshot/global fallback computed above.
       if (rec != null) {
         effectiveMode = rec.executionMode ?? 'auto';
-      } else if (conversationExistsInIndex(appHome, options.conversationId)) {
-        // The record EXISTS but couldn't be read (transient I/O failure), NOT recordless — FAIL
-        // CLOSED to plan-first (read-only) rather than run mutating tools on a maybe-plan-first
-        // chat during a disk blip (R135 f-3).
-        effectiveMode = 'plan-first';
+      } else {
+        // Couldn't read the record. Fail CLOSED via the tri-state probe (R136 f-2): a record
+        // that EXISTS-but-unreadable or an UNKNOWN state runs plan-first (read-only); only a
+        // definitively-ABSENT record keeps the snapshot/global fallback.
+        const state = conversationExistenceState(appHome, options.conversationId);
+        if (state !== 'absent') effectiveMode = 'plan-first';
       }
     } catch {
       /* best-effort: keep the passed / global mode */

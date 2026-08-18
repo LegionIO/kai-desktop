@@ -101,22 +101,27 @@ function slugifyPlanTitle(planTitle: string | undefined): string {
  *  it, the renderer never learns the change and the next turn runs under the stale
  *  mode's tool policy. Persisting in main makes the broadcast a notification/reconcile
  *  rather than the source of truth (R108 finding-4). No-op until wired. */
-type ExecutionModePersister = (conversationId: string, mode: 'auto' | 'plan-first') => void;
+type ExecutionModePersister = (conversationId: string, mode: 'auto' | 'plan-first') => boolean;
 let executionModePersister: ExecutionModePersister | null = null;
 export function setExecutionModePersister(fn: ExecutionModePersister | null): void {
   executionModePersister = fn;
 }
 
-function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'plan-first'): void {
-  // Persist FIRST (authoritative), then broadcast (notify/reconcile).
+/** Apply a mode change: persist (authoritative) then broadcast. Returns whether the persist
+ *  SUCCEEDED — a plan-first ENTER must fail closed if it didn't (R136 f-1), so the renderer
+ *  doesn't restart into a plan-first the trust-disk reconcile can't see. `auto` exits and the
+ *  unwired case return true (best-effort is fine when leaving plan mode / no persister). */
+function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'plan-first'): boolean {
+  let persisted = true;
   if (conversationId && executionModePersister) {
     try {
-      executionModePersister(conversationId, mode);
+      persisted = executionModePersister(conversationId, mode);
     } catch {
-      /* best-effort persist; the broadcast + renderer submit still carry the mode */
+      persisted = false;
     }
   }
   broadcastModeChange(mode, conversationId);
+  return persisted;
 }
 
 function broadcastModeChange(mode: string, conversationId?: string): void {
@@ -143,7 +148,18 @@ export function createEnterPlanModeTool(): ToolDefinition {
     }),
     execute: async (input, context) => {
       const { reason } = input as { reason?: string };
-      applyModeChange(context.conversationId, 'plan-first');
+      // FAIL CLOSED (R136 f-1): if plan-first can't be persisted (disk write failed / no record),
+      // do NOT report success — a GUI/CLI restart into plan-first would then trust the stale
+      // disk 'auto' at reconcile and run mutating tools during "planning". Tell the model the
+      // transition failed so it stays in the current (safe) mode rather than assuming read-only.
+      const entered = applyModeChange(context.conversationId, 'plan-first');
+      if (!entered) {
+        return {
+          success: false,
+          error:
+            'Could not enter plan mode (failed to persist the mode). Continue WITHOUT assuming read-only planning; do not treat this turn as plan mode.',
+        };
+      }
       const cwd = context.cwd;
       return {
         success: true,
