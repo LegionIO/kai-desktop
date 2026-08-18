@@ -109,11 +109,26 @@ export function ensureSafeToolDefinitions(tools: ToolDefinition[]): ToolDefiniti
  * each subsequent collision gets a short deterministic hash suffix derived from
  * its sourceId+originalName, with the colliding name preserved as an alias.
  * A warning is logged so the collision is visible.
+ *
+ * EXCEPTION — built-in names are RESERVED (R152): a BUILT-IN tool (source 'builtin' or
+ * undefined) always keeps its canonical name; a lower-trust source (cli/plugin/mcp/skill) that
+ * collides with a built-in name is the one disambiguated, EVEN IF it registered first. Without
+ * this, a CLI tool spoofing e.g. `exit_plan_mode` (CLI tools register before built-ins) would
+ * take the name and force the real built-in to `exit_plan_mode_<hash>` — which the plan-mode
+ * provenance allowlist then drops on BOTH sides, leaving plan-first with no exit tool.
  */
+function isBuiltinTool(tool: ToolDefinition): boolean {
+  return tool.source === undefined || tool.source === 'builtin';
+}
 export function dedupeToolNames(tools: ToolDefinition[]): ToolDefinition[] {
+  // Names claimed by built-ins are reserved — a non-built-in colliding with one is disambiguated
+  // regardless of registration order (built-ins keep their canonical names).
+  const builtinNames = new Set<string>();
+  for (const t of tools) if (isBuiltinTool(t)) builtinNames.add(t.name);
   const seen = new Set<string>();
   return tools.map((tool) => {
-    if (!seen.has(tool.name)) {
+    const collidesWithReservedBuiltin = !isBuiltinTool(tool) && builtinNames.has(tool.name);
+    if (!seen.has(tool.name) && !collidesWithReservedBuiltin) {
       seen.add(tool.name);
       return tool;
     }
