@@ -568,8 +568,12 @@ function persistAccumulatedReturningHead(
   opts?: { keepRunning?: boolean; replaceById?: boolean; restoreParentFromAcc?: boolean },
 ): string | null {
   const acc = accumulators.get(conversationId);
-  accumulators.delete(conversationId);
+  // Do NOT delete the accumulator eagerly (R168): deleting it before persistence SUCCEEDS meant a
+  // transient null read or a write throw below permanently LOST the accumulated (CLI/headless or
+  // partial-prefix) response. Delete only on a confirmed-success or genuinely-nothing-to-persist
+  // return; the catch/failure paths leave it intact so a later finalize retry can recover it.
   if (!acc || !acc.sawContent || acc.parts.length === 0) {
+    accumulators.delete(conversationId); // nothing to lose — clear it
     treeDebugLog(
       `[PERSIST-EMPTY] conv=${conversationId} hasAcc=${!!acc} sawContent=${acc?.sawContent ?? 'n/a'} ` +
         `parts=${acc?.parts.length ?? 0} accParent=${JSON.stringify(acc?.parentId)} keepRunning=${!!opts?.keepRunning}`,
@@ -695,6 +699,7 @@ function persistAccumulatedReturningHead(
           const written = writeConversation(appHome, nextConv);
           markResponseFinalized(conversationId, acc.responseMessageId);
           broadcastUpsert(appHome, written);
+          accumulators.delete(conversationId); // persisted — safe to clear (R168)
           return effectiveId;
         }
       } catch {
@@ -722,6 +727,10 @@ function persistAccumulatedReturningHead(
       },
     );
     if (updated?.headId) markResponseFinalized(conversationId, acc.responseMessageId);
+    // Clear the accumulator only on a CONFIRMED persist (a headId came back). If the append
+    // silently produced no head (shouldn't happen, but treat as not-persisted), leave the acc so a
+    // retry can recover it rather than losing the response (R168).
+    if (updated?.headId) accumulators.delete(conversationId);
     if (TREE_DEBUG_ENABLED) {
       const persistedNode = (
         updated?.messageTree as Array<{ id?: string; parentId?: string | null }> | undefined

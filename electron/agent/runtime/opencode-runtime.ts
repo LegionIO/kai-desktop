@@ -243,10 +243,14 @@ export class OpencodeRuntime implements AgentRuntime {
       let lastReadAt = Date.now();
       child.on('exit', () => {
         const IDLE_MS = 2000;
+        // Absolute post-exit deadline (R168): a stuck orphan descendant dribbling a byte every <IDLE_MS
+        // would re-arm the idle check forever and never let the stream finalize. Cap total wait after
+        // leader exit at 30s — past that, destroy regardless of trickle so the runtime always completes.
+        const HARD_DEADLINE = Date.now() + 30_000;
         const tick = (): void => {
           if (child.stdout.destroyed || child.stdout.readableEnded) return;
           const idle = Date.now() - lastReadAt >= IDLE_MS && child.stdout.readableLength === 0;
-          if (idle) {
+          if (idle || Date.now() >= HARD_DEADLINE) {
             child.stdout.destroy();
             return;
           }

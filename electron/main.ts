@@ -16,7 +16,19 @@ import {
   webContents,
 } from 'electron';
 import { basename, join, sep } from 'path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync } from 'fs';
+import {
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  statSync,
+  lstatSync,
+  openSync,
+  closeSync,
+  renameSync,
+  constants as fsReadConstants,
+} from 'fs';
 import {
   appendBoundedLog,
   enterErrorHandler,
@@ -2321,10 +2333,26 @@ if (gotSingleInstanceLock) {
         // Security: strip directory components and only allow reading from the plans directory
         const safeName = String(filename).replace(/[/\\]/g, '');
         const resolved = join(plansDir, safeName);
-        if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+        // Use lstatSync (NOT statSync) so a SYMLINK at the target is detected and REJECTED rather
+        // than followed (R168): statSync follows the link, so `~/.kai/plans/x.md → ~/.ssh/id_ed25519`
+        // would leak the target's contents through this IPC channel. Plan files are ephemeral
+        // working artifacts written by write_plan (with O_NOFOLLOW) — never legitimately symlinks.
+        let st: ReturnType<typeof lstatSync>;
+        try {
+          st = lstatSync(resolved);
+        } catch {
           return { error: 'File not found' };
         }
-        return { content: readFileSync(resolved, 'utf-8') };
+        if (st.isSymbolicLink() || !st.isFile()) {
+          return { error: 'File not found' };
+        }
+        // O_NOFOLLOW backstops a TOCTOU swap of the file for a symlink between lstat and open.
+        const fd = openSync(resolved, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW);
+        try {
+          return { content: readFileSync(fd, 'utf-8') };
+        } finally {
+          closeSync(fd);
+        }
       } catch (err) {
         return { error: String(err) };
       }

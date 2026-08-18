@@ -699,12 +699,22 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
             });
           }
           if (event.type === 'item.completed') {
+            // Reflect a FAILED command as an error result (R168): Codex reports failure via a
+            // non-zero exit_code or a failure status. Emitting it as a plain successful tool-result
+            // would misrepresent the failure in the UI and persisted history. Mirror the claude
+            // runtime's { isError, error } result shape so downstream treats it as an error.
+            const cmdFailed =
+              (typeof item.exit_code === 'number' && item.exit_code !== 0) ||
+              (typeof item.status === 'string' && /fail|error/i.test(item.status));
+            const output = item.aggregated_output ?? '';
             events.push({
               conversationId,
               type: 'tool-result',
               toolCallId: item.id,
               toolName: 'Bash',
-              result: item.aggregated_output ?? '',
+              result: cmdFailed
+                ? { isError: true, error: output || `command failed (exit ${item.exit_code ?? 'unknown'})` }
+                : output,
               finishedAt: new Date().toISOString(),
             });
           }
@@ -756,7 +766,7 @@ function translateCodexEvent(conversationId: string, event: ThreadEventAny): Str
               type: 'tool-result',
               toolCallId: item.id,
               toolName: `${item.server}/${item.tool}`,
-              result: item.error ? `Error: ${item.error.message}` : resultText,
+              result: item.error ? { isError: true, error: `Error: ${item.error.message}` } : resultText,
               finishedAt: new Date().toISOString(),
             });
           }

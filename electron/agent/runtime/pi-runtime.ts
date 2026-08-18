@@ -325,10 +325,13 @@ export class PiRuntime implements AgentRuntime {
       let lastReadAt = Date.now();
       spawned.on('exit', () => {
         const IDLE_MS = 2000;
+        // Absolute post-exit deadline (R168): a stuck orphan grandchild dribbling a byte every <IDLE_MS
+        // would re-arm the idle check forever. Cap total wait after leader exit at 30s.
+        const HARD_DEADLINE = Date.now() + 30_000;
         const tick = (): void => {
           if (spawned.stdout.destroyed || spawned.stdout.readableEnded) return;
           const idle = Date.now() - lastReadAt >= IDLE_MS && spawned.stdout.readableLength === 0;
-          if (idle) {
+          if (idle || Date.now() >= HARD_DEADLINE) {
             spawned.stdout.destroy();
             return;
           }
