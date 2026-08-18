@@ -1171,6 +1171,16 @@ function createToolHandler(
 
   // Standard tool handler — validate args, call execute(), wrap the result
   return async (args: unknown): Promise<CallToolResult> => {
+    // If THIS run was already aborted (superseded / Stopped) before a queued callback fires, do
+    // NOT execute enter_plan_mode (R144 f-1): it would persist plan-first but never emit the
+    // result MAIN's mid-stream interception needs to restart, so the SUCCESSOR run continues with
+    // its mutating tool set while disk/UI show Plan-First. The turn is over — refuse.
+    if (toolDef.name === 'enter_plan_mode' && abortSignal?.aborted) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'The turn was stopped.' }) }],
+        isError: true,
+      };
+    }
     const context: ToolExecutionContext = {
       toolCallId: `sdk-bridge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       conversationId,

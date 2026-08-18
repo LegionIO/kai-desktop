@@ -648,6 +648,12 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       /* if we can't read, fall through to reopen (safer to let the user retry) */
     }
     if (!committed) {
+      // Do NOT reopen for a conversation that was DELETED during/before the resume (R144 f-3):
+      // reopening clears the recorded answer and re-surfaces an alert that can NEVER be answered
+      // (its conversation is gone), stranding it. A confirmed-deleted target → leave it dismissed.
+      if (deps && isWriteTombstoned(deps.appHome, alert.conversationId)) {
+        throw err;
+      }
       const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
       if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
     }

@@ -75,6 +75,7 @@ import {
   readConversation,
   readAllConversations,
   writeConversation,
+  isWriteTombstoned,
   getActiveConversationId,
   setActiveConversationId,
 } from '../ipc/conversation-store.js';
@@ -1724,6 +1725,11 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     requirePermission('conversations:write');
     const normalizedConversation = normalizeConversationRecord(conversation);
     const written = writeConversation(callbacks.appHome, normalizedConversation as never);
+    // writeConversation SUPPRESSES a write for a tombstoned (deleted) id — it returns the record
+    // unchanged but nothing hits disk. Do NOT broadcast a phantom upsert for a deleted chat
+    // (R144 f-2): a durable-ring tombstone (survives restart / in-mem TTL expiry) would otherwise
+    // rebroadcast a nonexistent conversation to every client.
+    if (isWriteTombstoned(callbacks.appHome, normalizedConversation.id)) return;
     broadcastUpsert(callbacks.appHome, written);
   };
 
