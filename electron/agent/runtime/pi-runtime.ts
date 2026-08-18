@@ -316,13 +316,27 @@ export class PiRuntime implements AgentRuntime {
       // `for await (spawned.stdout)` loop and `exited` (waits on 'close') would hang forever (R166
       // f-3) — killProcessGroup's leader-alive SIGKILL gate deliberately does NOT group-kill after
       // leader exit (recycled-pid safety). Break the hang: once the leader exits, if 'close' hasn't
-      // followed within a grace period, force-destroy stdout so the stream read completes and the
-      // runtime finalizes. The orphaned grandchild is reparented to init and reaped by the OS.
+      // followed, force-destroy stdout so the stream read completes and the runtime finalizes. But
+      // destroy ONLY when the stream is genuinely IDLE — nothing buffered AND nothing consumed
+      // recently (R167 f-1): destroying mid-drain would drop the final buffered event of a COMPLETED
+      // response (slow consumer) and raise ERR_STREAM_PREMATURE_CLOSE, turning success into an error.
+      // `lastReadAt` is bumped by the streaming loop below (no competing 'data' listener, which would
+      // steal chunks from the async iterator). Re-arm while data is pending/flowing.
+      let lastReadAt = Date.now();
       spawned.on('exit', () => {
-        const t = setTimeout(() => {
-          if (!spawned.stdout.destroyed) spawned.stdout.destroy();
-        }, 2000);
-        if (typeof t.unref === 'function') t.unref();
+        const IDLE_MS = 2000;
+        const tick = (): void => {
+          if (spawned.stdout.destroyed || spawned.stdout.readableEnded) return;
+          const idle = Date.now() - lastReadAt >= IDLE_MS && spawned.stdout.readableLength === 0;
+          if (idle) {
+            spawned.stdout.destroy();
+            return;
+          }
+          const t = setTimeout(tick, IDLE_MS);
+          if (typeof t.unref === 'function') t.unref();
+        };
+        const t0 = setTimeout(tick, IDLE_MS);
+        if (typeof t0.unref === 'function') t0.unref();
       });
 
       onAbort = () => {
@@ -353,6 +367,7 @@ export class PiRuntime implements AgentRuntime {
       let totalBytes = 0;
       for await (const chunk of spawned.stdout) {
         if (abortSignal?.aborted) break;
+        lastReadAt = Date.now(); // R167 f-1: mark progress so the idle-destroy timer never fires mid-drain
         const bytes = chunk as Buffer;
         totalBytes += bytes.length;
         if (totalBytes > MAX_TOTAL_BYTES) {

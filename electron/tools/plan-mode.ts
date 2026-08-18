@@ -271,7 +271,20 @@ export function createExitPlanModeTool(): ToolDefinition {
           0o644,
         );
         try {
-          writeSync(fd, planContent, null, 'utf-8');
+          // writeSync can return a SHORT byte count (quota / disk-full) WITHOUT throwing (R167 f-3);
+          // ignoring it would persist a TRUNCATED plan and then report success + flip to auto. Write
+          // the full buffer, looping over any partial writes, and fail if a write makes no progress.
+          const planBuf = Buffer.from(planContent, 'utf-8');
+          let written = 0;
+          while (written < planBuf.length) {
+            const n = writeSync(fd, planBuf, written, planBuf.length - written);
+            if (n <= 0) {
+              throw new Error(
+                `short write persisting plan (${written}/${planBuf.length} bytes) — disk full or over quota`,
+              );
+            }
+            written += n;
+          }
         } finally {
           closeSync(fd);
         }

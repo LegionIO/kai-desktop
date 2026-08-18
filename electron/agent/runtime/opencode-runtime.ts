@@ -234,13 +234,27 @@ export class OpencodeRuntime implements AgentRuntime {
       // `for await (child.stdout)` loop below (and `exited`, which waits on 'close') would hang
       // forever (R166 f-3) — the leader-alive SIGKILL gate deliberately does NOT group-kill after
       // leader exit (recycled-pid safety). Break the hang: once the leader has exited, if 'close'
-      // hasn't followed within a grace period, force-destroy stdout so the stream read completes and
-      // the runtime finalizes. The orphaned descendant is reparented to init and reaped by the OS.
+      // hasn't followed, force-destroy stdout so the stream read completes and the runtime finalizes.
+      // But destroy ONLY when the stream is genuinely IDLE — nothing buffered AND nothing consumed
+      // recently (R167 f-1): destroying mid-drain would drop the final buffered event of a COMPLETED
+      // response (slow consumer) and raise ERR_STREAM_PREMATURE_CLOSE, turning success into an error.
+      // `lastReadAt` is bumped by the streaming loop below (no competing 'data' listener, which would
+      // steal chunks from the async iterator). Re-arm while data is pending/flowing.
+      let lastReadAt = Date.now();
       child.on('exit', () => {
-        const t = setTimeout(() => {
-          if (!child.stdout.destroyed) child.stdout.destroy();
-        }, 2000);
-        if (typeof t.unref === 'function') t.unref();
+        const IDLE_MS = 2000;
+        const tick = (): void => {
+          if (child.stdout.destroyed || child.stdout.readableEnded) return;
+          const idle = Date.now() - lastReadAt >= IDLE_MS && child.stdout.readableLength === 0;
+          if (idle) {
+            child.stdout.destroy();
+            return;
+          }
+          const t = setTimeout(tick, IDLE_MS);
+          if (typeof t.unref === 'function') t.unref();
+        };
+        const t0 = setTimeout(tick, IDLE_MS);
+        if (typeof t0.unref === 'function') t0.unref();
       });
 
       try {
@@ -256,6 +270,7 @@ export class OpencodeRuntime implements AgentRuntime {
         const MAX_LINE = 4 * 1024 * 1024;
         for await (const chunk of child.stdout) {
           if (abortSignal?.aborted) break;
+          lastReadAt = Date.now(); // R167 f-1: mark progress so the idle-destroy timer never fires mid-drain
           buf += (chunk as Buffer).toString('utf8');
           let nl: number;
           while ((nl = buf.indexOf('\n')) !== -1) {

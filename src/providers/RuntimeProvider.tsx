@@ -1329,8 +1329,26 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
         // failure a later delta's flush should retry) — and cap consecutive failures so a
         // persistently-unreadable (non-deleted) record can't loop the flusher forever either.
         const streak = (draftFlushFailStreak.get(convId) ?? 0) + 1;
-        if (deletedConversationIds.has(convId) || streak >= MAX_DRAFT_FLUSH_FAIL_STREAK) {
+        if (deletedConversationIds.has(convId)) {
+          // Deleted/cleared conversation: its drafts are moot — drop the whole buffer.
           pendingDraftDeltas.delete(convId);
+          draftFlushFailStreak.delete(convId);
+          return;
+        }
+        if (streak >= MAX_DRAFT_FLUSH_FAIL_STREAK) {
+          // Persistently-unreadable but NOT-deleted conversation: give up on THIS batch's ops so the
+          // flusher can't loop forever — but do NOT blanket-delete the buffer (R167 f-2): a NEWER
+          // displaced draft may have been folded into pendingDraftDeltas by a concurrent
+          // applyPendingDraftsDelta while this batch was awaiting its retries, and deleting the whole
+          // buffer would discard that fresh, never-flushed prompt. Remove only THIS batch's ops from
+          // the current buffer, preserving anything newer; clear the streak so the newer op gets its
+          // own fresh retry budget.
+          const cur = pendingDraftDeltas.get(convId);
+          if (cur) {
+            for (const id of buf.adds.keys()) cur.adds.delete(id);
+            for (const id of buf.removes) cur.removes.delete(id);
+            if (cur.adds.size === 0 && cur.removes.size === 0) pendingDraftDeltas.delete(convId);
+          }
           draftFlushFailStreak.delete(convId);
           return;
         }
