@@ -663,8 +663,15 @@ function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, 
  * Tool names that execute inside the provider (server-side web_search etc.) and
  * therefore never flow through our onToolExecutionStart wrapper. Callers use
  * this to skip UI arg-suppression for these tools (they'd never un-suppress).
+ *
+ * PLAN-FIRST returns EMPTY (R154 f-1): provider-defined tools are DROPPED from the tool set in
+ * plan-first, so their names must NOT be reported as provider-defined — otherwise a surviving
+ * KAI built-in of the same name (e.g. the built-in `web_search` when a provider `web_search` was
+ * configured) would be mis-classified as provider-defined and SKIP arg-suppression, broadcasting
+ * raw args before the enforcing PreToolUse hook redacts/blocks them.
  */
-export function getProviderDefinedToolNames(modelConfig: LLMModelConfig): Set<string> {
+export function getProviderDefinedToolNames(modelConfig: LLMModelConfig, executionMode?: string): Set<string> {
+  if (executionMode === 'plan-first') return new Set();
   return new Set(Object.keys(buildProviderDefinedTools(modelConfig)));
 }
 

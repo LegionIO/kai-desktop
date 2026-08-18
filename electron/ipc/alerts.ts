@@ -372,6 +372,25 @@ export async function deliverRecoveredAnswer(
             dismissPendingAlert();
             return { delivered: false };
           }
+          // The record could NOT be read (transient EMFILE/EACCES/parse) but the conversation is
+          // NOT deleted — we CANNOT confirm the turn didn't commit (R154 f-4). Do NOT invite a
+          // re-send (a committed turn + a resend would DUPLICATE it + repeat tool effects). Surface
+          // the CAUTIOUS "verify before resending" alert instead of "not delivered, re-send".
+          if (after == null) {
+            dismissPendingAlert();
+            try {
+              const alert = createAlert(deps.appHome, {
+                kind: 'fyi',
+                title: `Answer may be incomplete: ${title}`,
+                body: `Your answer was being applied but the conversation couldn't be read to confirm. CHECK the conversation before re-sending — if your answer is already there, re-sending would duplicate it:\n${body}`,
+                conversationId,
+              });
+              notifyNewAlert(alert);
+            } catch {
+              /* best-effort — the caller retains its bounded-stash copy */
+            }
+            return { delivered: false };
+          }
           // The CURRENT resume committed its user turn iff a message carrying THIS
           // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
           // active branch), NOT a count-based suffix: a count-relative slice breaks if
@@ -651,11 +670,16 @@ async function resume(alert: Alert, userText: string): Promise<void> {
     // Only reopen (invite a re-answer) when the answer's user turn is NOT already on
     // the branch — otherwise re-answering would duplicate it + repeat tool effects.
     let committed = false;
+    let readFailed = false;
     try {
       const after = readConversation(deps.appHome, alert.conversationId) as {
         messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
         messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
       } | null;
+      // A null read is a transient I/O failure (EMFILE/EACCES/parse) — NOT proof of non-commit
+      // (R154 f-4). Track it: on a failed read we must NOT reopen (a committed turn + a reopened
+      // re-answer would DUPLICATE it), unless the conversation is confirmed deleted.
+      if (after == null) readFailed = true;
       const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
         ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
         ...(Array.isArray(after?.messages) ? after!.messages : []),
@@ -671,9 +695,9 @@ async function resume(alert: Alert, userText: string): Promise<void> {
         return JSON.stringify(m.content ?? '').includes(deliveryId);
       });
     } catch {
-      /* if we can't read, fall through to reopen (safer to let the user retry) */
+      readFailed = true; // couldn't read → can't confirm non-commit; don't reopen (may duplicate)
     }
-    if (!committed) {
+    if (!committed && !readFailed) {
       // Do NOT reopen for a conversation that was DELETED during/before the resume (R144 f-3):
       // reopening clears the recorded answer and re-surfaces an alert that can NEVER be answered
       // (its conversation is gone), stranding it. A confirmed-deleted target → leave it dismissed.

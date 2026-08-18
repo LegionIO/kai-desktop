@@ -4164,7 +4164,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // has a provider-native tool of the same name — letting raw args leak
       // past a DLP hook. Recomputed on each model-fallback event below.
       let providerDefinedToolNames = modelEntry?.modelConfig
-        ? getProviderDefinedToolNames(modelEntry.modelConfig)
+        ? getProviderDefinedToolNames(modelEntry.modelConfig, effectiveExecutionMode)
         : new Set<string>();
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
@@ -7082,7 +7082,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   // fallback model so its provider tools aren't suppressed and,
                   // conversely, the previous model's local tools aren't wrongly
                   // exempted.
-                  providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
+                  providerDefinedToolNames = getProviderDefinedToolNames(
+                    fallbackEntry.modelConfig,
+                    effectiveExecutionMode,
+                  );
                 }
                 // Refresh the run context's model key so a mid-turn inject arriving
                 // AFTER this fallback gates under the model its text will actually
@@ -7403,7 +7406,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               : null;
             activeModelDisplayName = modelEntry?.displayName ?? null;
             providerDefinedToolNames = modelEntry?.modelConfig
-              ? getProviderDefinedToolNames(modelEntry.modelConfig)
+              ? getProviderDefinedToolNames(modelEntry.modelConfig, effectiveExecutionMode)
               : new Set<string>();
             activeModelEntryForRecovery = modelEntry;
             // Restore the active-run context's model key to the PRIMARY too, so a

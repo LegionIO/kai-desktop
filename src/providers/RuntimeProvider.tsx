@@ -1258,6 +1258,13 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
 // collapses the common stash-then-immediately-restore case into a no-op write.
 type PendingDraftDelta = { adds: Map<string, RejectedDraft>; removes: Set<string> };
 const pendingDraftDeltas = new Map<string, PendingDraftDelta>();
+// Consecutive durable-write failures per conversation. A non-deleted conversation whose
+// setPendingDrafts keeps returning {ok:false} (a persistently-unreadable record) would otherwise
+// loop the flusher forever via the re-fold + finally-relaunch (R154 f-2). After a bounded number
+// of failed batches we DROP the durable write (the in-memory queue still holds the draft for the
+// session; durability is best-effort). Reset on any success.
+const draftFlushFailStreak = new Map<string, number>();
+const MAX_DRAFT_FLUSH_FAIL_STREAK = 8;
 const draftDeltaFlushing = new Map<string, Promise<void>>();
 function applyPendingDraftsDelta(convId: string, add: RejectedDraft[], removeIds: string[]): void {
   let buf = pendingDraftDeltas.get(convId);
@@ -1315,14 +1322,28 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
         }
       }
       if (!ok) {
-        // Exhausted this batch. Re-fold it into the buffer so a later delta's flush retries it —
-        // but only ops not already superseded by a newer op (a fresh remove wins over our add).
+        // Exhausted this batch. A conversation DELETED/cleared this session returns {ok:false}
+        // PERMANENTLY (main can't read the record) — re-folding it would loop forever via the
+        // finally-relaunch below (R154 f-2). Its drafts are moot anyway (a deleted chat), so DROP
+        // the batch instead of re-folding. Only re-fold for a still-live conversation (a transient
+        // failure a later delta's flush should retry) — and cap consecutive failures so a
+        // persistently-unreadable (non-deleted) record can't loop the flusher forever either.
+        const streak = (draftFlushFailStreak.get(convId) ?? 0) + 1;
+        if (deletedConversationIds.has(convId) || streak >= MAX_DRAFT_FLUSH_FAIL_STREAK) {
+          pendingDraftDeltas.delete(convId);
+          draftFlushFailStreak.delete(convId);
+          return;
+        }
+        draftFlushFailStreak.set(convId, streak);
+        // Re-fold it into the buffer so a later delta's flush retries it — but only ops not
+        // already superseded by a newer op (a fresh remove wins over our add).
         const next = pendingDraftDeltas.get(convId) ?? { adds: new Map(), removes: new Set() };
         for (const d of buf.adds.values()) if (!next.removes.has(d.id) && !next.adds.has(d.id)) next.adds.set(d.id, d);
         for (const id of buf.removes) if (!next.adds.has(id)) next.removes.add(id);
         pendingDraftDeltas.set(convId, next);
         return; // stop laps; the next applyPendingDraftsDelta call restarts the flusher
       }
+      draftFlushFailStreak.delete(convId); // a successful batch resets the failure streak
     }
   })();
   draftDeltaFlushing.set(convId, run);

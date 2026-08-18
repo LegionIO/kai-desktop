@@ -237,6 +237,36 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(res).toEqual({ delivered: true });
   });
 
+  it('on resume FAILURE + a transient null post-read (not deleted), surfaces the CAUTIOUS alert — never invites a duplicate resend (R154)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation, isWriteTombstoned } = await import('../conversation-store.js');
+    const { createAlert } = await import('../alert-store.js');
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockReturnValue(false); // NOT deleted
+    // Conversation exists at entry + through resume; the resume THROWS and flips the read to
+    // return NULL afterward (transient I/O) — the committed-check can't confirm non-commit.
+    let ioFailed = false;
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() =>
+      ioFailed ? null : { id: 'c1', messages: [] },
+    );
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      ioFailed = true;
+      throw new Error('generation failed');
+    });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    expect(res).toEqual({ delivered: false });
+    const titles = (createAlert as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[1] as { title?: string })?.title ?? '',
+    );
+    expect(titles.some((t) => /may be incomplete/i.test(t))).toBe(true); // cautious wording
+    expect(titles.some((t) => /not delivered/i.test(t))).toBe(false); // never "re-send" (duplicate risk)
+    // Restore a clean read mock so later tests aren't affected by the flip.
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({ id: 'c1', messages: [] }));
+  });
+
   it('raises a persistent question Alert (delivered:false) when the conversation is gone', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { readConversation } = await import('../conversation-store.js');
