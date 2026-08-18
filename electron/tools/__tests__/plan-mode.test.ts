@@ -12,7 +12,7 @@ vi.mock('electron', () => ({ BrowserWindow: { getAllWindows: () => [] } }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: vi.fn() }));
 
 import { __internal } from '../plan-mode.js';
-import { createExitPlanModeTool } from '../plan-mode.js';
+import { createExitPlanModeTool, createEnterPlanModeTool } from '../plan-mode.js';
 
 const { slugifyPlanTitle } = __internal;
 
@@ -62,8 +62,32 @@ describe('exit_plan_mode size cap', () => {
     const huge = 'x'.repeat(1024 * 1024 + 1); // 1 MiB + 1 byte
     const res = (await tool.execute!({ planContent: huge, planTitle: 'big' }, {
       toolCallId: 't1',
+      planModeGateable: true, // reach the size check (past the R141 self-guard)
     } as never)) as { success?: boolean; error?: string };
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/too large/i);
+  });
+});
+
+describe('plan-mode tools self-guard (R141)', () => {
+  it('exit_plan_mode refuses in a non-gateable context (ungated executor)', async () => {
+    const tool = createExitPlanModeTool();
+    const res = (await tool.execute!({ planContent: 'plan', planTitle: 't' }, {
+      toolCallId: 't1',
+      conversationId: 'c1',
+      // planModeGateable ABSENT — an ungated executor (bridge/task/sub-agent/automation)
+    } as never)) as { success?: boolean; error?: string };
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/approval flow not available/i);
+  });
+
+  it('enter_plan_mode refuses in a non-gateable context', async () => {
+    const tool = createEnterPlanModeTool();
+    const res = (await tool.execute!({}, {
+      toolCallId: 't1',
+      conversationId: 'c1',
+    } as never)) as { success?: boolean; error?: string };
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/not available in this run/i);
   });
 });

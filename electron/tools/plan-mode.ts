@@ -160,6 +160,18 @@ export function createEnterPlanModeTool(): ToolDefinition {
     }),
     execute: async (input, context) => {
       const { reason } = input as { reason?: string };
+      // SELF-GUARD (R141): only run in a context that can actually enforce plan mode — an
+      // interactive/SDK run whose driver intercepts this tool to restart read-only. Every other
+      // executor (Pi/Codex/OpenCode bridges, task agents, sub-agents, observer, plugin inference,
+      // realtime, direct automation tool actions) calls execute DIRECTLY with planModeGateable
+      // ABSENT — there, entering plan mode would flip the mode but the run keeps its MUTATING
+      // tool set (no restart), so refuse instead.
+      if (!context.planModeGateable) {
+        return {
+          success: false,
+          error: 'Plan mode is not available in this run. Continue normally; do not treat this turn as plan mode.',
+        };
+      }
       // FAIL CLOSED (R136 f-1): if plan-first can't be persisted (disk write failed / no record),
       // do NOT report success — a GUI/CLI restart into plan-first would then trust the stale
       // disk 'auto' at reconcile and run mutating tools during "planning". Tell the model the
@@ -221,6 +233,19 @@ export function createExitPlanModeTool(): ToolDefinition {
         planTitle?: string;
         summary?: string;
       };
+
+      // SELF-GUARD (R141): exit_plan_mode WRITES the plan file + flips mode to auto. That must
+      // only happen AFTER user approval, which only the gateable runtimes perform (the Mastra
+      // streamHandler approval hook; the SDK createExitPlanModeHandler). An ungated executor
+      // (Pi/Codex/OpenCode bridge, task/sub-agent, observer, plugin inference, realtime,
+      // automation tool action) calls execute DIRECTLY with planModeGateable ABSENT — saving the
+      // plan + leaving plan mode with NO approval. Refuse there.
+      if (!context.planModeGateable) {
+        return {
+          success: false,
+          error: 'exit_plan_mode requires an interactive approval flow not available in this run.',
+        };
+      }
 
       // Bound the plan size: model-generated content is normally small, but a
       // runaway plan shouldn't be able to write an unbounded file / block the

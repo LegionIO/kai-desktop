@@ -1176,6 +1176,10 @@ function createToolHandler(
       conversationId,
       cwd,
       abortSignal,
+      // The SDK runtime IS a gateable plan-mode context: enter_plan_mode restarts via MAIN's
+      // name-stamped mid-stream interception (R139), and exit_plan_mode is gated by the
+      // dedicated createExitPlanModeHandler. So the plan tools may execute here (R141).
+      planModeGateable: true,
     };
 
     try {
@@ -1455,6 +1459,8 @@ function createExitPlanModeHandler(
       conversationId,
       cwd,
       abortSignal,
+      // Reached only AFTER user approval in createExitPlanModeHandler — a gated context (R141).
+      planModeGateable: true,
     };
 
     try {

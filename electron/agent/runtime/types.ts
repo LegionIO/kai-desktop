@@ -255,5 +255,10 @@ export const RUNTIME_LABELS: Record<RuntimeId, string> = {
  * external runtime can call the same tools the native Mastra agent can.
  *
  * `sub_agent`: both SDKs have a native sub-agent/Agent primitive.
+ *
+ * `enter_plan_mode` / `exit_plan_mode`: the interactive plan-mode flow (approval gate +
+ * plan-first restart) is only enforceable by the native Mastra streamHandler / the Claude SDK
+ * handler. The Pi/Codex/OpenCode bridges call tool.execute directly with no gate, so don't even
+ * offer them (the tools also self-guard on planModeGateable as a backstop — R141 f-1).
  */
-export const RUNTIME_BRIDGE_SKIP_TOOLS = new Set<string>(['sub_agent']);
+export const RUNTIME_BRIDGE_SKIP_TOOLS = new Set<string>(['sub_agent', 'enter_plan_mode', 'exit_plan_mode']);
