@@ -76,6 +76,7 @@ import {
   readAllConversations,
   writeConversation,
   isWriteTombstoned,
+  conversationExistenceState,
   getActiveConversationId,
   setActiveConversationId,
 } from '../ipc/conversation-store.js';
@@ -1728,21 +1729,39 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     // plugin upsert carries whatever mode was on disk at the plugin's get-time (and
     // PluginConversationRecord doesn't even model executionMode), so a DELAYED upsert can clobber
     // a plan-mode transition MAIN just wrote — re-exposing mutating tools on the next trust-disk
-    // turn. Always keep the CURRENT disk value over the incoming record's, exactly like
-    // conversations:put (R158 f-2). Read the live record; absent means auto (field deleted).
-    try {
-      const prev = readConversation(callbacks.appHome, normalizedConversation.id) as {
-        executionMode?: unknown;
-      } | null;
-      const prevMode = prev ? prev.executionMode : undefined;
+    // turn. Keep the CURRENT disk value over the incoming record's, like conversations:put (R158 f-2).
+    // readConversation returns NULL for BOTH a genuinely-absent record AND an existing-but-unreadable
+    // one (EMFILE / parse failure) — treating null as "absent → auto" would let a mode-less upsert
+    // clobber a plan-first record we merely failed to read (R159 f-3). Use the tri-state existence
+    // probe: 'exists' → merge prev's mode; 'absent' → new record, strip any incoming mode; 'unknown'
+    // → INDETERMINATE, FAIL CLOSED by aborting the whole upsert (never risk clobbering plan-first).
+    const existence = conversationExistenceState(callbacks.appHome, normalizedConversation.id);
+    if (existence === 'unknown') {
+      // Can't rule out an existing plan-first record; refuse rather than write a mode-less clobber.
+      return;
+    }
+    if (existence === 'exists') {
+      let prevMode: unknown = undefined;
+      try {
+        const prev = readConversation(callbacks.appHome, normalizedConversation.id) as {
+          executionMode?: unknown;
+        } | null;
+        if (!prev) {
+          // Raced from 'exists' to unreadable between the probe and this read — fail closed.
+          return;
+        }
+        prevMode = prev.executionMode;
+      } catch {
+        return; // fail closed
+      }
       if (prevMode !== undefined) {
         (normalizedConversation as { executionMode?: unknown }).executionMode = prevMode;
       } else if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
         delete (normalizedConversation as { executionMode?: unknown }).executionMode;
       }
-    } catch {
-      // Best-effort: on a read failure, strip any incoming executionMode so a stale plugin value
-      // can't win. MAIN will re-broadcast the authoritative mode on its next transition.
+    } else {
+      // 'absent' — a genuinely new record. Strip any incoming mode so a plugin can't seed a mode the
+      // authoritative path didn't set (MAIN broadcasts the real mode on its first transition).
       if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
         delete (normalizedConversation as { executionMode?: unknown }).executionMode;
       }
