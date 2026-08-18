@@ -123,6 +123,27 @@ const subAgentState = new Map<
 >();
 
 /**
+ * Resolve the ROOT (real, file-backed) conversation id that governs plan-mode for a sub-agent
+ * spawned/resumed under `parentThreadId` (R158 f-1). A sub-agent conversation id is `sub-*` and has
+ * NO conversation file, so reading its executionMode always misses — the mode that governs is the
+ * ROOT conversation's. Walk up the parent chain (subAgentState's persisted parentThreadId, falling
+ * back to the live activeSubAgentParents map) while ids are `sub-`-prefixed, stopping at the first
+ * non-`sub-` id = the root conversation. Returns null if the chain can't be resolved to a root
+ * (broken/inactive intermediate) so callers keep the snapshot mode rather than guess. Bounded to
+ * avoid a cycle looping forever (maxDepth is small; 64 is generous).
+ */
+function resolveRootConversationId(parentThreadId: string | null | undefined): string | null {
+  let cur: string | null | undefined = parentThreadId;
+  for (let hops = 0; hops < 64 && cur; hops++) {
+    if (!cur.startsWith('sub-')) return cur; // reached a real, file-backed conversation
+    const next = subAgentState.get(cur)?.parentThreadId ?? activeSubAgentParents.get(cur) ?? null;
+    if (!next || next === cur) return null; // chain broke or self-loop — don't guess
+    cur = next;
+  }
+  return null;
+}
+
+/**
  * Live-config accessor, registered by createSubAgentTool. Admission checks
  * (concurrency + per-parent caps) MUST read the CURRENT config, not the config
  * captured in a sub-agent's resumable state at its original completion — so a
@@ -686,25 +707,27 @@ async function resumeSubAgent(
     systemPrompt: persistedSystemPrompt,
   } = state;
 
-  // Re-derive the PARENT CONVERSATION's CURRENT executionMode at RESUME time (R156 f-2): the
+  // Re-derive the ROOT CONVERSATION's CURRENT executionMode at RESUME time (R156 f-2): the
   // persisted state.config captured the mode at SPAWN, so an auto child paused while its parent
   // switched to plan-first would otherwise resume with mutating auto tools. Read the parent's
   // live mode and overlay it onto the resume config. appHome is derivable from dbPath
   // (<appHome>/data/memory.db). NOTE the resumable state's field NAMED `parentConversationId`
   // actually holds the TOOL-CALL id per the resume-routing convention — the real parent CONVERSATION
-  // id is `parentThreadId` (R157 f-1); reading the tool-call id would always miss. An existing
+  // id is `parentThreadId` (R157 f-1); reading the tool-call id would always miss. But a NESTED
+  // sub-agent's parentThreadId is itself a `sub-*` thread with no conversation file, so we resolve
+  // up the chain to the ROOT (file-backed) conversation whose mode governs (R158 f-1). An existing
   // conversation stores auto by OMITTING executionMode (conversations.ts deletes it), so a present
-  // parent record means mode = executionMode ?? 'auto' and we ALWAYS overlay that (R157 f-2) — a
+  // root record means mode = executionMode ?? 'auto' and we ALWAYS overlay that (R157 f-2) — a
   // missing field must not be read as "no opinion" (that would retain a stale plan-first snapshot
   // after the parent switched back to auto, or run plan-first under a plan-first GLOBAL when the
-  // parent conversation is really auto). We overlay only when the parent record was READ (exists);
-  // a null/throw read keeps the snapshot mode. Best-effort.
+  // root conversation is really auto). We overlay only when the root record was READ (exists);
+  // a null/throw read (or unresolvable chain) keeps the snapshot mode. Best-effort.
   let resumeConfig = config;
   try {
     const appHomeForResume = join(dbPath, '..', '..');
-    const parentConvId = parentThreadId ?? null;
-    const parentConv = parentConvId
-      ? (readConversation(appHomeForResume, parentConvId) as {
+    const rootConvId = resolveRootConversationId(parentThreadId);
+    const parentConv = rootConvId
+      ? (readConversation(appHomeForResume, rootConvId) as {
           executionMode?: 'auto' | 'plan-first';
         } | null)
       : null;
@@ -1219,14 +1242,17 @@ export function createSubAgentTool(
       // auto child was paused resumes the child in plan-first. Overlay onto config so every
       // downstream use (tool filtering, provider-tool drop, DLP names) sees the right mode. An
       // existing conversation stores auto by OMITTING executionMode (conversations.ts deletes it),
-      // so a present parent record means mode = executionMode ?? 'auto' and we ALWAYS overlay that
+      // so a present root record means mode = executionMode ?? 'auto' and we ALWAYS overlay that
       // (R157 f-2): a missing field is auto, NOT "no opinion" — otherwise a plan-first GLOBAL would
-      // leak into an auto parent conversation's child. Overlay only when the parent record was READ
-      // (ctx.conversationId here is the LIVE parent conversation id, not the resume-state field).
+      // leak into an auto parent conversation's child. A NESTED spawn's ctx.conversationId is itself
+      // a `sub-*` thread with no conversation file, so resolve up to the ROOT (file-backed)
+      // conversation whose mode governs (R158 f-1); resolveRootConversationId returns a non-`sub-`
+      // id as-is. Overlay only when the root record was READ (exists).
       let config = globalConfig;
       try {
-        const parentConv = ctx.conversationId
-          ? (readConversation(appHome, ctx.conversationId) as { executionMode?: 'auto' | 'plan-first' } | null)
+        const rootConvId = resolveRootConversationId(ctx.conversationId);
+        const parentConv = rootConvId
+          ? (readConversation(appHome, rootConvId) as { executionMode?: 'auto' | 'plan-first' } | null)
           : null;
         if (parentConv) {
           const parentMode: 'auto' | 'plan-first' = parentConv.executionMode ?? 'auto';

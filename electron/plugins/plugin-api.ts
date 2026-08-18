@@ -1724,6 +1724,29 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
   api.conversations.upsert = (conversation: PluginConversationRecord) => {
     requirePermission('conversations:write');
     const normalizedConversation = normalizeConversationRecord(conversation);
+    // executionMode is MAIN-authoritative (persisted by the plan-mode tools / stream path). A
+    // plugin upsert carries whatever mode was on disk at the plugin's get-time (and
+    // PluginConversationRecord doesn't even model executionMode), so a DELAYED upsert can clobber
+    // a plan-mode transition MAIN just wrote — re-exposing mutating tools on the next trust-disk
+    // turn. Always keep the CURRENT disk value over the incoming record's, exactly like
+    // conversations:put (R158 f-2). Read the live record; absent means auto (field deleted).
+    try {
+      const prev = readConversation(callbacks.appHome, normalizedConversation.id) as {
+        executionMode?: unknown;
+      } | null;
+      const prevMode = prev ? prev.executionMode : undefined;
+      if (prevMode !== undefined) {
+        (normalizedConversation as { executionMode?: unknown }).executionMode = prevMode;
+      } else if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        delete (normalizedConversation as { executionMode?: unknown }).executionMode;
+      }
+    } catch {
+      // Best-effort: on a read failure, strip any incoming executionMode so a stale plugin value
+      // can't win. MAIN will re-broadcast the authoritative mode on its next transition.
+      if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        delete (normalizedConversation as { executionMode?: unknown }).executionMode;
+      }
+    }
     const written = writeConversation(callbacks.appHome, normalizedConversation as never);
     // writeConversation SUPPRESSES a write for a tombstoned (deleted) id — it returns the record
     // unchanged but nothing hits disk. Do NOT broadcast a phantom upsert for a deleted chat
