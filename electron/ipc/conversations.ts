@@ -60,6 +60,7 @@ import {
   isRecentlyDeleted,
   isWriteTombstoned,
   consumeWriteWasSuppressed,
+  conversationFileExists,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -879,7 +880,12 @@ export function registerConversationHandlers(
   ipcMain.handle('conversations:list', () => {
     // Reads only the lightweight index — no message bodies loaded.
     const index = readIndex(appHome);
-    const entries: ConversationIndexEntry[] = Object.values(index.conversations);
+    // Filter GHOST entries whose record file is gone (R162 f-2): a failed durable index write during
+    // delete/clear can leave an index entry pointing at a removed file. statSync fails OPEN (only a
+    // definite ENOENT drops the entry) so a transiently-unreadable real chat is never hidden.
+    const entries: ConversationIndexEntry[] = Object.values(index.conversations).filter((entry) =>
+      conversationFileExists(appHome, entry.id),
+    );
     entries.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;

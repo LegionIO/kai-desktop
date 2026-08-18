@@ -20,6 +20,7 @@ import {
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
+  __resetDeleteTombstonesForTests,
   sanitizeMessageTree,
   sanitizeConversationTree,
   mergeSnapshotContent,
@@ -59,6 +60,7 @@ beforeEach(() => {
   appHome = join(tempRoot, 'app-home');
   mkdirSync(join(appHome, 'data'), { recursive: true });
   __resetMigrationGuardForTests();
+  __resetDeleteTombstonesForTests();
 });
 
 afterEach(() => {
