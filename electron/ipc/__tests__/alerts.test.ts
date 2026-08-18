@@ -169,6 +169,28 @@ describe('deliverRecoveredAnswer (raced answer whose run finished before consumi
     expect(dismissAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/tmp/app', 'alert-1');
   });
 
+  it('does NOT attempt the fragile resume when the durable pending-alert write FAILS — falls to the durable fallback (R150)', async () => {
+    const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
+    const { resumeConversationWithMessage } = await import('../../automations/actions.js');
+    const { readConversation } = await import('../conversation-store.js');
+    const { createAlert } = await import('../alert-store.js');
+    (readConversation as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({ id: 'c1', messages: [] }));
+    (resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockClear();
+    // The pending-delivery alert write THROWS; the subsequent durable-fallback alert succeeds.
+    (createAlert as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      throw new Error('index write failed');
+    });
+    initializeAlerts({ appHome: '/tmp/app', getActionDeps: () => ({}) as never, alertSurface: () => 'off' });
+
+    const res = await deliverRecoveredAnswer('c1', 'Deploy target', { Env: 'prod' });
+    // No durability record → skip the fire-and-forget resume (a Kai exit would lose the answer).
+    expect(resumeConversationWithMessage as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    // Reported not-delivered; the durable fallback alert (recording the answer) was created.
+    expect(res).toEqual({ delivered: false });
+    expect(createAlert as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(2);
+  });
+
   it('abandons delivery + dismisses the pending alert when the conversation is DELETED during the resume wait (R133/R134)', async () => {
     const { initializeAlerts, deliverRecoveredAnswer } = await import('../alerts');
     const { resumeConversationWithMessage } = await import('../../automations/actions.js');

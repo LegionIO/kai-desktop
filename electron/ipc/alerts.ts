@@ -225,193 +225,201 @@ export async function deliverRecoveredAnswer(
       // Do NOT notifyNewAlert here — this is a transient durability record dismissed on
       // success; surfacing it would flash a notification for the normal (fast) path.
     } catch {
-      /* best-effort durability; the resume + failure-path alert still cover most cases */
+      /* alert persistence failed — handled below (fall to the durable fallback) */
     }
-    try {
-      // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
-      // the recovered answer runs under the same context the question was asked in —
-      // not the global default (R89/R90/R91). executionMode especially: a plan-first
-      // conversation must NOT resume in auto and expose mutating workspace tools.
-      // reasoningEffort + per-thread overrides (temperature/systemPrompt/maxSteps/…)
-      // are threaded too so the resume honors the conversation's own runtime (R92).
-      await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
-        correlationId,
-        ...(convBefore.selectedModelKey ? { modelKey: convBefore.selectedModelKey } : {}),
-        ...(convBefore.selectedProfileKey ? { profileKey: convBefore.selectedProfileKey } : {}),
-        ...(convBefore.currentWorkingDirectory ? { cwd: convBefore.currentWorkingDirectory } : {}),
-        ...(typeof convBefore.fallbackEnabled === 'boolean' ? { fallbackEnabled: convBefore.fallbackEnabled } : {}),
-        ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
-        ...(convBefore.reasoningEffort ? { reasoningEffort: convBefore.reasoningEffort } : {}),
-        ...(threadOverrides ? { threadOverrides } : {}),
-        userTurnId,
-      });
-      traceDiagnostic({
-        scope: 'alert',
-        event: 'recovered-answer.delivered',
-        correlationId,
-        conversationId,
-        fields: { answerCount: Object.keys(clean).length },
-      });
-      // "resume succeeded" does NOT mean the user turn is on disk: a SERVER-OWNED
-      // COOPERATIVE splice (CLI/headless Mastra) defers persistence to the next
-      // prepareStep, which lands only AFTER the current (possibly long-running) tool
-      // step. Reconcile against the RUN LIFECYCLE, not a fixed timeout: dismiss the
-      // durable pending alert the moment the userTurnId commits; keep polling WHILE the
-      // run is still active (a long tool step must not orphan the alert — R119); and
-      // stop (KEEPING the alert as the recoverable record) once the run is no longer
-      // active without having committed (a Kai exit before drain, or an aborted/stuck
-      // run). A non-cooperative abort+restart persists synchronously → first check
-      // passes. Bounded ceiling backstops a run whose active-state signal never clears.
-      const isCommittedOnDisk = () => {
+    // If the durable pending-delivery record could NOT be created, the whole "durable before
+    // the await" guarantee is void — a Kai exit during the resume wait would lose the answer
+    // with no trace (R150 f-1, not covered by settled item 5 which assumes the record exists).
+    // So do NOT enter the fragile fire-and-forget resume; fall through to the durable fallback
+    // Alert below (which records the answer as a persistent, restart-surviving entry).
+    if (pendingAlertId) {
+      try {
+        // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
+        // the recovered answer runs under the same context the question was asked in —
+        // not the global default (R89/R90/R91). executionMode especially: a plan-first
+        // conversation must NOT resume in auto and expose mutating workspace tools.
+        // reasoningEffort + per-thread overrides (temperature/systemPrompt/maxSteps/…)
+        // are threaded too so the resume honors the conversation's own runtime (R92).
+        await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
+          correlationId,
+          ...(convBefore.selectedModelKey ? { modelKey: convBefore.selectedModelKey } : {}),
+          ...(convBefore.selectedProfileKey ? { profileKey: convBefore.selectedProfileKey } : {}),
+          ...(convBefore.currentWorkingDirectory ? { cwd: convBefore.currentWorkingDirectory } : {}),
+          ...(typeof convBefore.fallbackEnabled === 'boolean' ? { fallbackEnabled: convBefore.fallbackEnabled } : {}),
+          ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
+          ...(convBefore.reasoningEffort ? { reasoningEffort: convBefore.reasoningEffort } : {}),
+          ...(threadOverrides ? { threadOverrides } : {}),
+          userTurnId,
+        });
+        traceDiagnostic({
+          scope: 'alert',
+          event: 'recovered-answer.delivered',
+          correlationId,
+          conversationId,
+          fields: { answerCount: Object.keys(clean).length },
+        });
+        // "resume succeeded" does NOT mean the user turn is on disk: a SERVER-OWNED
+        // COOPERATIVE splice (CLI/headless Mastra) defers persistence to the next
+        // prepareStep, which lands only AFTER the current (possibly long-running) tool
+        // step. Reconcile against the RUN LIFECYCLE, not a fixed timeout: dismiss the
+        // durable pending alert the moment the userTurnId commits; keep polling WHILE the
+        // run is still active (a long tool step must not orphan the alert — R119); and
+        // stop (KEEPING the alert as the recoverable record) once the run is no longer
+        // active without having committed (a Kai exit before drain, or an aborted/stuck
+        // run). A non-cooperative abort+restart persists synchronously → first check
+        // passes. Bounded ceiling backstops a run whose active-state signal never clears.
+        const isCommittedOnDisk = () => {
+          try {
+            const after = readConversation(alertsAppHome, conversationId) as {
+              messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+              messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+            } | null;
+            const nodes = [
+              ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+              ...(Array.isArray(after?.messages) ? after!.messages : []),
+            ];
+            return nodes.some(
+              (m) =>
+                m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
+            );
+          } catch {
+            return false;
+          }
+        };
+        let committedOnDisk = isCommittedOnDisk();
+        // Reconcile against the run lifecycle with NO fixed time ceiling when lifecycle
+        // tracking is available: a server-owned Mastra run can hold a single tool step
+        // (e.g. a long shell timeout) for far longer than any fixed budget, and the
+        // recovered answer only commits at the NEXT prepareStep after it. So loop until
+        // the answer commits OR the run actually terminates (then a short grace for the
+        // terminal persist) — a fixed ceiling would abandon the alert mid-run and leave
+        // it stale (R119→R120). Back off the poll interval so a multi-minute tool step
+        // isn't polled tightly. Without a lifecycle signal, keep the bounded ~3s fallback.
+        const runActive = deps?.isConversationTurnActive;
+        let inactiveGrace = 3;
+        // If the conversation is DELETED during the resume wait (another client/window),
+        // abandon the delivery: dismiss the durable pending alert (a FYI record referencing a
+        // deleted chat is worse than nothing) and stop reconciling. Use the DURABLE tombstone
+        // (isWriteTombstoned = in-memory isRecentlyDeleted OR the index's persisted deleted-id
+        // ring), NOT a null read — a null read can be a transient EMFILE/JSON error (would drop a
+        // live answer), and a purely in-memory tombstone can EXPIRE (10min) / EVICT (5000) before
+        // a long resume observes it (R134 f-1). The durable ring survives restart + TTL + eviction.
+        // Throw-safe (R146 f-2): the tombstone check reads the index, which can throw (EMFILE during
+        // a rebuild) — a throw must NOT abandon a LIVE delivery, so treat a lookup failure as "not
+        // gone" and keep reconciling.
+        const conversationGone = () => {
+          try {
+            return isWriteTombstoned(alertsAppHome, conversationId);
+          } catch {
+            return false;
+          }
+        };
+        // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
+        // leak this loop forever — far above any real tool timeout. Reaching it keeps the
+        // alert (uncommitted), which is the safe outcome.
+        const MAX_RECONCILE_MS = 6 * 60 * 60 * 1000; // 6h
+        const startedAt = Date.now();
+        for (let i = 0; !committedOnDisk; i++) {
+          if (Date.now() - startedAt > MAX_RECONCILE_MS) break;
+          // Deleted mid-wait → abandon: drop the durable alert (no FYI for a deleted chat).
+          if (conversationGone()) {
+            dismissPendingAlert();
+            return { delivered: false };
+          }
+          if (runActive) {
+            // Stop once the run is no longer streaming AND a short grace has elapsed —
+            // whatever was going to commit has; keep the alert if it still hasn't.
+            if (!runActive(conversationId) && inactiveGrace-- <= 0) break;
+          } else if (i >= 20) {
+            break; // no lifecycle signal → bounded ~3s fallback (R118 behavior)
+          }
+          // 150ms while the commit is imminent (first ~3s / after the run goes inactive),
+          // then back off to 1s so a long-running tool step doesn't tight-loop for minutes.
+          const stillRunning = runActive ? runActive(conversationId) : false;
+          await new Promise((r) => setTimeout(r, i < 20 || !stillRunning ? 150 : 1000));
+          committedOnDisk = isCommittedOnDisk();
+        }
+        if (committedOnDisk) dismissPendingAlert();
+        return { delivered: true };
+      } catch {
+        // fall through to the durable Alert fallback — but first determine whether the
+        // failure was BEFORE or AFTER the user turn was committed to the branch.
+        // resumeConversationWithMessage persists the labeled user turn EARLY, then
+        // streams; a throw AFTER commit (generation/finalization failure) means the
+        // answer is ALREADY on-branch, so telling the user to re-send would DUPLICATE
+        // it (and repeat tool side effects). Detect the committed turn on disk and word
+        // the fallback accordingly (R90).
         try {
-          const after = readConversation(alertsAppHome, conversationId) as {
+          const after = readConversation(deps.appHome, conversationId) as {
             messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
             messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
           } | null;
-          const nodes = [
+          // Conversation DELETED during the (failed) resume → abandon: dismiss the durable
+          // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
+          // R133 f-1). Use the DURABLE tombstone (isWriteTombstoned), NOT `after == null` — a
+          // null read can be a transient I/O error, and an in-memory-only tombstone can expire/
+          // evict before a long resume's failure lands (R134 f-1). THROW-SAFE (R147 f-2):
+          // isWriteTombstoned can throw (index rebuild EMFILE) — a throw here must NOT skip the
+          // committed-turn scan below (which would misclassify a COMMITTED turn as undelivered →
+          // invite a duplicate resend). A failed lookup → treat as not-deleted, fall through.
+          let targetDeleted = false;
+          try {
+            targetDeleted = isWriteTombstoned(deps.appHome, conversationId);
+          } catch {
+            targetDeleted = false;
+          }
+          if (targetDeleted) {
+            dismissPendingAlert();
+            return { delivered: false };
+          }
+          // The CURRENT resume committed its user turn iff a message carrying THIS
+          // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
+          // active branch), NOT a count-based suffix: a count-relative slice breaks if
+          // the branch was rewound to a shorter one while the resume was queued (the
+          // committed turn then sits outside `slice(beforeMessageCount)` and is missed,
+          // wrongly reporting delivered:false → duplicate resend). The deliveryId is
+          // globally unique and appears ONLY in this recovery's turn, so a full-set scan
+          // can't false-positive on a concurrent/earlier recovery either (R94/R96).
+          const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
             ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
             ...(Array.isArray(after?.messages) ? after!.messages : []),
           ];
-          return nodes.some(
+          // Committed iff a user node carries THIS resume's exact userTurnId (durable
+          // against a content-rewriting policy hook, R104) OR the in-content marker
+          // survived (fast path / cooperative-inject where the id may differ).
+          const committed = nodes.some(
             (m) => m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
           );
-        } catch {
-          return false;
-        }
-      };
-      let committedOnDisk = isCommittedOnDisk();
-      // Reconcile against the run lifecycle with NO fixed time ceiling when lifecycle
-      // tracking is available: a server-owned Mastra run can hold a single tool step
-      // (e.g. a long shell timeout) for far longer than any fixed budget, and the
-      // recovered answer only commits at the NEXT prepareStep after it. So loop until
-      // the answer commits OR the run actually terminates (then a short grace for the
-      // terminal persist) — a fixed ceiling would abandon the alert mid-run and leave
-      // it stale (R119→R120). Back off the poll interval so a multi-minute tool step
-      // isn't polled tightly. Without a lifecycle signal, keep the bounded ~3s fallback.
-      const runActive = deps?.isConversationTurnActive;
-      let inactiveGrace = 3;
-      // If the conversation is DELETED during the resume wait (another client/window),
-      // abandon the delivery: dismiss the durable pending alert (a FYI record referencing a
-      // deleted chat is worse than nothing) and stop reconciling. Use the DURABLE tombstone
-      // (isWriteTombstoned = in-memory isRecentlyDeleted OR the index's persisted deleted-id
-      // ring), NOT a null read — a null read can be a transient EMFILE/JSON error (would drop a
-      // live answer), and a purely in-memory tombstone can EXPIRE (10min) / EVICT (5000) before
-      // a long resume observes it (R134 f-1). The durable ring survives restart + TTL + eviction.
-      // Throw-safe (R146 f-2): the tombstone check reads the index, which can throw (EMFILE during
-      // a rebuild) — a throw must NOT abandon a LIVE delivery, so treat a lookup failure as "not
-      // gone" and keep reconciling.
-      const conversationGone = () => {
-        try {
-          return isWriteTombstoned(alertsAppHome, conversationId);
-        } catch {
-          return false;
-        }
-      };
-      // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
-      // leak this loop forever — far above any real tool timeout. Reaching it keeps the
-      // alert (uncommitted), which is the safe outcome.
-      const MAX_RECONCILE_MS = 6 * 60 * 60 * 1000; // 6h
-      const startedAt = Date.now();
-      for (let i = 0; !committedOnDisk; i++) {
-        if (Date.now() - startedAt > MAX_RECONCILE_MS) break;
-        // Deleted mid-wait → abandon: drop the durable alert (no FYI for a deleted chat).
-        if (conversationGone()) {
-          dismissPendingAlert();
-          return { delivered: false };
-        }
-        if (runActive) {
-          // Stop once the run is no longer streaming AND a short grace has elapsed —
-          // whatever was going to commit has; keep the alert if it still hasn't.
-          if (!runActive(conversationId) && inactiveGrace-- <= 0) break;
-        } else if (i >= 20) {
-          break; // no lifecycle signal → bounded ~3s fallback (R118 behavior)
-        }
-        // 150ms while the commit is imminent (first ~3s / after the run goes inactive),
-        // then back off to 1s so a long-running tool step doesn't tight-loop for minutes.
-        const stillRunning = runActive ? runActive(conversationId) : false;
-        await new Promise((r) => setTimeout(r, i < 20 || !stillRunning ? 150 : 1000));
-        committedOnDisk = isCommittedOnDisk();
-      }
-      if (committedOnDisk) dismissPendingAlert();
-      return { delivered: true };
-    } catch {
-      // fall through to the durable Alert fallback — but first determine whether the
-      // failure was BEFORE or AFTER the user turn was committed to the branch.
-      // resumeConversationWithMessage persists the labeled user turn EARLY, then
-      // streams; a throw AFTER commit (generation/finalization failure) means the
-      // answer is ALREADY on-branch, so telling the user to re-send would DUPLICATE
-      // it (and repeat tool side effects). Detect the committed turn on disk and word
-      // the fallback accordingly (R90).
-      try {
-        const after = readConversation(deps.appHome, conversationId) as {
-          messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
-          messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
-        } | null;
-        // Conversation DELETED during the (failed) resume → abandon: dismiss the durable
-        // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
-        // R133 f-1). Use the DURABLE tombstone (isWriteTombstoned), NOT `after == null` — a
-        // null read can be a transient I/O error, and an in-memory-only tombstone can expire/
-        // evict before a long resume's failure lands (R134 f-1). THROW-SAFE (R147 f-2):
-        // isWriteTombstoned can throw (index rebuild EMFILE) — a throw here must NOT skip the
-        // committed-turn scan below (which would misclassify a COMMITTED turn as undelivered →
-        // invite a duplicate resend). A failed lookup → treat as not-deleted, fall through.
-        let targetDeleted = false;
-        try {
-          targetDeleted = isWriteTombstoned(deps.appHome, conversationId);
-        } catch {
-          targetDeleted = false;
-        }
-        if (targetDeleted) {
-          dismissPendingAlert();
-          return { delivered: false };
-        }
-        // The CURRENT resume committed its user turn iff a message carrying THIS
-        // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
-        // active branch), NOT a count-based suffix: a count-relative slice breaks if
-        // the branch was rewound to a shorter one while the resume was queued (the
-        // committed turn then sits outside `slice(beforeMessageCount)` and is missed,
-        // wrongly reporting delivered:false → duplicate resend). The deliveryId is
-        // globally unique and appears ONLY in this recovery's turn, so a full-set scan
-        // can't false-positive on a concurrent/earlier recovery either (R94/R96).
-        const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
-          ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
-          ...(Array.isArray(after?.messages) ? after!.messages : []),
-        ];
-        // Committed iff a user node carries THIS resume's exact userTurnId (durable
-        // against a content-rewriting policy hook, R104) OR the in-content marker
-        // survived (fast path / cooperative-inject where the id may differ).
-        const committed = nodes.some(
-          (m) => m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
-        );
-        if (committed) {
-          // The answer IS on-branch; only the response generation failed. Do NOT invite
-          // a resend (it would duplicate). Surface an informational alert instead.
-          dismissPendingAlert(); // replaced by the accurate "response incomplete" alert
-          try {
-            const alert = createAlert(deps.appHome, {
-              kind: 'fyi',
-              title: `Answer applied, response incomplete: ${title}`,
-              body: `Your answer was recorded on the conversation, but generating the response failed. Continue in the conversation — do NOT re-send (that would duplicate it):\n${body}`,
-              conversationId,
-            });
-            notifyNewAlert(alert);
-            traceDiagnostic({
-              scope: 'alert',
-              event: 'recovered-answer.committed-response-failed',
-              correlationId,
-              conversationId,
-              alertId: alert.id,
-              fields: { answerCount: Object.keys(clean).length },
-            });
-          } catch {
-            /* best-effort */
+          if (committed) {
+            // The answer IS on-branch; only the response generation failed. Do NOT invite
+            // a resend (it would duplicate). Surface an informational alert instead.
+            dismissPendingAlert(); // replaced by the accurate "response incomplete" alert
+            try {
+              const alert = createAlert(deps.appHome, {
+                kind: 'fyi',
+                title: `Answer applied, response incomplete: ${title}`,
+                body: `Your answer was recorded on the conversation, but generating the response failed. Continue in the conversation — do NOT re-send (that would duplicate it):\n${body}`,
+                conversationId,
+              });
+              notifyNewAlert(alert);
+              traceDiagnostic({
+                scope: 'alert',
+                event: 'recovered-answer.committed-response-failed',
+                correlationId,
+                conversationId,
+                alertId: alert.id,
+                fields: { answerCount: Object.keys(clean).length },
+              });
+            } catch {
+              /* best-effort */
+            }
+            // Committed = the answer reached the branch; report delivered so the caller
+            // consumes the stash and doesn't ALSO route it elsewhere.
+            return { delivered: true };
           }
-          // Committed = the answer reached the branch; report delivered so the caller
-          // consumes the stash and doesn't ALSO route it elsewhere.
-          return { delivered: true };
+        } catch {
+          /* fall through to the pre-commit "re-send" fallback below */
         }
-      } catch {
-        /* fall through to the pre-commit "re-send" fallback below */
       }
     }
   }
