@@ -9166,7 +9166,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     if (wasServerPersist && hasInjects(conversationId)) {
       const stranded = drainInjects(conversationId);
       for (const entry of stranded) {
-        persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+        // Persist each accepted server-owned inject as a real user turn. Guard every entry
+        // (R164 f-2): persistCooperativeInjectedUserTurn can THROW, and a throw here would abort the
+        // rest of Stop cleanup below (inject/bookkeeping clears, serverPersist teardown, the terminal
+        // broadcast) — leaving a half-torn-down conversation. It also returns null on a transient
+        // conversation-read failure; log that (the inject can't be recovered on this terminal Stop,
+        // but a silent drop must at least be visible). NEVER let either abort the cleanup.
+        try {
+          const persisted = persistCooperativeInjectedUserTurn(appHome, conversationId, entry.text, entry.id);
+          if (!persisted) {
+            console.error(
+              `[agent] cancel: stranded inject ${entry.id} for ${conversationId} not persisted (conversation unreadable)`,
+            );
+          }
+        } catch (err) {
+          console.error(`[agent] cancel: failed to persist stranded inject ${entry.id}`, err);
+        }
       }
     }
     // Any injects STILL queued here are GUI-owned (the server-owned drain above

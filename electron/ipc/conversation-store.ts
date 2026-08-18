@@ -1376,7 +1376,11 @@ export function deleteConversation(appHome: string, id: string): boolean {
     // and a stale client could resurrect the just-deleted conversation.
     pushDurableDeletedId(index, id);
     writeIndex(appHome, index);
-    clearIndexGhostFlag(); // a full index rewrite without the removed entry reconciles any ghosts
+    // NOTE: do NOT clearIndexGhostFlag() here (R164 f-3). A single delete's writeIndex persists the
+    // index it just read MINUS this one id — it does NOT reconcile UNRELATED ghosts left by a prior
+    // failed bulk clear, so clearing the flag would stop the list-filter while those ghosts remain.
+    // Only clearAllConversations (which rebuilds the index from `preserved`) reconciles fully. An
+    // over-set flag is safe (just an O(N) list filter); an under-set one re-exposes ghosts.
   } catch (err) {
     // Durable index update failed AFTER the file was removed. The in-memory tombstone (above) still
     // guards this session (the write-path resurrection guard is tombstone-authoritative — R162 f-1);
@@ -1441,7 +1445,9 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     // write or the salvage-on-corrupt-index path, and this session is resurrection-guarded.
     try {
       writeIndex(appHome, index);
-      clearIndexGhostFlag(); // full index rewrite without the removed entries reconciles any ghosts
+      // NOTE: do NOT clearIndexGhostFlag() here (R164 f-3) — a batch delete's writeIndex removes only
+      // THIS batch's entries, not unrelated ghosts from a prior failed clear. Only clearAllConversations
+      // reconciles fully. Over-set is safe; under-set re-exposes ghosts.
     } catch (err) {
       // durable persist failed after removal — in-memory tombstones (set per id in the loop) still
       // guard this session via the tombstone-authoritative write-path guard (R162 f-1). Log so a

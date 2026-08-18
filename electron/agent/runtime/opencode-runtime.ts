@@ -219,15 +219,24 @@ export class OpencodeRuntime implements AgentRuntime {
 
       const onAbort = (): void => killProcessGroup(child);
       abortSignal?.addEventListener('abort', onAbort, { once: true });
+      // If the signal was ALREADY aborted before we attached the listener (a Stop that landed during
+      // spawn), addEventListener never fires — kill the freshly-spawned child NOW and do not send the
+      // prompt, or OpenCode would still receive it and execute tools after Stop (R164 f-1).
+      if (abortSignal?.aborted) {
+        killProcessGroup(child);
+      }
 
       const exited = new Promise<void>((resolve) => {
         child.on('close', () => resolve());
       });
 
       try {
-        // Send the prompt on stdin.
-        child.stdin.write(promptText);
-        child.stdin.end();
+        // Send the prompt on stdin — unless a Stop already aborted (the child was killed above);
+        // writing would race the kill and could still deliver the prompt to a not-yet-dead child.
+        if (!abortSignal?.aborted) {
+          child.stdin.write(promptText);
+          child.stdin.end();
+        }
 
         let buf = '';
         let sessionIdEmitted = false;
@@ -516,18 +525,35 @@ function extractLastUserText(messages: unknown[]): string | null {
 
 /** Kill the child's whole process group (reaps grandchildren spawned by tools). */
 function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
-  try {
-    if (child.exitCode !== null || child.signalCode) return;
-    if (process.platform !== 'win32' && typeof child.pid === 'number') {
-      try {
-        process.kill(-child.pid, 'SIGTERM');
-        return;
-      } catch {
-        /* fall through to direct kill */
+  // Escalate TERM → KILL and target the process GROUP even after the leader exits (R164 f-1): a
+  // TERM-resistant or backgrounded child in the group would otherwise keep running and mutating
+  // after Stop. On POSIX the child is spawned `detached`, so -pid addresses the whole group; send
+  // SIGTERM first for a clean shutdown, then SIGKILL after a short grace period to guarantee death.
+  const pid = child.pid;
+  const groupKill = (signal: NodeJS.Signals): boolean => {
+    try {
+      if (process.platform !== 'win32' && typeof pid === 'number') {
+        process.kill(-pid, signal); // negative pid → the whole process group
+        return true;
       }
+    } catch {
+      /* group gone or not a group leader — fall through to direct child kill */
     }
-    child.kill('SIGTERM');
-  } catch {
-    /* already gone */
-  }
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false; // already gone
+    }
+  };
+  // First TERM. Do NOT early-return on child.exitCode — the LEADER may have exited while backgrounded
+  // group members live on; the group-directed signal still reaches them.
+  groupKill('SIGTERM');
+  // Escalate to SIGKILL after a grace period. Unconditional (NOT cancelled on leader-close): a
+  // backgrounded group member can outlive the leader, and a group SIGKILL to an already-dead group
+  // is a harmless ESRCH (swallowed). unref so the timer never keeps the event loop / process alive.
+  const killTimer = setTimeout(() => {
+    groupKill('SIGKILL');
+  }, 2000);
+  if (typeof killTimer.unref === 'function') killTimer.unref();
 }

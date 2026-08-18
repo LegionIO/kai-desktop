@@ -254,84 +254,93 @@ export class PiRuntime implements AgentRuntime {
     // -----------------------------------------------------------------------
     // 5. Spawn + stream
     // -----------------------------------------------------------------------
-    if (mapping.unmappableReason) {
-      yield {
-        conversationId,
-        type: 'text-delta',
-        text:
-          `> Note: the pi runtime only drives models from its own known providers at their ` +
-          `official endpoints (no custom-endpoint support). Your selected model ` +
-          `"${primaryModel?.displayName ?? 'current model'}" uses a configuration pi can't target ` +
-          `(${mapping.unmappableReason}), so pi is using its own configured default model. Pick a ` +
-          `first-party Anthropic/OpenAI/Google/Bedrock model, set a default in ~/.pi, or switch to ` +
-          `the Claude/Codex runtime for this model.\n\n`,
-      };
-    }
-
-    const child = spawn(piPath, args, {
-      cwd: options.confinedCwd || cwd || process.cwd(),
-      env,
-      shell: false,
-      detached: process.platform !== 'win32', // own process group → reap bash grandchildren
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
-
+    // The bridge (loopback server + temp extension dir) is already started above; from here on it
+    // MUST be stopped on every exit path, so the try/finally opens BEFORE the unmappable-model
+    // warning yield and BEFORE spawn (R164 f-4): if the consumer closes the iterator AT that yield,
+    // or spawn() throws synchronously, a try that only began after spawn would skip the finally and
+    // leak the bridge. `child`/`onAbort` are nullable so the finally can null-guard the child cleanup
+    // for the spawn-threw / closed-at-yield cases (no child yet).
+    let child: ChildProcessWithoutNullStreams | null = null;
+    let onAbort: (() => void) | null = null;
+    // Declared OUTSIDE the try so the catch/finally can read them (the try body assigns them).
     let spawnError: NodeJS.ErrnoException | undefined;
     let stderrBuf = '';
     let exitCode: number | null = null;
     let errorYielded = false;
-
-    child.on('error', (err) => {
-      spawnError = err as NodeJS.ErrnoException;
-    });
-    // Writing the prompt to a child that has already exited (e.g. an abort
-    // landed during spawn) emits an async EPIPE 'error' on stdin that a
-    // synchronous try/catch can't catch — swallow it to avoid an unhandled error.
-    child.stdin.on('error', () => {});
-    child.stderr.on('data', (d: Buffer) => {
-      if (stderrBuf.length < STDERR_CAP) {
-        // Hard-cap on append: a single large stderr chunk must not push the
-        // buffer well past STDERR_CAP.
-        stderrBuf = (stderrBuf + d.toString('utf8')).slice(0, STDERR_CAP);
+    try {
+      if (mapping.unmappableReason) {
+        yield {
+          conversationId,
+          type: 'text-delta',
+          text:
+            `> Note: the pi runtime only drives models from its own known providers at their ` +
+            `official endpoints (no custom-endpoint support). Your selected model ` +
+            `"${primaryModel?.displayName ?? 'current model'}" uses a configuration pi can't target ` +
+            `(${mapping.unmappableReason}), so pi is using its own configured default model. Pick a ` +
+            `first-party Anthropic/OpenAI/Google/Bedrock model, set a default in ~/.pi, or switch to ` +
+            `the Claude/Codex runtime for this model.\n\n`,
+        };
       }
-    });
-    const exited = new Promise<void>((resolve) => {
-      child.on('close', (code) => {
-        exitCode = code;
-        resolve();
+
+      const spawned = spawn(piPath, args, {
+        cwd: options.confinedCwd || cwd || process.cwd(),
+        env,
+        shell: false,
+        detached: process.platform !== 'win32', // own process group → reap bash grandchildren
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }) as ChildProcessWithoutNullStreams;
+      child = spawned;
+
+      spawned.on('error', (err) => {
+        spawnError = err as NodeJS.ErrnoException;
       });
-    });
+      // Writing the prompt to a child that has already exited (e.g. an abort
+      // landed during spawn) emits an async EPIPE 'error' on stdin that a
+      // synchronous try/catch can't catch — swallow it to avoid an unhandled error.
+      spawned.stdin.on('error', () => {});
+      spawned.stderr.on('data', (d: Buffer) => {
+        if (stderrBuf.length < STDERR_CAP) {
+          // Hard-cap on append: a single large stderr chunk must not push the
+          // buffer well past STDERR_CAP.
+          stderrBuf = (stderrBuf + d.toString('utf8')).slice(0, STDERR_CAP);
+        }
+      });
+      const exited = new Promise<void>((resolve) => {
+        spawned.on('close', (code) => {
+          exitCode = code;
+          resolve();
+        });
+      });
 
-    const onAbort = () => {
-      killProcessGroup(child);
-      // Unblock the `for await (… of child.stdout)` loop even when the child has
-      // emitted nothing yet — otherwise an abort against a hung, silent child
-      // would never reach the `finally` that reaps it.
-      child.stdout.destroy();
-    };
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
-    // If the signal was already aborted before we attached (abort landed during
-    // spawn), `{ once: true }` won't fire — reap immediately.
-    if (abortSignal?.aborted) onAbort();
+      onAbort = () => {
+        killProcessGroup(spawned);
+        // Unblock the `for await (… of child.stdout)` loop even when the child has
+        // emitted nothing yet — otherwise an abort against a hung, silent child
+        // would never reach the `finally` that reaps it.
+        spawned.stdout.destroy();
+      };
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      // If the signal was already aborted before we attached (abort landed during
+      // spawn), `{ once: true }` won't fire — reap immediately.
+      if (abortSignal?.aborted) onAbort();
 
-    // Send the prompt via stdin, then close it so pi runs single-shot.
-    try {
-      child.stdin.write(promptText);
-      child.stdin.end();
-    } catch {
-      /* if the process already failed to spawn, the error path below handles it */
-    }
+      // Send the prompt via stdin, then close it so pi runs single-shot.
+      try {
+        spawned.stdin.write(promptText);
+        spawned.stdin.end();
+      } catch {
+        /* if the process already failed to spawn, the error path below handles it */
+      }
 
-    try {
       let buf = '';
       let totalBytes = 0;
-      for await (const chunk of child.stdout) {
+      for await (const chunk of spawned.stdout) {
         if (abortSignal?.aborted) break;
         const bytes = chunk as Buffer;
         totalBytes += bytes.length;
         if (totalBytes > MAX_TOTAL_BYTES) {
           errorYielded = true;
-          killProcessGroup(child);
+          killProcessGroup(spawned);
           yield {
             conversationId,
             type: 'error',
@@ -422,8 +431,10 @@ export class PiRuntime implements AgentRuntime {
         yield { conversationId, type: 'error', error: msg };
       }
     } finally {
-      abortSignal?.removeEventListener('abort', onAbort);
-      killProcessGroup(child); // ensure no orphan pi/bash processes survive
+      // Null-guarded: on a closed-at-yield or spawn-threw exit there is no child/listener yet, but
+      // the bridge (started before this try) still MUST be stopped (R164 f-4).
+      if (onAbort) abortSignal?.removeEventListener('abort', onAbort);
+      if (child) killProcessGroup(child); // ensure no orphan pi/bash processes survive
       if (piBridge) await piBridge.stop().catch(() => {});
       yield { conversationId, type: 'done' };
     }
