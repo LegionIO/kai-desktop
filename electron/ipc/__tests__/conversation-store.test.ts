@@ -17,6 +17,7 @@ import {
   clearAllConversations,
   reindexIfStale,
   writeIndex,
+  conversationExistsInIndex,
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
@@ -106,7 +107,9 @@ describe('per-file read/write', () => {
 
   it('derives hasComputerUse from computer_use* tool calls', () => {
     const autopilot = makeConv('cu1', {
-      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] },
+      ],
     });
     const plainTool = makeConv('cu2', {
       messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'read_file' }] }],
@@ -168,7 +171,9 @@ describe('per-file read/write', () => {
   it('reindexIfStale backfills new precomputed flags once, then no-ops', () => {
     // Seed a chat and hand-write a stale index missing the new flags + version.
     const conv = makeConv('r1', {
-      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] },
+      ],
     });
     writeConversation(appHome, conv);
     const stale = readIndex(appHome);
@@ -200,6 +205,29 @@ describe('per-file read/write', () => {
     // The durable ring persisted to the index carries the deleted id — this is the tombstone
     // that survives a process restart / the in-memory TTL expiry, blocking later resurrection.
     expect(readIndex(appHome).deletedIds).toContain('d1');
+  });
+
+  it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4)', () => {
+    // A confirmed delete records the durable ring; then the index file is corrupted (e.g. a
+    // truncated write on crash). readIndex must rebuild from live files BUT preserve deletedIds
+    // (lost otherwise → a stale put could recreate the deleted chat).
+    writeConversation(appHome, makeConv('live1'));
+    writeConversation(appHome, makeConv('gone1'));
+    deleteConversation(appHome, 'gone1');
+    expect(readIndex(appHome).deletedIds).toContain('gone1');
+    // Corrupt the index: keep a valid deletedIds array earlier in the text, then truncate.
+    const idxPath = join(appHome, 'data', 'index.json');
+    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["gone1"],"settings":{"trunc', 'utf-8');
+    const recovered = readIndex(appHome);
+    // Live conversation summaries are rebuilt AND the durable tombstone survives.
+    expect(recovered.conversations.live1).toBeDefined();
+    expect(recovered.deletedIds).toContain('gone1');
+  });
+
+  it('conversationExistsInIndex distinguishes an existing record from a genuinely-absent one', () => {
+    writeConversation(appHome, makeConv('exists1'));
+    expect(conversationExistsInIndex(appHome, 'exists1')).toBe(true);
+    expect(conversationExistsInIndex(appHome, 'never-created')).toBe(false);
   });
 
   it('records the durable tombstone even when the file exists but the index entry is absent (rebuilt index)', () => {

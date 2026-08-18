@@ -301,9 +301,41 @@ export function readIndex(appHome: string): ConversationIndex {
     // Corrupt/truncated index — the per-file conversation records are the source
     // of truth, so rebuild the summaries from them instead of returning empty
     // (which would make every chat vanish from the list). activeConversationId +
-    // settings are best-effort lost, but no message data is.
+    // settings are best-effort lost, but no message data is. PRESERVE the durable
+    // deletedIds ring (R135 f-4): it can't be reconstructed from live files (the deleted
+    // records are gone), so losing it would let a stale put RECREATE a deleted conversation.
+    // Recover it leniently from the corrupt text (a trailing truncation usually leaves the
+    // earlier deletedIds array intact) before rebuilding.
+    const salvagedDeletedIds = salvageDeletedIdsFromCorruptIndex(p);
     const rebuilt = rebuildIndexFromConversationFiles(appHome);
-    return rebuilt ?? { conversations: {}, activeConversationId: null, settings: {} };
+    if (rebuilt) {
+      if (salvagedDeletedIds.length > 0) rebuilt.deletedIds = salvagedDeletedIds;
+      return rebuilt;
+    }
+    return {
+      conversations: {},
+      activeConversationId: null,
+      settings: {},
+      ...(salvagedDeletedIds.length > 0 ? { deletedIds: salvagedDeletedIds } : {}),
+    };
+  }
+}
+
+/** Best-effort recover the `deletedIds` array from a CORRUPT index file's raw text. A
+ *  full JSON.parse already failed (truncation/corruption), but the deletedIds array — a
+ *  flat list of string ids — usually sits intact earlier in the file. Extract it with a
+ *  tolerant regex so the durable deletion ring survives corrupt-index recovery (R135 f-4).
+ *  Returns [] when nothing recoverable. */
+function salvageDeletedIdsFromCorruptIndex(indexFilePath: string): string[] {
+  try {
+    const raw = readFileSync(indexFilePath, 'utf-8');
+    const m = raw.match(/"deletedIds"\s*:\s*\[([^\]]*)\]/);
+    if (!m) return [];
+    const ids = m[1].match(/"([^"]+)"/g);
+    if (!ids) return [];
+    return ids.map((s) => s.slice(1, -1)).filter((s) => s.length > 0);
+  } catch {
+    return [];
   }
 }
 
@@ -386,7 +418,9 @@ export function readConversation(appHome: string, id: string): ConversationRecor
     const rec = JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
     // Advance the revision floor past any stored compaction revision so a clock rollback /
     // VM restore can't later issue a lower revision than what's already on disk.
-    observeCompactionRevision((rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision);
+    observeCompactionRevision(
+      (rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision,
+    );
     return rec;
   } catch {
     return null;
@@ -1101,6 +1135,13 @@ function pushDurableDeletedId(index: ConversationIndex, id: string): void {
 // True iff the id is in the index's durable deleted ring — a restart/TTL-surviving tombstone.
 function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
   return Array.isArray(index.deletedIds) && index.deletedIds.includes(id);
+}
+// True iff the conversation has an INDEX entry (exists on disk per the index), independent of
+// whether its record file can currently be READ. Lets a caller distinguish "genuinely absent /
+// first turn" from "exists but readConversation failed transiently (EMFILE/truncated JSON)" —
+// the latter must NOT be treated as recordless for a fail-closed security decision (R135 f-3).
+export function conversationExistsInIndex(appHome: string, id: string): boolean {
+  return Boolean(readIndex(appHome).conversations[id]);
 }
 // Public tombstone check: is this id currently blocked from a create-shaped write (recently
 // deleted in-memory, OR durably deleted and absent from the index)? Callers that BROADCAST a write

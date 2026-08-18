@@ -31,6 +31,7 @@ import {
   nextCompactionRevision,
   isRecentlyDeleted,
   isWriteTombstoned,
+  conversationExistsInIndex,
 } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
@@ -782,12 +783,11 @@ const liveCancelGenTokens = new Set<CancelGenToken>();
 function registerCancelGenToken(conversationId: string): CancelGenToken {
   const token: CancelGenToken = { conversationId, cancelled: false };
   liveCancelGenTokens.add(token);
-  // Safety valve: never let the live-token set grow without bound if a caller leaks one.
-  while (liveCancelGenTokens.size > 2000) {
-    const oldest = liveCancelGenTokens.values().next().value;
-    if (oldest === undefined) break;
-    liveCancelGenTokens.delete(oldest);
-  }
+  // NOT capped/evicted: an evicting cap could remove a token whose op is still pending → its
+  // Stop would be missed (R135 f-2). The set is bounded by CONCURRENT live deferred ops (a
+  // handful) because every op releases its token on EVERY exit path (see the release calls in
+  // injectUserTurnAndRestart + the plan-restart microtask finally). If this ever grew large it
+  // would signal a release leak (a bug to fix), not something to paper over with a lossy cap.
   return token;
 }
 function releaseCancelGenToken(token: CancelGenToken | undefined): void {
@@ -2521,22 +2521,33 @@ function observerToolsForExecutionMode(
  */
 const resolveHeaderTemplates = resolveHeaderTemplatesShared;
 
-function broadcastExecutionMode(mode: ExecutionMode, conversationId?: string): void {
+function broadcastExecutionMode(mode: ExecutionMode, conversationId?: string): boolean {
   // Persist the authoritative per-conversation mode FIRST (the exit_plan_mode dismiss
   // path previously failed to persist it — R121 finding-1), then broadcast. Carry
   // conversationId so the renderer applies the mode ONLY to the DISPLAYED conversation
   // — a background conversation's plan-mode transition must not flip the viewed
   // conversation (and expose mutating tools there). Route through the guarded,
-  // non-throwing broadcaster (R107 finding-4).
+  // non-throwing broadcaster (R107 finding-4). Returns whether the authoritative disk
+  // persist SUCCEEDED — a caller that will run a plan-first turn based on this (the
+  // server-persisted plan-restart) must FAIL CLOSED if it didn't (R135 f-1): the
+  // trust-disk reconcile would otherwise read stale 'auto' and run with mutating tools.
+  let persisted = true;
   if (conversationId) {
     try {
       const conv = readConversation(appHomeForRuntimeResolve, conversationId);
-      if (conv) writeConversation(appHomeForRuntimeResolve, { ...conv, executionMode: mode } as never);
+      if (conv) {
+        writeConversation(appHomeForRuntimeResolve, { ...conv, executionMode: mode } as never);
+      } else {
+        // No record to persist the mode onto → NOT durably set (for plan-first this must
+        // fail closed at the caller).
+        persisted = false;
+      }
     } catch {
-      /* best-effort persist */
+      persisted = false;
     }
   }
   broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
+  return persisted;
 }
 
 function withObserverAugmentation(result: unknown, augmentation: Record<string, unknown> | undefined): unknown {
@@ -2855,14 +2866,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     let effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
     try {
       const persistedConv = readConversation(appHome, conversationId) as { executionMode?: ExecutionMode } | null;
-      // `persistedKnown` = the conversation HAS a record: its executionMode (present or absent
-      // → 'auto') is authoritative. Only a genuinely recordless conversation (first turn before
-      // any record exists) falls back to the submitted mode.
-      effectiveExecutionMode = reconcileExecutionMode(
-        executionMode,
-        persistedConv?.executionMode,
-        persistedConv != null,
-      );
+      if (persistedConv != null) {
+        // Record read OK — its executionMode (present, or absent → 'auto') is authoritative.
+        effectiveExecutionMode = reconcileExecutionMode(executionMode, persistedConv.executionMode, true);
+      } else if (conversationExistsInIndex(appHome, conversationId)) {
+        // The record EXISTS (index entry) but couldn't be read — a transient EMFILE/truncated-
+        // JSON failure, NOT a first turn (R135 f-3). We can't rule out plan-first, so FAIL
+        // CLOSED to plan-first (read-only) rather than trust the possibly-stale submitted mode
+        // and expose mutating tools. Worst case: one turn of an auto conversation runs read-only
+        // during a disk blip — strictly safer than the inverse.
+        effectiveExecutionMode = 'plan-first';
+      } else {
+        // Genuinely recordless (first turn before any record exists) → trust the submitted mode.
+        effectiveExecutionMode = reconcileExecutionMode(executionMode, undefined, false);
+      }
     } catch {
       /* best-effort: fall back to the submitted mode */
     }
@@ -7758,11 +7775,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   const { tree, headId } = ensureConversationTree(updated);
                   if (headId !== plannedHead) return;
                   const branch = getConversationBranch(tree, headId);
+                  // Persist plan-first as the authoritative mode for the restarted turn so the
+                  // continuation (and any of ITS continuations) runs read-only. FAIL CLOSED
+                  // (R135 f-1): if the persist didn't land, the trust-disk reconcile would read
+                  // stale 'auto' and run the planning turn with MUTATING tools — so abandon the
+                  // restart rather than launch unsafely (the plan simply isn't produced).
+                  if (!broadcastExecutionMode('plan-first', conversationId)) return;
                   pendingServerPersist.add(conversationId);
                   pendingServerPersistParent.set(conversationId, headId);
-                  // Persist plan-first as the authoritative mode for the restarted turn so
-                  // the continuation (and any of ITS continuations) runs read-only.
-                  broadcastExecutionMode('plan-first', conversationId);
                   // Re-run the branch verbatim in plan-first (parity with the renderer path,
                   // which appends no synthetic nudge). `null` event = no renderer sender.
                   const res = await streamHandler(
@@ -8493,7 +8513,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (gateForcedFallthrough || ownershipChanged || contextDriftedDuringGate) {
           // Cooperative-only (raced answer): FAIL rather than abort+restart, so the
           // stale answer can't restart a stopped run or abort a newer one.
-          if (cooperativeOnly) return { ok: false, notCooperative: true };
+          if (cooperativeOnly) {
+            releaseCancelGenToken(injectCancelToken);
+            return { ok: false, notCooperative: true };
+          }
           // Otherwise fall through to abort+restart. Use the ORIGINAL userText (NOT
           // gate.text): the fresh turn re-runs plugin pre-send + UserPromptSubmit as
           // part of its normal flow, so passing the already-gated text would apply
@@ -8503,7 +8526,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         } else {
           const injectText = gate.text;
           const injectId = enqueueInject(conversationId, injectText, opts?.userTurnId);
-          if (!injectId) return { ok: false, error: 'failed-to-enqueue' };
+          if (!injectId) {
+            releaseCancelGenToken(injectCancelToken);
+            return { ok: false, error: 'failed-to-enqueue' };
+          }
           // Make acceptance FAILURE-ATOMIC (R104 finding-1): the entry is live in the
           // queue the moment it's enqueued, so if persist/broadcast throws we must not
           // return a plain failure (the renderer would then fallback-send a duplicate
