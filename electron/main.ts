@@ -1876,6 +1876,19 @@ if (gotSingleInstanceLock) {
       console.warn(`[${__BRAND_PRODUCT_NAME}] stale runStatus sweep failed (non-fatal):`, err);
     }
 
+    // Reconcile GHOST index entries left by a delete/clear whose durable index write failed before
+    // this process started (R165 f-2): drop entries whose record file is gone and durably tombstone
+    // their ids, so a deleted chat can't reappear or be resurrected after restart. Run this BEFORE
+    // reindexIfStale (R166 f-1): a stale-schema rebuild (rebuildIndexFromConversationFiles) would
+    // otherwise silently DROP the ghost entries (their files are gone) WITHOUT adding them to the
+    // durable deletedIds ring, so reconcile could no longer discover them and a stale put could
+    // recreate the deleted conversation.
+    try {
+      reconcileGhostIndexEntries(APP_HOME);
+    } catch (err) {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] ghost-index reconcile failed (non-fatal):`, err);
+    }
+
     // One-time index backfill: older index.json files lack precomputed fields
     // (hasComputerUse/hasMedia) added for the chats-list advanced filters. Rebuild
     // the summaries once so those filters work on pre-existing conversations.
@@ -1883,15 +1896,6 @@ if (gotSingleInstanceLock) {
       reindexIfStale(APP_HOME);
     } catch (err) {
       console.warn(`[${__BRAND_PRODUCT_NAME}] conversation reindex failed (non-fatal):`, err);
-    }
-
-    // Reconcile GHOST index entries left by a delete/clear whose durable index write failed before
-    // this process started (R165 f-2): drop entries whose record file is gone and durably tombstone
-    // their ids, so a deleted chat can't reappear or be resurrected after restart.
-    try {
-      reconcileGhostIndexEntries(APP_HOME);
-    } catch (err) {
-      console.warn(`[${__BRAND_PRODUCT_NAME}] ghost-index reconcile failed (non-fatal):`, err);
     }
 
     // Start the local IPC socket EARLY — as soon as the conversation/agent IPC

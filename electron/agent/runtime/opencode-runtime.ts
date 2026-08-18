@@ -230,6 +230,19 @@ export class OpencodeRuntime implements AgentRuntime {
         child.on('close', () => resolve());
       });
 
+      // If the LEADER exits but a TERM-resistant descendant keeps the stdout pipe open, the
+      // `for await (child.stdout)` loop below (and `exited`, which waits on 'close') would hang
+      // forever (R166 f-3) — the leader-alive SIGKILL gate deliberately does NOT group-kill after
+      // leader exit (recycled-pid safety). Break the hang: once the leader has exited, if 'close'
+      // hasn't followed within a grace period, force-destroy stdout so the stream read completes and
+      // the runtime finalizes. The orphaned descendant is reparented to init and reaped by the OS.
+      child.on('exit', () => {
+        const t = setTimeout(() => {
+          if (!child.stdout.destroyed) child.stdout.destroy();
+        }, 2000);
+        if (typeof t.unref === 'function') t.unref();
+      });
+
       try {
         // Send the prompt on stdin — unless a Stop already aborted (the child was killed above);
         // writing would race the kill and could still deliver the prompt to a not-yet-dead child.

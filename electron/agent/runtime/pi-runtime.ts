@@ -312,6 +312,19 @@ export class PiRuntime implements AgentRuntime {
         });
       });
 
+      // If the LEADER (pi) exits but a TERM-resistant bash grandchild keeps the stdout pipe open, the
+      // `for await (spawned.stdout)` loop and `exited` (waits on 'close') would hang forever (R166
+      // f-3) — killProcessGroup's leader-alive SIGKILL gate deliberately does NOT group-kill after
+      // leader exit (recycled-pid safety). Break the hang: once the leader exits, if 'close' hasn't
+      // followed within a grace period, force-destroy stdout so the stream read completes and the
+      // runtime finalizes. The orphaned grandchild is reparented to init and reaped by the OS.
+      spawned.on('exit', () => {
+        const t = setTimeout(() => {
+          if (!spawned.stdout.destroyed) spawned.stdout.destroy();
+        }, 2000);
+        if (typeof t.unref === 'function') t.unref();
+      });
+
       onAbort = () => {
         killProcessGroup(spawned);
         // Unblock the `for await (… of child.stdout)` loop even when the child has

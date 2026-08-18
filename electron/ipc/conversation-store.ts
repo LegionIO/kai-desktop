@@ -487,8 +487,12 @@ export function reconcileGhostIndexEntries(appHome: string): number {
   try {
     writeIndex(appHome, index);
   } catch (err) {
-    // If even this reconcile write fails, leave the ghost flag set so the list-filter still hides
-    // the entries for this session; a later successful write reconciles.
+    // If even this reconcile write fails, set an IN-MEMORY tombstone for each ghost (R166 f-2) so the
+    // tombstone-authoritative writeConversation guard still BLOCKS a stale client from resurrecting it
+    // THIS session (the disk index still contains the ghost, so the flag alone — which only gates the
+    // list-filter — is not enough). Also keep the ghost flag set so the list-filter hides them. A
+    // later successful write reconciles durably.
+    for (const id of ghostIds) tombstoneConversation(id);
     console.error('[conversation-store] reconcileGhostIndexEntries: index write failed', err);
     markIndexMayHaveGhosts();
     return 0;
