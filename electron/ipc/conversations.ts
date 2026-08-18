@@ -931,8 +931,18 @@ export function registerConversationHandlers(
     // still return a record, so broadcasting an upsert + returning ok here would make the renderer
     // launch an agent run against a deleted chat. Reject so the renderer rolls back instead
     // (matches the compacting-busy rejection contract). isWriteTombstoned covers BOTH the in-memory
-    // TTL tombstone AND the durable index ring (survives restart / TTL expiry).
-    if (!prev && isWriteTombstoned(appHome, conversation.id)) {
+    // TTL tombstone AND the durable index ring (survives restart / TTL expiry). Throw-safe
+    // (R147): a tombstone-lookup throw (index rebuild EMFILE) here defaults to NOT-deleted so a
+    // legitimate new chat isn't rejected on a transient blip — writeConversation itself re-checks
+    // + suppresses a genuinely-tombstoned write, and the post-write guard below (also throw-safe,
+    // defaulting to reject) backstops the phantom-broadcast case.
+    let admissionTombstoned = false;
+    try {
+      admissionTombstoned = !prev && isWriteTombstoned(appHome, conversation.id);
+    } catch {
+      admissionTombstoned = false;
+    }
+    if (admissionTombstoned) {
       return { rejected: 'conversation-deleted' as const };
     }
 
@@ -1259,7 +1269,16 @@ export function registerConversationHandlers(
     // unchanged, nothing hits disk). Do NOT broadcast a phantom upsert or emit ConversationStart or
     // report success in that case — signal conversation-deleted so the client rolls back its
     // optimistic state (matching the renderer's persistConversation deleted-rollback contract).
-    if (isWriteTombstoned(appHome, conversation.id)) {
+    // Throw-safe (R147): a lookup throw here defaults to REJECT (don't broadcast) — the write
+    // may have been suppressed for a tombstoned id, so a phantom upsert of a deleted chat is the
+    // worse outcome; a false reject of a live chat is recoverable (the client retries).
+    let writeTombstoned = true;
+    try {
+      writeTombstoned = isWriteTombstoned(appHome, conversation.id);
+    } catch {
+      writeTombstoned = true;
+    }
+    if (writeTombstoned) {
       return { rejected: 'conversation-deleted' as const };
     }
     broadcastUpsert(appHome, written);

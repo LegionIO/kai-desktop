@@ -136,6 +136,9 @@ vi.mock('../conversations.js', () => ({
 vi.mock('../conversation-store.js', () => ({
   readConversation: vi.fn(() => null),
   writeConversation: vi.fn(),
+  isWriteTombstoned: vi.fn(() => false),
+  isRecentlyDeleted: vi.fn(() => false),
+  conversationExistenceState: vi.fn(() => 'absent'),
 }));
 
 // ---------------------------------------------------------------------------
@@ -575,6 +578,26 @@ describe('planEnterResultFailed (skip plan-restart on a non-entry result — R14
     expect(planEnterResultFailed({ isError: true, error: '{"success":false,"error":"stopped"}' })).toBe(true);
     // Even a bare isError:true (no nested success) → did NOT enter → no restart.
     expect(planEnterResultFailed({ isError: true, error: 'boom' })).toBe(true);
+  });
+});
+
+describe('isConversationDeletedSafe (throw-safe tombstone lookup — R147)', () => {
+  const { isConversationDeletedSafe } = __internal;
+
+  it('returns the tombstone result when the lookup succeeds', async () => {
+    const store = await import('../conversation-store.js');
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(true);
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(false);
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(false);
+  });
+
+  it('returns FALSE (not-deleted) when the lookup THROWS — never abandons a possibly-live chat', async () => {
+    const store = await import('../conversation-store.js');
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      throw new Error('EMFILE');
+    });
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(false);
   });
 });
 

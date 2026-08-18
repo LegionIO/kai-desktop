@@ -1728,8 +1728,16 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     // writeConversation SUPPRESSES a write for a tombstoned (deleted) id — it returns the record
     // unchanged but nothing hits disk. Do NOT broadcast a phantom upsert for a deleted chat
     // (R144 f-2): a durable-ring tombstone (survives restart / in-mem TTL expiry) would otherwise
-    // rebroadcast a nonexistent conversation to every client.
-    if (isWriteTombstoned(callbacks.appHome, normalizedConversation.id)) return;
+    // rebroadcast a nonexistent conversation to every client. Throw-safe (R147): a lookup throw
+    // defaults to SKIP the broadcast (safer direction — a phantom deleted-chat broadcast is the
+    // bug; a missed live-chat broadcast is harmless, clients re-fetch on demand).
+    let tombstoned = true;
+    try {
+      tombstoned = isWriteTombstoned(callbacks.appHome, normalizedConversation.id);
+    } catch {
+      tombstoned = true;
+    }
+    if (tombstoned) return;
     broadcastUpsert(callbacks.appHome, written);
   };
 

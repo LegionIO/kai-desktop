@@ -351,8 +351,17 @@ export async function deliverRecoveredAnswer(
         // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
         // R133 f-1). Use the DURABLE tombstone (isWriteTombstoned), NOT `after == null` — a
         // null read can be a transient I/O error, and an in-memory-only tombstone can expire/
-        // evict before a long resume's failure lands (R134 f-1).
-        if (isWriteTombstoned(deps.appHome, conversationId)) {
+        // evict before a long resume's failure lands (R134 f-1). THROW-SAFE (R147 f-2):
+        // isWriteTombstoned can throw (index rebuild EMFILE) — a throw here must NOT skip the
+        // committed-turn scan below (which would misclassify a COMMITTED turn as undelivered →
+        // invite a duplicate resend). A failed lookup → treat as not-deleted, fall through.
+        let targetDeleted = false;
+        try {
+          targetDeleted = isWriteTombstoned(deps.appHome, conversationId);
+        } catch {
+          targetDeleted = false;
+        }
+        if (targetDeleted) {
           dismissPendingAlert();
           return { delivered: false };
         }

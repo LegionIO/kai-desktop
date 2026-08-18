@@ -1420,11 +1420,10 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     const onFailure = (): void => {
       // If the conversation was DELETED while this delivery was in flight,
       // invalidateConversationRecovery already purged its recovery state — do NOT re-stash
-      // (that would resurrect an answer for a deleted chat, R133 f-1). Use the DURABLE tombstone
-      // (isWriteTombstoned = in-memory OR the index's persisted deleted-id ring), NOT a null
-      // read — a null read can be a transient I/O error (would DROP a live answer), and an
-      // in-memory-only tombstone can expire/evict before a slow delivery fails (R134 f-1).
-      if (isWriteTombstoned(appHomeForRuntimeResolve, conversationId)) {
+      // (that would resurrect an answer for a deleted chat, R133 f-1). THROW-SAFE (R147): a
+      // tombstone-lookup throw must NOT skip the re-stash (the answer was already removed from the
+      // stash above — losing it + an unhandled rejection); a failed lookup → treat as not deleted.
+      if (isConversationDeletedSafe(appHomeForRuntimeResolve, conversationId)) {
         return;
       }
       // Always put the answer back in the stash.
@@ -1673,8 +1672,10 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
   // (R96). Use the DURABLE deletion tombstone (isWriteTombstoned = in-memory OR the index's
   // persisted deleted-id ring), NOT a null read: a transient I/O error also reads null (would
   // drop a live answer), and an in-memory-only tombstone can expire/evict before this routes
-  // under a huge bulk-delete (R134 f-1). All delete paths set the durable ring.
-  if (isWriteTombstoned(appHomeForRuntimeResolve, conversationId)) {
+  // under a huge bulk-delete (R134 f-1). All delete paths set the durable ring. THROW-SAFE
+  // (R147): a lookup throw must NOT skip recording the recovery tombstone (the answer would be
+  // lost under an obsolete sdk-ask-* id) — a failed lookup → treat as not deleted → recover.
+  if (isConversationDeletedSafe(appHomeForRuntimeResolve, conversationId)) {
     return;
   }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
@@ -1721,6 +1722,22 @@ function purgeRacedAnswerForKey(answerKey: string): void {
   // late answer from another open surface must NOT be routed through the durable
   // recovered-answer path within the TTL, overriding the user's rejection (R88).
   recoveryTombstones.delete(answerKey);
+}
+
+/**
+ * Throw-safe "is this conversation confirmed-deleted?" (R147). isWriteTombstoned reads the index
+ * and can THROW (readIndex → readdirSync EMFILE/permission during a rebuild), so it is NOT a total
+ * boolean. Every recovery/abandonment decision must treat a lookup FAILURE as "not deleted" — a
+ * throw must never skip re-stashing / recovery-routing for a possibly-LIVE conversation (that
+ * would silently lose a real answer / cause an unhandled rejection). Only a CONFIRMED tombstone
+ * abandons.
+ */
+function isConversationDeletedSafe(appHome: string, conversationId: string): boolean {
+  try {
+    return isWriteTombstoned(appHome, conversationId);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -9566,6 +9583,7 @@ export const __internal = {
   isSupersessionDescendant,
   reconcileExecutionMode,
   planEnterResultFailed,
+  isConversationDeletedSafe,
   // Cancel-generation ABA-safety primitives (R132): capture RAW (undefined = never Stopped),
   // compare undefined-aware so an evicted-after-Stop entry counts as changed (fail-safe).
   bumpExplicitCancelGeneration,
