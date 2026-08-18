@@ -509,6 +509,38 @@ describe('cancel-generation ABA-safety (evicted-after-Stop must count as changed
   });
 });
 
+describe('cancel-gen PUSH token (eviction-proof for run-starting deferred ops — R135)', () => {
+  const { bumpExplicitCancelGeneration, registerCancelGenToken, releaseCancelGenToken } = __internal;
+
+  it('a Stop flips a registered token even when the capture was undefined (never Stopped) AND the map entry is evicted', () => {
+    // The R134 f-2 hole: capture undefined → Stop → evict → numeric re-read is undefined again.
+    // The PUSH token catches it because the Stop flipped it directly.
+    const token = registerCancelGenToken('push-conv-1'); // never Stopped at registration
+    expect(token.cancelled).toBe(false);
+    bumpExplicitCancelGeneration('push-conv-1'); // Stop → flips the token
+    expect(token.cancelled).toBe(true);
+    // Even after eviction of push-conv-1's map entry, the token stays cancelled.
+    for (let i = 0; i < 600; i++) bumpExplicitCancelGeneration(`push-flood-${i}`);
+    expect(token.cancelled).toBe(true);
+    releaseCancelGenToken(token);
+  });
+
+  it('a token for a DIFFERENT conversation is not flipped by an unrelated Stop', () => {
+    const token = registerCancelGenToken('push-conv-2');
+    bumpExplicitCancelGeneration('push-conv-other');
+    expect(token.cancelled).toBe(false);
+    releaseCancelGenToken(token);
+  });
+
+  it('release removes the token so a later Stop no longer flips it', () => {
+    const token = registerCancelGenToken('push-conv-3');
+    releaseCancelGenToken(token);
+    bumpExplicitCancelGeneration('push-conv-3');
+    // The token object is detached from the registry; a Stop can't reach it.
+    expect(token.cancelled).toBe(false);
+  });
+});
+
 describe('reconcileExecutionMode (GUI submit vs MAIN-authoritative disk mode — R128/R129)', () => {
   const { reconcileExecutionMode } = __internal;
 

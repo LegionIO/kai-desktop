@@ -30,6 +30,7 @@ import {
   writeConversation,
   nextCompactionRevision,
   isRecentlyDeleted,
+  isWriteTombstoned,
 } from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
@@ -767,11 +768,35 @@ const MAX_TERMINAL_ABORT_TOKENS = 100;
 const explicitCancelGeneration = new Map<string, number>();
 const MAX_EXPLICIT_CANCEL_GEN_ENTRIES = 500;
 let globalStopSequence = 0;
+// PUSH-based cancel invalidation (R135) for deferred ops that will START A RUN after a delay
+// (plan-restart continuation; injectUserTurnAndRestart). The per-conversation stop map is
+// bounded + LRU, so it can't be the SOLE durable answer to "was this Stopped after my capture?"
+// — a capture of `undefined` (never Stopped) then a Stop then eviction of this conv's entry
+// re-reads `undefined` and misses the Stop (R134 f-2). So those ops register a live token; a
+// Stop actively flips `cancelled` on every token for the conversation. The token is held until
+// the op fires (live deferred ops are few + short-lived), so it can't be evicted out from under
+// a pending op. (The numeric undefined-aware capture/compare below stays for the raced-answer
+// handoff/tombstone EQUALITY fields, which live in their own bounded structs across turns.)
+type CancelGenToken = { conversationId: string; cancelled: boolean };
+const liveCancelGenTokens = new Set<CancelGenToken>();
+function registerCancelGenToken(conversationId: string): CancelGenToken {
+  const token: CancelGenToken = { conversationId, cancelled: false };
+  liveCancelGenTokens.add(token);
+  // Safety valve: never let the live-token set grow without bound if a caller leaks one.
+  while (liveCancelGenTokens.size > 2000) {
+    const oldest = liveCancelGenTokens.values().next().value;
+    if (oldest === undefined) break;
+    liveCancelGenTokens.delete(oldest);
+  }
+  return token;
+}
+function releaseCancelGenToken(token: CancelGenToken | undefined): void {
+  if (token) liveCancelGenTokens.delete(token);
+}
 function bumpExplicitCancelGeneration(conversationId: string): void {
   // Re-insert (delete → set) so a bumped entry becomes the NEWEST in iteration order (LRU):
-  // the most-recently-Stopped conversations — the ones a pending deferred op is most likely
-  // to re-check — are the LAST evicted. (Eviction is still ABA-safe on its own via the
-  // undefined-aware capture above; recency just reduces how often it happens.)
+  // the most-recently-Stopped conversations are the LAST evicted (reduces map-eviction races;
+  // the token registry is the durable guarantee for run-starting deferred ops).
   globalStopSequence += 1;
   explicitCancelGeneration.delete(conversationId);
   explicitCancelGeneration.set(conversationId, globalStopSequence);
@@ -780,9 +805,13 @@ function bumpExplicitCancelGeneration(conversationId: string): void {
     if (oldest === undefined) break;
     explicitCancelGeneration.delete(oldest);
   }
+  // PUSH: cancel every live deferred-op token for this conversation — durable regardless of
+  // whether the map entry later evicts.
+  for (const t of liveCancelGenTokens) if (t.conversationId === conversationId) t.cancelled = true;
 }
 /** Capture the current stop marker for a conversation (RAW — `undefined` when never Stopped).
- *  Pair with {@link cancelGenerationChanged} for an ABA-safe re-check. */
+ *  Pair with {@link cancelGenerationChanged}. Used for the raced-answer handoff/tombstone
+ *  EQUALITY fields; a run-STARTING deferred op should additionally hold a push token. */
 function captureCancelGeneration(conversationId: string): number | undefined {
   return explicitCancelGeneration.get(conversationId);
 }
@@ -1390,11 +1419,11 @@ function attemptRacedAnswerDelivery(conversationId: string): void {
     const onFailure = (): void => {
       // If the conversation was DELETED while this delivery was in flight,
       // invalidateConversationRecovery already purged its recovery state — do NOT re-stash
-      // (that would resurrect an answer for a deleted chat, R133 f-1). Use the EXPLICIT
-      // deletion tombstone (isRecentlyDeleted), NOT a null read — readConversation returns
-      // null on a transient I/O error too, and skipping the re-stash then would DROP a live
-      // answer with no other copy (R134 f-1).
-      if (isRecentlyDeleted(conversationId)) {
+      // (that would resurrect an answer for a deleted chat, R133 f-1). Use the DURABLE tombstone
+      // (isWriteTombstoned = in-memory OR the index's persisted deleted-id ring), NOT a null
+      // read — a null read can be a transient I/O error (would DROP a live answer), and an
+      // in-memory-only tombstone can expire/evict before a slow delivery fails (R134 f-1).
+      if (isWriteTombstoned(appHomeForRuntimeResolve, conversationId)) {
         return;
       }
       // Always put the answer back in the stash.
@@ -1640,10 +1669,11 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
   // FIFO terminalAbortTokens set (bounded) could evict this run's token before the
   // check above under a >100-conversation delete. Don't route recovery for a DELETED
   // conversation — it would record a tombstone / raise an Alert pointing at a deleted chat
-  // (R96). Use the EXPLICIT deletion tombstone (isRecentlyDeleted), NOT a null read: a
-  // transient I/O error also reads null, and skipping recovery then would silently drop a
-  // live answer (R134 f-1). All delete paths set the tombstone.
-  if (isRecentlyDeleted(conversationId)) {
+  // (R96). Use the DURABLE deletion tombstone (isWriteTombstoned = in-memory OR the index's
+  // persisted deleted-id ring), NOT a null read: a transient I/O error also reads null (would
+  // drop a live answer), and an in-memory-only tombstone can expire/evict before this routes
+  // under a huge bulk-delete (R134 f-1). All delete paths set the durable ring.
+  if (isWriteTombstoned(appHomeForRuntimeResolve, conversationId)) {
     return;
   }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
@@ -7683,14 +7713,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           //  - not terminal-aborted: a Stop/dismiss on THIS token marks it terminal — never
           //    resurrect a stopped planning turn.
           //  - cancel-generation unchanged from teardown: a Stop DURING the microtask gap
-          //    bumps it (like the raced-answer re-injection guard) → abandon.
+          //    is caught by a PUSH cancellation token (R135) — the bounded stop-map alone
+          //    could evict this conv's entry under a 500+ concurrent-Stop flood and miss it.
           //  - head-bound: capture the finalized head NOW and re-run ONLY if it is still the
           //    current head at fire time. A viewer rewind / sibling-select during the
           //    (async) observer cleanup moves the head WITHOUT minting a newer token, so an
           //    owner/recency check alone would run the user's abandoned branch + move the
           //    head (finding-4). If it moved, abandon (the plan simply isn't produced; the
           //    user's selection wins).
-          const planStartCancelGen = captureCancelGeneration(conversationId);
+          const planCancelToken = registerCancelGenToken(conversationId);
           const planFinalized = readConversation(appHome, conversationId);
           const plannedHead = planFinalized ? ensureConversationTree(planFinalized).headId : undefined;
           if (
@@ -7701,60 +7732,67 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           ) {
             queueMicrotask(() => {
               void (async () => {
-                if (isRecentlyDeleted(conversationId)) return;
-                const updated = readConversation(appHome, conversationId);
-                if (!updated) return;
-                // A newer turn took over (present entry, different token). Our own token was
-                // removed by cleanupStreamIfOwned — absent means we still own the slot.
-                const owner = activeStreams.get(conversationId)?.token;
-                if (owner !== undefined && owner !== streamToken) return;
-                // A strictly-newer turn was ISSUED (started+finished in the gap, leaving the
-                // map empty) — mirrors authorizeContinuation / the inject-drain recency guard.
-                const latestIssued = latestIssuedTurnToken.get(conversationId);
-                if (
-                  latestIssued !== undefined &&
-                  latestIssued !== streamToken &&
-                  turnTokenTime(streamToken) < turnTokenTime(latestIssued)
-                ) {
-                  return;
-                }
-                // A Stop landed during the gap (terminal on our token, or cancel-gen bumped).
-                if (terminalAbortTokens.has(streamToken)) return;
-                if (cancelGenerationChanged(conversationId, planStartCancelGen)) return;
-                // The head must still be the finalized head we captured — else the user
-                // rewound/switched branches; abandon rather than clobber their selection.
-                const { tree, headId } = ensureConversationTree(updated);
-                if (headId !== plannedHead) return;
-                const branch = getConversationBranch(tree, headId);
-                pendingServerPersist.add(conversationId);
-                pendingServerPersistParent.set(conversationId, headId);
-                // Persist plan-first as the authoritative mode for the restarted turn so
-                // the continuation (and any of ITS continuations) runs read-only.
-                broadcastExecutionMode('plan-first', conversationId);
-                // Re-run the branch verbatim in plan-first (parity with the renderer path,
-                // which appends no synthetic nudge). `null` event = no renderer sender.
-                const res = await streamHandler(
-                  null,
-                  conversationId,
-                  branch,
-                  modelKey,
-                  reasoningEffort,
-                  profileKey,
-                  fallbackEnabled,
-                  effectiveCwd ?? undefined,
-                  'plan-first',
-                  threadOverrides,
-                );
-                // On a busy rejection (compaction lock) the marker would leak → clear it if
-                // still ours (mirrors launchContinuation's busy handling).
-                if (res && (res as { busy?: boolean }).busy) {
-                  if (pendingServerPersistParent.get(conversationId) === headId) {
-                    pendingServerPersist.delete(conversationId);
-                    pendingServerPersistParent.delete(conversationId);
+                try {
+                  if (isRecentlyDeleted(conversationId)) return;
+                  const updated = readConversation(appHome, conversationId);
+                  if (!updated) return;
+                  // A newer turn took over (present entry, different token). Our own token was
+                  // removed by cleanupStreamIfOwned — absent means we still own the slot.
+                  const owner = activeStreams.get(conversationId)?.token;
+                  if (owner !== undefined && owner !== streamToken) return;
+                  // A strictly-newer turn was ISSUED (started+finished in the gap, leaving the
+                  // map empty) — mirrors authorizeContinuation / the inject-drain recency guard.
+                  const latestIssued = latestIssuedTurnToken.get(conversationId);
+                  if (
+                    latestIssued !== undefined &&
+                    latestIssued !== streamToken &&
+                    turnTokenTime(streamToken) < turnTokenTime(latestIssued)
+                  ) {
+                    return;
                   }
+                  // A Stop landed during the gap. The PUSH token (R135) is authoritative and
+                  // eviction-proof; terminalAbortTokens is a secondary signal.
+                  if (planCancelToken.cancelled || terminalAbortTokens.has(streamToken)) return;
+                  // The head must still be the finalized head we captured — else the user
+                  // rewound/switched branches; abandon rather than clobber their selection.
+                  const { tree, headId } = ensureConversationTree(updated);
+                  if (headId !== plannedHead) return;
+                  const branch = getConversationBranch(tree, headId);
+                  pendingServerPersist.add(conversationId);
+                  pendingServerPersistParent.set(conversationId, headId);
+                  // Persist plan-first as the authoritative mode for the restarted turn so
+                  // the continuation (and any of ITS continuations) runs read-only.
+                  broadcastExecutionMode('plan-first', conversationId);
+                  // Re-run the branch verbatim in plan-first (parity with the renderer path,
+                  // which appends no synthetic nudge). `null` event = no renderer sender.
+                  const res = await streamHandler(
+                    null,
+                    conversationId,
+                    branch,
+                    modelKey,
+                    reasoningEffort,
+                    profileKey,
+                    fallbackEnabled,
+                    effectiveCwd ?? undefined,
+                    'plan-first',
+                    threadOverrides,
+                  );
+                  // On a busy rejection (compaction lock) the marker would leak → clear it if
+                  // still ours (mirrors launchContinuation's busy handling).
+                  if (res && (res as { busy?: boolean }).busy) {
+                    if (pendingServerPersistParent.get(conversationId) === headId) {
+                      pendingServerPersist.delete(conversationId);
+                      pendingServerPersistParent.delete(conversationId);
+                    }
+                  }
+                } finally {
+                  releaseCancelGenToken(planCancelToken);
                 }
               })();
             });
+          } else {
+            // Guard failed → the continuation won't launch; release the token we registered.
+            releaseCancelGenToken(planCancelToken);
           }
         }
         // NOTE: the GUI-turn persistence fallback (finalizeGuiFallbackIfOwned) is invoked by
@@ -8171,6 +8209,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Stop landed mid-gate (R105 finding-3). Cooperative splice has its own
     // terminalAbortTokens/ownership guards; this covers the fresh-turn restart.
     const cancelGenAtEntry = captureCancelGeneration(conversationId);
+    // PUSH token (R135): the numeric capture above can miss a Stop whose map entry is evicted
+    // under a 500+ concurrent-Stop flood during the policy-gate await. Hold a token from here to
+    // the pre-restart re-check; a Stop flips it regardless of map eviction. Released at the
+    // re-check (its guard window ends there — the restart launches synchronously after).
+    const injectCancelToken = registerCancelGenToken(conversationId);
 
     // COOPERATIVE mid-turn injection (Mastra runtime only): if a Mastra turn is
     // still generating, splice the follow-up into the RUNNING turn at its next
@@ -8188,6 +8231,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       (!isCooperativelyInjectable(conversationId) ||
         (opts?.expectedToken !== undefined && activeStreams.get(conversationId)?.token !== opts.expectedToken))
     ) {
+      releaseCancelGenToken(injectCancelToken);
       return { ok: false, notCooperative: true };
     }
     if (isCooperativelyInjectable(conversationId)) {
@@ -8428,9 +8472,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // retries against the successor (cooperativeOnly) / a normal caller re-gates
           // on the fresh turn — never purge the answer on a stale-run denial.
           if (gate.terminal && !ownershipChanged) {
+            releaseCancelGenToken(injectCancelToken);
             return { ok: false, error: gate.reason ?? 'blocked-by-policy', blockedByPolicy: true };
           }
-          if (cooperativeOnly) return { ok: false, notCooperative: true };
+          if (cooperativeOnly) {
+            releaseCancelGenToken(injectCancelToken);
+            return { ok: false, notCooperative: true };
+          }
           gateForcedFallthrough = true;
         }
         // The gate awaited hooks; the turn may have finished/superseded meanwhile. If
@@ -8529,6 +8577,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               } catch {
                 /* best-effort mirror; acceptance already succeeded */
               }
+              releaseCancelGenToken(injectCancelToken);
               return { ok: true, injectedCooperatively: true };
             }
           } catch {
@@ -8543,6 +8592,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the advanced head as a branch switch (R106 finding-2).
               const tok = activeStreams.get(conversationId)?.token;
               if (tok !== undefined) recordInjectBoundaryLineage(conversationId, tok, injectId);
+              releaseCancelGenToken(injectCancelToken);
               return { ok: true, injectedCooperatively: true };
             }
             removeInject(conversationId, injectId);
@@ -8554,8 +8604,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // Revalidate the cancel generation before we abort+restart: if an explicit Stop
     // bumped it since entry (e.g. while a durable-recovery re-injection awaited its
     // policy gate), the user ended this conversation's turn — do NOT abort a run and
-    // launch a fresh tool-enabled turn for a now-stopped conversation (R105 finding-3).
-    if (cancelGenerationChanged(conversationId, cancelGenAtEntry)) {
+    // launch a fresh tool-enabled turn for a now-stopped conversation (R105 finding-3). The
+    // PUSH token (R135) catches a Stop whose bounded stop-map entry was evicted during the gate
+    // await; the numeric compare is the secondary signal. Release the token here — its guard
+    // window ends (the abort+restart below is synchronous, no further Stop-race to catch).
+    const stoppedDuringInject =
+      injectCancelToken.cancelled || cancelGenerationChanged(conversationId, cancelGenAtEntry);
+    releaseCancelGenToken(injectCancelToken);
+    if (stoppedDuringInject) {
       return { ok: false, error: 'conversation-stopped-during-injection' };
     }
 
@@ -9434,4 +9490,8 @@ export const __internal = {
   bumpExplicitCancelGeneration,
   captureCancelGeneration,
   cancelGenerationChanged,
+  // PUSH-based cancel invalidation (R135) — eviction-proof "was this Stopped after capture?"
+  // for run-starting deferred ops. A Stop flips the token regardless of stop-map eviction.
+  registerCancelGenToken,
+  releaseCancelGenToken,
 };
