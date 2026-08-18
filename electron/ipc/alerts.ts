@@ -297,7 +297,16 @@ export async function deliverRecoveredAnswer(
       // ring), NOT a null read — a null read can be a transient EMFILE/JSON error (would drop a
       // live answer), and a purely in-memory tombstone can EXPIRE (10min) / EVICT (5000) before
       // a long resume observes it (R134 f-1). The durable ring survives restart + TTL + eviction.
-      const conversationGone = () => isWriteTombstoned(alertsAppHome, conversationId);
+      // Throw-safe (R146 f-2): the tombstone check reads the index, which can throw (EMFILE during
+      // a rebuild) — a throw must NOT abandon a LIVE delivery, so treat a lookup failure as "not
+      // gone" and keep reconciling.
+      const conversationGone = () => {
+        try {
+          return isWriteTombstoned(alertsAppHome, conversationId);
+        } catch {
+          return false;
+        }
+      };
       // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
       // leak this loop forever — far above any real tool timeout. Reaching it keeps the
       // alert (uncommitted), which is the safe outcome.
@@ -651,7 +660,16 @@ async function resume(alert: Alert, userText: string): Promise<void> {
       // Do NOT reopen for a conversation that was DELETED during/before the resume (R144 f-3):
       // reopening clears the recorded answer and re-surfaces an alert that can NEVER be answered
       // (its conversation is gone), stranding it. A confirmed-deleted target → leave it dismissed.
-      if (deps && isWriteTombstoned(deps.appHome, alert.conversationId)) {
+      // But the tombstone check reads the index, which can THROW (EMFILE/permission during a
+      // rebuild) — a throw must NOT bypass reopen for a LIVE conversation (R146 f-2), so treat a
+      // lookup failure as "not tombstoned" and fall through to reopen (safer: let the user retry).
+      let targetDeleted = false;
+      try {
+        targetDeleted = Boolean(deps && isWriteTombstoned(deps.appHome, alert.conversationId));
+      } catch {
+        targetDeleted = false;
+      }
+      if (targetDeleted) {
         throw err;
       }
       const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;

@@ -2483,6 +2483,26 @@ function toolsForExecutionMode(tools: ToolDefinition[], executionMode: Execution
 }
 
 /**
+ * True when an `enter_plan_mode` tool RESULT indicates the tool did NOT enter plan mode (a
+ * fail-closed persist failure, or a stopped-run refusal) — so MAIN must NOT abort+restart into
+ * plan-first (the trust-disk reconcile would see 'auto' and run mutating tools). Covers every
+ * result shape (R146 f-1): a Mastra OBJECT `{success:false}`; a Pi STRINGIFIED object; and the
+ * SDK ERROR wrap `{isError:true, error:'{"success":false,...}'}` where the failure is nested in
+ * `.error` (or just `isError:true`). Pure for focused unit coverage.
+ */
+function planEnterResultFailed(planResult: unknown): boolean {
+  if (planResult == null) return false;
+  if (typeof planResult === 'string') return /"success"\s*:\s*false/.test(planResult);
+  if (typeof planResult === 'object') {
+    const r = planResult as { success?: unknown; isError?: unknown; error?: unknown };
+    if (r.success === false) return true;
+    if (r.isError === true) return true; // any errored tool result → did NOT enter
+    if (typeof r.error === 'string' && /"success"\s*:\s*false/.test(r.error)) return true;
+  }
+  return false;
+}
+
+/**
  * Reconcile a GUI-submitted executionMode against the persisted (MAIN-authoritative) mode.
  *
  * executionMode is MAIN-authoritative: the ONLY writers are genuine user intent (the composer
@@ -6886,18 +6906,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
               // Only restart into plan-first if the tool actually ENTERED plan mode. On a
-              // fail-closed persist failure (R136 f-1) it returns success:false — restarting
-              // then would run a "planning" turn that the trust-disk reconcile sees as auto
-              // (mutating tools). Detect the failure in the result and skip the restart. The
-              // result may be an OBJECT (Mastra) or a STRINGIFIED object (Pi always stringifies
-              // tool results — R137 f-1), so check both shapes for success:false.
+              // fail-closed persist failure (R136 f-1) / a stopped-run refusal (R145) it does NOT
+              // enter — restarting then would run a "planning" turn the trust-disk reconcile sees
+              // as auto (mutating tools). Detect non-entry across ALL result shapes (R146 f-1):
+              //  - Mastra OBJECT: { success:false } at top level
+              //  - Pi STRINGIFIED object: a "success":false substring
+              //  - SDK ERROR wrap: { isError:true, error:'{"success":false,...}' } — the failure
+              //    is INSIDE .error (or just isError:true), matching neither of the above.
               const planResult = (event as { result?: unknown }).result;
-              const planEntryFailed =
-                (planResult != null &&
-                  typeof planResult === 'object' &&
-                  (planResult as { success?: unknown }).success === false) ||
-                (typeof planResult === 'string' && /"success"\s*:\s*false/.test(planResult));
-              const planEntered = !planEntryFailed;
+              const planEntered = !planEnterResultFailed(planResult);
               if (!planEntered) {
                 emit(event);
                 // Not entering plan mode — let the turn continue normally (no abort/restart).
@@ -9548,6 +9565,7 @@ export const __internal = {
   recordSupersession,
   isSupersessionDescendant,
   reconcileExecutionMode,
+  planEnterResultFailed,
   // Cancel-generation ABA-safety primitives (R132): capture RAW (undefined = never Stopped),
   // compare undefined-aware so an evicted-after-Stop entry counts as changed (fail-safe).
   bumpExplicitCancelGeneration,

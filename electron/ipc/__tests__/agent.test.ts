@@ -554,6 +554,30 @@ describe('cancel-gen PUSH token (eviction-proof for run-starting deferred ops �
   });
 });
 
+describe('planEnterResultFailed (skip plan-restart on a non-entry result — R146)', () => {
+  const { planEnterResultFailed } = __internal;
+
+  it('does NOT flag a successful entry (restart proceeds)', () => {
+    expect(planEnterResultFailed({ success: true, mode: 'plan-first' })).toBe(false);
+    expect(planEnterResultFailed('entered plan mode')).toBe(false);
+    expect(planEnterResultFailed(null)).toBe(false);
+  });
+
+  it('flags a Mastra object success:false', () => {
+    expect(planEnterResultFailed({ success: false, error: 'no persist' })).toBe(true);
+  });
+
+  it('flags a Pi stringified success:false', () => {
+    expect(planEnterResultFailed('{"success":false,"error":"x"}')).toBe(true);
+  });
+
+  it('flags an SDK error wrap {isError:true, error:"{...success:false...}"} (R146 f-1)', () => {
+    expect(planEnterResultFailed({ isError: true, error: '{"success":false,"error":"stopped"}' })).toBe(true);
+    // Even a bare isError:true (no nested success) → did NOT enter → no restart.
+    expect(planEnterResultFailed({ isError: true, error: 'boom' })).toBe(true);
+  });
+});
+
 describe('reconcileExecutionMode (GUI submit vs MAIN-authoritative disk mode — R128/R129)', () => {
   const { reconcileExecutionMode } = __internal;
 
