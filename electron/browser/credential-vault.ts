@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, lstatSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { clipboard, safeStorage, systemPreferences } from 'electron';
@@ -129,7 +129,14 @@ export class BrowserCredentialVault {
 
   private load(): StoredCredential[] {
     try {
-      const fileSize = statSync(this.filePath).size;
+      // lstat (NOT stat) so a SYMLINK is detected + rejected rather than followed (R180): a link to
+      // /dev/zero or a FIFO reports a small/zero size (passing the cap) but readFileSync would block
+      // or stream unbounded into main. Require a REGULAR file; reject symlinks, FIFOs, and devices.
+      const st = lstatSync(this.filePath);
+      if (!st.isFile()) {
+        throw new Error('Credential vault is not a regular file.');
+      }
+      const fileSize = st.size;
       if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
         throw new Error('Credential vault exceeds its size limit.');
       }
@@ -382,7 +389,12 @@ export function readStoredCredentialCount(appHome: string, scopeKey: string): nu
   scopeKey = safeScopeKey(scopeKey);
   const filePath = join(appHome, 'browser', 'credentials', `${scopeKey}.json`);
   try {
-    const fileSize = statSync(filePath).size;
+    // lstat + regular-file check (R180): reject a symlink/FIFO/device named as a vault before reading.
+    const st = lstatSync(filePath);
+    if (!st.isFile()) {
+      throw new Error('Credential vault is not a regular file.');
+    }
+    const fileSize = st.size;
     if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
       throw new Error('Credential vault exceeds its size limit.');
     }

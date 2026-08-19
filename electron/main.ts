@@ -2563,14 +2563,21 @@ if (gotSingleInstanceLock) {
         if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
           return { error: 'Not a directory', entries: [] };
         }
-        const entries = readdirSync(resolved, { withFileTypes: true })
+        // Cap the enumeration (R180): this web-bridge-reachable handler synchronously reads + sorts
+        // EVERY entry of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules) would freeze
+        // main and produce an enormous WebSocket response. Read a bounded slice; flag truncation.
+        const MAX_DIR_ENTRIES = 5000;
+        const allNames = readdirSync(resolved, { withFileTypes: true });
+        const truncated = allNames.length > MAX_DIR_ENTRIES;
+        const entries = allNames
+          .slice(0, MAX_DIR_ENTRIES)
           .filter((e) => !e.name.startsWith('.'))
           .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
           .sort((a, b) => {
             if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
             return a.name.localeCompare(b.name);
           });
-        return { path: resolved, entries };
+        return { path: resolved, entries, ...(truncated ? { truncated: true } : {}) };
       } catch (err) {
         return { error: String(err), entries: [] };
       }
@@ -2595,6 +2602,12 @@ if (gotSingleInstanceLock) {
         }
         if (st.isSymbolicLink() || !st.isFile()) {
           return { error: 'File not found' };
+        }
+        // Byte cap (R180): an externally-created large regular file under ~/.kai/plans would otherwise
+        // cause a large allocation / main-process OOM. Plans are small markdown working artifacts.
+        const MAX_PLAN_READ_BYTES = 4 * 1024 * 1024;
+        if (st.size > MAX_PLAN_READ_BYTES) {
+          return { error: 'Plan file too large' };
         }
         // O_NOFOLLOW backstops a TOCTOU swap of the file for a symlink between lstat and open.
         const fd = openSync(resolved, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW);

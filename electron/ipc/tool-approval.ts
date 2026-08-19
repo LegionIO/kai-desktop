@@ -30,11 +30,6 @@ import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
  */
 export type ApprovalSettleSource = 'answered' | 'approve' | 'reject' | 'dismiss' | 'abort' | 'duplicate-evict';
 
-/** Resolver stored per pending approval. `source` (optional) lets the IPC
- *  handler that settles the entry name the true reason for the trace; when
- *  omitted it is derived from the resolved value. */
-type PendingApproval = { resolve: (approved: boolean | 'dismiss', source?: ApprovalSettleSource) => void };
-
 /**
  * Map of toolCallId → resolver.
  *

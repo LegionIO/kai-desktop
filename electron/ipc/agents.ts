@@ -1692,6 +1692,30 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     if (updates.runtime !== undefined && !isValidAgentRuntime(updates.runtime)) {
       return { error: `Unknown runtime: ${String(updates.runtime)}` };
     }
+    // The web bridge is UNTYPED — reject a non-string value for any STRING-typed field (R180): a
+    // poisoned `{terminalSessionId:{}}` would persist and later crash the reconciler when it calls
+    // .startsWith()/path ops on the object (an uncaught main-process exception, and the bad record
+    // survives restart). Validate every string field present in `updates`.
+    const stringFields = [
+      'name',
+      'icon',
+      'description',
+      'instructions',
+      'matchedRoleId',
+      'terminalSessionId',
+      'workspaceId',
+    ] as const;
+    for (const f of stringFields) {
+      const v = (updates as Record<string, unknown>)[f];
+      if (v !== undefined && typeof v !== 'string') {
+        return { error: `Invalid ${f}: expected string` };
+      }
+    }
+    if (updates.capabilities !== undefined) {
+      if (!Array.isArray(updates.capabilities) || updates.capabilities.some((c) => typeof c !== 'string')) {
+        return { error: 'Invalid capabilities: expected string[]' };
+      }
+    }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };
     try {
