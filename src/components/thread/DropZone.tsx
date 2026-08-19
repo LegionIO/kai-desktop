@@ -1,11 +1,13 @@
 import { useState, useCallback, useRef, type FC, type ReactNode, type DragEvent } from 'react';
 import { UploadIcon } from 'lucide-react';
 import { useAttachments } from '@/providers/AttachmentContext';
+import { useMidTurnComposer } from '@/providers/RuntimeProvider';
 import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 
 export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const { addAttachments } = useAttachments();
+  const { getActiveConversationId } = useMidTurnComposer();
   const dragCountRef = { current: 0 };
   // Transient notice for dropped files SKIPPED by the size gate (R183).
   const [notice, setNotice] = useState<string | null>(null);
@@ -46,6 +48,10 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
 
       const files = Array.from(e.dataTransfer.files);
       if (files.length === 0) return;
+
+      // Capture the conversation the drop targeted (R186): the attachment store is app-global, so a
+      // chat switch during the async reads would otherwise attach these files to the wrong chat.
+      const originConversationId = getActiveConversationId();
 
       // Gate by size BEFORE reading (R183): each FileReader materializes the whole file, so an oversized
       // or bulk drop would OOM the renderer if read first. Reject over-cap files up front and report them.
@@ -107,6 +113,8 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
         );
       }
       void Promise.all(pending).then((results) => {
+        // Discard if the user switched conversations while the reads were in flight (R186).
+        if (getActiveConversationId() !== originConversationId) return;
         const attachable = results.filter((r): r is Attachable => r !== null);
         const unreadable = accepted.length - attachable.length;
         if (attachable.length > 0) {
@@ -117,7 +125,7 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
         if (unreadable > 0) showNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
       });
     },
-    [addAttachments, showNotice],
+    [addAttachments, showNotice, getActiveConversationId],
   );
 
   return (

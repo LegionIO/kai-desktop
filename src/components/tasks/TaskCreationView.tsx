@@ -23,7 +23,7 @@ import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { useTasks } from '@/providers/TaskProvider';
-import { useAttachments } from '@/providers/AttachmentContext';
+import { useLocalAttachments } from '@/hooks/useLocalAttachments';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
@@ -46,7 +46,10 @@ interface TaskCreationViewProps {
 
 export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: _onCancel }) => {
   const { startAITaskCreation, selectTask } = useTasks();
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useAttachments();
+  // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
+  // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
+  // is discarded on unmount automatically, so no cross-surface clearing is needed.
+  const { attachments, addAttachments, removeAttachment } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -203,12 +206,6 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
-
-  // Clear any staged attachments when leaving task creation (R185): they can't be submitted with an
-  // AI task, so the shared attachment store must not carry them into a subsequent chat send.
-  useEffect(() => {
-    return () => clearAttachments();
-  }, [clearAttachments]);
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();

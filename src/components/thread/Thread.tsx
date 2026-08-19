@@ -1998,12 +1998,16 @@ const Composer: FC<{
       return;
     }
     try {
+      const originConversationId = getActiveConversationId();
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
         files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
         skipped?: string[];
       };
       if (result.canceled) return;
+      // Discard if the user switched conversations while the native dialog was open (R186) — the
+      // attachment store is app-global, so adding here would attach to the wrong chat.
+      if (getActiveConversationId() !== originConversationId) return;
       // Merge files skipped by MAIN (too large / not a regular file) with any rejected by the renderer
       // aggregate backstop, and surface the combined list so the action is never a silent no-op.
       const skippedNames = [...(result.skipped ?? [])];
@@ -2022,6 +2026,11 @@ const Composer: FC<{
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
+    // Capture the conversation the read was initiated for (R186): the attachment store is app-global,
+    // so if the user switches chats before these async reads resolve, adding the files would attach
+    // Chat A's files to the now-displayed Chat B (unintended disclosure). Drop the result if the active
+    // conversation has changed by the time it resolves.
+    const originConversationId = getActiveConversationId();
     // Gate by size BEFORE reading (R183): FileReader materializes each file fully, concurrently, so an
     // oversized or bulk selection would OOM the renderer if we read first. Reject over-cap files up front.
     const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
@@ -2078,6 +2087,8 @@ const Composer: FC<{
       );
     }
     void Promise.all(readers).then((results) => {
+      // Discard if the user switched conversations while the reads were in flight (R186).
+      if (getActiveConversationId() !== originConversationId) return;
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
       const unreadable = accepted.length - attachable.length;
       if (attachable.length > 0) {

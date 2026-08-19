@@ -29,7 +29,7 @@ import { cn } from '@/lib/utils';
 import { refocusComposer } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
 import { useAgents } from '@/providers/AgentProvider';
-import { useAttachments } from '@/providers/AttachmentContext';
+import { useLocalAttachments } from '@/hooks/useLocalAttachments';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
@@ -62,7 +62,9 @@ interface TaskDetailPanelProps {
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
   const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useAttachments();
+  // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
+  // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
+  const { attachments, addAttachments, removeAttachment } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -108,12 +110,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       setActiveTab(preserved);
     }
   });
-
-  // Clear any staged attachments when leaving the task detail (R185): they can't be submitted with
-  // refineTaskPlan, so the shared attachment store must not carry them into a subsequent chat send.
-  useEffect(() => {
-    return () => clearAttachments();
-  }, [clearAttachments]);
 
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId

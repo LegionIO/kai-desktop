@@ -7,7 +7,7 @@ import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvide
 import { isCompactCommand } from '@/lib/slash-commands';
 import { useCompactingIds, markConversationCompacting, clearConversationCompacting } from '@/lib/compaction-ui-store';
 import { cn } from '@/lib/utils';
-import { MAX_ATTACHMENT_BYTES, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
   placeholder = 'Discuss your thoughts and ideas...',
@@ -280,21 +280,23 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       if (imageItems.length === 0) return false;
 
       event.preventDefault();
-      const skippedPastes: string[] = [];
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (!file) continue;
-
-        // Gate by size BEFORE reading (R184): a pasted image is read fully by FileReader, so an
-        // oversized paste would exhaust renderer memory. Reject over-cap pastes up front.
-        if (file.size > MAX_ATTACHMENT_BYTES) {
-          skippedPastes.push(file.name || 'pasted image');
-          continue;
-        }
-
+      // Capture the conversation the paste targeted (R186): the attachment store is app-global, so a
+      // chat switch before a reader resolves would otherwise attach the image to the wrong chat.
+      const originConversationId = getActiveConversationId();
+      // Gate the WHOLE pasted batch before reading (R186): a per-file-only check lets several images
+      // materialize concurrently past the aggregate cap. filterAttachmentsBySize applies the per-file
+      // AND running aggregate limits up front; addAttachments' return then backstops the shared store.
+      const pastedFiles = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
+      const { accepted, skipped } = filterAttachmentsBySize(pastedFiles);
+      const skippedPastes = skipped.slice();
+      for (const file of accepted) {
         const reader = new FileReader();
+        reader.onerror = () => {};
+        reader.onabort = () => {};
         reader.onload = () => {
-          addAttachments([
+          // Discard if the user switched conversations while this read was in flight (R186).
+          if (getActiveConversationId() !== originConversationId) return;
+          const { skipped: overCap } = addAttachments([
             {
               name: file.name || `pasted-image-${Date.now()}.${file.type.split('/')[1] || 'png'}`,
               mime: file.type,
@@ -303,6 +305,14 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
               dataUrl: reader.result as string,
             },
           ]);
+          if (overCap.length > 0) {
+            const notice = skippedAttachmentsNotice(overCap);
+            if (notice) {
+              if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+              setSendBlockFor({ id: conversationId, msg: notice });
+              sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+            }
+          }
         };
         reader.readAsDataURL(file);
       }
