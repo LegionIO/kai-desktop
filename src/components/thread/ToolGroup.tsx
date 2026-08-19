@@ -39,6 +39,7 @@ import {
 import ShikiHighlighter from 'react-shiki';
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
+import { useRuntimeConversationId } from '@/providers/RuntimeProvider';
 import { EditDiffSummary } from './EditDiffSummary';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -931,6 +932,9 @@ const QuestionnaireView: FC<{
   const [activeTab, setActiveTab] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
+  // Conversation-scoped answer key (R191): pass the active conversation id so main keys the answer by
+  // conversationId::toolCallId and a provider that reuses `call_1` across conversations can't cross-route.
+  const conversationId = useRuntimeConversationId();
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -977,10 +981,10 @@ const QuestionnaireView: FC<{
         result[q.question] = answer;
       }
     });
-    void app.agent.answerToolQuestion(toolCallId, result);
+    void app.agent.answerToolQuestion(toolCallId, result, conversationId ?? undefined);
     onSubmit();
     refocusComposer();
-  }, [toolCallId, questions, answers, otherTexts, onSubmit]);
+  }, [toolCallId, questions, answers, otherTexts, onSubmit, conversationId]);
 
   if (questions.length === 0) return null;
 

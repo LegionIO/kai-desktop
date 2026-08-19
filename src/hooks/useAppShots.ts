@@ -113,19 +113,27 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
         // images materialize concurrently past the aggregate limit. filterAttachmentsBySize applies the
         // per-file AND running aggregate caps up front.
         const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles);
-        // Release the in-flight reservation once every reader settles (R187).
+        // Release each file's share of the reservation as its read settles (R191): holding the whole
+        // batch reservation until the last reader double-counts each committed file (reserved AND
+        // committed) against the addAttachments backstop. Per-file release transfers reserved→committed
+        // atomically; a remainder is swept when the last reader settles.
         let outstanding = accepted.length;
-        const settleOne = () => {
+        let releasedReserved = 0;
+        const settleOne = (bytes: number) => {
+          releasedReserved += bytes;
+          releaseAttachmentReservation(bytes);
           outstanding -= 1;
-          if (outstanding <= 0) releaseAttachmentReservation(reservedBytes);
+          if (outstanding <= 0 && releasedReserved < reservedBytes) {
+            releaseAttachmentReservation(reservedBytes - releasedReserved);
+          }
         };
         if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
         for (const file of accepted) {
           const reader = new FileReader();
-          reader.onerror = () => settleOne();
-          reader.onabort = () => settleOne();
+          reader.onerror = () => settleOne(file.size);
+          reader.onabort = () => settleOne(file.size);
           reader.onload = () => {
-            settleOne();
+            settleOne(file.size);
             if (getActiveConversationId() !== originConversationId) return;
             addAttachments([
               {

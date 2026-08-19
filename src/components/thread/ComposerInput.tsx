@@ -293,20 +293,31 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       const pastedFiles = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
       const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(pastedFiles);
       const skippedPastes = skipped.slice();
-      // Release the in-flight reservation once every reader settles (R187), whether it committed or was
-      // discarded on a chat switch — so the reserved bytes don't permanently shrink the global ceiling.
+      // Release each file's share of the in-flight reservation as its read settles (R191): the whole
+      // batch is reserved up front, but a file's bytes are DOUBLE-counted (reserved AND committed) if we
+      // hold the reservation until commit — the addAttachments backstop counts committed + reserved, so a
+      // valid batch near the cap would be wrongly rejected. Releasing per file transfers reserved→committed
+      // atomically (net outstanding unchanged), whether the file committed or was discarded on a chat switch.
+      // A rounding remainder (accepted sizes vs the reserved sum are identical, so none in practice) is
+      // swept when the last reader settles.
       let outstanding = accepted.length;
-      const settleOne = () => {
+      let releasedReserved = 0;
+      const settleOne = (bytes: number) => {
+        releasedReserved += bytes;
+        releaseAttachmentReservation(bytes);
         outstanding -= 1;
-        if (outstanding <= 0) releaseAttachmentReservation(reservedBytes);
+        if (outstanding <= 0 && releasedReserved < reservedBytes) {
+          releaseAttachmentReservation(reservedBytes - releasedReserved);
+        }
       };
       if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
       for (const file of accepted) {
         const reader = new FileReader();
-        reader.onerror = () => settleOne();
-        reader.onabort = () => settleOne();
+        reader.onerror = () => settleOne(file.size);
+        reader.onabort = () => settleOne(file.size);
         reader.onload = () => {
-          settleOne();
+          // Release this file's reservation BEFORE committing so the backstop doesn't see it twice.
+          settleOne(file.size);
           // Discard if the user switched conversations while this read was in flight (R186).
           if (getActiveConversationId() !== originConversationId) return;
           const { skipped: overCap } = addAttachments([

@@ -104,7 +104,11 @@ type AppAPI = {
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
-    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
+    answerToolQuestion: (
+      toolCallId: string,
+      answers: Record<string, string>,
+      conversationId?: string,
+    ) => Promise<{ ok: boolean }>;
     generateTitle: (
       messages: unknown[],
       modelKey?: string,

@@ -614,6 +614,7 @@ import {
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
   dropInFlightAnswersForConversation,
+  makeAnswerKey,
 } from '../tools/ask-user.js';
 
 // Track the model key used for each active stream so we can attribute token usage
@@ -1891,55 +1892,6 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
     return;
   }
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
-}
-
-/** Evict recovery state for `answerKey` that belongs to a DIFFERENT conversation than the one now
- *  registering a fresh ask_user under that key (R190). Provider tool-call ids are unique only within
- *  one provider response — a custom/local provider reuses `call_1` — so conversation B starting a new
- *  ask_user with id `call_1` must not let conversation A's leftover handoff / live claimant / recovery
- *  tombstone / stashed answer for `call_1` capture B's answer (the answer-arrival key-scan would find
- *  A first and inject B's answer into A's successor). recordApprovalAuthority already drops the stale
- *  AUTHORITY record on id-reuse; this is the matching purge of the raced-answer recovery state.
- *
- *  Only cross-conversation state is dropped: a same-conversation entry under the same key is this
- *  conversation's own legitimate in-flight recovery and must be preserved. */
-function evictStaleRecoveryForReusedKey(conversationId: string, answerKey: string): void {
-  const claimant = liveRacedAnswerClaimant.get(conversationId);
-  const handoff = racedAnswerHandoffs.get(conversationId);
-  const ownedBySelf = Boolean(claimant?.state.answerKeys.has(answerKey)) || Boolean(handoff?.answerKeys.has(answerKey));
-  if (ownedBySelf) return; // this conversation's own recovery entry — never evict it here.
-
-  let evictedForeign = false;
-  for (const [otherConv, c] of liveRacedAnswerClaimant) {
-    if (otherConv === conversationId) continue;
-    if (c.state.answerKeys.delete(answerKey)) {
-      evictedForeign = true;
-      if (c.state.answerKeys.size === 0) {
-        const stillOwnsRun = activeStreams.get(otherConv)?.token === c.token;
-        if (!stillOwnsRun) liveRacedAnswerClaimant.delete(otherConv);
-      }
-    }
-  }
-  for (const [otherConv, h] of racedAnswerHandoffs) {
-    if (otherConv === conversationId) continue;
-    if (h.answerKeys.delete(answerKey)) {
-      evictedForeign = true;
-      if (h.answerKeys.size === 0) racedAnswerHandoffs.delete(otherConv);
-    }
-  }
-  const tombstone = recoveryTombstones.get(answerKey);
-  if (tombstone && tombstone.conversationId !== conversationId) {
-    recoveryTombstones.delete(answerKey);
-    evictedForeign = true;
-  }
-  // A stashed answer under a reused key belongs to whichever conversation last stashed it. If we just
-  // evicted a FOREIGN owner's recovery state for this key, any stash entry it referenced is now
-  // orphaned to that dead owner — drop it so this conversation's fresh turn starts from a clean key
-  // rather than inheriting a stranger's stashed answer.
-  if (evictedForeign) {
-    pendingQuestionAnswers.delete(answerKey);
-    clearInFlightAnswer(answerKey);
-  }
 }
 
 /** Find the conversation whose pending handoff OR live claimant holds `answerKey`
@@ -7484,11 +7436,10 @@ export function registerAgentHandlers(
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-              // Provider tool-call ids reuse across responses (a custom provider reuses `call_1`), so
-              // before arming this turn's answer rendezvous, evict any stale recovery state for the
-              // same id left over by a DIFFERENT conversation — otherwise its handoff could capture
-              // THIS turn's answer via the answer-arrival key-scan (R190).
-              evictStaleRecoveryForReusedKey(conversationId, streamId);
+              // The stash + raced-recovery key is conversation-scoped (R191) so a provider that reuses
+              // `call_1` across conversations can't cross-route an answer. The APPROVAL id stays the raw
+              // streamId (the renderer/browser-authority key); only the answer/recovery routing composes.
+              const answerKey = makeAnswerKey(conversationId, streamId);
               const approvalDecision = registerPendingApproval(
                 streamId,
                 controller.signal,
@@ -7507,7 +7458,7 @@ export function registerAgentHandlers(
               // Abort-aware (see exit_plan_mode above): cancel resolves this as
               // 'dismiss' and cleans up, instead of leaking a pending approval.
               const approved = await approvalDecision;
-              const raced = pendingQuestionAnswers.get(streamId);
+              const raced = pendingQuestionAnswers.get(answerKey);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
               // ── Abort path: register the successor handoff IMMEDIATELY ──────
               // On a non-terminal abort, the answer is delivered by the NEXT
@@ -7538,9 +7489,9 @@ export function registerAgentHandlers(
                   };
                 }
                 // Non-terminal abort (supersession / plan-restart): the answer
-                // stays stashed under `streamId`; the actual successor claims it
+                // stays stashed under `answerKey`; the actual successor claims it
                 // (see registerRacedAnswerHandoff + the claim in streamHandler).
-                registerRacedAnswerHandoff(conversationId, streamId, cancelGenAtAbort, streamToken);
+                registerRacedAnswerHandoff(conversationId, answerKey, cancelGenAtAbort, streamToken);
                 // A successor may have ALREADY started and passed its sole claim
                 // site (registerLiveRacedAnswerClaimant) before this gate — one of a
                 // turn's PARALLEL ask_user calls whose slow PreToolUse hook only just
@@ -7600,8 +7551,9 @@ export function registerAgentHandlers(
               }
               if (raced) {
                 // Happy path (approved === true): the answer is already stashed
-                // under the key execute() reads. rekey is a no-op for equal ids.
-                rekeyRacedAnswer(streamId, state.toolCallId, raced);
+                // under the key execute() reads. Both keys are conversation-scoped
+                // (R191); rekey is a no-op for equal ids.
+                rekeyRacedAnswer(answerKey, makeAnswerKey(conversationId, state.toolCallId), raced);
               }
             }
           },
@@ -10474,131 +10426,145 @@ export function registerAgentHandlers(
     return { ok: true };
   });
 
-  ipcMain.handle('agent:answer-tool-question', (event, toolCallId: string, answers: Record<string, string>) => {
-    // Runtime type-guard (R132 finding-2): the web/WebSocket boundary is UNTYPED, so a client
-    // can send a non-string toolCallId (e.g. a ~4 MiB object used as the Map key, whose bulk
-    // slips past a length-based byte measure) or non-string answer values. Coerce/reject here
-    // so downstream (stash byte-accounting, id equality, recovery routing) only ever sees the
-    // declared shape: a string id and a flat Record<string,string>. Reject a malformed frame.
-    if (typeof toolCallId !== 'string' || toolCallId.length === 0 || toolCallId.length > 4096) {
-      return { ok: false, error: 'invalid-tool-call-id' };
-    }
-    // Must be a PLAIN object (R137 f-7): a Map / ArrayBuffer / class instance passes a bare
-    // `typeof === 'object'` + `Object.values()` (which is empty for them) so byte-accounting
-    // would measure it as `{}` while structured-clone still retains its (large) internal
-    // payload in MAIN — defeating the 64 KiB/4 MiB bounds. Require Object/null prototype.
-    if (answers === null || typeof answers !== 'object' || Array.isArray(answers)) {
-      return { ok: false, error: 'invalid-answers' };
-    }
-    const proto = Object.getPrototypeOf(answers);
-    if (proto !== Object.prototype && proto !== null) {
-      return { ok: false, error: 'invalid-answers' };
-    }
-    for (const v of Object.values(answers)) {
-      if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
-    }
-    const pending = pendingToolApprovals.get(toolCallId);
-    // A Browser-authorized approval may only be answered by the authorized surface (main's authority
-    // routing). A stale-browser-stream answer resolves the approval closed (dismiss) + closes the
-    // pop-out; other authority errors reject the answer without touching the pending entry.
-    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
-    if (pending && approvalError) {
-      if (approvalError === 'stale-browser-stream') {
-        pending.resolve(false);
-        closeApprovalWindow(toolCallId);
+  ipcMain.handle(
+    'agent:answer-tool-question',
+    (event, toolCallId: string, answers: Record<string, string>, conversationId?: string) => {
+      // Runtime type-guard (R132 finding-2): the web/WebSocket boundary is UNTYPED, so a client
+      // can send a non-string toolCallId (e.g. a ~4 MiB object used as the Map key, whose bulk
+      // slips past a length-based byte measure) or non-string answer values. Coerce/reject here
+      // so downstream (stash byte-accounting, id equality, recovery routing) only ever sees the
+      // declared shape: a string id and a flat Record<string,string>. Reject a malformed frame.
+      if (typeof toolCallId !== 'string' || toolCallId.length === 0 || toolCallId.length > 4096) {
+        return { ok: false, error: 'invalid-tool-call-id' };
       }
-      return { ok: false, error: approvalError };
-    }
-    // PENDINGLESS authority enforcement (R174): the raced-answer stash path below accepts an answer
-    // even when `pending` was already deleted by an abort (that's the whole ask_user-race fix). But a
-    // browser-authorized approval's authority must STILL be enforced there — otherwise a non-primary
-    // web surface could submit an answer for a browser-owned ask_user after abort and have it injected
-    // into the successor/recovery turn that still holds authenticated Browser authority. Consult the
-    // DURABLE authority record (survives the pending deletion) and reject an unauthorized late answer.
-    if (!pending) {
-      const recordedAuthority = getRecordedApprovalAuthority(toolCallId);
-      const requiresNativeAuthority =
-        recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
-      if (requiresNativeAuthority) {
-        // Enforce CALLER authority, NOT stream-current: the recovery path deliberately runs after the
-        // original stream ended, so a stream-current gate would wrongly reject a legitimate answer.
-        // Accept the PRIMARY window OR the exact authorized pop-out (its webContents id is mirrored
-        // onto the durable record, so an answer submitted while the one-shot capability was valid is
-        // not lost when abort deletes the pending entry — R175). A non-primary web/secondary surface
-        // fails both and is rejected.
-        const authorized =
-          isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
-          isAuthorizedApprovalWindowCaller(event, recordedAuthority!);
-        if (!authorized) {
-          return { ok: false, error: 'native-browser-authority-required' };
+      // Must be a PLAIN object (R137 f-7): a Map / ArrayBuffer / class instance passes a bare
+      // `typeof === 'object'` + `Object.values()` (which is empty for them) so byte-accounting
+      // would measure it as `{}` while structured-clone still retains its (large) internal
+      // payload in MAIN — defeating the 64 KiB/4 MiB bounds. Require Object/null prototype.
+      if (answers === null || typeof answers !== 'object' || Array.isArray(answers)) {
+        return { ok: false, error: 'invalid-answers' };
+      }
+      const proto = Object.getPrototypeOf(answers);
+      if (proto !== Object.prototype && proto !== null) {
+        return { ok: false, error: 'invalid-answers' };
+      }
+      for (const v of Object.values(answers)) {
+        if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
+      }
+      // Conversation-scoped answer key (R191): the stash + raced-recovery routing must key by
+      // conversationId::toolCallId so a provider that reuses `call_1` across conversations can't
+      // cross-route an answer. conversationId is optional/untrusted at this boundary — validate it as
+      // a bounded string; when absent (legacy/headless client), makeAnswerKey falls back to the raw id
+      // (unchanged behavior). The APPROVAL map + browser-authority checks below KEEP using the raw
+      // toolCallId (that map is keyed by the renderer-facing id).
+      const convId =
+        typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 200
+          ? conversationId
+          : undefined;
+      const answerKey = makeAnswerKey(convId, toolCallId);
+      const pending = pendingToolApprovals.get(toolCallId);
+      // A Browser-authorized approval may only be answered by the authorized surface (main's authority
+      // routing). A stale-browser-stream answer resolves the approval closed (dismiss) + closes the
+      // pop-out; other authority errors reject the answer without touching the pending entry.
+      const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+      if (pending && approvalError) {
+        if (approvalError === 'stale-browser-stream') {
+          pending.resolve(false);
+          closeApprovalWindow(toolCallId);
+        }
+        return { ok: false, error: approvalError };
+      }
+      // PENDINGLESS authority enforcement (R174): the raced-answer stash path below accepts an answer
+      // even when `pending` was already deleted by an abort (that's the whole ask_user-race fix). But a
+      // browser-authorized approval's authority must STILL be enforced there — otherwise a non-primary
+      // web surface could submit an answer for a browser-owned ask_user after abort and have it injected
+      // into the successor/recovery turn that still holds authenticated Browser authority. Consult the
+      // DURABLE authority record (survives the pending deletion) and reject an unauthorized late answer.
+      if (!pending) {
+        const recordedAuthority = getRecordedApprovalAuthority(toolCallId);
+        const requiresNativeAuthority =
+          recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
+        if (requiresNativeAuthority) {
+          // Enforce CALLER authority, NOT stream-current: the recovery path deliberately runs after the
+          // original stream ended, so a stream-current gate would wrongly reject a legitimate answer.
+          // Accept the PRIMARY window OR the exact authorized pop-out (its webContents id is mirrored
+          // onto the durable record, so an answer submitted while the one-shot capability was valid is
+          // not lost when abort deletes the pending entry — R175). A non-primary web/secondary surface
+          // fails both and is rejected.
+          const authorized =
+            isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+            isAuthorizedApprovalWindowCaller(event, recordedAuthority!);
+          if (!authorized) {
+            return { ok: false, error: 'native-browser-authority-required' };
+          }
         }
       }
-    }
-    // Stash the answers before resolving. A fully-submitted answer can race an
-    // abort (turn ended / superseded / plan-restart) that already settled + removed
-    // the pending approval a beat earlier — the old `if (pending)` guard dropped the
-    // answer in that window, and the tool then emitted "No user response received"
-    // even though the user DID answer. The stash is bounded (MAX_PENDING_QUESTION_ANSWERS
-    // FIFO), so an orphaned entry for a genuinely-dead turn can't leak. The ask_user
-    // gate + execute recover this entry by id; a still-live pending approval is
-    // resolved below.
-    //
-    // FIRST-SURFACE-WINS: multiple surfaces (inline card / dedicated window / web /
-    // CLI) can answer the same question. Once the FIRST answer resolved the pending
-    // approval (entry deleted), a LATER differing answer must NOT overwrite the
-    // already-stashed first answer before a raced-abort handoff consumes it — that
-    // would deliver the second surface's answer even though the first already
-    // succeeded. So stash only when this is the first answer (no existing stash) OR a
-    // pending approval is still live (this IS the winning surface resolving it now).
-    const alreadyStashed = pendingQuestionAnswers.has(toolCallId);
-    let stashed = true;
-    if (pending || !alreadyStashed) {
-      // stashQuestionAnswers rejects an oversized single entry (byte cap) — a legitimate
-      // answer is short typed text; an oversized frame is discarded rather than allowed to
-      // retain memory / FIFO-evict real recovery entries (R130 finding-2). A live pending
-      // approval is still resolved below (don't wedge a genuine turn), but there's no stash
-      // to recover from on a raced abort — acceptable, since a 64 KiB+ "answer" is abuse.
-      stashed = stashQuestionAnswers(toolCallId, answers);
-    }
-    traceDiagnostic({
-      scope: 'agent',
-      event: 'question.answer-received',
-      toolName: 'ask_user',
-      fields: {
-        toolCallId,
-        hadPending: Boolean(pending),
-        answerCount: Object.keys(answers ?? {}).length,
-        stashRejectedOversize: !stashed,
-      },
-    });
-    if (pending) {
-      // Resolve with the explicit `answered` source so the trace distinguishes a
-      // real ask_user answer from a generic tool approval.
-      pending.resolve(true, 'answered');
-      pendingToolApprovals.delete(toolCallId);
-    }
-    // Answer-arrival side of the raced-answer rendezvous: if this answer belongs
-    // to a pending handoff whose successor is already live (the successor started
-    // before the answer landed — a slow/remote client), deliver it now. No-op if
-    // there's no matching handoff/claimant yet (the successor-start path delivers
-    // once it registers). answer-tool-question only knows the answerKey
-    // (=toolCallId), so locate the owning conversation by that key.
-    const owningConv = conversationForRacedAnswerKey(toolCallId);
-    if (owningConv) {
-      attemptRacedAnswerDelivery(owningConv);
-    } else {
-      // No live handoff/claimant references this key — but a no-successor drop may
-      // have left a TTL-bound recovery tombstone. If so, this LATE-arriving answer is
-      // owed to that conversation; route it through the durable recovered-answer path
-      // (labeled re-inject / Alert) instead of leaving it orphaned in the stash (R87).
-      const tombstoneConv = recoveryTombstoneConversation(toolCallId);
-      if (tombstoneConv) {
-        recoveryTombstones.delete(toolCallId);
-        recoverOrphanedAnswerKeys(tombstoneConv, [toolCallId]);
+      // Stash the answers before resolving. A fully-submitted answer can race an
+      // abort (turn ended / superseded / plan-restart) that already settled + removed
+      // the pending approval a beat earlier — the old `if (pending)` guard dropped the
+      // answer in that window, and the tool then emitted "No user response received"
+      // even though the user DID answer. The stash is bounded (MAX_PENDING_QUESTION_ANSWERS
+      // FIFO), so an orphaned entry for a genuinely-dead turn can't leak. The ask_user
+      // gate + execute recover this entry by id; a still-live pending approval is
+      // resolved below.
+      //
+      // FIRST-SURFACE-WINS: multiple surfaces (inline card / dedicated window / web /
+      // CLI) can answer the same question. Once the FIRST answer resolved the pending
+      // approval (entry deleted), a LATER differing answer must NOT overwrite the
+      // already-stashed first answer before a raced-abort handoff consumes it — that
+      // would deliver the second surface's answer even though the first already
+      // succeeded. So stash only when this is the first answer (no existing stash) OR a
+      // pending approval is still live (this IS the winning surface resolving it now).
+      const alreadyStashed = pendingQuestionAnswers.has(answerKey);
+      let stashed = true;
+      if (pending || !alreadyStashed) {
+        // stashQuestionAnswers rejects an oversized single entry (byte cap) — a legitimate
+        // answer is short typed text; an oversized frame is discarded rather than allowed to
+        // retain memory / FIFO-evict real recovery entries (R130 finding-2). A live pending
+        // approval is still resolved below (don't wedge a genuine turn), but there's no stash
+        // to recover from on a raced abort — acceptable, since a 64 KiB+ "answer" is abuse.
+        stashed = stashQuestionAnswers(answerKey, answers);
       }
-    }
-    return { ok: true };
-  });
+      traceDiagnostic({
+        scope: 'agent',
+        event: 'question.answer-received',
+        toolName: 'ask_user',
+        fields: {
+          toolCallId,
+          hadPending: Boolean(pending),
+          answerCount: Object.keys(answers ?? {}).length,
+          stashRejectedOversize: !stashed,
+        },
+      });
+      if (pending) {
+        // Resolve with the explicit `answered` source so the trace distinguishes a
+        // real ask_user answer from a generic tool approval.
+        pending.resolve(true, 'answered');
+        pendingToolApprovals.delete(toolCallId);
+      }
+      // Answer-arrival side of the raced-answer rendezvous: if this answer belongs
+      // to a pending handoff whose successor is already live (the successor started
+      // before the answer landed — a slow/remote client), deliver it now. No-op if
+      // there's no matching handoff/claimant yet (the successor-start path delivers
+      // once it registers). Locate the owning conversation by the conversation-scoped
+      // answerKey (R191).
+      const owningConv = conversationForRacedAnswerKey(answerKey);
+      if (owningConv) {
+        attemptRacedAnswerDelivery(owningConv);
+      } else {
+        // No live handoff/claimant references this key — but a no-successor drop may
+        // have left a TTL-bound recovery tombstone. If so, this LATE-arriving answer is
+        // owed to that conversation; route it through the durable recovered-answer path
+        // (labeled re-inject / Alert) instead of leaving it orphaned in the stash (R87).
+        const tombstoneConv = recoveryTombstoneConversation(answerKey);
+        if (tombstoneConv) {
+          recoveryTombstones.delete(answerKey);
+          recoverOrphanedAnswerKeys(tombstoneConv, [answerKey]);
+        }
+      }
+      return { ok: true };
+    },
+  );
 
   ipcMain.handle(
     'agent:generate-title',

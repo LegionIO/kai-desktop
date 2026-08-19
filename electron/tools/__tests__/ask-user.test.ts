@@ -35,6 +35,7 @@ import {
   drainInFlightAnswersForToken,
   dropInFlightAnswersForToken,
   dropInFlightAnswersForConversation,
+  makeAnswerKey,
 } from '../ask-user.js';
 import { listAlerts, readAlert } from '../../ipc/alert-store.js';
 import type { ToolExecutionContext } from '../types.js';
@@ -45,6 +46,20 @@ beforeEach(() => {
 });
 
 const ctx = (toolCallId: string): ToolExecutionContext => ({ toolCallId }) as ToolExecutionContext;
+
+describe('makeAnswerKey', () => {
+  it('composes a conversation-scoped key when conversationId is present', () => {
+    expect(makeAnswerKey('conv-1', 'call_1')).toBe('conv-1::call_1');
+    // Two conversations reusing the same provider tool-call id get DISTINCT keys.
+    expect(makeAnswerKey('conv-2', 'call_1')).toBe('conv-2::call_1');
+    expect(makeAnswerKey('conv-1', 'call_1')).not.toBe(makeAnswerKey('conv-2', 'call_1'));
+  });
+
+  it('falls back to the raw toolCallId when conversationId is absent (headless/legacy)', () => {
+    expect(makeAnswerKey(undefined, 'call_1')).toBe('call_1');
+    expect(makeAnswerKey('', 'call_1')).toBe('call_1');
+  });
+});
 
 describe('stashQuestionAnswers', () => {
   it('stores answers under the toolCallId', () => {
@@ -369,7 +384,8 @@ describe('createAskUserTool headless fallback', () => {
 
   it('prefers stashed answers even when headless', async () => {
     const tool = createAskUserTool(appHome);
-    stashQuestionAnswers('tc-h3', { Env: 'prod' });
+    // The stash is conversation-scoped (R191): seed under makeAnswerKey(conversationId, toolCallId).
+    stashQuestionAnswers(makeAnswerKey('conv-9', 'tc-h3'), { Env: 'prod' });
     const result = await tool.execute!({ questions: [q] }, headlessCtx('tc-h3', 'conv-9'));
     expect(result).toEqual({ success: true, answers: { Env: 'prod' } });
     expect(listAlerts(appHome)).toHaveLength(0);

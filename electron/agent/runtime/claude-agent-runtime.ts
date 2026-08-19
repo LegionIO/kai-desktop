@@ -39,6 +39,7 @@ import {
   pendingQuestionAnswers,
   getAskUserRecoveryRouter,
   getActiveStreamTokenForConversation,
+  makeAnswerKey,
 } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
@@ -1311,7 +1312,9 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
     debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
     if (settleSource === 'abort') {
       try {
-        getAskUserRecoveryRouter()?.(conversationId, toolCallId, owningStreamToken);
+        // Recovery is keyed by the conversation-scoped answerKey (R191), matching how
+        // agent:answer-tool-question stashes the answer.
+        getAskUserRecoveryRouter()?.(conversationId, makeAnswerKey(conversationId, toolCallId), owningStreamToken);
       } catch {
         /* best-effort — the bounded stash copy remains as the last resort */
       }
@@ -1319,9 +1322,11 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
     return { error: 'User dismissed the question.' };
   }
 
-  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
-  const answers = pendingQuestionAnswers.get(toolCallId);
-  pendingQuestionAnswers.delete(toolCallId);
+  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler under the
+  //    conversation-scoped answerKey — R191)
+  const answerKey = makeAnswerKey(conversationId, toolCallId);
+  const answers = pendingQuestionAnswers.get(answerKey);
+  pendingQuestionAnswers.delete(answerKey);
 
   debugLog(`[ASK_USER] Got answers answerCount=${answers ? Object.keys(answers).length : 0}`);
 

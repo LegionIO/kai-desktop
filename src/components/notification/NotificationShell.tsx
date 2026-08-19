@@ -218,7 +218,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       if (submitting) return;
       setSubmitting(true);
       try {
-        await app.agent.answerToolQuestion(item.id, answers);
+        await app.agent.answerToolQuestion(item.id, answers, item.conversationId);
       } catch {
         /* main-side resolve is idempotent; close regardless */
       }

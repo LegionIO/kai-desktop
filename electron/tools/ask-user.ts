@@ -6,9 +6,20 @@ import { traceDiagnostic } from '../diagnostics/debug-trace.js';
 
 /**
  * Shared map where agent.ts stores user answers before the tool's execute runs.
- * Key: toolCallId, Value: user's answers keyed by question text.
+ * Key: makeAnswerKey(conversationId, toolCallId) — see below. Value: user's answers keyed by question text.
  */
 export const pendingQuestionAnswers = new Map<string, Record<string, string>>();
+
+/** Compose the globally-unique answer-stash / raced-recovery key (R191). Provider tool-call ids
+ *  (e.g. `call_1`) are unique only WITHIN one provider response — a custom/local provider reuses
+ *  `call_1` across different conversations — so two concurrent conversations can collide on the raw
+ *  id and one's answer can route into the other. Prefixing with the conversationId disambiguates.
+ *  Falls back to the raw id when conversationId is absent (headless / legacy callers) so behavior is
+ *  unchanged there. The `::` separator is safe: conversationIds are uuids and tool-call ids don't
+ *  contain `::` in practice (and a collision is harmless — same conversation, same id). */
+export function makeAnswerKey(conversationId: string | undefined, toolCallId: string): string {
+  return conversationId ? `${conversationId}::${toolCallId}` : toolCallId;
+}
 
 /** Bound on {@link pendingQuestionAnswers}. Answers are normally read+deleted by
  *  ask_user.execute, but a turn aborted/errored in the narrow window after the
@@ -412,12 +423,14 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
       // Move (don't hard-delete) into the in-flight ledger so the answer survives a
       // supersession/abort during the window before the tool-result commits (e.g. a
       // slow PostToolUse hook). agent.ts clears it on tool-result emit and recovers
-      // it on a non-terminal abort (R100 finding-7).
-      const answers = pendingQuestionAnswers.get(context.toolCallId);
-      pendingQuestionAnswers.delete(context.toolCallId);
+      // it on a non-terminal abort (R100 finding-7). The stash key is conversation-scoped
+      // (R191) so a provider that reuses `call_1` across conversations can't cross-route.
+      const answerKey = makeAnswerKey(context.conversationId, context.toolCallId);
+      const answers = pendingQuestionAnswers.get(answerKey);
+      pendingQuestionAnswers.delete(answerKey);
       if (answers)
         moveAnswerToInFlight(
-          context.toolCallId,
+          answerKey,
           answers,
           context.conversationId,
           // Stamp the OWNING run's token so drain/drop is token-scoped (R101 f-2).

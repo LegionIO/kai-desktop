@@ -105,8 +105,8 @@ const appAPI = {
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
-    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) =>
-      ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
+    answerToolQuestion: (toolCallId: string, answers: Record<string, string>, conversationId?: string) =>
+      ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers, conversationId),
     generateTitle: (messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) =>
       ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint, conversationId),
     onStreamEvent: (callback: (event: unknown) => void) => {

@@ -14,7 +14,7 @@ import type { StreamOptions, StreamEvent } from '../types.js';
 import type { ToolDefinition } from '../../../tools/types.js';
 import { hookDispatcher } from '../../hooks/dispatcher.js';
 import { pendingToolApprovals } from '../../../ipc/tool-approval.js';
-import { pendingQuestionAnswers } from '../../../tools/ask-user.js';
+import { pendingQuestionAnswers, makeAnswerKey } from '../../../tools/ask-user.js';
 
 // ---------------------------------------------------------------------------
 // SDK mock — controls what `query()` yields per test.
@@ -585,7 +585,9 @@ describe('ClaudeAgentRuntime', () => {
         const response = sdkState.toolHandlers.get('ask_user')?.({ prompt: 'private prompt' }, {});
         await vi.waitFor(() => expect(pendingToolApprovals.size).toBe(1));
         const [toolCallId, pending] = [...pendingToolApprovals.entries()][0]!;
-        pendingQuestionAnswers.set(toolCallId, { answer: 'private answer' });
+        // The answer stash is conversation-scoped (R191); seed under the composite key the SDK
+        // handler reads (conversationId 'conv-1' from makeOptions).
+        pendingQuestionAnswers.set(makeAnswerKey('conv-1', toolCallId), { answer: 'private answer' });
         pending.resolve(true);
         const result = (await response) as { content?: Array<{ text?: string }>; isError?: boolean };
 

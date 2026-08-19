@@ -421,7 +421,7 @@ export function getBridgeScript(): string {
       approveToolCall: function(id) { return invoke('agent:approve-tool', id); },
       rejectToolCall: function(id) { return invoke('agent:reject-tool', id); },
       dismissToolCall: function(id) { return invoke('agent:dismiss-tool', id); },
-      answerToolQuestion: function(id, answers) { return invoke('agent:answer-tool-question', id, answers); },
+      answerToolQuestion: function(id, answers, conversationId) { return invoke('agent:answer-tool-question', id, answers, conversationId); },
       generateTitle: function(msgs, mk, hint) { return invoke('agent:generate-title', msgs, mk, hint); },
       onStreamEvent: function(cb) { return on('agent:stream-event', cb); },
       sendSubAgentMessage: function(cId, msg) { return invoke('agent:sub-agent-message', cId, msg); },
