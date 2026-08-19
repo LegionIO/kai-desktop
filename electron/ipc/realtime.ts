@@ -540,6 +540,11 @@ export function registerRealtimeHandlers(
   // an event handler with no catch) and never let sendAudio's failure propagate.
   ipcMain.on('realtime:send-audio', (event, pcmBase64: string) => {
     if (typeof pcmBase64 !== 'string' || pcmBase64.length === 0) return;
+    // Cap the frame (R179): this fire-and-forget channel is web-bridge-reachable and bypasses the
+    // invoke concurrency limit; each frame is synchronously decoded/resampled/re-encoded/serialized
+    // and queued to the provider socket. An unbounded near-4-MiB frame stream would stall the main
+    // process and grow outbound buffers unboundedly. A real audio chunk is well under this bound.
+    if (pcmBase64.length > 1_048_576) return;
     if (activeSessionBrowserInitiated) {
       const primaryWindow = getPrimaryWindow();
       if (
