@@ -152,14 +152,14 @@ interface TaskContextValue {
     userMessage: string,
     metadata?: KaiTaskMetadata,
     attachments?: Array<{ image: string; mimeType?: string }>,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 
   /** Send a follow-up message to refine the currently streaming task plan. */
   refineTaskPlan: (
     taskId: string,
     userMessage: string,
     attachments?: Array<{ image: string; mimeType?: string }>,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 
   /** Cancel any active AI plan stream. */
   cancelAIStream: () => void;
@@ -473,7 +473,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       userMessage: string,
       metadata?: KaiTaskMetadata,
       attachments?: Array<{ image: string; mimeType?: string }>,
-    ) => {
+    ): Promise<boolean> => {
       try {
         // Create a placeholder task
         const task = await app.tasks.create({
@@ -483,7 +483,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           workspaceId: activeWorkspaceId || undefined,
           metadata,
         });
-        if (!task || !task.id) return;
+        if (!task || !task.id) return false;
 
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
 
@@ -497,16 +497,22 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
         // Start streaming the plan
         await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
+        return true;
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
+        return false;
       }
     },
     [activeWorkspaceId],
   );
 
   const refineTaskPlan = useCallback(
-    async (taskId: string, userMessage: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
+    async (
+      taskId: string,
+      userMessage: string,
+      attachments?: Array<{ image: string; mimeType?: string }>,
+    ): Promise<boolean> => {
       try {
         // Fetch fresh task from IPC to avoid stale closure over state.tasks
         const task = await app.tasks.get(taskId);
@@ -515,9 +521,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         dispatch({ type: 'START_AI_CREATE', taskId });
 
         await app.tasks.streamPlan(taskId, userMessage, history, attachments);
+        return true;
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
         dispatch({ type: 'STREAM_DONE' });
+        return false;
       }
     },
     [],

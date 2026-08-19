@@ -420,13 +420,21 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const images = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) return;
 
+    // Snapshot so a FAILED refine (IPC reject) restores the text + attachments rather than discarding
+    // them (R206) — clearing happens optimistically before the async submission confirms.
+    const stagedAttachments = [...attachments];
     setInput('');
     clearAttachments();
-    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined);
+    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((ok) => {
+      if (!ok) {
+        setInput(text);
+        if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
+      }
+    });
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, attachments, clearAttachments, task.id, refineTaskPlan, isActivelyStreaming]);
+  }, [input, attachments, clearAttachments, addAttachments, task.id, refineTaskPlan, isActivelyStreaming]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

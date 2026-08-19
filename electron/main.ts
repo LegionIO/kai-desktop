@@ -105,6 +105,7 @@ import {
   revokeRealtimeBrowserTools,
   updateActiveRealtimeSessionTools,
 } from './ipc/realtime.js';
+import { reapplyIsolatedBrowserWebRtcPolicy } from './computer-use/harnesses/isolated-browser.js';
 import type { AppConfig } from './config/schema.js';
 import { resolveAlertSurface } from './config/schema.js';
 import { registerRuntime } from './agent/runtime/index.js';
@@ -1561,6 +1562,10 @@ if (gotSingleInstanceLock) {
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
+      // A config change may have toggled computerUse.safety.isolatedBrowserAllowPrivateNetwork — reapply
+      // the WebRTC policy to any LIVE isolated-browser window so disabling private access re-locks WebRTC
+      // immediately, not just on the next window reuse (R206).
+      reapplyIsolatedBrowserWebRtcPolicy();
     };
     const publishBrowserTools = (browserConfig: AppConfig['browser']): void => {
       updateBrowserTools(browserConfig.enabled && getExistingBrowserManager() ? createBrowserTools(getConfig) : []);

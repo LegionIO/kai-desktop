@@ -162,6 +162,25 @@ function resolveIsolatedBrowserAllowPrivate(): boolean {
   }
 }
 
+/**
+ * Reapply the WebRTC IP-handling policy to EVERY live isolated-browser window from current config (R206).
+ * Called when global config is (re)applied (main.ts registry reload) so toggling
+ * computerUse.safety.isolatedBrowserAllowPrivateNetwork OFF re-locks WebRTC on an already-open,
+ * paused/approval-waiting window immediately — otherwise its page could keep opening direct LAN UDP until
+ * the next ensureWindow() reuse (the sync request guards already pick the change up live). Never throws.
+ */
+export function reapplyIsolatedBrowserWebRtcPolicy(): void {
+  const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+  for (const win of windows.values()) {
+    if (win.isDestroyed()) continue;
+    try {
+      configureBrowserWebContents(win.webContents, allowPrivate);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 function ensureWindow(sessionId: string): BrowserWindow {
   const existing = windows.get(sessionId);
   if (existing && !existing.isDestroyed()) {

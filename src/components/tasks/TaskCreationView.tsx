@@ -240,14 +240,23 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     // Require text OR at least one image (R187).
     if (!text && images.length === 0) return;
 
+    // Snapshot the staged attachments so a FAILED submission (create returns no id / IPC rejects) can
+    // restore them instead of discarding the user's selection (R206). Clear the composer optimistically
+    // for responsiveness, then roll back both text and attachments if submission never started.
+    const stagedAttachments = [...attachments];
     setInput('');
     clearAttachments();
     void startAITaskCreation(
       text,
       currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
       images.length > 0 ? images : undefined,
-    );
-  }, [input, attachments, clearAttachments, startAITaskCreation, currentWorkingDirectory]);
+    ).then((ok) => {
+      if (!ok) {
+        setInput(text);
+        if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
+      }
+    });
+  }, [input, attachments, clearAttachments, addAttachments, startAITaskCreation, currentWorkingDirectory]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {

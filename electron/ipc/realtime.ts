@@ -180,6 +180,21 @@ function resolveRealtimePlanFirst(appHome: string, conversationId: string, confi
 }
 
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
+  // Re-resolve plan-first from CURRENT config before re-gating (R206): this runs on every registry reload
+  // (main.ts), which is when a GLOBAL config.tools.executionMode change takes effect. A RECORDLESS session
+  // (voice/web/test, no conversation record) never receives a per-conversation execution-mode event, so
+  // onRealtimeExecutionModeChanged never fires for it — without re-resolving here, a global Auto→Plan-First
+  // switch would leave its frozen activeSessionPlanFirst=false and mutating tools active. resolveRealtimePlanFirst
+  // still honors a present conversation record's own mode (recorded sessions unaffected) and fails closed.
+  if (registeredGetConfig && registeredAppHome) {
+    const config = registeredGetConfig();
+    if (activeSession && sessionConversationId) {
+      activeSessionPlanFirst = resolveRealtimePlanFirst(registeredAppHome, sessionConversationId, config);
+    }
+    if (pendingStart) {
+      pendingStart.planFirst = resolveRealtimePlanFirst(registeredAppHome, pendingStart.conversationId, config);
+    }
+  }
   activeSession?.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
   if (pendingStart?.session) {
     pendingStart.session.updateTools(gateRealtimeTools(tools, pendingStart.allowsBrowserTools, pendingStart.planFirst));
