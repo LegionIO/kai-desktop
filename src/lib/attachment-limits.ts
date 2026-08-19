@@ -21,14 +21,21 @@ export const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across ALL attac
 let committedBytes = 0;
 let inFlightReservedBytes = 0;
 
+/** Coerce an untrusted byte count to a safe non-negative finite number (R195): a NaN/string/negative
+ *  `size` (e.g. from a corrupt persisted draft) must never enter the counters — one NaN makes
+ *  committedBytes NaN and every aggregate-cap comparison then fails OPEN. */
+function safeBytes(bytes: number): number {
+  return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+}
+
 /** A store reports bytes it has newly COMMITTED (added to its live list). */
 export function onAttachmentsCommitted(bytes: number): void {
-  committedBytes += Math.max(0, bytes);
+  committedBytes += safeBytes(bytes);
 }
 
 /** A store reports bytes it has RELEASED (removed/cleared/consumed from its live list). */
 export function onAttachmentsReleased(bytes: number): void {
-  committedBytes = Math.max(0, committedBytes - Math.max(0, bytes));
+  committedBytes = Math.max(0, committedBytes - safeBytes(bytes));
 }
 
 /** Current renderer-wide committed attachment bytes across all stores (for a store's own backstop). */
@@ -49,7 +56,7 @@ export function globalOutstandingBytes(): number {
  *  read commits, the store's onAttachmentsCommitted moves those bytes into `committedBytes`, so the
  *  reservation must be released to avoid double-counting. */
 export function releaseAttachmentReservation(bytes: number): void {
-  inFlightReservedBytes = Math.max(0, inFlightReservedBytes - Math.max(0, bytes));
+  inFlightReservedBytes = Math.max(0, inFlightReservedBytes - safeBytes(bytes));
 }
 
 export type AttachmentFilterResult = {
@@ -74,12 +81,14 @@ export function filterAttachmentsBySize(files: readonly File[]): AttachmentFilte
   const skipped: string[] = [];
   let batchBytes = 0;
   for (const file of files) {
-    const wouldTotal = committedBytes + inFlightReservedBytes + batchBytes + file.size;
-    if (file.size > MAX_ATTACHMENT_BYTES || wouldTotal > MAX_ATTACHMENT_TOTAL_BYTES) {
+    // Sanitize file.size (R195): a File with a bogus size must not poison the reservation counter.
+    const size = safeBytes(file.size);
+    const wouldTotal = committedBytes + inFlightReservedBytes + batchBytes + size;
+    if (size > MAX_ATTACHMENT_BYTES || wouldTotal > MAX_ATTACHMENT_TOTAL_BYTES) {
       skipped.push(file.name);
       continue;
     }
-    batchBytes += file.size;
+    batchBytes += size;
     accepted.push(file);
   }
   inFlightReservedBytes += batchBytes;

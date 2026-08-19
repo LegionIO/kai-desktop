@@ -298,11 +298,12 @@ function restorePriorFocus(id: string): void {
 }
 
 /** Close the notification window for an id once it's resolved/aborted. Idempotent. For a tool-approval
- *  pass the `conversationId` so the conversation-scoped key resolves (R193); falls back to the raw id
- *  (alerts, whose id is already globally unique, and any legacy raw-keyed entry). */
+ *  pass the `conversationId` so the conversation-scoped key resolves (R193). When conversationId is
+ *  provided the key is EXACT (no raw fallback) — a scoped tool-approval close must never fall back to the
+ *  raw namespace and match an unrelated ALERT whose UUID happens to equal the tool-call id (R195). The raw
+ *  key is used only for a call WITHOUT conversationId (alerts, whose id is globally unique; legacy). */
 export function closeNotificationWindow(id: string, conversationId?: string): void {
-  const composite = notifKeyFromParts(id, conversationId);
-  const key = notificationWindows.has(composite) || notificationItems.has(composite) ? composite : id;
+  const key = conversationId ? notifKeyFromParts(id, conversationId) : id;
   const win = notificationWindows.get(key);
   // Only manage focus if the POP-OUT WINDOW was actually the focused surface at
   // close time. When the user answers the INLINE card in the main GUI (which also
@@ -332,8 +333,9 @@ export function closeAllNotificationWindows(): void {
 }
 
 export function hasNotificationWindow(id: string, conversationId?: string): boolean {
-  const composite = notifKeyFromParts(id, conversationId);
-  const win = notificationWindows.get(composite) ?? notificationWindows.get(id);
+  // Exact key when scoped (no raw fallback) so a scoped query can't match an unrelated raw/alert entry (R195).
+  const key = conversationId ? notifKeyFromParts(id, conversationId) : id;
+  const win = notificationWindows.get(key);
   return Boolean(win && !win.isDestroyed());
 }
 
@@ -379,8 +381,10 @@ export function registerNotificationWindowIpc(): void {
   // conversation-scoped key, falling back to the raw id (alerts / legacy) (R193).
   ipcMain.handle('notif:get', (_event, id: unknown, conversationId?: unknown) => {
     if (typeof id !== 'string') return null;
-    const composite = notifKeyFromParts(id, typeof conversationId === 'string' ? conversationId : undefined);
-    return notificationItems.get(composite) ?? notificationItems.get(id) ?? null;
+    // Exact key when scoped: a scoped tool-approval pull must not fall back to the raw namespace and
+    // return an unrelated alert whose id equals the tool-call id (R195).
+    const key = typeof conversationId === 'string' && conversationId ? notifKeyFromParts(id, conversationId) : id;
+    return notificationItems.get(key) ?? null;
   });
   // Renderer reports its laid-out content height (ResizeObserver on #notif-root);
   // size the reporting window to it, clamped. Map sender → its BrowserWindow.

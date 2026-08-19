@@ -1654,6 +1654,17 @@ export function registerConversationHandlers(
         if (!d || typeof d.id !== 'string' || d.id.length === 0 || typeof d.stashedAt !== 'number') return false;
         const hasText = typeof d.text === 'string' && d.text.trim().length > 0;
         const hasAttachments = Array.isArray(d.attachments) && d.attachments.length > 0;
+        // Reject a draft whose any attachment carries a non-finite / negative `size` (R195): the renderer
+        // sums these into the renderer-wide committed-bytes counter on hydration, and a NaN/string size
+        // makes that counter NaN — after which EVERY aggregate-cap comparison fails open. A forged 0 also
+        // bypasses accounting. Persisted drafts are trusted-origin, but a corrupt/truncated write must not
+        // poison the accounting; drop the malformed draft rather than store it.
+        if (hasAttachments) {
+          for (const a of d.attachments as unknown[]) {
+            const size = (a as { size?: unknown } | null)?.size;
+            if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) return false;
+          }
+        }
         return hasText || hasAttachments;
       };
       const existing = ((conv as { pendingDrafts?: unknown }).pendingDrafts ?? []) as Array<{

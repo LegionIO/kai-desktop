@@ -862,16 +862,22 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         'image/heif',
       ]);
       const imageParts: Array<{ type: 'image'; image: string; mimeType?: string }> = [];
+      // Count images the caller SUPPLIED (non-empty string) so we can warn when the plan-side caps
+      // (6 MiB/image · 8 images · 12 MiB total) drop some — the renderer accepts up to 64 MiB, so a
+      // valid-to-the-composer image can be silently dropped here (R195). Text-bearing sends still
+      // proceed, but the user must be told their image wasn't included.
+      let suppliedImages = 0;
       if (Array.isArray(attachments)) {
         let count = 0;
         let totalBytes = 0;
         for (const att of attachments) {
-          if (count >= MAX_PLAN_ATTACHMENTS) break;
           const image = att?.image;
           if (typeof image !== 'string' || image.length === 0) continue;
+          suppliedImages += 1;
+          if (count >= MAX_PLAN_ATTACHMENTS) continue;
           const imageBytes = Buffer.byteLength(image, 'utf8');
           if (imageBytes > MAX_PLAN_ATTACHMENT_BYTES) continue;
-          if (totalBytes + imageBytes > MAX_PLAN_ATTACHMENTS_TOTAL_BYTES) break;
+          if (totalBytes + imageBytes > MAX_PLAN_ATTACHMENTS_TOTAL_BYTES) continue;
           totalBytes += imageBytes;
           count += 1;
           const mimeType =
@@ -879,6 +885,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           imageParts.push(mimeType ? { type: 'image', image, mimeType } : { type: 'image', image });
         }
       }
+      const droppedImages = suppliedImages - imageParts.length;
       if (imageParts.length > 0) {
         // Omit an empty text part (image-only send) — some providers reject a zero-length text part.
         const parts =
@@ -900,6 +907,16 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       // Stream in background (handler returns immediately)
       void (async () => {
         try {
+          // Warn (non-fatal) if the plan-side caps dropped supplied images while text still proceeds —
+          // the renderer already cleared the chips, so without this the user never learns their image
+          // wasn't included (R195). Emitted as a leading notice so it shows above the generated plan.
+          if (droppedImages > 0) {
+            emitTerminalIfCurrent({
+              taskId,
+              type: 'text-delta',
+              text: `> ⚠️ ${droppedImages} image${droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit of 8 images · 6 MiB each · 12 MiB total).\n\n`,
+            });
+          }
           const { streamText } = await import('ai');
           const { createLanguageModelFromConfig } = await import('../agent/language-model.js');
           const model = await createLanguageModelFromConfig(modelEntry.modelConfig);

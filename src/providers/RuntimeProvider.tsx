@@ -14,6 +14,7 @@ import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
 import type { AttachedFile } from './AttachmentContext';
+import { onAttachmentsCommitted, onAttachmentsReleased } from '@/lib/attachment-limits';
 import { useConfig } from './ConfigProvider';
 import {
   createUnifiedSpeechAdapter,
@@ -1107,6 +1108,31 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
 type RejectedDraft = { id: string; text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
+// Renderer-wide attachment accounting for PARKED rejected-draft attachments (R195). When a draft is
+// stashed, consumeAttachments() already released its bytes from the live store's committed total — but
+// the attachment data (base64 dataUrls) is still RESIDENT in the queue (and on disk). So re-commit those
+// bytes to the global counter while parked, and release them the instant the draft LEAVES the queue
+// (dequeued for restore — where the store re-commits — dropped, evicted, or purged on delete). This keeps
+// the 256 MiB renderer-wide ceiling honest: parked drafts count against new live attachments, and the
+// counter can't drift as long as every enqueue is matched by exactly one leave. Idempotency is enforced
+// by a per-entry-id "counted" set so a re-enqueue of an already-counted entry (front-requeue) never
+// double-commits, and a drop of an uncounted entry never over-releases.
+const draftBytesCounted = new Set<string>();
+function draftAttachmentBytes(entry: RejectedDraft): number {
+  return entry.attachments.reduce((sum, a) => sum + (a.size || 0), 0);
+}
+function retainDraftAttachmentBytes(entry: RejectedDraft): void {
+  if (draftBytesCounted.has(entry.id)) return;
+  const bytes = draftAttachmentBytes(entry);
+  if (bytes > 0) onAttachmentsCommitted(bytes);
+  draftBytesCounted.add(entry.id);
+}
+function releaseDraftAttachmentBytes(entry: RejectedDraft): void {
+  if (!draftBytesCounted.has(entry.id)) return;
+  const bytes = draftAttachmentBytes(entry);
+  if (bytes > 0) onAttachmentsReleased(bytes);
+  draftBytesCounted.delete(entry.id);
+}
 // Conversations with a draft claim currently in flight on THIS client — serializes the load-restore
 // and the composer-empty poll so they can't both claim (and double-restore) the same draft.
 const draftClaimInFlight = new Set<string>();
@@ -1131,9 +1157,11 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
   const q = rejectedDrafts.get(convId) ?? [];
   const entry: RejectedDraft = { id: msgId(), ...draft, stashedAt: Date.now() };
   q.push(entry);
+  retainDraftAttachmentBytes(entry); // count parked bytes against the renderer-wide ceiling (R195)
   // Pathological safety valve only. If ever hit, drop the OLDEST (least likely still wanted) —
   // and remove it from the durable store by id so the delta stays consistent.
   const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.shift() : undefined;
+  if (evicted) releaseDraftAttachmentBytes(evicted); // parked bytes leave with the evicted entry (R195)
   rejectedDrafts.set(convId, q);
   // DURABLE copy: the in-memory queue is the fast-restore mirror, but a reload/close/crash before
   // restore would silently lose this unsent input. ADD this draft to the conversation record's
@@ -1149,7 +1177,9 @@ function enqueueRejectedDraftEntry(convId: string, entry: RejectedDraft): void {
   if (deletedConversationIds.has(convId)) return; // deleted mid-flight → don't resurrect (R133 f-2)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  retainDraftAttachmentBytes(entry); // idempotent: no-op if this entry's bytes are already counted (R195)
   const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.pop() : undefined; // drop NEWEST on overflow (keep this requeued one)
+  if (evicted) releaseDraftAttachmentBytes(evicted);
   rejectedDrafts.set(convId, q);
   applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
 }
@@ -1159,7 +1189,10 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
   if (q.length === 0) rejectedDrafts.delete(convId);
-  if (next) applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
+  if (next) {
+    releaseDraftAttachmentBytes(next); // leaving the queue; the restore path re-commits via the store (R195)
+    applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
+  }
   return next;
 }
 // Peek the OLDEST rejected draft's id without removing it (used to name the atomic claim below).
@@ -1172,6 +1205,8 @@ function peekOldestRejectedDraftId(convId: string): string | undefined {
 function dropRejectedDraftLocal(convId: string, id: string): void {
   const q = rejectedDrafts.get(convId);
   if (!q) return;
+  const removed = q.find((d) => d.id === id);
+  if (removed) releaseDraftAttachmentBytes(removed); // leaving the queue (R195) — restore path re-commits via the store
   const next = q.filter((d) => d.id !== id);
   if (next.length === 0) rejectedDrafts.delete(convId);
   else rejectedDrafts.set(convId, next);
@@ -1184,6 +1219,7 @@ function requeueRejectedDraftLocalOnly(convId: string, entry: RejectedDraft): vo
   if (deletedConversationIds.has(convId)) return; // deleted after the claim → don't recreate the queue (R134 f-3)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  retainDraftAttachmentBytes(entry); // back in the queue → re-count its parked bytes (R195)
   rejectedDrafts.set(convId, q);
 }
 // ATOMICALLY reserve the oldest pending draft on MAIN and restore it into the composer — but only
@@ -1395,6 +1431,9 @@ function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: u
     restored.push({ id, text, attachments, stashedAt });
   }
   if (restored.length === 0) return false;
+  // Count each hydrated draft's parked attachment bytes (R195): after a reload the live counter is 0
+  // but these dataUrls are resident again. Idempotent per id, so a double-hydrate can't double-count.
+  for (const entry of restored) retainDraftAttachmentBytes(entry);
   rejectedDrafts.set(convId, restored);
   return true;
 }
@@ -3221,13 +3260,22 @@ export function RuntimeProvider({
         if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
         const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
         if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
-        if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+        // Same all-or-nothing attachment commit as the load-time restore (R194/R195): if the global
+        // reservation cap rejects any recovered attachment, roll back the partial commit and requeue so
+        // the durable draft isn't ACKed + deleted with its attachments lost.
+        if (rejected.attachments.length > 0) {
+          const { skipped } = addAttachments(rejected.attachments);
+          if (skipped.length > 0) {
+            clearAttachments();
+            return false;
+          }
+        }
         restoreComposerDraft(rejected.text);
         return true;
       });
     }, 1500);
     return () => clearInterval(timer);
-  }, [addAttachments]);
+  }, [addAttachments, clearAttachments]);
 
   // Reload the active conversation when the main process appends to it (e.g. an
   // automation targeting this thread). Our own persists never grow the tree past
@@ -3256,6 +3304,9 @@ export function RuntimeProvider({
           supersededResponseIds.delete(deletedId);
           pendingCompactionHandoff.delete(deletedId);
           clearLateCompactionHandoffTimer(deletedId);
+          // Release the parked attachment bytes of every rejected draft for this deleted conversation
+          // before dropping the queue (R195) — otherwise the global counter would leak them forever.
+          for (const d of rejectedDrafts.get(deletedId) ?? []) releaseDraftAttachmentBytes(d);
           rejectedDrafts.delete(deletedId);
           tombstoneDeletedConversation(deletedId); // so an in-flight inject's callback won't re-enqueue (R133 f-2)
           persistVersions.delete(deletedId);
@@ -3279,6 +3330,8 @@ export function RuntimeProvider({
         pendingCompactionHandoff.clear();
         for (const t of lateCompactionHandoffTimers.values()) clearTimeout(t);
         lateCompactionHandoffTimers.clear();
+        // Release parked draft attachment bytes across ALL conversations before the bulk clear (R195).
+        for (const q of rejectedDrafts.values()) for (const d of q) releaseDraftAttachmentBytes(d);
         rejectedDrafts.clear();
         cancelAllInFlightDisplacedInjects(); // a global clear cancels every in-flight displaced inject (R134 f-2)
         persistVersions.clear();
