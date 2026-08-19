@@ -10,6 +10,8 @@ import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
 import { applyBrandUserAgent } from '../../utils/user-agent.js';
 import { isUrlAllowed, urlResolvesToPrivate } from '../../utils/ssrf-guard.js';
+import { configureBrowserWebContents } from '../../browser/session.js';
+import { isIP } from 'net';
 import type { AppConfig } from '../../config/schema.js';
 
 const windows = new Map<string, BrowserWindow>();
@@ -43,6 +45,26 @@ export function checkIsolatedBrowserNavigation(
   }
   const verdict = isUrlAllowed(normalized, allowPrivate);
   if (!verdict.ok) return { ok: false, reason: verdict.reason };
+  // DNS-rebinding TOCTOU (R203): the Node preflight and Chromium resolve independently, so a hostname can
+  // answer public here then private to Chromium's own lookup. Requiring authenticated TLS (HTTPS) for
+  // HOSTNAME traffic (when private access is disabled) closes it: a rebound private peer can't present a
+  // valid cert for the hostname, so Chromium aborts before sending the request. IP LITERALS can't rebind,
+  // so public-IP HTTP stays allowed (isUrlAllowed already rejected private literals above). Mirrors the
+  // in-app Browser's assertAiNavigationAllowed rule.
+  if (!allowPrivate && isIP(host) === 0) {
+    let protocol: string;
+    try {
+      protocol = new URL(normalized).protocol;
+    } catch {
+      return { ok: false, reason: `invalid URL ${normalized}` };
+    }
+    if (protocol !== 'https:') {
+      return {
+        ok: false,
+        reason: `hostname HTTP is blocked while private-network access is disabled (rebind risk): ${host}`,
+      };
+    }
+  }
   return { ok: true, url: normalized };
 }
 
@@ -160,6 +182,15 @@ function ensureWindow(sessionId: string): BrowserWindow {
   });
   applyBrandUserAgent(win.webContents);
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // WebRTC ICE/STUN/TURN traffic bypasses webRequest entirely, so an untrusted page could otherwise open
+  // direct UDP sockets to private/LAN addresses while private-network access is disabled (R203). Force
+  // WebRTC through the proxy-aware path (no direct non-proxied UDP) unless private access is allowed —
+  // mirroring the in-app Browser's policy (configureBrowserWebContents).
+  try {
+    configureBrowserWebContents(win.webContents, resolveIsolatedBrowserAllowPrivate());
+  } catch {
+    /* setWebRTCIPHandlingPolicy unavailable — the webRequest guard remains the primary defense */
+  }
   // Re-validate EVERY redirect + top-level navigation against the SSRF guard (R171): the initial
   // navigate() URL is checked, but a public URL can 3xx-redirect (or a page can navigate) to
   // loopback / 169.254.169.254 (cloud metadata) / a private host — which the browser would otherwise
@@ -196,6 +227,25 @@ function ensureWindow(sessionId: string): BrowserWindow {
         return;
       }
       const urlForGuard = wsMatch ? details.url.replace(/^ws(s?):/i, (_m, s) => (s ? 'https:' : 'http:')) : details.url;
+      // DNS-rebinding TOCTOU (R203): the Node preflight below and Chromium resolve independently. Require
+      // authenticated TLS (https/wss) for HOSTNAME subresources when private access is disabled — a rebound
+      // private peer can't present a valid cert, so the connection fails before data flows. IP literals
+      // can't rebind, so public-IP insecure requests still get the resolved-address check below.
+      let guardHost: string;
+      let guardSecure: boolean;
+      try {
+        const u = new URL(urlForGuard);
+        guardHost = u.hostname.replace(/^\[|\]$/g, '');
+        guardSecure = u.protocol === 'https:';
+      } catch {
+        callback({ cancel: true });
+        return;
+      }
+      if (isIP(guardHost) === 0 && !guardSecure) {
+        console.error(`[isolated-browser] blocked insecure hostname subresource (rebind risk): ${details.url}`);
+        callback({ cancel: true });
+        return;
+      }
       // RESOLVE the hostname and reject if it lands on a private/local address (R202): a syntax-only
       // check passes wildcard-DNS names like 127.0.0.1.nip.io, and BrowserWindow traffic never routes
       // through the guarded DNS dispatcher safeFetch uses. Async is fine — onBeforeRequest's callback is

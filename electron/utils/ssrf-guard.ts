@@ -24,16 +24,35 @@ export const MAX_REDIRECTS = 5;
 const PRIVATE_V4 = new BlockList();
 PRIVATE_V4.addSubnet('0.0.0.0', 8, 'ipv4');
 PRIVATE_V4.addSubnet('10.0.0.0', 8, 'ipv4');
+PRIVATE_V4.addSubnet('100.64.0.0', 10, 'ipv4'); // RFC6598 CGNAT / carrier-grade NAT (Tailscale, etc.)
 PRIVATE_V4.addSubnet('127.0.0.0', 8, 'ipv4');
-PRIVATE_V4.addSubnet('169.254.0.0', 16, 'ipv4');
+PRIVATE_V4.addSubnet('169.254.0.0', 16, 'ipv4'); // link-local incl. 169.254.169.254 cloud metadata
 PRIVATE_V4.addSubnet('172.16.0.0', 12, 'ipv4');
+PRIVATE_V4.addSubnet('192.0.0.0', 24, 'ipv4'); // IETF protocol assignments
+PRIVATE_V4.addSubnet('192.0.2.0', 24, 'ipv4'); // TEST-NET-1 (documentation)
 PRIVATE_V4.addSubnet('192.168.0.0', 16, 'ipv4');
+PRIVATE_V4.addSubnet('198.18.0.0', 15, 'ipv4'); // benchmarking
+PRIVATE_V4.addSubnet('198.51.100.0', 24, 'ipv4'); // TEST-NET-2
+PRIVATE_V4.addSubnet('203.0.113.0', 24, 'ipv4'); // TEST-NET-3
+PRIVATE_V4.addSubnet('224.0.0.0', 4, 'ipv4'); // multicast
+PRIVATE_V4.addSubnet('240.0.0.0', 4, 'ipv4'); // reserved / future use (incl. 255.255.255.255)
 
 const PRIVATE_V6 = new BlockList();
 PRIVATE_V6.addAddress('::', 'ipv6'); // unspecified
 PRIVATE_V6.addAddress('::1', 'ipv6'); // loopback
+PRIVATE_V6.addSubnet('::', 96, 'ipv6'); // IPv4-compatible (deprecated, transition-only) — fail closed
+PRIVATE_V6.addSubnet('64:ff9b::', 96, 'ipv6'); // NAT64 well-known prefix
+PRIVATE_V6.addSubnet('64:ff9b:1::', 48, 'ipv6'); // NAT64 local-use
+PRIVATE_V6.addSubnet('100::', 64, 'ipv6'); // discard-only
+PRIVATE_V6.addSubnet('2001::', 23, 'ipv6'); // IETF protocol assignments (incl. Teredo)
+PRIVATE_V6.addSubnet('2001:db8::', 32, 'ipv6'); // documentation
+PRIVATE_V6.addSubnet('2002::', 16, 'ipv6'); // deprecated 6to4
+PRIVATE_V6.addSubnet('3fff::', 20, 'ipv6'); // documentation
+PRIVATE_V6.addSubnet('5f00::', 16, 'ipv6'); // segment-routing SIDs
 PRIVATE_V6.addSubnet('fc00::', 7, 'ipv6'); // unique-local
 PRIVATE_V6.addSubnet('fe80::', 10, 'ipv6'); // link-local
+PRIVATE_V6.addSubnet('fec0::', 10, 'ipv6'); // deprecated site-local
+PRIVATE_V6.addSubnet('ff00::', 8, 'ipv6'); // multicast
 // IPv4-mapped IPv6 (::ffff:0:0/96) — blocked wholesale so a mapped form can't
 // smuggle a private v4 past the check. (A stricter check would extract + re-test
 // the embedded v4, but since we already block v4 mapped addresses entirely,
