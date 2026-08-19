@@ -629,6 +629,13 @@ export class ComputerUseOrchestrator {
     const runSignal = this.activeRuns.get(sessionId)?.signal;
     try {
       await harness.initialize(session);
+      // Stop can land DURING initialize() (R200): most harness click/drag/open-app methods don't re-check
+      // an already-aborted signal, so executing after an abort produces real desktop side effects post-Stop.
+      // Re-check here and bail before executeAction if the run was aborted (or our controller replaced).
+      if (Boolean(runSignal?.aborted) || (controller !== null && this.activeRuns.get(sessionId) !== controller)) {
+        if (controller && this.activeRuns.get(sessionId) === controller) this.activeRuns.delete(sessionId);
+        return;
+      }
       // Thread the session's active-run abort signal so a stop/pause during an approved-action
       // execution propagates + the post-await fence in executeAction discards a resurrecting write.
       await this.executeAction(harness, { ...action, status: 'running' }, runSignal, sessionId);

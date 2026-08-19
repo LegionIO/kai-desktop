@@ -1333,9 +1333,14 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
       // reclaim it on a later poll tick. Keeping the marker means the poll keeps retrying; the
       // draft is never orphaned. (No composer clobber — we didn't restore anything.)
       // (leave rejectedDrafts[convId] as-is)
-    } else {
-      // Genuinely gone (no live reservation, not returned) — reconcile our local mirror.
+    } else if (res.ok) {
+      // ok:true but neither returned nor reserved → main CONFIRMED the draft is genuinely gone (already
+      // restored/removed elsewhere): reconcile our local mirror.
       dropRejectedDraftLocal(convId, id);
+    } else {
+      // ok:false → main could NOT read the record (a transient EMFILE/read blip, or a claim racing an
+      // uncommitted add). This is NOT a confirmed deletion, so do NOT drop the only in-memory copy (R200):
+      // leave it in place (and its durability pin intact) for a later retry tick.
     }
   } catch {
     // Claim failed — leave the draft in place (both disk and local) for a later retry tick.

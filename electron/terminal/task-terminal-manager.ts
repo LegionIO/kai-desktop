@@ -24,21 +24,14 @@ type IPty = import('@lydell/node-pty').IPty;
  * caller then forgets the session — a HUP-ignoring or backgrounded child survives and keeps making
  * filesystem/network side effects invisibly after Stop. A PTY child is a session/group leader, so
  * escalate SIGTERM → SIGKILL to the whole process GROUP (negative pid) with a short grace timer.
- * The delayed group SIGKILL is SKIPPED if the leader already exited before the grace elapsed (R199):
- * once the leader is gone its pid can be RECYCLED as an unrelated process-group id, and an unconditional
- * kill(-pid) would then SIGKILL a stranger's group. A still-running leader after 2s is the real target.
+ * Before the delayed group SIGKILL, PROBE the group with signal 0 (R199/R200): if it throws ESRCH the
+ * group is EMPTY and the leader pid may have been recycled — skip, so we don't SIGKILL a stranger's group.
+ * If the probe SUCCEEDS the group still has members; the kernel will not recycle a pid while it remains an
+ * active pgid with members, so those members are genuinely ours (a leader that exited but left a
+ * TERM-resistant descendant behind) and MUST be killed. This is correct whether or not the leader exited.
  */
 function killPtyHard(proc: IPty): void {
   const pid = proc.pid;
-  // Track leader exit so the delayed group-SIGKILL doesn't fire against a recycled pid.
-  let leaderExited = false;
-  try {
-    proc.onExit(() => {
-      leaderExited = true;
-    });
-  } catch {
-    /* onExit unavailable — fall back to firing the delayed kill (pre-R199 behavior) */
-  }
   try {
     proc.kill(); // node-pty default (SIGHUP to the leader) — clean shutdown for well-behaved children
   } catch {
@@ -51,12 +44,17 @@ function killPtyHard(proc: IPty): void {
     /* group already gone */
   }
   const t = setTimeout(() => {
-    // Do NOT group-SIGKILL once the leader has exited: its pid may now name an unrelated group (R199).
-    if (leaderExited) return;
+    // Probe first: an empty group (ESRCH) means the pid may be recycled — do NOT SIGKILL. A live group
+    // still holds OUR members (recycling can't reuse an active pgid), so kill it.
+    try {
+      process.kill(-pid, 0);
+    } catch {
+      return; // ESRCH (or EPERM) — group gone / not ours; skip the SIGKILL
+    }
     try {
       process.kill(-pid, 'SIGKILL');
     } catch {
-      /* group already gone (ESRCH) */
+      /* group vanished between the probe and the kill — harmless */
     }
   }, 2000);
   if (typeof t.unref === 'function') t.unref();
