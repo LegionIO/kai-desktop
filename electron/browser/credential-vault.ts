@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, rmSync, lstatSync } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { clipboard, safeStorage, systemPreferences } from 'electron';
 import type { BrowserCredentialSummary } from '../../shared/browser.js';
@@ -416,7 +416,13 @@ export async function readStoredCredentialCountAsync(appHome: string, scopeKey: 
   scopeKey = safeScopeKey(scopeKey);
   const filePath = join(appHome, 'browser', 'credentials', `${scopeKey}.json`);
   try {
-    const fileSize = (await stat(filePath)).size;
+    // lstat + regular-file check (R181): a symlink to /dev/zero or a FIFO named as a vault would
+    // otherwise be followed by readFile and consume memory / hang Browser Data enumeration.
+    const st = await lstat(filePath);
+    if (!st.isFile()) {
+      throw new Error('Credential vault is not a regular file.');
+    }
+    const fileSize = st.size;
     if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
       throw new Error('Credential vault exceeds its size limit.');
     }

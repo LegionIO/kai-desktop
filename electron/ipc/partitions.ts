@@ -122,6 +122,16 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
     if (!Array.isArray(names) || names.length === 0) {
       return { error: 'No partition names provided.' };
     }
+    // Bound the request count (R181): each name that survives the safe-path
+    // filter installs a durable clear-fence, enqueues a partition clear, and
+    // constructs an Electron Session — so an unbounded name list (thousands of
+    // fabricated names) synchronously creates that many fences / sessions /
+    // queue entries even when no such profile exists on disk. A real inventory
+    // never approaches this, so cap defensively.
+    const MAX_PARTITION_DELETE_NAMES = 1000;
+    if (names.length > MAX_PARTITION_DELETE_NAMES) {
+      return { error: 'Too many partition names provided.' };
+    }
 
     const deleted: string[] = [];
 

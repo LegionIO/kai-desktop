@@ -164,6 +164,22 @@ function isValidAgentRuntime(runtime: unknown): runtime is AgentFile['runtime'] 
   return typeof runtime === 'string' && ALLOWED_AGENT_RUNTIMES.has(runtime);
 }
 
+const ALLOWED_AGENT_STATUSES = new Set<string>(['idle', 'running', 'error']);
+const ALLOWED_AGENT_ROLES = new Set<string>(['general', 'engineer', 'reviewer', 'researcher']);
+function isValidAgentStatus(v: unknown): v is AgentFile['status'] {
+  return typeof v === 'string' && ALLOWED_AGENT_STATUSES.has(v);
+}
+function isValidAgentRole(v: unknown): v is AgentFile['role'] {
+  return typeof v === 'string' && ALLOWED_AGENT_ROLES.has(v);
+}
+/** A plain (Object/null-prototype) non-array, non-null object — for nested config/stats fields that
+ *  the reconciler + renderer later dereference. Rejects null / arrays / primitives. */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
 /**
  * Match a value against a simple glob pattern supporting `*` as a prefix
  * and/or suffix wildcard only (no mid-string globs, no regex).
@@ -1639,9 +1655,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
   ipcMain.handle('agents:create', (_e, payload: CreateAgentPayload) => {
     try {
+      // Validate the untyped web-bridge payload (R181): a non-string name / bad role / non-object
+      // config would persist + broadcast and crash a renderer agent view (survives restart).
+      if (!isPlainObject(payload)) return { error: 'Invalid agent payload' };
       const runtime = payload.runtime ?? 'auto';
       if (!isValidAgentRuntime(runtime)) {
         return { error: `Unknown runtime: ${String(payload.runtime)}` };
+      }
+      if (!isValidAgentRole(payload.role)) {
+        return { error: `Invalid role: ${String(payload.role)}` };
+      }
+      for (const f of ['name', 'icon', 'description', 'instructions', 'workspaceId'] as const) {
+        const v = (payload as Record<string, unknown>)[f];
+        if (v !== undefined && typeof v !== 'string') return { error: `Invalid ${f}: expected string` };
+      }
+      if (payload.config !== undefined && !isPlainObject(payload.config)) {
+        return { error: 'Invalid config: expected object' };
       }
       const id = randomUUID();
       const now = new Date().toISOString();
@@ -1715,6 +1744,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
       if (!Array.isArray(updates.capabilities) || updates.capabilities.some((c) => typeof c !== 'string')) {
         return { error: 'Invalid capabilities: expected string[]' };
       }
+    }
+    // Enum + nested-object fields (R181): a poisoned {status:"x"} / {stats:null} / {config:[]} would
+    // shallow-merge and later crash the reconciler (dereferences stats) or a renderer view.
+    if (updates.status !== undefined && !isValidAgentStatus(updates.status)) {
+      return { error: `Invalid status: ${String(updates.status)}` };
+    }
+    if (updates.role !== undefined && !isValidAgentRole(updates.role)) {
+      return { error: `Invalid role: ${String(updates.role)}` };
+    }
+    if (updates.stats !== undefined && !isPlainObject(updates.stats)) {
+      return { error: 'Invalid stats: expected object' };
+    }
+    if (updates.config !== undefined && !isPlainObject(updates.config)) {
+      return { error: 'Invalid config: expected object' };
     }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };

@@ -2453,9 +2453,28 @@ if (gotSingleInstanceLock) {
         });
         if (result.canceled) return { canceled: true, filePaths: [] };
 
-        // Read files and return as base64 data URLs
-        const files = result.filePaths.map((filePath) => {
+        // Read files and return as base64 data URLs. Enforce per-file + aggregate byte caps (R181):
+        // reading a multi-GB file (or many large files) synchronously into base64 would freeze/OOM
+        // main. Skip oversized files and stop once the aggregate cap is hit; report skipped ones.
+        const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024; // per file
+        const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across the selection
+        const skipped: string[] = [];
+        let aggregateBytes = 0;
+        const files: Array<Record<string, unknown>> = [];
+        for (const filePath of result.filePaths) {
+          let fileSize = 0;
+          try {
+            fileSize = statSync(filePath).size;
+          } catch {
+            skipped.push(basename(filePath));
+            continue;
+          }
+          if (fileSize > MAX_ATTACHMENT_BYTES || aggregateBytes + fileSize > MAX_ATTACHMENT_TOTAL_BYTES) {
+            skipped.push(basename(filePath));
+            continue;
+          }
           const data = readFileSync(filePath);
+          aggregateBytes += data.length;
           const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
           const mimeTypes: Record<string, string> = {
             png: 'image/png',
@@ -2472,7 +2491,7 @@ if (gotSingleInstanceLock) {
           };
           const mime = mimeTypes[ext] ?? 'application/octet-stream';
           const isImage = mime.startsWith('image/');
-          return {
+          files.push({
             path: filePath,
             name: basename(filePath),
             mime,
@@ -2481,9 +2500,9 @@ if (gotSingleInstanceLock) {
             dataUrl: `data:${mime};base64,${data.toString('base64')}`,
             // For text files, also include raw text
             ...(mime.startsWith('text/') || mime === 'application/json' ? { text: data.toString('utf-8') } : {}),
-          };
-        });
-        return { canceled: false, files };
+          });
+        }
+        return { canceled: false, files, ...(skipped.length > 0 ? { skipped } : {}) };
       },
     );
 

@@ -3,7 +3,19 @@ import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { writeUpdateReady } from '../local-bridge/update-signal.js';
-import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync, appendFileSync, mkdirSync } from 'fs';
+import {
+  existsSync,
+  writeFileSync,
+  readFileSync,
+  unlinkSync,
+  rmSync,
+  appendFileSync,
+  mkdirSync,
+  lstatSync,
+  openSync,
+  closeSync,
+  constants as fsConstants,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -306,8 +318,33 @@ function writePostUpdateMarker(version: string): boolean {
  */
 export function consumePostUpdateMarker(): { version: string; fromVersion: string } | null {
   try {
-    if (!existsSync(POST_UPDATE_MARKER)) return null;
-    const data = JSON.parse(readFileSync(POST_UPDATE_MARKER, 'utf-8'));
+    // Use lstatSync + O_NOFOLLOW and a byte cap (R181): the marker lives in
+    // userData, but a symlink or device/FIFO planted at that path would
+    // otherwise make readFileSync follow the link (leaking/blocking) or read an
+    // unbounded stream. The marker is a tiny JSON blob — reject anything that
+    // isn't a small regular file and never follow a link.
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(POST_UPDATE_MARKER);
+    } catch {
+      return null;
+    }
+    if (st.isSymbolicLink() || !st.isFile() || st.size > 1024 * 1024) {
+      try {
+        unlinkSync(POST_UPDATE_MARKER);
+      } catch {
+        /* */
+      }
+      return null;
+    }
+    const fd = openSync(POST_UPDATE_MARKER, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let raw: string;
+    try {
+      raw = readFileSync(fd, 'utf-8');
+    } finally {
+      closeSync(fd);
+    }
+    const data = JSON.parse(raw);
     unlinkSync(POST_UPDATE_MARKER);
     return data;
   } catch {

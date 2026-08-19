@@ -674,6 +674,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle('tasks:kick-back', (_e, id: string, reason: string, source: 'ai' | 'human') => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+    // Validate reason/source at the wire boundary (R181): the note is persisted and later read by
+    // TaskDetailPanel via `content.includes(...)`, so a non-string reason would crash the renderer,
+    // and an oversized reason would bypass the review-note schema's 20000-char cap.
+    if (typeof reason !== 'string' || reason.length > 20000) return { error: 'Invalid reason' };
+    if (source !== 'ai' && source !== 'human') return { error: 'Invalid source' };
     return withTaskLock(id, () => {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       if (!existsSync(filePath)) return { error: `Task ${id} not found` };
