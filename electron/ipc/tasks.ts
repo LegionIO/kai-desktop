@@ -762,7 +762,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       if (!isValidTaskId(taskId)) {
         broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', error: 'Invalid task ID' });
         broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done' });
-        return { taskId };
+        return { taskId, error: true };
       }
 
       // userMessage must be a string within the length cap. Empty text is allowed ONLY when at least
@@ -773,12 +773,12 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       if (typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
         broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
         broadcastTaskStreamEvent({ taskId, type: 'done' });
-        return { taskId };
+        return { taskId, error: true };
       }
       if (userMessage.length === 0 && !hasImageAttachment) {
         broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
         broadcastTaskStreamEvent({ taskId, type: 'done' });
-        return { taskId };
+        return { taskId, error: true };
       }
 
       if (existingHistory) {
@@ -786,7 +786,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         if (!historyCheck.success) {
           broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Invalid conversation history' });
           broadcastTaskStreamEvent({ taskId, type: 'done' });
-          return { taskId };
+          return { taskId, error: true };
         }
       }
 
@@ -823,7 +823,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         emitTerminalIfCurrent({ taskId, type: 'error', error: 'Failed to load config' });
         emitTerminalIfCurrent({ taskId, type: 'done' });
         clearIfCurrent();
-        return { taskId };
+        return { taskId, error: true };
       }
 
       const { resolveModelCatalog } = await import('../agent/model-catalog.js');
@@ -835,7 +835,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         emitTerminalIfCurrent({ taskId, type: 'error', error: 'No model configured' });
         emitTerminalIfCurrent({ taskId, type: 'done' });
         clearIfCurrent();
-        return { taskId };
+        return { taskId, error: true };
       }
 
       // Build conversation messages. The final user turn may carry image attachments (R187): the task
@@ -907,7 +907,7 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         emitTerminalIfCurrent({ taskId, type: 'error', error: 'No usable image attachments' });
         emitTerminalIfCurrent({ taskId, type: 'done' });
         clearIfCurrent();
-        return { taskId };
+        return { taskId, error: true };
       }
 
       // Stream in background (handler returns immediately)

@@ -495,8 +495,14 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           }
         });
 
-        // Start streaming the plan
-        await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
+        // Start streaming the plan. streamPlan RESOLVES {taskId} even for in-band validation/config/model
+        // failures (it broadcasts an error stream event but doesn't reject), signalling those via
+        // {error:true} — treat that as a failed submission so the composer rolls back (R207).
+        const res = await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
+        if (res && (res as { error?: boolean }).error) {
+          dispatch({ type: 'CANCEL_AI_CREATE' });
+          return false;
+        }
         return true;
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
@@ -520,7 +526,12 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
         dispatch({ type: 'START_AI_CREATE', taskId });
 
-        await app.tasks.streamPlan(taskId, userMessage, history, attachments);
+        // streamPlan resolves {taskId, error:true} for in-band failures (R207) — roll back on those too.
+        const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);
+        if (res && (res as { error?: boolean }).error) {
+          dispatch({ type: 'STREAM_DONE' });
+          return false;
+        }
         return true;
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);

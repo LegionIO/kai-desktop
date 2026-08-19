@@ -420,16 +420,21 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const images = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) return;
 
-    // Snapshot so a FAILED refine (IPC reject) restores the text + attachments rather than discarding
-    // them (R206) — clearing happens optimistically before the async submission confirms.
+    // Snapshot so a FAILED refine (IPC reject / in-band error) restores the text + attachments rather
+    // than discarding them (R206). Fence the rollback to the ORIGINATING task + an empty composer (R207):
+    // the user may switch tasks or type a new draft while the submission awaits, and an unconditional
+    // restore would clobber that newer draft or attach task A's files to task B.
+    const originTaskId = task.id;
     const stagedAttachments = [...attachments];
     setInput('');
     clearAttachments();
     void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((ok) => {
-      if (!ok) {
-        setInput(text);
-        if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
-      }
+      if (ok) return;
+      if (activeTaskIdRef.current !== originTaskId) return; // switched task — keep the newer context intact
+      const liveText = textareaRef.current?.value ?? '';
+      if (liveText.trim().length > 0 || attachments.length > 0) return; // a newer draft exists — don't clobber
+      setInput(text);
+      if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
     });
 
     // Request focus on next render (survives streaming state updates)

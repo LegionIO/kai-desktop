@@ -251,10 +251,13 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
       images.length > 0 ? images : undefined,
     ).then((ok) => {
-      if (!ok) {
-        setInput(text);
-        if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
-      }
+      if (ok) return;
+      // Don't clobber a newer draft the user started while the submission awaited (R207): only restore
+      // into an empty composer with no live attachments.
+      const liveText = textareaRef.current?.value ?? '';
+      if (liveText.trim().length > 0 || attachments.length > 0) return;
+      setInput(text);
+      if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
     });
   }, [input, attachments, clearAttachments, addAttachments, startAITaskCreation, currentWorkingDirectory]);
 
