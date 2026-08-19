@@ -540,6 +540,7 @@ type AppAPI = {
       taskId: string,
       userMessage: string,
       history?: TaskConversationMessage[],
+      attachments?: Array<{ image: string; mimeType?: string }>,
     ) => Promise<{ taskId: string }>;
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;

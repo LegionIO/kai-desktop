@@ -50,7 +50,11 @@ import {
 import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
-import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 import { useAttachments } from '@/providers/AttachmentContext';
 import {
   useBranchNav,
@@ -2033,11 +2037,14 @@ const Composer: FC<{
     const originConversationId = getActiveConversationId();
     // Gate by size BEFORE reading (R183): FileReader materializes each file fully, concurrently, so an
     // oversized or bulk selection would OOM the renderer if we read first. Reject over-cap files up front.
-    const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
     if (skipped.length > 0) showComposerNotice(skippedAttachmentsNotice(skipped) ?? '');
     // Reset early so the same file can be re-selected even if nothing is accepted.
     event.target.value = '';
-    if (accepted.length === 0) return;
+    if (accepted.length === 0) {
+      releaseAttachmentReservation(reservedBytes);
+      return;
+    }
     const readers: Promise<{
       name: string;
       mime: string;
@@ -2087,6 +2094,7 @@ const Composer: FC<{
       );
     }
     void Promise.all(readers).then((results) => {
+      releaseAttachmentReservation(reservedBytes);
       // Discard if the user switched conversations while the reads were in flight (R186).
       if (getActiveConversationId() !== originConversationId) return;
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);

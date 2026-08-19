@@ -742,8 +742,15 @@ const appAPI = {
       return () => ipcRenderer.removeListener('tasks:terminal-exit', handler);
     },
     // AI plan generation
-    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) =>
-      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history) as Promise<{ taskId: string }>,
+    streamPlan: (
+      taskId: string,
+      userMessage: string,
+      history?: unknown[],
+      attachments?: Array<{ image: string; mimeType?: string }>,
+    ) =>
+      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history, attachments) as Promise<{
+        taskId: string;
+      }>,
     cancelPlanStream: (taskId: string) => ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
     generateTitle: (userMessage: string) =>
       ipcRenderer.invoke('tasks:generate-title', userMessage) as Promise<{ title: string | null }>,

@@ -1,13 +1,34 @@
 import { useState, useCallback, useRef, type FC, type ReactNode, type DragEvent } from 'react';
 import { UploadIcon } from 'lucide-react';
 import { useAttachments } from '@/providers/AttachmentContext';
-import { useMidTurnComposer } from '@/providers/RuntimeProvider';
-import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 
-export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
+/**
+ * Full-window drag/drop target that stages files into the SHARED chat attachment store.
+ *
+ * DropZone is mounted ABOVE RuntimeProvider and wraps every view, so it must be told (a) whether the
+ * chat surface is currently active — otherwise a drop over Tasks/Plugins/Settings would silently add a
+ * hidden chat attachment (R187) — and (b) the active conversation id, so a chat switch during the async
+ * reads discards the result instead of attaching to the wrong chat (R186). It cannot read these from a
+ * runtime context because it sits outside RuntimeProvider.
+ */
+export const DropZone: FC<{
+  children: ReactNode;
+  /** True only while the chat surface is active; drops are ignored otherwise. */
+  enabled: boolean;
+  /** The conversation a drop targets; reads resolving after a switch are discarded. */
+  activeConversationId: string | null;
+}> = ({ children, enabled, activeConversationId }) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const { addAttachments } = useAttachments();
-  const { getActiveConversationId } = useMidTurnComposer();
+  // Track the latest active conversation id in a ref so async read callbacks compare against the
+  // CURRENT value, not the one captured at drop time by a stale render closure.
+  const activeConversationIdRef = useRef<string | null>(activeConversationId);
+  activeConversationIdRef.current = activeConversationId;
   const dragCountRef = { current: 0 };
   // Transient notice for dropped files SKIPPED by the size gate (R183).
   const [notice, setNotice] = useState<string | null>(null);
@@ -18,13 +39,18 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
     noticeTimerRef.current = setTimeout(() => setNotice(null), 6000);
   }, []);
 
-  const handleDragEnter = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    dragCountRef.current++;
-    if (e.dataTransfer.types.includes('Files')) {
-      setIsDragOver(true);
-    }
-  }, []);
+  const handleDragEnter = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      dragCountRef.current++;
+      // Don't show the chat drop overlay when the chat surface isn't active (R187) — a drop there is
+      // ignored, so a "drop to attach" hint would be misleading.
+      if (enabled && e.dataTransfer.types.includes('Files')) {
+        setIsDragOver(true);
+      }
+    },
+    [enabled],
+  );
 
   const handleDragLeave = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -46,18 +72,26 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
       dragCountRef.current = 0;
       setIsDragOver(false);
 
+      // Ignore drops when the chat surface isn't active (R187): DropZone wraps every view, but its files
+      // go into the chat attachment store — a drop over Tasks/Plugins/Settings would otherwise create a
+      // hidden chat attachment with no visible chip.
+      if (!enabled) return;
+
       const files = Array.from(e.dataTransfer.files);
       if (files.length === 0) return;
 
       // Capture the conversation the drop targeted (R186): the attachment store is app-global, so a
       // chat switch during the async reads would otherwise attach these files to the wrong chat.
-      const originConversationId = getActiveConversationId();
+      const originConversationId = activeConversationIdRef.current;
 
       // Gate by size BEFORE reading (R183): each FileReader materializes the whole file, so an oversized
       // or bulk drop would OOM the renderer if read first. Reject over-cap files up front and report them.
-      const { accepted, skipped } = filterAttachmentsBySize(files);
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(files);
       if (skipped.length > 0) showNotice(skippedAttachmentsNotice(skipped) ?? '');
-      if (accepted.length === 0) return;
+      if (accepted.length === 0) {
+        releaseAttachmentReservation(reservedBytes);
+        return;
+      }
 
       type Attachable = {
         name: string;
@@ -113,8 +147,9 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
         );
       }
       void Promise.all(pending).then((results) => {
+        releaseAttachmentReservation(reservedBytes);
         // Discard if the user switched conversations while the reads were in flight (R186).
-        if (getActiveConversationId() !== originConversationId) return;
+        if (activeConversationIdRef.current !== originConversationId) return;
         const attachable = results.filter((r): r is Attachable => r !== null);
         const unreadable = accepted.length - attachable.length;
         if (attachable.length > 0) {
@@ -125,7 +160,7 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
         if (unreadable > 0) showNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
       });
     },
-    [addAttachments, showNotice, getActiveConversationId],
+    [addAttachments, showNotice, enabled],
   );
 
   return (

@@ -7,7 +7,11 @@ import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvide
 import { isCompactCommand } from '@/lib/slash-commands';
 import { useCompactingIds, markConversationCompacting, clearConversationCompacting } from '@/lib/compaction-ui-store';
 import { cn } from '@/lib/utils';
-import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
   placeholder = 'Discuss your thoughts and ideas...',
@@ -287,13 +291,22 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       // materialize concurrently past the aggregate cap. filterAttachmentsBySize applies the per-file
       // AND running aggregate limits up front; addAttachments' return then backstops the shared store.
       const pastedFiles = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
-      const { accepted, skipped } = filterAttachmentsBySize(pastedFiles);
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(pastedFiles);
       const skippedPastes = skipped.slice();
+      // Release the in-flight reservation once every reader settles (R187), whether it committed or was
+      // discarded on a chat switch — so the reserved bytes don't permanently shrink the global ceiling.
+      let outstanding = accepted.length;
+      const settleOne = () => {
+        outstanding -= 1;
+        if (outstanding <= 0) releaseAttachmentReservation(reservedBytes);
+      };
+      if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
       for (const file of accepted) {
         const reader = new FileReader();
-        reader.onerror = () => {};
-        reader.onabort = () => {};
+        reader.onerror = () => settleOne();
+        reader.onabort = () => settleOne();
         reader.onload = () => {
+          settleOne();
           // Discard if the user switched conversations while this read was in flight (R186).
           if (getActiveConversationId() !== originConversationId) return;
           const { skipped: overCap } = addAttachments([

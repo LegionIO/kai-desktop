@@ -27,7 +27,12 @@ import { useLocalAttachments } from '@/hooks/useLocalAttachments';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
-import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+  attachmentsToImagePayload,
+} from '@/lib/attachment-limits';
 import { cn, refocusComposer } from '@/lib/utils';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
@@ -49,7 +54,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
   // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
   // is discarded on unmount automatically, so no cross-surface clearing is needed.
-  const { attachments, addAttachments, removeAttachment } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -86,10 +91,9 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const hasFileAttachments = attachments.length > 0;
-  // AI task creation carries only text through startAITaskCreation — attachments cannot be submitted
-  // (R185). Require text so the Send button is never enabled for an attachment-only selection that would
-  // silently do nothing, and so staged files can't leak into a later chat send from the shared store.
-  const canSend = input.trim().length > 0;
+  // Text OR image attachments can start a task (R187): image attachments are forwarded to the plan
+  // model. Text is still required unless at least one image is staged.
+  const canSend = input.trim().length > 0 || attachments.some((a) => a.isImage);
 
   // ── File attach / directory handlers ────────────────────────────────
   const isWebBridge = Boolean(
@@ -139,10 +143,13 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
     // Gate by size BEFORE reading (R184): FileReader materializes each file fully → renderer OOM risk.
-    const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
     if (skipped.length > 0) showAttachNotice(skipped);
     event.target.value = '';
-    if (accepted.length === 0) return;
+    if (accepted.length === 0) {
+      releaseAttachmentReservation(reservedBytes);
+      return;
+    }
     const readers: Promise<{
       name: string;
       mime: string;
@@ -168,6 +175,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       );
     }
     void Promise.all(readers).then((results) => {
+      releaseAttachmentReservation(reservedBytes);
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
       const unreadable = accepted.length - attachable.length;
       if (attachable.length > 0) {
@@ -209,11 +217,18 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();
-    if (!text) return;
+    const images = attachmentsToImagePayload(attachments);
+    // Require text OR at least one image (R187).
+    if (!text && images.length === 0) return;
 
     setInput('');
-    void startAITaskCreation(text, currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined);
-  }, [input, startAITaskCreation, currentWorkingDirectory]);
+    clearAttachments();
+    void startAITaskCreation(
+      text,
+      currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
+      images.length > 0 ? images : undefined,
+    );
+  }, [input, attachments, clearAttachments, startAITaskCreation, currentWorkingDirectory]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {

@@ -33,7 +33,12 @@ import { useLocalAttachments } from '@/hooks/useLocalAttachments';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
-import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+  attachmentsToImagePayload,
+} from '@/lib/attachment-limits';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
@@ -64,7 +69,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -151,9 +156,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const hasFileAttachments = attachments.length > 0;
-  // refineTaskPlan carries only text — attachments cannot be submitted here (R185). Require text so an
-  // attachment-only send isn't a silent no-op and staged files can't leak into a later chat send.
-  const canSend = input.trim().length > 0;
+  // Text OR image attachments can refine the plan (R187): image attachments are forwarded to the plan
+  // model. Text is still required unless at least one image is staged.
+  const canSend = input.trim().length > 0 || attachments.some((a) => a.isImage);
 
   // File attach handlers
   const isWebBridge = Boolean(
@@ -203,10 +208,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
     // Gate by size BEFORE reading (R184): FileReader materializes each file fully → renderer OOM risk.
-    const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
     if (skipped.length > 0) showAttachNotice(skipped);
     event.target.value = '';
-    if (accepted.length === 0) return;
+    if (accepted.length === 0) {
+      releaseAttachmentReservation(reservedBytes);
+      return;
+    }
     const readers: Promise<{
       name: string;
       mime: string;
@@ -232,6 +240,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       );
     }
     void Promise.all(readers).then((results) => {
+      releaseAttachmentReservation(reservedBytes);
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
       const unreadable = accepted.length - attachable.length;
       if (attachable.length > 0) {
@@ -372,14 +381,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const handleComposerSubmit = useCallback(() => {
     const text = input.trim();
-    if (!text || isActivelyStreaming) return;
+    if (isActivelyStreaming) return;
+    const images = attachmentsToImagePayload(attachments);
+    if (!text && images.length === 0) return;
 
     setInput('');
-    void refineTaskPlan(task.id, text);
+    clearAttachments();
+    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined);
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, task.id, refineTaskPlan, isActivelyStreaming]);
+  }, [input, attachments, clearAttachments, task.id, refineTaskPlan, isActivelyStreaming]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

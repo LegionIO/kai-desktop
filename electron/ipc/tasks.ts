@@ -14,6 +14,7 @@ import type {
 } from '../../shared/task-types.js';
 import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
+import type { ModelMessage } from 'ai';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
@@ -750,7 +751,13 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle(
     'tasks:stream-plan',
-    async (_e, taskId: string, userMessage: string, existingHistory?: TaskConversationMessage[]) => {
+    async (
+      _e,
+      taskId: string,
+      userMessage: string,
+      existingHistory?: TaskConversationMessage[],
+      attachments?: Array<{ image: string; mimeType?: string }>,
+    ) => {
       // Validate taskId to prevent path traversal
       if (!isValidTaskId(taskId)) {
         broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', error: 'Invalid task ID' });
@@ -813,14 +820,52 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         return { taskId };
       }
 
-      // Build conversation messages
-      const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      // Build conversation messages. The final user turn may carry image attachments (R187): the task
+      // composer now forwards them, so build a multimodal content array for that turn. History turns and
+      // the persisted description stay text-only. Caps mirror the chat submit path so a bulk/huge image
+      // set can't blow the model request or the persisted task file.
+      const messages: ModelMessage[] = [];
       if (existingHistory) {
         for (const msg of existingHistory) {
           messages.push({ role: msg.role, content: msg.content });
         }
       }
-      messages.push({ role: 'user', content: userMessage });
+      const MAX_PLAN_ATTACHMENTS = 8;
+      const MAX_PLAN_ATTACHMENT_BYTES = 6 * 1024 * 1024; // per image (data-URL length)
+      const MAX_PLAN_ATTACHMENTS_TOTAL_BYTES = 12 * 1024 * 1024; // across all images
+      const ALLOWED_PLAN_IMAGE_MIME = new Set([
+        'image/png',
+        'image/jpeg',
+        'image/gif',
+        'image/webp',
+        'image/bmp',
+        'image/svg+xml',
+        'image/heic',
+        'image/heif',
+      ]);
+      const imageParts: Array<{ type: 'image'; image: string; mimeType?: string }> = [];
+      if (Array.isArray(attachments)) {
+        let count = 0;
+        let totalBytes = 0;
+        for (const att of attachments) {
+          if (count >= MAX_PLAN_ATTACHMENTS) break;
+          const image = att?.image;
+          if (typeof image !== 'string' || image.length === 0) continue;
+          const imageBytes = Buffer.byteLength(image, 'utf8');
+          if (imageBytes > MAX_PLAN_ATTACHMENT_BYTES) continue;
+          if (totalBytes + imageBytes > MAX_PLAN_ATTACHMENTS_TOTAL_BYTES) break;
+          totalBytes += imageBytes;
+          count += 1;
+          const mimeType =
+            typeof att.mimeType === 'string' && ALLOWED_PLAN_IMAGE_MIME.has(att.mimeType) ? att.mimeType : undefined;
+          imageParts.push(mimeType ? { type: 'image', image, mimeType } : { type: 'image', image });
+        }
+      }
+      if (imageParts.length > 0) {
+        messages.push({ role: 'user', content: [{ type: 'text', text: userMessage }, ...imageParts] });
+      } else {
+        messages.push({ role: 'user', content: userMessage });
+      }
 
       // Stream in background (handler returns immediately)
       void (async () => {

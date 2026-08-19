@@ -148,10 +148,18 @@ interface TaskContextValue {
   moveTaskToColumn: (taskId: string, targetStatus: KaiTaskStatus, sourceStatus: KaiTaskStatus) => void;
 
   /** Start the AI task creation flow — creates a placeholder task, streams plan. */
-  startAITaskCreation: (userMessage: string, metadata?: KaiTaskMetadata) => Promise<void>;
+  startAITaskCreation: (
+    userMessage: string,
+    metadata?: KaiTaskMetadata,
+    attachments?: Array<{ image: string; mimeType?: string }>,
+  ) => Promise<void>;
 
   /** Send a follow-up message to refine the currently streaming task plan. */
-  refineTaskPlan: (taskId: string, userMessage: string) => Promise<void>;
+  refineTaskPlan: (
+    taskId: string,
+    userMessage: string,
+    attachments?: Array<{ image: string; mimeType?: string }>,
+  ) => Promise<void>;
 
   /** Cancel any active AI plan stream. */
   cancelAIStream: () => void;
@@ -461,7 +469,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   }, []);
 
   const startAITaskCreation = useCallback(
-    async (userMessage: string, metadata?: KaiTaskMetadata) => {
+    async (
+      userMessage: string,
+      metadata?: KaiTaskMetadata,
+      attachments?: Array<{ image: string; mimeType?: string }>,
+    ) => {
       try {
         // Create a placeholder task
         const task = await app.tasks.create({
@@ -484,7 +496,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         });
 
         // Start streaming the plan
-        await app.tasks.streamPlan(task.id, userMessage);
+        await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
@@ -493,20 +505,23 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     [activeWorkspaceId],
   );
 
-  const refineTaskPlan = useCallback(async (taskId: string, userMessage: string) => {
-    try {
-      // Fetch fresh task from IPC to avoid stale closure over state.tasks
-      const task = await app.tasks.get(taskId);
-      const history = task?.conversationHistory ?? [];
+  const refineTaskPlan = useCallback(
+    async (taskId: string, userMessage: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
+      try {
+        // Fetch fresh task from IPC to avoid stale closure over state.tasks
+        const task = await app.tasks.get(taskId);
+        const history = task?.conversationHistory ?? [];
 
-      dispatch({ type: 'START_AI_CREATE', taskId });
+        dispatch({ type: 'START_AI_CREATE', taskId });
 
-      await app.tasks.streamPlan(taskId, userMessage, history);
-    } catch (err) {
-      console.error('[TaskProvider] Failed to refine task plan:', err);
-      dispatch({ type: 'STREAM_DONE' });
-    }
-  }, []);
+        await app.tasks.streamPlan(taskId, userMessage, history, attachments);
+      } catch (err) {
+        console.error('[TaskProvider] Failed to refine task plan:', err);
+        dispatch({ type: 'STREAM_DONE' });
+      }
+    },
+    [],
+  );
 
   const cancelAIStream = useCallback(() => {
     if (state.creatingTaskId) {

@@ -2,7 +2,8 @@ import { useCallback, useEffect } from 'react';
 import { parseAppShotRef, type AppShotPayload } from '../../shared/app-shots';
 import { app } from '@/lib/ipc-client';
 import { useAttachments, type AttachedFile } from '@/providers/AttachmentContext';
-import { filterAttachmentsBySize } from '@/lib/attachment-limits';
+import { useMidTurnComposer } from '@/providers/RuntimeProvider';
+import { filterAttachmentsBySize, releaseAttachmentReservation } from '@/lib/attachment-limits';
 
 function toBase64(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -68,6 +69,7 @@ export function useAppShots(): void {
  */
 export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLElement>) => boolean {
   const { addAttachments } = useAttachments();
+  const { getActiveConversationId } = useMidTurnComposer();
 
   return useCallback(
     (event) => {
@@ -90,7 +92,12 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       }
 
       event.preventDefault();
+      // Bind to the originating conversation (R187): resolveRef + the fallback FileReaders are async and
+      // write to the app-global attachment store, so a chat switch mid-await would otherwise attach the
+      // screenshot + metadata to the wrong chat.
+      const originConversationId = getActiveConversationId();
       void app.appShots.resolveRef(refId).then((payload) => {
+        if (getActiveConversationId() !== originConversationId) return;
         if (payload) {
           addAttachments(appShotPayloadToAttachments(payload));
           return;
@@ -99,12 +106,21 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
         // Gate the WHOLE batch before reading (R186): a per-file-only cap lets several raw clipboard
         // images materialize concurrently past the aggregate limit. filterAttachmentsBySize applies the
         // per-file AND running aggregate caps up front.
-        const { accepted } = filterAttachmentsBySize(imageFiles);
+        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles);
+        // Release the in-flight reservation once every reader settles (R187).
+        let outstanding = accepted.length;
+        const settleOne = () => {
+          outstanding -= 1;
+          if (outstanding <= 0) releaseAttachmentReservation(reservedBytes);
+        };
+        if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
         for (const file of accepted) {
           const reader = new FileReader();
-          reader.onerror = () => {};
-          reader.onabort = () => {};
+          reader.onerror = () => settleOne();
+          reader.onabort = () => settleOne();
           reader.onload = () => {
+            settleOne();
+            if (getActiveConversationId() !== originConversationId) return;
             addAttachments([
               {
                 name: file.name || `appshot-${refId}.png`,
@@ -120,6 +136,6 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       });
       return true;
     },
-    [addAttachments],
+    [addAttachments, getActiveConversationId],
   );
 }
