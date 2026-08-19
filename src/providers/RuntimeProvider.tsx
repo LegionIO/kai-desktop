@@ -2771,7 +2771,7 @@ export function RuntimeProvider({
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
   onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
-  const { consumeAttachments, addAttachments, attachments } = useAttachments();
+  const { consumeAttachments, addAttachments, clearAttachments, attachments } = useAttachments();
   // Live mirror of the composer's current attachments, for reads inside async rollback
   // closures (state would be stale). Used to avoid clobbering a NEW draft's attachments
   // when restoring a rolled-back turn's consumed attachments.
@@ -3018,7 +3018,18 @@ export function RuntimeProvider({
           if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
           const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
           if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
-          if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+          // Commit attachments FIRST and only ACK the draft if they ALL committed (R194): the global
+          // reservation cap can reject some/all, and ACKing then would permanently delete the durable
+          // draft, silently losing the recovered attachments. On any skip, ROLL BACK the partial commit
+          // (the store was verified empty above) and requeue (return false) so a later attempt retries
+          // once budget frees — avoiding both loss and double-add. Text-only drafts always commit.
+          if (rejected.attachments.length > 0) {
+            const { skipped } = addAttachments(rejected.attachments);
+            if (skipped.length > 0) {
+              clearAttachments(); // undo the partial commit; keep the durable draft intact for retry
+              return false;
+            }
+          }
           restoreComposerDraft(rejected.text);
           return true;
         });
