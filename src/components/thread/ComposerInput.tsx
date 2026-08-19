@@ -19,7 +19,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   autoFocus,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments, getAttachmentCount, getResidentBytes } = useAttachments();
+  const { attachments, addAttachments, getAttachmentCount } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
   const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } =
@@ -291,7 +291,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       // materialize concurrently past the aggregate cap. filterAttachmentsBySize applies the per-file
       // AND running aggregate limits up front; addAttachments' return then backstops the shared store.
       const pastedFiles = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
-      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(pastedFiles, getResidentBytes());
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(pastedFiles);
       const skippedPastes = skipped.slice();
       // Release the in-flight reservation once every reader settles (R187), whether it committed or was
       // discarded on a chat switch — so the reserved bytes don't permanently shrink the global ceiling.
@@ -345,7 +345,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
 
       return true;
     },
-    [addAttachments, handleAppShotPaste, conversationId, getActiveConversationId, getResidentBytes],
+    [addAttachments, handleAppShotPaste, conversationId, getActiveConversationId],
   );
 
   const isMultiline = text.includes('\n');

@@ -69,7 +69,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -119,7 +119,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   // Clear staged attachments when the panel is reused for a DIFFERENT task (R188): TaskQueue reuses this
   // component instance across task.id changes, so without this an image staged for task A could be
   // submitted to task B. Keyed on task.id so switching tasks resets the (task-local) attachment store.
+  // The ref fences in-flight async reads (dialog await + FileReader) so a read STARTED for task A that
+  // resolves AFTER a switch to task B is discarded rather than attached to B (R189).
+  const activeTaskIdRef = useRef(task.id);
   useEffect(() => {
+    activeTaskIdRef.current = task.id;
     clearAttachments();
   }, [task.id, clearAttachments]);
 
@@ -197,6 +201,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       setTimeout(() => fileInputRef.current?.click(), 0);
       return;
     }
+    const originTaskId = task.id;
     try {
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
@@ -204,6 +209,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         skipped?: string[];
       };
       if (result.canceled) return;
+      // Discard if the panel switched to a different task while the native dialog was open (R189) —
+      // otherwise task A's picked images attach to task B.
+      if (activeTaskIdRef.current !== originTaskId) return;
       // Task plans can only submit IMAGES (R188) — only stage images; drop non-images with a notice.
       const images = (result.files ?? []).filter((f) => f.isImage);
       const nonImages = (result.files ?? []).filter((f) => !f.isImage).map((f) => f.name);
@@ -221,11 +229,12 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
+    const originTaskId = task.id;
     // Task plans can only submit IMAGES (R188) — keep only image files. Gate by size BEFORE reading (R184).
     const allFiles = Array.from(fileList);
     const imageFiles = allFiles.filter((f) => f.type.startsWith('image/'));
     const nonImageNames = allFiles.filter((f) => !f.type.startsWith('image/')).map((f) => f.name);
-    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles);
     if (nonImageNames.length > 0) {
       showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImageNames.join(', ')}`);
     } else if (skipped.length > 0) {
@@ -262,6 +271,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
     void Promise.all(readers).then((results) => {
       releaseAttachmentReservation(reservedBytes);
+      // Discard reads that resolved after a switch to a different task (R189).
+      if (activeTaskIdRef.current !== originTaskId) return;
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
       const unreadable = accepted.length - attachable.length;
       if (attachable.length > 0) {

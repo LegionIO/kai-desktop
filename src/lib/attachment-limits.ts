@@ -10,19 +10,37 @@
  * Kept intentionally in sync with the main-process caps in electron/main.ts (dialog:open-file).
  */
 export const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024; // per file
-export const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across a single selection
+export const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across ALL attachment stores, renderer-wide
 
-// Bytes currently reserved by in-flight reads that have NOT yet reached the attachment store (R187).
-// Each pre-read filter starts its own budget at zero, so without a shared reservation two rapid
-// drops/pastes could each pass their own aggregate gate and concurrently materialize ~2× the cap
-// (plus base64 overhead). filterAttachmentsBySize charges against this global reservation; the caller
-// releases it once the reads settle (whether committed to the store or dropped).
+// Two GLOBAL (module-level) counters form a single renderer-wide ceiling (R189):
+//   committedBytes    — bytes of attachments currently held across EVERY store (shared chat store +
+//                        any task-local stores). Each store reports its deltas via onAttachments*.
+//   inFlightReservedBytes — bytes of reads that have passed the pre-read gate but not yet committed.
+// The pre-read gate checks committed + reserved + batch, so neither multiple mounted stores (chat +
+// task-local) nor concurrent in-flight batches can collectively exceed MAX_ATTACHMENT_TOTAL_BYTES.
+let committedBytes = 0;
 let inFlightReservedBytes = 0;
 
-/** Reserve bytes for an in-flight batch (called internally by filterAttachmentsBySize for accepted
- *  files). Exported for callers that need to release the exact amount later. */
+/** A store reports bytes it has newly COMMITTED (added to its live list). */
+export function onAttachmentsCommitted(bytes: number): void {
+  committedBytes += Math.max(0, bytes);
+}
+
+/** A store reports bytes it has RELEASED (removed/cleared/consumed from its live list). */
+export function onAttachmentsReleased(bytes: number): void {
+  committedBytes = Math.max(0, committedBytes - Math.max(0, bytes));
+}
+
+/** Current renderer-wide committed attachment bytes across all stores (for a store's own backstop). */
+export function globalCommittedBytes(): number {
+  return committedBytes;
+}
+
+/** Release an in-flight reservation once the read settles (committed to a store OR discarded). When a
+ *  read commits, the store's onAttachmentsCommitted moves those bytes into `committedBytes`, so the
+ *  reservation must be released to avoid double-counting. */
 export function releaseAttachmentReservation(bytes: number): void {
-  inFlightReservedBytes = Math.max(0, inFlightReservedBytes - bytes);
+  inFlightReservedBytes = Math.max(0, inFlightReservedBytes - Math.max(0, bytes));
 }
 
 export type AttachmentFilterResult = {
@@ -37,21 +55,17 @@ export type AttachmentFilterResult = {
 
 /**
  * Partition a File selection into the files safe to read and the names to report as skipped.
- * Enforces the per-file cap and a running aggregate cap that INCLUDES both bytes already reserved by
- * other in-flight batches (R187) AND `residentBytes` already committed to the caller's store (R188), so
- * neither concurrent drops nor a large already-staged set can push total resident memory past the
- * ceiling. Reserves the accepted bytes against the global in-flight counter; the caller must release
- * `reservedBytes` when the reads settle. Order-preserving.
- *
- * `residentBytes` is the total size of attachments already committed to the store this selection will be
- * added to (the shared chat store or a task-local store) — pass 0 if unknown.
+ * Enforces the per-file cap and a single renderer-wide aggregate cap that INCLUDES bytes already
+ * committed to ANY store (R189) plus bytes reserved by other in-flight batches (R187). Reserves the
+ * accepted bytes against the global in-flight counter; the caller MUST release `reservedBytes` once the
+ * reads settle. Order-preserving.
  */
-export function filterAttachmentsBySize(files: readonly File[], residentBytes = 0): AttachmentFilterResult {
+export function filterAttachmentsBySize(files: readonly File[]): AttachmentFilterResult {
   const accepted: File[] = [];
   const skipped: string[] = [];
   let batchBytes = 0;
   for (const file of files) {
-    const wouldTotal = residentBytes + inFlightReservedBytes + batchBytes + file.size;
+    const wouldTotal = committedBytes + inFlightReservedBytes + batchBytes + file.size;
     if (file.size > MAX_ATTACHMENT_BYTES || wouldTotal > MAX_ATTACHMENT_TOTAL_BYTES) {
       skipped.push(file.name);
       continue;

@@ -24,7 +24,7 @@ export const DropZone: FC<{
   activeConversationId: string | null;
 }> = ({ children, enabled, activeConversationId }) => {
   const [isDragOver, setIsDragOver] = useState(false);
-  const { addAttachments, getResidentBytes } = useAttachments();
+  const { addAttachments } = useAttachments();
   // Track the latest active conversation id in a ref so async read callbacks compare against the
   // CURRENT value, not the one captured at drop time by a stale render closure.
   const activeConversationIdRef = useRef<string | null>(activeConversationId);
@@ -86,7 +86,7 @@ export const DropZone: FC<{
 
       // Gate by size BEFORE reading (R183): each FileReader materializes the whole file, so an oversized
       // or bulk drop would OOM the renderer if read first. Reject over-cap files up front and report them.
-      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(files, getResidentBytes());
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(files);
       if (skipped.length > 0) showNotice(skippedAttachmentsNotice(skipped) ?? '');
       if (accepted.length === 0) {
         releaseAttachmentReservation(reservedBytes);
@@ -160,7 +160,7 @@ export const DropZone: FC<{
         if (unreadable > 0) showNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
       });
     },
-    [addAttachments, showNotice, enabled, getResidentBytes],
+    [addAttachments, showNotice, enabled],
   );
 
   return (

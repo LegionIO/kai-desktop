@@ -68,7 +68,7 @@ export function useAppShots(): void {
  * Returns `true` when the paste was an App Shot and was fully handled.
  */
 export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLElement>) => boolean {
-  const { addAttachments, getResidentBytes } = useAttachments();
+  const { addAttachments } = useAttachments();
   const { getActiveConversationId } = useMidTurnComposer();
 
   return useCallback(
@@ -112,7 +112,7 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
         // Gate the WHOLE batch before reading (R186): a per-file-only cap lets several raw clipboard
         // images materialize concurrently past the aggregate limit. filterAttachmentsBySize applies the
         // per-file AND running aggregate caps up front.
-        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
+        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles);
         // Release the in-flight reservation once every reader settles (R187).
         let outstanding = accepted.length;
         const settleOne = () => {
@@ -142,6 +142,6 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       });
       return true;
     },
-    [addAttachments, getActiveConversationId, getResidentBytes],
+    [addAttachments, getActiveConversationId],
   );
 }

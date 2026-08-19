@@ -876,8 +876,17 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         const parts =
           userMessage.length > 0 ? [{ type: 'text' as const, text: userMessage }, ...imageParts] : imageParts;
         messages.push({ role: 'user', content: parts });
-      } else {
+      } else if (userMessage.length > 0) {
         messages.push({ role: 'user', content: userMessage });
+      } else {
+        // Image-only send whose every image was rejected by the per-image / total / MIME filter above
+        // (R189): the early hasImageAttachment gate saw raw attachments, but none survived. Sending
+        // { role:'user', content:'' } would run the model on an empty turn after the UI already cleared
+        // the files. Fail explicitly instead.
+        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No usable image attachments' });
+        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        clearIfCurrent();
+        return { taskId };
       }
 
       // Stream in background (handler returns immediately)

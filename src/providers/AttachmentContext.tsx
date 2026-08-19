@@ -1,5 +1,10 @@
 import { createContext, useContext, useRef, useCallback, useState, type ReactNode } from 'react';
-import { MAX_ATTACHMENT_TOTAL_BYTES } from '@/lib/attachment-limits';
+import {
+  MAX_ATTACHMENT_TOTAL_BYTES,
+  onAttachmentsCommitted,
+  onAttachmentsReleased,
+  globalCommittedBytes,
+} from '@/lib/attachment-limits';
 
 export type AttachedFile = {
   name: string;
@@ -52,42 +57,50 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
   attachmentsRef.current = attachments;
 
   const addAttachments = useCallback((files: AttachedFile[]): { skipped: string[] } => {
-    // Enforce the aggregate byte cap against the CURRENT live store (R185): each per-event pre-read
-    // filter starts its budget from zero, so without this backstop several separate picker/drop/paste
-    // batches could each pass their own 256 MiB gate and together exhaust renderer memory.
-    let liveBytes = attachmentsRef.current.reduce((sum, f) => sum + (f.size || 0), 0);
+    // Backstop the renderer-wide aggregate cap against the GLOBAL committed total (R185/R189): the
+    // pre-read gate already accounts for committed + in-flight bytes across every store, but this final
+    // check guards paths that add without a pre-read gate. Report committed deltas so the global counter
+    // tracks this store's contribution.
     const accepted: AttachedFile[] = [];
     const skipped: string[] = [];
+    let addedBytes = 0;
     for (const file of files) {
       const size = file.size || 0;
-      if (liveBytes + size > MAX_ATTACHMENT_TOTAL_BYTES) {
+      if (globalCommittedBytes() + addedBytes + size > MAX_ATTACHMENT_TOTAL_BYTES) {
         skipped.push(file.name);
         continue;
       }
-      liveBytes += size;
+      addedBytes += size;
       accepted.push(file);
     }
     if (accepted.length > 0) {
       attachmentsRef.current = [...attachmentsRef.current, ...accepted];
       setAttachments(attachmentsRef.current);
+      onAttachmentsCommitted(addedBytes);
     }
     return { skipped };
   }, []);
 
   const removeAttachment = useCallback((index: number) => {
+    const removed = attachmentsRef.current[index];
     attachmentsRef.current = attachmentsRef.current.filter((_, i) => i !== index);
     setAttachments(attachmentsRef.current);
+    if (removed) onAttachmentsReleased(removed.size || 0);
   }, []);
 
   const clearAttachments = useCallback(() => {
+    const releasedBytes = attachmentsRef.current.reduce((sum, f) => sum + (f.size || 0), 0);
     attachmentsRef.current = [];
     setAttachments([]);
+    onAttachmentsReleased(releasedBytes);
   }, []);
 
   const consumeAttachments = useCallback((): AttachedFile[] => {
     const current = attachmentsRef.current;
+    const releasedBytes = current.reduce((sum, f) => sum + (f.size || 0), 0);
     attachmentsRef.current = [];
     setAttachments([]);
+    onAttachmentsReleased(releasedBytes);
     return current;
   }, []);
 

@@ -54,7 +54,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
   // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
   // is discarded on unmount automatically, so no cross-surface clearing is needed.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -155,7 +155,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     const allFiles = Array.from(fileList);
     const imageFiles = allFiles.filter((f) => f.type.startsWith('image/'));
     const nonImageNames = allFiles.filter((f) => !f.type.startsWith('image/')).map((f) => f.name);
-    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles);
     if (nonImageNames.length > 0) {
       showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImageNames.join(', ')}`);
     } else if (skipped.length > 0) {

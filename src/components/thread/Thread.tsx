@@ -1815,7 +1815,7 @@ const Composer: FC<{
   onToggleFallback,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments, removeAttachment, getAttachmentCount, getResidentBytes } = useAttachments();
+  const { attachments, addAttachments, removeAttachment, getAttachmentCount } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -2037,7 +2037,7 @@ const Composer: FC<{
     const originConversationId = getActiveConversationId();
     // Gate by size BEFORE reading (R183): FileReader materializes each file fully, concurrently, so an
     // oversized or bulk selection would OOM the renderer if we read first. Reject over-cap files up front.
-    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList), getResidentBytes());
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
     if (skipped.length > 0) showComposerNotice(skippedAttachmentsNotice(skipped) ?? '');
     // Reset early so the same file can be re-selected even if nothing is accepted.
     event.target.value = '';
