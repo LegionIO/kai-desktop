@@ -22,8 +22,10 @@ import {
   readFileSync,
   writeFileSync,
   readdirSync,
+  opendirSync,
   statSync,
   lstatSync,
+  fstatSync,
   openSync,
   closeSync,
   renameSync,
@@ -2453,27 +2455,44 @@ if (gotSingleInstanceLock) {
         });
         if (result.canceled) return { canceled: true, filePaths: [] };
 
-        // Read files and return as base64 data URLs. Enforce per-file + aggregate byte caps (R181):
-        // reading a multi-GB file (or many large files) synchronously into base64 would freeze/OOM
-        // main. Skip oversized files and stop once the aggregate cap is hit; report skipped ones.
+        // Read files and return as base64 data URLs. Enforce per-file + aggregate byte caps (R181),
+        // and open each file with O_NOFOLLOW + fstat the fd (R182): a plain statSync FOLLOWS a symlink
+        // and never checks the file TYPE, so a selected symlink to /dev/zero or a FIFO reports size 0,
+        // passes the cap, and then readFileSync either OOMs or blocks main forever. Open first (no
+        // link-follow), then fstat the real fd for both type (regular file) and size before reading.
         const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024; // per file
         const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across the selection
         const skipped: string[] = [];
         let aggregateBytes = 0;
         const files: Array<Record<string, unknown>> = [];
         for (const filePath of result.filePaths) {
-          let fileSize = 0;
+          let fd: number;
           try {
-            fileSize = statSync(filePath).size;
+            fd = openSync(filePath, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW);
           } catch {
             skipped.push(basename(filePath));
             continue;
           }
-          if (fileSize > MAX_ATTACHMENT_BYTES || aggregateBytes + fileSize > MAX_ATTACHMENT_TOTAL_BYTES) {
+          let data: Buffer;
+          try {
+            const st = fstatSync(fd);
+            // Reject non-regular files (FIFO/device/socket/dir): their reported size is meaningless and
+            // reading can block main indefinitely or stream unbounded bytes.
+            if (!st.isFile()) {
+              skipped.push(basename(filePath));
+              continue;
+            }
+            if (st.size > MAX_ATTACHMENT_BYTES || aggregateBytes + st.size > MAX_ATTACHMENT_TOTAL_BYTES) {
+              skipped.push(basename(filePath));
+              continue;
+            }
+            data = readFileSync(fd);
+          } catch {
             skipped.push(basename(filePath));
             continue;
+          } finally {
+            closeSync(fd);
           }
-          const data = readFileSync(filePath);
           aggregateBytes += data.length;
           const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
           const mimeTypes: Record<string, string> = {
@@ -2582,20 +2601,34 @@ if (gotSingleInstanceLock) {
         if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
           return { error: 'Not a directory', entries: [] };
         }
-        // Cap the enumeration (R180): this web-bridge-reachable handler synchronously reads + sorts
-        // EVERY entry of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules) would freeze
-        // main and produce an enormous WebSocket response. Read a bounded slice; flag truncation.
+        // Cap the enumeration (R180/R182): this web-bridge-reachable handler synchronously reads +
+        // sorts entries of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules) would
+        // freeze main and produce an enormous WebSocket response. Iterate with opendirSync and STOP
+        // after the cap — readdirSync would still materialize every Dirent before we could slice, so
+        // the cap alone would not bound peak allocation on a pathological directory.
         const MAX_DIR_ENTRIES = 5000;
-        const allNames = readdirSync(resolved, { withFileTypes: true });
-        const truncated = allNames.length > MAX_DIR_ENTRIES;
-        const entries = allNames
-          .slice(0, MAX_DIR_ENTRIES)
-          .filter((e) => !e.name.startsWith('.'))
-          .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
-          .sort((a, b) => {
-            if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-            return a.name.localeCompare(b.name);
-          });
+        const collected: Array<{ name: string; isDirectory: boolean }> = [];
+        let truncated = false;
+        const dir = opendirSync(resolved);
+        try {
+          let dirent = dir.readSync();
+          while (dirent !== null) {
+            if (collected.length >= MAX_DIR_ENTRIES) {
+              truncated = true;
+              break;
+            }
+            if (!dirent.name.startsWith('.')) {
+              collected.push({ name: dirent.name, isDirectory: dirent.isDirectory() });
+            }
+            dirent = dir.readSync();
+          }
+        } finally {
+          dir.closeSync();
+        }
+        const entries = collected.sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
         return { path: resolved, entries, ...(truncated ? { truncated: true } : {}) };
       } catch (err) {
         return { error: String(err), entries: [] };

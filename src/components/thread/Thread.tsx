@@ -1818,15 +1818,22 @@ const Composer: FC<{
   const activeConversationId = useActiveConversationId();
   const { sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
-  // Transient status for a mid-turn send BLOCKED by a policy hook — packaged users
-  // have no DevTools, so a console.warn is invisible and Send looks like a no-op.
+  // Transient composer status notice (packaged users have no DevTools, so a console.warn is
+  // invisible and an action can look like a no-op). Used for a mid-turn send BLOCKED by a policy
+  // hook, and for attachment files the main process SKIPPED (too large / not a regular file) (R182).
   const [midTurnBlockNotice, setMidTurnBlockNotice] = useState<string | null>(null);
   const midTurnBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showMidTurnBlock = useCallback((reason?: string) => {
+  const showComposerNotice = useCallback((message: string) => {
     if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
-    setMidTurnBlockNotice(reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.');
+    setMidTurnBlockNotice(message);
     midTurnBlockTimerRef.current = setTimeout(() => setMidTurnBlockNotice(null), 6000);
   }, []);
+  const showMidTurnBlock = useCallback(
+    (reason?: string) => {
+      showComposerNotice(reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.');
+    },
+    [showComposerNotice],
+  );
   useEffect(() => {
     return () => {
       if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
@@ -1993,8 +2000,20 @@ const Composer: FC<{
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
         files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+        skipped?: string[];
       };
-      if (!result.canceled && result.files) addAttachments(result.files);
+      if (result.canceled) return;
+      if (result.files && result.files.length > 0) addAttachments(result.files);
+      // Main skips files that are too large or not regular files (R182). Without this the user picks a
+      // file and nothing happens — surface it in the composer notice so the action isn't a silent no-op.
+      if (result.skipped && result.skipped.length > 0) {
+        const names = result.skipped.join(', ');
+        showComposerNotice(
+          result.skipped.length === 1
+            ? `Couldn't attach ${names} (too large or not a regular file).`
+            : `Couldn't attach ${result.skipped.length} files (too large or not regular files): ${names}`,
+        );
+      }
     } catch (err) {
       console.error('Attach failed:', err);
     }

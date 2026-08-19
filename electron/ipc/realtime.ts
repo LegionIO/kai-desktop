@@ -145,6 +145,34 @@ function gateRealtimeTools(base: ToolDefinition[], allowBrowser: boolean, planFi
   return planFirst ? toolsForExecutionMode(browserFiltered, 'plan-first') : browserFiltered;
 }
 
+/**
+ * Resolve whether a Realtime call must run plan-first (read-only) for a conversation.
+ * Realtime never traverses the Mastra plan-mode chokepoint, so this decides tool gating directly.
+ *
+ * Priority (mirrors the text submit path in plugin-generate.ts):
+ *   - a present conversation record is MAIN-authoritative: its executionMode (or 'auto' when the
+ *     field is missing) wins — TRUST DISK (R129 f-3);
+ *   - a definitively ABSENT conversation (recordless voice/web/test session) falls back to the
+ *     GLOBAL config.tools.executionMode (R182) — a globally plan-first config must gate a recordless
+ *     call too, exactly like a recordless plugin generate;
+ *   - a present-but-UNREADABLE record, or any throw, fails CLOSED to plan-first.
+ */
+function resolveRealtimePlanFirst(appHome: string, conversationId: string, config: AppConfig): boolean {
+  try {
+    const persistedConv = readConversation(appHome, conversationId) as { executionMode?: string } | null;
+    if (persistedConv != null) {
+      return persistedConv.executionMode === 'plan-first';
+    }
+    if (conversationExistenceState(appHome, conversationId) === 'absent') {
+      return (config.tools as { executionMode?: string } | undefined)?.executionMode === 'plan-first';
+    }
+    // Present-but-unreadable (transient/unknown) → fail closed.
+    return true;
+  } catch {
+    return true; // fail closed
+  }
+}
+
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
   activeSession?.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
   if (pendingStart?.session) {
@@ -381,21 +409,11 @@ export function registerRealtimeHandlers(
         event.senderFrame === primaryWindow.webContents.mainFrame &&
         browserAuthorityCurrent();
       if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = allowBrowserTools;
-      // Plan-first read-only gating (R175): a plan-first conversation's voice call must NOT expose
-      // mutating tools (incl. Browser click/type/evaluate/tab-management) — Realtime does NOT traverse
-      // the Mastra plan-mode chokepoint, so filter here too. Resolve the conversation's MAIN-authoritative
-      // mode fail-CLOSED (a present-but-unreadable record → plan-first) like the text submit path.
-      let realtimePlanFirst = false;
-      try {
-        const persistedConv = readConversation(appHome, conversationId) as { executionMode?: string } | null;
-        if (persistedConv != null) {
-          realtimePlanFirst = persistedConv.executionMode === 'plan-first';
-        } else {
-          realtimePlanFirst = conversationExistenceState(appHome, conversationId) !== 'absent';
-        }
-      } catch {
-        realtimePlanFirst = true; // fail closed
-      }
+      // Plan-first read-only gating (R175/R182): a plan-first conversation's voice call must NOT
+      // expose mutating tools (incl. Browser click/type/evaluate/tab-management) — Realtime does NOT
+      // traverse the Mastra plan-mode chokepoint, so filter here too. Recordless calls fall back to
+      // the GLOBAL executionMode; present-but-unreadable fails CLOSED.
+      let realtimePlanFirst = resolveRealtimePlanFirst(appHome, conversationId, config);
       // Record on the pending start so tool-replacement paths that run BEFORE install gate correctly.
       if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
       const tools = gateRealtimeTools(availableTools, allowBrowserTools, realtimePlanFirst);
@@ -466,9 +484,21 @@ export function registerRealtimeHandlers(
         void scheduleAssistantTabCleanup(conversationId, session.browserOwnerId);
         browserRunRegistered = false;
       }
-      if (browserToolsStillAuthorized !== allowBrowserTools) {
+      // Re-resolve plan-first at INSTALL time (R182): the mode was frozen before the async connect,
+      // so a Plan-First toggle (or a conversation record written) while connecting would otherwise
+      // leave mutating tools attached to the freshly-installed session until the next tool reload.
+      // Fail-closed: only ever tighten toward plan-first here, never relax an in-flight plan-first
+      // resolution into auto based on a mid-connect state we can't fully trust.
+      const installPlanFirst = resolveRealtimePlanFirst(appHome, conversationId, getConfig());
+      const effectivePlanFirst = realtimePlanFirst || installPlanFirst;
+      const planFirstChanged = effectivePlanFirst !== realtimePlanFirst;
+      realtimePlanFirst = effectivePlanFirst;
+      if (browserToolsStillAuthorized !== allowBrowserTools || planFirstChanged) {
         session.updateTools(gateRealtimeTools(getTools(), browserToolsStillAuthorized, realtimePlanFirst));
       }
+      // Keep the pending-start flag in sync with the re-resolved mode so a tool-reload racing this
+      // install gates against the tightened value, not the pre-connect one.
+      if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
       activeSession = session;
       // Set timing/attribution at INSTALL time so a superseded start can't leave
       // stale globals, and so the recorded duration reflects connected time

@@ -180,6 +180,44 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+/** Validate the NESTED shape of an AgentStats partial (R182): a container-only check accepts
+ *  `{tasksCompleted:{}}`, which persists and then crashes the agent-detail renderer when React tries
+ *  to render an object as a child. Every present field must match AgentStats' declared type. */
+function isValidAgentStatsShape(v: unknown): boolean {
+  if (!isPlainObject(v)) return false;
+  const numberFields = ['tasksCompleted', 'totalRuntime', 'crashCount'] as const;
+  for (const f of numberFields) {
+    if (v[f] !== undefined && (typeof v[f] !== 'number' || !Number.isFinite(v[f]))) return false;
+  }
+  const stringFields = ['lastRunAt', 'lastCrashAt'] as const;
+  for (const f of stringFields) {
+    if (v[f] !== undefined && typeof v[f] !== 'string') return false;
+  }
+  return true;
+}
+
+/** Validate the NESTED shape of an AgentRuntimeConfig partial (R182): same reasoning as stats —
+ *  a poisoned nested field (e.g. `{cwd:{}}`, `{env:[]}`) would persist and later crash a renderer
+ *  view or a runtime spawn that treats these as strings/records. */
+function isValidAgentConfigShape(v: unknown): boolean {
+  if (!isPlainObject(v)) return false;
+  const stringFields = ['cwd', 'modelKey', 'profileKey'] as const;
+  for (const f of stringFields) {
+    if (v[f] !== undefined && typeof v[f] !== 'string') return false;
+  }
+  const numberFields = ['maxSessionSeconds', 'maxCrashesPerDay'] as const;
+  for (const f of numberFields) {
+    if (v[f] !== undefined && (typeof v[f] !== 'number' || !Number.isFinite(v[f]))) return false;
+  }
+  if (v.customArgs !== undefined) {
+    if (!Array.isArray(v.customArgs) || v.customArgs.some((a) => typeof a !== 'string')) return false;
+  }
+  if (v.env !== undefined) {
+    if (!isPlainObject(v.env) || Object.values(v.env).some((e) => typeof e !== 'string')) return false;
+  }
+  return true;
+}
+
 /**
  * Match a value against a simple glob pattern supporting `*` as a prefix
  * and/or suffix wildcard only (no mid-string globs, no regex).
@@ -1669,8 +1707,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
         const v = (payload as Record<string, unknown>)[f];
         if (v !== undefined && typeof v !== 'string') return { error: `Invalid ${f}: expected string` };
       }
-      if (payload.config !== undefined && !isPlainObject(payload.config)) {
-        return { error: 'Invalid config: expected object' };
+      if (payload.config !== undefined && !isValidAgentConfigShape(payload.config)) {
+        return { error: 'Invalid config' };
       }
       const id = randomUUID();
       const now = new Date().toISOString();
@@ -1745,19 +1783,20 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
         return { error: 'Invalid capabilities: expected string[]' };
       }
     }
-    // Enum + nested-object fields (R181): a poisoned {status:"x"} / {stats:null} / {config:[]} would
-    // shallow-merge and later crash the reconciler (dereferences stats) or a renderer view.
+    // Enum + nested-object fields (R181/R182): a poisoned {status:"x"} / {stats:null} / {config:[]}
+    // would shallow-merge and later crash the reconciler (dereferences stats) or a renderer view.
+    // Validate the NESTED shape too — a container-only check still admits {stats:{tasksCompleted:{}}}.
     if (updates.status !== undefined && !isValidAgentStatus(updates.status)) {
       return { error: `Invalid status: ${String(updates.status)}` };
     }
     if (updates.role !== undefined && !isValidAgentRole(updates.role)) {
       return { error: `Invalid role: ${String(updates.role)}` };
     }
-    if (updates.stats !== undefined && !isPlainObject(updates.stats)) {
-      return { error: 'Invalid stats: expected object' };
+    if (updates.stats !== undefined && !isValidAgentStatsShape(updates.stats)) {
+      return { error: 'Invalid stats' };
     }
-    if (updates.config !== undefined && !isPlainObject(updates.config)) {
-      return { error: 'Invalid config: expected object' };
+    if (updates.config !== undefined && !isValidAgentConfigShape(updates.config)) {
+      return { error: 'Invalid config' };
     }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };
