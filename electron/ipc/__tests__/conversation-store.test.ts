@@ -150,6 +150,17 @@ describe('per-file read/write', () => {
     expect(Object.keys(readIndex(appHome).conversations)).toEqual(['b2']);
   });
 
+  it('delete rejects a malformed / abusively-long id without polluting the durable deletedIds ring (R178)', () => {
+    const hugeId = 'x'.repeat(5_000_000); // ~5 MiB
+    expect(deleteConversation(appHome, hugeId)).toBe(false);
+    expect(deleteConversations(appHome, [hugeId, '', 'y'.repeat(500)])).toEqual([]);
+    // The durable deletedIds ring must not contain the oversized ids.
+    const idx = readIndex(appHome);
+    const deletedIds = Array.isArray(idx.deletedIds) ? idx.deletedIds : [];
+    expect(deletedIds).not.toContain(hugeId);
+    expect(deletedIds.some((d) => d.length > 256)).toBe(false);
+  });
+
   it('deleteConversations returns an ORPHAN record (file present, no index entry) so the caller tears it down', () => {
     // Simulate an orphan: a data file on disk with NO index entry (a rebuilt/corrupt index).
     writeConversation(appHome, makeConv('orphan'));

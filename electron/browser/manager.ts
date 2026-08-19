@@ -1572,7 +1572,20 @@ export class BrowserManager {
   }
 
   private assertConversationAvailable(conversationId: string): void {
-    if (this.isConversationAvailable(conversationId)) return;
+    if (this.removedConversations.has(conversationId)) {
+      throw new Error('Browser data is unavailable because this conversation was deleted or no longer exists.');
+    }
+    let exists: boolean;
+    try {
+      exists = this.conversationExists(conversationId);
+    } catch {
+      // TRANSIENT read failure (EMFILE/EACCES / existence unknown): deny access THIS time but do NOT
+      // fence — fencing permanently blocks a still-live conversation's Browser access until restart
+      // (R178). A later successful check re-enables it.
+      throw new Error('Browser data is temporarily unavailable (conversation record could not be read).');
+    }
+    if (exists) return;
+    // Definitively absent → the conversation was deleted; fence it permanently.
     this.fenceRemovedConversation(conversationId);
     throw new Error('Browser data is unavailable because this conversation was deleted or no longer exists.');
   }

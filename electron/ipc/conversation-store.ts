@@ -155,6 +155,15 @@ function conversationsDir(appHome: string): string {
 function conversationPath(appHome: string, id: string): string {
   return join(conversationsDir(appHome), `${sanitizeId(id)}.json`);
 }
+// A conversation id is a UUID (~36 chars); anything wildly longer is malformed/abusive. The
+// delete/tombstone/index-ring structures are keyed by id, and delete is reachable from the web
+// bridge — a near-4-MiB "id" would otherwise be stored in the durable deletedIds ring + index.json
+// and forced through synchronous rewrites (memory/disk DoS, R178). Reject a non-string or over-long
+// id at the delete chokepoint.
+const MAX_CONVERSATION_ID_LENGTH = 256;
+function isPlausibleConversationId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_CONVERSATION_ID_LENGTH;
+}
 function indexPath(appHome: string): string {
   return join(appHome, 'data', 'index.json');
 }
@@ -1434,6 +1443,9 @@ export function consumeWriteWasSuppressed(id: string): boolean {
  *  preserve-on-rm-failure semantics so a failed rm keeps the conversation intact (and the
  *  caller can avoid cancelling/broadcasting for a delete that didn't happen). */
 export function deleteConversation(appHome: string, id: string): boolean {
+  // Reject a malformed / abusively-long id before it enters the tombstone + durable deletedId ring
+  // + index (R178): treat it as a benign no-op (nothing to delete).
+  if (!isPlausibleConversationId(id)) return false;
   // Migrate first (and refuse if migration is pending) so a subsequent
   // readIndex() can't recreate the file we delete or strand old chats.
   assertMigratedBeforeWrite(appHome);
@@ -1494,6 +1506,8 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   const index = readIndex(appHome);
   const removed: string[] = [];
   for (const id of ids) {
+    // Skip a malformed / abusively-long id before it touches the tombstone/index structures (R178).
+    if (!isPlausibleConversationId(id)) continue;
     // Only drop the index entry once the data file is GONE (removed now, or already
     // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
     // would orphan that data AND make the conversation invisible — so keep the entry and

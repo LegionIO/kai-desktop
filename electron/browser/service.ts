@@ -1,6 +1,6 @@
 import { app, session, type BrowserWindow, type Session } from 'electron';
 import type { AppConfig } from '../config/schema.js';
-import { readConversation } from '../ipc/conversation-store.js';
+import { conversationExistenceState } from '../ipc/conversation-store.js';
 import { BrowserManager } from './manager.js';
 import { BrowserCredentialVault } from './credential-vault.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
@@ -43,14 +43,16 @@ export function initializeBrowserManager(
   if (manager) {
     throw new Error('The in-app Browser manager is already initialized; await replacement shutdown first.');
   }
-  const next = new BrowserManager(
-    appHome,
-    getConfig,
-    getWindow,
-    pagePreloadPath,
-    (conversationId) =>
-      !conversationRemovalsInFlight.has(conversationId) && readConversation(appHome, conversationId) !== null,
-  );
+  const next = new BrowserManager(appHome, getConfig, getWindow, pagePreloadPath, (conversationId) => {
+    if (conversationRemovalsInFlight.has(conversationId)) return false;
+    // Distinguish a GENUINELY-absent conversation (deleted → fence) from a TRANSIENT read failure
+    // (EMFILE/EACCES → do NOT permanently fence a live conversation's Browser access; R178). A
+    // tri-state 'unknown' THROWS so the manager's isConversationAvailable catch denies access this
+    // once without fencing; only a definitive 'absent' returns false (→ fence).
+    const state = conversationExistenceState(appHome, conversationId);
+    if (state === 'unknown') throw new Error('conversation existence unknown (transient read failure)');
+    return state === 'exists';
+  });
   // A headless profile clear can yield to Chromium before a GUI promotion
   // creates this manager. Fence every such conversation before publishing the
   // manager so no tab/session can enter the partition outside the clear queue.
