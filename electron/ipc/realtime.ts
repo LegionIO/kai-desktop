@@ -30,6 +30,9 @@ let pendingStart: {
   browserInitiated: boolean;
   allowsBrowserTools: boolean;
   browserToolsRevoked: boolean;
+  /** Plan-first (read-only) gating for this start, resolved at admission — known BEFORE the session
+   *  is installed so tool-replacement paths that run against a pending start still gate correctly. */
+  planFirst: boolean;
 } | null = null;
 /**
  * Monotonic start generation. Bumped at the top of BOTH start-session and
@@ -132,16 +135,21 @@ function isCurrentPrimaryMainFrame(event: IpcMainInvokeEvent, getPrimaryWindow: 
   );
 }
 
+/** Apply Browser-source + plan-first read-only gating to a tool set before it is advertised to a
+ *  realtime session (R176). EVERY session.updateTools(...) must route through this so a mid-call
+ *  browser-config change / renderer reload / hot reload / authority revalidation can never
+ *  re-introduce mutating (or Browser) tools into a plan-first call. `planFirst` is passed per-target
+ *  (the active session vs a not-yet-installed pending start, which has its own resolved flag). */
+function gateRealtimeTools(base: ToolDefinition[], allowBrowser: boolean, planFirst: boolean): ToolDefinition[] {
+  const browserFiltered = allowBrowser ? base : base.filter((tool) => tool.source !== 'browser');
+  return planFirst ? toolsForExecutionMode(browserFiltered, 'plan-first') : browserFiltered;
+}
+
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
-  const withoutBrowserTools = tools.filter((tool) => tool.source !== 'browser');
-  // Re-apply plan-first read-only gating on a mid-call hot-reload (R175) so it can't re-introduce
-  // mutating tools into a plan-first call.
-  const gate = (allowBrowser: boolean): ToolDefinition[] => {
-    const base = allowBrowser ? tools : withoutBrowserTools;
-    return activeSessionPlanFirst ? toolsForExecutionMode(base, 'plan-first') : base;
-  };
-  activeSession?.updateTools(gate(activeSessionAllowsBrowserTools));
-  pendingStart?.session?.updateTools(gate(pendingStart.allowsBrowserTools ?? false));
+  activeSession?.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
+  if (pendingStart?.session) {
+    pendingStart.session.updateTools(gateRealtimeTools(tools, pendingStart.allowsBrowserTools, pendingStart.planFirst));
+  }
 }
 
 /** Permanently remove native Browser authority from the current call/start.
@@ -158,9 +166,9 @@ export function revokeRealtimeBrowserTools(tools: ToolDefinition[]): void {
     pendingStart.allowsBrowserTools = false;
     pendingStart.browserToolsRevoked = true;
   }
-  const withoutBrowserTools = tools.filter((tool) => tool.source !== 'browser');
-  activeSession?.updateTools(withoutBrowserTools);
-  pendingStart?.session?.updateTools(withoutBrowserTools);
+  // Browser is force-disabled here, but plan-first gating must STILL apply to the remaining tools.
+  activeSession?.updateTools(gateRealtimeTools(tools, false, activeSessionPlanFirst));
+  pendingStart?.session?.updateTools(gateRealtimeTools(tools, false, pendingStart?.planFirst ?? false));
 }
 
 /**
@@ -288,6 +296,7 @@ export function registerRealtimeHandlers(
       browserInitiated,
       allowsBrowserTools: false,
       browserToolsRevoked: false,
+      planFirst: false,
     };
     try {
       previousPendingSession?.close();
@@ -372,9 +381,6 @@ export function registerRealtimeHandlers(
         event.senderFrame === primaryWindow.webContents.mainFrame &&
         browserAuthorityCurrent();
       if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = allowBrowserTools;
-      const browserFilteredTools = allowBrowserTools
-        ? availableTools
-        : availableTools.filter((tool) => tool.source !== 'browser');
       // Plan-first read-only gating (R175): a plan-first conversation's voice call must NOT expose
       // mutating tools (incl. Browser click/type/evaluate/tab-management) — Realtime does NOT traverse
       // the Mastra plan-mode chokepoint, so filter here too. Resolve the conversation's MAIN-authoritative
@@ -390,9 +396,9 @@ export function registerRealtimeHandlers(
       } catch {
         realtimePlanFirst = true; // fail closed
       }
-      const tools = realtimePlanFirst
-        ? toolsForExecutionMode(browserFilteredTools, 'plan-first')
-        : browserFilteredTools;
+      // Record on the pending start so tool-replacement paths that run BEFORE install gate correctly.
+      if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
+      const tools = gateRealtimeTools(availableTools, allowBrowserTools, realtimePlanFirst);
       let createdSession: RealtimeSession;
       createdSession = new RealtimeSession(getConfig, tools, () => handleRealtimeSessionTerminal(createdSession));
       session = createdSession;
@@ -417,7 +423,7 @@ export function registerRealtimeHandlers(
         if (allowBrowserTools) {
           if (!browserAuthorityCurrent() || pendingStart?.browserToolsRevoked) {
             if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = false;
-            session.updateTools(getTools().filter((tool) => tool.source !== 'browser'));
+            session.updateTools(gateRealtimeTools(getTools(), false, realtimePlanFirst));
           } else {
             // Browser runs from the text and Realtime runtimes must not coexist:
             // each runtime maintains independent page assumptions and would
@@ -461,9 +467,7 @@ export function registerRealtimeHandlers(
         browserRunRegistered = false;
       }
       if (browserToolsStillAuthorized !== allowBrowserTools) {
-        session.updateTools(
-          browserToolsStillAuthorized ? getTools() : getTools().filter((tool) => tool.source !== 'browser'),
-        );
+        session.updateTools(gateRealtimeTools(getTools(), browserToolsStillAuthorized, realtimePlanFirst));
       }
       activeSession = session;
       // Set timing/attribution at INSTALL time so a superseded start can't leave
