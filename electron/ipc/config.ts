@@ -1249,19 +1249,37 @@ export function registerConfigHandlers(
     broadcastTimer = setTimeout(flushConfigBroadcast, 25);
   };
 
+  const applyReload = () => {
+    try {
+      currentConfig = readEffectiveConfig(appHome);
+      // External edit to desktop.json (enabled/content/scopes/retention) must
+      // take effect without an internal write or restart.
+      invalidateDiagnosticTraceConfig();
+      scheduleConfigBroadcast();
+    } catch {
+      // Ignore read errors during write
+    }
+  };
+
   const reloadConfig = () => {
     if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
     reloadDebounceTimer = setTimeout(() => {
-      try {
-        currentConfig = readEffectiveConfig(appHome);
-        // External edit to desktop.json (enabled/content/scopes/retention) must
-        // take effect without an internal write or restart.
-        invalidateDiagnosticTraceConfig();
-        scheduleConfigBroadcast();
-      } catch {
-        // Ignore read errors during write
-      }
+      reloadDebounceTimer = null;
+      applyReload();
     }, 200);
+  };
+
+  // Flush a PENDING external reload synchronously (R169): an external edit to desktop.json/llm.json
+  // is reloaded on a 200ms debounce; an internal config:set landing inside that window mutates the
+  // STALE cached currentConfig and rewrites the WHOLE desktop payload, silently clobbering the
+  // external edit. Before any internal mutation, if a reload is pending, cancel the timer and reload
+  // NOW so currentConfig reflects the external change, and the internal mutation layers on top of it.
+  const flushPendingReload = () => {
+    if (reloadDebounceTimer) {
+      clearTimeout(reloadDebounceTimer);
+      reloadDebounceTimer = null;
+      applyReload();
+    }
   };
 
   // Watch each settings file for external edits. `fs.watch` on the file itself
@@ -1300,6 +1318,9 @@ export function registerConfigHandlers(
   const llmProviderKeys = new Set(['anthropic', 'openai', 'gemini', 'bedrock', 'ollama']);
 
   const setConfigImpl = (path: string, value: unknown): void => {
+    // Fold in any pending external edit BEFORE mutating (R169) so this internal write can't clobber
+    // an external change that arrived within the reload debounce window.
+    flushPendingReload();
     if (path === 'models') {
       currentConfig = readEffectiveConfig(appHome);
       scheduleConfigBroadcast();

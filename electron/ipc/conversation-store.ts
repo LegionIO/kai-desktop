@@ -1356,9 +1356,19 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
     }
   }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
-  const index = readIndex(appHome);
-  index.conversations[sanitized.id] = toIndexEntry(sanitized);
-  writeIndex(appHome, index);
+  // The conversation FILE is now committed — the write SUCCEEDED from the caller's perspective. The
+  // index is a DERIVED, rebuildable cache (rebuildIndexFromConversationFiles scans the files), so a
+  // throw during index maintenance must NOT propagate out of writeConversation (R169 f-2): letting it
+  // throw made the stream-persistence caller treat a COMMITTED response as failed, retain its
+  // accumulator, and DOUBLE-PERSIST it under a collision id on the next finalize. Swallow + log; the
+  // index self-heals on the next corrupt/missing read or the startup ghost reconcile.
+  try {
+    const index = readIndex(appHome);
+    index.conversations[sanitized.id] = toIndexEntry(sanitized);
+    writeIndex(appHome, index);
+  } catch (err) {
+    console.error('[conversation-store] writeConversation: index maintenance failed after file commit', err);
+  }
   lastWriteSuppressed.delete(sanitized.id);
   return sanitized;
 }

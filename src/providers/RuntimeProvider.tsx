@@ -3082,7 +3082,18 @@ export function RuntimeProvider({
   useEffect(() => {
     (async () => {
       try {
+        // Capture the load sequence BEFORE awaiting getActiveId() (R169): if the user selects a
+        // different conversation while this IPC is pending, that selection runs its own
+        // loadConversationState and bumps loadSeqRef. Without this guard, resolving getActiveId here
+        // would then call loadConversationState for the STALE active id, which bumps the token AGAIN
+        // (becoming newest) and overwrites the user's selection — and a send in that window would
+        // target the old conversation. If the token advanced during the await, a newer load owns the
+        // state; skip the mount load entirely.
+        const seqBeforeResolve = loadSeqRef.current;
         const id = conversationId ?? (await app.conversations.getActiveId());
+        if (loadSeqRef.current !== seqBeforeResolve) {
+          return; // a newer selection-driven load started while we awaited getActiveId — defer to it
+        }
         if (id && (await loadConversationState(id))) {
           return;
         }

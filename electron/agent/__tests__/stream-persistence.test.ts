@@ -47,8 +47,8 @@ import {
 import type { StreamEvent } from '../mastra-agent.js';
 
 const APP_HOME = '/tmp/fake-home';
-const feed = (e: Partial<StreamEvent>): void => accumulateForPersistence(APP_HOME, e as StreamEvent);
-const feedWithParent = (e: Partial<StreamEvent>, parentId?: string): void =>
+const feed = (e: Partial<StreamEvent>) => accumulateForPersistence(APP_HOME, e as StreamEvent);
+const feedWithParent = (e: Partial<StreamEvent>, parentId?: string) =>
   accumulateForPersistence(APP_HOME, e as StreamEvent, parentId);
 
 describe('stream persistence accumulator', () => {

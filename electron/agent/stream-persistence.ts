@@ -149,9 +149,13 @@ function appendText(acc: Accumulator, text: string): void {
  * persist the accumulated assistant turn (if any) and clear state. Returns
  * nothing — invoked for side effects from broadcastStreamEvent.
  */
-export function accumulateForPersistence(appHome: string, event: StreamEvent, parentId?: string): void {
+export function accumulateForPersistence(
+  appHome: string,
+  event: StreamEvent,
+  parentId?: string,
+): 'done' | 'failed' | undefined {
   const conversationId = event.conversationId;
-  if (!conversationId) return;
+  if (!conversationId) return undefined;
 
   switch (event.type) {
     case 'text-delta': {
@@ -332,15 +336,21 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
         // is a sibling of the eventual success rather than its ancestor.
         // keepRunning: the retry is still in flight — don't flip the conversation
         // to 'idle' or a concurrent automation could fork the branch mid-fallback.
-        persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true });
-        // Re-seed for the retry, KEEPING the original parent so the next attempt
-        // is a sibling (not chained after this errored one).
-        accumulators.set(conversationId, {
-          parts: [],
-          toolIndex: new Map(),
-          sawContent: false,
-          parentId: originalParentId,
-        });
+        const variantHead = persistAccumulatedReturningHead(appHome, conversationId, { keepRunning: true });
+        // Re-seed for the retry, KEEPING the original parent so the next attempt is a sibling — but
+        // ONLY if the errored-variant persist SUCCEEDED (R169 f-3). If it FAILED, R168 f-2 RETAINED
+        // the accumulator (still holding this variant's content); unconditionally overwriting it here
+        // would permanently lose Model A's partial/errored variant. On failure, leave the retained
+        // accumulator so a later finalize can still persist it (the next attempt appends to it — a
+        // degraded merge, but no data loss).
+        if (variantHead !== null || !accumulators.has(conversationId)) {
+          accumulators.set(conversationId, {
+            parts: [],
+            toolIndex: new Map(),
+            sawContent: false,
+            parentId: originalParentId,
+          });
+        }
       }
       break;
     }
@@ -357,10 +367,10 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
       break;
     }
     case 'done': {
-      finalizeTurn(appHome, conversationId);
-      break;
+      return finalizeTurn(appHome, conversationId);
     }
   }
+  return undefined;
 }
 
 /**
@@ -368,9 +378,18 @@ export function accumulateForPersistence(appHome: string, event: StreamEvent, pa
  * its accumulator (idempotent — safe to call more than once per conversation).
  * If there's nothing to persist, still reset a lingering `running` runStatus so
  * the conversation doesn't look stuck busy. Persistence is best-effort.
+ *
+ * Returns `'failed'` when there WAS content but the write did NOT succeed (the
+ * accumulator was RETAINED for a retry, so the caller MUST NOT clear persistence
+ * ownership — R169 f-1). Returns `'done'` when the turn was persisted OR there was
+ * genuinely nothing to persist (ownership is safe to clear either way).
  */
-function finalizeTurn(appHome: string, conversationId: string): void {
+function finalizeTurn(appHome: string, conversationId: string): 'done' | 'failed' {
+  const hadContent = Boolean(accumulators.get(conversationId)?.sawContent);
   persistAccumulated(appHome, conversationId);
+  // If content existed and the accumulator is STILL present, persist failed and retained it (R168 f-2).
+  if (hadContent && accumulators.has(conversationId)) return 'failed';
+  return 'done';
 }
 
 /**

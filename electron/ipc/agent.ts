@@ -2228,12 +2228,21 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         // Parent the persisted assistant turn on the head captured at submit
         // (the user node it answers), so a mid-run branch change can't reparent it.
         const parentId = serverPersistParents.get(event.conversationId);
-        accumulateForPersistence(serverPersistAppHome, event, parentId ?? undefined);
+        const persistOutcome = accumulateForPersistence(serverPersistAppHome, event, parentId ?? undefined);
         if (event.type === 'done') {
-          serverPersistTokens.delete(event.conversationId);
-          serverPersistParents.delete(event.conversationId);
-          clearFinalizedResponseIds(event.conversationId);
-          void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+          // Clear persistence ownership only when the terminal finalize did NOT fail with a retained
+          // accumulator (R169 f-1): if the append hit a transient write/read failure,
+          // accumulateForPersistence returns 'failed' and KEEPS the accumulator for a retry — clearing
+          // ownership here would orphan it (the next turn discards it), permanently losing a complete
+          // CLI/headless reply. Leave ownership intact so a subsequent finalize (a follow-up turn's
+          // drain, or a retry) can still persist it. On 'failed' we also keep runStatus as-is rather
+          // than declaring the turn done.
+          if (persistOutcome !== 'failed') {
+            serverPersistTokens.delete(event.conversationId);
+            serverPersistParents.delete(event.conversationId);
+            clearFinalizedResponseIds(event.conversationId);
+            void maybeAutoTitle(serverPersistAppHome, event.conversationId);
+          }
         }
       }
     } else if (fromCurrentRun && serverPersistAppHome && guiFallbackParents.has(event.conversationId)) {

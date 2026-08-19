@@ -17,6 +17,30 @@ type McpServerConfig = AppConfig['mcpServers'][number];
  *  bounded so it can never keep the turn (and its tool promise) alive. */
 const MCP_CALL_TIMEOUT_MS = 120_000;
 const MCP_CALL_MAX_TOTAL_MS = 600_000;
+// Per-step cap for the STARTUP handshake (connect + listTools). The MCP SDK defaults each to 60s;
+// servers are connected SERIALLY, so a couple of unreachable servers could stall the whole tool
+// registry (and every waiting CLI submit / GUI turn) for MINUTES (R169). Cap each step tightly so a
+// bad server fails fast and the rest register. Runtime tool CALLS keep the longer MCP_CALL_TIMEOUT_MS.
+const MCP_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** Reject with a timeout error if `p` doesn't settle within `ms`. Does NOT cancel `p` (the caller
+ *  tears down the client/transport on the thrown error), it just stops the caller from WAITING. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 type McpConnection = {
   name: string;
@@ -84,16 +108,47 @@ async function createTransport(server: McpServerConfig): Promise<Transport> {
   }
 
   if (server.url) {
-    // Try Streamable HTTP first (MCP 2025+), fall back to SSE
-    try {
-      const transport = new StreamableHTTPClientTransport(new URL(server.url));
-      return transport;
-    } catch {
-      return new SSEClientTransport(new URL(server.url));
-    }
+    // Default to Streamable HTTP (MCP 2025+); the SSE fallback is handled at CONNECT time
+    // (connectUrlWithFallback), not here — protocol negotiation fails inside client.connect, NOT at
+    // transport construction, so a construction-only try/catch never reached SSE (R169).
+    return new StreamableHTTPClientTransport(new URL(server.url));
   }
 
   throw new Error('Server must have either a "url" or "command" configured');
+}
+
+/** Connect a URL server, falling back from Streamable HTTP to SSE when the FIRST connect fails
+ *  (R169): the failure surfaces in client.connect (protocol negotiation), not at transport
+ *  construction, so a valid SSE-only endpoint must get a real SSE connect attempt. Each attempt is
+ *  time-boxed. Returns the transport that actually connected. */
+async function connectUrlWithFallback(client: Client, url: string): Promise<Transport> {
+  const httpTransport: Transport = new StreamableHTTPClientTransport(new URL(url));
+  try {
+    await withTimeout(client.connect(httpTransport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect (http)');
+    return httpTransport;
+  } catch (httpErr) {
+    try {
+      await httpTransport.close();
+    } catch {
+      /* ignore */
+    }
+    const sseTransport: Transport = new SSEClientTransport(new URL(url));
+    try {
+      await withTimeout(client.connect(sseTransport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect (sse)');
+      return sseTransport;
+    } catch (sseErr) {
+      try {
+        await sseTransport.close();
+      } catch {
+        /* ignore */
+      }
+      // Surface the SSE error (the last attempt), noting the HTTP attempt also failed.
+      throw new Error(
+        `MCP connect failed (http: ${httpErr instanceof Error ? httpErr.message : String(httpErr)}; ` +
+          `sse: ${sseErr instanceof Error ? sseErr.message : String(sseErr)})`,
+      );
+    }
+  }
 }
 
 export async function connectMcpServer(server: McpServerConfig): Promise<McpConnection> {
@@ -107,13 +162,19 @@ export async function connectMcpServer(server: McpServerConfig): Promise<McpConn
   let transport: Transport | null = null;
 
   try {
-    transport = await createTransport(server);
     client = new Client({ name: __BRAND_MCP_CLIENT_NAME, version: '1.0.0' });
 
-    await client.connect(transport);
+    if (server.url && !server.command) {
+      // URL server: connect with a Streamable-HTTP→SSE fallback, each attempt time-boxed.
+      transport = await connectUrlWithFallback(client, server.url);
+    } else {
+      transport = await createTransport(server);
+      await withTimeout(client.connect(transport), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP connect');
+    }
 
-    // Discover tools
-    const { tools: mcpTools } = await client.listTools();
+    // Discover tools (time-boxed so a server that accepts the connection but hangs on listTools
+    // can't stall the serial startup for the SDK-default 60s — R169).
+    const { tools: mcpTools } = await withTimeout(client.listTools(), MCP_HANDSHAKE_TIMEOUT_MS, 'MCP listTools');
     const tools: ToolDefinition[] = mcpTools.map((t) => ({
       name: buildScopedToolName('mcp', server.name, t.name),
       description: `[MCP: ${server.name}] ${t.description ?? t.name}`,
