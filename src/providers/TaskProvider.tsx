@@ -485,6 +485,20 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         });
         if (!task || !task.id) return false;
 
+        // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
+        // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
+        // roll back into an unmounted/disposed composer and lose the prompt. streamPlan resolves almost
+        // immediately (it launches the stream in the background and returns), and its deltas are broadcast
+        // async — so deferring the transition until after this await does not drop early stream events.
+        const res = await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
+        if (res && (res as { error?: boolean }).error) {
+          // Admission failed before streaming began — the composer is still mounted with the user's
+          // input/attachments intact (we never transitioned), so just clean up the placeholder task and
+          // report failure; no rollback into a live composer is needed.
+          void app.tasks.delete?.(task.id).catch(() => {});
+          return false;
+        }
+
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
 
         // Generate title in parallel (non-blocking)
@@ -494,15 +508,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             void app.tasks.update(task.id, { title });
           }
         });
-
-        // Start streaming the plan. streamPlan RESOLVES {taskId} even for in-band validation/config/model
-        // failures (it broadcasts an error stream event but doesn't reject), signalling those via
-        // {error:true} — treat that as a failed submission so the composer rolls back (R207).
-        const res = await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
-        if (res && (res as { error?: boolean }).error) {
-          dispatch({ type: 'CANCEL_AI_CREATE' });
-          return false;
-        }
         return true;
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);

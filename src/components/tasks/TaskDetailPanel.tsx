@@ -69,7 +69,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -432,14 +432,23 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       if (ok) return;
       if (activeTaskIdRef.current !== originTaskId) return; // switched task — keep the newer context intact
       const liveText = textareaRef.current?.value ?? '';
-      if (liveText.trim().length > 0 || attachments.length > 0) return; // a newer draft exists — don't clobber
+      if (liveText.trim().length > 0 || getResidentBytes() > 0) return; // a newer draft exists — don't clobber
       setInput(text);
       if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
     });
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, attachments, clearAttachments, addAttachments, task.id, refineTaskPlan, isActivelyStreaming]);
+  }, [
+    input,
+    attachments,
+    clearAttachments,
+    addAttachments,
+    getResidentBytes,
+    task.id,
+    refineTaskPlan,
+    isActivelyStreaming,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

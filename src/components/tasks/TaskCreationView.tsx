@@ -54,7 +54,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
   // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
   // is discarded on unmount automatically, so no cross-surface clearing is needed.
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -252,14 +252,22 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       images.length > 0 ? images : undefined,
     ).then((ok) => {
       if (ok) return;
-      // Don't clobber a newer draft the user started while the submission awaited (R207): only restore
-      // into an empty composer with no live attachments.
+      // Don't clobber a newer draft the user started while the submission awaited (R207/R208): read LIVE
+      // composer text + LIVE attachment state (getResidentBytes, not the stale closure snapshot).
       const liveText = textareaRef.current?.value ?? '';
-      if (liveText.trim().length > 0 || attachments.length > 0) return;
+      if (liveText.trim().length > 0 || getResidentBytes() > 0) return;
       setInput(text);
       if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
     });
-  }, [input, attachments, clearAttachments, addAttachments, startAITaskCreation, currentWorkingDirectory]);
+  }, [
+    input,
+    attachments,
+    clearAttachments,
+    addAttachments,
+    getResidentBytes,
+    startAITaskCreation,
+    currentWorkingDirectory,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
