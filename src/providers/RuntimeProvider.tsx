@@ -1118,15 +1118,38 @@ const rejectedDrafts = new Map<string, RejectedDraft[]>();
 // by a per-entry-id "counted" set so a re-enqueue of an already-counted entry (front-requeue) never
 // double-commits, and a drop of an uncounted entry never over-releases.
 const draftBytesCounted = new Set<string>();
+// Normalize an attachment's byte size (R196/R197): a corrupt persisted size (negative / NaN / string /
+// forged 0 on a large payload) must not flow into the accounting or the store's arithmetic. Derive from
+// the dataUrl when the recorded size is unusable. Shared by hydrate AND the cross-client claim path so
+// BOTH reconstruction sites (which both feed addAttachments + the byte counters) get a sane size.
+function attachmentSafeSize(a: AttachedFile): number {
+  const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
+  const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
+  return Math.max(recorded, fromDataUrl);
+}
+function normalizeAttachmentSizes(attachments: AttachedFile[]): AttachedFile[] {
+  return attachments.map((a) => {
+    const size = attachmentSafeSize(a);
+    return size === a.size ? a : { ...a, size };
+  });
+}
 function draftAttachmentBytes(entry: RejectedDraft): number {
-  // Sanitize PER attachment (R196): a single negative/NaN size must not cancel valid sizes or make the
-  // whole sum NaN. Fall back to the dataUrl byte length when the recorded size is missing/invalid/zero
-  // but a payload is present, so a forged 0 on a large dataUrl can't hide its real memory cost.
-  return entry.attachments.reduce((sum, a) => {
-    const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
-    const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
-    return sum + Math.max(recorded, fromDataUrl);
-  }, 0);
+  return entry.attachments.reduce((sum, a) => sum + attachmentSafeSize(a), 0);
+}
+// Deterministic id for a LEGACY id-less persisted draft (R197): two viewers hydrating the same on-disk
+// entry concurrently must mint the SAME id, or main keeps both (after dropping the id-less original) and
+// the draft restores twice. Derive it from the draft's stable content (text + attachment dataUrls +
+// stashedAt) with a cheap stable string hash — identical content ⇒ identical id, so main dedups by key.
+function deterministicLegacyDraftId(text: string, attachments: AttachedFile[], stashedAt: number): string {
+  const material = `${stashedAt} ${text} ${attachments.map((a) => a.dataUrl ?? '').join(' ')}`;
+  let h1 = 0x811c9dc5;
+  let h2 = 0xc2b2ae35;
+  for (let i = 0; i < material.length; i++) {
+    const c = material.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  return `legacy-${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
 }
 function retainDraftAttachmentBytes(entry: RejectedDraft): void {
   if (draftBytesCounted.has(entry.id)) return;
@@ -1145,10 +1168,14 @@ function releaseDraftAttachmentBytes(entry: RejectedDraft): void {
 // attachment bytes stay counted against the renderer-wide ceiling — visiting many chats with drafts
 // would otherwise accumulate unbounded resident memory and could exceed the cap / OOM. Restore only
 // ever targets the ACTIVE conversation, so dropping inactive mirrors is safe; they re-hydrate on return.
-// A conversation with a claim in flight is left intact so we don't race its lease.
+// A conversation with a claim in flight is left intact so we don't race its lease. A conversation whose
+// durable add-delta is still buffered/flushing is ALSO left intact (R197): unloading its memory mirror
+// before the disk write lands would lose the draft entirely if that write ultimately fails, and would
+// release its byte accounting while the retry buffer still holds the attachment data.
 function unloadInactiveDraftMirrors(keepConvId: string): void {
   for (const [convId, q] of [...rejectedDrafts]) {
     if (convId === keepConvId || draftClaimInFlight.has(convId)) continue;
+    if (pendingDraftDeltas.has(convId) || draftDeltaFlushing.has(convId)) continue; // durable write in flight
     for (const d of q) releaseDraftAttachmentBytes(d);
     rejectedDrafts.delete(convId);
   }
@@ -1270,7 +1297,9 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
       const d: RejectedDraft = {
         id: res.draft.id || id,
         text: res.draft.text,
-        attachments: (res.draft.attachments as RejectedDraft['attachments']) ?? [],
+        // Normalize sizes (R197): the claim reconstructs from RAW persisted attachments, so a corrupt
+        // size would otherwise reach addAttachments + bypass the aggregate counter.
+        attachments: normalizeAttachmentSizes((res.draft.attachments as RejectedDraft['attachments']) ?? []),
         stashedAt: res.draft.stashedAt,
       };
       dropRejectedDraftLocal(convId, d.id);
@@ -1445,19 +1474,16 @@ function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: u
   const migratedLegacyIds: RejectedDraft[] = []; // id-less legacy entries we minted an id for
   for (const d of raw as Array<{ id?: unknown; text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
     const text = typeof d?.text === 'string' ? d.text : '';
-    const rawAttachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
-    // Normalize each attachment's size on hydrate (R196): a corrupt persisted size (negative / NaN /
-    // string / forged 0 on a large payload) must not flow into the accounting or the store's arithmetic.
-    // Derive from the dataUrl when the recorded size is unusable.
-    const attachments = rawAttachments.map((a) => {
-      const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
-      const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
-      const size = Math.max(recorded, fromDataUrl);
-      return size === a.size ? a : { ...a, size };
-    });
+    // Normalize each attachment's size on hydrate (R196/R197): corrupt persisted sizes must not flow
+    // into accounting or the store. Shared with the claim path via normalizeAttachmentSizes.
+    const attachments = normalizeAttachmentSizes(
+      Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [],
+    );
     const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
     const hadId = typeof d?.id === 'string' && d.id.length > 0;
-    const id = hadId ? (d.id as string) : msgId();
+    // Legacy id-less entry: use a DETERMINISTIC content-derived id (R197) so concurrent viewers agree
+    // and main dedups instead of restoring the draft twice.
+    const id = hadId ? (d.id as string) : deterministicLegacyDraftId(text, attachments, stashedAt);
     if (text.trim().length === 0 && attachments.length === 0) continue;
     const entry = { id, text, attachments, stashedAt };
     restored.push(entry);

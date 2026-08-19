@@ -333,6 +333,10 @@ export class PiRuntime implements AgentRuntime {
           const idle = Date.now() - lastReadAt >= IDLE_MS && spawned.stdout.readableLength === 0;
           if (idle || Date.now() >= HARD_DEADLINE) {
             spawned.stdout.destroy();
+            // `exited` resolves on 'close', which needs EVERY stdio stream closed — a TERM-resistant
+            // descendant holding stderr open would keep 'close' from firing even after stdout is
+            // destroyed, hanging finalization forever (R197). Destroy stderr too so 'close' can complete.
+            if (!spawned.stderr.destroyed) spawned.stderr.destroy();
             return;
           }
           const t = setTimeout(tick, IDLE_MS);
