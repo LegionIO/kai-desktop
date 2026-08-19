@@ -136,12 +136,15 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       // notice instead of showing a chip that would be silently cleared without being sent.
       const images = (result.files ?? []).filter((f) => f.isImage);
       const nonImages = (result.files ?? []).filter((f) => !f.isImage).map((f) => f.name);
-      if (images.length > 0) addAttachments(images);
+      // Surface images the renderer-wide budget rejected (R202): addAttachments returns {skipped} when
+      // another store / in-flight reservation consumed the cap — otherwise they'd vanish with no chip.
+      const overCap = images.length > 0 ? addAttachments(images).skipped : [];
       if (nonImages.length > 0) {
         showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImages.join(', ')}`);
       } else if (result.skipped && result.skipped.length > 0) {
         showAttachNotice(result.skipped);
       }
+      if (overCap.length > 0) showAttachNotice(overCap);
     } catch (err) {
       console.error('Attach failed:', err);
     }

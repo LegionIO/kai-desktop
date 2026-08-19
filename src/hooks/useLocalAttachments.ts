@@ -79,6 +79,9 @@ export function useLocalAttachments() {
   // its bytes into the renderer-wide committed counter forever. Mark disposed so a late async read's
   // addAttachments can't re-commit bytes after this release.
   useEffect(() => {
+    // Reset on (re)mount so React 18 StrictMode's dev setup→cleanup→setup on the SAME ref doesn't leave
+    // the store permanently disposed (which would reject every subsequent add in development) — R202.
+    disposedRef.current = false;
     return () => {
       disposedRef.current = true;
       const releasedBytes = ref.current.reduce((sum, f) => sum + (f.size || 0), 0);

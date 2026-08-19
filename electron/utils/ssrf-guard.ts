@@ -45,6 +45,34 @@ export function isPrivateAddress(addr: string, family: 4 | 6): boolean {
 }
 
 /**
+ * Resolve a URL's hostname and report whether ANY resolved address is private/local (R202). IP-literal
+ * hosts are checked directly (no DNS). This closes the wildcard-DNS / DNS-rebinding hole for consumers
+ * that CANNOT route through {@link guardedDispatcher} — notably Electron BrowserWindow traffic, whose
+ * webRequest.onBeforeRequest only sees the URL string, so `127.0.0.1.nip.io` (a public name resolving to
+ * loopback) would otherwise pass a syntax-only check. Fails CLOSED: a resolution error → treated as
+ * disallowed (`true`), since we can't prove the target is public. Only meaningful for http(s)/ws(s).
+ */
+export async function urlResolvesToPrivate(url: string): Promise<boolean> {
+  let host: string;
+  try {
+    host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return true; // unparseable → fail closed
+  }
+  const literalFamily = isIP(host);
+  if (literalFamily !== 0) return isPrivateAddress(host, literalFamily as 4 | 6);
+  return new Promise<boolean>((resolve) => {
+    dnsLookup(host, { all: true }, (err, addrs) => {
+      if (err || !addrs || addrs.length === 0) return resolve(true); // can't resolve → fail closed
+      for (const a of addrs as LookupAddress[]) {
+        if (isPrivateAddress(a.address, a.family as 4 | 6)) return resolve(true);
+      }
+      resolve(false);
+    });
+  });
+}
+
+/**
  * undici dispatcher whose socket-level DNS lookup rejects any resolution that
  * lands on a private/local address. The hook runs for the ACTUAL connection
  * (and every redirect hop), so the checked address is the dialled address —

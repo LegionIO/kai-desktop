@@ -9,7 +9,7 @@ import type {
 import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
 import { applyBrandUserAgent } from '../../utils/user-agent.js';
-import { isUrlAllowed } from '../../utils/ssrf-guard.js';
+import { isUrlAllowed, urlResolvesToPrivate } from '../../utils/ssrf-guard.js';
 import type { AppConfig } from '../../config/schema.js';
 
 const windows = new Map<string, BrowserWindow>();
@@ -196,12 +196,20 @@ function ensureWindow(sessionId: string): BrowserWindow {
         return;
       }
       const urlForGuard = wsMatch ? details.url.replace(/^ws(s?):/i, (_m, s) => (s ? 'https:' : 'http:')) : details.url;
-      const decision = checkIsolatedBrowserNavigation(urlForGuard, false);
-      if (!decision.ok) {
-        callback({ cancel: true });
-        return;
-      }
-      callback({});
+      // RESOLVE the hostname and reject if it lands on a private/local address (R202): a syntax-only
+      // check passes wildcard-DNS names like 127.0.0.1.nip.io, and BrowserWindow traffic never routes
+      // through the guarded DNS dispatcher safeFetch uses. Async is fine — onBeforeRequest's callback is
+      // deferred. Fails closed on a resolution error.
+      void urlResolvesToPrivate(urlForGuard)
+        .then((isPrivate) => {
+          if (isPrivate) {
+            console.error(`[isolated-browser] blocked private-network subresource: ${details.url}`);
+            callback({ cancel: true });
+          } else {
+            callback({});
+          }
+        })
+        .catch(() => callback({ cancel: true }));
     });
   } catch {
     /* webRequest unavailable — navigation guards above are the primary defense */
