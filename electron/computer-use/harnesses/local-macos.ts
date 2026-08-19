@@ -659,7 +659,16 @@ export class LocalMacosHarness implements ComputerHarness {
     return buildResult(`Scrolled by ${deltaX}, ${deltaY}.`, cursor);
   }
 
-  async typeText(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
+  async typeText(
+    _session: ComputerSession,
+    action: ComputerActionProposal,
+    context?: ComputerHarnessActionContext,
+  ): Promise<ComputerHarnessActionResult> {
+    // Honor a Stop that already landed before this action starts (R171): the orchestrator now
+    // registers an active-run controller around an approved action, so context.signal is real. The
+    // helper types the whole string in one process (no per-char JS loop to interrupt mid-run), so the
+    // effective cancellation point is BEFORE the spawn — don't start a long typing burst if aborted.
+    if (context?.signal?.aborted) throw new Error('cancelled');
     const text = action.text ?? '';
     const encoded = Buffer.from(text, 'utf-8').toString('base64');
     const delayMs = Math.max(8, Math.min(action.waitMs ?? 45, 250));
@@ -667,7 +676,12 @@ export class LocalMacosHarness implements ComputerHarness {
     return buildResult(`Typed ${JSON.stringify(text)}.`);
   }
 
-  async pressKeys(_session: ComputerSession, action: ComputerActionProposal): Promise<ComputerHarnessActionResult> {
+  async pressKeys(
+    _session: ComputerSession,
+    action: ComputerActionProposal,
+    context?: ComputerHarnessActionContext,
+  ): Promise<ComputerHarnessActionResult> {
+    if (context?.signal?.aborted) throw new Error('cancelled');
     const keys = action.keys ?? [];
     const encoded = Buffer.from(JSON.stringify(keys), 'utf-8').toString('base64');
     const delayMs = Math.max(12, Math.min(action.waitMs ?? 60, 400));

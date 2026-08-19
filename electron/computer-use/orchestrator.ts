@@ -154,6 +154,12 @@ export function approvalRequired(
 
   if (mode === 'autonomous') return false;
 
+  // STEP mode = "Approve every action" (the UI contract): EVERY action requires approval regardless
+  // of the model's self-reported risk/requiresApproval (R171). Without this, a low-risk-labelled
+  // click/doubleClick/navigate fell through to the model-provided requiresApproval and could execute
+  // unapproved in step mode. The model can only RAISE the bar, never lower it below "always ask".
+  if (mode === 'step') return true;
+
   // Server-side risk FLOOR: the action's `risk`/`requiresApproval` fields come
   // from the model's own output (provider-adapters/shared.ts), so a model could
   // self-label an inherently risky action (openApp/focusWindow/pressKeys/
@@ -607,19 +613,35 @@ export class ComputerUseOrchestrator {
     const action = session.actions.find((candidate) => candidate.id === actionId);
     if (!action) return;
     const harness = getHarness(this.getConfig(), session, this.getConfig);
+    // Establish a fresh active-run controller for the duration of the approved-action execution
+    // (R171): at approval-request time the prior run's controller was removed, so activeRuns had NO
+    // entry — the action ran with an undefined signal and pressing Stop during a long approved
+    // typeText/drag couldn't cancel it. Register a controller so stop()/pause() can abort THIS
+    // execution, and pass its signal into executeAction. Compare-and-delete on cleanup so a
+    // concurrent resume's controller isn't evicted.
+    let controller: AbortController | null = null;
+    if (!this.activeRuns.has(sessionId)) {
+      controller = new AbortController();
+      this.activeRuns.set(sessionId, controller);
+    }
     try {
       await harness.initialize(session);
-      // Thread the session's active-run abort signal (if any) so a stop/pause
-      // during an approved-action execution can propagate + the post-await fence
-      // in executeAction discards a resurrecting write.
+      // Thread the session's active-run abort signal so a stop/pause during an approved-action
+      // execution propagates + the post-await fence in executeAction discards a resurrecting write.
       await this.executeAction(
         harness,
         { ...action, status: 'running' },
         this.activeRuns.get(sessionId)?.signal,
         sessionId,
       );
+      if (controller && this.activeRuns.get(sessionId) === controller) {
+        this.activeRuns.delete(sessionId);
+      }
       this.resume(sessionId);
     } catch (error) {
+      if (controller && this.activeRuns.get(sessionId) === controller) {
+        this.activeRuns.delete(sessionId);
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.markActionFailed(sessionId, actionId, message);
       this.mutateSession(sessionId, (current) => ({

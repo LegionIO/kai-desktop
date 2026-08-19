@@ -264,6 +264,19 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             }
           }
 
+          // Touch the config so the change fans out to the tools hot-reload (R171): an `edit` only
+          // rewrites skill.json / files on disk, which — with no directory watcher — would NOT trigger
+          // handleConfigChanged, so the OLD manifest/HTTP/prompt workflow stayed active until restart.
+          // Writing config (unchanged shape, directory normalized like create/delete) fires the
+          // config-changed broadcast → handleConfigChanged → the skills content-fingerprint (which now
+          // includes skill.json mtime) detects the edit and reloads the skill's tool.
+          config.skills = {
+            ...config.skills,
+            enabled: config.skills?.enabled ?? [],
+            directory: config.skills?.directory ?? join(appHome, 'skills'),
+          };
+          writeDesktopConfig(appHome, config);
+
           return {
             success: true,
             updated,

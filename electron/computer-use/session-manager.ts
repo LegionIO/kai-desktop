@@ -85,12 +85,33 @@ function readActiveConversationId(appHome: string): string | null {
 }
 
 function normalizeHydratedSession(session: ComputerSession): ComputerSession {
+  // On restart hydration there is NO orchestrator run backing a session, so any TRANSIENT state is
+  // stale (R171): a persisted 'starting'/'running'/'awaiting-approval' session would block new
+  // sessions (capacity/singleton checks) and — worst — APPROVING a persisted pending request would
+  // execute its OLD coordinates against the CURRENT desktop. Downgrade transient session status to
+  // 'paused' (user can explicitly resume, which starts a fresh run), demote in-flight ACTION states
+  // to a safe terminal/proposed state, and INVALIDATE pending approvals so a stale click can't fire.
+  const TRANSIENT_SESSION: ComputerSession['status'][] = ['starting', 'running', 'awaiting-approval'];
+  const nextStatus: ComputerSession['status'] = TRANSIENT_SESSION.includes(session.status) ? 'paused' : session.status;
   return {
     ...session,
+    status: nextStatus,
     actions: session.actions.map((action) => ({
       ...action,
       movementPath: action.movementPath ?? 'teleport',
+      // A 'running' action never resumed after restart → mark failed; an 'awaiting-approval'/'approved'
+      // action's approval is now stale (coordinates may not match the current desktop) → back to
+      // 'proposed' so the model must re-propose against the live screen rather than execute blindly.
+      status:
+        action.status === 'running'
+          ? 'failed'
+          : action.status === 'awaiting-approval' || action.status === 'approved'
+            ? 'proposed'
+            : action.status,
     })),
+    // Drop still-pending approvals: their action is no longer awaiting-approval, and executing a
+    // persisted approval against the current desktop is unsafe — mark them rejected so nothing fires.
+    approvals: session.approvals.map((a) => (a.status === 'pending' ? { ...a, status: 'rejected' as const } : a)),
   };
 }
 

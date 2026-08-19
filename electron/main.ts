@@ -163,7 +163,7 @@ import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
-import { safeReadFileWithin } from './utils/safe-file-read.js';
+import { safeReadFileWithin, safeReadRangeWithin } from './utils/safe-file-read.js';
 
 /**
  * Open a URL in the OS default handler, but ONLY for safe web schemes. Displayed
@@ -2512,11 +2512,6 @@ if (gotSingleInstanceLock) {
         return new Response('Forbidden', { status: 403 });
       }
 
-      const data = safeReadFileWithin(mediaDir, filePath);
-      if (!data) {
-        return new Response('Not Found', { status: 404 });
-      }
-
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
       const mimeTypes: Record<string, string> = {
         png: 'image/png',
@@ -2535,8 +2530,64 @@ if (gotSingleInstanceLock) {
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 
+      // Honor a Range request (R171) so a media element (esp. <video preload="metadata">) can fetch
+      // just the bytes it needs instead of making us buffer the WHOLE file (up to 512MiB) into memory.
+      // Parse a single `bytes=start-end` range; multi-range is uncommon for media and we fall back to
+      // a full read for it.
+      const rangeHeader = request.headers.get('Range') || request.headers.get('range');
+      const singleRange = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+      if (singleRange) {
+        // Need the size first; do a bounded ranged read starting at the requested offset.
+        const startStr = singleRange[1];
+        const endStr = singleRange[2];
+        // Suffix range (bytes=-N) → last N bytes; needs the size, so read once to learn it via a
+        // best-effort full-containment stat. We resolve start/end after a small probe read.
+        const MEDIA_CHUNK = 4 * 1024 * 1024; // serve at most 4MiB per range response
+        let start: number;
+        let end: number;
+        if (startStr === '' && endStr !== '') {
+          // suffix range — resolve against size from a 1-byte probe (cheap) to get total length
+          const probe = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+          if (!probe) return new Response('Not Found', { status: 404 });
+          const suffix = Math.min(parseInt(endStr, 10), probe.size);
+          start = Math.max(0, probe.size - suffix);
+          end = probe.size - 1;
+        } else {
+          start = startStr === '' ? 0 : parseInt(startStr, 10);
+          end = endStr === '' ? start + MEDIA_CHUNK - 1 : parseInt(endStr, 10);
+          // Cap the served span so a `bytes=0-` request doesn't buffer the whole file.
+          end = Math.min(end, start + MEDIA_CHUNK - 1);
+        }
+        const ranged = safeReadRangeWithin(mediaDir, filePath, start, end);
+        if (!ranged) {
+          // Unsatisfiable / not found — probe existence to choose 416 vs 404.
+          const exists = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+          if (exists) {
+            return new Response('Range Not Satisfiable', {
+              status: 416,
+              headers: { 'Content-Range': `bytes */${exists.size}` },
+            });
+          }
+          return new Response('Not Found', { status: 404 });
+        }
+        return new Response(new Uint8Array(ranged.data), {
+          status: 206,
+          headers: {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${ranged.start}-${ranged.end}/${ranged.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(ranged.data.length),
+            'Cache-Control': 'no-cache',
+          },
+        });
+      }
+
+      const data = safeReadFileWithin(mediaDir, filePath);
+      if (!data) {
+        return new Response('Not Found', { status: 404 });
+      }
       return new Response(new Uint8Array(data), {
-        headers: { 'Content-Type': contentType, 'Cache-Control': 'no-cache' },
+        headers: { 'Content-Type': contentType, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-cache' },
       });
     });
 
@@ -2695,6 +2746,18 @@ if (gotSingleInstanceLock) {
         // CLI agent:submit calls don't hang forever awaiting a registry that
         // will never arrive. registerTools() flips the ready latch.
         registerTools(getRegisteredTools());
+        // Enable hot-reloads even on build failure (R171): otherwise a single initial-build rejection
+        // would DEFER every config-driven MCP/skill/CLI reload forever (until restart). Re-run any
+        // change that arrived during the (failed) build so config still takes effect live.
+        initialToolsRegistered = true;
+        if (configChangedDuringStartup) {
+          configChangedDuringStartup = false;
+          try {
+            handleConfigChanged(getConfig());
+          } catch (e) {
+            console.error(`[${__BRAND_PRODUCT_NAME}] deferred config hot-reload failed:`, e);
+          }
+        }
       });
 
     void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {

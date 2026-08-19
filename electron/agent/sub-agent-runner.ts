@@ -1020,7 +1020,23 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       // (R170 f-9). Previously only turnText was pushed, so a tool-only turn contributed nothing and a
       // `continue` re-ran without the tool evidence/side effects. Build assistant content = [text?, …
       // tool-call parts]; follow with a `tool` message holding the results so the model sees outcomes.
+      // CRITICAL (R171): every tool-call part MUST have a matching tool-result, or strict providers
+      // (Anthropic) reject the request with an orphaned tool_use. A stream error/abort after a
+      // tool-call but before its result leaves an orphan — SYNTHESIZE an error result for any
+      // unmatched call so the pairing is complete AND the evidence that the call happened is kept.
       if (turnText || turnToolParts.length > 0) {
+        const resultIds = new Set(turnToolResults.map((r) => r.toolCallId));
+        const completeResults = [...turnToolResults];
+        for (const p of turnToolParts) {
+          if (!resultIds.has(p.toolCallId)) {
+            completeResults.push({
+              type: 'tool-result',
+              toolCallId: p.toolCallId,
+              toolName: p.toolName,
+              result: { isError: true, error: 'Tool call did not complete (turn ended before a result).' },
+            });
+          }
+        }
         const assistantContent: Array<Record<string, unknown>> = [];
         if (turnText) assistantContent.push({ type: 'text', text: turnText });
         for (const p of turnToolParts) assistantContent.push({ ...p });
@@ -1030,8 +1046,8 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             ? { role: 'assistant', content: assistantContent }
             : { role: 'assistant', content: turnText },
         );
-        if (turnToolResults.length > 0) {
-          messages.push({ role: 'tool', content: turnToolResults.map((r) => ({ ...r })) });
+        if (completeResults.length > 0) {
+          messages.push({ role: 'tool', content: completeResults.map((r) => ({ ...r })) });
         }
       }
 

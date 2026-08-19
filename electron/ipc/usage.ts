@@ -161,6 +161,11 @@ function readEventStore(): UsageEventStore {
 
 export function recordUsageEvent(event: Omit<UsageEvent, 'id' | 'timestamp'>): void {
   if (!_appHome) return;
+  // Validate + bound the event (R171): usage:record-event is reachable from the web bridge (a network
+  // trust boundary), so an anonymous client could otherwise append near-4-MiB events unboundedly —
+  // filling disk and making the full-log read in reports OOM/stall the main process. Require a plain
+  // object and cap the SERIALIZED size; drop anything malformed or oversized rather than persist it.
+  if (!event || typeof event !== 'object' || Array.isArray(event)) return;
   // Fold any legacy JSON store into the NDJSON log first so this event lands in
   // the same place history will be read from.
   migrateLegacyStoreIfNeeded();
@@ -169,8 +174,21 @@ export function recordUsageEvent(event: Omit<UsageEvent, 'id' | 'timestamp'>): v
     id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp: new Date().toISOString(),
   };
-  // O(1) append — no read-modify-write of the whole log.
-  appendFileSync(eventLogPath(), serializeEventLine(full));
+  const line = serializeEventLine(full);
+  const MAX_EVENT_BYTES = 16 * 1024; // a usage event is small counters/ids; 16KiB is generous
+  if (Buffer.byteLength(line, 'utf-8') > MAX_EVENT_BYTES) {
+    console.error('[usage] dropping oversized usage event', { bytes: Buffer.byteLength(line, 'utf-8') });
+    return;
+  }
+  // O(1) append — no read-modify-write of the whole log. Throw-SAFE (R171): recordUsageEvent runs
+  // inside stream broadcasting (a successful LLM turn) and after media generation; a disk-full/EACCES
+  // appendFileSync throw would otherwise turn a successful response into a terminal error, or report
+  // failure for media that was already created. Telemetry must never break the operation it measures.
+  try {
+    appendFileSync(eventLogPath(), line);
+  } catch (err) {
+    console.error('[usage] failed to append usage event (non-fatal)', err);
+  }
 }
 
 // ── Conversation metadata (from conversations.json) ─────────────────────────

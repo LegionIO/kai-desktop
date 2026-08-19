@@ -125,6 +125,18 @@ function clampCoordinate(value: number, max: number): number {
   return Math.max(0, Math.min(Math.round(value), max - 1));
 }
 
+// Module-level accessor for the isolatedBrowserAllowPrivateNetwork flag so the module-scope
+// ensureWindow's navigation guards (will-redirect / will-navigate) can consult live config even
+// though they aren't on the harness instance. Set by the harness constructor (R171).
+let isolatedBrowserAllowPrivateResolver: (() => boolean) | null = null;
+function resolveIsolatedBrowserAllowPrivate(): boolean {
+  try {
+    return isolatedBrowserAllowPrivateResolver?.() ?? false;
+  } catch {
+    return false; // fail closed
+  }
+}
+
 function ensureWindow(sessionId: string): BrowserWindow {
   const existing = windows.get(sessionId);
   if (existing && !existing.isDestroyed()) return existing;
@@ -148,6 +160,20 @@ function ensureWindow(sessionId: string): BrowserWindow {
   });
   applyBrandUserAgent(win.webContents);
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // Re-validate EVERY redirect + top-level navigation against the SSRF guard (R171): the initial
+  // navigate() URL is checked, but a public URL can 3xx-redirect (or a page can navigate) to
+  // loopback / 169.254.169.254 (cloud metadata) / a private host — which the browser would otherwise
+  // follow, exposing internal services to computer-use capture. Veto any target that fails the guard.
+  const guardNavigation = (event: { preventDefault: () => void }, targetUrl: string): void => {
+    const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+    const decision = checkIsolatedBrowserNavigation(targetUrl, allowPrivate);
+    if (!decision.ok) {
+      event.preventDefault();
+      console.error(`[isolated-browser] blocked navigation/redirect to ${targetUrl}: ${decision.reason}`);
+    }
+  };
+  win.webContents.on('will-redirect', (event, targetUrl) => guardNavigation(event, targetUrl));
+  win.webContents.on('will-navigate', (event, targetUrl) => guardNavigation(event, targetUrl));
   windows.set(sessionId, win);
   return win;
 }
@@ -751,7 +777,11 @@ async function dispatchChromiumDrag(
 export class IsolatedBrowserHarness implements ComputerHarness {
   readonly target = 'isolated-browser' as const;
 
-  constructor(private readonly getConfig?: () => AppConfig) {}
+  constructor(private readonly getConfig?: () => AppConfig) {
+    // Expose the allow-private flag to the module-scope navigation guards (R171).
+    isolatedBrowserAllowPrivateResolver = () =>
+      this.getConfig?.().computerUse.safety.isolatedBrowserAllowPrivateNetwork ?? false;
+  }
 
   async initialize(session: ComputerSession): Promise<void> {
     const win = ensureWindow(session.id);
