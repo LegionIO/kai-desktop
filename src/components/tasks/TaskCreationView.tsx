@@ -27,7 +27,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
-import { filterAttachmentsBySize } from '@/lib/attachment-limits';
+import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 import { cn, refocusComposer } from '@/lib/utils';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
@@ -46,7 +46,7 @@ interface TaskCreationViewProps {
 
 export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: _onCancel }) => {
   const { startAITaskCreation, selectTask } = useTasks();
-  const { attachments, addAttachments, removeAttachment } = useAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -83,7 +83,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const hasFileAttachments = attachments.length > 0;
-  const canSend = input.trim().length > 0 || attachments.length > 0;
+  // AI task creation carries only text through startAITaskCreation — attachments cannot be submitted
+  // (R185). Require text so the Send button is never enabled for an attachment-only selection that would
+  // silently do nothing, and so staged files can't leak into a later chat send from the shared store.
+  const canSend = input.trim().length > 0;
 
   // ── File attach / directory handlers ────────────────────────────────
   const isWebBridge = Boolean(
@@ -95,17 +98,18 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // file) (R183) — without this the user picks a file and nothing happens (silent no-op).
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
   const attachNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showAttachNotice = useCallback((skipped: string[]) => {
-    if (skipped.length === 0) return;
+  const showAttachMessage = useCallback((message: string) => {
+    if (!message) return;
     if (attachNoticeTimerRef.current) clearTimeout(attachNoticeTimerRef.current);
-    const names = skipped.join(', ');
-    setAttachNotice(
-      skipped.length === 1
-        ? `Couldn't attach ${names} (too large or not a regular file).`
-        : `Couldn't attach ${skipped.length} files (too large or not regular files): ${names}`,
-    );
+    setAttachNotice(message);
     attachNoticeTimerRef.current = setTimeout(() => setAttachNotice(null), 6000);
   }, []);
+  const showAttachNotice = useCallback(
+    (skipped: string[]) => {
+      showAttachMessage(skippedAttachmentsNotice(skipped) ?? '');
+    },
+    [showAttachMessage],
+  );
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -143,11 +147,14 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       size: number;
       dataUrl: string;
       text?: string;
-    }>[] = [];
+    } | null>[] = [];
     for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
+          // Resolve null on error/abort (R185) so one unreadable file can't hang Promise.all.
+          reader.onerror = () => resolve(null);
+          reader.onabort = () => resolve(null);
           reader.onload = () => {
             const dataUrl = reader.result as string;
             const isImage = file.type.startsWith('image/');
@@ -157,7 +164,15 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
         }),
       );
     }
-    void Promise.all(readers).then((results) => addAttachments(results));
+    void Promise.all(readers).then((results) => {
+      const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+      const unreadable = accepted.length - attachable.length;
+      if (attachable.length > 0) {
+        const { skipped: overCap } = addAttachments(attachable);
+        if (overCap.length > 0) showAttachNotice(overCap);
+      }
+      if (unreadable > 0) showAttachMessage(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+    });
   };
 
   const handleAttachDirectory = async () => {
@@ -188,6 +203,12 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  // Clear any staged attachments when leaving task creation (R185): they can't be submitted with an
+  // AI task, so the shared attachment store must not carry them into a subsequent chat send.
+  useEffect(() => {
+    return () => clearAttachments();
+  }, [clearAttachments]);
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();

@@ -448,6 +448,10 @@ export function registerRealtimeHandlers(
       // traverse the Mastra plan-mode chokepoint, so filter here too. Recordless calls fall back to
       // the GLOBAL executionMode; present-but-unreadable fails CLOSED.
       let realtimePlanFirst = resolveRealtimePlanFirst(appHome, conversationId, config);
+      // The gate actually baked into the session's INITIAL tools below. Install compares against THIS
+      // (not a mutated local) to decide whether a reload is needed — so it reapplies exactly when the
+      // authoritative resolution has diverged from what's installed, and stays a no-op otherwise.
+      const initialPlanFirst = realtimePlanFirst;
       // Record on the pending start so tool-replacement paths that run BEFORE install gate correctly.
       if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
       const tools = gateRealtimeTools(availableTools, allowBrowserTools, realtimePlanFirst);
@@ -518,20 +522,22 @@ export function registerRealtimeHandlers(
         void scheduleAssistantTabCleanup(conversationId, session.browserOwnerId);
         browserRunRegistered = false;
       }
-      // Re-resolve plan-first at INSTALL time (R182): the mode was frozen before the async connect,
-      // so a Plan-First toggle (or a conversation record written) while connecting would otherwise
-      // leave mutating tools attached to the freshly-installed session until the next tool reload.
-      // Fail-closed: only ever tighten toward plan-first here, never relax an in-flight plan-first
-      // resolution into auto based on a mid-connect state we can't fully trust.
-      const installPlanFirst = resolveRealtimePlanFirst(appHome, conversationId, getConfig());
-      const effectivePlanFirst = realtimePlanFirst || installPlanFirst;
-      const planFirstChanged = effectivePlanFirst !== realtimePlanFirst;
-      realtimePlanFirst = effectivePlanFirst;
-      if (browserToolsStillAuthorized !== allowBrowserTools || planFirstChanged) {
+      // Re-resolve plan-first at INSTALL time (R182/R185): the mode was frozen before the async
+      // connect, so a Plan-First toggle (or a conversation record written) while connecting would
+      // otherwise leave the wrong tool set on the freshly-installed session. resolveRealtimePlanFirst
+      // is itself fail-CLOSED (present-but-unreadable / throw → plan-first), so its result is the
+      // authoritative gate — use it directly rather than OR-ing in the stale captured value, which
+      // could DIVERGE tools from the flag (a start relaxed to Auto mid-connect by
+      // onRealtimeExecutionModeChanged would keep those Auto tools while a `stale || fresh` set the flag
+      // back to plan-first, and an equality guard against the stale value would then skip the reload).
+      // Reapply the gate iff the authoritative (browser-authority, plan-first) pair differs from what
+      // was actually installed — correct AND still a no-op when nothing changed.
+      realtimePlanFirst = resolveRealtimePlanFirst(appHome, conversationId, getConfig());
+      if (browserToolsStillAuthorized !== allowBrowserTools || realtimePlanFirst !== initialPlanFirst) {
         session.updateTools(gateRealtimeTools(getTools(), browserToolsStillAuthorized, realtimePlanFirst));
       }
       // Keep the pending-start flag in sync with the re-resolved mode so a tool-reload racing this
-      // install gates against the tightened value, not the pre-connect one.
+      // install gates against the authoritative value, not the pre-connect one.
       if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
       activeSession = session;
       // Set timing/attribution at INSTALL time so a superseded start can't leave

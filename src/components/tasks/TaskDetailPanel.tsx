@@ -33,7 +33,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
-import { filterAttachmentsBySize } from '@/lib/attachment-limits';
+import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
@@ -62,7 +62,7 @@ interface TaskDetailPanelProps {
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
   const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
-  const { attachments, addAttachments, removeAttachment } = useAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -109,6 +109,12 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   });
 
+  // Clear any staged attachments when leaving the task detail (R185): they can't be submitted with
+  // refineTaskPlan, so the shared attachment store must not carry them into a subsequent chat send.
+  useEffect(() => {
+    return () => clearAttachments();
+  }, [clearAttachments]);
+
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId
   const [activeTerminalTab, setActiveTerminalTab] = useState<string | null>(null);
@@ -149,7 +155,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const hasFileAttachments = attachments.length > 0;
-  const canSend = input.trim().length > 0 || attachments.length > 0;
+  // refineTaskPlan carries only text — attachments cannot be submitted here (R185). Require text so an
+  // attachment-only send isn't a silent no-op and staged files can't leak into a later chat send.
+  const canSend = input.trim().length > 0;
 
   // File attach handlers
   const isWebBridge = Boolean(
@@ -161,17 +169,18 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   // (R183) — otherwise picking such a file is a silent no-op.
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
   const attachNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showAttachNotice = useCallback((skipped: string[]) => {
-    if (skipped.length === 0) return;
+  const showAttachMessage = useCallback((message: string) => {
+    if (!message) return;
     if (attachNoticeTimerRef.current) clearTimeout(attachNoticeTimerRef.current);
-    const names = skipped.join(', ');
-    setAttachNotice(
-      skipped.length === 1
-        ? `Couldn't attach ${names} (too large or not a regular file).`
-        : `Couldn't attach ${skipped.length} files (too large or not regular files): ${names}`,
-    );
+    setAttachNotice(message);
     attachNoticeTimerRef.current = setTimeout(() => setAttachNotice(null), 6000);
   }, []);
+  const showAttachNotice = useCallback(
+    (skipped: string[]) => {
+      showAttachMessage(skippedAttachmentsNotice(skipped) ?? '');
+    },
+    [showAttachMessage],
+  );
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -209,11 +218,14 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       size: number;
       dataUrl: string;
       text?: string;
-    }>[] = [];
+    } | null>[] = [];
     for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
+          // Resolve null on error/abort (R185) so one unreadable file can't hang Promise.all.
+          reader.onerror = () => resolve(null);
+          reader.onabort = () => resolve(null);
           reader.onload = () => {
             const dataUrl = reader.result as string;
             const isImage = file.type.startsWith('image/');
@@ -223,7 +235,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         }),
       );
     }
-    void Promise.all(readers).then((results) => addAttachments(results));
+    void Promise.all(readers).then((results) => {
+      const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+      const unreadable = accepted.length - attachable.length;
+      if (attachable.length > 0) {
+        const { skipped: overCap } = addAttachments(attachable);
+        if (overCap.length > 0) showAttachNotice(overCap);
+      }
+      if (unreadable > 0) showAttachMessage(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+    });
   };
 
   const handleAttachDirectory = async () => {

@@ -2004,16 +2004,15 @@ const Composer: FC<{
         skipped?: string[];
       };
       if (result.canceled) return;
-      if (result.files && result.files.length > 0) addAttachments(result.files);
-      // Main skips files that are too large or not regular files (R182). Without this the user picks a
-      // file and nothing happens — surface it in the composer notice so the action isn't a silent no-op.
-      if (result.skipped && result.skipped.length > 0) {
-        const names = result.skipped.join(', ');
-        showComposerNotice(
-          result.skipped.length === 1
-            ? `Couldn't attach ${names} (too large or not a regular file).`
-            : `Couldn't attach ${result.skipped.length} files (too large or not regular files): ${names}`,
-        );
+      // Merge files skipped by MAIN (too large / not a regular file) with any rejected by the renderer
+      // aggregate backstop, and surface the combined list so the action is never a silent no-op.
+      const skippedNames = [...(result.skipped ?? [])];
+      if (result.files && result.files.length > 0) {
+        const { skipped: overCap } = addAttachments(result.files);
+        skippedNames.push(...overCap);
+      }
+      if (skippedNames.length > 0) {
+        showComposerNotice(skippedAttachmentsNotice(skippedNames) ?? '');
       }
     } catch (err) {
       console.error('Attach failed:', err);
@@ -2037,17 +2036,23 @@ const Composer: FC<{
       size: number;
       dataUrl: string;
       text?: string;
-    }>[] = [];
+    } | null>[] = [];
     for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
+          // Resolve null on read error/abort (R185) so one unreadable file can't leave Promise.all
+          // pending forever and swallow the successfully-read files.
+          reader.onerror = () => resolve(null);
+          reader.onabort = () => resolve(null);
           reader.onload = () => {
             const dataUrl = reader.result as string;
             const isImage = file.type.startsWith('image/');
             const isText = file.type.startsWith('text/') || file.type === 'application/json';
             if (isText) {
               const textReader = new FileReader();
+              textReader.onerror = () => resolve(null);
+              textReader.onabort = () => resolve(null);
               textReader.onload = () =>
                 resolve({
                   name: file.name,
@@ -2072,7 +2077,15 @@ const Composer: FC<{
         }),
       );
     }
-    void Promise.all(readers).then((results) => addAttachments(results));
+    void Promise.all(readers).then((results) => {
+      const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+      const unreadable = accepted.length - attachable.length;
+      if (attachable.length > 0) {
+        const { skipped: overCap } = addAttachments(attachable);
+        if (overCap.length > 0) showComposerNotice(skippedAttachmentsNotice(overCap) ?? '');
+      }
+      if (unreadable > 0) showComposerNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+    });
   };
 
   const handleAttachDirectory = async () => {

@@ -53,51 +53,69 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
       if (skipped.length > 0) showNotice(skippedAttachmentsNotice(skipped) ?? '');
       if (accepted.length === 0) return;
 
-      const pending: Promise<void>[] = [];
+      type Attachable = {
+        name: string;
+        mime: string;
+        isImage: boolean;
+        size: number;
+        dataUrl: string;
+        text?: string;
+        filePath?: string;
+      };
+      const pending: Promise<Attachable | null>[] = [];
       for (const file of accepted) {
         const filePath = (file as File & { path?: string }).path || undefined;
         pending.push(
-          new Promise<void>((resolve) => {
+          new Promise<Attachable | null>((resolve) => {
             const reader = new FileReader();
+            // Resolve null on read error/abort (R185) so one unreadable dropped file can't leak an
+            // unresolved promise or block the batch.
+            reader.onerror = () => resolve(null);
+            reader.onabort = () => resolve(null);
             reader.onload = () => {
               const dataUrl = reader.result as string;
               const isText = file.type.startsWith('text/') || file.type === 'application/json';
               if (isText) {
-                // Also read as text
                 const textReader = new FileReader();
+                textReader.onerror = () => resolve(null);
+                textReader.onabort = () => resolve(null);
                 textReader.onload = () => {
-                  addAttachments([
-                    {
-                      name: file.name,
-                      mime: file.type,
-                      isImage: file.type.startsWith('image/'),
-                      size: file.size,
-                      dataUrl,
-                      text: textReader.result as string,
-                      filePath,
-                    },
-                  ]);
-                  resolve();
-                };
-                textReader.readAsText(file);
-              } else {
-                addAttachments([
-                  {
+                  resolve({
                     name: file.name,
                     mime: file.type,
                     isImage: file.type.startsWith('image/'),
                     size: file.size,
                     dataUrl,
+                    text: textReader.result as string,
                     filePath,
-                  },
-                ]);
-                resolve();
+                  });
+                };
+                textReader.readAsText(file);
+              } else {
+                resolve({
+                  name: file.name,
+                  mime: file.type,
+                  isImage: file.type.startsWith('image/'),
+                  size: file.size,
+                  dataUrl,
+                  filePath,
+                });
               }
             };
             reader.readAsDataURL(file);
           }),
         );
       }
+      void Promise.all(pending).then((results) => {
+        const attachable = results.filter((r): r is Attachable => r !== null);
+        const unreadable = accepted.length - attachable.length;
+        if (attachable.length > 0) {
+          // Add in one call so the aggregate backstop applies across the whole drop, not per file.
+          const { skipped: overCap } = addAttachments(attachable);
+          if (overCap.length > 0) showNotice(skippedAttachmentsNotice(overCap) ?? '');
+        }
+        if (unreadable > 0) showNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+      });
     },
     [addAttachments, showNotice],
   );

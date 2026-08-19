@@ -2,6 +2,7 @@ import { useCallback, useEffect } from 'react';
 import { parseAppShotRef, type AppShotPayload } from '../../shared/app-shots';
 import { app } from '@/lib/ipc-client';
 import { useAttachments, type AttachedFile } from '@/providers/AttachmentContext';
+import { MAX_ATTACHMENT_BYTES } from '@/lib/attachment-limits';
 
 function toBase64(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -96,7 +97,12 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
         }
         if (imageFiles.length === 0) return;
         for (const file of imageFiles) {
+          // Gate by size before reading (R185): a stale app-shot ref falls back to attaching the raw
+          // clipboard image, which FileReader materializes fully — cap it like every other paste path.
+          if (file.size > MAX_ATTACHMENT_BYTES) continue;
           const reader = new FileReader();
+          reader.onerror = () => {};
+          reader.onabort = () => {};
           reader.onload = () => {
             addAttachments([
               {
