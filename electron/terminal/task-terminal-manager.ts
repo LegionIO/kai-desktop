@@ -24,11 +24,21 @@ type IPty = import('@lydell/node-pty').IPty;
  * caller then forgets the session — a HUP-ignoring or backgrounded child survives and keeps making
  * filesystem/network side effects invisibly after Stop. A PTY child is a session/group leader, so
  * escalate SIGTERM → SIGKILL to the whole process GROUP (negative pid) with a short grace timer.
- * The group SIGKILL fires unconditionally after the grace period; ESRCH on an already-dead group is
- * harmless (swallowed). unref so the timer never keeps the process alive.
+ * The delayed group SIGKILL is SKIPPED if the leader already exited before the grace elapsed (R199):
+ * once the leader is gone its pid can be RECYCLED as an unrelated process-group id, and an unconditional
+ * kill(-pid) would then SIGKILL a stranger's group. A still-running leader after 2s is the real target.
  */
 function killPtyHard(proc: IPty): void {
   const pid = proc.pid;
+  // Track leader exit so the delayed group-SIGKILL doesn't fire against a recycled pid.
+  let leaderExited = false;
+  try {
+    proc.onExit(() => {
+      leaderExited = true;
+    });
+  } catch {
+    /* onExit unavailable — fall back to firing the delayed kill (pre-R199 behavior) */
+  }
   try {
     proc.kill(); // node-pty default (SIGHUP to the leader) — clean shutdown for well-behaved children
   } catch {
@@ -41,6 +51,8 @@ function killPtyHard(proc: IPty): void {
     /* group already gone */
   }
   const t = setTimeout(() => {
+    // Do NOT group-SIGKILL once the leader has exited: its pid may now name an unrelated group (R199).
+    if (leaderExited) return;
     try {
       process.kill(-pid, 'SIGKILL');
     } catch {

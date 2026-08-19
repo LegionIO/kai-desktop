@@ -1333,7 +1333,7 @@ export function registerConfigHandlers(
     onBrowserChanged?.(structuredClone(currentConfig.browser));
   };
 
-  const applyReload = () => {
+  const applyReload = (): boolean => {
     try {
       currentConfig = readWatchedConfig();
       publishBrowserConfig(false);
@@ -1341,8 +1341,10 @@ export function registerConfigHandlers(
       // take effect without an internal write or restart.
       invalidateDiagnosticTraceConfig();
       scheduleConfigBroadcast();
+      return true;
     } catch {
       // Ignore read errors during write
+      return false;
     }
   };
 
@@ -1376,7 +1378,16 @@ export function registerConfigHandlers(
     if (reloadDebounceTimer) {
       clearTimeout(reloadDebounceTimer);
       reloadDebounceTimer = null;
-      applyReload();
+      // If the synchronous flush read FAILS (partial external write mid-flush), do NOT leave the pending
+      // reload cancelled (R199): currentConfig is still stale and the caller's internal config:set would
+      // then rewrite the whole payload from stale state, clobbering the external edit. Re-arm the debounce
+      // so the external change is still picked up shortly after the writer finishes.
+      if (!applyReload() && !reloadDebounceTimer) {
+        reloadDebounceTimer = setTimeout(() => {
+          reloadDebounceTimer = null;
+          applyReload();
+        }, 200);
+      }
     }
   };
 

@@ -620,28 +620,37 @@ export class ComputerUseOrchestrator {
     // execution, and pass its signal into executeAction. Compare-and-delete on cleanup so a
     // concurrent resume's controller isn't evicted.
     let controller: AbortController | null = null;
+    // Capture the signal actually used for this execution (a fresh controller we create, OR a
+    // pre-existing active-run controller) so the post-await abort check below is accurate regardless.
     if (!this.activeRuns.has(sessionId)) {
       controller = new AbortController();
       this.activeRuns.set(sessionId, controller);
     }
+    const runSignal = this.activeRuns.get(sessionId)?.signal;
     try {
       await harness.initialize(session);
       // Thread the session's active-run abort signal so a stop/pause during an approved-action
       // execution propagates + the post-await fence in executeAction discards a resurrecting write.
-      await this.executeAction(
-        harness,
-        { ...action, status: 'running' },
-        this.activeRuns.get(sessionId)?.signal,
-        sessionId,
-      );
+      await this.executeAction(harness, { ...action, status: 'running' }, runSignal, sessionId);
+      // If a Stop/pause aborted THIS execution, do NOT resume (R199): resume() would flip the stopped
+      // session back to running and run further desktop actions. Detect it via the run signal we used
+      // (aborted) OR our freshly-created controller having been removed/replaced by a concurrent Stop.
+      const aborted =
+        Boolean(runSignal?.aborted) || (controller !== null && this.activeRuns.get(sessionId) !== controller);
       if (controller && this.activeRuns.get(sessionId) === controller) {
         this.activeRuns.delete(sessionId);
       }
+      if (aborted) return;
       this.resume(sessionId);
     } catch (error) {
+      const abortedRun =
+        Boolean(runSignal?.aborted) || (controller !== null && this.activeRuns.get(sessionId) !== controller);
       if (controller && this.activeRuns.get(sessionId) === controller) {
         this.activeRuns.delete(sessionId);
       }
+      // A Stop/pause that aborted this execution can surface as a thrown abort error — do NOT overwrite
+      // the (deliberately) stopped/paused session with 'failed' then (R199). Leave it as Stop set it.
+      if (abortedRun) return;
       const message = error instanceof Error ? error.message : String(error);
       this.markActionFailed(sessionId, actionId, message);
       this.mutateSession(sessionId, (current) => ({
