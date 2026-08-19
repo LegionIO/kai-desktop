@@ -328,15 +328,22 @@ export class PiRuntime implements AgentRuntime {
         // Absolute post-exit deadline (R168): a stuck orphan grandchild dribbling a byte every <IDLE_MS
         // would re-arm the idle check forever. Cap total wait after leader exit at 30s.
         const HARD_DEADLINE = Date.now() + 30_000;
+        // `exited` resolves on 'close', which needs EVERY stdio stream closed. A TERM-resistant descendant
+        // can hold stderr open even after stdout ends/destroys — so whenever stdout is DONE we must also
+        // force stderr closed, or 'close' never fires and `await exited` hangs (R197/R198). This covers
+        // BOTH orderings: stdout ends first (early-return path) and stdout still open-but-idle.
+        const forceStderrClosed = (): void => {
+          if (!spawned.stderr.destroyed) spawned.stderr.destroy();
+        };
         const tick = (): void => {
-          if (spawned.stdout.destroyed || spawned.stdout.readableEnded) return;
+          if (spawned.stdout.destroyed || spawned.stdout.readableEnded) {
+            forceStderrClosed(); // stdout already done — ensure stderr is too so 'close' can fire
+            return;
+          }
           const idle = Date.now() - lastReadAt >= IDLE_MS && spawned.stdout.readableLength === 0;
           if (idle || Date.now() >= HARD_DEADLINE) {
             spawned.stdout.destroy();
-            // `exited` resolves on 'close', which needs EVERY stdio stream closed — a TERM-resistant
-            // descendant holding stderr open would keep 'close' from firing even after stdout is
-            // destroyed, hanging finalization forever (R197). Destroy stderr too so 'close' can complete.
-            if (!spawned.stderr.destroyed) spawned.stderr.destroy();
+            forceStderrClosed();
             return;
           }
           const t = setTimeout(tick, IDLE_MS);

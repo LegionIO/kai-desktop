@@ -247,15 +247,22 @@ export class OpencodeRuntime implements AgentRuntime {
         // would re-arm the idle check forever and never let the stream finalize. Cap total wait after
         // leader exit at 30s — past that, destroy regardless of trickle so the runtime always completes.
         const HARD_DEADLINE = Date.now() + 30_000;
+        // `exited` resolves on 'close', which needs EVERY stdio stream closed. A TERM-resistant descendant
+        // can hold stderr open even after stdout ends/destroys — so whenever stdout is DONE we must also
+        // force stderr closed, or 'close' never fires and `await exited` hangs (R197/R198). Covers BOTH
+        // orderings: stdout ends first (early-return path) and stdout still open-but-idle.
+        const forceStderrClosed = (): void => {
+          if (!child.stderr.destroyed) child.stderr.destroy();
+        };
         const tick = (): void => {
-          if (child.stdout.destroyed || child.stdout.readableEnded) return;
+          if (child.stdout.destroyed || child.stdout.readableEnded) {
+            forceStderrClosed();
+            return;
+          }
           const idle = Date.now() - lastReadAt >= IDLE_MS && child.stdout.readableLength === 0;
           if (idle || Date.now() >= HARD_DEADLINE) {
             child.stdout.destroy();
-            // `exited` resolves on 'close', which needs EVERY stdio stream closed — a TERM-resistant
-            // descendant holding stderr open would keep 'close' from firing even after stdout is
-            // destroyed, hanging finalization forever (R197). Destroy stderr too so 'close' can complete.
-            if (!child.stderr.destroyed) child.stderr.destroy();
+            forceStderrClosed();
             return;
           }
           const t = setTimeout(tick, IDLE_MS);

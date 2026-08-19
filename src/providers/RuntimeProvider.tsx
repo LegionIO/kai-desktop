@@ -1176,6 +1176,7 @@ function unloadInactiveDraftMirrors(keepConvId: string): void {
   for (const [convId, q] of [...rejectedDrafts]) {
     if (convId === keepConvId || draftClaimInFlight.has(convId)) continue;
     if (pendingDraftDeltas.has(convId) || draftDeltaFlushing.has(convId)) continue; // durable write in flight
+    if (draftDurableWriteFailed.has(convId)) continue; // durable write permanently failed → mirror is the only copy (R198)
     for (const d of q) releaseDraftAttachmentBytes(d);
     rejectedDrafts.delete(convId);
   }
@@ -1353,6 +1354,11 @@ const pendingDraftDeltas = new Map<string, PendingDraftDelta>();
 // session; durability is best-effort). Reset on any success.
 const draftFlushFailStreak = new Map<string, number>();
 const MAX_DRAFT_FLUSH_FAIL_STREAK = 8;
+// Conversations whose DURABLE draft write permanently failed this session (retry budget exhausted on a
+// still-live, unreadable record). Their in-memory queue is now the ONLY surviving copy, so it must NOT be
+// unloaded on conversation switch (R198) — unloading would lose the unsent input, contradicting the
+// "failed persistence retains the draft for the session" guarantee. Reset when a later write succeeds.
+const draftDurableWriteFailed = new Set<string>();
 const draftDeltaFlushing = new Map<string, Promise<void>>();
 function applyPendingDraftsDelta(convId: string, add: RejectedDraft[], removeIds: string[]): void {
   let buf = pendingDraftDeltas.get(convId);
@@ -1438,6 +1444,10 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
             if (cur.adds.size === 0 && cur.removes.size === 0) pendingDraftDeltas.delete(convId);
           }
           draftFlushFailStreak.delete(convId);
+          // This batch had ADDs whose durable write permanently failed — the in-memory queue is now the
+          // ONLY copy, so pin its mirror against unload-on-switch (R198). (A pure-remove batch failing is
+          // harmless: the on-disk draft simply lingers and is reconciled later.)
+          if (buf.adds.size > 0) draftDurableWriteFailed.add(convId);
           return;
         }
         draftFlushFailStreak.set(convId, streak);
@@ -1450,6 +1460,7 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
         return; // stop laps; the next applyPendingDraftsDelta call restarts the flusher
       }
       draftFlushFailStreak.delete(convId); // a successful batch resets the failure streak
+      draftDurableWriteFailed.delete(convId); // durability restored — the mirror may be unloaded again (R198)
     }
   })();
   draftDeltaFlushing.set(convId, run);
@@ -3374,6 +3385,7 @@ export function RuntimeProvider({
           // before dropping the queue (R195) — otherwise the global counter would leak them forever.
           for (const d of rejectedDrafts.get(deletedId) ?? []) releaseDraftAttachmentBytes(d);
           rejectedDrafts.delete(deletedId);
+          draftDurableWriteFailed.delete(deletedId); // deleted chat: drop its unload pin (R198)
           tombstoneDeletedConversation(deletedId); // so an in-flight inject's callback won't re-enqueue (R133 f-2)
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
@@ -3399,6 +3411,7 @@ export function RuntimeProvider({
         // Release parked draft attachment bytes across ALL conversations before the bulk clear (R195).
         for (const q of rejectedDrafts.values()) for (const d of q) releaseDraftAttachmentBytes(d);
         rejectedDrafts.clear();
+        draftDurableWriteFailed.clear(); // R198
         cancelAllInFlightDisplacedInjects(); // a global clear cancels every in-flight displaced inject (R134 f-2)
         persistVersions.clear();
         lastRetitleCount.clear();
