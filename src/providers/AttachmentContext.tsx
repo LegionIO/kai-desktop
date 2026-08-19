@@ -3,7 +3,7 @@ import {
   MAX_ATTACHMENT_TOTAL_BYTES,
   onAttachmentsCommitted,
   onAttachmentsReleased,
-  globalCommittedBytes,
+  globalOutstandingBytes,
 } from '@/lib/attachment-limits';
 
 export type AttachedFile = {
@@ -57,16 +57,16 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
   attachmentsRef.current = attachments;
 
   const addAttachments = useCallback((files: AttachedFile[]): { skipped: string[] } => {
-    // Backstop the renderer-wide aggregate cap against the GLOBAL committed total (R185/R189): the
-    // pre-read gate already accounts for committed + in-flight bytes across every store, but this final
-    // check guards paths that add without a pre-read gate. Report committed deltas so the global counter
-    // tracks this store's contribution.
+    // Backstop the renderer-wide aggregate cap against the GLOBAL OUTSTANDING total (R185/R189/R190):
+    // committed bytes across every store PLUS in-flight reserved bytes. This path (native picker / App
+    // Shot) commits WITHOUT a pre-read gate, so it must not ignore bytes another store's large in-flight
+    // drop already reserved. Report committed deltas so the global counter tracks this store's contribution.
     const accepted: AttachedFile[] = [];
     const skipped: string[] = [];
     let addedBytes = 0;
     for (const file of files) {
       const size = file.size || 0;
-      if (globalCommittedBytes() + addedBytes + size > MAX_ATTACHMENT_TOTAL_BYTES) {
+      if (globalOutstandingBytes() + addedBytes + size > MAX_ATTACHMENT_TOTAL_BYTES) {
         skipped.push(file.name);
         continue;
       }

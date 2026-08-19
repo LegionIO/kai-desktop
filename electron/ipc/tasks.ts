@@ -800,10 +800,18 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       // new stream uncancellable and race plan writes).
       const streamToken = Symbol(taskId);
       activeTaskStreams.set(taskId, { token: streamToken, abort: () => controller.abort() });
+      const isCurrent = () => activeTaskStreams.get(taskId)?.token === streamToken;
       const clearIfCurrent = () => {
-        if (activeTaskStreams.get(taskId)?.token === streamToken) {
+        if (isCurrent()) {
           activeTaskStreams.delete(taskId);
         }
+      };
+      // Broadcast a terminal event ONLY if THIS stream still owns the task (R190): after the first
+      // `await` below, a newer stream-plan request for the same taskId may have replaced this one. A
+      // stale run's error/done must not delete the replacement's entry (clearIfCurrent handles the map)
+      // nor emit a terminal event the UI would attribute to the live stream.
+      const emitTerminalIfCurrent = (event: Parameters<typeof broadcastTaskStreamEvent>[0]) => {
+        if (isCurrent()) broadcastTaskStreamEvent(event);
       };
 
       // Resolve config and model
@@ -812,9 +820,9 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         const { readEffectiveConfig } = await import('./config.js');
         config = readEffectiveConfig(appHome);
       } catch {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Failed to load config' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        activeTaskStreams.delete(taskId);
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'Failed to load config' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
+        clearIfCurrent();
         return { taskId };
       }
 
@@ -824,9 +832,9 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       const haikuModel = catalog.entries.find((e) => e.modelConfig.modelName.toLowerCase().includes('haiku'));
       const modelEntry = haikuModel ?? catalog.defaultEntry;
       if (!modelEntry) {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No model configured' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        activeTaskStreams.delete(taskId);
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'No model configured' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
+        clearIfCurrent();
         return { taskId };
       }
 
@@ -883,8 +891,8 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         // (R189): the early hasImageAttachment gate saw raw attachments, but none survived. Sending
         // { role:'user', content:'' } would run the model on an empty turn after the UI already cleared
         // the files. Fail explicitly instead.
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No usable image attachments' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'No usable image attachments' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
         clearIfCurrent();
         return { taskId };
       }
@@ -931,15 +939,15 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
             }
           }
 
-          broadcastTaskStreamEvent({ taskId, type: 'done' });
+          emitTerminalIfCurrent({ taskId, type: 'done' });
         } catch (error) {
           if (!controller.signal.aborted) {
-            broadcastTaskStreamEvent({
+            emitTerminalIfCurrent({
               taskId,
               type: 'error',
               error: error instanceof Error ? error.message : String(error),
             });
-            broadcastTaskStreamEvent({ taskId, type: 'done' });
+            emitTerminalIfCurrent({ taskId, type: 'done' });
           }
         } finally {
           clearIfCurrent();

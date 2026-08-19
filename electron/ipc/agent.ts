@@ -1893,6 +1893,55 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
 }
 
+/** Evict recovery state for `answerKey` that belongs to a DIFFERENT conversation than the one now
+ *  registering a fresh ask_user under that key (R190). Provider tool-call ids are unique only within
+ *  one provider response — a custom/local provider reuses `call_1` — so conversation B starting a new
+ *  ask_user with id `call_1` must not let conversation A's leftover handoff / live claimant / recovery
+ *  tombstone / stashed answer for `call_1` capture B's answer (the answer-arrival key-scan would find
+ *  A first and inject B's answer into A's successor). recordApprovalAuthority already drops the stale
+ *  AUTHORITY record on id-reuse; this is the matching purge of the raced-answer recovery state.
+ *
+ *  Only cross-conversation state is dropped: a same-conversation entry under the same key is this
+ *  conversation's own legitimate in-flight recovery and must be preserved. */
+function evictStaleRecoveryForReusedKey(conversationId: string, answerKey: string): void {
+  const claimant = liveRacedAnswerClaimant.get(conversationId);
+  const handoff = racedAnswerHandoffs.get(conversationId);
+  const ownedBySelf = Boolean(claimant?.state.answerKeys.has(answerKey)) || Boolean(handoff?.answerKeys.has(answerKey));
+  if (ownedBySelf) return; // this conversation's own recovery entry — never evict it here.
+
+  let evictedForeign = false;
+  for (const [otherConv, c] of liveRacedAnswerClaimant) {
+    if (otherConv === conversationId) continue;
+    if (c.state.answerKeys.delete(answerKey)) {
+      evictedForeign = true;
+      if (c.state.answerKeys.size === 0) {
+        const stillOwnsRun = activeStreams.get(otherConv)?.token === c.token;
+        if (!stillOwnsRun) liveRacedAnswerClaimant.delete(otherConv);
+      }
+    }
+  }
+  for (const [otherConv, h] of racedAnswerHandoffs) {
+    if (otherConv === conversationId) continue;
+    if (h.answerKeys.delete(answerKey)) {
+      evictedForeign = true;
+      if (h.answerKeys.size === 0) racedAnswerHandoffs.delete(otherConv);
+    }
+  }
+  const tombstone = recoveryTombstones.get(answerKey);
+  if (tombstone && tombstone.conversationId !== conversationId) {
+    recoveryTombstones.delete(answerKey);
+    evictedForeign = true;
+  }
+  // A stashed answer under a reused key belongs to whichever conversation last stashed it. If we just
+  // evicted a FOREIGN owner's recovery state for this key, any stash entry it referenced is now
+  // orphaned to that dead owner — drop it so this conversation's fresh turn starts from a clean key
+  // rather than inheriting a stranger's stashed answer.
+  if (evictedForeign) {
+    pendingQuestionAnswers.delete(answerKey);
+    clearInFlightAnswer(answerKey);
+  }
+}
+
 /** Find the conversation whose pending handoff OR live claimant holds `answerKey`
  *  (the answer-arrival side only knows the key). Bounded scan over small maps. */
 function conversationForRacedAnswerKey(answerKey: string): string | undefined {
@@ -7435,6 +7484,11 @@ export function registerAgentHandlers(
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              // Provider tool-call ids reuse across responses (a custom provider reuses `call_1`), so
+              // before arming this turn's answer rendezvous, evict any stale recovery state for the
+              // same id left over by a DIFFERENT conversation — otherwise its handoff could capture
+              // THIS turn's answer via the answer-arrival key-scan (R190).
+              evictStaleRecoveryForReusedKey(conversationId, streamId);
               const approvalDecision = registerPendingApproval(
                 streamId,
                 controller.signal,

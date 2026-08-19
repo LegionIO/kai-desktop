@@ -36,6 +36,15 @@ export function globalCommittedBytes(): number {
   return committedBytes;
 }
 
+/** Current renderer-wide OUTSTANDING attachment bytes: committed across every store PLUS bytes reserved
+ *  by in-flight reads that have passed the pre-read gate but not yet committed. A direct-commit backstop
+ *  (a path that adds WITHOUT going through filterAttachmentsBySize — native picker / App Shot payload)
+ *  must check against this, not committedBytes alone: otherwise a large in-flight drop that already
+ *  reserved the budget plus a concurrent direct commit can together exceed the renderer-wide cap (R190). */
+export function globalOutstandingBytes(): number {
+  return committedBytes + inFlightReservedBytes;
+}
+
 /** Release an in-flight reservation once the read settles (committed to a store OR discarded). When a
  *  read commits, the store's onAttachmentsCommitted moves those bytes into `committedBytes`, so the
  *  reservation must be released to avoid double-counting. */

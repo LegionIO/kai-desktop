@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AttachedFile } from '@/providers/AttachmentContext';
 import {
   MAX_ATTACHMENT_TOTAL_BYTES,
-  globalCommittedBytes,
+  globalOutstandingBytes,
   onAttachmentsCommitted,
   onAttachmentsReleased,
 } from '@/lib/attachment-limits';
@@ -23,14 +23,20 @@ export function useLocalAttachments() {
   const [attachments, setAttachments] = useState<AttachedFile[]>([]);
   const ref = useRef<AttachedFile[]>([]);
   ref.current = attachments;
+  // Once the view unmounts, any pending async read (native dialog await / FileReader) that later calls
+  // addAttachments must be a full no-op: committing bytes post-unmount would increment the renderer-wide
+  // global counter with no future release (unmount cleanup already ran), permanently leaking budget (R190).
+  const disposedRef = useRef(false);
 
   const addAttachments = useCallback((files: AttachedFile[]): { skipped: string[] } => {
+    if (disposedRef.current) return { skipped: files.map((f) => f.name) };
     // Aggregate cap is renderer-wide: this local store's bytes plus every OTHER store's committed
-    // bytes (chat + other task views) must not exceed the ceiling. Count our own resident bytes
-    // exactly and add the rest via globalCommittedBytes(), which already includes ours — so subtract
-    // our resident bytes to avoid double-counting, then grow as we accept.
+    // bytes (chat + other task views) plus in-flight reserved bytes must not exceed the ceiling.
+    // globalOutstandingBytes() = committed(all stores) + reserved; it already includes THIS store's
+    // committed bytes, so subtract our resident bytes to avoid double-counting them, then grow as we
+    // accept. Including reserved bytes (R190) closes a concurrent large-drop-plus-direct-commit overflow.
     const ownResident = ref.current.reduce((sum, f) => sum + (f.size || 0), 0);
-    const otherBytes = Math.max(0, globalCommittedBytes() - ownResident);
+    const otherBytes = Math.max(0, globalOutstandingBytes() - ownResident);
     let liveBytes = ownResident;
     const accepted: AttachedFile[] = [];
     const skipped: string[] = [];
@@ -70,9 +76,11 @@ export function useLocalAttachments() {
   const getResidentBytes = useCallback((): number => ref.current.reduce((sum, f) => sum + (f.size || 0), 0), []);
 
   // Releasing on unmount prevents a task view that is torn down with files still staged from leaking
-  // its bytes into the renderer-wide committed counter forever.
+  // its bytes into the renderer-wide committed counter forever. Mark disposed so a late async read's
+  // addAttachments can't re-commit bytes after this release.
   useEffect(() => {
     return () => {
+      disposedRef.current = true;
       const releasedBytes = ref.current.reduce((sum, f) => sum + (f.size || 0), 0);
       if (releasedBytes > 0) onAttachmentsReleased(releasedBytes);
     };
