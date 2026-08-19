@@ -9,6 +9,8 @@ import { RealtimeSession } from '../realtime/realtime-session.js';
 import { buildRealtimeMemoryContext } from '../realtime/realtime-context.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
+import { toolsForExecutionMode } from '../agent/plan-mode-tools.js';
+import { readConversation, conversationExistenceState } from './conversation-store.js';
 import { getExistingBrowserManager } from '../browser/service.js';
 import { recordUsageEvent } from './usage.js';
 import { dismissPendingNativeBrowserApprovalsForOwner, type ToolApprovalAuthority } from './tool-approval.js';
@@ -18,6 +20,9 @@ let sessionStartTime: string | null = null;
 let sessionConversationId: string | null = null;
 let activeSessionBrowserInitiated = false;
 let activeSessionAllowsBrowserTools = false;
+// Whether the ACTIVE realtime call runs plan-first (read-only). A mid-call tool hot-reload must
+// re-apply the plan-first filter so it can't re-introduce mutating tools into a plan-first call (R175).
+let activeSessionPlanFirst = false;
 let pendingStart: {
   generation: number;
   conversationId: string;
@@ -129,8 +134,14 @@ function isCurrentPrimaryMainFrame(event: IpcMainInvokeEvent, getPrimaryWindow: 
 
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
   const withoutBrowserTools = tools.filter((tool) => tool.source !== 'browser');
-  activeSession?.updateTools(activeSessionAllowsBrowserTools ? tools : withoutBrowserTools);
-  pendingStart?.session?.updateTools(pendingStart.allowsBrowserTools ? tools : withoutBrowserTools);
+  // Re-apply plan-first read-only gating on a mid-call hot-reload (R175) so it can't re-introduce
+  // mutating tools into a plan-first call.
+  const gate = (allowBrowser: boolean): ToolDefinition[] => {
+    const base = allowBrowser ? tools : withoutBrowserTools;
+    return activeSessionPlanFirst ? toolsForExecutionMode(base, 'plan-first') : base;
+  };
+  activeSession?.updateTools(gate(activeSessionAllowsBrowserTools));
+  pendingStart?.session?.updateTools(gate(pendingStart.allowsBrowserTools ?? false));
 }
 
 /** Permanently remove native Browser authority from the current call/start.
@@ -170,6 +181,7 @@ function recordAndCloseActiveSession(closeSession = true): Promise<void> {
   sessionConversationId = null;
   activeSessionBrowserInitiated = false;
   activeSessionAllowsBrowserTools = false;
+  activeSessionPlanFirst = false;
 
   if (!session) return Promise.resolve();
 
@@ -360,7 +372,27 @@ export function registerRealtimeHandlers(
         event.senderFrame === primaryWindow.webContents.mainFrame &&
         browserAuthorityCurrent();
       if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = allowBrowserTools;
-      const tools = allowBrowserTools ? availableTools : availableTools.filter((tool) => tool.source !== 'browser');
+      const browserFilteredTools = allowBrowserTools
+        ? availableTools
+        : availableTools.filter((tool) => tool.source !== 'browser');
+      // Plan-first read-only gating (R175): a plan-first conversation's voice call must NOT expose
+      // mutating tools (incl. Browser click/type/evaluate/tab-management) — Realtime does NOT traverse
+      // the Mastra plan-mode chokepoint, so filter here too. Resolve the conversation's MAIN-authoritative
+      // mode fail-CLOSED (a present-but-unreadable record → plan-first) like the text submit path.
+      let realtimePlanFirst = false;
+      try {
+        const persistedConv = readConversation(appHome, conversationId) as { executionMode?: string } | null;
+        if (persistedConv != null) {
+          realtimePlanFirst = persistedConv.executionMode === 'plan-first';
+        } else {
+          realtimePlanFirst = conversationExistenceState(appHome, conversationId) !== 'absent';
+        }
+      } catch {
+        realtimePlanFirst = true; // fail closed
+      }
+      const tools = realtimePlanFirst
+        ? toolsForExecutionMode(browserFilteredTools, 'plan-first')
+        : browserFilteredTools;
       let createdSession: RealtimeSession;
       createdSession = new RealtimeSession(getConfig, tools, () => handleRealtimeSessionTerminal(createdSession));
       session = createdSession;
@@ -441,6 +473,7 @@ export function registerRealtimeHandlers(
       sessionConversationId = conversationId;
       activeSessionBrowserInitiated = browserInitiated;
       activeSessionAllowsBrowserTools = browserToolsStillAuthorized;
+      activeSessionPlanFirst = realtimePlanFirst;
       return { ok: true };
     } catch (err) {
       const msg = isStale() ? 'Session start superseded' : err instanceof Error ? err.message : String(err);

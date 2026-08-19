@@ -10451,12 +10451,16 @@ export function registerAgentHandlers(
       const requiresNativeAuthority =
         recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
       if (requiresNativeAuthority) {
-        // Enforce CALLER authority (the primary window), NOT stream-current: the recovery path
-        // deliberately runs after the original stream ended, so a stream-current gate would wrongly
-        // reject a legitimate primary-surface answer. The pop-out capability lived on the (now-deleted)
-        // pending entry, so only the primary window can authorize a late answer. The threat is a
-        // non-primary web/secondary surface injecting — that fails this check.
-        if (!isPrimaryBrowserToolCaller(event, getPrimaryWindow)) {
+        // Enforce CALLER authority, NOT stream-current: the recovery path deliberately runs after the
+        // original stream ended, so a stream-current gate would wrongly reject a legitimate answer.
+        // Accept the PRIMARY window OR the exact authorized pop-out (its webContents id is mirrored
+        // onto the durable record, so an answer submitted while the one-shot capability was valid is
+        // not lost when abort deletes the pending entry — R175). A non-primary web/secondary surface
+        // fails both and is rejected.
+        const authorized =
+          isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+          isAuthorizedApprovalWindowCaller(event, recordedAuthority!);
+        if (!authorized) {
           return { ok: false, error: 'native-browser-authority-required' };
         }
       }

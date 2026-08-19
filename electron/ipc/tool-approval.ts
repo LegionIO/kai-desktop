@@ -106,7 +106,7 @@ function settleReason(value: boolean | 'dismiss', aborted: boolean): ApprovalSet
  *  the raced-answer stash/recovery path still processes a late answer for that id — it must enforce
  *  the SAME authority so a non-primary web surface can't inject an answer into a browser-authorized
  *  successor/recovery turn. Bounded FIFO; entries are short-lived (one turn's recovery window). */
-type ApprovalAuthorityRecord = Pick<PendingToolApproval, 'authority' | 'streamOwner'>;
+type ApprovalAuthorityRecord = Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'approvalWindowWebContentsId'>;
 const approvalAuthorityById = new Map<string, ApprovalAuthorityRecord>();
 const APPROVAL_AUTHORITY_MAP_MAX = 500;
 /** Returns the recorded authority for a toolCallId whose pending entry may already be gone (abort). */
@@ -114,10 +114,14 @@ export function getRecordedApprovalAuthority(toolCallId: string): ApprovalAuthor
   return approvalAuthorityById.get(toolCallId);
 }
 function recordApprovalAuthority(toolCallId: string, record: ApprovalAuthorityRecord): void {
+  // ALWAYS drop any prior record for this id FIRST (R175): tool-call ids are only unique within one
+  // provider response — a custom/local provider can reuse `call_1`, so a NEW approval under a reused
+  // id must not inherit the PRIOR one's Browser authority (which would wrongly reject a legitimate
+  // non-primary answer to the new, non-browser approval).
+  approvalAuthorityById.delete(toolCallId);
   // Only record when authority actually matters (native-browser OR a resolved streamOwner) — a
   // plain any-renderer approval has nothing to enforce after its pending entry is gone.
   if (record.authority !== 'native-browser' && !record.streamOwner) return;
-  approvalAuthorityById.delete(toolCallId);
   approvalAuthorityById.set(toolCallId, record);
   while (approvalAuthorityById.size > APPROVAL_AUTHORITY_MAP_MAX) {
     const oldest = approvalAuthorityById.keys().next().value;
@@ -184,6 +188,11 @@ export function authorizePendingApprovalWindow(toolCallId: string, webContentsId
   const pending = pendingToolApprovals.get(toolCallId);
   if (!pending || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
   pending.approvalWindowWebContentsId = webContentsId;
+  // Mirror onto the DURABLE authority record (R175) so a raced answer from the authorized pop-out is
+  // still accepted after abort deletes the pending entry (the pendingless branch would otherwise only
+  // accept the primary window, losing an answer submitted while the one-shot capability was valid).
+  const record = approvalAuthorityById.get(toolCallId);
+  if (record) record.approvalWindowWebContentsId = webContentsId;
   return true;
 }
 
