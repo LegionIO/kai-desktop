@@ -499,9 +499,16 @@ function listPermission(instance: PluginInstance): string {
   return instance.manifest.permissions.join(', ') || 'none';
 }
 
+/** Per-API set of in-flight agent-generation abort controllers, so cleanupPluginAPI can abort them
+ *  on plugin unload (R172 f-4). WeakMap keyed by the api object → auto-drops when the api is GC'd. */
+const apiAgentControllers = new WeakMap<PluginAPI, Set<AbortController>>();
+
 export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICallbacks): PluginAPI {
   const { manifest } = instance;
   let httpServer: Server | null = null;
+  // In-flight host abort controllers for agent.generate/stream (R172 f-4): cleanupPluginAPI aborts
+  // them on unload so an orphaned generation + tool execution can't outlive the plugin.
+  const inFlightAgentControllers = new Set<AbortController>();
 
   // Reject calls from a stale activation generation — e.g. a timer/promise that
   // survived a disable (and possible re-enable) and would otherwise act for an
@@ -1477,40 +1484,65 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
         const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
-        return generateForPlugin({
-          messages: options.messages,
-          config,
-          appHome: callbacks.appHome,
-          modelKey: options.modelKey,
-          profileKey: options.profileKey,
-          reasoningEffort: options.reasoningEffort,
-          fallbackEnabled: options.fallbackEnabled,
-          systemPrompt: options.systemPrompt,
-          tools: allTools,
-          abortSignal: options.abortSignal,
-        });
+        // Host-owned abort controller (R172 f-4): if the plugin omits abortSignal, an orphaned
+        // main-process generation (and any tool execution it drives) would keep running after the
+        // plugin is disabled/crashes/unloads. Link the plugin's signal (if any) into a host controller
+        // that cleanupPluginAPI aborts on unload, so teardown always cancels in-flight generation.
+        const hostController = new AbortController();
+        inFlightAgentControllers.add(hostController);
+        if (options.abortSignal) {
+          if (options.abortSignal.aborted) hostController.abort();
+          else options.abortSignal.addEventListener('abort', () => hostController.abort(), { once: true });
+        }
+        try {
+          return await generateForPlugin({
+            messages: options.messages,
+            config,
+            appHome: callbacks.appHome,
+            modelKey: options.modelKey,
+            profileKey: options.profileKey,
+            reasoningEffort: options.reasoningEffort,
+            fallbackEnabled: options.fallbackEnabled,
+            systemPrompt: options.systemPrompt,
+            tools: allTools,
+            abortSignal: hostController.signal,
+          });
+        } finally {
+          inFlightAgentControllers.delete(hostController);
+        }
       },
 
       stream: async function* (options) {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
         const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
-        for await (const ev of streamForPlugin({
-          messages: options.messages,
-          config,
-          appHome: callbacks.appHome,
-          modelKey: options.modelKey,
-          profileKey: options.profileKey,
-          reasoningEffort: options.reasoningEffort,
-          fallbackEnabled: options.fallbackEnabled,
-          systemPrompt: options.systemPrompt,
-          tools: allTools,
-          abortSignal: options.abortSignal,
-        })) {
-          // `inject-consumed` is an internal branch-split marker for automation
-          // persistence; plugins never need it. Filter it out of the plugin API.
-          if ((ev as { type?: string }).type === 'inject-consumed') continue;
-          yield ev as unknown as PluginAgentStreamEvent;
+        // Host-owned controller so unload aborts an in-flight stream + its tool execution (R172 f-4).
+        const hostController = new AbortController();
+        inFlightAgentControllers.add(hostController);
+        if (options.abortSignal) {
+          if (options.abortSignal.aborted) hostController.abort();
+          else options.abortSignal.addEventListener('abort', () => hostController.abort(), { once: true });
+        }
+        try {
+          for await (const ev of streamForPlugin({
+            messages: options.messages,
+            config,
+            appHome: callbacks.appHome,
+            modelKey: options.modelKey,
+            profileKey: options.profileKey,
+            reasoningEffort: options.reasoningEffort,
+            fallbackEnabled: options.fallbackEnabled,
+            systemPrompt: options.systemPrompt,
+            tools: allTools,
+            abortSignal: hostController.signal,
+          })) {
+            // `inject-consumed` is an internal branch-split marker for automation
+            // persistence; plugins never need it. Filter it out of the plugin API.
+            if ((ev as { type?: string }).type === 'inject-consumed') continue;
+            yield ev as unknown as PluginAgentStreamEvent;
+          }
+        } finally {
+          inFlightAgentControllers.delete(hostController);
         }
       },
 
@@ -1850,11 +1882,25 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     });
   };
 
+  apiAgentControllers.set(api, inFlightAgentControllers);
   return api;
 }
 
 /** Cleanup HTTP server when plugin is deactivated */
 export async function cleanupPluginAPI(api: PluginAPI): Promise<void> {
+  // Abort any in-flight agent generations/streams so they (and their tool execution) don't outlive
+  // the plugin's unload (R172 f-4).
+  const controllers = apiAgentControllers.get(api);
+  if (controllers) {
+    for (const c of controllers) {
+      try {
+        c.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    controllers.clear();
+  }
   try {
     await api.http.close();
   } catch {

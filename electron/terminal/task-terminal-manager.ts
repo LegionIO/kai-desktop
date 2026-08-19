@@ -19,6 +19,37 @@ import { broadcastToAllWindows } from '../utils/window-send.js';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 type IPty = import('@lydell/node-pty').IPty;
 
+/**
+ * Kill a PTY session HARD (R172): node-pty's default kill() sends a leader-only SIGHUP, and the
+ * caller then forgets the session — a HUP-ignoring or backgrounded child survives and keeps making
+ * filesystem/network side effects invisibly after Stop. A PTY child is a session/group leader, so
+ * escalate SIGTERM → SIGKILL to the whole process GROUP (negative pid) with a short grace timer.
+ * The group SIGKILL fires unconditionally after the grace period; ESRCH on an already-dead group is
+ * harmless (swallowed). unref so the timer never keeps the process alive.
+ */
+function killPtyHard(proc: IPty): void {
+  const pid = proc.pid;
+  try {
+    proc.kill(); // node-pty default (SIGHUP to the leader) — clean shutdown for well-behaved children
+  } catch {
+    /* already gone */
+  }
+  if (typeof pid !== 'number' || process.platform === 'win32') return;
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
+    /* group already gone */
+  }
+  const t = setTimeout(() => {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      /* group already gone (ESRCH) */
+    }
+  }, 2000);
+  if (typeof t.unref === 'function') t.unref();
+}
+
 interface TaskTerminal {
   id: string;
   taskId: string;
@@ -176,7 +207,7 @@ export class TaskTerminalManager {
   kill(sessionId: string): void {
     const term = this.terminals.get(sessionId);
     if (term) {
-      term.process.kill();
+      killPtyHard(term.process);
       this.terminals.delete(sessionId);
     }
   }
@@ -185,7 +216,7 @@ export class TaskTerminalManager {
   killByTask(taskId: string): void {
     for (const [sessionId, term] of this.terminals) {
       if (term.taskId === taskId) {
-        term.process.kill();
+        killPtyHard(term.process);
         this.terminals.delete(sessionId);
       }
     }

@@ -152,6 +152,9 @@ export class RealtimeSession {
 
   /** Tracks whether we are inside a response (between response.created and response.done) */
   private _inResponse = false;
+  /** True once the initial "call answered" greeting has been injected on the FIRST session.updated,
+   *  so later session.update echoes (e.g. mid-call updateTools) don't re-greet (R172 f-6). */
+  private _greetedOnSessionUpdate = false;
   private functionCallBuffers: Map<string, { name: string; args: string; itemId: string; callId: string }> = new Map();
 
   /** Audio tracking for barge-in truncation */
@@ -200,6 +203,7 @@ export class RealtimeSession {
     this.assistantTranscriptBuffers.clear();
     this._endCallRequested = false;
     this._inResponse = false;
+    this._greetedOnSessionUpdate = false;
     this._audioChunkCount = 0;
     this._serverEventCount = 0;
 
@@ -208,9 +212,14 @@ export class RealtimeSession {
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
       const settle = (fn: () => void) => {
         if (!settled) {
           settled = true;
+          if (handshakeTimer) {
+            clearTimeout(handshakeTimer);
+            handshakeTimer = null;
+          }
           fn();
         }
       };
@@ -220,6 +229,25 @@ export class RealtimeSession {
         console.info(`[RealtimeSession] Connecting to: ${redactUrlForLog(url)}`);
         console.info(`[RealtimeSession] Headers: ${Object.keys(headers).join(', ')}`);
         this.ws = new WebSocket(url, { headers });
+
+        // Handshake timeout (R172): a peer that accepts the TCP connection but never completes the
+        // WebSocket upgrade would otherwise leave start() pending FOREVER — and the IPC layer only
+        // installs activeSession after start() resolves, so Hang Up can't close the hung socket.
+        // Terminate the socket + reject so the connection + listeners don't leak on repeated starts.
+        handshakeTimer = setTimeout(() => {
+          if (settled) return;
+          console.error('[RealtimeSession] WebSocket handshake timed out');
+          this.setStatus('error', 'connection timed out');
+          try {
+            this.ws?.terminate();
+          } catch {
+            /* ignore */
+          }
+          this.teardownComputerUseTracking();
+          this.ws = null;
+          settle(() => reject(new Error('Realtime connection timed out')));
+        }, 20_000);
+        if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref();
 
         this.ws.on('open', () => {
           this.setStatus('connected');
@@ -649,8 +677,12 @@ export class RealtimeSession {
         break;
       case 'session.updated':
         console.info('[RealtimeSession] Session updated');
-        // Inject a synthetic message to prompt the assistant to greet the user
-        if (this.ws?.readyState === WS_OPEN) {
+        // Inject the "call answered" greeting prompt ONLY on the FIRST session.updated — the initial
+        // connection (R172 f-6). Every subsequent session.update we send (e.g. updateTools() on an
+        // MCP/skill/CLI hot reload DURING a call) also echoes a session.updated; re-injecting the
+        // greeting + response.create there produced an unsolicited extra greeting mid-call.
+        if (!this._greetedOnSessionUpdate && this.ws?.readyState === WS_OPEN) {
+          this._greetedOnSessionUpdate = true;
           this.ws.send(
             JSON.stringify({
               type: 'conversation.item.create',

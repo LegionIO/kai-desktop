@@ -174,6 +174,34 @@ function ensureWindow(sessionId: string): BrowserWindow {
   };
   win.webContents.on('will-redirect', (event, targetUrl) => guardNavigation(event, targetUrl));
   win.webContents.on('will-navigate', (event, targetUrl) => guardNavigation(event, targetUrl));
+  // Block private-network SUBRESOURCE requests too (R172): the navigation guards only cover the
+  // top-level frame, but an untrusted public page can embed http://127.0.0.1:PORT / 169.254.169.254
+  // in an <iframe>/<img>/fetch — probing internal services and, for an iframe, exposing rendered
+  // cross-origin pixels via capturePage(). A session-level webRequest filter vets EVERY request
+  // (all resource types) against the same SSRF guard and cancels private ones (unless allowPrivate).
+  try {
+    win.webContents.session.webRequest.onBeforeRequest((details, callback) => {
+      const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+      if (allowPrivate) {
+        callback({});
+        return;
+      }
+      // Only vet http(s) subresources; data:/blob:/about: don't hit the network and would be
+      // spuriously rejected by the http-normalizing guard.
+      if (!/^https?:/i.test(details.url)) {
+        callback({});
+        return;
+      }
+      const decision = checkIsolatedBrowserNavigation(details.url, false);
+      if (!decision.ok) {
+        callback({ cancel: true });
+        return;
+      }
+      callback({});
+    });
+  } catch {
+    /* webRequest unavailable — navigation guards above are the primary defense */
+  }
   windows.set(sessionId, win);
   return win;
 }

@@ -2551,7 +2551,10 @@ if (gotSingleInstanceLock) {
           if (!probe) return new Response('Not Found', { status: 404 });
           const suffix = Math.min(parseInt(endStr, 10), probe.size);
           start = Math.max(0, probe.size - suffix);
-          end = probe.size - 1;
+          // Cap the served span to MEDIA_CHUNK (R172): an open-ended suffix like bytes=-536870912
+          // would otherwise buffer the whole (up to 512MiB) file. The client re-requests further
+          // bytes with follow-up ranges.
+          end = Math.min(probe.size - 1, start + MEDIA_CHUNK - 1);
         } else {
           start = startStr === '' ? 0 : parseInt(startStr, 10);
           end = endStr === '' ? start + MEDIA_CHUNK - 1 : parseInt(endStr, 10);
@@ -2580,6 +2583,26 @@ if (gotSingleInstanceLock) {
             'Cache-Control': 'no-cache',
           },
         });
+      }
+
+      // A Range header that is PRESENT but not a parseable single range (multi-range, or malformed)
+      // must NOT fall through to the unbounded full-file read (R172) — a `bytes=-BIG` or multi-range
+      // against a 512MiB video would allocate the whole file. Serve a bounded first chunk as 206.
+      if (rangeHeader) {
+        const ranged = safeReadRangeWithin(mediaDir, filePath, 0, 4 * 1024 * 1024 - 1);
+        if (ranged) {
+          return new Response(new Uint8Array(ranged.data), {
+            status: 206,
+            headers: {
+              'Content-Type': contentType,
+              'Content-Range': `bytes ${ranged.start}-${ranged.end}/${ranged.size}`,
+              'Accept-Ranges': 'bytes',
+              'Content-Length': String(ranged.data.length),
+              'Cache-Control': 'no-cache',
+            },
+          });
+        }
+        // fall through to full read only if the ranged read failed (e.g. empty file)
       }
 
       const data = safeReadFileWithin(mediaDir, filePath);
