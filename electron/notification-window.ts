@@ -64,6 +64,18 @@ const notificationWindows = new Map<string, BrowserWindow>();
 // left the window spinning forever).
 const notificationItems = new Map<string, NotificationWindowItem>();
 
+/** Registry key for the pop-out maps (R193). A `tool-approval` item's `id` is the provider tool-call id
+ *  (e.g. `call_1`), unique only WITHIN one conversation — two concurrent conversations can share it — so
+ *  scope it by conversationId. An `alert` item's id is a globally-unique alert id, used as-is. Mirrors the
+ *  `conversationId::toolCallId` scheme used for the pending-approval map (approvalKey). */
+function notifKey(item: NotificationWindowItem): string {
+  return item.source === 'tool-approval' ? `${item.conversationId}::${item.id}` : item.id;
+}
+/** Compose the same key from raw parts, for lookups that only have the id (+ optional conversationId). */
+function notifKeyFromParts(id: string, conversationId?: string): string {
+  return conversationId ? `${conversationId}::${id}` : id;
+}
+
 function loadNotificationRoute(win: BrowserWindow, query: Record<string, string>): void {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   const rendererHtmlPath = join(import.meta.dirname, '../renderer/index.html');
@@ -127,14 +139,17 @@ function applyReportedHeight(win: BrowserWindow, height: number): void {
  * window is never touched, and focus returns to the prior window on close.
  */
 export function openNotificationWindow(item: NotificationWindowItem): BrowserWindow {
+  // All pop-out registries are keyed by the conversation-scoped notifKey (R193) so two concurrent
+  // conversations sharing a raw tool-call id get distinct windows/payloads/focus records.
+  const key = notifKey(item);
   // Store the payload so the renderer can pull it on mount (notif:get).
-  notificationItems.set(item.id, item);
+  notificationItems.set(key, item);
   // Remember what was focused before we steal focus, to restore it on close
   // (so answering doesn't leave the main Kai window raised). Only the FIRST open
   // for an id records it (a re-open shouldn't overwrite with our own window).
-  if (!notificationPriorFocus.has(item.id)) {
+  if (!notificationPriorFocus.has(key)) {
     const prior = BrowserWindow.getFocusedWindow?.() ?? null;
-    notificationPriorFocus.set(item.id, prior && !prior.isDestroyed?.() ? prior : null);
+    notificationPriorFocus.set(key, prior && !prior.isDestroyed?.() ? prior : null);
     // Was KAI the frontmost app right now (before show() activates it)? If not,
     // another app (Chrome, …) was — we'll hand focus back to it on close.
     let kaiFrontmost = false;
@@ -145,9 +160,9 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     } catch {
       kaiFrontmost = prior !== null;
     }
-    notificationKaiWasFrontmost.set(item.id, kaiFrontmost);
+    notificationKaiWasFrontmost.set(key, kaiFrontmost);
   }
-  const existing = notificationWindows.get(item.id);
+  const existing = notificationWindows.get(key);
   if (existing && !existing.isDestroyed()) {
     // Re-send the payload (renderer may have mounted late) and surface it.
     safelySend(existing, 'notif:request', item);
@@ -194,7 +209,11 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
   win.setAlwaysOnTop(true, 'floating');
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
-  loadNotificationRoute(win, { notif: '1', notifId: item.id });
+  loadNotificationRoute(win, {
+    notif: '1',
+    notifId: item.id,
+    ...(item.source === 'tool-approval' ? { notifConv: item.conversationId } : {}),
+  });
 
   win.once('ready-to-show', () => {
     // FIFO surfacing: if another pop-out is already open + focused, don't steal
@@ -217,17 +236,17 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
   win.on('closed', () => {
     // Identity-guard the delete: only clear the map entry if it still points at
     // THIS window, so a late 'closed' from a replaced window can't evict a newer
-    // window registered under the same id.
-    if (notificationWindows.get(item.id) === win) {
-      notificationWindows.delete(item.id);
-      notificationItems.delete(item.id);
+    // window registered under the same key.
+    if (notificationWindows.get(key) === win) {
+      notificationWindows.delete(key);
+      notificationItems.delete(key);
       // If the window was closed by some path other than closeNotificationWindow
       // (which already restores), still restore prior focus + clean up.
-      if (notificationPriorFocus.has(item.id)) restorePriorFocus(item.id);
+      if (notificationPriorFocus.has(key)) restorePriorFocus(key);
     }
   });
 
-  notificationWindows.set(item.id, win);
+  notificationWindows.set(key, win);
   return win;
 }
 
@@ -278,21 +297,25 @@ function restorePriorFocus(id: string): void {
   }, 0);
 }
 
-/** Close the notification window for an id once it's resolved/aborted. Idempotent. */
-export function closeNotificationWindow(id: string): void {
-  const win = notificationWindows.get(id);
+/** Close the notification window for an id once it's resolved/aborted. Idempotent. For a tool-approval
+ *  pass the `conversationId` so the conversation-scoped key resolves (R193); falls back to the raw id
+ *  (alerts, whose id is already globally unique, and any legacy raw-keyed entry). */
+export function closeNotificationWindow(id: string, conversationId?: string): void {
+  const composite = notifKeyFromParts(id, conversationId);
+  const key = notificationWindows.has(composite) || notificationItems.has(composite) ? composite : id;
+  const win = notificationWindows.get(key);
   // Only manage focus if the POP-OUT WINDOW was actually the focused surface at
   // close time. When the user answers the INLINE card in the main GUI (which also
   // closes any pop-out via the dismissal-sync path), the pop-out was NOT focused —
   // restoring/blurring then would wrongly blur the main window they're using.
   const popoutWasFocused = Boolean(win && !win.isDestroyed() && win.isFocused?.());
-  notificationWindows.delete(id);
-  notificationItems.delete(id);
+  notificationWindows.delete(key);
+  notificationItems.delete(key);
   if (win && !win.isDestroyed()) win.destroy();
-  if (popoutWasFocused) restorePriorFocus(id);
+  if (popoutWasFocused) restorePriorFocus(key);
   else {
-    notificationPriorFocus.delete(id);
-    notificationKaiWasFrontmost.delete(id);
+    notificationPriorFocus.delete(key);
+    notificationKaiWasFrontmost.delete(key);
   }
 }
 
@@ -308,8 +331,9 @@ export function closeAllNotificationWindows(): void {
   notificationItems.clear();
 }
 
-export function hasNotificationWindow(id: string): boolean {
-  const win = notificationWindows.get(id);
+export function hasNotificationWindow(id: string, conversationId?: string): boolean {
+  const composite = notifKeyFromParts(id, conversationId);
+  const win = notificationWindows.get(composite) ?? notificationWindows.get(id);
   return Boolean(win && !win.isDestroyed());
 }
 
@@ -341,17 +365,23 @@ let closeIpcRegistered = false;
 export function registerNotificationWindowIpc(): void {
   if (closeIpcRegistered) return;
   closeIpcRegistered = true;
-  const closeHandler = (_event: unknown, id: unknown): void => {
-    if (typeof id === 'string' && id) closeNotificationWindow(id);
+  const closeHandler = (_event: unknown, id: unknown, conversationId?: unknown): void => {
+    if (typeof id === 'string' && id) {
+      closeNotificationWindow(id, typeof conversationId === 'string' ? conversationId : undefined);
+    }
   };
   ipcMain.on('notif:close', closeHandler);
   // Back-compat channel (ApprovalShell during migration).
   ipcMain.on('approval:close', closeHandler);
   // Renderer pulls its item on mount — avoids the ready-to-show push racing the
-  // renderer's not-yet-mounted subscription (which left the window spinning).
-  ipcMain.handle('notif:get', (_event, id: unknown) =>
-    typeof id === 'string' ? (notificationItems.get(id) ?? null) : null,
-  );
+  // renderer's not-yet-mounted subscription (which left the window spinning). The
+  // pop-out route carries notifId + (for tool-approvals) notifConv so we resolve the
+  // conversation-scoped key, falling back to the raw id (alerts / legacy) (R193).
+  ipcMain.handle('notif:get', (_event, id: unknown, conversationId?: unknown) => {
+    if (typeof id !== 'string') return null;
+    const composite = notifKeyFromParts(id, typeof conversationId === 'string' ? conversationId : undefined);
+    return notificationItems.get(composite) ?? notificationItems.get(id) ?? null;
+  });
   // Renderer reports its laid-out content height (ResizeObserver on #notif-root);
   // size the reporting window to it, clamped. Map sender → its BrowserWindow.
   ipcMain.on('notif:resize', (event, height: unknown) => {

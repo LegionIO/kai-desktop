@@ -127,12 +127,12 @@ type AppAPI = {
   };
   approval: {
     onRequest: (callback: (request: unknown) => void) => () => void;
-    close: (approvalId: string) => void;
+    close: (approvalId: string, conversationId?: string) => void;
   };
   notification: {
     onRequest: (callback: (item: unknown) => void) => () => void;
-    get: (id: string) => Promise<unknown>;
-    close: (id: string) => void;
+    get: (id: string, conversationId?: string) => Promise<unknown>;
+    close: (id: string, conversationId?: string) => void;
     reportSize: (height: number) => void;
   };
   conversations: {

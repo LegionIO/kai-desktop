@@ -154,6 +154,9 @@ function AppRoot() {
   const approvalId = isApprovalWindow ? (search?.get('approvalId') ?? null) : null;
   const isNotifWindow = search?.get('notif') === '1';
   const notifId = isNotifWindow ? (search?.get('notifId') ?? null) : null;
+  // Conversation-scoped pop-out key (R193): tool-approval pop-outs carry notifConv so the shell can
+  // resolve/close its item under the conversationId::id key (alerts omit it — their id is unique).
+  const notifConv = isNotifWindow ? (search?.get('notifConv') ?? null) : null;
   if (typeof window !== 'undefined' && (isApprovalWindow || isNotifWindow)) {
     // TEMP debug: is the pop-out window rendering the standalone shell?
     console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId} notifId=${notifId}`);
@@ -169,7 +172,7 @@ function AppRoot() {
 
   // Unified dedicated pop-out window (approvals · questions · alerts).
   if (notifId) {
-    return <NotificationShell id={notifId} />;
+    return <NotificationShell id={notifId} conversationId={notifConv ?? undefined} />;
   }
 
   // Back-compat: legacy approval-only route.

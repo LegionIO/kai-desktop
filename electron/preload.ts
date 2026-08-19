@@ -135,7 +135,8 @@ const appAPI = {
       ipcRenderer.on('approval:request', handler);
       return () => ipcRenderer.removeListener('approval:request', handler);
     },
-    close: (approvalId: string) => ipcRenderer.send('approval:close', approvalId),
+    close: (approvalId: string, conversationId?: string) =>
+      ipcRenderer.send('approval:close', approvalId, conversationId),
   },
 
   // Dedicated notification pop-out window (approvals · questions · alerts).
@@ -145,8 +146,8 @@ const appAPI = {
       ipcRenderer.on('notif:request', handler);
       return () => ipcRenderer.removeListener('notif:request', handler);
     },
-    get: (id: string) => ipcRenderer.invoke('notif:get', id),
-    close: (id: string) => ipcRenderer.send('notif:close', id),
+    get: (id: string, conversationId?: string) => ipcRenderer.invoke('notif:get', id, conversationId),
+    close: (id: string, conversationId?: string) => ipcRenderer.send('notif:close', id, conversationId),
     reportSize: (height: number) => ipcRenderer.send('notif:resize', height),
   },
 

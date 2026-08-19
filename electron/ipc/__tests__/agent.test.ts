@@ -654,7 +654,7 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
     expect(pendingToolApprovals.has('tc-approve')).toBe(false);
     // Answering inline must also close the dedicated approval window (sync dismissal).
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve', undefined);
   });
 
   it('resolves the pending approval promise with false on agent:reject-tool', async () => {
@@ -678,7 +678,7 @@ describe('agent IPC: tool approval channels', () => {
     await pending;
     expect(decisions).toEqual([false]);
     expect(pendingToolApprovals.has('tc-reject')).toBe(false);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject', undefined);
   });
 
   it('resolves with the sentinel "dismiss" string on agent:dismiss-tool', async () => {
@@ -699,7 +699,7 @@ describe('agent IPC: tool approval channels', () => {
     await harness.invoke('agent:dismiss-tool', FAKE_EVENT, 'tc-dismiss');
     await pending;
     expect(decisions).toEqual(['dismiss']);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss', undefined);
   });
 
   it('stores answers and approves the call on agent:answer-tool-question', async () => {

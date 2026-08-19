@@ -85,32 +85,32 @@ describe('approval-window dedup + lifecycle', () => {
     openApprovalWindow(req('a'));
     openApprovalWindow(req('a')); // same id — must reuse, not construct a 2nd
     expect(constructed).toHaveLength(1);
-    expect(hasApprovalWindow('a')).toBe(true);
+    expect(hasApprovalWindow('a', 'c1')).toBe(true);
   });
 
   it('opens distinct windows for distinct ids', () => {
     openApprovalWindow(req('a'));
     openApprovalWindow(req('b'));
     expect(constructed).toHaveLength(2);
-    expect(hasApprovalWindow('a')).toBe(true);
-    expect(hasApprovalWindow('b')).toBe(true);
+    expect(hasApprovalWindow('a', 'c1')).toBe(true);
+    expect(hasApprovalWindow('b', 'c1')).toBe(true);
   });
 
   it('close destroys the window and is idempotent', () => {
     openApprovalWindow(req('a'));
-    closeApprovalWindow('a');
-    expect(hasApprovalWindow('a')).toBe(false);
+    closeApprovalWindow('a', 'c1');
+    expect(hasApprovalWindow('a', 'c1')).toBe(false);
     expect(constructed[0].destroyed).toBe(true);
     // Second close is a no-op (no throw).
-    expect(() => closeApprovalWindow('a')).not.toThrow();
+    expect(() => closeApprovalWindow('a', 'c1')).not.toThrow();
   });
 
   it('closeAll destroys every window', () => {
     openApprovalWindow(req('a'));
     openApprovalWindow(req('b'));
     closeAllApprovalWindows();
-    expect(hasApprovalWindow('a')).toBe(false);
-    expect(hasApprovalWindow('b')).toBe(false);
+    expect(hasApprovalWindow('a', 'c1')).toBe(false);
+    expect(hasApprovalWindow('b', 'c1')).toBe(false);
     expect(constructed.every((w) => w.destroyed)).toBe(true);
   });
 });

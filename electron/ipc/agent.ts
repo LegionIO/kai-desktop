@@ -1898,9 +1898,12 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
 /** Validate the OPTIONAL, UNTRUSTED conversationId that arrives with an answer/reject/dismiss over the
  *  (possibly web/WS) IPC boundary. Returns the string when it is a bounded non-empty string, else
  *  undefined — makeAnswerKey then falls back to the raw id (legacy/headless behavior). Keeping this in
- *  ONE place ensures the answer path and the reject/dismiss purge compose the SAME composite key (R192). */
+ *  ONE place ensures the answer path and the reject/dismiss purge compose the SAME composite key (R192).
+ *  The cap is only anti-abuse (bounding the composite stash key's byte size) — set generously above any
+ *  real conversation/sub-agent/automation id (UUIDs, `auto-…`, `subagent-…`) so a legitimately long id is
+ *  never silently downgraded to undefined (which would miss the composite lookup and wedge the turn — R193). */
 function sanitizeAnswerConversationId(conversationId: unknown): string | undefined {
-  return typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 200
+  return typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 1024
     ? conversationId
     : undefined;
 }
@@ -2559,7 +2562,7 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     if (event.type === 'tool-approval-required' && event.toolCallId) {
       maybeOpenDedicatedApprovalWindow(event);
     } else if (event.type === 'tool-result' && event.toolCallId) {
-      closeApprovalWindow(event.toolCallId);
+      closeApprovalWindow(event.toolCallId, event.conversationId);
       // The tool-result committed — an ask_user answer consumed by execute() is now
       // on the branch, so drop its in-flight ledger entry (no recovery needed). No-op
       // for non-ask_user ids (the ledger only holds ask_user answers) (R100 finding-7).
@@ -2576,10 +2579,15 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // nothing (R107 finding-1). A live/owning run's tool-result IS persisted, so
       // clearing is correct then; anything else leaves recovery to A's cleanup.
       const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
-      // The in-flight ledger is keyed by the conversation-scoped answerKey (R191/R192); clear the
-      // COMPOSITE key or the committed entry lingers and teardown re-delivers an already-committed answer.
-      if (emittingToken !== undefined && emittingToken === activeTok)
+      // The in-flight ledger is keyed by the conversation-scoped answerKey (R191/R192). For ask_user,
+      // exec id == stream id (pairing is by id-identity), so the event's toolCallId composes the same
+      // key execute() ledgered under. Clear the composite key AND the raw key defensively (R193): the
+      // clear is idempotent, and the raw key covers any path where the ledger entry was keyed without a
+      // conversationId (headless/legacy) — otherwise a committed answer lingers and teardown re-delivers it.
+      if (emittingToken !== undefined && emittingToken === activeTok) {
         clearInFlightAnswer(makeAnswerKey(event.conversationId, event.toolCallId));
+        clearInFlightAnswer(event.toolCallId);
+      }
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the
@@ -10393,7 +10401,7 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId);
+        closeApprovalWindow(toolCallId, conversationId);
       }
       return { ok: false, error: approvalError };
     }
@@ -10404,7 +10412,7 @@ export function registerAgentHandlers(
     // Sync dismissal: if the user answered the INLINE card, close the dedicated
     // approval window too. (Approve normally emits a tool-result that also closes
     // it, but reject/dismiss may not — close here so the surfaces never diverge.)
-    closeApprovalWindow(toolCallId);
+    closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
 
@@ -10425,7 +10433,7 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId);
+        closeApprovalWindow(toolCallId, conversationId);
       }
       return { ok: false, error: approvalError };
     }
@@ -10438,7 +10446,7 @@ export function registerAgentHandlers(
     // surface can't still be delivered to the successor. The handoff/tombstone keys are
     // conversation-scoped (R192), so purge under the composite key.
     purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
-    closeApprovalWindow(toolCallId);
+    closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
 
@@ -10449,7 +10457,7 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId);
+        closeApprovalWindow(toolCallId, conversationId);
       }
       return { ok: false, error: approvalError };
     }
@@ -10458,7 +10466,7 @@ export function registerAgentHandlers(
       pendingToolApprovals.delete(resolved.key);
     }
     purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
-    closeApprovalWindow(toolCallId);
+    closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
 
@@ -10506,7 +10514,7 @@ export function registerAgentHandlers(
       if (pending && approvalError) {
         if (approvalError === 'stale-browser-stream') {
           pending.resolve(false);
-          closeApprovalWindow(toolCallId);
+          closeApprovalWindow(toolCallId, conversationId);
         }
         return { ok: false, error: approvalError };
       }
