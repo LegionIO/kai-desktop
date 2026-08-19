@@ -875,6 +875,12 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           if (typeof image !== 'string' || image.length === 0) continue;
           suppliedImages += 1;
           if (count >= MAX_PLAN_ATTACHMENTS) continue;
+          // Require a bounded inline data: URL (R205). The task composers always produce base64 data URLs,
+          // so a non-data image is either malformed or a remote http(s) URL — and for a provider without
+          // URL support (e.g. Bedrock) the AI SDK would fetch a remote URL locally with a ~2 GiB default
+          // limit (× up to 8 images), OOMing main. A data: URL's bytes ARE the string, so the caps below
+          // measure the real payload; a URL's short string would slip past them.
+          if (!/^data:/i.test(image)) continue;
           const imageBytes = Buffer.byteLength(image, 'utf8');
           if (imageBytes > MAX_PLAN_ATTACHMENT_BYTES) continue;
           if (totalBytes + imageBytes > MAX_PLAN_ATTACHMENTS_TOTAL_BYTES) continue;
