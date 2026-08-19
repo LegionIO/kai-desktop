@@ -1,5 +1,5 @@
 import { resolve } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { defineConfig } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/postcss';
@@ -41,6 +41,7 @@ if (existsSync(localPath)) {
 }
 
 const resolved = resolveBranding(mergedBranding);
+const sandboxedBrowserPreloadPath = resolve(__dirname, 'electron/browser/page-preload.cjs');
 const brandDefines: Record<string, string> = {};
 for (const [key, value] of Object.entries(resolved)) {
   brandDefines[`__BRAND_${camelToScreamingSnake(key)}`] = JSON.stringify(value);
@@ -131,6 +132,24 @@ export default defineConfig({
   },
   preload: {
     define: brandDefines,
+    plugins: [
+      {
+        name: 'copy-sandboxed-browser-preload',
+        buildStart() {
+          this.addWatchFile(sandboxedBrowserPreloadPath);
+        },
+        generateBundle() {
+          // Sandboxed Electron preloads do not support ESM. Keep this one as a
+          // literal CommonJS asset instead of feeding it through the preload
+          // target, whose output format is .mjs for the primary preload.
+          this.emitFile({
+            type: 'asset',
+            fileName: 'browser-page.cjs',
+            source: readFileSync(sandboxedBrowserPreloadPath),
+          });
+        },
+      },
+    ],
     build: {
       rollupOptions: {
         input: {

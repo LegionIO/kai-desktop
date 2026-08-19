@@ -33,21 +33,27 @@ import { readEffectiveConfig, registerConfigHandlers } from './ipc/config.js';
 import {
   registerAgentHandlers,
   registerTools,
+  registerToolsPreservingBrowserState,
   updateMcpTools,
   updateSkillTools,
   updatePluginTools,
   updateCliTools,
+  updateBrowserTools,
   getRegisteredTools,
   setWorkspaceToolDefinitions,
   getWorkspaceToolDefinitions,
   hasActiveStreams,
   isConversationTurnActive,
+  isTextConversationTurnActive,
+  mayPersistConversationForBrowserAuthority,
   getInjectUserTurnAndRestart,
+  revokeActiveTextBrowserTools,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
 import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js';
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
+import { createBrowserTools } from './tools/browser.js';
 import { buildCliTools } from './tools/cli-tools.js';
 import { retryPendingSubAgentResumes } from './tools/sub-agent.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
@@ -71,7 +77,12 @@ import { registerMicRecorderHandlers, cleanupMicRecorder, getRecorderWindow } fr
 import { registerLiveSttHandlers } from './audio/live-stt.js';
 import { registerBatchTranscribeHandlers } from './audio/batch-transcribe.js';
 import { registerStreamingSttHandlers } from './audio/streaming-stt.js';
-import { registerRealtimeHandlers, updateActiveRealtimeSessionTools } from './ipc/realtime.js';
+import {
+  registerRealtimeHandlers,
+  resolveRealtimeBrowserApprovalOwner,
+  revokeRealtimeBrowserTools,
+  updateActiveRealtimeSessionTools,
+} from './ipc/realtime.js';
 import type { AppConfig } from './config/schema.js';
 import { resolveAlertSurface } from './config/schema.js';
 import { registerRuntime } from './agent/runtime/index.js';
@@ -85,6 +96,7 @@ import { getExistingComputerUseManager } from './computer-use/service.js';
 import { registerClipboardHandlers } from './ipc/clipboard.js';
 import { registerShellHandlers } from './ipc/shell.js';
 import { registerPartitionHandlers } from './ipc/partitions.js';
+import { registerBrowserHandlers } from './ipc/browser.js';
 import { registerDiagnosticsHandlers } from './ipc/diagnostics.js';
 import { broadcastTaskChange, listAllTasks, registerTaskHandlers } from './ipc/tasks.js';
 import {
@@ -114,6 +126,11 @@ import {
   consumePostUpdateMarker,
 } from './ipc/auto-update.js';
 import { applyBrandUserAgent, withBrandUserAgent } from './utils/user-agent.js';
+import {
+  isAllowedPrimaryRendererFrameNavigation,
+  isCanonicalPrimaryRendererUrl,
+  resolvePrimaryRendererUrl,
+} from './primary-renderer-url.js';
 import { safeFetch, readCappedArrayBuffer } from './utils/ssrf-guard.js';
 import { bootstrapSuperpowers } from './tools/superpowers-bootstrap.js';
 import {
@@ -144,6 +161,50 @@ import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
 import { safeReadFileWithin } from './utils/safe-file-read.js';
+import { overrideCommittedQuitUnloadVeto } from './quit-lifecycle.js';
+import {
+  BROWSER_FORCE_EXIT_GRACE_MS,
+  getExistingBrowserManager,
+  initializeBrowserManager,
+  shutdownBrowserManager,
+} from './browser/service.js';
+import {
+  createBrowserConfigTransitionCoordinator,
+  type BrowserConfigTransitionCoordinator,
+} from './browser/config-transition.js';
+import {
+  dispatchBrowserAwareApplicationMenuCommand,
+  dispatchBrowserAwareEditCommand,
+  type BrowserAwareApplicationMenuCommand,
+  type BrowserAwareEditCommand,
+} from './browser/edit-menu.js';
+
+const BROWSER_INTEGRATION_DRIVER = Symbol.for('kai.browser.integration-driver');
+
+/** Playwright's ElectronApplication.evaluate runs in the main process, so this
+ * opt-in driver can exercise the exact assistant-owned manager path without
+ * exposing a test IPC method to any renderer. It is absent outside local tests. */
+function installBrowserIntegrationTestDriver(): void {
+  if (process.env.NODE_ENV !== 'test' || process.env.KAI_BROWSER_INTEGRATION_TEST !== '1') return;
+  const manager = getExistingBrowserManager();
+  if (!manager) return;
+  Reflect.set(
+    globalThis,
+    BROWSER_INTEGRATION_DRIVER,
+    Object.freeze({
+      beginAssistantRun: (conversationId: string, runId: string) => manager.beginAssistantRun(conversationId, runId),
+      createAssistantTab: (conversationId: string, url: string, runId: string) =>
+        manager.createTab({ conversationId, url, owner: 'assistant' }, { id: runId }),
+      runAssistantAction: (conversationId: string, runId: string, request: Parameters<typeof manager.action>[1]) =>
+        manager.action(conversationId, request, { id: runId }),
+      keepAssistantTabOpen: (conversationId: string, tabId: string, runId: string) =>
+        manager.commandTab(conversationId, tabId, 'keep-open', 'assistant', {
+          id: runId,
+        }),
+      endAssistantRun: (conversationId: string, runId: string) => manager.cleanupAssistantTabs(conversationId, runId),
+    }),
+  );
+}
 
 /**
  * Open a URL in the OS default handler, but ONLY for safe web schemes. Displayed
@@ -174,6 +235,7 @@ function resolveUserDataDir(): string {
 }
 
 const APP_HOME = resolveUserDataDir();
+let browserConfigTransitions: BrowserConfigTransitionCoordinator | null = null;
 
 // Initialize the diagnostic trace at module scope so events emitted early in
 // startup (e.g. WindowHealthMonitor.logSession) are captured when tracing was
@@ -277,6 +339,12 @@ app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(({ url }) => {
     openExternalSafely(url);
     return { action: 'deny' };
+  });
+  contents.on('will-prevent-unload', (event) => {
+    // The first quit is still cancellable while Browser metadata drains. Once
+    // that barrier completes, cleanup has already disposed native Browser and
+    // background services, so a page veto must not strand a half-alive app.
+    overrideCommittedQuitUnloadVeto(event, quitCleanupStarted, browserShutdownComplete);
   });
 });
 
@@ -432,7 +500,9 @@ if (otaRollbackResult) {
 // the active code version. A future enhancement could use a tiny entry.js wrapper
 // to also redirect main process loading.
 const codePaths = resolveCodePaths(__BRAND_APP_SLUG, __APP_VERSION, import.meta.dirname);
-initPluginBrowser(codePaths);
+const primaryRendererUrl = resolvePrimaryRendererUrl(codePaths.renderer, process.env.ELECTRON_RENDERER_URL);
+const isPrimaryRendererUrl = (url: string): boolean => isCanonicalPrimaryRendererUrl(url, primaryRendererUrl);
+initPluginBrowser(codePaths, APP_HOME);
 
 // ── Window state persistence ──────────────────────────────────────────
 const WINDOW_STATE_FILE = join(APP_HOME, 'settings', 'window-state.json');
@@ -552,6 +622,8 @@ if (process.env.KAI_USER_DATA && process.env.KAI_USER_DATA.length > 0) {
 let pluginManagerRef: PluginManager | null = null;
 let taskTerminalManagerRef: TaskTerminalManager | null = null;
 let taskDispatcherRef: TaskDispatcher | null = null;
+let quitCleanupStarted = false;
+let browserShutdownComplete = false;
 
 function ensureAppHome(): void {
   const dirs = [
@@ -605,8 +677,39 @@ function applyTheme(): void {
   }
 }
 
+function runEditMenuCommand(command: BrowserAwareEditCommand): void {
+  dispatchBrowserAwareEditCommand(webContents.getFocusedWebContents(), getExistingBrowserManager(), command);
+}
+
+function runApplicationMenuCommand(command: BrowserAwareApplicationMenuCommand): void {
+  dispatchBrowserAwareApplicationMenuCommand(
+    webContents.getFocusedWebContents(),
+    getExistingBrowserManager(),
+    command,
+    (contents, fallbackCommand) => {
+      if (fallbackCommand === 'find') contents.send('menu:find');
+      else if (fallbackCommand === 'reload') contents.reload();
+      else if (fallbackCommand === 'hard-reload') contents.reloadIgnoringCache();
+      else if (fallbackCommand === 'toggle-devtools') contents.toggleDevTools();
+      else if (fallbackCommand === 'zoom-reset') contents.setZoomLevel(0);
+      else {
+        const delta = fallbackCommand === 'zoom-in' ? 0.5 : -0.5;
+        contents.setZoomLevel(contents.getZoomLevel() + delta);
+      }
+    },
+  );
+}
+
 let updateDownloaded = false;
 let primaryWindowRef: BrowserWindow | null = null;
+
+/** A primary renderer realm owns every native Browser capability. Losing that
+ * realm must revoke manager, text, and Realtime authority as one operation. */
+function revokeBrowserHostRendererAccess(): void {
+  getExistingBrowserManager()?.handleHostRendererUnavailable();
+  revokeActiveTextBrowserTools();
+  revokeRealtimeBrowserTools(getRegisteredTools());
+}
 let lastFocusedWindowRef: BrowserWindow | null = null;
 
 app.on('browser-window-focus', (_event, win) => {
@@ -672,18 +775,15 @@ function buildMenu(): void {
       { role: 'undo' },
       { role: 'redo' },
       { type: 'separator' },
-      { role: 'cut' },
-      { role: 'copy' },
-      { role: 'paste' },
+      { label: 'Cut', accelerator: 'CommandOrControl+X', click: () => runEditMenuCommand('cut') },
+      { label: 'Copy', accelerator: 'CommandOrControl+C', click: () => runEditMenuCommand('copy') },
+      { label: 'Paste', accelerator: 'CommandOrControl+V', click: () => runEditMenuCommand('paste') },
       { role: 'selectAll' },
       { type: 'separator' },
       {
         label: 'Find',
         accelerator: 'CommandOrControl+F',
-        click: () => {
-          const win = BrowserWindow.getFocusedWindow();
-          if (win) win.webContents.send('menu:find');
-        },
+        click: () => runApplicationMenuCommand('find'),
       },
     ],
   });
@@ -691,13 +791,33 @@ function buildMenu(): void {
   template.push({
     label: 'View',
     submenu: [
-      { role: 'reload' },
-      { role: 'forceReload' },
-      { role: 'toggleDevTools' },
+      { label: 'Reload', accelerator: 'CommandOrControl+R', click: () => runApplicationMenuCommand('reload') },
+      {
+        label: 'Force Reload',
+        accelerator: 'CommandOrControl+Shift+R',
+        click: () => runApplicationMenuCommand('hard-reload'),
+      },
+      {
+        label: 'Toggle Developer Tools',
+        accelerator: IS_MAC ? 'Alt+Command+I' : 'Control+Shift+I',
+        click: () => runApplicationMenuCommand('toggle-devtools'),
+      },
       { type: 'separator' },
-      { role: 'resetZoom' },
-      { role: 'zoomIn' },
-      { role: 'zoomOut' },
+      {
+        label: 'Actual Size',
+        accelerator: 'CommandOrControl+0',
+        click: () => runApplicationMenuCommand('zoom-reset'),
+      },
+      {
+        label: 'Zoom In',
+        accelerator: 'CommandOrControl+=',
+        click: () => runApplicationMenuCommand('zoom-in'),
+      },
+      {
+        label: 'Zoom Out',
+        accelerator: 'CommandOrControl+-',
+        click: () => runApplicationMenuCommand('zoom-out'),
+      },
       { type: 'separator' },
       { role: 'togglefullscreen' },
     ],
@@ -854,6 +974,36 @@ function createWindow(): BrowserWindow {
     },
   });
   primaryWindowRef = mainWindow;
+  if (!getExistingBrowserManager()) {
+    initializeBrowserManager(
+      APP_HOME,
+      () => readEffectiveConfig(APP_HOME),
+      () => primaryWindowRef,
+      join(codePaths.preload, 'browser-page.cjs'),
+    );
+  }
+  installBrowserIntegrationTestDriver();
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    getExistingBrowserManager()?.handleChromeShortcut(event, input);
+  });
+  const notifyBrowserWindowVisibility = () => {
+    getExistingBrowserManager()?.handleHostWindowVisibilityChanged();
+  };
+  mainWindow.on('show', notifyBrowserWindowVisibility);
+  mainWindow.on('hide', notifyBrowserWindowVisibility);
+  mainWindow.on('focus', notifyBrowserWindowVisibility);
+  mainWindow.on('blur', notifyBrowserWindowVisibility);
+  mainWindow.on('minimize', notifyBrowserWindowVisibility);
+  mainWindow.on('restore', notifyBrowserWindowVisibility);
+  notifyBrowserWindowVisibility();
+  const browserConfig = readEffectiveConfig(APP_HOME).browser;
+  // A reopened primary window must not republish Browser tools while Chromium
+  // is still draining or remapping an authenticated profile. The coordinator's
+  // committed generation is the sole release point for this hold.
+  if (!browserConfigTransitions?.isPending()) {
+    updateBrowserTools(browserConfig.enabled ? createBrowserTools(() => readEffectiveConfig(APP_HOME)) : []);
+    updateActiveRealtimeSessionTools(getRegisteredTools());
+  }
   windowHealthMonitor.attachWindow(mainWindow);
   applyBrandUserAgent(mainWindow.webContents);
 
@@ -879,6 +1029,15 @@ function createWindow(): BrowserWindow {
     return { action: 'deny' };
   });
 
+  // WebContentsView children are owned by the BrowserWindow, not the React
+  // renderer. A renderer reload/navigation would otherwise leave the old page
+  // view alive above a fresh BrowserPanel. Preserve tab shells, but detach and
+  // destroy every native view before the primary renderer is replaced.
+  mainWindow.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (!isMainFrame || isInPlace) return;
+    revokeBrowserHostRendererAccess();
+  });
+
   // Main-process navigation backstop for the main window AND its subframes.
   // Artifact previews render agent-supplied html/svg/react inside a
   // sandbox="allow-scripts" srcdoc iframe under a strict CSP, but Chromium does
@@ -887,30 +1046,14 @@ function createWindow(): BrowserWindow {
   // or <meta http-equiv=refresh>). The renderer's onLoad guard is too late (the
   // request already fired) and bypassable. This will-frame-navigate handler runs
   // in the main process BEFORE the request and can't be defeated by the frame:
-  // allow only the app's own origin (dev server / file://) and about: schemes
-  // (about:blank, about:srcdoc — the artifact frames). Anything else is denied +
-  // safe-routed to the OS browser (a user-clicked http(s) link still opens).
-  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
-  const isAllowedFrameNavigation = (target: string): boolean => {
-    if (/^about:/i.test(target)) return true; // about:blank / about:srcdoc (artifact frames)
-    let parsed: URL;
-    try {
-      parsed = new URL(target);
-    } catch {
-      return true; // unparseable / relative → not a cross-origin egress
-    }
-    if (parsed.protocol === 'file:') return true;
-    if (rendererUrl) {
-      try {
-        if (parsed.origin === new URL(rendererUrl).origin) return true; // dev server
-      } catch {
-        /* ignore */
-      }
-    }
-    return false;
-  };
+  // allow only the exact privileged renderer document at top level. Artifact
+  // subframes may additionally use about:blank/about:srcdoc and PDF data URLs
+  // used by the attachment preview. Anything else is
+  // denied + safe-routed to the OS browser (a user-clicked http(s) link still
+  // opens). Exact matching also prevents same-origin Vite /@fs resources or a
+  // sibling packaged file from inheriting the primary preload's authority.
   mainWindow.webContents.on('will-frame-navigate', (event) => {
-    if (isAllowedFrameNavigation(event.url)) return;
+    if (isAllowedPrimaryRendererFrameNavigation(event.url, primaryRendererUrl, event.isMainFrame)) return;
     event.preventDefault();
     openExternalSafely(event.url);
   });
@@ -1056,11 +1199,7 @@ function createWindow(): BrowserWindow {
     }
   });
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-  } else {
-    mainWindow.loadFile(join(codePaths.renderer, 'index.html'));
-  }
+  void mainWindow.loadURL(primaryRendererUrl);
 
   mainWindow.once('ready-to-show', () => {
     if (savedState.isMaximized) mainWindow.maximize();
@@ -1079,6 +1218,8 @@ function createWindow(): BrowserWindow {
     saveWindowState(mainWindow);
   });
   mainWindow.on('closed', () => {
+    revokeBrowserHostRendererAccess();
+    updateBrowserTools([]);
     if (primaryWindowRef === mainWindow) {
       windowHealthMonitor.detachWindow();
       primaryWindowRef = null;
@@ -1232,6 +1373,11 @@ if (gotSingleInstanceLock) {
       windowHealthMonitor.recordChildProcessGone({ ...details });
     });
     app.on('render-process-gone', (_event, contents, details) => {
+      // A Browser page renderer crash is handled by BrowserManager itself. Only
+      // loss of the primary React renderer invalidates all native child views.
+      if (primaryWindowRef && contents === primaryWindowRef.webContents) {
+        revokeBrowserHostRendererAccess();
+      }
       // Enrich the crash record with main-process memory + timing context. The
       // renderer abort itself carries `reason` ('crashed' | 'oom' | 'killed' |
       // 'launch-failed' | …) and `exitCode` (5 = SIGTRAP, the V8/cppgc fatal
@@ -1389,6 +1535,36 @@ if (gotSingleInstanceLock) {
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
+    };
+    const publishBrowserTools = (browserConfig: AppConfig['browser']): void => {
+      updateBrowserTools(browserConfig.enabled && getExistingBrowserManager() ? createBrowserTools(getConfig) : []);
+      syncRealtimeTools();
+    };
+    const revokeBrowserAssistantAccess = (): void => {
+      getExistingBrowserManager()?.revokeAssistantAccess();
+      revokeActiveTextBrowserTools();
+      revokeRealtimeBrowserTools(getRegisteredTools());
+    };
+
+    let setBrowserRollbackConfig: ((path: string, value: unknown) => void) | null = null;
+    browserConfigTransitions = createBrowserConfigTransitionCoordinator({
+      initialConfig: getConfig().browser,
+      getManager: () => getExistingBrowserManager(),
+      getPersistedConfig: () => getConfig().browser,
+      rollbackConfig: (browserConfig) => setBrowserRollbackConfig?.('browser', browserConfig),
+      onAssistantAuthorityRevoked: revokeBrowserAssistantAccess,
+      onTransitionCommitted: publishBrowserTools,
+      onError: (error) => console.warn(`[${__BRAND_PRODUCT_NAME}] Browser config transition failed:`, error),
+    });
+
+    const handleBrowserConfigChanged = (browserConfig: AppConfig['browser']): void => {
+      // The persisted config changes before Chromium finishes draining and
+      // swapping profiles. New turns must not receive Browser tools while the
+      // manager can still expose the prior scope; the coordinator republishes
+      // them only after the latest transition commits.
+      updateBrowserTools([]);
+      syncRealtimeTools();
+      browserConfigTransitions?.handle(browserConfig);
     };
 
     const handleConfigChanged = (config: AppConfig) => {
@@ -1558,8 +1734,34 @@ if (gotSingleInstanceLock) {
 
     // Register IPC handlers (capture must be installed first for web UI bridge)
     installIpcCapture(ipcMain);
-    const { setConfig } = registerConfigHandlers(ipcMain, APP_HOME, handleConfigChanged);
-    registerConversationHandlers(ipcMain, APP_HOME, getConfig, () => pluginManagerRef, isConversationTurnActive);
+    const { setConfig } = registerConfigHandlers(
+      ipcMain,
+      APP_HOME,
+      handleConfigChanged,
+      (event) => {
+        const invokeEvent = event as Electron.IpcMainInvokeEvent & { __kaiWebBridge?: boolean };
+        // Resolve dynamically: macOS can destroy and later recreate the primary
+        // window while these handlers remain registered for the app lifetime.
+        const primaryWindow = primaryWindowRef;
+        if (!primaryWindow || primaryWindow.isDestroyed()) return false;
+        return (
+          invokeEvent.__kaiWebBridge !== true &&
+          invokeEvent.sender === primaryWindow.webContents &&
+          invokeEvent.senderFrame === primaryWindow.webContents.mainFrame
+        );
+      },
+      handleBrowserConfigChanged,
+    );
+    setBrowserRollbackConfig = setConfig;
+    registerConversationHandlers(
+      ipcMain,
+      APP_HOME,
+      getConfig,
+      () => pluginManagerRef,
+      isConversationTurnActive,
+      (event, conversationId) =>
+        mayPersistConversationForBrowserAuthority(event, conversationId, () => primaryWindowRef),
+    );
     // Broadcast on-demand /compact lock changes to EVERY client (windows + web bridge)
     // so a renderer that didn't start the /compact still blocks a concurrent send before
     // optimistically persisting a user turn the backend would reject. The renderer's
@@ -1662,6 +1864,7 @@ if (gotSingleInstanceLock) {
     registerComputerUseHandlers(ipcMain, APP_HOME, getConfig);
     registerClipboardHandlers(ipcMain);
     registerShellHandlers(ipcMain);
+    registerBrowserHandlers(ipcMain, () => primaryWindowRef, isPrimaryRendererUrl);
     registerPartitionHandlers(ipcMain);
     registerDiagnosticsHandlers(ipcMain, MAIN_PROCESS_LOG, WINDOW_HEALTH_LOG);
     const taskTerminalManager = new TaskTerminalManager();
@@ -1850,13 +2053,29 @@ if (gotSingleInstanceLock) {
       getConfig,
       setConfig, // Unified setConfig that handles models.* persistence correctly
       getBrandRequiredPluginNames(),
+      revokeBrowserHostRendererAccess,
     );
-    registerPluginHandlers(ipcMain, pluginManager);
+    pluginManager.setBrowserAssistantRevocationHandler(revokeBrowserAssistantAccess);
+    registerPluginHandlers(
+      ipcMain,
+      pluginManager,
+      () => primaryWindowRef,
+      () => {
+        revokeBrowserHostRendererAccess();
+      },
+      primaryRendererUrl,
+    );
     pluginManagerRef = pluginManager;
     setUpdateHookRunner(pluginManager);
 
     // Register agent handlers after pluginManager so inference providers are available
-    registerAgentHandlers(ipcMain, APP_HOME, pluginManager);
+    registerAgentHandlers(
+      ipcMain,
+      APP_HOME,
+      pluginManager,
+      () => primaryWindowRef,
+      resolveRealtimeBrowserApprovalOwner,
+    );
 
     // A fresh backend has no in-flight runs. If a previous leader died mid-run,
     // stale `running`/`awaiting-approval` runStatus is left on disk — sweep it to
@@ -1901,7 +2120,7 @@ if (gotSingleInstanceLock) {
         // never lingers after its clients are gone.
         setTimeout(() => {
           app.exit(0);
-        }, 2000).unref();
+        }, BROWSER_FORCE_EXIT_GRACE_MS).unref();
       },
     })
       .then((socketPath) => console.info(`[${__BRAND_PRODUCT_NAME}] Local CLI bridge listening at ${socketPath}`))
@@ -1911,9 +2130,11 @@ if (gotSingleInstanceLock) {
         // the singleton lock forever, blocking every future CLI/GUI launch. Exit
         // so the next launch can take over. A windowed GUI leader keeps running
         // (the socket is a bonus there, not its reason to exist).
-        if (IS_HEADLESS) {
+        if (headlessWindowBlockActive) {
           app.quit();
-          setTimeout(() => app.exit(1), 2000).unref();
+          setTimeout(() => {
+            if (headlessWindowBlockActive) app.exit(1);
+          }, BROWSER_FORCE_EXIT_GRACE_MS).unref();
         }
       });
 
@@ -1933,7 +2154,7 @@ if (gotSingleInstanceLock) {
         );
         clearInterval(watcher);
         app.quit();
-        setTimeout(() => app.exit(0), 2000).unref();
+        setTimeout(() => app.exit(0), BROWSER_FORCE_EXIT_GRACE_MS).unref();
       }, 5000);
       watcher.unref();
     }
@@ -2460,13 +2681,7 @@ if (gotSingleInstanceLock) {
         return new Response('Not Found', { status: 404 });
       }
 
-      // Symlink/TOCTOU-safe read: a malicious plugin could plant a symlink in
-      // its own dir to exfiltrate files outside it via its renderer bundle.
-      const data = safeReadFileWithin(resolved.baseDir, resolved.filePath);
-      if (!data) {
-        return new Response('Not Found', { status: 404 });
-      }
-      return new Response(new Uint8Array(data), {
+      return new Response(new Uint8Array(resolved.data), {
         headers: {
           'Content-Type': resolved.contentType,
           'Cache-Control': 'no-cache',
@@ -2548,11 +2763,21 @@ if (gotSingleInstanceLock) {
       .then((tools) => {
         const pluginTools = pluginManager.getAllPluginTools();
         const allTools = [...tools, ...pluginTools];
-        registerTools(allTools);
+        // Browser tools are hot-swapped as soon as the primary window/config
+        // changes. MCP startup can take long enough for that state to change;
+        // do not let this older registry snapshot overwrite the live setting.
+        registerToolsPreservingBrowserState(allTools);
         console.info(`[${__BRAND_PRODUCT_NAME}] ${tools.length} tools + ${pluginTools.length} plugin tools registered`);
 
         // Register realtime handlers (needs tool registry)
-        registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);
+        registerRealtimeHandlers(
+          ipcMain,
+          getConfig,
+          getRegisteredTools,
+          APP_HOME,
+          () => primaryWindowRef,
+          isTextConversationTurnActive,
+        );
 
         // Start web UI server if enabled — but NOT in headless (CLI-spawned)
         // mode. The web server is a GUI-app feature; a headless CLI backend
@@ -2652,7 +2877,14 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  // Browser profile metadata is intentionally written off the main thread.
+  // Hold the first quit request long enough to drain those writes, then issue a
+  // second quit that passes straight through. This also remains bounded by the
+  // existing hard-exit fallbacks used by headless/update shutdown paths.
+  if (!browserShutdownComplete) event.preventDefault();
+  if (quitCleanupStarted) return;
+  quitCleanupStarted = true;
   // Signal OTA rollback that this was a graceful quit (not a crash)
   signalGracefulQuit(__BRAND_APP_SLUG);
   cleanupOta();
@@ -2679,4 +2911,12 @@ app.on('before-quit', () => {
   terminateTokenizerWorker();
   flushOutputBuffers();
   taskDispatcherRef?.stop();
+  void shutdownBrowserManager()
+    .catch((error) => {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] Failed to flush Browser profile data during shutdown:`, error);
+    })
+    .finally(() => {
+      browserShutdownComplete = true;
+      app.quit();
+    });
 });

@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { app } from '@/lib/ipc-client';
+import { putConversationChecked } from '@/lib/conversation-writes';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
@@ -28,6 +29,7 @@ import { ExportDialog } from './ExportDialog';
 import { RenameChatModal } from './RenameChatModal';
 import { FilterPopover } from './FilterPopover';
 import { useConversationPreferences, type FilterPreference } from './useConversationPreferences';
+import type { ConversationDeleteManyResult, ConversationDeleteResult } from '../../../shared/conversation-delete';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -51,7 +53,15 @@ type ConversationSummary = Pick<
 
 type ChatsListPageProps = {
   onOpenConversation: (id: string) => void;
-  onNewConversation: () => Promise<void> | void;
+  onNewConversation: (expectedCurrentId?: string | null) => Promise<void> | void;
+  onDeleteConversation: (
+    id: string,
+    fallbackCandidateIds?: string[],
+  ) => Promise<ConversationDeleteResult> | ConversationDeleteResult;
+  onDeleteConversations: (
+    ids: string[],
+    fallbackCandidateIds?: string[],
+  ) => Promise<ConversationDeleteManyResult> | ConversationDeleteManyResult;
   activeConversationId?: string | null;
   workspaceId?: string | null;
 };
@@ -149,7 +159,8 @@ export function matchesAdvancedFilter(conv: FilterableConversation, filter: Filt
 export const ChatsListPage: FC<ChatsListPageProps> = ({
   onOpenConversation,
   onNewConversation,
-  activeConversationId,
+  onDeleteConversation,
+  onDeleteConversations,
   workspaceId,
 }) => {
   const fullWidth = useFullWidthContent();
@@ -185,6 +196,7 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const [renameModal, setRenameModal] = useState<{ id: string; value: string } | null>(null);
   const [exportConvId, setExportConvId] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const visibleConversationIdsRef = useRef<string[]>([]);
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try {
       return new Set(JSON.parse(localStorage.getItem(__BRAND_APP_SLUG + ':pinned-conversations') ?? '[]'));
@@ -254,7 +266,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     async (id: string) => {
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
       if (!conv) return;
-      await app.conversations.put({ ...conv, archived: !conv.archived });
+      const result = await putConversationChecked({ ...conv, archived: !conv.archived });
+      if (!result.persisted) return;
       setSelectedIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
@@ -267,26 +280,17 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
   const handleDelete = useCallback(
     async (id: string) => {
-      const deletingActive = activeConversationId != null && id === activeConversationId;
-      const res = (await app.conversations.delete(id)) as { ok?: boolean } | undefined;
-      // A filesystem deletion failure preserves the conversation (ok:false); don't prune the
-      // selection, detach the active chat, or treat it as removed in that case.
-      if (res && res.ok === false) {
-        await loadConversations();
-        return;
+      const result = await onDeleteConversation(id, visibleConversationIdsRef.current);
+      if (result.ok) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
       }
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
       await loadConversations();
-      // Deleting the conversation the runtime is currently attached to would leave it
-      // streaming/persisting against a now-missing record — detach by starting a fresh chat
-      // (mirrors the sidebar's active-delete handling).
-      if (deletingActive) await onNewConversation();
     },
-    [activeConversationId, loadConversations, onNewConversation],
+    [loadConversations, onDeleteConversation],
   );
 
   const handleRename = useCallback(
@@ -301,7 +305,8 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
         setRenameModal(null);
         return;
       }
-      await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
+      const result = await putConversationChecked({ ...conv, title: trimmed, titleStatus: 'manual' });
+      if (!result.persisted) return;
       setRenameModal(null);
       await loadConversations();
     },
@@ -316,28 +321,28 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
 
   const handleBulkArchive = useCallback(async () => {
     const shouldArchive = filterMode !== 'archived';
+    const persistedIds = new Set<string>();
     for (const id of selectedIds) {
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-      if (conv && conv.archived !== shouldArchive) {
-        await app.conversations.put({ ...conv, archived: shouldArchive });
+      if (!conv) continue;
+      if (conv.archived === shouldArchive) {
+        persistedIds.add(id);
+        continue;
       }
+      const result = await putConversationChecked({ ...conv, archived: shouldArchive });
+      if (result.persisted) persistedIds.add(id);
     }
-    setSelectedIds(new Set());
+    setSelectedIds((current) => new Set([...current].filter((id) => !persistedIds.has(id))));
     await loadConversations();
   }, [selectedIds, filterMode, loadConversations]);
 
   const handleBulkDelete = useCallback(async () => {
-    const res = await app.conversations.deleteMany([...selectedIds]);
-    setSelectedIds(new Set());
+    const requestedIds = [...selectedIds];
+    const result = await onDeleteConversations(requestedIds, visibleConversationIdsRef.current);
+    const removedIds = new Set(result.ok ? (result.removedIds ?? requestedIds) : []);
+    setSelectedIds((current) => new Set([...current].filter((id) => !removedIds.has(id))));
     await loadConversations();
-    // Detach the UI only if the ACTIVE conversation was actually removed (a partial-failure
-    // delete can retain it — removedIds reflects what truly went away). Fall back to the
-    // requested set when the backend didn't report removedIds.
-    const removed = res?.removedIds ?? [...selectedIds];
-    if (activeConversationId != null && removed.includes(activeConversationId)) {
-      await onNewConversation();
-    }
-  }, [activeConversationId, selectedIds, loadConversations, onNewConversation]);
+  }, [selectedIds, loadConversations, onDeleteConversations]);
 
   const handleRowContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>, convId: string) => {
     e.preventDefault();
@@ -440,7 +445,18 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
     });
 
     return result;
-  }, [conversations, workspaceId, searchQuery, contentMatch, filterMode, sortMode, pinnedIds, filter, activeFilterCount]);
+  }, [
+    conversations,
+    workspaceId,
+    searchQuery,
+    contentMatch,
+    filterMode,
+    sortMode,
+    pinnedIds,
+    filter,
+    activeFilterCount,
+  ]);
+  visibleConversationIdsRef.current = processed.map((conversation) => conversation.id);
 
   // Delete every conversation currently visible in the list (respects search +
   // filter mode + advanced filters). Powers both "Delete all" and, when a
@@ -448,16 +464,11 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
   const handleDeleteView = useCallback(async () => {
     const ids = processed.map((c) => c.id);
     if (ids.length === 0) return;
-    const res = await app.conversations.deleteMany(ids);
-    setSelectedIds(new Set());
+    const result = await onDeleteConversations(ids, ids);
+    const removedIds = new Set(result.ok ? (result.removedIds ?? ids) : []);
+    setSelectedIds((current) => new Set([...current].filter((id) => !removedIds.has(id))));
     await loadConversations();
-    // Detach only if the ACTIVE conversation was actually removed (partial failure can
-    // retain it) — use removedIds, falling back to the requested set if unavailable.
-    const removed = res?.removedIds ?? ids;
-    if (activeConversationId != null && removed.includes(activeConversationId)) {
-      await onNewConversation();
-    }
-  }, [processed, activeConversationId, loadConversations, onNewConversation]);
+  }, [processed, loadConversations, onDeleteConversations]);
 
   const isSelecting = selectedIds.size > 0;
   const allSelected = isSelecting && processed.length > 0 && processed.every((c) => selectedIds.has(c.id));
@@ -932,7 +943,9 @@ export const ChatsListPage: FC<ChatsListPageProps> = ({
               onClick={(e) => e.stopPropagation()}
             >
               <h2 className="text-sm font-semibold text-foreground">
-                {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all' ? 'Delete results' : 'Delete all chats'}
+                {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all'
+                  ? 'Delete results'
+                  : 'Delete all chats'}
               </h2>
               <p className="mt-2 text-xs text-muted-foreground">
                 {searchQuery.trim() || activeFilterCount > 0 || filterMode !== 'all'

@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
-import type { Dirent } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, opendirSync, readSync, type BigIntStats } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { PluginManifest, PluginPermission, ExecScopeDeclaration, AllowedBinary } from './types.js';
 
@@ -10,57 +9,289 @@ export type PluginIntegrity = {
   version: string;
 };
 
+export type PluginDirectorySnapshot = {
+  fileHash: string;
+  files: ReadonlyMap<string, Uint8Array>;
+};
+
+export const MAX_PLUGIN_DIRECTORY_DEPTH = 32;
+export const MAX_PLUGIN_DIRECTORY_ENTRIES = 10_000;
+export const MAX_PLUGIN_FILE_BYTES = 32 * 1024 * 1024;
+export const MAX_PLUGIN_DIRECTORY_BYTES = 128 * 1024 * 1024;
+export const MAX_PLUGIN_RENDERER_ASSET_BYTES = 16 * 1024 * 1024;
+export const MAX_PLUGIN_RENDERER_BYTES = 32 * 1024 * 1024;
+
+type PluginFile = {
+  path: string;
+  relativePath: string;
+  size: number;
+  identity: PluginPathIdentity;
+};
+
+type PluginPathIdentity = {
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+};
+
+export const AUTHENTICATED_BROWSER_PERMISSION: PluginPermission = 'browser:authenticated-session';
+
+/** Frontend plugin modules execute in Kai's primary renderer. That renderer
+ * owns the authenticated Browser bridge, so loading frontend.js is itself an
+ * elevated capability even when the plugin never declares a browser API.
+ * Keep this host-inferred consent marker outside readPluginManifest(): parsing
+ * a manifest must never fabricate a capability that was not present on disk. */
+export function effectivePluginPermissions(
+  pluginDir: string,
+  declared: readonly PluginPermission[],
+): PluginPermission[] {
+  const permissions = [...new Set(declared)];
+  let hasFrontend = false;
+  const frontendPath = join(pluginDir, 'frontend.js');
+  try {
+    const stats = lstatSync(frontendPath, { bigint: true });
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Symbolic links are not allowed in plugin directories: ${frontendPath}`);
+    }
+    hasFrontend = stats.isFile();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (hasFrontend && !permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) {
+    permissions.push(AUTHENTICATED_BROWSER_PERMISSION);
+  }
+  return permissions;
+}
+
 function shouldHashPluginFile(relativePath: string): boolean {
   return relativePath !== 'settings.json';
 }
 
-function collectPluginFiles(rootDir: string, currentDir = rootDir): string[] {
-  const entries = readdirSync(currentDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) =>
-    a.name.localeCompare(b.name),
-  );
-  const files: string[] = [];
+function pluginPathIdentity(stats: BigIntStats): PluginPathIdentity {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: stats.mode,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+  };
+}
 
-  for (const entry of entries) {
-    const fullPath = join(currentDir, entry.name);
-    if (entry.isSymbolicLink()) {
-      throw new Error(`Symbolic links are not allowed in plugin directories: ${fullPath}`);
-    }
-    if (entry.isDirectory()) {
-      files.push(...collectPluginFiles(rootDir, fullPath));
-      continue;
-    }
-    if (entry.isFile()) {
-      const relativePath = relative(rootDir, fullPath).replace(/\\/g, '/');
-      if (shouldHashPluginFile(relativePath)) {
-        files.push(fullPath);
-      }
-    }
+function samePluginPathIdentity(left: PluginPathIdentity, right: PluginPathIdentity): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+function checkedPluginFile(
+  path: string,
+  stats: BigIntStats,
+  maxBytes = MAX_PLUGIN_FILE_BYTES,
+): {
+  size: number;
+  identity: PluginPathIdentity;
+} {
+  if (!stats.isFile()) throw new Error(`Plugin path is not a regular file: ${path}`);
+  if (stats.size < 0n || stats.size > BigInt(maxBytes) || stats.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Plugin file exceeds the ${maxBytes} byte limit: ${path}`);
+  }
+  return { size: Number(stats.size), identity: pluginPathIdentity(stats) };
+}
+
+/** Open without following the final component, validate the already-open file,
+ * and read at most its checked size from that same descriptor. Comparing both
+ * ends of the read catches in-place mutation; comparing a collected identity
+ * catches path or parent-directory replacement before any bytes are exposed. */
+function readBoundedPluginFile(
+  path: string,
+  expectedIdentity?: PluginPathIdentity,
+  maxBytes = MAX_PLUGIN_FILE_BYTES,
+): Buffer {
+  const collected = checkedPluginFile(path, lstatSync(path, { bigint: true }), maxBytes);
+  if (expectedIdentity && !samePluginPathIdentity(expectedIdentity, collected.identity)) {
+    throw new Error(`Plugin file changed while it was being validated: ${path}`);
   }
 
-  return files;
+  let descriptor: number;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    throw new Error(`Plugin file could not be opened without following symbolic links: ${path}`, { cause: error });
+  }
+  try {
+    const opened = checkedPluginFile(path, fstatSync(descriptor, { bigint: true }), maxBytes);
+    if (!samePluginPathIdentity(collected.identity, opened.identity)) {
+      throw new Error(`Plugin file changed while it was being opened: ${path}`);
+    }
+    const data = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < data.byteLength) {
+      const bytesRead = readSync(descriptor, data, offset, data.byteLength - offset, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const overflowProbe = Buffer.allocUnsafe(1);
+    const extraBytes = readSync(descriptor, overflowProbe, 0, 1, null);
+    const completed = pluginPathIdentity(fstatSync(descriptor, { bigint: true }));
+    if (offset !== data.byteLength || extraBytes !== 0 || !samePluginPathIdentity(opened.identity, completed)) {
+      throw new Error(`Plugin file changed while it was being read: ${path}`);
+    }
+    return data;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function collectPluginFiles(rootDir: string): PluginFile[] {
+  const files: PluginFile[] = [];
+  let entriesSeen = 0;
+  let totalBytes = 0;
+  const visit = (currentDir: string, depth: number): void => {
+    if (depth > MAX_PLUGIN_DIRECTORY_DEPTH) {
+      throw new Error(`Plugin directory exceeds the maximum depth of ${MAX_PLUGIN_DIRECTORY_DEPTH}.`);
+    }
+    const directoryStats = lstatSync(currentDir, { bigint: true });
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      throw new Error(`Plugin directory path is not a regular directory: ${currentDir}`);
+    }
+    const directoryIdentity = pluginPathIdentity(directoryStats);
+    const directory = opendirSync(currentDir);
+    try {
+      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+        entriesSeen++;
+        if (entriesSeen > MAX_PLUGIN_DIRECTORY_ENTRIES) {
+          throw new Error(`Plugin directory exceeds the ${MAX_PLUGIN_DIRECTORY_ENTRIES} entry limit.`);
+        }
+        const fullPath = join(currentDir, entry.name);
+        const stats = lstatSync(fullPath, { bigint: true });
+        if (stats.isSymbolicLink()) {
+          throw new Error(`Symbolic links are not allowed in plugin directories: ${fullPath}`);
+        }
+        if (stats.isDirectory()) {
+          visit(fullPath, depth + 1);
+          continue;
+        }
+        if (!stats.isFile()) continue;
+        const { size, identity } = checkedPluginFile(fullPath, stats);
+        totalBytes += size;
+        if (totalBytes > MAX_PLUGIN_DIRECTORY_BYTES) {
+          throw new Error(`Plugin directory exceeds the ${MAX_PLUGIN_DIRECTORY_BYTES} byte limit.`);
+        }
+        const relativePath = relative(rootDir, fullPath).replace(/\\/g, '/');
+        if (shouldHashPluginFile(relativePath)) files.push({ path: fullPath, relativePath, size, identity });
+      }
+    } finally {
+      directory.closeSync();
+    }
+    const completedDirectory = lstatSync(currentDir, { bigint: true });
+    if (
+      completedDirectory.isSymbolicLink() ||
+      !completedDirectory.isDirectory() ||
+      !samePluginPathIdentity(directoryIdentity, pluginPathIdentity(completedDirectory))
+    ) {
+      throw new Error(`Plugin directory changed while it was being validated: ${currentDir}`);
+    }
+  };
+  visit(rootDir, 0);
+  return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
 export function hashPluginFile(path: string): string {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
+  const data = readBoundedPluginFile(path);
+  return createHash('sha256').update(data).digest('hex');
 }
 
-export function hashPluginDirectory(dir: string): string {
+function digestPluginFiles(
+  files: readonly PluginFile[],
+  capture?: (relativePath: string, data: Uint8Array) => void,
+): string {
   const hash = createHash('sha256');
-  const files = collectPluginFiles(dir);
+  let actualBytes = 0;
 
-  for (const filePath of files) {
-    const relativePath = relative(dir, filePath).replace(/\\/g, '/');
-    hash.update(relativePath);
+  for (const file of files) {
+    const data = readBoundedPluginFile(file.path, file.identity);
+    actualBytes += data.byteLength;
+    if (data.byteLength > MAX_PLUGIN_FILE_BYTES || actualBytes > MAX_PLUGIN_DIRECTORY_BYTES) {
+      throw new Error('Plugin files changed while enforcing directory resource limits.');
+    }
+    hash.update(file.relativePath);
     hash.update('\0');
-    hash.update(readFileSync(filePath));
+    hash.update(data);
     hash.update('\0');
+    capture?.(file.relativePath, data);
   }
 
   return hash.digest('hex');
 }
 
+function shouldCaptureRendererAsset(relativePath: string): boolean {
+  if (relativePath === 'plugin.json' || relativePath === 'backend.js') return false;
+  // Plugin frontends historically could request any regular plugin-local file,
+  // with unknown extensions served as application/octet-stream. Capture every
+  // bounded asset (including extensionless data and node_modules dependencies)
+  // so immutable serving preserves that contract without reopening live reads.
+  return true;
+}
+
+export function snapshotPluginDirectory(
+  dir: string,
+  rendererEntryPath: string | null = 'frontend.js',
+): PluginDirectorySnapshot {
+  const files = collectPluginFiles(dir);
+  const rendererFiles = new Set<string>();
+  let rendererBytes = 0;
+  // Backend-only plugins never expose plugin-local files to Kai's renderer.
+  // Keep hashing the complete directory, but apply the tighter renderer
+  // capture budget only when the caller's renderer entry point exists in the
+  // approved directory snapshot. Production plugins use root frontend.js;
+  // renderer-build callers may select another plugin-local entry point.
+  if (rendererEntryPath !== null && files.some((file) => file.relativePath === rendererEntryPath)) {
+    for (const file of files) {
+      if (!shouldCaptureRendererAsset(file.relativePath)) continue;
+      if (file.size > MAX_PLUGIN_RENDERER_ASSET_BYTES) {
+        throw new Error(`Plugin renderer asset exceeds the ${MAX_PLUGIN_RENDERER_ASSET_BYTES} byte limit.`);
+      }
+      rendererBytes += file.size;
+      if (rendererBytes > MAX_PLUGIN_RENDERER_BYTES) {
+        throw new Error(`Plugin renderer assets exceed the ${MAX_PLUGIN_RENDERER_BYTES} byte limit.`);
+      }
+      rendererFiles.add(file.relativePath);
+    }
+  }
+  const snapshot = new Map<string, Uint8Array>();
+  let capturedBytes = 0;
+  const fileHash = digestPluginFiles(files, (relativePath, data) => {
+    if (!rendererFiles.has(relativePath)) return;
+    capturedBytes += data.byteLength;
+    if (data.byteLength > MAX_PLUGIN_RENDERER_ASSET_BYTES || capturedBytes > MAX_PLUGIN_RENDERER_BYTES) {
+      throw new Error('Plugin renderer assets changed while enforcing resource limits.');
+    }
+    snapshot.set(relativePath, data);
+  });
+  return { fileHash, files: snapshot };
+}
+
+export function hashPluginDirectory(dir: string): string {
+  // Hash-only callers can run while an approved renderer snapshot is already
+  // resident. Stream one file at a time instead of allocating a second map of
+  // every plugin byte and doubling peak startup memory.
+  return digestPluginFiles(collectPluginFiles(dir));
+}
+
 export function readPluginManifest(pluginDir: string, fallbackName?: string): PluginManifest {
-  const raw = JSON.parse(readFileSync(join(pluginDir, 'plugin.json'), 'utf-8')) as Record<string, unknown>;
+  const raw = JSON.parse(readBoundedPluginFile(join(pluginDir, 'plugin.json')).toString('utf-8')) as Record<
+    string,
+    unknown
+  >;
   const name = typeof raw.name === 'string' ? raw.name : (fallbackName ?? '');
 
   return {
@@ -92,7 +323,7 @@ export function getPluginIntegrity(pluginDir: string, fallbackName?: string): Pl
   const manifest = readPluginManifest(pluginDir, fallbackName);
   return {
     fileHash: hashPluginDirectory(pluginDir),
-    permissions: manifest.permissions,
+    permissions: effectivePluginPermissions(pluginDir, manifest.permissions),
     version: manifest.version,
   };
 }
@@ -108,6 +339,33 @@ export function arePermissionSetsEqual(left: readonly string[] = [], right: read
   }
 
   return true;
+}
+
+/** Match only the rollout migration where the host-inferred authenticated
+ * Browser permission is the sole addition to a previously trusted snapshot. */
+export function isLegacyInferredBrowserPermissionSnapshot(
+  previous: readonly string[] | undefined,
+  current: readonly string[],
+): boolean {
+  if (
+    !previous ||
+    previous.includes(AUTHENTICATED_BROWSER_PERMISSION) ||
+    !current.includes(AUTHENTICATED_BROWSER_PERMISSION)
+  ) {
+    return false;
+  }
+  return arePermissionSetsEqual(
+    previous,
+    current.filter((permission) => permission !== AUTHENTICATED_BROWSER_PERMISSION),
+  );
+}
+
+/** Legacy approvals predate permission snapshots. Preserve their compatibility
+ * except when a plugin now acquires authenticated Browser access, which must
+ * always be represented explicitly so the user sees a fresh consent prompt. */
+export function approvalPermissionsMatch(approved: readonly string[] | undefined, current: readonly string[]): boolean {
+  if (!approved) return !current.includes('browser:authenticated-session');
+  return arePermissionSetsEqual(approved, current);
 }
 
 // ─── Scope Parsing Helpers ──────────────────────────────────────────────────

@@ -12,7 +12,10 @@ vi.mock('electron', () => ({
 }));
 vi.mock('../../utils/window-send.js', () => ({ broadcastToAllWindows: () => 0 }));
 vi.mock('../../web-server/web-clients.js', () => ({ broadcastToWebClients: () => {} }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
+vi.mock('../../ipc/agent.js', () => ({
+  broadcastAgentStreamEvent: vi.fn(),
+  isConversationTurnActive: vi.fn(() => false),
+}));
 vi.mock('../../agent/plugin-generate.js', () => ({
   generateForPlugin: vi.fn(async () => ({ text: 'AGENT SAYS HI', modelKey: 'test', toolCalls: [] })),
   // Conversation-mode runs stream; yield a text delta then done carrying modelKey.
@@ -70,7 +73,10 @@ vi.mock('../../ipc/conversations.js', () => ({
   }),
   registerAutomationAborter: vi.fn(),
 }));
-vi.mock('../../ipc/agent.js', () => ({ broadcastAgentStreamEvent: vi.fn(), isConversationTurnActive: vi.fn(() => false) }));
+vi.mock('../../ipc/agent.js', () => ({
+  broadcastAgentStreamEvent: vi.fn(),
+  isConversationTurnActive: vi.fn(() => false),
+}));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readIndex: vi.fn(() => ({
     conversations: mockStore.conversations,
@@ -391,6 +397,27 @@ describe('agent conversationTarget', () => {
     // NOT recorded as a success (which would silently lose e.g. an alert answer).
     expect(rec.results[0].ok).toBe(false);
     expect(String(rec.results[0].error ?? '')).toMatch(/injection into convA failed|conversation-not-found/);
+  });
+
+  it('does not fall through to persistence when Browser authority rejects background injection', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({
+      ok: false,
+      error: 'native-browser-authority-required',
+    }));
+
+    const rec = await executeActions(
+      agentAction({ type: 'existing', conversationId: 'convA' }),
+      evt,
+      deps({ injectUserTurnAndRestart }),
+    );
+
+    expect(rec.results[0].ok).toBe(false);
+    expect(String(rec.results[0].error ?? '')).toContain('native-browser-authority-required');
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(appendConversationMessages).not.toHaveBeenCalled();
   });
 
   it('busy existing target with onBusyTarget:"divert" still diverts even when a helper is bound', async () => {
@@ -822,7 +849,9 @@ describe('agent conversationTarget', () => {
 
     await executeActions(agentAction({ type: 'existing', conversationId: 'convThrow' }), evt, deps()).catch(() => {});
 
-    const users = (mockStore.conversations.convThrow.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+    const users = (
+      mockStore.conversations.convThrow.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>
+    )
       .filter((m) => m.role === 'user')
       .map((m) => m.content?.[0]?.text);
     expect(users).toContain('lost follow-up');
@@ -860,7 +889,9 @@ describe('agent conversationTarget', () => {
 
     // The follow-up must have been re-queued (with a fresh id, since it was never
     // persisted) so the restarted attempt could consume + persist it.
-    const users = (mockStore.conversations.convRetry.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>)
+    const users = (
+      mockStore.conversations.convRetry.messageTree as Array<{ role?: string; content?: Array<{ text?: string }> }>
+    )
       .filter((m) => m.role === 'user')
       .map((m) => m.content?.[0]?.text);
     expect(users).toContain('the follow-up');

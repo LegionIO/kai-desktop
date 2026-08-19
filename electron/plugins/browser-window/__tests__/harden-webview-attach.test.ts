@@ -5,7 +5,10 @@
  * attacker-controllable preload, regardless of what the tag attributes request.
  */
 import { describe, it, expect } from 'vitest';
+import type { Session } from 'electron';
 import { hardenWebviewAttach } from '../index.js';
+
+const trustedSession = { trusted: true } as unknown as Session;
 
 describe('hardenWebviewAttach', () => {
   it('forces safe webPreferences even when the tag asked for dangerous ones', () => {
@@ -20,8 +23,10 @@ describe('hardenWebviewAttach', () => {
       experimentalFeatures: true,
       enableBlinkFeatures: 'CSSVariables',
       preload: '/evil/preload.js',
+      partition: 'persist:kai-browser-global',
+      session: { authenticated: true },
     };
-    hardenWebviewAttach(webPreferences, {});
+    hardenWebviewAttach(trustedSession, webPreferences, {});
     expect(webPreferences.nodeIntegration).toBe(false);
     expect(webPreferences.nodeIntegrationInSubFrames).toBe(false);
     expect(webPreferences.nodeIntegrationInWorker).toBe(false);
@@ -32,6 +37,8 @@ describe('hardenWebviewAttach', () => {
     expect(webPreferences.experimentalFeatures).toBe(false);
     expect('enableBlinkFeatures' in webPreferences).toBe(false);
     expect('preload' in webPreferences).toBe(false);
+    expect('partition' in webPreferences).toBe(false);
+    expect(webPreferences.session).toBe(trustedSession);
   });
 
   it('strips Node/preload-enabling tag attributes from params', () => {
@@ -42,28 +49,32 @@ describe('hardenWebviewAttach', () => {
       preload: 'file:///evil.js',
       webpreferences: 'nodeIntegration=yes,contextIsolation=no',
       enableblinkfeatures: 'CSSVariables',
-      partition: 'persist:browser',
+      partition: 'persist:kai-browser-global',
     };
-    hardenWebviewAttach({}, params);
+    const webPreferences: Record<string, unknown> = {};
+    hardenWebviewAttach(trustedSession, webPreferences, params);
     expect('nodeintegration' in params).toBe(false);
     expect('nodeintegrationinsubframes' in params).toBe(false);
     expect('preload' in params).toBe(false);
     expect('webpreferences' in params).toBe(false);
     expect('enableblinkfeatures' in params).toBe(false);
-    // Legitimate attributes are preserved.
+    // Navigation chrome is preserved, but guests must inherit the outer
+    // plugin window's already-validated Session.
     expect(params.src).toBe('https://evil.example');
-    expect(params.partition).toBe('persist:browser');
+    expect('partition' in params).toBe(false);
+    expect(webPreferences.session).toBe(trustedSession);
   });
 
   it('is a no-op-safe on already-clean inputs', () => {
     const webPreferences: Record<string, unknown> = {};
     const params: Record<string, unknown> = { src: 'https://ok.example' };
-    hardenWebviewAttach(webPreferences, params);
+    hardenWebviewAttach(trustedSession, webPreferences, params);
     expect(webPreferences.nodeIntegration).toBe(false);
     expect(webPreferences.contextIsolation).toBe(true);
     expect(webPreferences.sandbox).toBe(true);
     expect(webPreferences.allowRunningInsecureContent).toBe(false);
     expect(webPreferences.experimentalFeatures).toBe(false);
+    expect(webPreferences.session).toBe(trustedSession);
     expect(params.src).toBe('https://ok.example');
   });
 });

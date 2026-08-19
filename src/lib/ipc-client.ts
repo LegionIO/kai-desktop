@@ -15,6 +15,12 @@ import type { PlatformCapabilities } from '../../electron/platform/capabilities'
 import type { ConversationChange } from '../../electron/ipc/conversations';
 import type { CliInstallStatus } from '../../electron/ipc/cli-install';
 import type { Alert, AlertIndexEntry } from '../../electron/ipc/alert-store';
+import type { BrowserBridge } from '../../shared/browser';
+import type {
+  ConversationClearResult,
+  ConversationDeleteManyResult,
+  ConversationDeleteResult,
+} from '../../shared/conversation-delete';
 
 export type { ConversationChange } from '../../electron/ipc/conversations';
 export type { ConversationRecord } from '../../electron/ipc/conversation-store';
@@ -93,6 +99,7 @@ type AppAPI = {
     ) => Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }>;
     listInjects: (conversationId: string) => Promise<Array<{ id: string; text: string; at: number }>>;
     cancelInject: (conversationId: string, id: string) => Promise<{ ok: boolean; text?: string }>;
+    getToolApprovalPrivateDetails?: (toolCallId: string) => Promise<{ browserInput: unknown } | null>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
@@ -125,11 +132,18 @@ type AppAPI = {
     search: (term: string) => Promise<unknown[]>;
     get: (id: string) => Promise<unknown>;
     put: (conversation: unknown) => Promise<unknown>;
-    delete: (id: string) => Promise<unknown>;
-    deleteMany: (ids: string[]) => Promise<{ ok: boolean; deleted?: number; removedIds?: string[] }>;
-    clear: () => Promise<unknown>;
+    delete: (id: string) => Promise<ConversationDeleteResult>;
+    deleteMany: (ids: string[]) => Promise<ConversationDeleteManyResult>;
+    clear: () => Promise<ConversationClearResult>;
     getActiveId: () => Promise<string | null>;
-    setActiveId: (id: string) => Promise<unknown>;
+    setActiveId: (
+      id: string | null,
+      expectedCurrentId?: string | null,
+    ) => Promise<{
+      ok: boolean;
+      error?: 'active-conversation-changed' | 'conversation-not-found';
+      activeConversationId?: string | null;
+    }>;
     fork: (
       id: string,
       upToMessageIndex?: number,
@@ -379,7 +393,7 @@ type AppAPI = {
   modelCatalog: () => Promise<unknown>;
   realtime: {
     startSession: (conversationId: string) => Promise<{ ok?: boolean; error?: string }>;
-    endSession: () => Promise<{ ok?: boolean }>;
+    endSession: () => Promise<{ ok?: boolean; error?: string }>;
     sendAudio: (pcmBase64: string) => void;
     getStatus: () => Promise<{ status: string }>;
     onEvent: (callback: (event: unknown) => void) => () => void;
@@ -417,9 +431,24 @@ type AppAPI = {
   shell: {
     openPath: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
   };
+  browser: BrowserBridge;
   partitions: {
-    list: () => Promise<Array<{ name: string; sizeBytes: number }>>;
-    delete: (names: string[]) => Promise<{ success?: boolean; deleted?: string[]; error?: string }>;
+    list: () => Promise<
+      Array<{
+        name: string;
+        displayName?: string;
+        sizeBytes: number;
+        quarantined?: boolean;
+        recoveryRequired?: 'all-plugin-partitions';
+        corruptMarkerCount?: number;
+      }>
+    >;
+    delete: (names: string[]) => Promise<{
+      success?: boolean;
+      deleted?: string[];
+      recoveredCorruptMarkers?: number;
+      error?: string;
+    }>;
   };
   debug: {
     log: (file: string, message: string) => void;

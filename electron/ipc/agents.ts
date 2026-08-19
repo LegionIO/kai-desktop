@@ -6,6 +6,7 @@
  */
 
 import type { IpcMain } from 'electron';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -626,8 +627,9 @@ async function runSingleReviewer(
         const text = String(ev.text).replace(/\n/g, '\r\n');
         broadcast(text);
       } else if (ev.type === 'tool-call') {
+        const exposedArgs = redactBrowserToolArgsForExposure(String(ev.toolName ?? ''), ev.args);
         broadcast(
-          `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 200)})\r\n`,
+          `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(exposedArgs ?? {}).slice(0, 200)})\r\n`,
         );
       } else if (ev.type === 'tool-result') {
         const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');
@@ -1089,7 +1091,7 @@ async function startAgentRunLocked(
         broadcast(`\x1b[90m${'-'.repeat(60)}\x1b[0m\r\n\r\n`);
 
         const dbPath = join(appHome, 'data', 'task-agent-memory.db');
-        const registeredTools = getRegisteredTools();
+        const registeredTools = getRegisteredTools().filter((tool) => tool.source !== 'browser');
 
         // Add task lifecycle tools that let the agent explicitly promote/block the task
         const taskLifecycleTools = [
@@ -1302,8 +1304,9 @@ async function startAgentRunLocked(
             const text = String(ev.text).replace(/\n/g, '\r\n');
             broadcast(text);
           } else if (ev.type === 'tool-call') {
+            const exposedArgs = redactBrowserToolArgsForExposure(String(ev.toolName ?? ''), ev.args);
             broadcast(
-              `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(ev.args ?? {}).slice(0, 100)})\r\n`,
+              `\r\n\x1b[1;33m[Tool]\x1b[0m ${String(ev.toolName ?? 'unknown')}(${JSON.stringify(exposedArgs ?? {}).slice(0, 100)})\r\n`,
             );
           } else if (ev.type === 'tool-result') {
             const resultStr = typeof ev.result === 'string' ? ev.result : JSON.stringify(ev.result ?? '');

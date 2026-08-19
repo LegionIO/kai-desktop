@@ -25,6 +25,10 @@ async function approveRegistration(
       error: `Cannot ${actionLabel}: registering a CLI tool grants command-execution capability (${binaries.join(', ')}) and requires user approval, but this context has no live chat to prompt. A user can do this in Settings, or approve it in a live chat.`,
     };
   }
+  const decisionPromise = registerPendingApproval(toolCallId, context.abortSignal, 'any-renderer', {
+    conversationId: context.conversationId,
+    browserOwnerId: context.browserOwnerId,
+  });
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
@@ -37,7 +41,7 @@ async function approveRegistration(
       reason: `This registers a CLI tool that can run ${binaries.map((b) => `\`${b}\``).join(', ')}. A CLI tool executes that binary with model-provided arguments — approve only if you trust this.`,
     },
   });
-  const decision = await registerPendingApproval(toolCallId, context.abortSignal);
+  const decision = await decisionPromise;
   if (decision === true) return { ok: true };
   return {
     ok: false,

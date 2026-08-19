@@ -78,6 +78,10 @@ async function approveServerRegistration(
       error: `Cannot ${actionLabel}: registering an MCP server grants a new capability (${detail}) and requires user approval, but this context has no live chat to prompt. A user can do this in Settings, or approve it in a live chat.`,
     };
   }
+  const decisionPromise = registerPendingApproval(toolCallId, context.abortSignal, 'any-renderer', {
+    conversationId: context.conversationId,
+    browserOwnerId: context.browserOwnerId,
+  });
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
@@ -89,7 +93,7 @@ async function approveServerRegistration(
       reason: `This registers an MCP server (${detail}). A command server launches a local process; a URL server connects out and imports its tools. Approve only if you trust it.`,
     },
   });
-  const decision = await registerPendingApproval(toolCallId, context.abortSignal);
+  const decision = await decisionPromise;
   if (decision === true) return { ok: true };
   return {
     ok: false,

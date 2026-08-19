@@ -334,7 +334,7 @@ export class CodexRuntime implements AgentRuntime {
 
     if (customTools && customTools.length > 0) {
       try {
-        bridgeUrl = await bridge.start(customTools, conversationId, cwd, abortSignal);
+        bridgeUrl = await bridge.start(customTools, conversationId, cwd, abortSignal, options.browserOwnerId);
         console.info(`[codex-runtime] MCP bridge enabled with ${customTools.length} custom tool(s)`);
       } catch (err) {
         // Non-fatal — Codex can still work with its built-in tools only

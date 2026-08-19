@@ -22,6 +22,7 @@ import {
   FileJsonIcon,
 } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { putConversationChecked } from '@/lib/conversation-writes';
 import { cn } from '@/lib/utils';
 import { useComputerUse } from '@/providers/ComputerUseProvider';
 import {
@@ -37,6 +38,7 @@ import { FilterPopover } from './FilterPopover';
 import { SortPopover } from './SortPopover';
 import { useConversationPreferences } from './useConversationPreferences';
 import { matchesAdvancedFilter } from './ChatsListPage';
+import type { ConversationDeleteManyResult, ConversationDeleteResult } from '../../../shared/conversation-delete';
 
 type ConversationSummary = Pick<
   ConversationRecord,
@@ -65,9 +67,16 @@ type ConversationSummary = Pick<
 type ConversationListProps = {
   activeConversationId: string | null;
   activeThreadMode?: 'chat' | 'computer';
-  onSwitchConversation: (id: string) => void;
-  onNewConversation: () => Promise<void> | void;
-  onDeleteConversation?: (id: string) => Promise<void> | void;
+  onSwitchConversation: (id: string, expectedCurrentId?: string | null) => boolean | void | Promise<boolean | void>;
+  onNewConversation: (expectedCurrentId?: string | null) => Promise<void> | void;
+  onDeleteConversation: (
+    id: string,
+    fallbackCandidateIds?: string[],
+  ) => Promise<ConversationDeleteResult> | ConversationDeleteResult;
+  onDeleteConversations: (
+    ids: string[],
+    fallbackCandidateIds?: string[],
+  ) => Promise<ConversationDeleteManyResult> | ConversationDeleteManyResult;
   onNavigateToChatsPage?: () => void;
   /** When set, only conversations matching this workspace (or unscoped legacy conversations) are shown. */
   workspaceId?: string | null;
@@ -128,7 +137,8 @@ export const ConversationList: FC<ConversationListProps> = ({
   activeThreadMode,
   onSwitchConversation,
   onNewConversation,
-  onDeleteConversation: _onDeleteConversation,
+  onDeleteConversation,
+  onDeleteConversations,
   onNavigateToChatsPage,
   workspaceId,
 }) => {
@@ -375,49 +385,29 @@ export const ConversationList: FC<ConversationListProps> = ({
   const handleDeleteFiltered = useCallback(async () => {
     const ids = processedConversations.map((c) => c.id);
     if (ids.length === 0) return;
-    const res = await app.conversations.deleteMany(ids);
+    await onDeleteConversations(ids, ids);
     await loadConversations();
-    // Start a new chat only if the ACTIVE conversation was actually removed (a partial
-    // failure can retain it) — use removedIds, falling back to the requested set.
-    const removed = res?.removedIds ?? ids;
-    if (activeConversationId != null && removed.includes(activeConversationId)) {
-      await onNewConversation();
-    }
-  }, [processedConversations, activeConversationId, loadConversations, onNewConversation]);
+  }, [processedConversations, loadConversations, onDeleteConversations]);
 
   const handleDelete = async (id: string) => {
     setDeletingId(id);
     try {
       const wasDeletingActive = id === activeConversationId;
-      let next: ConversationSummary | undefined;
-
       if (wasDeletingActive) {
-        const idx = processedConversations.findIndex((c) => c.id === id);
-        next = processedConversations[idx + 1] ?? processedConversations[idx - 1];
         // Keep the deleted item visually "active" during the fade-out
         setFadingActiveId(id);
       }
-
-      const res = (await app.conversations.delete(id)) as { ok?: boolean } | undefined;
+      const result = await onDeleteConversation(
+        id,
+        processedConversations.map((conversation) => conversation.id),
+      );
       await loadConversations();
-      // A filesystem deletion failure preserves the conversation (ok:false) — don't clear
-      // the fade highlight-as-removed or navigate away from a chat that's still there.
-      if (res && res.ok === false) {
+      if (!result.ok) {
         setFadingActiveId(null);
         return;
       }
-
       if (wasDeletingActive) {
-        // Wait for the 300ms removal animation to finish before switching
-        setTimeout(async () => {
-          setFadingActiveId(null);
-          if (next) {
-            await app.conversations.setActiveId(next.id);
-            onSwitchConversation(next.id);
-          } else {
-            await onNewConversation();
-          }
-        }, 300);
+        setTimeout(() => setFadingActiveId(null), 300);
       }
     } finally {
       setDeletingId(null);
@@ -428,7 +418,8 @@ export const ConversationList: FC<ConversationListProps> = ({
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return;
     const isArchived = !conv.archived;
-    await app.conversations.put({ ...conv, archived: isArchived });
+    const result = await putConversationChecked({ ...conv, archived: isArchived });
+    if (!result.persisted) return;
     if (isArchived && id === activeConversationId) {
       await onNewConversation();
     }
@@ -471,7 +462,8 @@ export const ConversationList: FC<ConversationListProps> = ({
       setRenameModal(null);
       return;
     }
-    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' });
+    const result = await putConversationChecked({ ...conv, title: trimmed, titleStatus: 'manual' });
+    if (!result.persisted) return;
     setRenameModal(null);
     await loadConversations();
   };
@@ -508,7 +500,10 @@ export const ConversationList: FC<ConversationListProps> = ({
     // the user hasn't actually addressed the pending prompt yet, so the
     // indicator should reappear when they navigate away.
     if (conv?.hasUnread && conv.runStatus !== 'awaiting-approval') {
-      await app.conversations.put({ ...conv, hasUnread: false });
+      // Clearing the unread marker is metadata-only and best effort. A passive
+      // web/secondary renderer can be denied that write while a Browser-owned
+      // turn is active, but it must still be able to open the conversation.
+      await putConversationChecked({ ...conv, hasUnread: false });
     }
     onSwitchConversation(id);
   };

@@ -89,6 +89,8 @@ type HookRegistration = {
 export type DispatchResult<T = unknown> = {
   payload: T;
   denied: boolean;
+  /** True only when a modify hook supplied the returned replacement payload. */
+  modified: boolean;
   reason?: string;
 };
 
@@ -447,7 +449,7 @@ export class HookDispatcher {
     const enabled = cfg?.hooks?.enabled ?? true;
     const timeoutMs = cfg?.hooks?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    if (!enabled) return { payload, denied: false };
+    if (!enabled) return { payload, denied: false, modified: false };
 
     if (cfg) this.syncUserHooks(cfg);
 
@@ -475,12 +477,13 @@ export class HookDispatcher {
 
     if (list.length === 0) {
       emitObserve(payload);
-      return { payload, denied: false };
+      return { payload, denied: false, modified: false };
     }
 
     const ordered = [...list].sort((a, b) => (a.source === b.source ? 0 : a.source === 'plugin' ? -1 : 1));
     const toolName = extractToolName(payload);
     let current = payload;
+    let modified = false;
 
     for (const reg of ordered) {
       if ((event === 'PreToolUse' || event === 'PostToolUse') && !matchesToolName(reg.matcher, toolName)) {
@@ -542,12 +545,13 @@ export class HookDispatcher {
         return {
           payload: current,
           denied: true,
+          modified,
           reason: `${effectiveMode} hook failed (${message}); failing closed to avoid leaking unmodified data.`,
         };
       }
 
       if (outcome?.decision === 'deny') {
-        return { payload: current, denied: true, reason: outcome.reason };
+        return { payload: current, denied: true, modified, reason: outcome.reason };
       }
       if (effectiveMode === 'modify') {
         // A modify hook MUST return a replacement payload that carries the field
@@ -561,15 +565,17 @@ export class HookDispatcher {
           return {
             payload: current,
             denied: true,
+            modified,
             reason: `modify hook for ${event} returned no usable replacement (missing the expected field); failing closed to avoid leaking unmodified data.`,
           };
         }
         current = replacement as T;
+        modified = true;
       }
     }
 
     emitObserve(current);
-    return { payload: current, denied: false };
+    return { payload: current, denied: false, modified };
   }
 
   /* ── User (shell) hooks — sourced from automations config ── */

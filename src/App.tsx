@@ -10,6 +10,8 @@ import { ComputerSetupPanel } from '@/components/thread/ComputerSetupPanel';
 import { SubAgentThread } from '@/components/thread/SubAgentThread';
 import { DropZone } from '@/components/thread/DropZone';
 import { ConversationList } from '@/components/conversations/ConversationList';
+import { ConversationCleanupWarningHost } from '@/components/conversations/ConversationCleanupWarningHost';
+import { ConversationWriteWarningHost } from '@/components/conversations/ConversationWriteWarningHost';
 import { SubAgentSidebarSection } from '@/components/conversations/SubAgentSidebarSection';
 import { SettingsPanel } from '@/components/settings/SettingsPanel';
 import { KeyboardShortcutsOverlay } from '@/components/KeyboardShortcutsOverlay';
@@ -41,6 +43,7 @@ import {
   ChevronRightIcon,
   DownloadIcon,
   FileDiffIcon,
+  GlobeIcon,
   LoaderIcon,
   MenuIcon,
   MessageSquareIcon,
@@ -71,15 +74,30 @@ import type { ReasoningEffort } from '@/components/thread/ReasoningEffortSelecto
 import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app, type ConversationChange } from '@/lib/ipc-client';
 import { cn, generateId } from '@/lib/utils';
-import { shouldAdoptBroadcastActiveId } from '@/lib/conversation-selection';
+import {
+  commitLocalConversationSelection,
+  filterConversationDeleteFallbackCandidates,
+  isConversationWorkspaceRestorationCurrent,
+  openBrowserConversationInWorkspace,
+  selectConversationDeleteFallback,
+  shouldAdoptBroadcastActiveId,
+  shouldApplyConversationDeleteFallback,
+  shouldClearSelectionForNullActiveBroadcast,
+  type WorkspaceObservationWait,
+} from '@/lib/conversation-selection';
+import { surfaceConversationCleanupWarnings } from '@/lib/conversation-delete-warnings';
+import { putConversationChecked, surfaceConversationDeleteFailure } from '@/lib/conversation-writes';
 import type { ConversationRecord } from '@/providers/RuntimeProvider';
 import { shouldShowComputerSetup, type ComputerSession, type ComputerUseSurface } from '../shared/computer-use';
+import type { ConversationDeleteManyResult, ConversationDeleteResult } from '../shared/conversation-delete';
 import { usePlugins } from '@/providers/PluginProvider';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
 import { PlanPanelProvider } from '@/providers/PlanPanelContext';
 import { ArtifactProvider, ARTIFACT_PREVIEW_TAB_ID } from '@/providers/ArtifactProvider';
 import { SidePanelProvider, SidePanelHost, ArtifactPanel, type SidePanelTab } from '@/components/side-panel';
+import { BrowserPanel, BrowserPanelAutoOpen } from '@/components/browser';
+import { BROWSER_PANEL_TAB_ID } from '../shared/browser';
 import { DiffPanel } from '@/components/diff';
 import { TaskProvider, useTasksOptional } from '@/providers/TaskProvider';
 import { AgentProvider, useAgents } from '@/providers/AgentProvider';
@@ -109,6 +127,7 @@ export default function App() {
             <TaskProvider>
               <AgentProvider>
                 <AppRoot />
+                <ConversationWriteWarningHost />
               </AgentProvider>
             </TaskProvider>
           </ComputerUseProvider>
@@ -260,6 +279,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   // See AppShell: gate persistence until this conversation's settings hydrate,
   // or the persist effect clobbers saved values with initial null state.
   const hydratedSettingsConvIdRef = useRef<string | null>(null);
+  const settingsPersistSeqRef = useRef(0);
 
   useEffect(() => {
     if (!conversationId) {
@@ -303,9 +323,10 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
   useEffect(() => {
     if (!conversationId) return;
     if (hydratedSettingsConvIdRef.current !== conversationId) return;
+    const persistSeq = ++settingsPersistSeqRef.current;
     app.conversations
       .get(conversationId)
-      .then((conv: unknown) => {
+      .then(async (conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
         // Skip if values haven't actually changed to avoid unnecessary writes
@@ -317,7 +338,7 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
           record.profilePrimaryModelKey === profilePrimaryModelKey
         )
           return;
-        app.conversations.put({
+        const result = await putConversationChecked({
           ...record,
           selectedModelKey,
           selectedProfileKey,
@@ -325,6 +346,16 @@ const ComputerSetupShell: FC<{ preferredConversationId?: string | null }> = ({ p
           profilePrimaryModelKey,
           updatedAt: new Date().toISOString(),
         });
+        if (
+          !result.persisted &&
+          persistSeq === settingsPersistSeqRef.current &&
+          hydratedSettingsConvIdRef.current === conversationId
+        ) {
+          setSelectedModelKey(record.selectedModelKey ?? null);
+          setSelectedProfileKey(record.selectedProfileKey ?? null);
+          setFallbackEnabled(record.fallbackEnabled ?? false);
+          setProfilePrimaryModelKey(record.profilePrimaryModelKey ?? null);
+        }
       })
       .catch(() => {});
   }, [conversationId, fallbackEnabled, profilePrimaryModelKey, selectedModelKey, selectedProfileKey]);
@@ -554,6 +585,12 @@ function AppShell() {
             </div>
           ),
       },
+      {
+        id: BROWSER_PANEL_TAB_ID,
+        label: 'Browser',
+        icon: GlobeIcon,
+        render: () => <BrowserPanel conversationId={activeConversationId} />,
+      },
     ],
     [activeConversationId],
   );
@@ -566,6 +603,7 @@ function AppShell() {
   // until this matches the active conversation, or it clobbers the saved values
   // with the previous conversation's stale state on switch.
   const hydratedSettingsConvIdRef = useRef<string | null>(null);
+  const settingsPersistSeqRef = useRef(0);
   const [selectedModelKey, setSelectedModelKey] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto');
@@ -649,6 +687,33 @@ function AppShell() {
   // Monotonic token guarding async active-conversation reads (onChanged fetch +
   // switch title load) so out-of-order resolutions can't apply stale state.
   const activeSyncSeqRef = useRef(0);
+  const configuredWorkspaceIdRef = useRef<string | null>(null);
+  const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
+  const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
+  const workspaceObservationWaitersRef = useRef<Map<string, Set<(observed: boolean) => void>>>(new Map());
+  const createWorkspaceObservationWait = useCallback((workspaceId: string): WorkspaceObservationWait => {
+    if (configuredWorkspaceIdRef.current === workspaceId && observedWorkspaceIdRef.current === workspaceId) {
+      return { promise: Promise.resolve(true), cancel: () => {} };
+    }
+
+    let settle: (observed: boolean) => void = () => {};
+    const promise = new Promise<boolean>((resolve) => {
+      const waiters = workspaceObservationWaitersRef.current.get(workspaceId) ?? new Set();
+      let settled = false;
+      settle = (observed) => {
+        if (settled) return;
+        settled = true;
+        waiters.delete(settle);
+        if (waiters.size === 0 && workspaceObservationWaitersRef.current.get(workspaceId) === waiters) {
+          workspaceObservationWaitersRef.current.delete(workspaceId);
+        }
+        resolve(observed);
+      };
+      waiters.add(settle);
+      workspaceObservationWaitersRef.current.set(workspaceId, waiters);
+    });
+    return { promise, cancel: () => settle(false) };
+  }, []);
   const { config, updateConfig } = useConfig();
   const fullWidth = useFullWidthContent();
   const { title: themeTitle, Icon: ThemeIcon, toggle: toggleTheme } = useThemeToggleControl();
@@ -667,6 +732,8 @@ function AppShell() {
   );
   const activeWorkspaceId =
     (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
+  configuredWorkspaceIdRef.current = activeWorkspaceId;
+  knownWorkspaceIdsRef.current = new Set(workspaces.map((workspace) => workspace.id));
   const activeWorkspace = useMemo<Workspace | null>(
     () => workspaces.find((w) => w.id === activeWorkspaceId) ?? null,
     [workspaces, activeWorkspaceId],
@@ -714,14 +781,63 @@ function AppShell() {
     // instead of forcing a switch back to the chat view.
     if (activeWorkspace?.lastActiveConversationId) {
       const restoredId = activeWorkspace.lastActiveConversationId;
+      const restoringWorkspaceId = activeWorkspace.id;
+      const selectionSequence = ++activeSyncSeqRef.current;
+      const selectionWhenStarted = activeConversationIdRef.current;
       void (async () => {
-        await app.conversations.setActiveId(restoredId);
-        setActiveConversationId(restoredId);
+        const isCurrent = () =>
+          isConversationWorkspaceRestorationCurrent({
+            workspaceId: restoringWorkspaceId,
+            currentWorkspaceId: prevWorkspaceIdRef.current,
+            selectionSequence,
+            currentSelectionSequence: activeSyncSeqRef.current,
+            selectionWhenStarted,
+            currentSelection: activeConversationIdRef.current,
+          });
+        const activation = await app.conversations.setActiveId(restoredId);
+        if (!isCurrent()) return;
+        if (!activation.ok) {
+          if (activation.error === 'conversation-not-found') {
+            await app.workspaces.saveLastConversation({ workspaceId: restoringWorkspaceId, conversationId: null });
+          }
+          return;
+        }
         const conv = (await app.conversations.get(restoredId)) as ConversationRecord | null;
+        if (!isCurrent()) return;
+        if (!conv) {
+          const cleared = await app.conversations.setActiveId(null, restoredId);
+          if (cleared.ok && isCurrent()) {
+            await app.workspaces.saveLastConversation({ workspaceId: restoringWorkspaceId, conversationId: null });
+          }
+          return;
+        }
+        commitLocalConversationSelection(activeConversationIdRef, restoredId, setActiveConversationId);
         setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(restoredId)));
       })();
     }
   }, [activeWorkspaceId]); // intentionally only react to workspace ID changes
+
+  // Browser attention must not select its destination chat until the effect
+  // above has recorded the chat belonging to the workspace we just left.
+  // Effects run in declaration order, so resolving here makes that ordering
+  // explicit. A different observed workspace cancels stale concurrent waits.
+  useEffect(() => {
+    observedWorkspaceIdRef.current = activeWorkspaceId;
+    const pending = [...workspaceObservationWaitersRef.current.entries()];
+    workspaceObservationWaitersRef.current.clear();
+    for (const [workspaceId, waiters] of pending) {
+      for (const settle of waiters) settle(workspaceId === activeWorkspaceId);
+    }
+  }, [activeWorkspaceId]);
+
+  useEffect(
+    () => () => {
+      const pending = [...workspaceObservationWaitersRef.current.values()].flatMap((waiters) => [...waiters]);
+      workspaceObservationWaitersRef.current.clear();
+      for (const settle of pending) settle(false);
+    },
+    [],
+  );
 
   // Build a name→displayName map from the plugin list (refreshed when pluginUIState changes)
   useEffect(() => {
@@ -800,7 +916,9 @@ function AppShell() {
         // else: keep our selection; the list refresh (loadConversations) still
         // surfaces the CLI's new chat without moving our outline.
       } else if (activeId == null) {
-        applyStore(null, null);
+        if (shouldClearSelectionForNullActiveBroadcast(activeConversationIdRef.current, change)) {
+          applyStore(null, null);
+        }
       } else if (shouldAdoptBroadcastActiveId(activeConversationIdRef.current, activeId)) {
         // Same anti-hijack guard as the upsert branch above: the backend's
         // global active-id can be flipped by another client (the `kai` CLI
@@ -926,55 +1044,200 @@ function AppShell() {
 
   const handleRename = useCallback(async (id: string, newTitle: string) => {
     const trimmed = newTitle.trim();
-    setRenamingTitle(false);
-    if (!trimmed) return;
+    if (!trimmed) {
+      setRenamingTitle(false);
+      return;
+    }
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-    if (!conv) return;
-    await app.conversations.put({ ...conv, title: trimmed, titleStatus: 'manual' } as ConversationRecord);
+    if (!conv) {
+      setRenamingTitle(false);
+      return;
+    }
+    const result = await putConversationChecked({
+      ...conv,
+      title: trimmed,
+      titleStatus: 'manual',
+    } as ConversationRecord);
+    if (result.persisted) setRenamingTitle(false);
   }, []);
 
   const handleDeleteConversation = useCallback(
-    async (id: string) => {
+    async (id: string, fallbackCandidateIds?: string[]): Promise<ConversationDeleteResult> => {
+      const selectionWhenDeleteStarted = activeConversationIdRef.current;
+      let backendFallbackId: string | null = null;
       const allConversations = (await app.conversations.list()) as ConversationRecord[];
-      const remaining = allConversations
-        .filter((c) => c.id !== id)
-        .sort((a, b) => {
-          const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
-          const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
-          return bTime - aTime;
-        });
-      // Set the next active conversation BEFORE deleting so the backend
-      // never broadcasts activeConversationId = null.
-      if (remaining.length > 0) {
-        await app.conversations.setActiveId(remaining[0].id);
+      const remaining = filterConversationDeleteFallbackCandidates(allConversations, [id], {
+        fallbackCandidateIds,
+        workspaceId: activeWorkspaceId,
+      }).sort((a, b) => {
+        const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
+        const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
+        return bTime - aTime;
+      });
+      // When deleting this window's selected chat, set the backend fallback
+      // before deletion so it never broadcasts activeConversationId = null.
+      // Deleting a background chat must not move the current selection.
+      if (
+        remaining.length > 0 &&
+        shouldApplyConversationDeleteFallback(id, selectionWhenDeleteStarted, activeConversationIdRef.current)
+      ) {
+        const fallbackResult = await app.conversations.setActiveId(remaining[0].id, id);
+        if (fallbackResult.ok) backendFallbackId = remaining[0].id;
       }
-      const delRes = (await app.conversations.delete(id)) as { ok?: boolean; error?: string } | undefined;
+      const delRes = await app.conversations.delete(id);
+      surfaceConversationDeleteFailure(delRes);
       if (delRes && delRes.ok === false) {
         // The delete did NOT happen (e.g. file removal failed — the store preserves the
         // conversation on rm failure). Do NOT navigate away / present the surviving chat as
         // deleted: the target is still on disk. Restore the active selection to the target and
         // surface the failure rather than silently misrepresenting the state.
-        if (remaining.length > 0) await app.conversations.setActiveId(id).catch(() => {});
+        if (
+          backendFallbackId &&
+          shouldApplyConversationDeleteFallback(id, selectionWhenDeleteStarted, activeConversationIdRef.current)
+        ) {
+          await app.conversations.setActiveId(id, backendFallbackId).catch(() => {});
+        }
         console.error(`[App] delete conversation ${id.slice(0, 8)} failed: ${delRes.error ?? 'unknown'}`);
-        return;
+        return delRes;
       }
-      if (remaining.length > 0) {
-        setActiveConversationId(remaining[0].id);
-        setActiveConversationTitle(
-          getConversationDisplayTitle(remaining[0], cuSessionsByConversation.get(remaining[0].id)),
-        );
+      surfaceConversationCleanupWarnings(delRes);
+      if (!shouldApplyConversationDeleteFallback(id, selectionWhenDeleteStarted, activeConversationIdRef.current)) {
+        return delRes;
+      }
+      let fallback: ConversationRecord | null = null;
+      try {
+        fallback = await selectConversationDeleteFallback({
+          deletedId: id,
+          expectedBackendId: backendFallbackId,
+          list: async () =>
+            filterConversationDeleteFallbackCandidates((await app.conversations.list()) as ConversationRecord[], [id], {
+              fallbackCandidateIds,
+              workspaceId: activeWorkspaceId,
+            }).sort((a, b) => {
+              const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
+              const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
+              return bTime - aTime;
+            }),
+          setActiveId: (fallbackId, expectedCurrentId) => app.conversations.setActiveId(fallbackId, expectedCurrentId),
+        });
+      } catch (error) {
+        console.error('[App] Failed to resolve a surviving conversation after deletion:', error);
+      }
+      if (!shouldApplyConversationDeleteFallback(id, selectionWhenDeleteStarted, activeConversationIdRef.current)) {
+        return delRes;
+      }
+      if (fallback) {
+        activeConversationIdRef.current = fallback.id;
+        setActiveConversationId(fallback.id);
+        setActiveConversationTitle(getConversationDisplayTitle(fallback, cuSessionsByConversation.get(fallback.id)));
+        setActiveConversationHasMessages((fallback.messageCount ?? 0) > 0);
       } else {
+        activeConversationIdRef.current = null;
         setActiveConversationId(null);
         setActiveConversationTitle(null);
+        setActiveConversationHasMessages(false);
       }
+      return delRes;
     },
-    [cuSessionsByConversation],
+    [activeWorkspaceId, cuSessionsByConversation],
+  );
+
+  const handleDeleteConversations = useCallback(
+    async (ids: string[], fallbackCandidateIds?: string[]): Promise<ConversationDeleteManyResult> => {
+      const requestedIds = [...new Set(ids)];
+      if (requestedIds.length === 0) return { ok: true, deleted: 0, removedIds: [] };
+      const requested = new Set(requestedIds);
+      let excludedFromFallback = requested;
+      const selectionWhenDeleteStarted = activeConversationIdRef.current;
+      const deletingSelectedConversation =
+        selectionWhenDeleteStarted !== null && requested.has(selectionWhenDeleteStarted);
+      const listSurvivors = async (): Promise<ConversationRecord[]> =>
+        filterConversationDeleteFallbackCandidates(
+          (await app.conversations.list()) as ConversationRecord[],
+          excludedFromFallback,
+          { fallbackCandidateIds, workspaceId: activeWorkspaceId },
+        ).sort((a, b) => {
+          const aTime = new Date(a.lastMessageAt ?? a.updatedAt ?? a.createdAt).getTime();
+          const bTime = new Date(b.lastMessageAt ?? b.updatedAt ?? b.createdAt).getTime();
+          return bTime - aTime;
+        });
+      let backendFallbackId: string | null = null;
+      if (
+        deletingSelectedConversation &&
+        shouldApplyConversationDeleteFallback(
+          selectionWhenDeleteStarted,
+          selectionWhenDeleteStarted,
+          activeConversationIdRef.current,
+        )
+      ) {
+        const candidate = (await listSurvivors())[0];
+        if (candidate) {
+          const fallbackResult = await app.conversations.setActiveId(candidate.id, selectionWhenDeleteStarted);
+          if (fallbackResult.ok) backendFallbackId = candidate.id;
+        }
+      }
+
+      const result = await app.conversations.deleteMany(requestedIds);
+      surfaceConversationDeleteFailure(result);
+      surfaceConversationCleanupWarnings(result);
+      const removed = new Set(result.ok === false ? [] : (result.removedIds ?? requestedIds));
+      excludedFromFallback = removed;
+      if (!selectionWhenDeleteStarted || !removed.has(selectionWhenDeleteStarted)) {
+        if (selectionWhenDeleteStarted && backendFallbackId) {
+          await app.conversations.setActiveId(selectionWhenDeleteStarted, backendFallbackId).catch(() => {});
+        }
+        return result;
+      }
+      if (
+        !shouldApplyConversationDeleteFallback(
+          selectionWhenDeleteStarted,
+          selectionWhenDeleteStarted,
+          activeConversationIdRef.current,
+        )
+      ) {
+        return result;
+      }
+
+      let fallback: ConversationRecord | null = null;
+      try {
+        fallback = await selectConversationDeleteFallback({
+          deletedId: selectionWhenDeleteStarted,
+          expectedBackendId: backendFallbackId,
+          list: listSurvivors,
+          setActiveId: (fallbackId, expectedCurrentId) => app.conversations.setActiveId(fallbackId, expectedCurrentId),
+        });
+      } catch (error) {
+        console.error('[App] Failed to resolve a surviving conversation after bulk deletion:', error);
+      }
+      if (
+        !shouldApplyConversationDeleteFallback(
+          selectionWhenDeleteStarted,
+          selectionWhenDeleteStarted,
+          activeConversationIdRef.current,
+        )
+      ) {
+        return result;
+      }
+      if (fallback) {
+        activeConversationIdRef.current = fallback.id;
+        setActiveConversationId(fallback.id);
+        setActiveConversationTitle(getConversationDisplayTitle(fallback, cuSessionsByConversation.get(fallback.id)));
+        setActiveConversationHasMessages((fallback.messageCount ?? 0) > 0);
+      } else {
+        activeConversationIdRef.current = null;
+        setActiveConversationId(null);
+        setActiveConversationTitle(null);
+        setActiveConversationHasMessages(false);
+      }
+      return result;
+    },
+    [activeWorkspaceId, cuSessionsByConversation],
   );
 
   const handleArchiveConversation = useCallback(async (id: string) => {
     const conv = (await app.conversations.get(id)) as ConversationRecord | null;
     if (!conv) return;
-    await app.conversations.put({ ...conv, archived: !conv.archived } as ConversationRecord);
+    await putConversationChecked({ ...conv, archived: !conv.archived } as ConversationRecord);
   }, []);
 
   useEffect(() => {
@@ -1009,69 +1272,117 @@ function AppShell() {
   }, [dragState, sidebarWidth, updateConfig]);
 
   const handleSwitchConversation = useCallback(
-    async (id: string) => {
+    async (id: string, expectedCurrentId?: string | null): Promise<boolean> => {
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
       const seq = ++activeSyncSeqRef.current;
-      await app.conversations.setActiveId(id);
+      const previousId = activeConversationIdRef.current;
+      // Publish the user's selection intent synchronously so an async Browser
+      // cleanup/delete cannot apply a stale fallback while backend selection is
+      // still in flight. The main-process compare-and-set covers cross-window
+      // ordering; this ref covers this renderer's intent ordering.
+      activeConversationIdRef.current = id;
+      try {
+        const result = await app.conversations.setActiveId(id, expectedCurrentId);
+        if (!result.ok) {
+          if (seq === activeSyncSeqRef.current && activeConversationIdRef.current === id) {
+            activeConversationIdRef.current = previousId;
+          }
+          return false;
+        }
+      } catch (error) {
+        if (seq === activeSyncSeqRef.current && activeConversationIdRef.current === id) {
+          activeConversationIdRef.current = previousId;
+        }
+        throw error;
+      }
+      if (seq !== activeSyncSeqRef.current || activeConversationIdRef.current !== id) return false;
       setActiveView(CHAT_VIEW);
       setActiveConversationId(id);
       // Load the title for the switched-to conversation. Guard the async title
       // write so a rapid re-switch (A→B→A) doesn't let B's late-resolving title
       // overwrite the now-active A.
       const conv = (await app.conversations.get(id)) as ConversationRecord | null;
-      if (seq !== activeSyncSeqRef.current) return;
+      if (seq !== activeSyncSeqRef.current || activeConversationIdRef.current !== id) return false;
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
+      return true;
     },
     [cuSessionsByConversation, isMobile],
   );
 
-  const handleNewConversation = useCallback(async () => {
-    if (isMobile) setSidebarOpen(false);
-    setPlanPanel(null);
-    suppressStoreSync.current = true;
-    try {
-      const newId = generateId();
-      const now = new Date().toISOString();
-      await app.conversations.put({
-        id: newId,
-        title: null,
-        fallbackTitle: null,
-        messages: [],
-        messageTree: [],
-        headId: null,
-        conversationCompaction: null,
-        lastContextUsage: null,
-        createdAt: now,
-        updatedAt: now,
-        lastMessageAt: null,
-        titleStatus: 'idle',
-        titleUpdatedAt: null,
-        messageCount: 0,
-        userMessageCount: 0,
-        runStatus: 'idle',
-        hasUnread: false,
-        lastAssistantUpdateAt: null,
-        selectedModelKey: null,
-        currentWorkingDirectory: activeWorkspace?.directory ?? null,
-        workspaceId: activeWorkspaceId ?? undefined,
-      });
-      await app.conversations.setActiveId(newId);
-      setActiveView(CHAT_VIEW);
-      setActiveConversationId(newId);
-      setActiveConversationTitle(null);
-      setActiveConversationHasMessages(false);
-      setSelectedModelKey(null);
-      setSelectedProfileKey(null);
-      setFallbackEnabled(false);
-      setProfilePrimaryModelKey(null);
-      setExecutionMode('auto');
-    } catch (err) {
-      console.error('[AppShell] handleNewConversation failed:', err);
-    } finally {
-      suppressStoreSync.current = false;
-    }
-  }, [isMobile, activeWorkspace, activeWorkspaceId]);
+  const handleOpenBrowserConversation = useCallback(
+    (id: string): Promise<boolean> =>
+      openBrowserConversationInWorkspace({
+        conversationId: id,
+        getConversation: (conversationId) =>
+          app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
+        getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
+        getKnownWorkspaceIds: () => knownWorkspaceIdsRef.current,
+        saveLastConversation: (args) => app.workspaces.saveLastConversation(args),
+        setActiveWorkspace: (workspaceId) => app.workspaces.setActive({ id: workspaceId }),
+        createWorkspaceObservationWait,
+        switchConversation: handleSwitchConversation,
+      }),
+    [createWorkspaceObservationWait, handleSwitchConversation],
+  );
+
+  const handleNewConversation = useCallback(
+    async (expectedCurrentId?: string | null) => {
+      if (isMobile) setSidebarOpen(false);
+      setPlanPanel(null);
+      suppressStoreSync.current = true;
+      try {
+        const newId = generateId();
+        const now = new Date().toISOString();
+        const createResult = await putConversationChecked({
+          id: newId,
+          title: null,
+          fallbackTitle: null,
+          messages: [],
+          messageTree: [],
+          headId: null,
+          conversationCompaction: null,
+          lastContextUsage: null,
+          createdAt: now,
+          updatedAt: now,
+          lastMessageAt: null,
+          titleStatus: 'idle',
+          titleUpdatedAt: null,
+          messageCount: 0,
+          userMessageCount: 0,
+          runStatus: 'idle',
+          hasUnread: false,
+          lastAssistantUpdateAt: null,
+          selectedModelKey: null,
+          currentWorkingDirectory: activeWorkspace?.directory ?? null,
+          workspaceId: activeWorkspaceId ?? undefined,
+        });
+        if (!createResult.persisted) return;
+        const activation = await app.conversations.setActiveId(newId, expectedCurrentId);
+        if (!activation.ok) {
+          // `put` broadcasts before this CAS. Another window may already have
+          // adopted and started using the new record, so a failed activation is
+          // not proof that the shell is unused. Retain it rather than deleting
+          // another renderer's active conversation.
+          return;
+        }
+        setActiveView(CHAT_VIEW);
+        commitLocalConversationSelection(activeConversationIdRef, newId, setActiveConversationId);
+        setActiveConversationTitle(null);
+        setActiveConversationHasMessages(false);
+        setSelectedModelKey(null);
+        setSelectedProfileKey(null);
+        setFallbackEnabled(false);
+        setProfilePrimaryModelKey(null);
+        setExecutionMode('auto');
+      } catch (err) {
+        console.error('[AppShell] handleNewConversation failed:', err);
+      } finally {
+        suppressStoreSync.current = false;
+      }
+    },
+    [isMobile, activeWorkspace, activeWorkspaceId],
+  );
 
   const [preSettingsView, setPreSettingsView] = useState<string>(CHAT_VIEW);
 
@@ -1236,9 +1547,10 @@ function AppShell() {
     // the loaded model/profile/overrides are applied; writing here would clobber
     // the saved values with the previous conversation's stale state.
     if (hydratedSettingsConvIdRef.current !== activeConversationId) return;
+    const persistSeq = ++settingsPersistSeqRef.current;
     app.conversations
       .get(activeConversationId)
-      .then((conv: unknown) => {
+      .then(async (conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
         // Skip if values haven't actually changed to avoid unnecessary writes
@@ -1257,7 +1569,7 @@ function AppShell() {
           (record.runtimeOverride ?? null) === (threadOverrides?.runtimeOverride ?? null)
         )
           return;
-        app.conversations.put({
+        const result = await putConversationChecked({
           ...record,
           selectedModelKey,
           selectedProfileKey,
@@ -1272,6 +1584,25 @@ function AppShell() {
           runtimeOverride: threadOverrides?.runtimeOverride ?? null,
           updatedAt: new Date().toISOString(),
         });
+        if (
+          !result.persisted &&
+          persistSeq === settingsPersistSeqRef.current &&
+          hydratedSettingsConvIdRef.current === activeConversationId
+        ) {
+          setSelectedModelKey(record.selectedModelKey ?? null);
+          setSelectedProfileKey(record.selectedProfileKey ?? null);
+          setFallbackEnabled(record.fallbackEnabled ?? false);
+          setProfilePrimaryModelKey(record.profilePrimaryModelKey ?? null);
+          setReasoningEffort((record.reasoningEffort as ReasoningEffort | null | undefined) ?? 'medium');
+          setExecutionMode((record.executionMode as ExecutionMode | null | undefined) ?? 'auto');
+          setThreadOverrides({
+            temperature: record.temperature ?? null,
+            systemPromptOverride: record.systemPromptOverride ?? null,
+            maxSteps: record.maxSteps ?? null,
+            maxRetries: record.maxRetries ?? null,
+            runtimeOverride: record.runtimeOverride ?? null,
+          });
+        }
       })
       .catch(() => {});
   }, [
@@ -1578,7 +1909,13 @@ function AppShell() {
   // Global keyboard shortcuts
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      // Feature surfaces such as the in-app Browser handle overlapping
+      // shortcuts during capture. Respect that ownership instead of also
+      // switching Kai's global sidebar for Cmd/Ctrl+1-5.
+      if (e.defaultPrevented) return;
       if (!(e.metaKey || e.ctrlKey)) return;
+      const shortcutTarget = e.target instanceof Element ? e.target : null;
+      if (shortcutTarget?.closest('[data-kai-browser-panel]')) return;
 
       const matchingPluginCommand = pluginCommands.find(
         (command) => command.shortcut && matchesPluginShortcut(e, command.shortcut),
@@ -1875,979 +2212,995 @@ function AppShell() {
             }}
           />
           <RealtimeProvider>
-            <PluginErrorBoundary fallback={() => null}>
-              <PluginModalHost />
-            </PluginErrorBoundary>
-            <PluginErrorBoundary fallback={() => null}>
-              <PluginToastHost />
-            </PluginErrorBoundary>
-            <AlertModalHost
-              activeConversationId={activeConversationId}
-              chatViewActive={activeView === CHAT_VIEW || activeView === activeConversationId}
-              threadMode={threadMode}
-              alertsViewActive={activeView === ALERTS_VIEW}
-            />
-            <PluginErrorBoundary fallback={() => null}>
-              <PermissionConsentModal />
-            </PluginErrorBoundary>
-            <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
-            <ExportDialog
-              open={exportOpen}
-              onClose={() => setExportOpen(false)}
-              conversationId={activeConversationId}
-            />
-            <ThreadSettingsModal
-              open={threadSettingsOpen}
-              conversationId={activeConversationId}
-              onClose={() => setThreadSettingsOpen(false)}
-              isActiveConversation={true}
-            />
-            {activeView === SETTINGS_VIEW &&
-              createPortal(
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center"
-                  onClick={handleCloseSettings}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') handleCloseSettings();
-                  }}
-                >
-                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-                  <div
-                    className="relative flex h-[min(85vh,800px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
-                      <h2 className="text-sm font-semibold text-foreground">Settings</h2>
-                      <button
-                        type="button"
-                        onClick={handleCloseSettings}
-                        className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
-                      >
-                        <XIcon className="h-4 w-4" />
-                      </button>
-                    </div>
-                    <div className="min-h-0 flex-1">
-                      <SettingsPanel onClose={handleCloseSettings} onOpenConversation={handleSwitchConversation} />
-                    </div>
-                  </div>
-                </div>,
-                document.body,
-              )}
-            {pluginSettingsOpen && (
-              <PluginSettingsModal
-                pluginName={pluginSettingsOpen}
-                displayName={pluginDisplayName(pluginSettingsOpen)}
-                onClose={() => setPluginSettingsOpen(null)}
+            <SidePanelProvider>
+              <PluginErrorBoundary fallback={() => null}>
+                <PluginModalHost />
+              </PluginErrorBoundary>
+              <PluginErrorBoundary fallback={() => null}>
+                <PluginToastHost />
+              </PluginErrorBoundary>
+              <ConversationCleanupWarningHost />
+              <BrowserPanelAutoOpen
+                conversationId={activeConversationId}
+                chatViewActive={activeView === CHAT_VIEW || activeView === activeConversationId}
+                onOpenConversation={handleOpenBrowserConversation}
+                onRevealChat={() => setActiveView(CHAT_VIEW)}
               />
-            )}
-            {renamingTitle && activeConversationId && (
-              <RenameChatModal
-                initialValue={renameValue}
-                onSave={(title) => void handleRename(activeConversationId, title)}
-                onClose={() => setRenamingTitle(false)}
+              <AlertModalHost
+                activeConversationId={activeConversationId}
+                chatViewActive={activeView === CHAT_VIEW || activeView === activeConversationId}
+                threadMode={threadMode}
+                alertsViewActive={activeView === ALERTS_VIEW}
               />
-            )}
-            {confirmingDelete &&
-              activeConversationId &&
-              createPortal(
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center"
-                  onClick={() => setConfirmingDelete(false)}
-                >
-                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-                  <div
-                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <h2 className="text-lg font-semibold text-foreground">Delete chat</h2>
-                    <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
-                    <div className="mt-5 flex justify-end gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmingDelete(false)}
-                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setConfirmingDelete(false);
-                          void handleDeleteConversation(activeConversationId);
-                        }}
-                        className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                </div>,
-                document.body,
-              )}
-            {confirmPluginUninstall &&
-              createPortal(
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center"
-                  onClick={() => setConfirmPluginUninstall(null)}
-                >
-                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-                  <div
-                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
-                    <p className="mt-2 text-sm text-muted-foreground">
-                      This will uninstall{' '}
-                      <span className="font-medium text-foreground">{pluginDisplayName(confirmPluginUninstall)}</span>.
-                      This cannot be undone.
-                    </p>
-                    <div className="mt-5 flex justify-end gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmPluginUninstall(null)}
-                        disabled={isPluginUninstalling}
-                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handlePluginUninstall(confirmPluginUninstall);
-                        }}
-                        disabled={isPluginUninstalling}
-                        className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
-                      >
-                        {isPluginUninstalling ? (
-                          <>
-                            <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
-                            Uninstalling...
-                          </>
-                        ) : (
-                          <>
-                            <Trash2Icon className="h-3.5 w-3.5" />
-                            Uninstall
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                </div>,
-                document.body,
-              )}
-            {confirmPluginDisable && (
-              <DisablePluginModal
-                displayName={pluginDisplayName(confirmPluginDisable)}
-                onConfirm={(persist) => {
-                  const name = confirmPluginDisable;
-                  setConfirmPluginDisable(null);
-                  void handlePluginDisable(name, persist);
-                }}
-                onCancel={() => setConfirmPluginDisable(null)}
+              <PluginErrorBoundary fallback={() => null}>
+                <PermissionConsentModal />
+              </PluginErrorBoundary>
+              <KeyboardShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+              <ExportDialog
+                open={exportOpen}
+                onClose={() => setExportOpen(false)}
+                conversationId={activeConversationId}
               />
-            )}
-            {renamingTask &&
-              tasksCtx?.state.selectedTaskId &&
-              createPortal(
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center"
-                  onClick={() => setRenamingTask(false)}
-                >
-                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+              <ThreadSettingsModal
+                open={threadSettingsOpen}
+                conversationId={activeConversationId}
+                onClose={() => setThreadSettingsOpen(false)}
+                isActiveConversation={true}
+              />
+              {activeView === SETTINGS_VIEW &&
+                createPortal(
                   <div
-                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-                    onClick={(e) => e.stopPropagation()}
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    onClick={handleCloseSettings}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') handleCloseSettings();
+                    }}
                   >
-                    <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
-                    <input
-                      ref={renameInputRef}
-                      value={taskRenameValue}
-                      onChange={(e) => setTaskRenameValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue);
-                        if (e.key === 'Escape') setRenamingTask(false);
-                      }}
-                      className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
-                    />
-                    <div className="mt-5 flex justify-end gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setRenamingTask(false)}
-                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
-                        className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
-                      >
-                        Save
-                      </button>
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                    <div
+                      className="relative flex h-[min(85vh,800px)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/50 bg-popover/95 shadow-2xl backdrop-blur-xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="flex items-center justify-between border-b border-border/70 px-5 py-3">
+                        <h2 className="text-sm font-semibold text-foreground">Settings</h2>
+                        <button
+                          type="button"
+                          onClick={handleCloseSettings}
+                          className="rounded-lg p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
+                        >
+                          <XIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <div className="min-h-0 flex-1">
+                        <SettingsPanel
+                          onClose={handleCloseSettings}
+                          onOpenConversation={handleSwitchConversation}
+                          selectedConversationId={activeConversationId}
+                        />
+                      </div>
                     </div>
-                  </div>
-                </div>,
-                document.body,
-              )}
-            {confirmingTaskDelete &&
-              tasksCtx?.state.selectedTaskId &&
-              createPortal(
-                <div
-                  className="fixed inset-0 z-50 flex items-center justify-center"
-                  onClick={() => setConfirmingTaskDelete(false)}
-                >
-                  <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-                  <div
-                    className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
-                    <p className="mt-2 text-sm text-muted-foreground">
-                      Are you sure you want to delete this task? This cannot be undone.
-                    </p>
-                    <div className="mt-5 flex justify-end gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmingTaskDelete(false)}
-                        className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handleTaskDelete(tasksCtx.state.selectedTaskId!);
-                        }}
-                        className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                </div>,
-                document.body,
-              )}
-            <div className="relative flex h-screen overflow-hidden text-foreground">
-              {/* Mobile sidebar backdrop */}
-              {isMobile && sidebarOpen && (
-                <div
-                  className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
-                  onClick={() => setSidebarOpen(false)}
+                  </div>,
+                  document.body,
+                )}
+              {pluginSettingsOpen && (
+                <PluginSettingsModal
+                  pluginName={pluginSettingsOpen}
+                  displayName={pluginDisplayName(pluginSettingsOpen)}
+                  onClose={() => setPluginSettingsOpen(null)}
                 />
               )}
-              {/* Sidebar */}
-              <aside
-                className={
-                  isMobile
-                    ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
-                    : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
-                }
-                style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
-              >
-                <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
+              {renamingTitle && activeConversationId && (
+                <RenameChatModal
+                  initialValue={renameValue}
+                  onSave={(title) => void handleRename(activeConversationId, title)}
+                  onClose={() => setRenamingTitle(false)}
+                />
+              )}
+              {confirmingDelete &&
+                activeConversationId &&
+                createPortal(
                   <div
-                    className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4"
-                    onDoubleClick={() => window.app?.titlebar.doubleClick()}
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    onClick={() => setConfirmingDelete(false)}
                   >
-                    {app.platform.os === 'darwin' && (
-                      <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
-                    )}
-                    <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
-                      <span
-                        className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}
-                      >
-                        {__BRAND_WORDMARK}
-                      </span>
-                    </span>
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
                     <div
-                      className="titlebar-no-drag absolute right-3 flex items-center gap-1"
-                      onDoubleClick={(e) => e.stopPropagation()}
+                      className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                      onClick={(e) => e.stopPropagation()}
                     >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handleSettingsToggle();
-                        }}
-                        className={cn(
-                          'rounded-lg p-1.5 transition-colors',
-                          activeView === SETTINGS_VIEW
-                            ? 'text-[var(--brand-accent)]'
-                            : 'text-muted-foreground hover:bg-sidebar-accent/80',
-                        )}
-                        title="Settings"
-                      >
-                        <SettingsIcon className="h-4 w-4" />
-                      </button>
+                      <h2 className="text-lg font-semibold text-foreground">Delete chat</h2>
+                      <p className="mt-2 text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
+                      <div className="mt-5 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingDelete(false)}
+                          className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setConfirmingDelete(false);
+                            void handleDeleteConversation(activeConversationId);
+                          }}
+                          className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex min-h-0 flex-1 flex-col">
-                    <ContentPanel
-                      activeTab={sidebarSection}
-                      chatsContent={
-                        <>
+                  </div>,
+                  document.body,
+                )}
+              {confirmPluginUninstall &&
+                createPortal(
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    onClick={() => setConfirmPluginUninstall(null)}
+                  >
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                    <div
+                      className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <h2 className="text-lg font-semibold text-foreground">Uninstall plugin</h2>
+                      <p className="mt-2 text-sm text-muted-foreground">
+                        This will uninstall{' '}
+                        <span className="font-medium text-foreground">{pluginDisplayName(confirmPluginUninstall)}</span>
+                        . This cannot be undone.
+                      </p>
+                      <div className="mt-5 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmPluginUninstall(null)}
+                          disabled={isPluginUninstalling}
+                          className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handlePluginUninstall(confirmPluginUninstall);
+                          }}
+                          disabled={isPluginUninstalling}
+                          className="flex items-center gap-1.5 rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:opacity-50"
+                        >
+                          {isPluginUninstalling ? (
+                            <>
+                              <LoaderIcon className="h-3.5 w-3.5 animate-spin" />
+                              Uninstalling...
+                            </>
+                          ) : (
+                            <>
+                              <Trash2Icon className="h-3.5 w-3.5" />
+                              Uninstall
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>,
+                  document.body,
+                )}
+              {confirmPluginDisable && (
+                <DisablePluginModal
+                  displayName={pluginDisplayName(confirmPluginDisable)}
+                  onConfirm={(persist) => {
+                    const name = confirmPluginDisable;
+                    setConfirmPluginDisable(null);
+                    void handlePluginDisable(name, persist);
+                  }}
+                  onCancel={() => setConfirmPluginDisable(null)}
+                />
+              )}
+              {renamingTask &&
+                tasksCtx?.state.selectedTaskId &&
+                createPortal(
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    onClick={() => setRenamingTask(false)}
+                  >
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                    <div
+                      className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <h2 className="text-lg font-semibold text-foreground">Rename task</h2>
+                      <input
+                        ref={renameInputRef}
+                        value={taskRenameValue}
+                        onChange={(e) => setTaskRenameValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue);
+                          if (e.key === 'Escape') setRenamingTask(false);
+                        }}
+                        className="mt-4 w-full rounded-xl border border-border/70 bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+                      />
+                      <div className="mt-5 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setRenamingTask(false)}
+                          className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleTaskRename(tasksCtx.state.selectedTaskId!, taskRenameValue)}
+                          className="rounded-xl bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                        >
+                          Save
+                        </button>
+                      </div>
+                    </div>
+                  </div>,
+                  document.body,
+                )}
+              {confirmingTaskDelete &&
+                tasksCtx?.state.selectedTaskId &&
+                createPortal(
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center"
+                    onClick={() => setConfirmingTaskDelete(false)}
+                  >
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+                    <div
+                      className="relative w-full max-w-sm rounded-2xl border border-border/50 bg-popover/95 p-6 shadow-2xl backdrop-blur-xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <h2 className="text-lg font-semibold text-foreground">Delete task</h2>
+                      <p className="mt-2 text-sm text-muted-foreground">
+                        Are you sure you want to delete this task? This cannot be undone.
+                      </p>
+                      <div className="mt-5 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingTaskDelete(false)}
+                          className="rounded-xl border border-border/70 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleTaskDelete(tasksCtx.state.selectedTaskId!);
+                          }}
+                          className="rounded-xl bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  </div>,
+                  document.body,
+                )}
+              <div className="relative flex h-screen overflow-hidden text-foreground">
+                {/* Mobile sidebar backdrop */}
+                {isMobile && sidebarOpen && (
+                  <div
+                    className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm"
+                    onClick={() => setSidebarOpen(false)}
+                  />
+                )}
+                {/* Sidebar */}
+                <aside
+                  className={
+                    isMobile
+                      ? `fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col p-2 text-sidebar-foreground transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`
+                      : 'relative z-30 flex h-full shrink-0 flex-col p-2 text-sidebar-foreground'
+                  }
+                  style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
+                >
+                  <div className="app-composer-glass app-sidebar-shadow flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70">
+                    <div
+                      className="titlebar-drag relative flex h-14 items-center justify-center border-b border-sidebar-border/80 px-4"
+                      onDoubleClick={() => window.app?.titlebar.doubleClick()}
+                    >
+                      {app.platform.os === 'darwin' && (
+                        <div className="pointer-events-none absolute inset-y-0 left-0 w-0 md:w-20" />
+                      )}
+                      <span className="pointer-events-none inline-flex items-center text-sm font-medium text-sidebar-foreground">
+                        <span
+                          className={`app-wordmark ${__BRAND_THEME_GRADIENT_TEXT !== 'false' ? 'app-gradient-text' : 'app-gradient-text-off'}`}
+                        >
+                          {__BRAND_WORDMARK}
+                        </span>
+                      </span>
+                      <div
+                        className="titlebar-no-drag absolute right-3 flex items-center gap-1"
+                        onDoubleClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleSettingsToggle();
+                          }}
+                          className={cn(
+                            'rounded-lg p-1.5 transition-colors',
+                            activeView === SETTINGS_VIEW
+                              ? 'text-[var(--brand-accent)]'
+                              : 'text-muted-foreground hover:bg-sidebar-accent/80',
+                          )}
+                          title="Settings"
+                        >
+                          <SettingsIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex min-h-0 flex-1 flex-col">
+                      <ContentPanel
+                        activeTab={sidebarSection}
+                        chatsContent={
+                          <>
+                            <div className="min-h-0 flex-1 overflow-y-auto">
+                              <ConversationList
+                                activeConversationId={activeView === CHAT_LIST_VIEW ? null : activeConversationId}
+                                activeThreadMode={threadMode}
+                                onSwitchConversation={handleSwitchConversation}
+                                onNewConversation={handleNewConversation}
+                                onDeleteConversation={handleDeleteConversation}
+                                onDeleteConversations={handleDeleteConversations}
+                                onNavigateToChatsPage={() => setActiveView(CHAT_LIST_VIEW)}
+                                workspaceId={activeWorkspaceId}
+                              />
+                            </div>
+                            <div className="shrink-0">
+                              <SubAgentSidebarSection />
+                            </div>
+                          </>
+                        }
+                        tasksContent={
                           <div className="min-h-0 flex-1 overflow-y-auto">
-                            <ConversationList
-                              activeConversationId={activeView === CHAT_LIST_VIEW ? null : activeConversationId}
-                              activeThreadMode={threadMode}
-                              onSwitchConversation={handleSwitchConversation}
-                              onNewConversation={handleNewConversation}
-                              onDeleteConversation={handleDeleteConversation}
-                              onNavigateToChatsPage={() => setActiveView(CHAT_LIST_VIEW)}
+                            <TaskSidebarList
+                              onSelectTask={() => {
+                                setIsCreatingTask(false);
+                                setActiveView(TASKS_VIEW);
+                              }}
+                              onCreateTask={() => {
+                                tasksCtx?.selectTask(null);
+                                tasksCtx?.exitAICreation();
+                                setIsCreatingTask(true);
+                                setActiveView(TASKS_VIEW);
+                              }}
+                              onViewBoard={() => {
+                                tasksCtx?.selectTask(null);
+                                setIsCreatingTask(false);
+                                setActiveView(TASKS_VIEW);
+                              }}
+                              isBoardActive={
+                                activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId
+                              }
+                              isCreatingTask={isCreatingTask}
                               workspaceId={activeWorkspaceId}
                             />
                           </div>
-                          <div className="shrink-0">
-                            <SubAgentSidebarSection />
+                        }
+                        agentsContent={
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
                           </div>
-                        </>
-                      }
-                      tasksContent={
-                        <div className="min-h-0 flex-1 overflow-y-auto">
-                          <TaskSidebarList
-                            onSelectTask={() => {
-                              setIsCreatingTask(false);
-                              setActiveView(TASKS_VIEW);
-                            }}
-                            onCreateTask={() => {
-                              tasksCtx?.selectTask(null);
-                              tasksCtx?.exitAICreation();
-                              setIsCreatingTask(true);
-                              setActiveView(TASKS_VIEW);
-                            }}
-                            onViewBoard={() => {
-                              tasksCtx?.selectTask(null);
-                              setIsCreatingTask(false);
-                              setActiveView(TASKS_VIEW);
-                            }}
-                            isBoardActive={
-                              activeView === TASKS_VIEW && !isCreatingTask && !tasksCtx?.state.selectedTaskId
-                            }
-                            isCreatingTask={isCreatingTask}
-                            workspaceId={activeWorkspaceId}
-                          />
-                        </div>
-                      }
-                      agentsContent={
-                        <div className="min-h-0 flex-1 overflow-y-auto">
-                          <AgentListPanel onNavigateToAgentsPage={() => setActiveView(AGENTS_VIEW)} />
-                        </div>
-                      }
-                      pluginsContent={
-                        <div className="min-h-0 flex-1 overflow-y-auto">
-                          <InstalledPluginsList
-                            activeView={activeView}
-                            onNavigate={handlePluginNavigationItem}
-                            onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                            onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
-                            onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
-                            onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
-                            pluginBrandRequired={pluginBrandRequired}
-                          />
-                        </div>
-                      }
-                      alertsContent={<AlertsSidebarList onSelect={() => setActiveView(ALERTS_VIEW)} />}
-                    />
-                    <SidebarDock
-                      items={dockItems}
-                      bubbleExpanded={pluginBubbleExpanded}
-                      onToggleBubble={handleToggleBubble}
-                      onReorderUnits={handleReorderUnits}
-                      onReorderPlugins={handleReorderPlugins}
-                      unitOrder={dockUnitOrder}
-                      pluginOrder={dockPluginOrder}
-                      trailing={
+                        }
+                        pluginsContent={
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            <InstalledPluginsList
+                              activeView={activeView}
+                              onNavigate={handlePluginNavigationItem}
+                              onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                              onOpenPlugins={() => setActiveView(PLUGINS_VIEW)}
+                              onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                              onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
+                              pluginBrandRequired={pluginBrandRequired}
+                            />
+                          </div>
+                        }
+                        alertsContent={<AlertsSidebarList onSelect={() => setActiveView(ALERTS_VIEW)} />}
+                      />
+                      <SidebarDock
+                        items={dockItems}
+                        bubbleExpanded={pluginBubbleExpanded}
+                        onToggleBubble={handleToggleBubble}
+                        onReorderUnits={handleReorderUnits}
+                        onReorderPlugins={handleReorderPlugins}
+                        unitOrder={dockUnitOrder}
+                        pluginOrder={dockPluginOrder}
+                        trailing={
+                          <button
+                            type="button"
+                            onClick={toggleTheme}
+                            className="flex h-8 w-8 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
+                            title={themeTitle}
+                          >
+                            <ThemeIcon className="h-[18px] w-[18px]" />
+                          </button>
+                        }
+                      />
+                    </div>
+                  </div>
+                </aside>
+                {!isMobile && (
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="Resize left navigation"
+                    aria-valuenow={sidebarWidth}
+                    aria-valuemin={SIDEBAR_MIN_WIDTH}
+                    aria-valuemax={SIDEBAR_MAX_WIDTH}
+                    onPointerDown={(event) => {
+                      event.preventDefault();
+                      setDragState({ startX: event.clientX, startWidth: sidebarWidth });
+                    }}
+                    className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
+                  >
+                    {/* Invisible hit area — wide enough to grab easily */}
+                    <div className="absolute inset-y-0 -left-4 w-6" />
+                    {/* Handle pill — on the panel border, appears on hover */}
+                    <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
+                    {/* Tooltip */}
+                    <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
+                      <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
+                        Drag to resize
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Main content area */}
+                <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                  <UpdateCard />
+                  {/* Interactive title bar */}
+                  <div
+                    onDoubleClick={() => window.app?.titlebar.doubleClick()}
+                    className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
+                  >
+                    <div className="flex w-full items-center justify-between">
+                      {isMobile && (
                         <button
                           type="button"
-                          onClick={toggleTheme}
-                          className="flex h-8 w-8 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-sidebar-accent/80"
-                          title={themeTitle}
+                          onClick={() => setSidebarOpen(true)}
+                          className="titlebar-no-drag mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
                         >
-                          <ThemeIcon className="h-[18px] w-[18px]" />
+                          <MenuIcon className="h-5 w-5" />
                         </button>
-                      }
-                    />
-                  </div>
-                </div>
-              </aside>
-              {!isMobile && (
-                <div
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="Resize left navigation"
-                  aria-valuenow={sidebarWidth}
-                  aria-valuemin={SIDEBAR_MIN_WIDTH}
-                  aria-valuemax={SIDEBAR_MAX_WIDTH}
-                  onPointerDown={(event) => {
-                    event.preventDefault();
-                    setDragState({ startX: event.clientX, startWidth: sidebarWidth });
-                  }}
-                  className="group relative h-full w-0 shrink-0 cursor-col-resize z-30"
-                >
-                  {/* Invisible hit area — wide enough to grab easily */}
-                  <div className="absolute inset-y-0 -left-4 w-6" />
-                  {/* Handle pill — on the panel border, appears on hover */}
-                  <div className="absolute -left-2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-8 w-1 rounded-full bg-border/0 transition-all duration-150 group-hover:bg-muted-foreground/40 group-hover:h-12 group-active:bg-primary/60 group-active:h-14" />
-                  {/* Tooltip */}
-                  <div className="pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 translate-x-2 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300">
-                    <div className="whitespace-nowrap rounded-lg bg-popover px-2.5 py-1.5 text-[11px] font-medium text-popover-foreground shadow-lg ring-1 ring-border/50">
-                      Drag to resize
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Main content area */}
-              <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                <UpdateCard />
-                {/* Interactive title bar */}
-                <div
-                  onDoubleClick={() => window.app?.titlebar.doubleClick()}
-                  className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
-                >
-                  <div className="flex w-full items-center justify-between">
-                    {isMobile && (
-                      <button
-                        type="button"
-                        onClick={() => setSidebarOpen(true)}
-                        className="titlebar-no-drag mr-2 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted/40"
+                      )}
+                      <div
+                        className="titlebar-no-drag min-w-0 shrink-0 flex items-center"
+                        onDoubleClick={(e) => e.stopPropagation()}
                       >
-                        <MenuIcon className="h-5 w-5" />
-                      </button>
-                    )}
-                    <div
-                      className="titlebar-no-drag min-w-0 shrink-0 flex items-center"
-                      onDoubleClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="min-w-0">
-                        {activeView === SETTINGS_VIEW ? (
-                          <div className="flex items-center gap-1.5">
-                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
-                              Settings
+                        <div className="min-w-0">
+                          {activeView === SETTINGS_VIEW ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                Settings
+                              </div>
                             </div>
-                          </div>
-                        ) : activeView === MARKETPLACE_VIEW ? (
-                          <div className="flex items-center gap-1.5" />
-                        ) : activeView === PLUGINS_VIEW ? (
-                          <div className="flex items-center gap-1.5">
-                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
-                              Plugins
+                          ) : activeView === MARKETPLACE_VIEW ? (
+                            <div className="flex items-center gap-1.5" />
+                          ) : activeView === PLUGINS_VIEW ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                Plugins
+                              </div>
                             </div>
-                          </div>
-                        ) : activeView === AGENTS_VIEW ? (
-                          (() => {
-                            if (agentsCtx.state.isCreatingAgent) {
-                              return null;
-                            }
-                            const selectedAgentId = agentsCtx.state.selectedAgentId;
-                            const selectedAgent = selectedAgentId
-                              ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
-                              : null;
-                            if (selectedAgent) {
-                              const agentIsPending = selectedAgent.name === 'New Agent';
+                          ) : activeView === AGENTS_VIEW ? (
+                            (() => {
+                              if (agentsCtx.state.isCreatingAgent) {
+                                return null;
+                              }
+                              const selectedAgentId = agentsCtx.state.selectedAgentId;
+                              const selectedAgent = selectedAgentId
+                                ? agentsCtx.state.agents.find((a) => a.id === selectedAgentId)
+                                : null;
+                              if (selectedAgent) {
+                                const agentIsPending = selectedAgent.name === 'New Agent';
+                                return (
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => agentsCtx.selectAgent(null)}
+                                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                                    >
+                                      Agents
+                                    </button>
+                                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                                    <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
+                                      <DropdownMenu.Trigger asChild>
+                                        <button
+                                          type="button"
+                                          className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                        >
+                                          <span
+                                            className={`whitespace-nowrap text-sm font-medium ${agentIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
+                                          >
+                                            {agentIsPending ? 'Generating…' : selectedAgent.name}
+                                          </span>
+                                          {!agentIsPending && (
+                                            <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                          )}
+                                        </button>
+                                      </DropdownMenu.Trigger>
+                                      <DropdownMenu.Portal>
+                                        <DropdownMenu.Content
+                                          align="start"
+                                          sideOffset={4}
+                                          className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                        >
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                            onSelect={() => {
+                                              setAgentRenameModal({ id: selectedAgent.id, value: selectedAgent.name });
+                                              setAgentTitleMenuOpen(false);
+                                            }}
+                                          >
+                                            <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                            <span>Rename</span>
+                                          </DropdownMenu.Item>
+                                          <div className="my-1 h-px bg-border/60" />
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                            onSelect={() => {
+                                              setAgentDeleteModal({ id: selectedAgent.id, name: selectedAgent.name });
+                                              setAgentTitleMenuOpen(false);
+                                            }}
+                                          >
+                                            <Trash2Icon className="h-4 w-4" />
+                                            <span>Delete Agent</span>
+                                          </DropdownMenu.Item>
+                                        </DropdownMenu.Content>
+                                      </DropdownMenu.Portal>
+                                    </DropdownMenu.Root>
+                                  </div>
+                                );
+                              }
                               return (
                                 <div className="flex items-center gap-1.5">
-                                  <button
-                                    type="button"
-                                    onClick={() => agentsCtx.selectAgent(null)}
-                                    className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                                  >
+                                  <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
                                     Agents
-                                  </button>
-                                  <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                                  <DropdownMenu.Root open={agentTitleMenuOpen} onOpenChange={setAgentTitleMenuOpen}>
-                                    <DropdownMenu.Trigger asChild>
-                                      <button
-                                        type="button"
-                                        className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
-                                      >
-                                        <span
-                                          className={`whitespace-nowrap text-sm font-medium ${agentIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
-                                        >
-                                          {agentIsPending ? 'Generating…' : selectedAgent.name}
-                                        </span>
-                                        {!agentIsPending && (
-                                          <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                        )}
-                                      </button>
-                                    </DropdownMenu.Trigger>
-                                    <DropdownMenu.Portal>
-                                      <DropdownMenu.Content
-                                        align="start"
-                                        sideOffset={4}
-                                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                                      >
-                                        <DropdownMenu.Item
-                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                          onSelect={() => {
-                                            setAgentRenameModal({ id: selectedAgent.id, value: selectedAgent.name });
-                                            setAgentTitleMenuOpen(false);
-                                          }}
-                                        >
-                                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                          <span>Rename</span>
-                                        </DropdownMenu.Item>
-                                        <div className="my-1 h-px bg-border/60" />
-                                        <DropdownMenu.Item
-                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                          onSelect={() => {
-                                            setAgentDeleteModal({ id: selectedAgent.id, name: selectedAgent.name });
-                                            setAgentTitleMenuOpen(false);
-                                          }}
-                                        >
-                                          <Trash2Icon className="h-4 w-4" />
-                                          <span>Delete Agent</span>
-                                        </DropdownMenu.Item>
-                                      </DropdownMenu.Content>
-                                    </DropdownMenu.Portal>
-                                  </DropdownMenu.Root>
+                                  </div>
                                 </div>
                               );
-                            }
-                            return (
-                              <div className="flex items-center gap-1.5">
-                                <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
-                                  Agents
-                                </div>
-                              </div>
-                            );
-                          })()
-                        ) : activeView === TASKS_VIEW ? (
-                          (() => {
-                            if (isCreatingTask) {
-                              return null;
-                            }
-                            const selectedTaskId = tasksCtx?.state.selectedTaskId;
-                            const selectedTask = selectedTaskId
-                              ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId)
-                              : null;
-                            if (selectedTask) {
-                              const taskIsPending = selectedTask.title === 'New Task';
+                            })()
+                          ) : activeView === TASKS_VIEW ? (
+                            (() => {
+                              if (isCreatingTask) {
+                                return null;
+                              }
+                              const selectedTaskId = tasksCtx?.state.selectedTaskId;
+                              const selectedTask = selectedTaskId
+                                ? tasksCtx?.state.tasks.find((t) => t.id === selectedTaskId)
+                                : null;
+                              if (selectedTask) {
+                                const taskIsPending = selectedTask.title === 'New Task';
+                                return (
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => tasksCtx?.selectTask(null)}
+                                      className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                                    >
+                                      Tasks
+                                    </button>
+                                    <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                                    <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
+                                      <DropdownMenu.Trigger asChild>
+                                        <button
+                                          type="button"
+                                          className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                        >
+                                          <span
+                                            className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
+                                          >
+                                            {selectedTask.title}
+                                          </span>
+                                          {!taskIsPending && (
+                                            <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                          )}
+                                        </button>
+                                      </DropdownMenu.Trigger>
+                                      <DropdownMenu.Portal>
+                                        <DropdownMenu.Content
+                                          align="start"
+                                          sideOffset={4}
+                                          className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                        >
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                            onSelect={() => toggleTaskPin(selectedTask.id)}
+                                          >
+                                            <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                            <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
+                                          </DropdownMenu.Item>
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                            onSelect={() => {
+                                              setTaskRenameValue(selectedTask.title);
+                                              setRenamingTask(true);
+                                            }}
+                                          >
+                                            <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                            <span>Rename</span>
+                                          </DropdownMenu.Item>
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                            onSelect={() => void tasksCtx?.archiveTask(selectedTask.id)}
+                                          >
+                                            <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" />
+                                            <span>Archive</span>
+                                          </DropdownMenu.Item>
+                                          <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                          <DropdownMenu.Item
+                                            className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                            onSelect={() => setConfirmingTaskDelete(true)}
+                                          >
+                                            <Trash2Icon className="h-4 w-4" />
+                                            <span>Delete</span>
+                                          </DropdownMenu.Item>
+                                        </DropdownMenu.Content>
+                                      </DropdownMenu.Portal>
+                                    </DropdownMenu.Root>
+                                  </div>
+                                );
+                              }
                               return (
                                 <div className="flex items-center gap-1.5">
+                                  <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                    Tasks
+                                  </div>
+                                </div>
+                              );
+                            })()
+                          ) : activeErrorPluginName ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setActiveView(PLUGINS_VIEW)}
+                                className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                              >
+                                Plugins
+                              </button>
+                              <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                              <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                                <DropdownMenu.Trigger asChild>
                                   <button
                                     type="button"
-                                    onClick={() => tasksCtx?.selectTask(null)}
-                                    className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                                    className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
                                   >
-                                    Tasks
+                                    <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                      {pluginDisplayName(activeErrorPluginName)}
+                                    </span>
+                                    <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
                                   </button>
-                                  <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                                  <DropdownMenu.Root open={taskTitleMenuOpen} onOpenChange={setTaskTitleMenuOpen}>
-                                    <DropdownMenu.Trigger asChild>
-                                      <button
-                                        type="button"
-                                        className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Portal>
+                                  <DropdownMenu.Content
+                                    align="start"
+                                    sideOffset={4}
+                                    className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                  >
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => togglePluginPin(activeErrorPluginName)}
+                                    >
+                                      <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>{pinnedPlugins.has(activeErrorPluginName) ? 'Unpin' : 'Pin'}</span>
+                                    </DropdownMenu.Item>
+                                    {pluginUIState?.settingsSections.some(
+                                      (s) => s.pluginName === activeErrorPluginName,
+                                    ) && (
+                                      <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                        onSelect={() => setPluginSettingsOpen(activeErrorPluginName)}
                                       >
-                                        <span
-                                          className={`whitespace-nowrap text-sm font-medium ${taskIsPending ? 'italic text-muted-foreground/50' : 'text-foreground'}`}
-                                        >
-                                          {selectedTask.title}
-                                        </span>
-                                        {!taskIsPending && (
-                                          <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                        )}
-                                      </button>
-                                    </DropdownMenu.Trigger>
-                                    <DropdownMenu.Portal>
-                                      <DropdownMenu.Content
-                                        align="start"
-                                        sideOffset={4}
-                                        className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                                      >
-                                        <DropdownMenu.Item
-                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                          onSelect={() => toggleTaskPin(selectedTask.id)}
-                                        >
-                                          <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                          <span>{pinnedTaskIds.has(selectedTask.id) ? 'Unpin' : 'Pin'}</span>
-                                        </DropdownMenu.Item>
-                                        <DropdownMenu.Item
-                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                          onSelect={() => {
-                                            setTaskRenameValue(selectedTask.title);
-                                            setRenamingTask(true);
-                                          }}
-                                        >
-                                          <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                          <span>Rename</span>
-                                        </DropdownMenu.Item>
-                                        <DropdownMenu.Item
-                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                          onSelect={() => void tasksCtx?.archiveTask(selectedTask.id)}
-                                        >
-                                          <ArchiveRestoreIcon className="h-4 w-4 text-muted-foreground" />
-                                          <span>Archive</span>
-                                        </DropdownMenu.Item>
+                                        <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                                        <span>Settings</span>
+                                      </DropdownMenu.Item>
+                                    )}
+                                    {!pluginBrandRequired.has(activeErrorPluginName) && (
+                                      <>
                                         <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
                                         <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => setConfirmPluginDisable(activeErrorPluginName)}
+                                        >
+                                          <PowerIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>Disable</span>
+                                        </DropdownMenu.Item>
+                                        <DropdownMenu.Item
                                           className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                          onSelect={() => setConfirmingTaskDelete(true)}
+                                          onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
                                         >
                                           <Trash2Icon className="h-4 w-4" />
-                                          <span>Delete</span>
+                                          <span>Uninstall</span>
                                         </DropdownMenu.Item>
-                                      </DropdownMenu.Content>
-                                    </DropdownMenu.Portal>
-                                  </DropdownMenu.Root>
-                                </div>
-                              );
-                            }
-                            return (
-                              <div className="flex items-center gap-1.5">
-                                <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
-                                  Tasks
-                                </div>
+                                      </>
+                                    )}
+                                  </DropdownMenu.Content>
+                                </DropdownMenu.Portal>
+                              </DropdownMenu.Root>
+                            </div>
+                          ) : activePluginPanel ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setActiveView(PLUGINS_VIEW)}
+                                className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                              >
+                                Plugins
+                              </button>
+                              <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                              <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
+                                <DropdownMenu.Trigger asChild>
+                                  <button
+                                    type="button"
+                                    className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
+                                  >
+                                    <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                      {pluginDisplayName(activePluginPanel.pluginName)}
+                                    </span>
+                                    <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                  </button>
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Portal>
+                                  <DropdownMenu.Content
+                                    align="start"
+                                    sideOffset={4}
+                                    className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                  >
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => togglePluginPin(activePluginPanel.pluginName)}
+                                    >
+                                      <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>{pinnedPlugins.has(activePluginPanel.pluginName) ? 'Unpin' : 'Pin'}</span>
+                                    </DropdownMenu.Item>
+                                    {pluginUIState?.settingsSections.some(
+                                      (s) => s.pluginName === activePluginPanel.pluginName,
+                                    ) && (
+                                      <DropdownMenu.Item
+                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                        onSelect={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
+                                      >
+                                        <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                                        <span>Settings</span>
+                                      </DropdownMenu.Item>
+                                    )}
+                                    {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
+                                      <>
+                                        <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                          onSelect={() => setConfirmPluginDisable(activePluginPanel.pluginName)}
+                                        >
+                                          <PowerIcon className="h-4 w-4 text-muted-foreground" />
+                                          <span>Disable</span>
+                                        </DropdownMenu.Item>
+                                        <DropdownMenu.Item
+                                          className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                          onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
+                                        >
+                                          <Trash2Icon className="h-4 w-4" />
+                                          <span>Uninstall</span>
+                                        </DropdownMenu.Item>
+                                      </>
+                                    )}
+                                  </DropdownMenu.Content>
+                                </DropdownMenu.Portal>
+                              </DropdownMenu.Root>
+                            </div>
+                          ) : activeView === CHAT_LIST_VIEW ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
+                                Chats
                               </div>
-                            );
-                          })()
-                        ) : activeErrorPluginName ? (
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => setActiveView(PLUGINS_VIEW)}
-                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                            >
-                              Plugins
-                            </button>
-                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                            <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
-                              <DropdownMenu.Trigger asChild>
-                                <button
-                                  type="button"
-                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
-                                >
-                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                                    {pluginDisplayName(activeErrorPluginName)}
-                                  </span>
-                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                </button>
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Portal>
-                                <DropdownMenu.Content
-                                  align="start"
-                                  sideOffset={4}
-                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                                >
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => togglePluginPin(activeErrorPluginName)}
+                            </div>
+                          ) : activeConversationId && !activeConversationTitle && activeConversationHasMessages ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveView(CHAT_LIST_VIEW);
+                                }}
+                                className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                              >
+                                Chats
+                              </button>
+                              <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                              <span className="whitespace-nowrap rounded-lg px-2 py-1 text-sm font-medium italic text-muted-foreground/50">
+                                New Chat
+                              </span>
+                            </div>
+                          ) : activeConversationId && activeConversationTitle ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveView(CHAT_LIST_VIEW);
+                                }}
+                                className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+                              >
+                                Chats
+                              </button>
+                              <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                              <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
+                                <DropdownMenu.Trigger asChild>
+                                  <button
+                                    type="button"
+                                    className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
                                   >
-                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>{pinnedPlugins.has(activeErrorPluginName) ? 'Unpin' : 'Pin'}</span>
-                                  </DropdownMenu.Item>
-                                  {pluginUIState?.settingsSections.some(
-                                    (s) => s.pluginName === activeErrorPluginName,
-                                  ) && (
+                                    <span className="whitespace-nowrap text-sm font-medium text-foreground">
+                                      {activeConversationTitle}
+                                    </span>
+                                    <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                  </button>
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Portal>
+                                  <DropdownMenu.Content
+                                    align="start"
+                                    sideOffset={4}
+                                    className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+                                  >
                                     <DropdownMenu.Item
                                       className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                      onSelect={() => setPluginSettingsOpen(activeErrorPluginName)}
+                                      onSelect={() => togglePin(activeConversationId)}
                                     >
-                                      <Settings2Icon className="h-4 w-4 text-muted-foreground" />
-                                      <span>Settings</span>
+                                      <PinIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
                                     </DropdownMenu.Item>
-                                  )}
-                                  {!pluginBrandRequired.has(activeErrorPluginName) && (
-                                    <>
-                                      <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                                      <DropdownMenu.Item
-                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                        onSelect={() => setConfirmPluginDisable(activeErrorPluginName)}
-                                      >
-                                        <PowerIcon className="h-4 w-4 text-muted-foreground" />
-                                        <span>Disable</span>
-                                      </DropdownMenu.Item>
-                                      <DropdownMenu.Item
-                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                        onSelect={() => setConfirmPluginUninstall(activeErrorPluginName)}
-                                      >
-                                        <Trash2Icon className="h-4 w-4" />
-                                        <span>Uninstall</span>
-                                      </DropdownMenu.Item>
-                                    </>
-                                  )}
-                                </DropdownMenu.Content>
-                              </DropdownMenu.Portal>
-                            </DropdownMenu.Root>
-                          </div>
-                        ) : activePluginPanel ? (
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => setActiveView(PLUGINS_VIEW)}
-                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                            >
-                              Plugins
-                            </button>
-                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                            <DropdownMenu.Root open={pluginTitleMenuOpen} onOpenChange={setPluginTitleMenuOpen}>
-                              <DropdownMenu.Trigger asChild>
-                                <button
-                                  type="button"
-                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
-                                >
-                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                                    {pluginDisplayName(activePluginPanel.pluginName)}
-                                  </span>
-                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                </button>
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Portal>
-                                <DropdownMenu.Content
-                                  align="start"
-                                  sideOffset={4}
-                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                                >
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => togglePluginPin(activePluginPanel.pluginName)}
-                                  >
-                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>{pinnedPlugins.has(activePluginPanel.pluginName) ? 'Unpin' : 'Pin'}</span>
-                                  </DropdownMenu.Item>
-                                  {pluginUIState?.settingsSections.some(
-                                    (s) => s.pluginName === activePluginPanel.pluginName,
-                                  ) && (
                                     <DropdownMenu.Item
                                       className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                      onSelect={() => setPluginSettingsOpen(activePluginPanel.pluginName)}
+                                      onSelect={() => {
+                                        setRenameValue(activeConversationTitle ?? '');
+                                        setRenamingTitle(true);
+                                      }}
                                     >
-                                      <Settings2Icon className="h-4 w-4 text-muted-foreground" />
+                                      <PencilIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>Rename</span>
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => void handleArchiveConversation(activeConversationId)}
+                                    >
+                                      <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>Archive</span>
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => setExportOpen(true)}
+                                    >
+                                      <DownloadIcon className="h-4 w-4 text-muted-foreground" />
+                                      <span>Export</span>
+                                    </DropdownMenu.Item>
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
+                                      onSelect={() => setThreadSettingsOpen(true)}
+                                    >
+                                      <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
                                       <span>Settings</span>
                                     </DropdownMenu.Item>
-                                  )}
-                                  {!pluginBrandRequired.has(activePluginPanel.pluginName) && (
-                                    <>
-                                      <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                                      <DropdownMenu.Item
-                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                        onSelect={() => setConfirmPluginDisable(activePluginPanel.pluginName)}
-                                      >
-                                        <PowerIcon className="h-4 w-4 text-muted-foreground" />
-                                        <span>Disable</span>
-                                      </DropdownMenu.Item>
-                                      <DropdownMenu.Item
-                                        className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                        onSelect={() => setConfirmPluginUninstall(activePluginPanel.pluginName)}
-                                      >
-                                        <Trash2Icon className="h-4 w-4" />
-                                        <span>Uninstall</span>
-                                      </DropdownMenu.Item>
-                                    </>
-                                  )}
-                                </DropdownMenu.Content>
-                              </DropdownMenu.Portal>
-                            </DropdownMenu.Root>
-                          </div>
-                        ) : activeView === CHAT_LIST_VIEW ? (
-                          <div className="flex items-center gap-1.5">
-                            <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">Chats</div>
-                          </div>
-                        ) : activeConversationId && !activeConversationTitle && activeConversationHasMessages ? (
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveView(CHAT_LIST_VIEW);
-                              }}
-                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                            >
-                              Chats
-                            </button>
-                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                            <span className="whitespace-nowrap rounded-lg px-2 py-1 text-sm font-medium italic text-muted-foreground/50">
-                              New Chat
+                                    <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
+                                    <DropdownMenu.Item
+                                      className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
+                                      onSelect={() => setConfirmingDelete(true)}
+                                    >
+                                      <Trash2Icon className="h-4 w-4" />
+                                      <span>Delete</span>
+                                    </DropdownMenu.Item>
+                                  </DropdownMenu.Content>
+                                </DropdownMenu.Portal>
+                              </DropdownMenu.Root>
+                            </div>
+                          ) : activeConversationTitle ? (
+                            <span className="block whitespace-nowrap text-sm font-medium text-foreground">
+                              {activeConversationTitle}
                             </span>
-                          </div>
-                        ) : activeConversationId && activeConversationTitle ? (
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveView(CHAT_LIST_VIEW);
-                              }}
-                              className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-                            >
-                              Chats
-                            </button>
-                            <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
-                            <DropdownMenu.Root open={titleMenuOpen} onOpenChange={setTitleMenuOpen}>
-                              <DropdownMenu.Trigger asChild>
-                                <button
-                                  type="button"
-                                  className="flex items-center gap-1.5 rounded-lg px-2 py-1 transition-colors hover:bg-foreground/10"
-                                >
-                                  <span className="whitespace-nowrap text-sm font-medium text-foreground">
-                                    {activeConversationTitle}
-                                  </span>
-                                  <ChevronDownIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                                </button>
-                              </DropdownMenu.Trigger>
-                              <DropdownMenu.Portal>
-                                <DropdownMenu.Content
-                                  align="start"
-                                  sideOffset={4}
-                                  className="z-[9999] min-w-[180px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
-                                >
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => togglePin(activeConversationId)}
-                                  >
-                                    <PinIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>{pinnedIds.has(activeConversationId) ? 'Unpin' : 'Pin'}</span>
-                                  </DropdownMenu.Item>
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => {
-                                      setRenameValue(activeConversationTitle ?? '');
-                                      setRenamingTitle(true);
-                                    }}
-                                  >
-                                    <PencilIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>Rename</span>
-                                  </DropdownMenu.Item>
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => void handleArchiveConversation(activeConversationId)}
-                                  >
-                                    <ArchiveIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>Archive</span>
-                                  </DropdownMenu.Item>
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => setExportOpen(true)}
-                                  >
-                                    <DownloadIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>Export</span>
-                                  </DropdownMenu.Item>
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70"
-                                    onSelect={() => setThreadSettingsOpen(true)}
-                                  >
-                                    <SlidersHorizontalIcon className="h-4 w-4 text-muted-foreground" />
-                                    <span>Settings</span>
-                                  </DropdownMenu.Item>
-                                  <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                                  <DropdownMenu.Item
-                                    className="flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-destructive outline-none transition-colors data-[highlighted]:bg-destructive/10"
-                                    onSelect={() => setConfirmingDelete(true)}
-                                  >
-                                    <Trash2Icon className="h-4 w-4" />
-                                    <span>Delete</span>
-                                  </DropdownMenu.Item>
-                                </DropdownMenu.Content>
-                              </DropdownMenu.Portal>
-                            </DropdownMenu.Root>
-                          </div>
-                        ) : activeConversationTitle ? (
-                          <span className="block whitespace-nowrap text-sm font-medium text-foreground">
-                            {activeConversationTitle}
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                    <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
-                      <WorkspaceSelector
-                        workspaces={workspaces}
-                        activeWorkspaceId={activeWorkspaceId}
-                        activeWorkspace={activeWorkspace}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className="min-h-0 flex-1 flex flex-col">
-                  {activeView === MARKETPLACE_VIEW ? (
-                    <div className="relative flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                      <SplashBackground visible storageKey="__marketplace_bg_last_index" />
-                      <PluginMarketplace />
-                    </div>
-                  ) : activeView === PLUGINS_VIEW ? (
-                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                      <InstalledPluginsView
-                        onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
-                        onNavigate={handlePluginNavigationItem}
-                        onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
-                        onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
-                      />
-                    </div>
-                  ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
-                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                      <div className="flex-1 overflow-y-auto">
-                        <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
-                          <BrokenPluginView
-                            pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
-                            onUninstalled={() => setActiveView(PLUGINS_VIEW)}
-                          />
+                          ) : null}
                         </div>
                       </div>
-                    </div>
-                  ) : activePluginPanel ? (
-                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                      <PluginPanelHost
-                        panel={activePluginPanel}
-                        onClose={() => setActiveView(CHAT_VIEW)}
-                        displayName={pluginDisplayName(activePluginPanel.pluginName)}
-                      />
-                    </div>
-                  ) : activeView === CHAT_LIST_VIEW ? (
-                    <ChatsListPage
-                      onOpenConversation={(id) => {
-                        setActiveView(CHAT_VIEW);
-                        void handleSwitchConversation(id);
-                      }}
-                      onNewConversation={() => {
-                        setActiveView(CHAT_VIEW);
-                        return handleNewConversation();
-                      }}
-                      activeConversationId={activeConversationId}
-                      workspaceId={activeWorkspaceId}
-                    />
-                  ) : activeView === TASKS_VIEW ? (
-                    isCreatingTask ? (
-                      <TaskCreationView
-                        onDone={(taskId) => {
-                          setIsCreatingTask(false);
-                          tasksCtx?.selectTask(taskId);
-                        }}
-                        onCancel={() => {
-                          setIsCreatingTask(false);
-                        }}
-                      />
-                    ) : (
-                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                        <TaskQueue workspaceId={activeWorkspaceId} />
+                      <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
+                        <WorkspaceSelector
+                          workspaces={workspaces}
+                          activeWorkspaceId={activeWorkspaceId}
+                          activeWorkspace={activeWorkspace}
+                        />
                       </div>
-                    )
-                  ) : activeView === AGENTS_VIEW ? (
-                    <div className="flex flex-col flex-1 min-h-0">
-                      <AgentSwarmView />
-                      {agentRenameModal && (
-                        <AgentRenameModal
-                          initialValue={agentRenameModal.value}
-                          onSave={(name) => {
-                            void agentsCtx.updateAgent(agentRenameModal.id, { name });
-                            setAgentRenameModal(null);
-                          }}
-                          onClose={() => setAgentRenameModal(null)}
-                        />
-                      )}
-                      {agentDeleteModal && (
-                        <DeleteAgentModal
-                          agentName={agentDeleteModal.name}
-                          onConfirm={() => {
-                            void agentsCtx.deleteAgent(agentDeleteModal.id);
-                            agentsCtx.selectAgent(null);
-                          }}
-                          onClose={() => setAgentDeleteModal(null)}
-                        />
-                      )}
                     </div>
-                  ) : activeView === ALERTS_VIEW ? (
-                    <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
-                      <AlertsView onOpenConversation={(id) => void handleSwitchConversation(id)} />
-                    </div>
-                  ) : (
-                    <PlanPanelProvider onOpenPlan={handleOpenPlan}>
-                      <SidePanelProvider>
+                  </div>
+                  <div className="min-h-0 flex-1 flex flex-col">
+                    {activeView === MARKETPLACE_VIEW ? (
+                      <div className="relative flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <SplashBackground visible storageKey="__marketplace_bg_last_index" />
+                        <PluginMarketplace />
+                      </div>
+                    ) : activeView === PLUGINS_VIEW ? (
+                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <InstalledPluginsView
+                          onOpenMarketplace={() => setActiveView(MARKETPLACE_VIEW)}
+                          onNavigate={handlePluginNavigationItem}
+                          onOpenPluginError={(name) => setActiveView(PLUGIN_ERROR_VIEW_PREFIX + name)}
+                          onOpenPluginSettings={(name) => setPluginSettingsOpen(name)}
+                        />
+                      </div>
+                    ) : activeView.startsWith(PLUGIN_ERROR_VIEW_PREFIX) ? (
+                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <div className="flex-1 overflow-y-auto">
+                          <div className={cn('mx-auto px-4 py-6', !fullWidth && 'max-w-3xl')}>
+                            <BrokenPluginView
+                              pluginName={activeView.slice(PLUGIN_ERROR_VIEW_PREFIX.length)}
+                              onUninstalled={() => setActiveView(PLUGINS_VIEW)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ) : activePluginPanel ? (
+                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <PluginPanelHost
+                          panel={activePluginPanel}
+                          onClose={() => setActiveView(CHAT_VIEW)}
+                          displayName={pluginDisplayName(activePluginPanel.pluginName)}
+                        />
+                      </div>
+                    ) : activeView === CHAT_LIST_VIEW ? (
+                      <ChatsListPage
+                        onOpenConversation={(id) => {
+                          setActiveView(CHAT_VIEW);
+                          void handleSwitchConversation(id);
+                        }}
+                        onNewConversation={(expectedCurrentId) => {
+                          setActiveView(CHAT_VIEW);
+                          return handleNewConversation(expectedCurrentId);
+                        }}
+                        onDeleteConversation={handleDeleteConversation}
+                        onDeleteConversations={handleDeleteConversations}
+                        activeConversationId={activeConversationId}
+                        workspaceId={activeWorkspaceId}
+                      />
+                    ) : activeView === TASKS_VIEW ? (
+                      isCreatingTask ? (
+                        <TaskCreationView
+                          onDone={(taskId) => {
+                            setIsCreatingTask(false);
+                            tasksCtx?.selectTask(taskId);
+                          }}
+                          onCancel={() => {
+                            setIsCreatingTask(false);
+                          }}
+                        />
+                      ) : (
+                        <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                          <TaskQueue workspaceId={activeWorkspaceId} />
+                        </div>
+                      )
+                    ) : activeView === AGENTS_VIEW ? (
+                      <div className="flex flex-col flex-1 min-h-0">
+                        <AgentSwarmView />
+                        {agentRenameModal && (
+                          <AgentRenameModal
+                            initialValue={agentRenameModal.value}
+                            onSave={(name) => {
+                              void agentsCtx.updateAgent(agentRenameModal.id, { name });
+                              setAgentRenameModal(null);
+                            }}
+                            onClose={() => setAgentRenameModal(null)}
+                          />
+                        )}
+                        {agentDeleteModal && (
+                          <DeleteAgentModal
+                            agentName={agentDeleteModal.name}
+                            onConfirm={() => {
+                              void agentsCtx.deleteAgent(agentDeleteModal.id);
+                              agentsCtx.selectAgent(null);
+                            }}
+                            onClose={() => setAgentDeleteModal(null)}
+                          />
+                        )}
+                      </div>
+                    ) : activeView === ALERTS_VIEW ? (
+                      <div className="flex flex-col flex-1 min-h-0 pt-14 md:pt-16">
+                        <AlertsView onOpenConversation={(id) => void handleSwitchConversation(id)} />
+                      </div>
+                    ) : (
+                      <PlanPanelProvider onOpenPlan={handleOpenPlan}>
                         <ArtifactProvider key={activeConversationId ?? 'no-conv'}>
                           <div className="flex h-full min-h-0">
                             {/* Chat column */}
@@ -2879,12 +3232,12 @@ function AppShell() {
                             )}
                           </div>
                         </ArtifactProvider>
-                      </SidePanelProvider>
-                    </PlanPanelProvider>
-                  )}
-                </div>
-              </main>
-            </div>
+                      </PlanPanelProvider>
+                    )}
+                  </div>
+                </main>
+              </div>
+            </SidePanelProvider>
           </RealtimeProvider>
         </RuntimeProvider>
       </DropZone>

@@ -91,6 +91,7 @@ export const SidePanelProvider: FC<PropsWithChildren> = ({ children }) => {
 const MIN_PCT = 20;
 const MAX_PCT = 80;
 const DEFAULT_PCT = 45;
+const KEYBOARD_STEP_PCT = 5;
 
 export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
   const { state, activeTabId, openPanel, minimizePanel, setActiveTab } = useSidePanel();
@@ -125,6 +126,20 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
     event.currentTarget.releasePointerCapture(event.pointerId);
   }, []);
 
+  const handleResizeKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      let next: number | null = null;
+      if (event.key === 'ArrowLeft') next = Math.min(MAX_PCT, widthPct + KEYBOARD_STEP_PCT);
+      else if (event.key === 'ArrowRight') next = Math.max(MIN_PCT, widthPct - KEYBOARD_STEP_PCT);
+      else if (event.key === 'Home') next = MIN_PCT;
+      else if (event.key === 'End') next = MAX_PCT;
+      if (next === null) return;
+      event.preventDefault();
+      setWidthPct(next);
+    },
+    [widthPct],
+  );
+
   if (tabs.length === 0) return null;
 
   if (state === 'minimized') {
@@ -136,6 +151,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
         <Tooltip content="Expand panel" side="left">
           <button
             type="button"
+            aria-label="Expand panel"
             onClick={() => openPanel()}
             className="titlebar-no-drag flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
@@ -148,6 +164,8 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
             <Tooltip key={tab.id} content={tab.label} side="left">
               <button
                 type="button"
+                aria-label={tab.label}
+                aria-pressed={tab.id === effectiveTabId}
                 onClick={() => openPanel(tab.id)}
                 className={cn(
                   'titlebar-no-drag relative flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
@@ -182,13 +200,21 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
       {/* Drag handle */}
       <div
         role="separator"
+        tabIndex={0}
+        aria-label="Resize side panel"
         aria-orientation="vertical"
+        aria-valuemin={MIN_PCT}
+        aria-valuemax={MAX_PCT}
+        aria-valuenow={Math.round(widthPct)}
+        aria-valuetext={`${Math.round(widthPct)}% of the window`}
+        data-native-browser-overlay-ignore
+        onKeyDown={handleResizeKeyDown}
         onPointerDown={handleDragStart}
         onPointerMove={handleDragMove}
         onPointerUp={handleDragEnd}
         onPointerCancel={handleDragEnd}
         onDoubleClick={() => setWidthPct(DEFAULT_PCT)}
-        className="absolute -left-1 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none hover:bg-primary/20 active:bg-primary/30"
+        className="absolute -left-2 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none hover:bg-primary/20 active:bg-primary/30"
       />
 
       {/* Tab bar. `titlebar-no-drag` is REQUIRED: this bar sits in the same top
@@ -203,6 +229,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
               <button
                 key={tab.id}
                 type="button"
+                aria-pressed={active}
                 onClick={() => setActiveTab(tab.id)}
                 className={cn(
                   'titlebar-no-drag flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
@@ -223,6 +250,7 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
         <Tooltip content="Collapse panel" side="bottom">
           <button
             type="button"
+            aria-label="Collapse panel"
             onClick={minimizePanel}
             className="titlebar-no-drag flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >

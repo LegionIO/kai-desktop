@@ -1,6 +1,6 @@
 import type { z } from 'zod';
 
-export type ToolSource = 'builtin' | 'mcp' | 'skill' | 'plugin' | 'cli';
+export type ToolSource = 'builtin' | 'mcp' | 'skill' | 'plugin' | 'cli' | 'browser';
 
 export type ToolProgressEvent = {
   stream: 'stdout' | 'stderr';
@@ -21,6 +21,10 @@ export type ToolProgressEvent = {
 export type ToolExecutionContext = {
   toolCallId: string;
   conversationId?: string;
+  /** Unique owner for the current assistant run. Browser tabs and control leases
+   * are scoped to this id so overlapping text/Realtime runs cannot clean up one
+   * another's state. */
+  browserOwnerId?: string;
   cwd?: string;
   abortSignal?: AbortSignal;
   onProgress?: (event: ToolProgressEvent) => void;

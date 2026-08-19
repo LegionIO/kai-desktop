@@ -12,8 +12,11 @@
  * @deprecated Use createSdkMcpServer() from @anthropic-ai/claude-agent-sdk instead.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
 import { buildMcpToolContent } from '../tool-model-content.js';
+import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
+import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -94,11 +97,13 @@ export class ToolMcpBridge {
   private tools: Map<string, ToolDefinition>;
   private conversationId: string;
   private cwd?: string;
+  private browserOwnerId?: string;
 
-  constructor(options: { tools: ToolDefinition[]; conversationId: string; cwd?: string }) {
+  constructor(options: { tools: ToolDefinition[]; conversationId: string; cwd?: string; browserOwnerId?: string }) {
     this.tools = new Map(options.tools.map((t) => [t.name, t]));
     this.conversationId = options.conversationId;
     this.cwd = options.cwd;
+    this.browserOwnerId = options.browserOwnerId;
   }
 
   /** Returns tool definitions in MCP list_tools format with real JSON Schemas. */
@@ -126,31 +131,30 @@ export class ToolMcpBridge {
     }
 
     try {
-      // Validate args against the Zod schema before execution. These tools run
-      // with full local privileges, so if the schema rejects, fail the call
-      // rather than passing unvalidated input through.
-      let validatedArgs = args;
-      const safeParse = (tool.inputSchema as { safeParse?: (v: unknown) => { success: boolean; data?: unknown } })
-        .safeParse;
-      if (typeof safeParse === 'function') {
-        const parseResult = safeParse.call(tool.inputSchema, args);
-        if (!parseResult.success) {
-          return {
-            content: [{ type: 'text', text: `Invalid arguments for tool "${name}".` }],
-            isError: true,
-          };
-        }
-        validatedArgs = parseResult.data;
-      }
-
+      const toolCallId = `mcp-bridge-${randomUUID()}`;
       const context: ToolExecutionContext = {
-        toolCallId: `mcp-bridge-${Date.now()}`,
+        toolCallId,
         conversationId: this.conversationId,
+        browserOwnerId: this.browserOwnerId,
         cwd: this.cwd,
         abortSignal,
       };
-
-      const result = await tool.execute(validatedArgs, context);
+      const result = await executeToolWithLifecycleHooks({
+        conversationId: this.conversationId,
+        toolCallId,
+        toolName: tool.name,
+        args,
+        validate: (candidate) => {
+          const safeParse = (
+            tool.inputSchema as { safeParse?: (value: unknown) => { success: boolean; data?: unknown } }
+          ).safeParse;
+          if (typeof safeParse !== 'function') return candidate;
+          const parsed = safeParse.call(tool.inputSchema, candidate);
+          if (!parsed.success) throw new Error(`Invalid arguments for tool "${name}".`);
+          return parsed.data;
+        },
+        execute: (validatedArgs) => tool.execute(validatedArgs, context),
+      });
 
       // Surface an error-shaped tool result as an MCP error, not a success.
       const resultIsError =
@@ -170,7 +174,7 @@ export class ToolMcpBridge {
       };
     } catch (error) {
       return {
-        content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+        content: [{ type: 'text', text: redactBrowserToolErrorForExposure(tool.name, error) }],
         isError: true,
       };
     }

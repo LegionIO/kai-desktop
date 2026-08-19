@@ -1,7 +1,9 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
+import { getExistingBrowserManager } from '../browser/service.js';
 import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import {
@@ -21,7 +23,12 @@ import {
   getConversationBranch,
   appendConversationMessages,
 } from './conversations.js';
-import { readConversation, writeConversation, nextCompactionRevision, isRecentlyDeleted } from './conversation-store.js';
+import {
+  readConversation,
+  writeConversation,
+  nextCompactionRevision,
+  isRecentlyDeleted,
+} from './conversation-store.js';
 import { detectRuntimeSwitch, generateSwitchContext, wrapSwitchContext } from '../agent/runtime-switch.js';
 import { stripDisplayOnlyParts, invalidateStaleTokenCounts } from '../agent/message-sanitizer.js';
 import { estimateStaticRequestTokens, WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE } from '../agent/static-tokens.js';
@@ -70,6 +77,7 @@ import { COMPACTION_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { getAppHome } from '../local-bridge/paths.js';
+import { isRealtimeConversationBrowserAuthorized, isRealtimeConversationTurnActive } from './realtime.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging for stream pipeline diagnostics
@@ -92,7 +100,7 @@ function ipcDebugLog(msg: string): void {
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ChatMessage as ChatMessageForCompaction } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
-import { ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
+import { dedupeToolNames, ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
 import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import { buildAgentChildEnv, resolveConfinedCwd, providerKeyEnv } from '../agent/runtime/confinement.js';
 import {
@@ -111,15 +119,105 @@ import {
 import { recordUsageEvent } from './usage.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { normalizeTokenUsage } from '../../shared/token-usage.js';
-import type { HookMessage } from '../plugins/types.js';
+import {
+  redactBrowserErrorForExposure,
+  redactBrowserToolArgsForExposure,
+  redactBrowserToolErrorForExposure,
+} from '../../shared/browser.js';
+import type { HookMessage, PluginInferenceProvider } from '../plugins/types.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
+import { applyPostToolUseHooks, prepareToolUseWithHooks } from '../agent/hooks/tool-lifecycle.js';
 
-const activeStreams = new Map<string, { abort: () => void; token: string }>();
+type ActiveStreamState = {
+  abort: () => void;
+  token: string;
+  /** Sticky provenance: this run was admitted with native Browser authority.
+   * Revocation removes its tools but must not let a web/secondary surface take
+   * over the still-running private turn. */
+  nativeBrowserInitiator: boolean;
+  /** Current Browser-tool capability. This may be revoked independently of the
+   * initiator provenance above. */
+  nativeBrowserTools: boolean;
+};
+
+function shouldWarnAboutUnwrappedRuntimeTools(
+  capabilities: { builtInTools?: boolean },
+  enforcingHooksActive: boolean,
+): boolean {
+  return enforcingHooksActive && capabilities.builtInTools === true;
+}
+
+const UNCORRELATED_TOOL_ARGS_REASON =
+  'Arguments hidden because enforcing tool hooks cannot be correlated with this runtime event.';
+
+/** Prevent a streamed tool-call from exposing arguments before an enforcing
+ * PreToolUse hook has resolved. Mastra has an execution callback with the same
+ * call id, so its placeholder can be corrected later. Bridged runtimes and
+ * plugin providers use unrelated ids; fail closed with a permanent redacted
+ * sentinel rather than leaking the pre-hook payload or leaving a pending card. */
+function protectUnresolvedToolCallArgs(
+  event: StreamEvent,
+  enforcingHooksActive: boolean,
+  hookApplies: boolean,
+  correctionExpected: boolean,
+): void {
+  if (event.type !== 'tool-call' || !enforcingHooksActive || !hookApplies) return;
+  const mutableEvent = event as StreamEvent & { argsPending?: boolean };
+  if (correctionExpected) {
+    mutableEvent.args = { pending: true };
+    mutableEvent.argsPending = true;
+    return;
+  }
+  mutableEvent.args = { redacted: true, reason: UNCORRELATED_TOOL_ARGS_REASON };
+  mutableEvent.argsPending = false;
+}
+
+const activeStreams = new Map<string, ActiveStreamState>();
 
 /** True if any conversation currently has a live agent stream. Used by the
  *  headless update-restart watcher to avoid exiting mid-turn. */
 export function hasActiveStreams(): boolean {
   return activeStreams.size > 0;
+}
+
+function markTextBrowserCapabilitiesRevoked(streams: Iterable<Pick<ActiveStreamState, 'nativeBrowserTools'>>): void {
+  for (const stream of streams) stream.nativeBrowserTools = false;
+}
+
+function revokeTextBrowserCapabilities(
+  streams: Iterable<readonly [string, Pick<ActiveStreamState, 'token' | 'nativeBrowserTools'>]>,
+  approvals: Iterable<Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'resolve'>>,
+): void {
+  const revokedOwners = new Map<string, Set<string>>();
+  for (const [conversationId, stream] of streams) {
+    if (stream.nativeBrowserTools) {
+      const tokens = revokedOwners.get(conversationId) ?? new Set<string>();
+      tokens.add(stream.token);
+      revokedOwners.set(conversationId, tokens);
+    }
+    stream.nativeBrowserTools = false;
+  }
+
+  // A Browser policy prompt can no longer succeed after revocation. Settle
+  // only those native-browser waiters; generic ask_user/plan approvals remain
+  // live as long as their owning stream token is still current.
+  for (const approval of approvals) {
+    const owner = approval.streamOwner;
+    if (
+      approval.authority === 'native-browser' &&
+      owner &&
+      revokedOwners.get(owner.conversationId)?.has(owner.streamToken)
+    ) {
+      approval.resolve('dismiss');
+    }
+  }
+}
+
+/** Permanently remove the Browser bit from every live text stream. The Browser
+ * manager separately rotates its authority generation and clears run leases,
+ * so registry/tool refreshes after re-enable cannot restore the capability. */
+export function revokeActiveTextBrowserTools(): void {
+  revokeTextBrowserCapabilities(activeStreams.entries(), pendingToolApprovals.values());
 }
 
 // Delete the active-stream entry only if it still belongs to this run. A newer
@@ -156,6 +254,89 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
   consumedInjectBytes.delete(conversationId);
+}
+
+/** Close assistant-created browser tabs only while this exact turn still owns
+ * the conversation. A superseded turn must never close its replacement's tabs. */
+function cleanupAssistantTabsIfOwned(conversationId: string, token: string): boolean {
+  if (activeStreams.get(conversationId)?.token !== token) return false;
+  const cleanup = getExistingBrowserManager()?.cleanupAssistantTabs(conversationId, token);
+  if (cleanup) {
+    void cleanup.catch((error) => {
+      console.error('[Agent:stream] Failed to clean up assistant Browser tabs:', error);
+    });
+  }
+  return true;
+}
+
+/** A Browser-authorized turn can lose its renderer while waiting for preflight
+ * drains, before the normal stream/fallback terminal path exists. Clear only a
+ * still-running disk marker; a renderer that survived will persist its richer
+ * terminal error after receiving the rejection result. */
+function resetBrowserAuthorityRevokedRunStatus(appHome: string, conversationId: string): boolean {
+  try {
+    const conversation = readConversation(appHome, conversationId);
+    if (!conversation || conversation.runStatus !== 'running') return false;
+    conversation.runStatus = 'idle';
+    broadcastUpsert(appHome, writeConversation(appHome, conversation));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shouldPrepareBrowserContinuation(
+  event: { type: StreamEvent['type']; errorCategory?: string },
+  serverPersistedRun: boolean,
+  autoContinueOnMaxTurns: boolean,
+  allowNativeBrowserTools: boolean,
+): boolean {
+  return (
+    event.type === 'error' &&
+    event.errorCategory === 'max_turns' &&
+    !serverPersistedRun &&
+    autoContinueOnMaxTurns &&
+    allowNativeBrowserTools
+  );
+}
+
+function isBrowserDrainSuperseded(aborted: boolean, activeToken: string | undefined, streamToken: string): boolean {
+  return aborted || activeToken !== streamToken;
+}
+
+function isNativeBrowserAuthorityCurrent(
+  manager: ReturnType<typeof getExistingBrowserManager>,
+  generation: number | null | undefined,
+): generation is number {
+  return (
+    generation !== null && generation !== undefined && manager?.isHostRendererAuthorityCurrent(generation) === true
+  );
+}
+
+function isNativeBrowserAuthorityRevoked(
+  wasAuthorized: boolean,
+  managerAtAuthorization: ReturnType<typeof getExistingBrowserManager>,
+  currentManager: ReturnType<typeof getExistingBrowserManager>,
+  generation: number | null | undefined,
+): boolean {
+  return (
+    wasAuthorized &&
+    (managerAtAuthorization !== currentManager || !isNativeBrowserAuthorityCurrent(currentManager, generation))
+  );
+}
+
+function mayDriveBrowserContinuation(
+  manager: ReturnType<typeof getExistingBrowserManager>,
+  conversationId: string,
+  predecessorRunId: string,
+  hasNativeBrowserAuthority: boolean,
+): boolean {
+  return !manager?.hasPendingAssistantContinuation(conversationId, predecessorRunId) || hasNativeBrowserAuthority;
+}
+
+function pluginProviderErrorForExposure(error: unknown, allowNativeBrowserTools: boolean): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return allowNativeBrowserTools ? redactBrowserErrorForExposure(message) : message;
 }
 const activeObserverSessions = new Map<string, string>();
 const PLAN_MODE_CUSTOM_TOOLS = new Set(['ask_user', 'enter_plan_mode', 'exit_plan_mode', 'web_fetch', 'web_search']);
@@ -213,9 +394,23 @@ async function splitBranchMediaForTokenSum(
 function jsonStableString(value: unknown): string {
   if (value === undefined) return '';
   try {
-    return JSON.stringify(value) ?? '';
+    const seen = new WeakSet<object>();
+    return (
+      JSON.stringify(value, (_key, nested) => {
+        if (typeof nested === 'bigint') return `${nested.toString()}n`;
+        if (typeof nested === 'object' && nested !== null) {
+          if (seen.has(nested)) return '[Circular]';
+          seen.add(nested);
+        }
+        return nested;
+      }) ?? ''
+    );
   } catch {
-    return String(value);
+    try {
+      return String(value);
+    } catch {
+      return '[Unserializable value]';
+    }
   }
 }
 
@@ -277,7 +472,10 @@ function persistRedactedUserTurn(
       type: 'prompt-redacted',
       data: { messageId: node.id, content: node.content },
     });
-    return { id: node.id as string, sig: messageContentSignature(node as Parameters<typeof messageContentSignature>[0]) };
+    return {
+      id: node.id as string,
+      sig: messageContentSignature(node as Parameters<typeof messageContentSignature>[0]),
+    };
   } catch (err) {
     console.warn('[Agent] Failed to persist redacted user turn:', err);
     return null;
@@ -288,8 +486,17 @@ function persistRedactedUserTurn(
 import {
   pendingToolApprovals,
   setServerPersistTagger,
+  setToolApprovalOwnerResolver,
+  setRawApprovalWindowOpener,
+  setRawApprovalWindowCloser,
+  setPrimaryApprovalWindowResolver,
+  authorizePendingApprovalWindow,
+  mayBroadcastApprovalToWebClients,
+  resolveApprovalBroadcastWindowIds,
   registerPendingApproval,
   broadcastStreamEventRaw,
+  type PendingToolApproval,
+  type ToolApprovalAuthority,
 } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
@@ -358,6 +565,14 @@ const cancelledSubmits = new Set<number>();
  * usually discard it as busy. This closes that window.
  */
 export function isConversationTurnActive(conversationId: string): boolean {
+  if (isRealtimeConversationTurnActive(conversationId)) return true;
+  return isTextConversationTurnActive(conversationId);
+}
+
+/** Text-only half of the per-conversation turn exclusion contract. Realtime
+ * startup consumes this through an injected callback to avoid an agent↔realtime
+ * module cycle. */
+export function isTextConversationTurnActive(conversationId: string): boolean {
   if (activeStreams.has(conversationId)) return true;
   const pending = currentPendingSubmit.get(conversationId);
   return typeof pending === 'number' && !cancelledSubmits.has(pending);
@@ -471,9 +686,12 @@ function turnTokenTime(token: string): number {
 //     for a NEWER turn than the incoming one always denies (never downgrade to an older turn).
 function authorizeContinuation(conversationId: string, clientId: string, turnToken: string): boolean {
   if (
-    typeof conversationId !== 'string' || !conversationId ||
-    typeof clientId !== 'string' || !clientId ||
-    typeof turnToken !== 'string' || !turnToken
+    typeof conversationId !== 'string' ||
+    !conversationId ||
+    typeof clientId !== 'string' ||
+    !clientId ||
+    typeof turnToken !== 'string' ||
+    !turnToken
   ) {
     return false;
   }
@@ -613,7 +831,8 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
  * assistant reply is written via the server-persist accumulator (there may be
  * no renderer, e.g. an automation). Set by registerAgentHandlers (closes over
  * streamHandler + module state); consumed by the automations busy-inject path.
- * Returns { ok } — ok:false only for a genuinely missing conversation.
+ * Returns { ok }. Background callers are rejected before any mutation when a
+ * native Browser-authorized stream owns the conversation.
  */
 export type InjectUserTurnFn = (
   conversationId: string,
@@ -648,6 +867,34 @@ export function isSupersededRunEvent(emittingToken: string | undefined, activeTo
   return emittingToken !== activeToken;
 }
 
+/** Open the optional dedicated approval surface and bind that exact window to
+ * the already-registered pending request. Raw approval producers install this
+ * helper through tool-approval.ts so every approval path gets identical
+ * presence policy and one-shot authority. */
+function maybeOpenDedicatedApprovalWindow(event: StreamEvent): void {
+  if (event.type !== 'tool-approval-required' || !event.toolCallId || !event.conversationId) return;
+  let popOut = false;
+  if (serverPersistAppHome) {
+    try {
+      const raw = readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow;
+      popOut = resolveApprovalPopOut(raw);
+    } catch {
+      popOut = false;
+    }
+  }
+  if (!popOut) return;
+  const win = openApprovalWindow({
+    approvalId: event.toolCallId,
+    conversationId: event.conversationId,
+    toolName: event.toolName ?? 'tool',
+    args: event.args,
+  });
+  const webContentsId = win?.webContents?.id;
+  if (typeof webContentsId === 'number') {
+    authorizePendingApprovalWindow(event.toolCallId, webContentsId);
+  }
+}
+
 /**
  * @param emittingToken  The stream token of the run that produced this event.
  *   Persistence/accumulation is only applied when it matches BOTH the persist
@@ -657,7 +904,10 @@ export function isSupersededRunEvent(emittingToken: string | undefined, activeTo
  *   (automation / redaction), which are never server-persist owners.
  */
 function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void {
-  let eventToBroadcast = event;
+  let eventToBroadcast: StreamEvent =
+    event.type === 'tool-call'
+      ? { ...event, args: redactBrowserToolArgsForExposure(event.toolName, event.args) }
+      : event;
   // Debug: log every event broadcast
   const eventSummary =
     event.type === 'text-delta'
@@ -717,7 +967,7 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         // Parent the persisted assistant turn on the head captured at submit
         // (the user node it answers), so a mid-run branch change can't reparent it.
         const parentId = serverPersistParents.get(event.conversationId);
-        accumulateForPersistence(serverPersistAppHome, event, parentId ?? undefined);
+        accumulateForPersistence(serverPersistAppHome, eventToBroadcast, parentId ?? undefined);
         if (event.type === 'done') {
           serverPersistTokens.delete(event.conversationId);
           serverPersistParents.delete(event.conversationId);
@@ -732,37 +982,21 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // persist); the stream loop's terminal handler polls disk and finalizes this accumulator
       // ONLY if the renderer didn't. Non-terminal events just build the accumulator.
       if (event.type !== 'done') {
-        accumulateForPersistence(serverPersistAppHome, event, guiFallbackParents.get(event.conversationId) ?? undefined);
+        accumulateForPersistence(
+          serverPersistAppHome,
+          eventToBroadcast,
+          guiFallbackParents.get(event.conversationId) ?? undefined,
+        );
       }
     }
   }
 
-  // Dedicated approval window (ui.approvals.dedicatedWindow):
-  //   'auto' (default) → presence-aware: pop out ONLY when the user isn't on
-  //     Kai (no GUI focus, no recently-active CLI) — otherwise the inline
-  //     in-thread card / CLI prompt is the surface. 'always'/'never' force it.
-  // Close the window once the tool resolves or the turn ends. The inline card
-  // still renders and resolves the same pending entry (whichever surface the
-  // user answers first wins — resolve is idempotent).
+  // Dedicated approval window (ui.approvals.dedicatedWindow). Registration is
+  // synchronous and happens before this broadcast, so the exact pop-out can be
+  // attached as a one-shot resolver capability before any answer arrives.
   if (event.conversationId) {
     if (event.type === 'tool-approval-required' && event.toolCallId) {
-      let popOut = false;
-      if (serverPersistAppHome) {
-        try {
-          const raw = readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow;
-          popOut = resolveApprovalPopOut(raw);
-        } catch {
-          popOut = false;
-        }
-      }
-      if (popOut) {
-        openApprovalWindow({
-          approvalId: event.toolCallId,
-          conversationId: event.conversationId,
-          toolName: event.toolName ?? 'tool',
-          args: event.args,
-        });
-      }
+      maybeOpenDedicatedApprovalWindow(event);
     } else if (event.type === 'tool-result' && event.toolCallId) {
       closeApprovalWindow(event.toolCallId);
     } else if (event.type === 'done') {
@@ -799,13 +1033,17 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     eventToBroadcast = { ...eventToBroadcast, runGeneration: emittingToken } as StreamEvent;
   }
 
+  const authorizedApprovalWindowIds = resolveApprovalBroadcastWindowIds(event);
   for (const win of BrowserWindow.getAllWindows()) {
+    if (authorizedApprovalWindowIds && !authorizedApprovalWindowIds.has(win.webContents.id)) continue;
     win.webContents.send('agent:stream-event', eventToBroadcast);
   }
   // REMOTE clients are frame-capped (web WS 4 MiB / CLI local-bridge 8 MiB) — strip oversized
   // media/originals from the copy fanned out to them (local Electron windows keep the full event).
   // Shared with the sub-agent broadcast (electron/agent/remote-frame-cap.ts).
-  broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
+  if (mayBroadcastApprovalToWebClients(event)) {
+    broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
+  }
 }
 
 /**
@@ -827,7 +1065,14 @@ async function gateTitleGenerationMessages(
   // purpose explicitly so the title systemPrompt lands in the SIXTH arg — passing it as the fifth
   // would put it in `purpose` and leave the gate's systemPrompt empty (DLP hooks then see no
   // system prompt, and a system-prompt-conditioned rule could wrongly pass).
-  return gateMessagesThroughUserPromptSubmit(messages, config, conversationId, modelKey, 'title-generation', systemPrompt);
+  return gateMessagesThroughUserPromptSubmit(
+    messages,
+    config,
+    conversationId,
+    modelKey,
+    'title-generation',
+    systemPrompt,
+  );
 }
 
 /**
@@ -911,6 +1156,257 @@ function toolsForExecutionMode(tools: ToolDefinition[], executionMode: Execution
   }
 
   return tools;
+}
+
+function toolsForRun(
+  tools: ToolDefinition[],
+  executionMode: ExecutionMode,
+  allowNativeBrowserTools: boolean,
+): ToolDefinition[] {
+  const surfaceTools = allowNativeBrowserTools ? tools : tools.filter((tool) => tool.source !== 'browser');
+  return toolsForExecutionMode(surfaceTools, executionMode);
+}
+
+function toolsForPluginInferenceProvider(
+  tools: ToolDefinition[],
+  executionMode: ExecutionMode,
+  allowNativeBrowserTools: boolean,
+  pluginManager: PluginManager | undefined,
+  provider: PluginInferenceProvider,
+): ToolDefinition[] {
+  const providerMayUseBrowser =
+    allowNativeBrowserTools &&
+    pluginManager?.inferenceProviderHasPermission(provider, 'browser:authenticated-session') === true;
+  return toolsForRun(tools, executionMode, providerMayUseBrowser);
+}
+
+function validateToolInput(tool: ToolDefinition, input: unknown): unknown {
+  const parsed = tool.inputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new Error(`Invalid arguments for tool "${tool.name}".`);
+  }
+  return parsed.data;
+}
+
+function observerToolErrorForExposure(toolName: string, error: unknown): { isError: true; error: string } {
+  return {
+    isError: true,
+    error: redactBrowserToolErrorForExposure(toolName, error),
+  };
+}
+
+/** Plugin inference providers receive executable host tool definitions and may
+ * call them directly. Validate every host-tool invocation at this trust boundary,
+ * and bind every tool to the host turn so approvals cannot be detached from a
+ * Browser-authorized stream. Browser tools additionally rely on this binding
+ * for tab/control cleanup ownership. */
+function bindBrowserToolsToRun(
+  tools: ToolDefinition[],
+  conversationId: string,
+  browserOwnerId: string,
+  abortSignal: AbortSignal,
+  trustedContext: Pick<ToolExecutionContext, 'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey'>,
+  isCurrent: (tool: ToolDefinition) => boolean,
+): ToolDefinition[] {
+  return tools.map((tool) => ({
+    ...tool,
+    execute: async (input: unknown, _context: ToolExecutionContext) => {
+      const assertCurrent = (): void => {
+        if (abortSignal.aborted || !isCurrent(tool)) {
+          throw new Error('This plugin tool capability is no longer active.');
+        }
+      };
+      assertCurrent();
+      const toolCallId = `plugin-${tool.source === 'browser' ? 'browser-' : ''}tool-${randomUUID()}`;
+      const prepared = await prepareToolUseWithHooks(conversationId, toolCallId, tool.name, input);
+      assertCurrent();
+      if (!prepared.allowed) {
+        const denied = await applyPostToolUseHooks(
+          conversationId,
+          toolCallId,
+          tool.name,
+          prepared.exposedArgs,
+          prepared.result,
+        );
+        assertCurrent();
+        return denied.result;
+      }
+
+      let validatedInput: unknown;
+      try {
+        validatedInput = validateToolInput(tool, prepared.args);
+      } catch (error) {
+        const errorResult = {
+          isError: true,
+          error: redactBrowserToolErrorForExposure(tool.name, error),
+        };
+        const postTool = await applyPostToolUseHooks(
+          conversationId,
+          toolCallId,
+          tool.name,
+          prepared.exposedArgs,
+          errorResult,
+        );
+        assertCurrent();
+        if (postTool.denied || postTool.modified) return postTool.result;
+        throw new Error(errorResult.error);
+      }
+      const exposedArgs = redactBrowserToolArgsForExposure(tool.name, validatedInput);
+      const context: ToolExecutionContext = {
+        // The provider is a plugin trust boundary. Never preserve any context
+        // field supplied by the plugin. Bind only host-derived values so a
+        // supplied call id cannot collide with another pending approval and a
+        // supplied cwd/profile/model cannot redirect or re-parent host tools.
+        toolCallId,
+        conversationId,
+        browserOwnerId,
+        abortSignal,
+        cwd: trustedContext.cwd,
+        isHeadless: trustedContext.isHeadless,
+        parentProfileKey: trustedContext.parentProfileKey,
+        parentModelKey: trustedContext.parentModelKey,
+      };
+      try {
+        assertCurrent();
+        const result = await tool.execute(validatedInput, context);
+        assertCurrent();
+        const postTool = await applyPostToolUseHooks(conversationId, toolCallId, tool.name, exposedArgs, result);
+        assertCurrent();
+        return postTool.result;
+      } catch (error) {
+        // If disable/update/cancellation happened during execution, do not run
+        // more plugin hooks or deliver a stale result through the old provider.
+        assertCurrent();
+        const errorResult = {
+          isError: true,
+          error: redactBrowserToolErrorForExposure(tool.name, error),
+        };
+        const postTool = await applyPostToolUseHooks(conversationId, toolCallId, tool.name, exposedArgs, errorResult);
+        assertCurrent();
+        if (postTool.denied || postTool.modified) return postTool.result;
+        throw new Error(errorResult.error);
+      }
+    },
+  }));
+}
+
+function isPrimaryBrowserToolCaller(
+  event:
+    | {
+        sender?: { send?: (channel: string, ...args: unknown[]) => void; mainFrame?: unknown } | null;
+        senderFrame?: unknown;
+        __kaiWebBridge?: boolean;
+      }
+    | null
+    | undefined,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  const primaryWindow = getPrimaryWindow();
+  return (
+    !!primaryWindow &&
+    !primaryWindow.isDestroyed() &&
+    event?.__kaiWebBridge !== true &&
+    event?.sender === primaryWindow.webContents &&
+    event?.senderFrame === primaryWindow.webContents.mainFrame
+  );
+}
+
+function mayMutateBrowserAuthorizedStream(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  stream: Pick<ActiveStreamState, 'nativeBrowserInitiator' | 'nativeBrowserTools'> | undefined,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  return (
+    (!stream?.nativeBrowserInitiator && !stream?.nativeBrowserTools) ||
+    isPrimaryBrowserToolCaller(event, getPrimaryWindow)
+  );
+}
+
+/** Authoritative admission check for renderer-owned conversation persistence.
+ * A renderer persists its optimistic user turn before invoking `agent:stream`.
+ * Reject that write while another renderer owns a Browser-capable stream so a
+ * later stream rejection cannot leave the unauthorized branch active on disk. */
+export function mayPersistConversationForBrowserAuthority(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  conversationId: string,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  if (isRealtimeConversationBrowserAuthorized(conversationId) && !isPrimaryBrowserToolCaller(event, getPrimaryWindow)) {
+    return false;
+  }
+  const browserManager = getExistingBrowserManager();
+  if (browserManager?.hasPendingAssistantContinuationForConversation(conversationId)) {
+    const authorityGeneration = browserManager.getHostRendererAuthorityGeneration();
+    if (
+      !isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+      !isNativeBrowserAuthorityCurrent(browserManager, authorityGeneration)
+    ) {
+      return false;
+    }
+  }
+  return mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow);
+}
+
+/** Background automations have no native renderer capability. Keep this
+ * separate from mayMutateBrowserAuthorizedStream so a sender-less internal
+ * caller cannot accidentally be treated as a trusted continuation. */
+function mayInjectAutomationIntoActiveStream(
+  stream: Pick<ActiveStreamState, 'nativeBrowserInitiator' | 'nativeBrowserTools'> | undefined,
+): boolean {
+  return !stream?.nativeBrowserInitiator && !stream?.nativeBrowserTools;
+}
+
+function isAuthorizedApprovalWindowCaller(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'approvalWindowWebContentsId'>,
+): boolean {
+  const expectedId = pending.approvalWindowWebContentsId;
+  const sender = event?.sender as { id?: unknown; mainFrame?: unknown } | null | undefined;
+  return (
+    event?.__kaiWebBridge !== true &&
+    typeof expectedId === 'number' &&
+    sender?.id === expectedId &&
+    event?.senderFrame === sender.mainFrame
+  );
+}
+
+function isPendingApprovalStreamCurrent(
+  pending: Pick<PendingToolApproval, 'streamOwner'>,
+  streams: Pick<Map<string, ActiveStreamState>, 'get'> = activeStreams,
+): boolean {
+  if (!pending.streamOwner) return true;
+  if (pending.streamOwner.isCurrent) {
+    try {
+      return pending.streamOwner.isCurrent();
+    } catch {
+      return false;
+    }
+  }
+  const stream = streams.get(pending.streamOwner.conversationId);
+  return stream?.token === pending.streamOwner.streamToken;
+}
+
+function mayResolveToolApproval(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'approvalWindowWebContentsId'>,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  if (!isPendingApprovalStreamCurrent(pending)) return false;
+  const requiresNativeAuthority = pending.authority === 'native-browser' || Boolean(pending.streamOwner);
+  return (
+    !requiresNativeAuthority ||
+    isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+    isAuthorizedApprovalWindowCaller(event, pending)
+  );
+}
+
+function toolApprovalResolutionError(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'approvalWindowWebContentsId'>,
+  getPrimaryWindow: () => BrowserWindow | null,
+): 'stale-browser-stream' | 'native-browser-authority-required' | null {
+  if (!isPendingApprovalStreamCurrent(pending)) return 'stale-browser-stream';
+  return mayResolveToolApproval(event, pending, getPrimaryWindow) ? null : 'native-browser-authority-required';
 }
 
 function observerToolsForExecutionMode(
@@ -1040,6 +1536,18 @@ function logToolCompactionDebug(stage: string, details: Record<string, unknown>)
 // Tool registry - will be populated by Phase 4
 let registeredTools: ToolDefinition[] = [];
 
+/** Browser tool names are a trusted app contract. Normalize/dedupe every live
+ * registry with Browser tools first so a plugin/MCP/CLI name or alias cannot
+ * capture browser_tabs/browser_action dispatch, then restore the public
+ * registry ordering with Browser tools last. */
+function normalizeRegisteredTools(tools: ToolDefinition[]): ToolDefinition[] {
+  const safe = ensureSafeToolDefinitions(tools);
+  const browserTools = safe.filter((tool) => tool.source === 'browser');
+  const nonBrowserTools = safe.filter((tool) => tool.source !== 'browser');
+  const prioritized = dedupeToolNames([...browserTools, ...nonBrowserTools]);
+  return [...prioritized.slice(browserTools.length), ...prioritized.slice(0, browserTools.length)];
+}
+
 // Resolves once the initial tool registry (built-in + MCP + skills + plugins +
 // CLI tools) has been registered. The local CLI bridge starts serving EARLY
 // (before this, for fast connect), so a CLI turn arriving in that window would
@@ -1051,11 +1559,19 @@ const toolsReady: Promise<void> = new Promise((r) => {
 let toolsRegistered = false;
 
 export function registerTools(tools: ToolDefinition[]): void {
-  registeredTools = ensureSafeToolDefinitions(tools);
+  registeredTools = normalizeRegisteredTools(tools);
   if (!toolsRegistered) {
     toolsRegistered = true;
     resolveToolsReady();
   }
+}
+
+/** Commit the asynchronously-built startup registry without overwriting the
+ * Browser source that the live window/config lifecycle already hot-swapped.
+ * Browser enablement can change while MCP connections are still resolving. */
+export function registerToolsPreservingBrowserState(tools: ToolDefinition[]): void {
+  const browserTools = registeredTools.filter((tool) => tool.source === 'browser');
+  registerTools([...tools.filter((tool) => tool.source !== 'browser'), ...browserTools]);
 }
 
 export function getRegisteredTools(): ToolDefinition[] {
@@ -1088,30 +1604,62 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
 /** Hot-swap MCP tools without touching built-in, skill, or plugin tools */
 export function updateMcpTools(mcpTools: ToolDefinition[]): void {
   const nonMcp = registeredTools.filter((t) => t.source !== 'mcp');
-  registeredTools = [...nonMcp, ...ensureSafeToolDefinitions(mcpTools)];
+  registeredTools = normalizeRegisteredTools([...nonMcp, ...mcpTools]);
 }
 
 /** Hot-swap skill tools without touching built-in or MCP tools */
 export function updateSkillTools(skillTools: ToolDefinition[]): void {
   const nonSkill = registeredTools.filter((t) => t.source !== 'skill');
-  registeredTools = [...nonSkill, ...ensureSafeToolDefinitions(skillTools)];
+  registeredTools = normalizeRegisteredTools([...nonSkill, ...skillTools]);
 }
 
 /** Hot-swap plugin tools without touching built-in, MCP, or skill tools */
 export function updatePluginTools(pluginTools: ToolDefinition[]): void {
   const nonPlugin = registeredTools.filter((t) => t.source !== 'plugin');
-  registeredTools = [...nonPlugin, ...ensureSafeToolDefinitions(pluginTools)];
+  registeredTools = normalizeRegisteredTools([...nonPlugin, ...pluginTools]);
 }
 
 /** Hot-swap CLI tools without touching built-in, MCP, skill, or plugin tools */
 export function updateCliTools(cliTools: ToolDefinition[]): void {
   const nonCli = registeredTools.filter((t) => t.source !== 'cli');
-  registeredTools = [...nonCli, ...ensureSafeToolDefinitions(cliTools)];
+  registeredTools = normalizeRegisteredTools([...nonCli, ...cliTools]);
 }
 
-export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
+/** Hot-swap native browser tools as the desktop window is enabled/created/closed. */
+export function updateBrowserTools(browserTools: ToolDefinition[]): void {
+  const nonBrowser = registeredTools.filter((tool) => tool.source !== 'browser');
+  registeredTools = normalizeRegisteredTools([...nonBrowser, ...browserTools]);
+}
+
+export function registerAgentHandlers(
+  ipcMain: IpcMain,
+  appHome: string,
+  pluginManager?: PluginManager,
+  getPrimaryWindow: () => BrowserWindow | null = () => null,
+  resolveRealtimeBrowserApprovalOwner: (
+    conversationId: string,
+    browserOwnerId: string,
+    authority: ToolApprovalAuthority,
+  ) => (() => boolean) | undefined = () => undefined,
+): void {
   hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
   serverPersistAppHome = appHome;
+  setToolApprovalOwnerResolver((conversationId, browserOwnerId, authority) => {
+    const stream = activeStreams.get(conversationId);
+    const ownerCurrent =
+      stream?.token === browserOwnerId &&
+      (authority === 'native-browser'
+        ? stream.nativeBrowserTools
+        : stream.nativeBrowserInitiator || stream.nativeBrowserTools);
+    if (ownerCurrent) {
+      return { conversationId, streamToken: stream.token };
+    }
+    const isCurrent = resolveRealtimeBrowserApprovalOwner(conversationId, browserOwnerId, authority);
+    return isCurrent ? { conversationId, streamToken: browserOwnerId, isCurrent } : undefined;
+  });
+  setRawApprovalWindowOpener(maybeOpenDedicatedApprovalWindow);
+  setRawApprovalWindowCloser(closeApprovalWindow);
+  setPrimaryApprovalWindowResolver(getPrimaryWindow);
   // Persist cooperative injects for server-owned (CLI/headless) turns at the
   // ACTUAL prepareStep consumption boundary — after the prior tool step's results
   // have arrived. Splitting at enqueue time can clear the persistence tool index
@@ -1167,7 +1715,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   const streamHandler = async (
-    event: { sender?: { send?: (channel: string, ...args: unknown[]) => void } } | null | undefined,
+    event:
+      | {
+          sender?: { send?: (channel: string, ...args: unknown[]) => void } | null;
+          __kaiWebBridge?: boolean;
+        }
+      | null
+      | undefined,
     conversationId: string,
     messages: unknown[],
     modelKey?: string,
@@ -1190,6 +1744,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       continuationPredecessorToken?: string;
     },
     responseMessageId?: string,
+    nativeBrowserToolsOverride?: boolean,
+    nativeBrowserAuthorityGenerationOverride?: number,
   ) => {
     messages = stripDisplayOnlyParts(messages);
     // Raw disk-equivalent per-id content signature of the turn's INPUT branch, captured
@@ -1207,6 +1763,50 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
     const effectiveCwd = normalizeAgentCwd(cwd);
     const effectiveExecutionMode: ExecutionMode = executionMode ?? 'auto';
+    // Web/CLI/background callers have no native sidebar to render or own a
+    // WebContentsView. Only a real Electron renderer invocation may expose the
+    // in-app browser tools. Internal continuations inherit a generation-bound
+    // grant rather than a bare boolean: host reload/crash teardown increments
+    // the manager generation, so a delayed continuation cannot restore access
+    // to an authenticated Browser profile after its renderer authority ended.
+    const browserManagerAtAuthorization = getExistingBrowserManager();
+    const directRendererAuthorized = isPrimaryBrowserToolCaller(event, getPrimaryWindow);
+    const nativeBrowserAuthorityGeneration =
+      nativeBrowserToolsOverride === undefined
+        ? directRendererAuthorized
+          ? browserManagerAtAuthorization?.getHostRendererAuthorityGeneration()
+          : undefined
+        : nativeBrowserAuthorityGenerationOverride;
+    const hasNativeBrowserAuthority =
+      (nativeBrowserToolsOverride ?? directRendererAuthorized) &&
+      isNativeBrowserAuthorityCurrent(browserManagerAtAuthorization, nativeBrowserAuthorityGeneration);
+    const continuationPredecessorToken =
+      typeof threadOverrides?.continuationPredecessorToken === 'string' &&
+      threadOverrides.continuationPredecessorToken.length > 0
+        ? threadOverrides.continuationPredecessorToken
+        : undefined;
+
+    // Text and Realtime runtimes maintain independent accumulators, tool
+    // ownership, and terminal persistence. Never run them concurrently for the
+    // same conversation or their events can merge into one renderer branch.
+    if (isRealtimeConversationTurnActive(conversationId)) {
+      const sender = event?.sender;
+      let delivered = false;
+      if (sender && typeof sender.send === 'function') {
+        try {
+          sender.send('agent:stream-event', {
+            conversationId,
+            type: 'error',
+            error: 'End the active voice call before starting a text response.',
+            ...(responseMessageId ? { responseMessageId } : {}),
+          });
+          delivered = true;
+        } catch {
+          delivered = false;
+        }
+      }
+      return { conversationId, busy: true as const, delivered, realtimeTurnActive: true as const };
+    }
 
     // An on-demand `/compact` is summarizing this conversation right now (a paid,
     // slow op). Don't start a concurrent turn — it would race + force /compact to
@@ -1256,8 +1856,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // rather than let its unconditional abort below clobber the genuine newer turn. (A continuation
     // whose predecessor IS still the latest proceeds normally.)
     {
-      const predToken = threadOverrides?.continuationPredecessorToken;
-      if (typeof predToken === 'string' && predToken) {
+      const predToken = continuationPredecessorToken;
+      if (predToken) {
         const latest = latestIssuedTurnToken.get(conversationId);
         if (latest !== undefined && latest !== predToken && turnTokenTime(latest) > turnTokenTime(predToken)) {
           return { conversationId, busy: true as const, delivered: false, staleContinuation: true as const };
@@ -1265,9 +1865,70 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
+    // A web/secondary renderer may observe this max-turn event, but it has no
+    // native Browser authority. Do not let a direct or stale bridge call bypass
+    // the continuation-driver authorization and abort the predecessor before
+    // adopting tabs it cannot control.
+    if (
+      continuationPredecessorToken &&
+      !mayDriveBrowserContinuation(
+        getExistingBrowserManager(),
+        conversationId,
+        continuationPredecessorToken,
+        hasNativeBrowserAuthority,
+      )
+    ) {
+      return {
+        conversationId,
+        busy: true as const,
+        delivered: false,
+        nativeBrowserContinuationRequired: true as const,
+      };
+    }
+
+    if (
+      !continuationPredecessorToken &&
+      !hasNativeBrowserAuthority &&
+      getExistingBrowserManager()?.hasPendingAssistantContinuationForConversation(conversationId)
+    ) {
+      return {
+        conversationId,
+        busy: true as const,
+        delivered: false,
+        nativeBrowserContinuationRequired: true as const,
+      };
+    }
+
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
-    if (existing) existing.abort();
+    if (existing) {
+      // A Browser-authorized turn carries access to the primary window's
+      // authenticated Chromium profile. Passive/web/secondary clients may view
+      // it, but must not abort and replace it with their own prompt. The only
+      // sender-less exception is the generation-bound continuation minted by
+      // this process for the exact predecessor token.
+      const trustedInternalContinuation =
+        event == null && hasNativeBrowserAuthority && continuationPredecessorToken === existing.token;
+      if (!trustedInternalContinuation && !mayMutateBrowserAuthorizedStream(event, existing, getPrimaryWindow)) {
+        return {
+          conversationId,
+          busy: true as const,
+          delivered: false,
+          nativeBrowserAuthorityRequired: true as const,
+        };
+      }
+      existing.abort();
+      if (continuationPredecessorToken === existing.token) {
+        // A renderer can launch the successor while the predecessor is still
+        // unwinding its finally block. Freeze that browser capability now, but
+        // retain its temporary tabs for the logical-turn handoff below.
+        getExistingBrowserManager()?.prepareAssistantContinuation(conversationId, existing.token);
+      } else {
+        // The old token still owns the map at this point and the replacement has
+        // not created tabs yet, so its temporary tabs can be reclaimed safely.
+        cleanupAssistantTabsIfOwned(conversationId, existing.token);
+      }
+    }
     // A live GUI persistence FALLBACK for the PRIOR turn is about to be discarded by this new turn.
     // If main still holds the authoritative full copy and it hasn't been superseded on disk, FLUSH
     // it first — else the prior turn's complete reply is lost (e.g. a sole renderer reloaded after
@@ -1317,7 +1978,40 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
+    activeStreams.set(conversationId, {
+      abort: () => controller.abort(),
+      token: streamToken,
+      // Reserve Browser authority immediately for a primary-renderer request.
+      // Runtime/plugin filtering below may downgrade it, but while asynchronous
+      // admission drains are pending a remote renderer must not steal the run.
+      nativeBrowserInitiator: hasNativeBrowserAuthority,
+      nativeBrowserTools: hasNativeBrowserAuthority,
+    });
+    const rejectRevokedBrowserLaunch = () => {
+      releaseContinuationAuth(conversationId);
+      resetBrowserAuthorityRevokedRunStatus(appHome, conversationId);
+      let delivered = false;
+      const sender = event?.sender;
+      if (sender && typeof sender.send === 'function') {
+        try {
+          sender.send('agent:stream-event', {
+            conversationId,
+            type: 'error',
+            error: 'The Browser sidebar reloaded before the request could start. Please retry.',
+            ...(responseMessageId ? { responseMessageId } : {}),
+          });
+          delivered = true;
+        } catch {
+          delivered = false;
+        }
+      }
+      return {
+        conversationId,
+        busy: true as const,
+        delivered,
+        browserAuthorityRevoked: true as const,
+      };
+    };
     // Record the latest issued turn token so a delayed continuation request for an OLDER turn is
     // rejected even after a newer turn has already finished (see authorizeContinuation). Bounded.
     // Also assign a monotonic ordinal so turn recency comparisons are immune to system-clock jumps.
@@ -1414,6 +2108,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (serverPersistedRun) emit({ conversationId, type: 'done' });
       // Clean up the activeStreams entry set above — otherwise this conversation
       // stays "busy" forever and later agent:submit calls return conversation-busy.
+      cleanupAssistantTabsIfOwned(conversationId, streamToken);
       cleanupStreamIfOwned(conversationId, streamToken);
       pendingServerPersist.delete(conversationId);
       pendingServerPersistParent.delete(conversationId);
@@ -1470,6 +2165,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
         }
         cleanupStreamIfOwned(conversationId, streamToken);
         return { conversationId };
@@ -1522,6 +2218,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
         }
         cleanupStreamIfOwned(conversationId, streamToken);
         return { conversationId };
@@ -1615,6 +2312,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         ...(warningMeta ? { messageMeta: warningMeta } : {}),
       });
       void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+      cleanupAssistantTabsIfOwned(conversationId, streamToken);
       cleanupStreamIfOwned(conversationId, streamToken);
       return { conversationId };
     }
@@ -1625,18 +2323,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       emit({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
     }
 
-    // Lifecycle tool hooks are only enforced by the Mastra runtime. If the
-    // user has block/modify PreToolUse/PostToolUse hooks configured but is
-    // running under an SDK runtime that executes tools directly, warn that
-    // those hooks will NOT be applied — a silently-bypassed DLP/deny policy
-    // is worse than none.
-    if (runtime.id !== 'mastra' && hookDispatcher.hasEnforcingToolHooks()) {
+    const enforcingToolHooksActive = hookDispatcher.hasEnforcingToolHooks();
+
+    // SDK/CLI runtimes can execute provider-owned shell, file, and web tools
+    // without crossing Kai's bridged-tool boundary. Keep this warning even
+    // though their Kai MCP tools now receive lifecycle hooks: otherwise a
+    // block/modify policy would look complete while silently covering only a
+    // subset of the runtime's tool surface.
+    if (shouldWarnAboutUnwrappedRuntimeTools(runtime.capabilities, enforcingToolHooksActive)) {
       emit({
         conversationId,
         type: 'text-delta',
         text:
-          `> ⚠️ Block/modify tool hooks are configured but the **${runtime.name}** runtime does not enforce them; ` +
-          `tool calls in this chat will run without PreToolUse/PostToolUse hooks. Switch to the Mastra runtime to enforce them.\n\n`,
+          `> ⚠️ The **${runtime.name}** runtime has built-in tools that run outside Kai's tool wrappers. ` +
+          `Those built-in shell, file, and web actions are NOT covered by your block/modify ` +
+          `PreToolUse/PostToolUse hooks; Kai MCP and Browser tools remain covered. ` +
+          `Use the Mastra runtime if complete hook enforcement is required.\n\n`,
       });
     }
 
@@ -1648,7 +2350,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // to a provider-tool model mid-stream where the hooks would be bypassed.
     const chainForProviderTools = [modelEntry, ...(fallbackEnabled ? (streamConfig?.fallbackModels ?? []) : [])];
     const hasProviderTools = chainForProviderTools.some((m) => (m?.modelConfig.providerTools?.length ?? 0) > 0);
-    if (runtime.id === 'mastra' && hasProviderTools && hookDispatcher.hasEnforcingToolHooks()) {
+    if (hasProviderTools && enforcingToolHooksActive) {
       emit({
         conversationId,
         type: 'text-delta',
@@ -1706,6 +2408,146 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
+    // Resolve the exact host-tool surface before registering Browser ownership.
+    // A primary renderer may have native Browser authority while this particular
+    // run still has no Browser tools (feature disabled, plan mode, or a plugin
+    // inference provider without authenticated-session permission). Registering
+    // those runs would needlessly conflict with Realtime and apply privileged
+    // cancellation/input rules to an ordinary stream.
+    const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
+    const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
+    const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
+    const isBuiltInRuntime = (id: string): boolean =>
+      id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
+    const pluginRuntimeId =
+      resolution.inferenceProviderRuntimeId ??
+      (!isBuiltInRuntime(resolution.runtimeId) ? resolution.runtimeId : undefined);
+    const inferenceProvider =
+      pluginManager?.getInferenceProvider({
+        runtimeId: pluginRuntimeId ?? resolution.runtimeId,
+        modelProviderKey,
+      }) ?? null;
+    const effectiveRunTools =
+      pluginRuntimeId && !inferenceProvider
+        ? toolsForRun(registeredTools, effectiveExecutionMode, false)
+        : inferenceProvider
+          ? toolsForPluginInferenceProvider(
+              registeredTools,
+              effectiveExecutionMode,
+              hasNativeBrowserAuthority,
+              pluginManager,
+              inferenceProvider,
+            )
+          : toolsForRun(registeredTools, effectiveExecutionMode, hasNativeBrowserAuthority);
+    const allowNativeBrowserTools = effectiveRunTools.some((tool) => tool.source === 'browser');
+    const admittedStream = activeStreams.get(conversationId);
+    if (admittedStream?.token === streamToken) {
+      // Renderer authority reserves the stream during async setup; once the
+      // effective tool set is known, retain that protection only for a run that
+      // can actually receive native Browser tools.
+      admittedStream.nativeBrowserInitiator = allowNativeBrowserTools;
+      admittedStream.nativeBrowserTools = allowNativeBrowserTools;
+    }
+
+    const rollbackBrowserAdmissionIfOwned = (): boolean => {
+      if (activeStreams.get(conversationId)?.token !== streamToken) return false;
+      releaseContinuationAuth(conversationId);
+      resetBrowserAuthorityRevokedRunStatus(appHome, conversationId);
+      if (serverPersistTokens.get(conversationId) === streamToken) {
+        serverPersistTokens.delete(conversationId);
+        serverPersistParents.delete(conversationId);
+        discardPersistenceAccumulator(conversationId);
+      }
+      cleanupStreamIfOwned(conversationId, streamToken);
+      void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+      return true;
+    };
+
+    // Browser continuation cleanup applies to every replacement turn, but only
+    // a run whose final tool array contains a Browser tool receives a Browser
+    // capability. Publish activeStreams.nativeBrowserTools only after admission
+    // succeeds, so a rejection cannot leave a phantom privileged/busy stream.
+    const browserManager = getExistingBrowserManager();
+    const browserAuthorityRevoked = () =>
+      isNativeBrowserAuthorityRevoked(
+        allowNativeBrowserTools,
+        browserManagerAtAuthorization,
+        getExistingBrowserManager(),
+        nativeBrowserAuthorityGeneration,
+      );
+    if (allowNativeBrowserTools && (!browserManager || browserAuthorityRevoked())) {
+      const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+      rollbackBrowserAdmissionIfOwned();
+      if (stillOwned) return rejectRevokedBrowserLaunch();
+      return { conversationId };
+    }
+    if (browserManager) {
+      try {
+        // Realtime terminal cleanup revokes its Browser owner synchronously but
+        // may still be draining an in-flight action. Do not race a replacement
+        // text turn into beginAssistantRun while that owner is still registered.
+        await browserManager.waitForAssistantTabCleanup(conversationId);
+        if (allowNativeBrowserTools && continuationPredecessorToken) {
+          await browserManager.beginAssistantContinuation(conversationId, streamToken, continuationPredecessorToken);
+        } else {
+          // A non-Browser run must reclaim a retained predecessor instead of
+          // adopting its authenticated temporary tabs.
+          await browserManager.cancelAssistantContinuations(conversationId);
+        }
+
+        // Browser drains can wait behind an in-flight action. A replacement
+        // turn may take ownership while this handler is suspended; do not let
+        // the old handler resume into shared bookkeeping or stream setup.
+        const drainSuperseded = isBrowserDrainSuperseded(
+          controller.signal.aborted,
+          activeStreams.get(conversationId)?.token,
+          streamToken,
+        );
+        const authorityRevoked = browserAuthorityRevoked();
+        if (drainSuperseded || authorityRevoked) {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+          const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+          rollbackBrowserAdmissionIfOwned();
+          if (authorityRevoked && stillOwned) return rejectRevokedBrowserLaunch();
+          return { conversationId };
+        }
+
+        if (allowNativeBrowserTools && !continuationPredecessorToken) {
+          browserManager.beginAssistantRun(conversationId, streamToken);
+        }
+
+        const postAdmissionSuperseded = isBrowserDrainSuperseded(
+          controller.signal.aborted,
+          activeStreams.get(conversationId)?.token,
+          streamToken,
+        );
+        const postAdmissionAuthorityRevoked = browserAuthorityRevoked();
+        if (postAdmissionSuperseded || postAdmissionAuthorityRevoked) {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+          const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+          rollbackBrowserAdmissionIfOwned();
+          if (postAdmissionAuthorityRevoked && stillOwned) return rejectRevokedBrowserLaunch();
+          return { conversationId };
+        }
+
+        if (allowNativeBrowserTools) {
+          const ownedStream = activeStreams.get(conversationId);
+          if (ownedStream?.token === streamToken) ownedStream.nativeBrowserTools = true;
+        }
+      } catch (error) {
+        // beginAssistantRun can reject when Realtime owns this conversation.
+        // Roll back every state item published before admission so the failed
+        // request does not remain phantom-busy and the conversation can retry.
+        try {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+        } catch {
+          // The rejected run may never have reached the Browser registry.
+        }
+        rollbackBrowserAdmissionIfOwned();
+        throw error;
+      }
+    }
+
     const observerSupported = runtime.capabilities.toolObserver;
     const compactionSupported = runtime.capabilities.compaction;
 
@@ -1723,36 +2565,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // abort+restart (CLI runtimes).
     activeStreamRuntime.set(conversationId, runtime.id);
     for (const [index, message] of messageList.entries()) {
+      const serializedContent = jsonStableString(message.content ?? '');
       const contentPreview =
-        typeof message.content === 'string'
-          ? message.content.slice(0, 200)
-          : Array.isArray(message.content)
-            ? JSON.stringify(message.content).slice(0, 200)
-            : String(message.content ?? '').slice(0, 200);
+        typeof message.content === 'string' ? message.content.slice(0, 200) : serializedContent.slice(0, 200);
       console.info(
-        `[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${JSON.stringify(message.content ?? '').length} preview=${contentPreview}`,
+        `[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${serializedContent.length} preview=${contentPreview}`,
       );
     }
 
+    const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
+
     // Run streaming in background
     (async () => {
-      // Check for plugin inference provider — only use it when the resolved
-      // runtime or model belongs to the plugin that registered the provider.
-      // This prevents a plugin provider from hijacking requests meant for
-      // other configured providers (e.g. llm-gateway, OpenAI direct).
-      const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
-      const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
-      const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
-      const isBuiltInRuntime = (id: string): boolean =>
-        id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
-      const pluginRuntimeId =
-        resolution.inferenceProviderRuntimeId ??
-        (!isBuiltInRuntime(resolution.runtimeId) ? resolution.runtimeId : undefined);
-      const inferenceProvider =
-        pluginManager?.getInferenceProvider({
-          runtimeId: pluginRuntimeId ?? resolution.runtimeId,
-          modelProviderKey,
-        }) ?? null;
       if (!inferenceProvider && pluginRuntimeId) {
         const meta = { runtimeId: pluginRuntimeId };
         emit({
@@ -1763,6 +2587,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         });
         emit({ conversationId, type: 'done', messageMeta: meta });
         void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+        cleanupAssistantTabsIfOwned(conversationId, streamToken);
         cleanupStreamIfOwned(conversationId, streamToken);
         return;
       }
@@ -1770,79 +2595,111 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         console.info(
           `[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`,
         );
-        // A plugin inference provider executes host tools inside the plugin,
-        // outside our onToolExecutionStart/augmentToolResult wrappers, so
-        // block/modify hooks can't be enforced there. Warn (same posture as
-        // non-Mastra runtimes) since the runtime.id check below won't fire.
-        if (hookDispatcher.hasEnforcingToolHooks()) {
-          emit({
-            conversationId,
-            type: 'text-delta',
-            text:
-              `> ⚠️ Block/modify tool hooks are configured but the **${inferenceProvider.name}** inference provider ` +
-              `executes tools outside hook enforcement; tool calls in this chat will not run PreToolUse/PostToolUse hooks.\n\n`,
-          });
-        }
         let emittedTextDelta = false;
         try {
           const providerModelKey =
             rawCatalogEntry?.provider === rawCatalogEntry?.key
               ? undefined
               : (modelEntry?.key ?? modelKey ?? config.models.defaultModelKey);
-          const providerStream = inferenceProvider.stream({
-            conversationId,
-            messages: messages as Array<{ role: string; content: unknown }>,
-            ...(providerModelKey ? { modelKey: providerModelKey } : {}),
-            systemPrompt: effectiveSystemPrompt,
-            reasoningEffort,
-            abortSignal: controller.signal,
-            // Forward host-registered tools, filtered by execution mode (plan-first
-            // strips mutating tools). Mirrors the standard runtime path at the
-            // `runtime.stream(...)` call below. Without this, the LLM behind a
-            // plugin inference provider has no awareness of any tools.
-            tools: toolsForExecutionMode(registeredTools, effectiveExecutionMode),
-          });
-
           let providerResponseText = '';
-          for await (const event of providerStream) {
-            if (controller.signal.aborted && event.type !== 'done') continue;
-            if (event.type === 'text-delta') {
-              emittedTextDelta = true;
-              providerResponseText += event.text ?? '';
-            }
-            // A plugin provider may YIELD an error event (not just throw). If it's a
-            // context overflow, classify it + append provider-appropriate guidance
-            // (parity with the throw path below) so the renderer surfaces recovery
-            // steps — the plugin runs outside Kai's compact-and-retry loop.
-            if (event.type === 'error' && !(event as { errorCategory?: unknown }).errorCategory) {
-              const evErr = (event as { error?: unknown }).error;
-              if (isContextOverflowError(evErr)) {
-                (event as Record<string, unknown>).errorCategory = 'context-overflow';
-                (event as Record<string, unknown>).error =
-                  `${evErr instanceof Error ? evErr.message : String(evErr ?? 'Context window exceeded.')}` +
-                  `\n\n> ℹ️ The request exceeded the context window. This model runs through a plugin provider that manages its own context — start a new chat or remove older messages/attachments, then resend.`;
-              }
-            }
-
-            // Stamp runtimeId on every event so the UI popover shows the
-            // inference provider name regardless of whether the stream ends
-            // with a normal done, an error, or an early abort.
-            const eventWithMeta = (() => {
-              const ev = event as Record<string, unknown>;
-              const existingMeta = (ev.messageMeta as Record<string, unknown> | undefined) ?? {};
-              return {
-                ...event,
+          const pluginToolCapability = new AbortController();
+          const pluginToolSignal = mergeAbortSignals(controller.signal, pluginToolCapability.signal)!;
+          try {
+            const providerStream = inferenceProvider.stream({
+              conversationId,
+              messages: messages as Array<{ role: string; content: unknown }>,
+              ...(providerModelKey ? { modelKey: providerModelKey } : {}),
+              systemPrompt: effectiveSystemPrompt,
+              reasoningEffort,
+              abortSignal: controller.signal,
+              // Forward host-registered tools, filtered by execution mode (plan-first
+              // strips mutating tools). Mirrors the standard runtime path at the
+              // `runtime.stream(...)` call below. Without this, the LLM behind a
+              // plugin inference provider has no awareness of any tools.
+              tools: bindBrowserToolsToRun(
+                effectiveRunTools,
                 conversationId,
-                messageMeta: { ...existingMeta, runtimeId: inferenceProvider.name },
-              };
-            })();
+                streamToken,
+                pluginToolSignal,
+                {
+                  cwd: effectiveCwd,
+                  isHeadless: false,
+                  parentProfileKey:
+                    profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
+                  parentModelKey: modelEntry?.key ?? modelKey ?? null,
+                },
+                (tool) =>
+                  !controller.signal.aborted &&
+                  activeStreams.get(conversationId)?.token === streamToken &&
+                  pluginManager?.inferenceProviderHasPermission(inferenceProvider, 'agent:inference-provider') ===
+                    true &&
+                  (tool.source !== 'browser' ||
+                    pluginManager?.inferenceProviderHasPermission(
+                      inferenceProvider,
+                      'browser:authenticated-session',
+                    ) === true),
+              ),
+            });
 
-            if (event.type === 'done') {
+            for await (const event of providerStream) {
+              if (controller.signal.aborted && event.type !== 'done') continue;
+              if (event.type === 'text-delta') {
+                emittedTextDelta = true;
+                providerResponseText += event.text ?? '';
+              }
+              // A plugin provider may YIELD an error event (not just throw). If it's a
+              // context overflow, classify it + append provider-appropriate guidance
+              // (parity with the throw path below) so the renderer surfaces recovery
+              // steps — the plugin runs outside Kai's compact-and-retry loop.
+              if (event.type === 'error' && !(event as { errorCategory?: unknown }).errorCategory) {
+                const evErr = (event as { error?: unknown }).error;
+                if (isContextOverflowError(evErr)) {
+                  (event as Record<string, unknown>).errorCategory = 'context-overflow';
+                  (event as Record<string, unknown>).error =
+                    `${evErr instanceof Error ? evErr.message : String(evErr ?? 'Context window exceeded.')}` +
+                    `\n\n> ℹ️ The request exceeded the context window. This model runs through a plugin provider that manages its own context — start a new chat or remove older messages/attachments, then resend.`;
+                }
+              }
+              if (event.type === 'error' && (event as { error?: unknown }).error !== undefined) {
+                (event as Record<string, unknown>).error = pluginProviderErrorForExposure(
+                  (event as { error?: unknown }).error,
+                  allowNativeBrowserTools,
+                );
+              }
+              protectUnresolvedToolCallArgs(
+                event,
+                enforcingHooksActive,
+                event.type === 'tool-call' &&
+                  !!event.toolName &&
+                  findToolByName(effectiveRunTools, event.toolName) !== undefined,
+                false,
+              );
+
+              // Stamp runtimeId on every event so the UI popover shows the
+              // inference provider name regardless of whether the stream ends
+              // with a normal done, an error, or an early abort.
+              const eventWithMeta = (() => {
+                const ev = event as Record<string, unknown>;
+                const existingMeta = (ev.messageMeta as Record<string, unknown> | undefined) ?? {};
+                return {
+                  ...event,
+                  conversationId,
+                  messageMeta: { ...existingMeta, runtimeId: inferenceProvider.name },
+                };
+              })();
+
+              if (event.type === 'done') {
+                emit(eventWithMeta as typeof event);
+                break;
+              }
+
               emit(eventWithMeta as typeof event);
-              break;
             }
-
-            emit(eventWithMeta as typeof event);
+          } finally {
+            // A provider can retain executable tool closures after its iterator
+            // settles. Revoke them at that exact boundary, before post-receive
+            // hooks or later turns can run, even when the provider throws.
+            pluginToolCapability.abort();
           }
 
           // Run post-receive hooks for plugin inference provider path.
@@ -1873,6 +2730,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             conversationId,
             aborted: controller.signal.aborted,
           });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
 
           // Provider handled the request — clean up and exit. cleanupStreamIfOwned runs the
           // GUI-turn persistence fallback (finalize main's accumulated reply if the renderer never
@@ -1882,26 +2740,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         } catch (providerError) {
           if (emittedTextDelta) {
             // Already started streaming text — can't fall back mid-response
+            const exposedProviderError = pluginProviderErrorForExposure(providerError, allowNativeBrowserTools);
             console.error(
               `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed after emitting text:`,
-              providerError,
+              exposedProviderError,
             );
             const meta = { runtimeId: inferenceProvider.name };
             emit({
               conversationId,
               type: 'error',
-              error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
+              error: `Inference provider error: ${exposedProviderError}`,
               messageMeta: meta,
             });
             emit({ conversationId, type: 'done', messageMeta: meta });
             void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
+            cleanupAssistantTabsIfOwned(conversationId, streamToken);
             cleanupStreamIfOwned(conversationId, streamToken);
             return;
           }
-          console.error(
-            `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text:`,
-            providerError,
-          );
           const meta = { runtimeId: inferenceProvider.name };
           // A plugin inference provider runs OUTSIDE the Mastra do/while retry loop
           // AND doesn't consume Kai's persisted compaction record, so neither
@@ -1909,8 +2765,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // and give actionable (provider-appropriate) guidance + the structured
           // category so the renderer surfaces a recovery hint.
           const pluginOverflow = isContextOverflowError(providerError);
-          const pluginBaseMsg =
-            providerError instanceof Error ? providerError.message : String(providerError);
+          const pluginBaseMsg = pluginProviderErrorForExposure(providerError, allowNativeBrowserTools);
+          console.error(
+            `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text:`,
+            pluginBaseMsg,
+          );
           emit({
             conversationId,
             type: 'error',
@@ -1922,6 +2781,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           emit({ conversationId, type: 'done', messageMeta: meta });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
           cleanupStreamIfOwned(conversationId, streamToken);
           return;
         }
@@ -1943,28 +2803,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const existing = preToolResults.get(toolCallId);
         if (existing) return existing;
         const p = (async (): Promise<PreToolResult> => {
+          // Browser typing can contain passwords, OTPs, recovery codes, and
+          // tokens. Hooks and their automation fan-out receive only the safe
+          // display form; the original remains private to the executor unless
+          // an enforcing modify hook explicitly supplies replacement args.
+          const exposedArgs = redactBrowserToolArgsForExposure(toolName, args);
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
             conversationId,
             toolCallId,
             toolName,
-            args,
+            args: exposedArgs,
           });
           if (preTool.denied) {
             const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
             return { denied: true, reason, args: { redacted: true, reason } };
           }
-          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+          const nextArgs = preTool.modified ? (preTool.payload as { args?: unknown } | undefined)?.args : undefined;
           return { denied: false, args: nextArgs !== undefined ? nextArgs : args };
         })();
         preToolResults.set(toolCallId, p);
         return p;
       };
       // When block/modify hooks are active, the UI-facing `tool-call` stream
-      // event can arrive before PreToolUse resolves. To guarantee raw args
-      // never reach the renderer/persistence, we SUPPRESS args on the initial
-      // broadcast (showing a pending placeholder) and fill them in via the
-      // corrective re-broadcast once the hook has run.
-      const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
+      // event can arrive before PreToolUse resolves. Mastra calls back with a
+      // matching id, so its initial pending placeholder is corrected below.
+      // Runtimes without correlatable ids remain permanently redacted.
       // Provider-native tool names for the CURRENTLY ACTIVE model. Provider-
       // native tools execute in-provider and never hit onToolExecutionStart,
       // so their args must not be suppressed (nothing would un-suppress them →
@@ -1979,6 +2842,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
       let observer: ToolObserverManager | null = null;
+      let browserContinuationPrepared = false;
       // Accumulate assistant response text for post-receive hooks
       let accumulatedResponseText = '';
       // Track the provider:modelName that is producing the current response.
@@ -2158,8 +3022,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           if (!nextExecQ || !nextStreamQ) break;
           const nextShared = nextExecQ.find((id) => nextStreamQ.includes(id));
           if (nextShared === undefined) break;
-          pendingExecIdsByToolName.set(toolName, nextExecQ.filter((id) => id !== nextShared));
-          pendingStreamIdsByToolName.set(toolName, nextStreamQ.filter((id) => id !== nextShared));
+          pendingExecIdsByToolName.set(
+            toolName,
+            nextExecQ.filter((id) => id !== nextShared),
+          );
+          pendingStreamIdsByToolName.set(
+            toolName,
+            nextStreamQ.filter((id) => id !== nextShared),
+          );
           if (pendingExecIdsByToolName.get(toolName)?.length === 0) pendingExecIdsByToolName.delete(toolName);
           if (pendingStreamIdsByToolName.get(toolName)?.length === 0) pendingStreamIdsByToolName.delete(toolName);
           streamToolCallIdByExecId.set(nextShared, nextShared);
@@ -2315,7 +3185,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (!toolCallId) return;
         applyArgRecharge(toolCallId, newArgs);
       };
-      const fitToolMediaToBudget = (toolName: string, result: unknown, toolCallId?: string, args?: unknown): Promise<unknown> => {
+      const fitToolMediaToBudget = (
+        toolName: string,
+        result: unknown,
+        toolCallId?: string,
+        args?: unknown,
+      ): Promise<unknown> => {
         const run = mediaFitChain.then(() => fitToolMediaToBudgetInner(toolName, result, toolCallId, args));
         // Keep the chain alive regardless of this run's outcome (swallow to avoid
         // an unhandled rejection breaking the chain for the next result).
@@ -2400,7 +3275,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // summarization + truncation won't GROW past the original in practice, and this can't
           // under-count → no wrongly-retained media → no post-tool overflow).
           if (toolCfg?.useAI) {
-            return canonical ? Math.min(rawBytes, Math.max(maxTokens * 4, Buffer.byteLength(TRUNCATE_MARKER, 'utf8'))) : rawBytes;
+            return canonical
+              ? Math.min(rawBytes, Math.max(maxTokens * 4, Buffer.byteLength(TRUNCATE_MARKER, 'utf8')))
+              : rawBytes;
           }
           const minChars = Math.max(0, toolCfg?.truncateMinChars ?? 200);
           const headRatio = toolCfg?.truncateHeadRatio ?? 0.7;
@@ -2439,9 +3316,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             compactionSupported && toolName !== 'create_artifact' && toolName !== 'update_artifact';
           try {
             const { resultForCompaction } = splitPreservedFields(r);
-            const bodyText = typeof resultForCompaction === 'string'
-              ? resultForCompaction
-              : (JSON.stringify(resultForCompaction) ?? '');
+            const bodyText =
+              typeof resultForCompaction === 'string'
+                ? resultForCompaction
+                : (JSON.stringify(resultForCompaction) ?? '');
             const rawBytes = Buffer.byteLength(bodyText, 'utf8');
             // Diff (preserved in full) is added back on top of the compacted body.
             let diffBytes = 0;
@@ -2457,7 +3335,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               !!toolCfg?.enabled &&
               toolCfg.outputMaxTokens > 0 &&
               bodyTotalTokens > toolCfg.triggerTokens;
-            return (willCompact ? compactedBodyBytesUpperBound(bodyText, rawBytes, bodyTotalTokens) : rawBytes) + diffBytes;
+            return (
+              (willCompact ? compactedBodyBytesUpperBound(bodyText, rawBytes, bodyTotalTokens) : rawBytes) + diffBytes
+            );
           } catch {
             return 0;
           }
@@ -2606,10 +3486,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // a prior image's cached count includes its base64 — counting that as text
         // massively over-counts), and add back the media's NATIVE token estimate
         // so prior media still costs its real (smaller) amount rather than zero.
-        const { messages: branchForSum, nativeMediaTokens, branchMediaBytes } = await splitBranchMediaForTokenSum(
-          messages as unknown[],
-          controller.signal,
-        );
+        const {
+          messages: branchForSum,
+          nativeMediaTokens,
+          branchMediaBytes,
+        } = await splitBranchMediaForTokenSum(messages as unknown[], controller.signal);
         let remaining = Infinity;
         for (const entry of eligibleModels) {
           const t = resolveConversationTokenization(
@@ -2894,7 +3775,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       };
 
-      const activeCustomTools = toolsForExecutionMode(registeredTools, effectiveExecutionMode);
+      const activeCustomTools = effectiveRunTools;
       let observerWorkspaceToolsPromise: Promise<ToolDefinition[]> | undefined;
       const getObserverWorkspaceTools = (): Promise<ToolDefinition[]> => {
         observerWorkspaceToolsPromise ??= createWorkspaceToolDefinitions(effectiveCwd, () => config, {
@@ -2986,13 +3867,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           toolCancels.delete(toolCallId);
           return { ok: false, details: reason };
         }
-        // Use the (possibly sanitized) args for observer, UI, and execution.
-        const effectiveArgs = preTool.args;
+        // Validate AFTER PreToolUse because a hook may replace the payload. Use
+        // the parsed (possibly transformed/defaulted) value for observer state,
+        // UI events, PostToolUse, compaction accounting, and execution.
+        let effectiveArgs: unknown;
+        try {
+          effectiveArgs = validateToolInput(tool, preTool.args);
+        } catch (error) {
+          toolCancels.delete(toolCallId);
+          return { ok: false, details: error instanceof Error ? error.message : String(error) };
+        }
+        const exposedEffectiveArgs = redactBrowserToolArgsForExposure(toolName, effectiveArgs);
 
         observer.onToolExecutionStart({
           toolCallId,
           toolName,
-          args: effectiveArgs,
+          args: exposedEffectiveArgs,
           observerInitiated: true,
         });
 
@@ -3001,7 +3891,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           type: 'tool-call',
           toolCallId,
           toolName,
-          args: effectiveArgs,
+          args: exposedEffectiveArgs,
           startedAt,
           observerInitiated: true,
         });
@@ -3011,6 +3901,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const context: ToolExecutionContext = {
               toolCallId,
               conversationId,
+              browserOwnerId: streamToken,
               cwd: effectiveCwd,
               abortSignal: mergedAbortSignal,
               onProgress: (progress) => {
@@ -3041,7 +3932,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               conversationId,
               toolCallId,
               toolName,
-              args: effectiveArgs,
+              args: exposedEffectiveArgs,
               result: rawResult,
             });
             if (postTool.denied) {
@@ -3052,7 +3943,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             observer?.onToolExecutionResult(toolCallId, toolName, hookedResult);
             const observerAugmented = withObserverAugmentation(hookedResult, observer?.getToolAugmentation(toolCallId));
-            const compacted = await maybeCompactToolOutput(toolCallId, toolName, observerAugmented, 'direct', effectiveArgs);
+            const compacted = await maybeCompactToolOutput(
+              toolCallId,
+              toolName,
+              observerAugmented,
+              'direct',
+              exposedEffectiveArgs,
+            );
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
@@ -3069,17 +3966,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               });
             }
           } catch (error) {
-            let errorResult: unknown = {
-              isError: true,
-              error: error instanceof Error ? error.message : String(error),
-            };
+            let errorResult: unknown = observerToolErrorForExposure(toolName, error);
             // PostToolUse on the error path too, so a DLP hook can sanitize
             // error payloads from observer-launched tools.
             const postTool = await hookDispatcher.dispatch('PostToolUse', {
               conversationId,
               toolCallId,
               toolName,
-              args: effectiveArgs,
+              args: exposedEffectiveArgs,
               result: errorResult,
             });
             if (postTool.denied) {
@@ -3090,7 +3984,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             observer?.onToolExecutionResult(toolCallId, toolName, errorResult);
             const observerAugmented = withObserverAugmentation(errorResult, observer?.getToolAugmentation(toolCallId));
-            const compacted = await maybeCompactToolOutput(toolCallId, toolName, observerAugmented, 'direct', effectiveArgs);
+            const compacted = await maybeCompactToolOutput(
+              toolCallId,
+              toolName,
+              observerAugmented,
+              'direct',
+              exposedEffectiveArgs,
+            );
             const finishedAt = new Date().toISOString();
 
             if (activeObserverSessions.get(conversationId) === observerSessionId && !controller.signal.aborted) {
@@ -3268,9 +4168,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // pre-send/DLP hooks redact content in memory only, so re-reading disk
           // would feed the summarizer un-redacted content.
           const inMemoryBranch =
-            Array.isArray(messages) && messages.length > 0
-              ? (messages as unknown as ChatMessageForCompaction[])
-              : null;
+            Array.isArray(messages) && messages.length > 0 ? (messages as unknown as ChatMessageForCompaction[]) : null;
           if (!inMemoryBranch) return null;
           // Drift baseline = the RAW turn-start signature (captured pre-hook at the top of
           // the handler), NOT the post-hook in-memory branch. A pre-send/DLP hook rewrites
@@ -3388,10 +4286,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // Leaving baseWindow undefined here would SKIP static-input budgeting, so a
           // summary sized to the raw window overflows once system + tool-schema tokens
           // are added on the retry — and recovery is single-use, so the turn then fails.
-          let baseWindow: number | undefined = recoveryConvConfig.contextWindowTokens ?? recoveryModel.modelConfig.maxInputTokens;
+          let baseWindow: number | undefined =
+            recoveryConvConfig.contextWindowTokens ?? recoveryModel.modelConfig.maxInputTokens;
           if (typeof baseWindow !== 'number' || baseWindow <= 0) {
             try {
-              baseWindow = resolveConversationTokenization(recoveryModel.modelConfig.modelName).contextWindowTokens ?? undefined;
+              baseWindow =
+                resolveConversationTokenization(recoveryModel.modelConfig.modelName).contextWindowTokens ?? undefined;
             } catch {
               /* leave undefined — no window to budget against */
             }
@@ -3445,12 +4345,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // recovery model's config already carries the overridden endpoint, so
             // the summarizer must NOT fall back to the ambient chain (which would
             // send the transcript to the model's original provider).
-            { disableAmbientFallback: !!resolution.providerOverride,
+            {
+              disableAmbientFallback: !!resolution.providerOverride,
               externalPromptOverReserve: recoveryExternalOverReserve,
               protectNewestUser: true, // live recovery: never summarize away the current user turn
               ...(recoveryCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
                 ? { systemPromptOverride: recoveryCompactionPrompt }
-                : {}) },
+                : {}),
+            },
           );
 
           // Only proceed if THIS run still owns the conversation — a superseding
@@ -3554,7 +4456,12 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // reuse falls through to the normal shouldCompact/recompute path; we never
           // drop a message. Substitution stays LOCAL to this turn's `messages`.
           const storedCompaction = readConversation(appHome, conversationId)?.conversationCompaction as
-            | { compactionId?: string; summaryText?: string; compactedMessageIds?: string[]; coveredContentSig?: Record<string, string> }
+            | {
+                compactionId?: string;
+                summaryText?: string;
+                compactedMessageIds?: string[];
+                coveredContentSig?: Record<string, string>;
+              }
             | null
             | undefined;
           let reusedCompaction = false;
@@ -3639,8 +4546,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the fit path + final compaction check) — else a retained protected-
               // tail image counts as ~hundreds of k "text" tokens and would refuse
               // this reuse, re-summarizing the same prefix every turn.
-              const { messages: candidateForSum, nativeMediaTokens: candidateMediaTokens, branchMediaBytes: candidateMediaBytes } =
-                await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal);
+              const {
+                messages: candidateForSum,
+                nativeMediaTokens: candidateMediaTokens,
+                branchMediaBytes: candidateMediaBytes,
+              } = await splitBranchMediaForTokenSum(candidate as unknown[], controller.signal);
               const reuseCheck = await shouldCompactAsync(
                 candidateForSum as Parameters<typeof shouldCompactAsync>[0],
                 modelEntry.modelConfig.modelName,
@@ -3721,11 +4631,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                       effectiveSystemPrompt ?? '',
                     );
                     const gatedMsg = (gated.messages as Array<{ content?: unknown }> | undefined)?.[0];
-                    if (
-                      gated.suppressed ||
-                      !gatedMsg ||
-                      gatedMsg.content !== storedCompaction.summaryText
-                    ) {
+                    if (gated.suppressed || !gatedMsg || gatedMsg.content !== storedCompaction.summaryText) {
                       summarySafeToReuse = false;
                     }
                   } catch {
@@ -3746,8 +4652,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             : await (async () => {
                 // Same media-aware projection as the reuse check + fit path: charge
                 // retained media its native estimate, not its base64 text length.
-                const { messages: branchForCheck, nativeMediaTokens: checkMediaTokens, branchMediaBytes } =
-                  await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal);
+                const {
+                  messages: branchForCheck,
+                  nativeMediaTokens: checkMediaTokens,
+                  branchMediaBytes,
+                } = await splitBranchMediaForTokenSum(chatMessages as unknown[], controller.signal);
                 const gate = await shouldCompactAsync(
                   branchForCheck as Parameters<typeof shouldCompactAsync>[0],
                   modelEntry.modelConfig.modelName,
@@ -3859,34 +4768,33 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             }
             const compactionResult = proactiveHooksOk
               ? await compactConversationPrefix(
-              proactiveBranch as Parameters<typeof compactConversationPrefix>[0],
-              modelEntry.modelConfig,
-              config.compaction.conversation,
-              controller.signal,
-              // A provider override routes this turn through a plugin/gateway; the
-              // summarizer must NOT fall back to the ambient chain (which would send
-              // the prefix to the model's original provider). Parity with reactive
-              // recovery + /compact.
-              {
-                disableAmbientFallback: !!resolution.providerOverride,
-                // Hand the NEXT-turn static excess (instructions + tool schemas beyond
-                // the reserve) to compactConversationPrefix so the summary leaves room
-                // for it — otherwise on a small window with large static input the
-                // summary "fits" the raw window yet the real request overflows, forcing
-                // reactive recovery to summarize AGAIN (a second paid call). Parity with
-                // /compact + recovery, which already pass this.
-                externalPromptOverReserve: Math.max(
-                  0,
-                  (await getStaticInputTokens()) -
-                    Math.max(0, config.compaction.conversation.promptReserveTokens),
-                ),
-                // Honor a hook rewrite of the COMPACTION prompt (parity with recovery/compact).
-                protectNewestUser: true, // live proactive: never summarize away the current user turn
-                ...(proactiveCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
-                  ? { systemPromptOverride: proactiveCompactionPrompt }
-                  : {}),
-              },
-            )
+                  proactiveBranch as Parameters<typeof compactConversationPrefix>[0],
+                  modelEntry.modelConfig,
+                  config.compaction.conversation,
+                  controller.signal,
+                  // A provider override routes this turn through a plugin/gateway; the
+                  // summarizer must NOT fall back to the ambient chain (which would send
+                  // the prefix to the model's original provider). Parity with reactive
+                  // recovery + /compact.
+                  {
+                    disableAmbientFallback: !!resolution.providerOverride,
+                    // Hand the NEXT-turn static excess (instructions + tool schemas beyond
+                    // the reserve) to compactConversationPrefix so the summary leaves room
+                    // for it — otherwise on a small window with large static input the
+                    // summary "fits" the raw window yet the real request overflows, forcing
+                    // reactive recovery to summarize AGAIN (a second paid call). Parity with
+                    // /compact + recovery, which already pass this.
+                    externalPromptOverReserve: Math.max(
+                      0,
+                      (await getStaticInputTokens()) - Math.max(0, config.compaction.conversation.promptReserveTokens),
+                    ),
+                    // Honor a hook rewrite of the COMPACTION prompt (parity with recovery/compact).
+                    protectNewestUser: true, // live proactive: never summarize away the current user turn
+                    ...(proactiveCompactionPrompt !== COMPACTION_SYSTEM_PROMPT
+                      ? { systemPromptOverride: proactiveCompactionPrompt }
+                      : {}),
+                  },
+                )
               : { compactedMessages: null, summaryText: null, compactionId: null, compactedMessageIds: [] };
             if (controller.signal.aborted) {
               emit({ conversationId, type: 'done' });
@@ -4091,9 +4999,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the paired stream id if available. The stream `tool-call`
               // handler resolves either — so a rebroadcast reaches the correct
               // rendered card regardless of which side fired first.
-              hookRewrittenArgs.set(state.toolCallId, preTool.args);
+              hookRewrittenArgs.set(state.toolCallId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
               const denyStreamId = streamToolCallIdByExecId.get(state.toolCallId);
-              if (denyStreamId) hookRewrittenArgs.set(denyStreamId, preTool.args);
+              if (denyStreamId) {
+                hookRewrittenArgs.set(denyStreamId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
+              }
               // Only rebroadcast when the stream id is known; otherwise the
               // stream `tool-call` handler will apply the stored args when it
               // fires (avoids emitting a duplicate card under the exec id).
@@ -4103,13 +5013,46 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   type: 'tool-call',
                   toolCallId: denyStreamId,
                   toolName: state.toolName,
-                  args: preTool.args,
+                  args: redactBrowserToolArgsForExposure(state.toolName, preTool.args),
                 });
               }
               return { skip: true as const, result: { isError: true, error: reason } };
             }
             const modStreamId = streamToolCallIdByExecId.get(state.toolCallId);
             if (preTool.args !== state.args) {
+              // A modify hook crosses a second trust boundary: parse it through
+              // the target tool's schema before touching the by-reference args.
+              // This also applies schema defaults/transforms consistently with
+              // observer-launched tools.
+              let parsedReplacement: unknown;
+              try {
+                let tool = findToolByName(activeCustomTools, state.toolName);
+                if (!tool && runtime.id === 'mastra') {
+                  const workspaceTools = await getObserverWorkspaceTools();
+                  tool = findToolByName(
+                    observerToolsForExecutionMode([], workspaceTools, effectiveExecutionMode),
+                    state.toolName,
+                  );
+                }
+                if (!tool) throw new Error(`Tool "${state.toolName}" is not registered.`);
+                parsedReplacement = validateToolInput(tool, preTool.args);
+              } catch (error) {
+                const reason =
+                  error instanceof Error ? error.message : `Invalid arguments for tool "${state.toolName}".`;
+                hookDeniedToolCalls.set(state.toolCallId, reason);
+                hookRewrittenArgs.set(state.toolCallId, { redacted: true, reason });
+                if (modStreamId) {
+                  hookRewrittenArgs.set(modStreamId, { redacted: true, reason });
+                  emit({
+                    conversationId,
+                    type: 'tool-call',
+                    toolCallId: modStreamId,
+                    toolName: state.toolName,
+                    args: { redacted: true, reason },
+                  });
+                }
+                return { skip: true as const, result: { isError: true, error: reason } };
+              }
               // The executor passes `state.args` to tool.execute() BY REFERENCE,
               // so the only way to deliver modified args is to mutate that object
               // in place. That works when both sides are plain objects. If a
@@ -4121,13 +5064,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 state.args &&
                 typeof state.args === 'object' &&
                 !Array.isArray(state.args) &&
-                preTool.args &&
-                typeof preTool.args === 'object' &&
-                !Array.isArray(preTool.args);
+                parsedReplacement &&
+                typeof parsedReplacement === 'object' &&
+                !Array.isArray(parsedReplacement);
               if (canMutateInPlace) {
                 const target = state.args as Record<string, unknown>;
                 for (const k of Object.keys(target)) delete target[k];
-                Object.assign(target, preTool.args as Record<string, unknown>);
+                Object.assign(target, parsedReplacement as Record<string, unknown>);
                 // The args were charged (pre-rewrite) at execution start; a hook that
                 // ENLARGED them must re-charge the delta so the media budget accounts
                 // for the bigger tool-call message sent to the next step.
@@ -4136,16 +5079,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 const reason =
                   'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed to avoid running with unsanitized input.';
                 hookDeniedToolCalls.set(state.toolCallId, reason);
-                hookRewrittenArgs.set(state.toolCallId, preTool.args);
+                hookRewrittenArgs.set(state.toolCallId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
                 const failStreamId = streamToolCallIdByExecId.get(state.toolCallId);
                 if (failStreamId) {
-                  hookRewrittenArgs.set(failStreamId, preTool.args);
+                  hookRewrittenArgs.set(failStreamId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
                   emit({
                     conversationId,
                     type: 'tool-call',
                     toolCallId: failStreamId,
                     toolName: state.toolName,
-                    args: preTool.args,
+                    args: redactBrowserToolArgsForExposure(state.toolName, preTool.args),
                   });
                 }
                 return { skip: true as const, result: { isError: true, error: reason } };
@@ -4155,10 +5098,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // broadcast with suppressed ({pending}) args; emit the resolved
             // args now (sanitized or allowed-unchanged). Renderer upserts by id.
             if (enforcingHooksActive) {
+              const exposedResolvedArgs = redactBrowserToolArgsForExposure(state.toolName, state.args);
               // Store under exec id always; also under the stream id if paired.
               // The stream `tool-call` handler resolves either when it fires.
-              hookRewrittenArgs.set(state.toolCallId, preTool.args);
-              if (modStreamId) hookRewrittenArgs.set(modStreamId, preTool.args);
+              hookRewrittenArgs.set(state.toolCallId, exposedResolvedArgs);
+              if (modStreamId) hookRewrittenArgs.set(modStreamId, exposedResolvedArgs);
               // Only rebroadcast when the stream id is known; otherwise the
               // stream handler applies the stored args on arrival (no dup card).
               if (modStreamId) {
@@ -4167,7 +5111,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   type: 'tool-call',
                   toolCallId: modStreamId,
                   toolName: state.toolName,
-                  args: preTool.args,
+                  args: exposedResolvedArgs,
                 });
               }
             }
@@ -4178,6 +5122,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate exit_plan_mode behind user approval regardless of execution mode
             if (state.toolName === 'exit_plan_mode') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              // Register before broadcasting so even a synchronous renderer
+              // answer resolves this waiter, and so the dedicated pop-out can
+              // receive a one-shot capability for the pending request.
+              const approvalDecision = registerPendingApproval(streamId, controller.signal, 'any-renderer', {
+                conversationId,
+                browserOwnerId: streamToken,
+              });
               emit({
                 conversationId,
                 type: 'tool-approval-required',
@@ -4189,7 +5140,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Abort-aware: a cancel-stream aborts controller.signal, which
               // resolves this with 'dismiss' and deletes the pending entry, so a
               // later GUI approval can't resume a cancelled run (and no leak).
-              const approved = await registerPendingApproval(streamId, controller.signal);
+              const approved = await approvalDecision;
               if (approved !== true) {
                 state.cancel();
                 if (approved === 'dismiss') {
@@ -4218,6 +5169,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              const approvalDecision = registerPendingApproval(streamId, controller.signal, 'any-renderer', {
+                conversationId,
+                browserOwnerId: streamToken,
+              });
               emit({
                 conversationId,
                 type: 'tool-approval-required',
@@ -4228,7 +5183,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               observer?.onToolAwaitingApproval(state.toolCallId);
               // Abort-aware (see exit_plan_mode above): cancel resolves this as
               // 'dismiss' and cleans up, instead of leaking a pending approval.
-              const approved = await registerPendingApproval(streamId, controller.signal);
+              const approved = await approvalDecision;
               if (approved !== true) {
                 state.cancel();
               } else {
@@ -4271,7 +5226,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Use the redacted/sanitized args (if a PreToolUse hook rewrote or
             // denied them) so PostToolUse/observers never see the raw args.
             const execIdForArgs = execToolCallIdByStreamId.get(toolCallId) ?? toolCallId;
-            const postArgs = hookRewrittenArgs.get(toolCallId) ?? hookRewrittenArgs.get(execIdForArgs) ?? args;
+            const postArgs = redactBrowserToolArgsForExposure(
+              toolName,
+              hookRewrittenArgs.get(toolCallId) ?? hookRewrittenArgs.get(execIdForArgs) ?? args,
+            );
             const postTool = await hookDispatcher.dispatch('PostToolUse', {
               conversationId,
               toolCallId,
@@ -4428,327 +5386,382 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             messages,
             responseMessageId: currentResponseMessageId,
             config: configWithExecutionMode,
-          tools: activeCustomTools,
-          appHome,
-          cwd: effectiveCwd,
-          reasoningEffort,
-          abortSignal: controller.signal,
-          streamConfig: streamConfig ?? undefined,
-          primaryModel: modelEntry,
-          // Thread this turn's active profile/model so a sub_agent tool can
-          // inherit the parent's profile + fallback chain (see sub-agent.ts).
-          // Fall back to the global defaultProfileKey when the turn has no
-          // explicit profile — the turn ran under that default, so the sub-agent
-          // should inherit it rather than dropping to the single-model path.
-          parentProfileKey: profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
-          parentModelKey: modelEntry?.key ?? modelKey ?? null,
-          modelAuth: resolution.modelAuth,
-          conversationMetadata: convMetadata,
-          switchContext,
-          childEnv: confinedChildEnv,
-          confinedCwd: confinedCwdValue,
-          emitEvent: streamOptions.emitEvent,
-          onToolExecutionStart: streamOptions.onToolExecutionStart,
-          onToolExecutionEnd: streamOptions.onToolExecutionEnd,
-          augmentToolResult: streamOptions.augmentToolResult,
-        });
+            tools: activeCustomTools,
+            appHome,
+            cwd: effectiveCwd,
+            reasoningEffort,
+            abortSignal: controller.signal,
+            browserOwnerId: streamToken,
+            streamConfig: streamConfig ?? undefined,
+            primaryModel: modelEntry,
+            // Thread this turn's active profile/model so a sub_agent tool can
+            // inherit the parent's profile + fallback chain (see sub-agent.ts).
+            // Fall back to the global defaultProfileKey when the turn has no
+            // explicit profile — the turn ran under that default, so the sub-agent
+            // should inherit it rather than dropping to the single-model path.
+            parentProfileKey: profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
+            parentModelKey: modelEntry?.key ?? modelKey ?? null,
+            modelAuth: resolution.modelAuth,
+            conversationMetadata: convMetadata,
+            switchContext,
+            childEnv: confinedChildEnv,
+            confinedCwd: confinedCwdValue,
+            emitEvent: streamOptions.emitEvent,
+            onToolExecutionStart: streamOptions.onToolExecutionStart,
+            onToolExecutionEnd: streamOptions.onToolExecutionEnd,
+            augmentToolResult: streamOptions.augmentToolResult,
+          });
 
-        for await (const event of stream) {
-          // Track whether this turn produced any tool side effects or streamed
-          // output. The reactive context-overflow recovery only auto-retries when
-          // NOTHING ran yet (a pure over-context prompt on the first model call);
-          // once a tool executed or text streamed, replaying the turn could
-          // duplicate side effects or lose partial output, so we surface the
-          // /compact guidance instead of silently re-running.
-          if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'text-delta') {
-            sawToolOrTextThisTurn = true;
-            if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
-          }
-          // After a plan-related done event has been sent and the stream aborted,
-          // ignore any trailing events (especially the generator's final plain done).
-          if (planDoneSent || overflowRecoveryTookOver) {
-            ipcDebugLog(
-              `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=${planDoneSent ? 'planDoneSent' : 'overflowRecovery'}`,
-            );
-            continue;
-          }
-          if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
-            logToolCompactionDebug('stream-event', {
-              conversationId,
-              eventType: event.type,
-              toolCallId: event.toolCallId ?? null,
-              toolName: event.toolName ?? null,
-              hasCompaction: 'compaction' in event && Boolean(event.compaction),
-              compactionPhase:
-                event.type === 'tool-compaction'
-                  ? ((event.data as { phase?: string } | undefined)?.phase ?? null)
-                  : null,
-            });
-          }
-          if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
-            enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
-            pairExecuteAndStreamToolCallIds(event.toolName);
-            // Resolve rewritten args by this stream id OR the now-paired exec
-            // id (onToolExecutionStart may have run first and stored under the
-            // exec id before pairing existed).
-            const pairedExecId = execToolCallIdByStreamId.get(event.toolCallId);
-            const rewritten =
-              hookRewrittenArgs.get(event.toolCallId) ??
-              (pairedExecId ? hookRewrittenArgs.get(pairedExecId) : undefined);
-            if (rewritten !== undefined) {
-              // Hook already resolved — publish the sanitized args.
-              (event as Record<string, unknown>).args = rewritten;
-            } else if (
-              enforcingHooksActive &&
-              runtime.id === 'mastra' &&
-              !providerDefinedToolNames.has(event.toolName)
-            ) {
-              // Suppress raw args until the corrective re-broadcast fills them
-              // in — but ONLY under Mastra (which calls onToolExecutionStart)
-              // and NOT for provider-native tools (which execute in-provider
-              // and never un-suppress → would stick at {pending} forever).
-              (event as Record<string, unknown>).args = { pending: true };
-              (event as Record<string, unknown>).argsPending = true;
+          for await (const event of stream) {
+            // Track whether this turn produced any tool side effects or streamed
+            // output. The reactive context-overflow recovery only auto-retries when
+            // NOTHING ran yet (a pure over-context prompt on the first model call);
+            // once a tool executed or text streamed, replaying the turn could
+            // duplicate side effects or lose partial output, so we surface the
+            // /compact guidance instead of silently re-running.
+            if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'text-delta') {
+              sawToolOrTextThisTurn = true;
+              if (event.type === 'tool-call' || event.type === 'tool-result') executedToolThisTurn = true;
             }
-          }
-          if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
-            // Plan mode was entered mid-stream. Abort this stream so the renderer
-            // can re-send with executionMode='plan-first' (correct system prompt + tool set).
-            console.info(
-              `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
-            );
-            emit(event);
-            planDoneSent = true;
-            emit({ conversationId, type: 'done', data: { planModeRestart: true } });
-            controller.abort();
-            return { conversationId };
-          }
-          if (event.type === 'tool-result' && event.toolCallId) {
-            observer?.onToolExecutionEnd(event.toolCallId);
-            // Inject compaction metadata into the event's data field
-            const execId = execToolCallIdByStreamId.get(event.toolCallId) ?? event.toolCallId;
-            const compaction = execId ? compactionByExecuteId.get(execId) : undefined;
-            if (compaction) {
-              compactionByExecuteId.delete(execId!);
-              // Attach as a data field the renderer will pick up
-              (event as Record<string, unknown>).compaction = compaction;
-              logToolCompactionDebug('attach-result-compaction', {
+            // After a plan-related done event has been sent and the stream aborted,
+            // ignore any trailing events (especially the generator's final plain done).
+            if (planDoneSent || overflowRecoveryTookOver) {
+              ipcDebugLog(
+                `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=${planDoneSent ? 'planDoneSent' : 'overflowRecovery'}`,
+              );
+              continue;
+            }
+            if (event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'tool-compaction') {
+              logToolCompactionDebug('stream-event', {
                 conversationId,
-                toolCallId: event.toolCallId,
-                executeToolCallId: execId,
+                eventType: event.type,
+                toolCallId: event.toolCallId ?? null,
                 toolName: event.toolName ?? null,
-                extractionDurationMs: compaction.extractionDurationMs,
-                originalLength: compaction.originalContent.length,
+                hasCompaction: 'compaction' in event && Boolean(event.compaction),
+                compactionPhase:
+                  event.type === 'tool-compaction'
+                    ? ((event.data as { phase?: string } | undefined)?.phase ?? null)
+                    : null,
               });
             }
-            if (execId) {
-              streamToolCallIdByExecId.delete(execId);
+            if (event.type === 'tool-call' && event.toolCallId && event.toolName) {
+              enqueueByToolName(pendingStreamIdsByToolName, event.toolName, event.toolCallId);
+              pairExecuteAndStreamToolCallIds(event.toolName);
+              // Resolve rewritten args by this stream id OR the now-paired exec
+              // id (onToolExecutionStart may have run first and stored under the
+              // exec id before pairing existed).
+              const pairedExecId = execToolCallIdByStreamId.get(event.toolCallId);
+              const rewritten =
+                hookRewrittenArgs.get(event.toolCallId) ??
+                (pairedExecId ? hookRewrittenArgs.get(pairedExecId) : undefined);
+              if (rewritten !== undefined) {
+                // Hook already resolved — publish the sanitized args.
+                (event as Record<string, unknown>).args = rewritten;
+              } else {
+                protectUnresolvedToolCallArgs(
+                  event,
+                  enforcingHooksActive,
+                  !providerDefinedToolNames.has(event.toolName),
+                  runtime.id === 'mastra',
+                );
+              }
             }
-            execToolCallIdByStreamId.delete(event.toolCallId);
-            pendingToolCompactionByExecId.delete(execId);
-          }
-          if (event.type === 'done' && !controller.signal.aborted) {
-            observerLaunchesEnabled = false;
-            await waitForObserverToolExecutions();
-
-            // ── Lifecycle hook: AssistantMessage ────────────────────────
-            if (accumulatedResponseText.length > 0) {
-              void hookDispatcher.dispatch('AssistantMessage', {
-                conversationId,
-                text: accumulatedResponseText,
-              });
+            if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
+              // Plan mode was entered mid-stream. Abort this stream so the renderer
+              // can re-send with executionMode='plan-first' (correct system prompt + tool set).
+              console.info(
+                `[Agent:stream] enter_plan_mode detected mid-stream, aborting to restart with plan-first mode`,
+              );
+              emit(event);
+              planDoneSent = true;
+              emit({ conversationId, type: 'done', data: { planModeRestart: true } });
+              controller.abort();
+              return { conversationId };
             }
-
-            // Run post-receive hooks (e.g. plugin learning pipelines)
-            if (pluginManager && accumulatedResponseText.length > 0) {
-              try {
-                await pluginManager.runPostReceiveHooks({
-                  response: { role: 'assistant', content: accumulatedResponseText },
-                  messages: messages as HookMessage[],
-                  config,
+            if (event.type === 'tool-result' && event.toolCallId) {
+              observer?.onToolExecutionEnd(event.toolCallId);
+              // Inject compaction metadata into the event's data field
+              const execId = execToolCallIdByStreamId.get(event.toolCallId) ?? event.toolCallId;
+              const compaction = execId ? compactionByExecuteId.get(execId) : undefined;
+              if (compaction) {
+                compactionByExecuteId.delete(execId!);
+                // Attach as a data field the renderer will pick up
+                (event as Record<string, unknown>).compaction = compaction;
+                logToolCompactionDebug('attach-result-compaction', {
+                  conversationId,
+                  toolCallId: event.toolCallId,
+                  executeToolCallId: execId,
+                  toolName: event.toolName ?? null,
+                  extractionDurationMs: compaction.extractionDurationMs,
+                  originalLength: compaction.originalContent.length,
                 });
-              } catch (err) {
-                console.error('[Agent:stream] Post-receive hook error:', err);
+              }
+              if (execId) {
+                streamToolCallIdByExecId.delete(execId);
+              }
+              execToolCallIdByStreamId.delete(event.toolCallId);
+              pendingToolCompactionByExecId.delete(execId);
+            }
+            if (event.type === 'done' && !controller.signal.aborted) {
+              observerLaunchesEnabled = false;
+              await waitForObserverToolExecutions();
+
+              // ── Lifecycle hook: AssistantMessage ────────────────────────
+              if (accumulatedResponseText.length > 0) {
+                void hookDispatcher.dispatch('AssistantMessage', {
+                  conversationId,
+                  text: accumulatedResponseText,
+                });
+              }
+
+              // Run post-receive hooks (e.g. plugin learning pipelines)
+              if (pluginManager && accumulatedResponseText.length > 0) {
+                try {
+                  await pluginManager.runPostReceiveHooks({
+                    response: { role: 'assistant', content: accumulatedResponseText },
+                    messages: messages as HookMessage[],
+                    config,
+                  });
+                } catch (err) {
+                  console.error('[Agent:stream] Post-receive hook error:', err);
+                }
               }
             }
-          }
-          if (event.type === 'model-fallback') {
-            // A mid-stream fallback restarts the response on the next model —
-            // drop the failed partial so post-receive hooks / AssistantMessage
-            // don't get the failed + successful variants concatenated (matching
-            // the renderer + persistence + other collectors).
-            accumulatedResponseText = '';
-            // streamWithFallback restarts the next model from the ORIGINAL messages —
-            // the failed attempt's tool args/results are NOT in the new model's
-            // context. Reset the same-turn media budget accumulators so the fallback
-            // doesn't downscale/omit otherwise-fitting media against phantom usage.
-            committedMediaTokens = 0;
-            committedMediaBytes = 0;
-            committedNonMediaTokens = 0;
-            committedToolCallArgIds.clear();
-            // The fallback restarts from the ORIGINAL messages: the failed primary's partial
-            // TEXT is discarded (not in the new model's context), so a text-only primary can
-            // reset sawToolOrTextThisTurn — otherwise a content-filtered primary that emitted
-            // text would leave it TRUE, gating off the overflow compact-and-retry on a
-            // fallback that immediately overflows with NO retained output (safe overflow
-            // wrongly hard-failed). BUT if a TOOL actually EXECUTED, its SIDE EFFECT already
-            // happened — do NOT reset (a compact-and-retry could replay the mutation). Only
-            // reset when no tool executed.
-            if (!executedToolThisTurn) sawToolOrTextThisTurn = false;
-            // Invalidate the static-input memo so it recomputes under the FALLBACK
-            // model's tokenizer (a cross-provider fallback can tokenize the same
-            // system prompt / schemas very differently).
-            staticInputTokensMemo = -1;
-            const fbData = event.data as { toModelKey?: string } | undefined;
-            if (fbData?.toModelKey && streamConfig) {
-              fellBackThisStream = true;
-              const fallbackEntry = streamConfig.fallbackModels.find((m) => m.key === fbData.toModelKey);
-              if (fallbackEntry?.modelConfig) {
-                activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
-                activeModelDisplayName = fallbackEntry.displayName ?? null;
-                // Track the active model's config so overflow recovery compacts
-                // with the CURRENTLY-active model's tokenizer/window/creds (not the
-                // primary's, which may be unavailable or have a larger window).
-                activeModelEntryForRecovery = fallbackEntry;
-                // Re-point the provider-native exemption at the now-active
-                // fallback model so its provider tools aren't suppressed and,
-                // conversely, the previous model's local tools aren't wrongly
-                // exempted.
-                providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
+            if (event.type === 'model-fallback') {
+              // A mid-stream fallback restarts the response on the next model —
+              // drop the failed partial so post-receive hooks / AssistantMessage
+              // don't get the failed + successful variants concatenated (matching
+              // the renderer + persistence + other collectors).
+              accumulatedResponseText = '';
+              // streamWithFallback restarts the next model from the ORIGINAL messages —
+              // the failed attempt's tool args/results are NOT in the new model's
+              // context. Reset the same-turn media budget accumulators so the fallback
+              // doesn't downscale/omit otherwise-fitting media against phantom usage.
+              committedMediaTokens = 0;
+              committedMediaBytes = 0;
+              committedNonMediaTokens = 0;
+              committedToolCallArgIds.clear();
+              // The fallback restarts from the ORIGINAL messages: the failed primary's partial
+              // TEXT is discarded (not in the new model's context), so a text-only primary can
+              // reset sawToolOrTextThisTurn — otherwise a content-filtered primary that emitted
+              // text would leave it TRUE, gating off the overflow compact-and-retry on a
+              // fallback that immediately overflows with NO retained output (safe overflow
+              // wrongly hard-failed). BUT if a TOOL actually EXECUTED, its SIDE EFFECT already
+              // happened — do NOT reset (a compact-and-retry could replay the mutation). Only
+              // reset when no tool executed.
+              if (!executedToolThisTurn) sawToolOrTextThisTurn = false;
+              // Invalidate the static-input memo so it recomputes under the FALLBACK
+              // model's tokenizer (a cross-provider fallback can tokenize the same
+              // system prompt / schemas very differently).
+              staticInputTokensMemo = -1;
+              const fbData = event.data as { toModelKey?: string } | undefined;
+              if (fbData?.toModelKey && streamConfig) {
+                fellBackThisStream = true;
+                const fallbackEntry = streamConfig.fallbackModels.find((m) => m.key === fbData.toModelKey);
+                if (fallbackEntry?.modelConfig) {
+                  activeSourceModel = `${fallbackEntry.modelConfig.provider}:${fallbackEntry.modelConfig.modelName}`;
+                  activeModelDisplayName = fallbackEntry.displayName ?? null;
+                  // Track the active model's config so overflow recovery compacts
+                  // with the CURRENTLY-active model's tokenizer/window/creds (not the
+                  // primary's, which may be unavailable or have a larger window).
+                  activeModelEntryForRecovery = fallbackEntry;
+                  // Re-point the provider-native exemption at the now-active
+                  // fallback model so its provider tools aren't suppressed and,
+                  // conversely, the previous model's local tools aren't wrongly
+                  // exempted.
+                  providerDefinedToolNames = getProviderDefinedToolNames(fallbackEntry.modelConfig);
+                }
               }
             }
-          }
-          if (event.type === 'text-delta') {
-            accumulatedResponseText += event.text ?? '';
-            (event as Record<string, unknown>).messageMeta = {
-              ...(((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined) ?? {}),
-              ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
-              ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
-              reasoningEffort: reasoningEffort ?? null,
-              runtimeId: runtime.id,
-              ...(resolution.providerOverride ? { providerKey: resolution.providerOverride } : {}),
-            };
-          }
-          if (activeObserverSessions.get(conversationId) !== observerSessionId) {
+            if (event.type === 'text-delta') {
+              accumulatedResponseText += event.text ?? '';
+              (event as Record<string, unknown>).messageMeta = {
+                ...(((event as Record<string, unknown>).messageMeta as Record<string, unknown> | undefined) ?? {}),
+                ...(activeSourceModel ? { sourceModel: activeSourceModel } : {}),
+                ...(activeModelDisplayName ? { sourceModelDisplayName: activeModelDisplayName } : {}),
+                reasoningEffort: reasoningEffort ?? null,
+                runtimeId: runtime.id,
+                ...(resolution.providerOverride ? { providerKey: resolution.providerOverride } : {}),
+              };
+            }
+            if (activeObserverSessions.get(conversationId) !== observerSessionId) {
+              ipcDebugLog(
+                `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=observerSessionMismatch current=${activeObserverSessions.get(conversationId)} expected=${observerSessionId}`,
+              );
+              continue;
+            }
             ipcDebugLog(
-              `[LOOP-SKIP] conv=${conversationId} event.type=${event.type} reason=observerSessionMismatch current=${activeObserverSessions.get(conversationId)} expected=${observerSessionId}`,
+              `[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`,
             );
-            continue;
-          }
-          ipcDebugLog(
-            `[LOOP-EMIT] conv=${conversationId} event.type=${event.type} toolCallId=${event.toolCallId ?? 'none'} toolName=${event.toolName ?? 'none'}`,
-          );
-          // Intercept a context-overflow ERROR EVENT before emitting it. Mastra
-          // surfaces non-transient provider failures as an `error` event (then
-          // `done`), NOT a thrown error — so this branch, not the catch below, is
-          // where a typical overflow arrives. Compact and retry the model stream
-          // in place (see the do/while); if recoverable, swallow this error event
-          // (and the trailing `done`) so the UI sees only the retry. If not
-          // recoverable, upgrade the message with the /compact guidance.
-          // `errorCategory` is authoritative WHEN PRESENT — a structured non-
-          // overflow category (e.g. 'rate-limit' whose message happens to mention
-          // token limits) must NOT be reclassified as overflow. Only fall back to
-          // message-string classification when no category was provided.
-          const isOverflowEvent =
-            event.type === 'error' &&
-            (event.errorCategory
-              ? event.errorCategory === 'context-overflow'
-              : isContextOverflowError(event.error));
-          if (isOverflowEvent) {
-            // If streamWithFallback preserved a MASKED primary overflow across the
-            // fallback chain (the terminal error was actually an unrelated fallback
-            // failure), it tells us WHICH model overflowed. Recover THAT model — not the
-            // failed fallback that `activeModelEntryForRecovery` currently points at, or
-            // we'd retry the broken (e.g. 401) fallback summarizer and never recover.
-            const ovKey = (event as { overflowRecoveryModelKey?: string }).overflowRecoveryModelKey;
-            if (ovKey && streamConfig) {
-              const ovEntry =
-                (streamConfig.primaryModel?.key === ovKey ? streamConfig.primaryModel : undefined) ??
-                streamConfig.fallbackModels.find((m) => m.key === ovKey);
-              if (ovEntry?.modelConfig) activeModelEntryForRecovery = ovEntry;
-            }
-            const compacted = await computeOverflowCompaction(true);
-            if (compacted?.compactedMessages && compacted.compactedMessages.length > 0) {
-              overflowRecoveryUsed = true;
-              messages = compacted.compactedMessages as unknown as typeof messages;
-              retryAfterOverflow = true;
-              overflowRecoveryTookOver = true; // swallow this error + trailing done from the FAILED stream
-              // Emit a `compaction` event so persistence records the summary for
-              // REUSE on the next turn (else the next turn reloads the original
-              // branch, re-overflows, and re-summarizes). BUT skip persisting when
-              // the compacted ids include a synthetic `compaction-summary-*` id —
-              // that means the in-memory branch was ALREADY compacted this turn
-              // (pre-turn compaction / prior recovery), so the ids don't exist in
-              // the stored tree; persisting would overwrite a good record with one
-              // whose prefix check always fails. The in-place retry still uses the
-              // compacted messages directly regardless.
-              // If the recompacted prefix begins with a synthetic
-              // `compaction-summary-<id>` (the branch already reused a stored
-              // record this turn), COMPOSE it back to the underlying message ids the
-              // OLD summary covered (from the stored record) so the new record's ids
-              // are real disk-branch ids and REUSABLE next turn. Otherwise the retry
-              // lives only in memory and the next turn re-overflows + re-pays.
-              const composedCompactedIds: string[] = (() => {
-                const ids = compacted.compactedMessageIds;
-                if (ids.length === 0 || !syntheticSummaryIdsThisTurn.has(ids[0])) return ids;
-                // Resolve the synthetic id from the stored record on disk OR the
-                // pre-stream compaction emitted THIS turn (renderer persists it
-                // async, so it may not be on disk yet).
-                const candidates: Array<{ compactionId?: string; compactedMessageIds?: string[] } | null | undefined> =
-                  [];
-                if (pendingCompactionThisTurn) candidates.push(pendingCompactionThisTurn);
-                try {
-                  candidates.push(
-                    readConversation(appHome, conversationId)?.conversationCompaction as
-                      | { compactionId?: string; compactedMessageIds?: string[] }
-                      | null
-                      | undefined,
-                  );
-                } catch {
-                  /* disk read failed — rely on the in-memory pending record */
-                }
-                for (const rec of candidates) {
-                  if (
-                    rec &&
-                    `compaction-summary-${rec.compactionId}` === ids[0] &&
-                    Array.isArray(rec.compactedMessageIds) &&
-                    rec.compactedMessageIds.length > 0
-                  ) {
-                    return [...rec.compactedMessageIds, ...ids.slice(1)];
+            // Intercept a context-overflow ERROR EVENT before emitting it. Mastra
+            // surfaces non-transient provider failures as an `error` event (then
+            // `done`), NOT a thrown error — so this branch, not the catch below, is
+            // where a typical overflow arrives. Compact and retry the model stream
+            // in place (see the do/while); if recoverable, swallow this error event
+            // (and the trailing `done`) so the UI sees only the retry. If not
+            // recoverable, upgrade the message with the /compact guidance.
+            // `errorCategory` is authoritative WHEN PRESENT — a structured non-
+            // overflow category (e.g. 'rate-limit' whose message happens to mention
+            // token limits) must NOT be reclassified as overflow. Only fall back to
+            // message-string classification when no category was provided.
+            const isOverflowEvent =
+              event.type === 'error' &&
+              (event.errorCategory ? event.errorCategory === 'context-overflow' : isContextOverflowError(event.error));
+            if (isOverflowEvent) {
+              // If streamWithFallback preserved a MASKED primary overflow across the
+              // fallback chain (the terminal error was actually an unrelated fallback
+              // failure), it tells us WHICH model overflowed. Recover THAT model — not the
+              // failed fallback that `activeModelEntryForRecovery` currently points at, or
+              // we'd retry the broken (e.g. 401) fallback summarizer and never recover.
+              const ovKey = (event as { overflowRecoveryModelKey?: string }).overflowRecoveryModelKey;
+              if (ovKey && streamConfig) {
+                const ovEntry =
+                  (streamConfig.primaryModel?.key === ovKey ? streamConfig.primaryModel : undefined) ??
+                  streamConfig.fallbackModels.find((m) => m.key === ovKey);
+                if (ovEntry?.modelConfig) activeModelEntryForRecovery = ovEntry;
+              }
+              const compacted = await computeOverflowCompaction(true);
+              if (compacted?.compactedMessages && compacted.compactedMessages.length > 0) {
+                overflowRecoveryUsed = true;
+                messages = compacted.compactedMessages as unknown as typeof messages;
+                retryAfterOverflow = true;
+                overflowRecoveryTookOver = true; // swallow this error + trailing done from the FAILED stream
+                // Emit a `compaction` event so persistence records the summary for
+                // REUSE on the next turn (else the next turn reloads the original
+                // branch, re-overflows, and re-summarizes). BUT skip persisting when
+                // the compacted ids include a synthetic `compaction-summary-*` id —
+                // that means the in-memory branch was ALREADY compacted this turn
+                // (pre-turn compaction / prior recovery), so the ids don't exist in
+                // the stored tree; persisting would overwrite a good record with one
+                // whose prefix check always fails. The in-place retry still uses the
+                // compacted messages directly regardless.
+                // If the recompacted prefix begins with a synthetic
+                // `compaction-summary-<id>` (the branch already reused a stored
+                // record this turn), COMPOSE it back to the underlying message ids the
+                // OLD summary covered (from the stored record) so the new record's ids
+                // are real disk-branch ids and REUSABLE next turn. Otherwise the retry
+                // lives only in memory and the next turn re-overflows + re-pays.
+                const composedCompactedIds: string[] = (() => {
+                  const ids = compacted.compactedMessageIds;
+                  if (ids.length === 0 || !syntheticSummaryIdsThisTurn.has(ids[0])) return ids;
+                  // Resolve the synthetic id from the stored record on disk OR the
+                  // pre-stream compaction emitted THIS turn (renderer persists it
+                  // async, so it may not be on disk yet).
+                  const candidates: Array<
+                    { compactionId?: string; compactedMessageIds?: string[] } | null | undefined
+                  > = [];
+                  if (pendingCompactionThisTurn) candidates.push(pendingCompactionThisTurn);
+                  try {
+                    candidates.push(
+                      readConversation(appHome, conversationId)?.conversationCompaction as
+                        | { compactionId?: string; compactedMessageIds?: string[] }
+                        | null
+                        | undefined,
+                    );
+                  } catch {
+                    /* disk read failed — rely on the in-memory pending record */
                   }
-                }
-                return ids;
-              })();
-              // Whether the composed ids resolved to REAL disk-branch ids is decided by
-              // the strict-prefix disk check below — NOT by a name heuristic. (An earlier
-              // version rejected any id starting with `compaction-summary-`, but an
-              // imported/plugin conversation may legitimately carry such an id; a synthetic
-              // id that FAILED to expand simply isn't on disk, so isStrictPrefix rejects it
-              // anyway. Relying on the disk check avoids false-rejecting legit ids.)
-              const persistIsStrictPrefix = (() => {
-                try {
-                  const diskConv = readConversation(appHome, conversationId);
-                  if (!diskConv) return false;
-                  const { tree, headId } = ensureConversationTree(diskConv);
-                  const branchIds = getConversationBranch(tree, headId).map((m) => m.id);
-                  if (!isStrictPrefix(composedCompactedIds, branchIds)) return false;
-                  // Reject if a concurrent conversations:put edited a covered message's
-                  // CONTENT (same id) at ANY point since the turn's input branch was
-                  // established. Two baselines cover the composed ids:
-                  //  (1) preSig = the RAW in-memory branch THIS recovery summarized
-                  //      (captured at recovery start) — covers ids we summarized directly.
-                  //  (2) earlierSig = the baseline of the EARLIER same-turn record whose
-                  //      synthetic summary this recovery expanded (composedCompactedIds
-                  //      spliced its underlying ids in). Those ids are NOT in preSig; the
-                  //      earlier record signed them. If that earlier record's own persist
-                  //      was rejected due to a concurrent edit on one of them, trusting the
-                  //      expansion blindly would persist THIS summary over the changed
-                  //      content — so we re-verify them against fresh disk here too.
-                  const preSig = compacted.compactionId ? recoveryPreDiskSig.get(compacted.compactionId) : undefined;
+                  for (const rec of candidates) {
+                    if (
+                      rec &&
+                      `compaction-summary-${rec.compactionId}` === ids[0] &&
+                      Array.isArray(rec.compactedMessageIds) &&
+                      rec.compactedMessageIds.length > 0
+                    ) {
+                      return [...rec.compactedMessageIds, ...ids.slice(1)];
+                    }
+                  }
+                  return ids;
+                })();
+                // Whether the composed ids resolved to REAL disk-branch ids is decided by
+                // the strict-prefix disk check below — NOT by a name heuristic. (An earlier
+                // version rejected any id starting with `compaction-summary-`, but an
+                // imported/plugin conversation may legitimately carry such an id; a synthetic
+                // id that FAILED to expand simply isn't on disk, so isStrictPrefix rejects it
+                // anyway. Relying on the disk check avoids false-rejecting legit ids.)
+                const persistIsStrictPrefix = (() => {
+                  try {
+                    const diskConv = readConversation(appHome, conversationId);
+                    if (!diskConv) return false;
+                    const { tree, headId } = ensureConversationTree(diskConv);
+                    const branchIds = getConversationBranch(tree, headId).map((m) => m.id);
+                    if (!isStrictPrefix(composedCompactedIds, branchIds)) return false;
+                    // Reject if a concurrent conversations:put edited a covered message's
+                    // CONTENT (same id) at ANY point since the turn's input branch was
+                    // established. Two baselines cover the composed ids:
+                    //  (1) preSig = the RAW in-memory branch THIS recovery summarized
+                    //      (captured at recovery start) — covers ids we summarized directly.
+                    //  (2) earlierSig = the baseline of the EARLIER same-turn record whose
+                    //      synthetic summary this recovery expanded (composedCompactedIds
+                    //      spliced its underlying ids in). Those ids are NOT in preSig; the
+                    //      earlier record signed them. If that earlier record's own persist
+                    //      was rejected due to a concurrent edit on one of them, trusting the
+                    //      expansion blindly would persist THIS summary over the changed
+                    //      content — so we re-verify them against fresh disk here too.
+                    const preSig = compacted.compactionId ? recoveryPreDiskSig.get(compacted.compactionId) : undefined;
+                    const rawIds = compacted.compactedMessageIds;
+                    const expandedFromSynthetic = rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0]);
+                    let earlierSig: Record<string, string> | undefined;
+                    if (expandedFromSynthetic) {
+                      if (
+                        pendingCompactionThisTurn &&
+                        `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
+                      ) {
+                        earlierSig = pendingCompactionThisTurn.coveredContentSig;
+                      }
+                      if (!earlierSig) {
+                        try {
+                          const rec = readConversation(appHome, conversationId)?.conversationCompaction as
+                            | { compactionId?: string; coveredContentSig?: Record<string, string> }
+                            | null
+                            | undefined;
+                          if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) {
+                            earlierSig = rec.coveredContentSig;
+                          }
+                        } catch {
+                          /* disk read failed — handled by the missing-baseline check below */
+                        }
+                      }
+                    }
+                    if (preSig) {
+                      const nowSig = diskSigMap();
+                      // Every composed id must have a baseline (from preSig or the earlier
+                      // record) that MATCHES fresh disk. An id with NO baseline on an
+                      // expanded record means we can't prove it's unchanged → don't persist.
+                      for (const id of composedCompactedIds) {
+                        const base = preSig.has(id) ? preSig.get(id) : earlierSig?.[id];
+                        if (base === undefined) {
+                          // No baseline: only tolerated for the NON-expanded case (all ids in
+                          // preSig by construction). For an expanded record a missing earlier
+                          // signature is unsafe → reject.
+                          if (expandedFromSynthetic) return false;
+                          continue;
+                        }
+                        if (base !== nowSig.get(id)) return false;
+                      }
+                    }
+                    return true;
+                  } catch {
+                    return false;
+                  }
+                })();
+                if (
+                  compacted.compactionId &&
+                  compacted.summaryText &&
+                  composedCompactedIds.length > 0 &&
+                  persistIsStrictPrefix
+                ) {
+                  // Baseline signatures for the persisted record. For ids THIS recovery
+                  // summarized directly, use its own baseline (recoveryPreDiskSig). For ids
+                  // spliced in by expanding an earlier same-turn synthetic summary, carry
+                  // the EARLIER record's signatures so a chained future recovery can still
+                  // verify every composed id (persistIsStrictPrefix already required these
+                  // to match fresh disk, so they're current).
+                  const preSig = recoveryPreDiskSig.get(compacted.compactionId);
+                  const coveredContentSig: Record<string, string> = {};
                   const rawIds = compacted.compactedMessageIds;
-                  const expandedFromSynthetic = rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0]);
                   let earlierSig: Record<string, string> | undefined;
-                  if (expandedFromSynthetic) {
+                  if (rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0])) {
                     if (
                       pendingCompactionThisTurn &&
                       `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
@@ -4761,182 +5774,135 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                           | { compactionId?: string; coveredContentSig?: Record<string, string> }
                           | null
                           | undefined;
-                        if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) {
+                        if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0])
                           earlierSig = rec.coveredContentSig;
-                        }
                       } catch {
-                        /* disk read failed — handled by the missing-baseline check below */
+                        /* disk read failed — omit; a future expansion of this record then rejects */
                       }
                     }
                   }
-                  if (preSig) {
-                    const nowSig = diskSigMap();
-                    // Every composed id must have a baseline (from preSig or the earlier
-                    // record) that MATCHES fresh disk. An id with NO baseline on an
-                    // expanded record means we can't prove it's unchanged → don't persist.
-                    for (const id of composedCompactedIds) {
-                      const base = preSig.has(id) ? preSig.get(id) : earlierSig?.[id];
-                      if (base === undefined) {
-                        // No baseline: only tolerated for the NON-expanded case (all ids in
-                        // preSig by construction). For an expanded record a missing earlier
-                        // signature is unsafe → reject.
-                        if (expandedFromSynthetic) return false;
-                        continue;
-                      }
-                      if (base !== nowSig.get(id)) return false;
-                    }
+                  for (const id of composedCompactedIds) {
+                    const s = preSig?.get(id) ?? earlierSig?.[id];
+                    if (s !== undefined) coveredContentSig[id] = s;
                   }
-                  return true;
-                } catch {
-                  return false;
+                  emit({
+                    conversationId,
+                    type: 'compaction',
+                    data: {
+                      compactionId: compacted.compactionId,
+                      summaryText: compacted.summaryText,
+                      compactedMessageIds: composedCompactedIds,
+                      coveredContentSig,
+                      compactionRevision: nextCompactionRevision(),
+                    },
+                  });
                 }
-              })();
-              if (
-                compacted.compactionId &&
-                compacted.summaryText &&
-                composedCompactedIds.length > 0 &&
-                persistIsStrictPrefix
-              ) {
-                // Baseline signatures for the persisted record. For ids THIS recovery
-                // summarized directly, use its own baseline (recoveryPreDiskSig). For ids
-                // spliced in by expanding an earlier same-turn synthetic summary, carry
-                // the EARLIER record's signatures so a chained future recovery can still
-                // verify every composed id (persistIsStrictPrefix already required these
-                // to match fresh disk, so they're current).
-                const preSig = recoveryPreDiskSig.get(compacted.compactionId);
-                const coveredContentSig: Record<string, string> = {};
-                const rawIds = compacted.compactedMessageIds;
-                let earlierSig: Record<string, string> | undefined;
-                if (rawIds.length > 0 && syntheticSummaryIdsThisTurn.has(rawIds[0])) {
-                  if (
-                    pendingCompactionThisTurn &&
-                    `compaction-summary-${pendingCompactionThisTurn.compactionId}` === rawIds[0]
-                  ) {
-                    earlierSig = pendingCompactionThisTurn.coveredContentSig;
-                  }
-                  if (!earlierSig) {
-                    try {
-                      const rec = readConversation(appHome, conversationId)?.conversationCompaction as
-                        | { compactionId?: string; coveredContentSig?: Record<string, string> }
-                        | null
-                        | undefined;
-                      if (rec && `compaction-summary-${rec.compactionId}` === rawIds[0]) earlierSig = rec.coveredContentSig;
-                    } catch {
-                      /* disk read failed — omit; a future expansion of this record then rejects */
-                    }
-                  }
-                }
-                for (const id of composedCompactedIds) {
-                  const s = preSig?.get(id) ?? earlierSig?.[id];
-                  if (s !== undefined) coveredContentSig[id] = s;
-                }
+                // Informational "compacting + retrying" note. Emit as a `retry` (observer) event,
+                // NOT a `text-delta`: a text-delta has no responseMessageId here (the retry mints a
+                // FRESH id downstream), so the renderer would attach it to the PRIOR attempt's
+                // assistant — mis-attributed, and after a preserved fallback variant it can collide
+                // with a duplicate id. The retry/observer path attaches to the current assistant
+                // without responseMessageId keying, so it survives the id change cleanly.
                 emit({
                   conversationId,
-                  type: 'compaction',
+                  type: 'retry',
                   data: {
-                    compactionId: compacted.compactionId,
-                    summaryText: compacted.summaryText,
-                    compactedMessageIds: composedCompactedIds,
-                    coveredContentSig,
-                    compactionRevision: nextCompactionRevision(),
+                    reason: 'context-overflow',
+                    text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
                   },
                 });
+                continue; // drain the rest of the failed stream; the do/while re-runs it
               }
-              // Informational "compacting + retrying" note. Emit as a `retry` (observer) event,
-              // NOT a `text-delta`: a text-delta has no responseMessageId here (the retry mints a
-              // FRESH id downstream), so the renderer would attach it to the PRIOR attempt's
-              // assistant — mis-attributed, and after a preserved fallback variant it can collide
-              // with a duplicate id. The retry/observer path attaches to the current assistant
-              // without responseMessageId keying, so it survives the id change cleanly.
+              // Recovery declined/failed. If the turn was cancelled or superseded
+              // while recovery's compaction ran, don't emit a stale terminal error
+              // over a run that no longer owns the conversation.
+              if (controller.signal.aborted || activeStreams.get(conversationId)?.token !== streamToken) {
+                overflowRecoveryTookOver = true; // suppress this + trailing done
+                continue;
+              }
               emit({
-                conversationId,
-                type: 'retry',
-                data: {
-                  reason: 'context-overflow',
-                  text: '> ℹ️ The request exceeded the context window; compacted the conversation and retrying…',
-                },
+                ...event,
+                // Recovery EXHAUSTED = it actually ran compaction (not gated off) and
+                // got nothing → `/compact` would also be a no-op, so give generic
+                // guidance. If recovery was merely SKIPPED (a tool/text/inject already
+                // happened this turn), `/compact` may still help next turn — keep it.
+                error: `${event.error ?? 'Context window exceeded.'}${overflowGuidance(!compacted && !recoveryGatedOffLast)}`,
+                errorCategory: 'context-overflow',
               });
-              continue; // drain the rest of the failed stream; the do/while re-runs it
-            }
-            // Recovery declined/failed. If the turn was cancelled or superseded
-            // while recovery's compaction ran, don't emit a stale terminal error
-            // over a run that no longer owns the conversation.
-            if (controller.signal.aborted || activeStreams.get(conversationId)?.token !== streamToken) {
-              overflowRecoveryTookOver = true; // suppress this + trailing done
+              // This terminal error is fully terminal for a GUI turn (the renderer's error
+              // handler deletes the accumulator + persists idle). Suppress the FAILED stream's
+              // trailing `done` (via overflowRecoveryTookOver) so it can't recreate the
+              // accumulator from stale tree state and overwrite the persisted overflow error
+              // (round-100/108 pattern). A serverPersisted (CLI/automation) turn KEEPS its
+              // accumulator on error and needs the trailing `done`, so leave it flowing there.
+              if (!serverPersistedRun) overflowRecoveryTookOver = true;
               continue;
             }
-            emit({
-              ...event,
-              // Recovery EXHAUSTED = it actually ran compaction (not gated off) and
-              // got nothing → `/compact` would also be a no-op, so give generic
-              // guidance. If recovery was merely SKIPPED (a tool/text/inject already
-              // happened this turn), `/compact` may still help next turn — keep it.
-              error: `${event.error ?? 'Context window exceeded.'}${overflowGuidance(!compacted && !recoveryGatedOffLast)}`,
-              errorCategory: 'context-overflow',
-            });
-            // This terminal error is fully terminal for a GUI turn (the renderer's error
-            // handler deletes the accumulator + persists idle). Suppress the FAILED stream's
-            // trailing `done` (via overflowRecoveryTookOver) so it can't recreate the
-            // accumulator from stale tree state and overwrite the persisted overflow error
-            // (round-100/108 pattern). A serverPersisted (CLI/automation) turn KEEPS its
-            // accumulator on error and needs the trailing `done`, so leave it flowing there.
-            if (!serverPersistedRun) overflowRecoveryTookOver = true;
-            continue;
+            // The stream yields a terminal `error` and THEN an unconditional `done`
+            // (mastra-agent). For a GUI turn the error is fully terminal (renderer deletes the
+            // accumulator); forwarding the trailing `done` would recreate it from stale state +
+            // supersede the error write (a provider failure would flash then vanish). Track the
+            // error and drop the following `done` for GUI turns. serverPersisted keeps its
+            // accumulator on error and needs the `done`.
+            if (
+              shouldPrepareBrowserContinuation(
+                event,
+                serverPersistedRun,
+                config.agent?.autoContinueOnMaxTurns === true,
+                allowNativeBrowserTools,
+              ) &&
+              getExistingBrowserManager()?.prepareAssistantContinuation(conversationId, streamToken)
+            ) {
+              browserContinuationPrepared = true;
+            }
+            if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
+            if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
+            emit(event);
           }
-          // The stream yields a terminal `error` and THEN an unconditional `done`
-          // (mastra-agent). For a GUI turn the error is fully terminal (renderer deletes the
-          // accumulator); forwarding the trailing `done` would recreate it from stale state +
-          // supersede the error write (a provider failure would flash then vanish). Track the
-          // error and drop the following `done` for GUI turns. serverPersisted keeps its
-          // accumulator on error and needs the `done`.
-          if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
-          if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
-          emit(event);
-        }
-        // If the just-drained stream was an overflow that we compacted, reset the
-        // per-stream suppression flag and re-run the model with the compacted
-        // `messages` (hooks/lifecycle/injects already ran and are NOT repeated).
-        if (retryAfterOverflow) {
-          overflowRecoveryTookOver = false;
-          // If this failed stream fell back to a fallback model, the renderer's
-          // model selector is now pinned to that fallback key. The retry restarts at
-          // the PRIMARY, so emit a restoration model-fallback (primary as the target)
-          // to un-pin the selector — otherwise a successful compacted retry on the
-          // primary would leave the selector (and subsequent bare-model turns) stuck
-          // on the fallback.
-          if (fellBackThisStream && modelEntry?.key) {
-            emit({
-              conversationId,
-              type: 'model-fallback',
-              data: {
-                fromModel: activeModelDisplayName ?? 'fallback model',
-                toModel: modelEntry.displayName ?? modelEntry.key,
-                toModelKey: modelEntry.key,
-                error: '',
-                reason: 'overflow-recovery-retry-primary',
-              },
-            });
+          // If the just-drained stream was an overflow that we compacted, reset the
+          // per-stream suppression flag and re-run the model with the compacted
+          // `messages` (hooks/lifecycle/injects already ran and are NOT repeated).
+          if (retryAfterOverflow) {
+            overflowRecoveryTookOver = false;
+            // If this failed stream fell back to a fallback model, the renderer's
+            // model selector is now pinned to that fallback key. The retry restarts at
+            // the PRIMARY, so emit a restoration model-fallback (primary as the target)
+            // to un-pin the selector — otherwise a successful compacted retry on the
+            // primary would leave the selector (and subsequent bare-model turns) stuck
+            // on the fallback.
+            if (fellBackThisStream && modelEntry?.key) {
+              emit({
+                conversationId,
+                type: 'model-fallback',
+                data: {
+                  fromModel: activeModelDisplayName ?? 'fallback model',
+                  toModel: modelEntry.displayName ?? modelEntry.key,
+                  toModelKey: modelEntry.key,
+                  error: '',
+                  reason: 'overflow-recovery-retry-primary',
+                },
+              });
+            }
+            // Reset per-model state to the PRIMARY before re-running. The failed
+            // stream may have fallen back to a fallback model before overflowing,
+            // mutating these; the retry restarts at the primary, so stale values
+            // would misattribute the reply's source model AND (critically) apply
+            // the fallback's provider-native tool exemptions to the primary —
+            // which could leak unsanitized local-tool args past a DLP hook or leave
+            // the primary's native-tool args stuck pending.
+            accumulatedResponseText = '';
+            activeSourceModel = modelEntry?.modelConfig
+              ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
+              : null;
+            activeModelDisplayName = modelEntry?.displayName ?? null;
+            providerDefinedToolNames = modelEntry?.modelConfig
+              ? getProviderDefinedToolNames(modelEntry.modelConfig)
+              : new Set<string>();
+            activeModelEntryForRecovery = modelEntry;
+            // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
+            // reply can't collide with a failed sibling preserved under the prior attempt's id.
+            currentResponseMessageId = undefined;
           }
-          // Reset per-model state to the PRIMARY before re-running. The failed
-          // stream may have fallen back to a fallback model before overflowing,
-          // mutating these; the retry restarts at the primary, so stale values
-          // would misattribute the reply's source model AND (critically) apply
-          // the fallback's provider-native tool exemptions to the primary —
-          // which could leak unsanitized local-tool args past a DLP hook or leave
-          // the primary's native-tool args stuck pending.
-          accumulatedResponseText = '';
-          activeSourceModel = modelEntry?.modelConfig
-            ? `${modelEntry.modelConfig.provider}:${modelEntry.modelConfig.modelName}`
-            : null;
-          activeModelDisplayName = modelEntry?.displayName ?? null;
-          providerDefinedToolNames = modelEntry?.modelConfig
-            ? getProviderDefinedToolNames(modelEntry.modelConfig)
-            : new Set<string>();
-          activeModelEntryForRecovery = modelEntry;
-          // Fresh response id for the retry (undefined → mastra-agent mints one) so the retried
-          // reply can't collide with a failed sibling preserved under the prior attempt's id.
-          currentResponseMessageId = undefined;
-        }
         } while (retryAfterOverflow);
       } catch (error) {
         ipcDebugLog(
@@ -4953,9 +5919,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           emit({
             conversationId,
             type: 'error',
-            error: overflow
-              ? `${baseMsg}${overflowGuidance()}`
-              : baseMsg,
+            error: overflow ? `${baseMsg}${overflowGuidance()}` : baseMsg,
             ...(overflow ? { errorCategory: 'context-overflow' } : {}),
           });
           // Only a serverPersisted (CLI/automation) turn needs a trailing `done`: its
@@ -4988,6 +5952,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // below reads the inject maps (their only readers are the tool-fit/recovery
         // paths that already ran during streaming), and the observer is disposed above.
         const stillOwnsRun = activeStreams.get(conversationId)?.token === streamToken;
+        if (!browserContinuationPrepared) cleanupAssistantTabsIfOwned(conversationId, streamToken);
         cleanupStreamIfOwned(conversationId, streamToken);
 
         // Drain-at-end safety net for a cooperative inject that arrived AFTER the
@@ -5077,6 +6042,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     effectiveCwd ?? undefined,
                     effectiveExecutionMode,
                     threadOverrides,
+                    undefined,
+                    allowNativeBrowserTools,
+                    nativeBrowserAuthorityGeneration,
                   );
                   // streamHandler consumes pendingServerPersist at its top on the NORMAL path.
                   // If it rejected EARLY (compaction lock held → `{busy}`) it did NOT consume,
@@ -5146,8 +6114,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 if (owner !== undefined && owner !== streamToken) return;
                 const updated = readConversation(appHome, conversationId);
                 if (updated) {
-                  const { tree: continuationTree, headId: continuationHead } =
-                    ensureConversationTree(updated);
+                  const { tree: continuationTree, headId: continuationHead } = ensureConversationTree(updated);
                   const continuationBranch = getConversationBranch(continuationTree, continuationHead);
                   // Wait for the RENDERER to have finished persisting THIS turn's assistant reply
                   // before launching — else the continuation reads a branch missing the just-
@@ -5216,7 +6183,48 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { conversationId };
   };
 
-  ipcMain.handle('agent:stream', streamHandler);
+  // Keep the final browser-tools bit internal. Bridge clients can pass surplus
+  // positional arguments to an IPC handler, so registering streamHandler
+  // directly would let an untrusted web/local caller set that bit to true and
+  // obtain the primary window's authenticated browser tools. This explicit
+  // renderer-facing signature intentionally drops every argument after
+  // responseMessageId; only in-process continuation calls reach the override.
+  ipcMain.handle(
+    'agent:stream',
+    (
+      event,
+      conversationId: string,
+      messages: unknown[],
+      modelKey?: string,
+      reasoningEffort?: ReasoningEffort,
+      profileKey?: string,
+      fallbackEnabled?: boolean,
+      cwd?: string,
+      executionMode?: ExecutionMode,
+      threadOverrides?: {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+        continuationPredecessorToken?: string;
+      },
+      responseMessageId?: string,
+    ) =>
+      streamHandler(
+        event,
+        conversationId,
+        messages,
+        modelKey,
+        reasoningEffort,
+        profileKey,
+        fallbackEnabled,
+        cwd,
+        executionMode,
+        threadOverrides,
+        responseMessageId,
+      ),
+  );
 
   // ── Renderer-facing cooperative mid-turn injection ────────────────────────
   // The GUI composer, when a message is sent while a Mastra turn is still
@@ -5228,11 +6236,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   ipcMain.handle(
     'agent:inject-mid-turn',
     (
-      _event,
+      event,
       conversationId: string,
       userText: string,
     ): { ok: boolean; cooperative?: boolean; id?: string; error?: string } => {
       if (!conversationId || !userText) return { ok: false, error: 'missing conversationId or text' };
+      if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
+      }
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
       // Cooperative splice only works on the Mastra runtime (prepareStep). If the
@@ -5295,7 +6306,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // the renderer's "edit" affordance can pre-fill the composer with it.
   ipcMain.handle(
     'agent:cancel-inject',
-    (_event, conversationId: string, id: string): { ok: boolean; text?: string } => {
+    (event, conversationId: string, id: string): { ok: boolean; text?: string; error?: string } => {
+      if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
+      }
       const text = removeInject(conversationId, id);
       return { ok: text !== null, text: text ?? undefined };
     },
@@ -5309,6 +6323,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // restarts with the combined branch) instead of diverting to a new chat.
   // NO skipIfBusy — superseding the in-flight run is the intended behavior.
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
+    // Automations are background principals, not the native Browser renderer.
+    // Reject synchronously before enqueueing, finalizing a partial reply,
+    // appending history, or arming server persistence. The initiator bit is
+    // sticky after Browser-tool revocation, so a still-private turn cannot be
+    // taken over merely because its tool list was downgraded.
+    if (!mayInjectAutomationIntoActiveStream(activeStreams.get(conversationId))) {
+      return { ok: false, error: 'native-browser-authority-required' };
+    }
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
 
@@ -5462,7 +6484,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // could cancel the wrong one and let a detached run proceed. The post-
       // toolsReady busy-check covers the already-streaming case; this covers the
       // pre-toolsReady window.
-      if (currentPendingSubmit.has(conversationId) || activeStreams.has(conversationId)) {
+      if (
+        currentPendingSubmit.has(conversationId) ||
+        activeStreams.has(conversationId) ||
+        isRealtimeConversationTurnActive(conversationId)
+      ) {
         return { ok: false, error: 'conversation-busy' };
       }
 
@@ -5496,6 +6522,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         busyCheck.runStatus === 'running' ||
         busyCheck.runStatus === 'awaiting-approval' ||
         activeStreams.has(conversationId) ||
+        isRealtimeConversationTurnActive(conversationId) ||
         isCompacting(conversationId)
       ) {
         // Distinguish a COMPACTION lock (drains on the conversations:compacting broadcast)
@@ -5557,6 +6584,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // The terminal assistant/error persist (or cancel) resets it to idle.
       // skipIfBusy guards against a run that started between the check above and
       // this write; a null return means we lost the race and must abort.
+      // A retained Browser continuation has no activeStreams entry and its disk
+      // status is idle, but its authenticated temporary tabs still belong to the
+      // desktop renderer. Re-check that authority immediately before the
+      // synchronous append so a web/CLI submit cannot durably move the head and
+      // only then be rejected by streamHandler.
+      if (!mayPersistConversationForBrowserAuthority(event, conversationId, getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
+      }
       const promptWrite = appendConversationMessages(
         appHome,
         conversationId,
@@ -5578,8 +6613,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const promptTree = Array.isArray(promptWrite.messageTree) ? promptWrite.messageTree : [];
       const promptUserId = promptWrite.headId ?? null;
       const promptUserParent =
-        (promptTree.find((m) => (m as { id?: unknown }).id === promptUserId) as { parentId?: string | null } | undefined)
-          ?.parentId ?? null;
+        (
+          promptTree.find((m) => (m as { id?: unknown }).id === promptUserId) as
+            | { parentId?: string | null }
+            | undefined
+        )?.parentId ?? null;
 
       // Broadcast the user turn so OTHER attached clients (e.g. the `kai` CLI
       // when this submit came from the GUI) render the prompt, not just the
@@ -5640,11 +6678,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // (mark automationStreams, don't persist), but a GUI in-flight turn has NO renderer persisting
   // it after the reload — the reconnecting renderer must ADOPT it (own its persistence), not
   // treat it as main-owned (which would discard its terminal output + leave it stuck running).
-  ipcMain.handle('agent:in-flight', (_event, conversationId: string): { inFlight: boolean; serverPersisted: boolean } => {
-    const inFlight = activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
-    const serverPersisted = serverPersistTokens.has(conversationId) || pendingServerPersist.has(conversationId);
-    return { inFlight, serverPersisted };
-  });
+  ipcMain.handle(
+    'agent:in-flight',
+    (_event, conversationId: string): { inFlight: boolean; serverPersisted: boolean } => {
+      const inFlight = activeStreams.has(conversationId) || currentPendingSubmit.has(conversationId);
+      const serverPersisted = serverPersistTokens.has(conversationId) || pendingServerPersist.has(conversationId);
+      return { inFlight, serverPersisted };
+    },
+  );
 
   // Main-authoritative GUI continuation authorization. A renderer about to drive an auto-continue
   // (max-turns) or plan-restart asks main to authorize it for THIS turn (keyed by the run's stream
@@ -5654,7 +6695,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // winner simply isn't the one asking for the NEXT turn's authorization, so continuation resumes.
   ipcMain.handle(
     'agent:authorize-continuation',
-    (_event, conversationId: string, clientId: string, turnToken: string) => {
+    (event, conversationId: string, clientId: string, turnToken: string) => {
+      const browserManager = getExistingBrowserManager();
+      const browserAuthorityGeneration = browserManager?.getHostRendererAuthorityGeneration();
+      const hasNativeBrowserAuthority =
+        isPrimaryBrowserToolCaller(event, getPrimaryWindow) &&
+        isNativeBrowserAuthorityCurrent(browserManager, browserAuthorityGeneration);
+      if (!mayDriveBrowserContinuation(browserManager, conversationId, turnToken, hasNativeBrowserAuthority)) {
+        return { authorized: false };
+      }
       return { authorized: authorizeContinuation(conversationId, clientId, turnToken) };
     },
   );
@@ -5667,8 +6716,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // { confirmed:false } when main has no fallback for this conv (the caller then uses its own
   // accumulator — it IS the originator, or the turn was server-persisted) OR when a REPLACEMENT turn
   // now owns the conversation (never finalize/discard a newer turn's accumulator).
-  ipcMain.handle('agent:finalize-gui-fallback', (_event, conversationId: string, turnToken?: string) => {
+  ipcMain.handle('agent:finalize-gui-fallback', (event, conversationId: string, turnToken?: string) => {
     if (typeof conversationId !== 'string' || !conversationId || !serverPersistAppHome) {
+      return { confirmed: false, headId: null as string | null };
+    }
+    // Finalizing consumes main's crash-recovery accumulator and can persist a
+    // still-partial assistant reply. A passive web/secondary renderer may see
+    // the same runGeneration, but it must not mutate a Browser-authorized turn
+    // owned by the primary desktop renderer.
+    if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
       return { confirmed: false, headId: null as string | null };
     }
     // TURN-TOKEN guard: only finalize the turn the caller was authorized for. If a REPLACEMENT turn
@@ -5709,7 +6765,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
   });
 
-  ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
+  ipcMain.handle('agent:cancel-stream', async (event, conversationId: string) => {
+    if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+      return { ok: false, error: 'native-browser-authority-required' };
+    }
     cancelConversationStreamInner(conversationId);
     return { ok: true };
   });
@@ -5726,6 +6785,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     const controller = activeStreams.get(conversationId);
     if (controller) {
       controller.abort();
+      // Close this cancelled turn's temporary tabs while its token is still the
+      // active owner. Its finally block cannot do this after the map entry is
+      // removed below, and a future replacement must be left untouched.
+      cleanupAssistantTabsIfOwned(conversationId, controller.token);
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).
       deleteStreamIfOwned(conversationId, controller.token);
@@ -5864,8 +6927,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   }
   cancelConversationStreamImpl = cancelConversationStreamInner;
 
-  ipcMain.handle('agent:approve-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:approve-tool', (event, toolCallId: string) => {
     const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
@@ -5877,8 +6948,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:reject-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:get-tool-approval-private-details', (event, toolCallId: string) => {
+    if (typeof toolCallId !== 'string' || !toolCallId) return null;
     const pending = pendingToolApprovals.get(toolCallId);
+    if (!pending?.privateDetails || !mayResolveToolApproval(event, pending, getPrimaryWindow)) return null;
+    // This is intentionally the only path that returns exact Browser approval
+    // input. It is restricted to the primary renderer or the exact one-shot
+    // approval pop-out, and the pending map drops it on every settle path.
+    return { ...pending.privateDetails };
+  });
+
+  ipcMain.handle('agent:reject-tool', (event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve(false);
       pendingToolApprovals.delete(toolCallId);
@@ -5887,8 +6976,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:dismiss-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string) => {
     const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve('dismiss');
       pendingToolApprovals.delete(toolCallId);
@@ -5897,11 +6994,19 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
+  ipcMain.handle('agent:answer-tool-question', (event, toolCallId: string, answers: Record<string, string>) => {
     // Only stash answers if there's actually a pending approval to resolve; a
     // stale toolCallId (already dismissed/aborted) would otherwise leave an
     // orphaned pendingQuestionAnswers entry that the terminated tool never reads.
     const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       stashQuestionAnswers(toolCallId, answers);
       pending.resolve(true);
@@ -5949,7 +7054,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // { title: null, suppressed: true } so the renderer does NOT fall back to
       // deriving a title from the raw messages; a `modify` rewrites the messages
       // and/or the system prompt.
-      const gated = await gateTitleGenerationMessages(messages, config, conversationId ?? '', modelKey, CHAT_TITLE_PROMPT);
+      const gated = await gateTitleGenerationMessages(
+        messages,
+        config,
+        conversationId ?? '',
+        modelKey,
+        CHAT_TITLE_PROMPT,
+      );
       if (gated.suppressed) return { title: null, suppressed: true };
       const effectiveMessages = gated.messages;
 
@@ -6059,4 +7170,30 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 }
 
 /** Exposed for unit tests only. */
-export const __internal = { extractLastUserText, observerToolsForExecutionMode };
+export const __internal = {
+  extractLastUserText,
+  observerToolsForExecutionMode,
+  isPrimaryBrowserToolCaller,
+  mayMutateBrowserAuthorizedStream,
+  mayInjectAutomationIntoActiveStream,
+  isAuthorizedApprovalWindowCaller,
+  isPendingApprovalStreamCurrent,
+  mayResolveToolApproval,
+  toolApprovalResolutionError,
+  shouldPrepareBrowserContinuation,
+  isBrowserDrainSuperseded,
+  isNativeBrowserAuthorityCurrent,
+  isNativeBrowserAuthorityRevoked,
+  mayDriveBrowserContinuation,
+  pluginProviderErrorForExposure,
+  resetBrowserAuthorityRevokedRunStatus,
+  toolsForPluginInferenceProvider,
+  bindBrowserToolsToRun,
+  redactBrowserToolArgsForExposure,
+  observerToolErrorForExposure,
+  validateToolInput,
+  markTextBrowserCapabilitiesRevoked,
+  revokeTextBrowserCapabilities,
+  shouldWarnAboutUnwrappedRuntimeTools,
+  protectUnresolvedToolCallArgs,
+};

@@ -1,9 +1,138 @@
-import type { IpcMain } from 'electron';
+import type { BrowserWindow, IpcMain } from 'electron';
 import { app } from 'electron';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { UnverifiedPluginError } from '../plugins/marketplace-service.js';
+import { isCanonicalPrimaryRendererUrl } from '../primary-renderer-url.js';
 
-export function registerPluginHandlers(ipcMain: IpcMain, pluginManager: PluginManager): void {
+const RENDERER_RELOAD_TIMEOUT_MS = 30_000;
+
+export function registerPluginHandlers(
+  ipcMain: IpcMain,
+  pluginManager: PluginManager,
+  getPrimaryWindow: () => BrowserWindow | null,
+  revokePrimaryRendererAuthority: () => void,
+  primaryRendererUrl: string,
+): void {
+  if (
+    !getPrimaryWindow ||
+    !revokePrimaryRendererAuthority ||
+    !isCanonicalPrimaryRendererUrl(primaryRendererUrl, primaryRendererUrl)
+  ) {
+    throw new Error('Plugin renderer replacement requires primary-renderer revocation callbacks and a canonical URL.');
+  }
+  const reloadPrimaryRendererIfRequired = async (_pluginName: string, required: boolean): Promise<void> => {
+    if (!required) return;
+    const primaryWindow = getPrimaryWindow();
+    if (!primaryWindow || primaryWindow.isDestroyed() || primaryWindow.webContents.isDestroyed()) {
+      return;
+    }
+    const contents = primaryWindow.webContents;
+    // Confirm that the old realm actually unloaded before forgetting that it
+    // held the plugin. A page-level beforeunload handler must not be allowed to
+    // retain the authenticated Browser bridge after the plugin is disabled.
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        contents.removeListener('will-prevent-unload', onWillPreventUnload);
+        contents.removeListener('did-navigate', onDidNavigate);
+        contents.removeListener('did-fail-load', onDidFailLoad);
+        contents.removeListener('render-process-gone', onRenderProcessGone);
+        contents.removeListener('destroyed', onDestroyed);
+      };
+      const finish = (error?: Error, rendererAlreadyRevoked = false) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (!error) {
+          resolve();
+          return;
+        }
+        // A failed or wedged reload must fail closed. The disabled frontend
+        // plugin still has every capability of the old renderer realm until
+        // that renderer exits, including the authenticated Browser bridge.
+        if (!rendererAlreadyRevoked && !contents.isDestroyed()) {
+          try {
+            contents.forcefullyCrashRenderer();
+          } catch {
+            // BrowserWindow.destroy() is the last-resort synchronous revocation
+            // path if Chromium refuses the renderer crash request.
+            try {
+              if (!primaryWindow.isDestroyed()) primaryWindow.destroy();
+            } catch {
+              // Preserve the reload error; both revocation APIs failing is
+              // still surfaced through diagnostics and the rejected IPC call.
+            }
+          }
+        }
+        reject(error);
+      };
+      const onWillPreventUnload = (event: Electron.Event) => {
+        // Electron interprets preventDefault here as permission to ignore the
+        // page's beforeunload veto and continue replacing the renderer.
+        event.preventDefault();
+      };
+      const onDidNavigate = (_event: Electron.Event, url: string) => {
+        if (!isCanonicalPrimaryRendererUrl(url, primaryRendererUrl)) {
+          finish(new Error('Primary renderer replacement committed an unexpected URL.'));
+          return;
+        }
+        finish();
+      };
+      const onDidFailLoad = (
+        _event: Electron.Event,
+        errorCode: number,
+        errorDescription: string,
+        _validatedUrl: string,
+        isMainFrame: boolean,
+      ) => {
+        // ERR_ABORTED may be followed by another committed top-level
+        // navigation. Keep waiting for that replacement rather than
+        // acknowledging the old realm prematurely.
+        if (isMainFrame && errorCode !== -3) {
+          finish(new Error(`Primary renderer reload failed (${errorCode}): ${errorDescription}`));
+        }
+      };
+      const onRenderProcessGone = (_event: Electron.Event, details: Electron.RenderProcessGoneDetails) =>
+        finish(new Error(`Primary renderer exited during reload: ${details.reason}`), true);
+      const onDestroyed = () => finish(new Error('Primary renderer was destroyed during reload.'), true);
+      const timeout = setTimeout(
+        () => finish(new Error('Timed out waiting for the primary renderer to reload.')),
+        RENDERER_RELOAD_TIMEOUT_MS,
+      );
+      timeout.unref?.();
+
+      contents.on('will-prevent-unload', onWillPreventUnload);
+      contents.on('did-navigate', onDidNavigate);
+      contents.on('did-fail-load', onDidFailLoad);
+      contents.on('render-process-gone', onRenderProcessGone);
+      contents.on('destroyed', onDestroyed);
+      try {
+        void contents.loadURL(primaryRendererUrl).catch((error: unknown) => {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+  pluginManager.setRendererReplacementHandler(async (pluginName) => {
+    // Revoke authenticated Browser IPC before requesting navigation. A reload
+    // can fail before Chromium emits did-start-navigation, and crashing a
+    // renderer is asynchronous; neither window leaves the old plugin realm
+    // with a usable Browser bridge while replacement is being confirmed.
+    let revocationError: unknown;
+    try {
+      revokePrimaryRendererAuthority();
+    } catch (error) {
+      // Bookkeeping failure must not leave the already-loaded plugin realm
+      // alive with its authenticated Browser bridge. Replace every renderer,
+      // then surface the original failure to the lifecycle caller.
+      revocationError = error;
+    }
+    await reloadPrimaryRendererIfRequired(pluginName, true);
+    if (revocationError) throw revocationError;
+  });
   ipcMain.handle('plugin:get-ui-state', () => {
     return pluginManager.getUIState();
   });

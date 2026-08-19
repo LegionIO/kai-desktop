@@ -10,8 +10,10 @@ import { NotificationShell } from '../NotificationShell';
 
 // Capture the notif:request callback so the test can push an item like main does.
 let requestCb: ((item: unknown) => void) | null = null;
+const getToolApprovalPrivateDetails = vi.fn();
 beforeEach(() => {
   requestCb = null;
+  getToolApprovalPrivateDetails.mockReset().mockResolvedValue(null);
   (window as unknown as { app: unknown }).app = {
     notification: {
       onRequest: (cb: (item: unknown) => void) => {
@@ -22,7 +24,12 @@ beforeEach(() => {
       close: vi.fn(),
       reportSize: vi.fn(),
     },
-    agent: { answerToolQuestion: vi.fn(), approveToolCall: vi.fn(), rejectToolCall: vi.fn() },
+    agent: {
+      answerToolQuestion: vi.fn(),
+      approveToolCall: vi.fn(),
+      rejectToolCall: vi.fn(),
+      getToolApprovalPrivateDetails,
+    },
     alerts: { answer: vi.fn(), decide: vi.fn(), dismiss: vi.fn() },
   };
 });
@@ -61,6 +68,65 @@ describe('NotificationShell', () => {
     expect(screen.getByText('Approval required')).toBeInTheDocument();
     expect(screen.getByText('Approve')).toBeInTheDocument();
     expect(screen.getByText('Reject')).toBeInTheDocument();
+  });
+
+  it('shows redacted event details plus exact transient Browser input before approval', async () => {
+    getToolApprovalPrivateDetails.mockResolvedValue({
+      browserInput: { script: 'document.querySelector("button").click()' },
+    });
+    render(<NotificationShell id="browser-1" />);
+    act(() => {
+      requestCb?.({
+        source: 'tool-approval',
+        id: 'browser-1',
+        conversationId: 'c1',
+        toolName: 'browser_evaluate',
+        args: {
+          script: '[redacted browser script: 42 characters]',
+          target: {
+            tabId: '00000000-0000-0000-0000-000000000001',
+            origin: 'https://example.com',
+          },
+          approvalKind: 'browser-control',
+          reason: 'Run JavaScript in the current web page',
+        },
+      });
+    });
+
+    expect(screen.getByText('Run JavaScript in the current web page')).toBeInTheDocument();
+    const details = screen.getByTestId('browser-approval-details');
+    expect(details).toHaveTextContent('redacted browser script');
+    expect(details).toHaveTextContent('https://example.com');
+    expect(details).toHaveTextContent('00000000-0000-0000-0000-000000000001');
+    expect(details).not.toHaveTextContent('approvalKind');
+    const exactInput = await screen.findByTestId('browser-private-approval-input');
+    expect(exactInput).toHaveTextContent('document.querySelector("button").click()');
+    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('browser-1');
+  });
+
+  it('bounds cyclic and oversized Browser approval details in the notification renderer', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    render(<NotificationShell id="browser-bounded" />);
+    act(() => {
+      requestCb?.({
+        source: 'tool-approval',
+        id: 'browser-bounded',
+        conversationId: 'c1',
+        toolName: 'browser_evaluate',
+        args: {
+          approvalKind: 'browser-control',
+          reason: 'Run a bounded operation',
+          script: 'x'.repeat(50_000),
+          cyclic,
+        },
+      });
+    });
+
+    const details = screen.getByTestId('browser-approval-details');
+    expect(details.textContent?.length).toBeLessThanOrEqual(8_220);
+    expect(details).toHaveTextContent(/truncated/i);
+    expect(details).toHaveTextContent(/circular/i);
   });
 
   it('renders the AlertCard for an alert item', () => {

@@ -235,15 +235,20 @@ export const GeneralSettings: FC<SettingsProps & { hideTitle?: boolean }> = ({ c
           </p>
         </div>
       </fieldset>
-
-      <PartitionManager />
     </div>
   );
 };
 
 // ─── Partition Manager ──────────────────────────────────────────────────────
 
-type PartitionEntry = { name: string; sizeBytes: number };
+type PartitionEntry = {
+  name: string;
+  displayName?: string;
+  sizeBytes: number;
+  quarantined?: boolean;
+  recoveryRequired?: 'all-plugin-partitions';
+  corruptMarkerCount?: number;
+};
 type PartitionStatus = 'idle' | 'confirming' | 'deleting' | 'done' | 'error';
 
 function formatBytes(bytes: number): string {
@@ -252,11 +257,15 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const PartitionManager: FC = () => {
+export const PartitionManager: FC = () => {
   const [partitions, setPartitions] = useState<PartitionEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState<PartitionStatus>('idle');
-  const [result, setResult] = useState<{ deleted?: string[]; error?: string } | null>(null);
+  const [result, setResult] = useState<{
+    deleted?: string[];
+    recoveredCorruptMarkers?: number;
+    error?: string;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
 
   const loadPartitions = useCallback(async () => {
@@ -280,12 +289,18 @@ const PartitionManager: FC = () => {
     setStatus('deleting');
     setResult(null);
     try {
+      // The main-process partition remover holds one continuous plugin-window
+      // fence while it drains Chromium and deletes the on-disk profile.
       const res = await app.partitions.delete(names);
       if (res.error) {
-        setResult({ error: res.error, deleted: res.deleted });
+        setResult({
+          error: res.error,
+          deleted: res.deleted,
+          recoveredCorruptMarkers: res.recoveredCorruptMarkers,
+        });
         setStatus('error');
       } else {
-        setResult({ deleted: res.deleted });
+        setResult({ deleted: res.deleted, recoveredCorruptMarkers: res.recoveredCorruptMarkers });
         setStatus('done');
         setSelected(new Set());
         await loadPartitions();
@@ -311,16 +326,20 @@ const PartitionManager: FC = () => {
   };
 
   const targetNames = selected.size > 0 ? Array.from(selected) : partitions.map((p) => p.name);
+  const targetEntries = partitions.filter((partition) => targetNames.includes(partition.name));
+  const recoveringCorruptState = targetEntries.some(
+    (partition) => partition.recoveryRequired === 'all-plugin-partitions',
+  );
 
   return (
     <fieldset data-setting-id="partitions" className="rounded-lg border border-destructive/30 p-3 space-y-3">
       <legend className="text-xs font-semibold px-1 text-destructive flex items-center gap-1">
         <HardDriveIcon className="h-3 w-3" />
-        Browser Partitions
+        Plugin Browser Data
       </legend>
       <p className="text-[10px] text-muted-foreground">
-        Plugins create isolated browser sessions (partitions) for authentication and browsing. Deleting a partition
-        clears its cookies, cache, and local storage.
+        Plugins keep authentication in isolated browser profiles. Clearing a profile removes its cookies, cache, and
+        local storage without affecting the in-app Browser profile above.
       </p>
       {loading && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -345,8 +364,19 @@ const PartitionManager: FC = () => {
                   onChange={() => toggleSelected(p.name)}
                   className="h-3.5 w-3.5 rounded"
                 />
-                <span className="text-xs flex-1 truncate font-mono">{p.name}</span>
-                <span className="text-[10px] text-muted-foreground">{formatBytes(p.sizeBytes)}</span>
+                <span className="text-xs flex-1 truncate font-mono">{p.displayName ?? p.name}</span>
+                {p.quarantined && (
+                  <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-300">
+                    Recovery required
+                  </span>
+                )}
+                {p.corruptMarkerCount ? (
+                  <span className="text-[10px] text-muted-foreground">
+                    {p.corruptMarkerCount} invalid marker{p.corruptMarkerCount === 1 ? '' : 's'}
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-muted-foreground">{formatBytes(p.sizeBytes)}</span>
+                )}
               </label>
             ))}
           </div>
@@ -357,7 +387,11 @@ const PartitionManager: FC = () => {
             className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-40"
           >
             <Trash2Icon className="h-3 w-3" />
-            {selected.size > 0 ? `Delete ${selected.size} selected` : 'Delete all'}
+            {recoveringCorruptState
+              ? 'Recover all plugin Browser data'
+              : selected.size > 0
+                ? `Delete ${selected.size} selected`
+                : 'Delete all'}
           </button>
         </>
       )}
@@ -367,15 +401,22 @@ const PartitionManager: FC = () => {
             <AlertTriangleIcon className="h-4 w-4 text-destructive shrink-0 mt-0.5" />
             <div>
               <p className="text-xs font-medium text-destructive">Are you sure?</p>
-              <p className="text-[10px] text-muted-foreground mt-0.5">
-                This will permanently delete all cookies, cache, and storage for{' '}
-                {targetNames.length === 1 ? (
-                  <span className="font-mono">{targetNames[0]}</span>
-                ) : (
-                  <span>{targetNames.length} partitions</span>
-                )}
-                . You may need to re-authenticate with affected plugins.
-              </p>
+              {recoveringCorruptState ? (
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  Cleanup metadata is unreadable. Recovery clears every plugin Browser profile before removing invalid
+                  cleanup markers. You will need to re-authenticate with affected plugins.
+                </p>
+              ) : (
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  This will permanently delete all cookies, cache, and storage for{' '}
+                  {targetNames.length === 1 ? (
+                    <span className="font-mono">{targetEntries[0]?.displayName ?? targetNames[0]}</span>
+                  ) : (
+                    <span>{targetNames.length} partitions</span>
+                  )}
+                  . You may need to re-authenticate with affected plugins.
+                </p>
+              )}
             </div>
           </div>
           <div className="flex gap-2">
@@ -384,7 +425,7 @@ const PartitionManager: FC = () => {
               onClick={handleDelete}
               className="rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors"
             >
-              Delete
+              {recoveringCorruptState ? 'Recover all' : 'Delete'}
             </button>
             <button
               type="button"
@@ -410,6 +451,12 @@ const PartitionManager: FC = () => {
               <p className="text-xs font-medium text-green-700 dark:text-green-400">
                 Deleted {result.deleted.length} partition{result.deleted.length !== 1 ? 's' : ''}.
               </p>
+              {(result.recoveredCorruptMarkers ?? 0) > 0 && (
+                <p className="text-[10px] text-green-700 dark:text-green-400">
+                  Removed {result.recoveredCorruptMarkers} unreadable cleanup marker
+                  {result.recoveredCorruptMarkers === 1 ? '' : 's'}.
+                </p>
+              )}
               <ul className="mt-1 space-y-0.5">
                 {result.deleted.map((name) => (
                   <li key={name} className="text-[10px] text-muted-foreground font-mono">

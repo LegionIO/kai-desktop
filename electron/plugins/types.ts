@@ -52,6 +52,7 @@ export type PluginPermission =
   | 'agent:register-cli-tool'
   | 'safe-storage'
   | 'browser:window'
+  | 'browser:authenticated-session'
   | 'exec:whitelisted'
   | 'tools:detect'
   | 'system:env'
@@ -77,6 +78,11 @@ export type PluginPermission =
  *                            machine.
  *   - 'tasks:write'        — create, edit, or archive user tasks, including
  *                            changing their workflow status.
+ *   - 'browser:authenticated-session' — run frontend code in Kai's privileged
+ *                            renderer, where Kai desktop data, API keys, and
+ *                            authenticated Browser pages are available, and
+ *                            allow a plugin-provided inference backend to
+ *                            control those authenticated pages.
  */
 export const DANGEROUS_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new Set<PluginPermission>([
   'exec:whitelisted',
@@ -84,6 +90,7 @@ export const DANGEROUS_PLUGIN_PERMISSIONS: ReadonlySet<PluginPermission> = new S
   'agent:hook',
   'http:listen:network',
   'tasks:write',
+  'browser:authenticated-session',
 ]);
 
 export type PluginApprovalRecord = {
@@ -437,6 +444,10 @@ export type PluginRendererBuild = {
   scripts: PluginRendererScript[];
   styles: PluginRendererStyle[];
   mimeTypes: Record<string, string>;
+  /** Immutable bytes captured from the exact directory snapshot the user
+   * approved. Backend activation can mutate its own install directory, but it
+   * can never change what the privileged renderer receives this session. */
+  assets: ReadonlyMap<string, Uint8Array>;
 };
 
 export type PluginNotificationDescriptor = {

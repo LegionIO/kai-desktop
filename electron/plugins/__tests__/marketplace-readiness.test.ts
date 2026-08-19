@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import type { PluginInferenceProvider } from '../types.js';
 
 /**
  * Tests for the marketplace readiness state machine on PluginManager.
@@ -52,9 +53,11 @@ vi.mock('../marketplace-service.js', () => ({
 vi.mock('../plugin-api.js', () => ({ createPluginAPI: () => ({}), cleanupPluginAPI: () => {} }));
 vi.mock('../plugin-bootstrap.js', () => ({ getBundledPluginIntegrity: () => null }));
 vi.mock('../plugin-integrity.js', () => ({
+  AUTHENTICATED_BROWSER_PERMISSION: 'browser:authenticated-session',
   arePermissionSetsEqual: () => true,
   hashPluginDirectory: () => '',
   readPluginManifest: () => null,
+  snapshotPluginDirectory: () => ({ fileHash: 'trusted-hash', files: new Map() }),
 }));
 vi.mock('../plugin-compat.js', () => ({ checkPluginCompatibility: () => ({ ok: true }) }));
 vi.mock('../renderer-build.js', () => ({ buildPluginRendererBundle: async () => null }));
@@ -74,13 +77,14 @@ const { PluginManager } = await import('../plugin-manager.js');
 // __BRAND_MARKETPLACE_URLS is a compile-time `define` baked from the committed
 // branding config, so getMarketplaceUrls() can't be varied via a global. Stub
 // the private method per instance to model "configured" vs "unconfigured".
-function makeManager(urls: string[]) {
+function makeManager(urls: string[], requiredPlugins: string[] = [], revokeRenderer = vi.fn()) {
   const mgr = new PluginManager(
     '/tmp/plugins-test',
     '/tmp/app-home-test',
     () => ({}) as never,
     () => {},
-    [],
+    requiredPlugins,
+    revokeRenderer,
   );
   (mgr as unknown as { getMarketplaceUrls: () => string[] }).getMarketplaceUrls = () => urls;
   return mgr;
@@ -91,6 +95,611 @@ beforeEach(() => {
   fetchImpl = async () => [];
   cachedCatalog = [];
   fetchCallCount = 0;
+});
+
+describe('required plugin Browser consent', () => {
+  it('reports pending permission approval instead of an integrity failure', async () => {
+    const manager = makeManager([], ['required-ui']);
+    const manifest = {
+      name: 'required-ui',
+      displayName: 'Required UI',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      pendingConsent: Map<string, { manifest: typeof manifest; fileHash: string }>;
+      ensurePluginApproved: () => boolean;
+      loadPlugin: (plugin: typeof manifest, directory: string) => Promise<void>;
+      plugins: Map<string, { error?: string }>;
+    };
+    internal.pendingConsent.set(manifest.name, { manifest, fileHash: 'trusted-hash' });
+    internal.ensurePluginApproved = () => false;
+
+    await internal.loadPlugin(manifest, '/tmp/plugins-test/required-ui');
+
+    expect(internal.plugins.get(manifest.name)?.error).toBe(
+      'Plugin permission approval is required before it can be loaded.',
+    );
+  });
+});
+
+describe('frontend update revocation', () => {
+  it('revokes a captured previous provider after fail-closed removal from the instance', () => {
+    const manager = makeManager([]);
+    const revoke = vi.fn();
+    manager.setBrowserAssistantRevocationHandler(revoke);
+    const provider = {
+      name: 'Previous AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    const instance = {
+      inferenceProvider: null,
+      manifest: { permissions: ['browser:authenticated-session'] },
+    };
+
+    const revokeInstance = Reflect.get(manager, 'revokeBrowserAssistantAccessForInstance') as (
+      targetInstance: typeof instance,
+      provider: PluginInferenceProvider,
+    ) => void;
+    revokeInstance.call(manager, instance, provider);
+
+    expect(revoke).toHaveBeenCalledOnce();
+  });
+
+  it('revokes active Browser inference authority while renderer replacement is pending', () => {
+    const manager = makeManager([]);
+    const revoke = vi.fn();
+    const manifest = {
+      name: 'frontend-plugin',
+      displayName: 'Frontend Plugin',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => {
+        state: string;
+        inferenceProvider: PluginInferenceProvider | null;
+      };
+      plugins: Map<string, { state: string; inferenceProvider: PluginInferenceProvider | null }>;
+      rendererLoadedThisSession: Set<string>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/frontend-plugin', 'active');
+    const provider = {
+      name: 'Frontend AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    instance.inferenceProvider = provider;
+    internal.plugins.set(manifest.name, instance);
+    internal.rendererLoadedThisSession.add(manifest.name);
+    manager.setBrowserAssistantRevocationHandler(revoke);
+
+    expect(manager.getInferenceProvider()).toBe(provider);
+    expect(manager.inferenceProviderHasPermission(provider, 'browser:authenticated-session')).toBe(true);
+
+    expect(manager.beginRendererUnload(manifest.name)).toBe(true);
+    expect(revoke).toHaveBeenCalledOnce();
+    expect(manager.getInferenceProvider()).toBeNull();
+    expect(manager.inferenceProviderHasPermission(provider, 'browser:authenticated-session')).toBe(false);
+
+    expect(manager.cancelRendererUnload(manifest.name)).toBe(true);
+    expect(manager.getInferenceProvider()).toBe(provider);
+    expect(manager.inferenceProviderHasPermission(provider, 'browser:authenticated-session')).toBe(true);
+  });
+
+  it('revokes primary-renderer authority even when no replacement handler is available', async () => {
+    const revokeRenderer = vi.fn();
+    const manager = makeManager([], [], revokeRenderer);
+    const manifest = {
+      name: 'missing-replacement',
+      displayName: 'Missing Replacement',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => { state: string; inferenceProvider: PluginInferenceProvider | null };
+      plugins: Map<string, { state: string; inferenceProvider: PluginInferenceProvider | null }>;
+      rendererLoadedThisSession: Set<string>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/missing-replacement', 'active');
+    instance.inferenceProvider = {
+      name: 'Missing Replacement AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    internal.plugins.set(manifest.name, instance);
+    internal.rendererLoadedThisSession.add(manifest.name);
+
+    await expect(manager.disablePlugin(manifest.name, { persist: false })).rejects.toThrow(
+      /before its renderer is replaced/,
+    );
+
+    expect(revokeRenderer).toHaveBeenCalledOnce();
+    expect(manager.getInferenceProvider()).toBeNull();
+  });
+
+  it('continues renderer replacement when assistant revocation bookkeeping throws', async () => {
+    const revokeRenderer = vi.fn();
+    const manager = makeManager([], [], revokeRenderer);
+    const replacement = vi.fn(async () => undefined);
+    const operation = vi.fn(async () => 'updated');
+    const manifest = {
+      name: 'revocation-replacement',
+      displayName: 'Revocation Replacement',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => { inferenceProvider: PluginInferenceProvider | null };
+      plugins: Map<string, { inferenceProvider: PluginInferenceProvider | null }>;
+      rendererLoadedThisSession: Set<string>;
+      withRendererReplacementForUpdate: <T>(pluginName: string, callback: () => Promise<T>) => Promise<T>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/revocation-replacement', 'active');
+    instance.inferenceProvider = {
+      name: 'Revocation Replacement AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    internal.plugins.set(manifest.name, instance);
+    internal.rendererLoadedThisSession.add(manifest.name);
+    manager.setBrowserAssistantRevocationHandler(() => {
+      throw new Error('assistant bookkeeping failed');
+    });
+    manager.setRendererReplacementHandler(replacement);
+
+    await expect(internal.withRendererReplacementForUpdate(manifest.name, operation)).resolves.toBe('updated');
+
+    expect(revokeRenderer).toHaveBeenCalledOnce();
+    expect(replacement).toHaveBeenCalledWith(manifest.name);
+    expect(operation).toHaveBeenCalledOnce();
+  });
+
+  it('replaces a crashed plugin frontend before completing backend cleanup', async () => {
+    const manager = makeManager([]);
+    const replacement = vi.fn(async () => undefined);
+    const manifest = {
+      name: 'frontend-plugin',
+      displayName: 'Frontend Plugin',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (plugin: typeof manifest, directory: string, state: 'active') => object;
+      plugins: Map<string, object>;
+      rendererLoadedThisSession: Set<string>;
+      rendererRevocations: Set<string>;
+      broadcastUIState: () => void;
+      notifyToolsChanged: () => void;
+      notifyCliToolsChanged: () => void;
+      handleUnexpectedPluginExit: (instance: object, details: { code: number; error?: string }) => Promise<void>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/frontend-plugin', 'active');
+    Reflect.set(instance, 'rendererBuild', {});
+    internal.plugins.set(manifest.name, instance);
+    internal.rendererLoadedThisSession.add(manifest.name);
+    internal.broadcastUIState = vi.fn();
+    internal.notifyToolsChanged = vi.fn();
+    internal.notifyCliToolsChanged = vi.fn();
+    manager.setRendererReplacementHandler(replacement);
+
+    await internal.handleUnexpectedPluginExit(instance, { code: 1, error: 'backend crashed' });
+
+    expect(replacement).toHaveBeenCalledWith(manifest.name);
+    expect(Reflect.get(instance, 'state')).toBe('error');
+    expect(Reflect.get(instance, 'rendererBuild')).toBeNull();
+    expect(internal.rendererLoadedThisSession.has(manifest.name)).toBe(false);
+    expect(internal.rendererRevocations.has(manifest.name)).toBe(false);
+  });
+
+  it('keeps a crashed plugin frontend revoked when renderer replacement fails', async () => {
+    const manager = makeManager([]);
+    const replacementError = new Error('renderer replacement failed');
+    const replacement = vi.fn(async () => {
+      throw replacementError;
+    });
+    const manifest = {
+      name: 'frontend-plugin',
+      displayName: 'Frontend Plugin',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+      capabilities: [],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (plugin: typeof manifest, directory: string, state: 'active') => object;
+      plugins: Map<string, object>;
+      rendererLoadedThisSession: Set<string>;
+      rendererRevocations: Set<string>;
+      broadcastUIState: () => void;
+      notifyToolsChanged: () => void;
+      notifyCliToolsChanged: () => void;
+      handleUnexpectedPluginExit: (instance: object, details: { code: number; error?: string }) => Promise<void>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/frontend-plugin', 'active');
+    Reflect.set(instance, 'rendererBuild', {});
+    internal.plugins.set(manifest.name, instance);
+    internal.rendererLoadedThisSession.add(manifest.name);
+    internal.broadcastUIState = vi.fn();
+    internal.notifyToolsChanged = vi.fn();
+    internal.notifyCliToolsChanged = vi.fn();
+    manager.setRendererReplacementHandler(replacement);
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await internal.handleUnexpectedPluginExit(instance, { code: 1, error: 'backend crashed' });
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(internal.rendererLoadedThisSession.has(manifest.name)).toBe(true);
+    expect(internal.rendererRevocations.has(manifest.name)).toBe(true);
+  });
+
+  it('replaces the privileged renderer before running an update and then releases the new generation', async () => {
+    const manager = makeManager([]);
+    const replacement = vi.fn(async () => undefined);
+    const operation = vi.fn(async () => 'updated');
+    const internal = manager as unknown as {
+      plugins: Map<string, { state: string; rendererBuild?: object }>;
+      rendererLoadedThisSession: Set<string>;
+      rendererRevocations: Set<string>;
+      broadcastUIState: () => void;
+      withRendererReplacementForUpdate: <T>(pluginName: string, work: () => Promise<T>) => Promise<T>;
+    };
+    internal.broadcastUIState = vi.fn();
+    internal.plugins.set('frontend-plugin', { state: 'active', rendererBuild: {} });
+    internal.rendererLoadedThisSession.add('frontend-plugin');
+    manager.setRendererReplacementHandler(replacement);
+
+    await expect(internal.withRendererReplacementForUpdate('frontend-plugin', operation)).resolves.toBe('updated');
+
+    expect(replacement).toHaveBeenCalledWith('frontend-plugin');
+    expect(operation).toHaveBeenCalledOnce();
+    expect(internal.rendererLoadedThisSession.has('frontend-plugin')).toBe(true);
+    expect(internal.rendererRevocations.has('frontend-plugin')).toBe(false);
+  });
+
+  it('keeps an update frontend revoked when renderer replacement fails', async () => {
+    const manager = makeManager([]);
+    const replacementError = new Error('renderer replacement failed');
+    const replacement = vi.fn(async () => {
+      throw replacementError;
+    });
+    const operation = vi.fn(async () => 'updated');
+    const internal = manager as unknown as {
+      plugins: Map<string, { state: string; rendererBuild?: object }>;
+      rendererLoadedThisSession: Set<string>;
+      rendererRevocations: Set<string>;
+      broadcastUIState: () => void;
+      withRendererReplacementForUpdate: <T>(pluginName: string, work: () => Promise<T>) => Promise<T>;
+    };
+    internal.broadcastUIState = vi.fn();
+    internal.plugins.set('frontend-plugin', { state: 'active', rendererBuild: {} });
+    internal.rendererLoadedThisSession.add('frontend-plugin');
+    manager.setRendererReplacementHandler(replacement);
+
+    await expect(internal.withRendererReplacementForUpdate('frontend-plugin', operation)).rejects.toBe(
+      replacementError,
+    );
+
+    expect(operation).not.toHaveBeenCalled();
+    expect(internal.rendererLoadedThisSession.has('frontend-plugin')).toBe(true);
+    expect(internal.rendererRevocations.has('frontend-plugin')).toBe(true);
+  });
+
+  it('restores a denied frontend update into the replacement renderer without a restart banner', async () => {
+    const manager = makeManager([]);
+    const replacement = vi.fn(async () => undefined);
+    const pluginName = 'frontend-plugin';
+    const restoredManifest = {
+      name: pluginName,
+      displayName: 'Frontend Plugin',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+    };
+    const internal = manager as unknown as {
+      plugins: Map<string, { state: string; manifest?: typeof restoredManifest; rendererBuild?: object }>;
+      rendererLoadedThisSession: Set<string>;
+      pendingConsentRollback: Map<
+        string,
+        {
+          attemptedVersion: string;
+          backupDir?: string;
+          priorInstalledRecord?: { version: string };
+        }
+      >;
+      marketplaceService: { rollbackInstall: ReturnType<typeof vi.fn> } | null;
+      broadcastUIState: () => void;
+      broadcastUpdateCount: () => void;
+      discoverPlugins: () => Array<{ manifest: typeof restoredManifest; dir: string }>;
+      loadPlugin: (manifest: typeof restoredManifest, dir: string) => Promise<void>;
+      unloadPlugin: (pluginName: string) => Promise<void>;
+      resolvePendingConsentRollback: (pluginName: string, activated: boolean, error?: string) => Promise<void>;
+      withRendererReplacementForUpdate: <T>(pluginName: string, work: () => Promise<T>) => Promise<T>;
+    };
+    internal.broadcastUIState = vi.fn();
+    internal.broadcastUpdateCount = vi.fn();
+    internal.plugins.set(pluginName, { state: 'active', manifest: restoredManifest, rendererBuild: {} });
+    internal.rendererLoadedThisSession.add(pluginName);
+    manager.setRendererReplacementHandler(replacement);
+
+    await internal.withRendererReplacementForUpdate(pluginName, async () => {
+      internal.plugins.set(pluginName, { state: 'error' });
+      internal.pendingConsentRollback.set(pluginName, {
+        attemptedVersion: '2.0.0',
+        backupDir: '/tmp/plugins-test/frontend-plugin.prev',
+        priorInstalledRecord: { version: '1.0.0' },
+      });
+    });
+
+    expect(replacement).toHaveBeenCalledWith(pluginName);
+    expect(manager.getPendingRestart()).toEqual([]);
+    internal.marketplaceService = { rollbackInstall: vi.fn() };
+    internal.unloadPlugin = vi.fn(async () => {
+      internal.plugins.delete(pluginName);
+    });
+    internal.discoverPlugins = () => [{ manifest: restoredManifest, dir: '/tmp/plugins-test/frontend-plugin' }];
+    internal.loadPlugin = vi.fn(async (manifest) => {
+      internal.plugins.set(pluginName, { state: 'active', manifest, rendererBuild: {} });
+      // loadPlugin records a restored frontend as available before the fresh
+      // renderer consumes the following UI-state broadcast.
+      internal.rendererLoadedThisSession.add(pluginName);
+    });
+
+    await internal.resolvePendingConsentRollback(pluginName, false, 'Permission denied by user');
+
+    expect(internal.marketplaceService.rollbackInstall).toHaveBeenCalledOnce();
+    expect(manager.getPendingRestart()).toEqual([]);
+  });
+
+  it('holds the per-plugin lock across disable revocation and renderer replacement', async () => {
+    const manager = makeManager([]);
+    let replacementStarted!: () => void;
+    let releaseReplacement!: () => void;
+    const started = new Promise<void>((resolve) => (replacementStarted = resolve));
+    const replacementGate = new Promise<void>((resolve) => (releaseReplacement = resolve));
+    const replacement = vi.fn(async () => {
+      replacementStarted();
+      await replacementGate;
+    });
+    const concurrentUpdate = vi.fn(async () => undefined);
+    const manifest = {
+      name: 'frontend-plugin',
+      displayName: 'Frontend Plugin',
+      version: '1.0.0',
+      permissions: ['browser:authenticated-session'],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (plugin: typeof manifest, directory: string, state: 'active') => { state: string };
+      plugins: Map<string, { state: string; rendererBuild?: object }>;
+      rendererLoadedThisSession: Set<string>;
+      rendererRevocations: Set<string>;
+      unloadPlugin: (pluginName: string) => Promise<void>;
+      withInstallLock: <T>(pluginName: string, work: () => Promise<T>) => Promise<T>;
+      broadcastUIState: () => void;
+      notifyToolsChanged: () => void;
+      notifyCliToolsChanged: () => void;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/frontend-plugin', 'active');
+    internal.plugins.set('frontend-plugin', { ...instance, rendererBuild: {} });
+    internal.rendererLoadedThisSession.add('frontend-plugin');
+    internal.unloadPlugin = vi.fn(async () => {
+      internal.plugins.delete('frontend-plugin');
+    });
+    internal.broadcastUIState = vi.fn();
+    internal.notifyToolsChanged = vi.fn();
+    internal.notifyCliToolsChanged = vi.fn();
+    manager.setRendererReplacementHandler(replacement);
+
+    const disabling = manager.disablePlugin('frontend-plugin', { persist: false });
+    await started;
+    expect(internal.rendererRevocations.has('frontend-plugin')).toBe(true);
+
+    const updating = internal.withInstallLock('frontend-plugin', concurrentUpdate);
+    await Promise.resolve();
+    expect(concurrentUpdate).not.toHaveBeenCalled();
+
+    releaseReplacement();
+    await disabling;
+    await updating;
+
+    expect(concurrentUpdate).toHaveBeenCalledOnce();
+    expect(internal.rendererRevocations.has('frontend-plugin')).toBe(false);
+    expect(internal.plugins.get('frontend-plugin')?.state).toBe('disabled');
+  });
+
+  it('coalesces enable requests that queued while the plugin was disabled', async () => {
+    const manager = makeManager([]);
+    const pluginName = 'queued-enable';
+    const manifest = {
+      name: pluginName,
+      displayName: 'Queued Enable',
+      version: '1.0.0',
+      permissions: [],
+      capabilities: [],
+    };
+    let releaseBlocker!: () => void;
+    let blockerStarted!: () => void;
+    const blockerGate = new Promise<void>((resolve) => (releaseBlocker = resolve));
+    const blockerEntered = new Promise<void>((resolve) => (blockerStarted = resolve));
+    let releaseLoad!: () => void;
+    let loadStarted!: () => void;
+    const loadGate = new Promise<void>((resolve) => (releaseLoad = resolve));
+    const loadEntered = new Promise<void>((resolve) => (loadStarted = resolve));
+    const internal = manager as unknown as {
+      plugins: Map<string, { state: string; manifest?: typeof manifest }>;
+      withInstallLock: <T>(pluginName: string, work: () => Promise<T>) => Promise<T>;
+      unloadPlugin: (pluginName: string) => Promise<void>;
+      discoverPlugins: () => Array<{ manifest: typeof manifest; dir: string }>;
+      loadPlugin: (pluginManifest: typeof manifest, dir: string) => Promise<void>;
+    };
+    internal.plugins.set(pluginName, { state: 'disabled', manifest });
+    internal.unloadPlugin = vi.fn(async () => {
+      internal.plugins.delete(pluginName);
+    });
+    internal.discoverPlugins = () => [{ manifest, dir: `/tmp/plugins-test/${pluginName}` }];
+    internal.loadPlugin = vi.fn(async () => {
+      loadStarted();
+      await loadGate;
+      internal.plugins.set(pluginName, { state: 'active', manifest });
+    });
+
+    const blocker = internal.withInstallLock(pluginName, async () => {
+      blockerStarted();
+      await blockerGate;
+    });
+    await blockerEntered;
+    const first = manager.enablePlugin(pluginName);
+    const duplicate = manager.enablePlugin(pluginName);
+    releaseBlocker();
+    await blocker;
+    await loadEntered;
+    releaseLoad();
+    await Promise.all([first, duplicate]);
+
+    expect(internal.unloadPlugin).toHaveBeenCalledOnce();
+    expect(internal.loadPlugin).toHaveBeenCalledOnce();
+    expect(internal.plugins.get(pluginName)?.state).toBe('active');
+  });
+
+  it('revokes Browser-authorized inference turns before backend-only deactivation can block', async () => {
+    const manager = makeManager([]);
+    let releaseDeactivate!: () => void;
+    const deactivateGate = new Promise<void>((resolve) => (releaseDeactivate = resolve));
+    const deactivate = vi.fn(() => deactivateGate);
+    const revoke = vi.fn();
+    const manifest = {
+      name: 'backend-inference',
+      displayName: 'Backend Inference',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => {
+        state: string;
+        inferenceProvider: unknown;
+      };
+      plugins: Map<string, { state: string; inferenceProvider: unknown }>;
+      pluginProcesses: Map<string, { deactivate: () => Promise<void> }>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/backend-inference', 'active');
+    const provider = {
+      name: 'Backend AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    };
+    instance.inferenceProvider = provider;
+    internal.plugins.set(manifest.name, instance);
+    internal.pluginProcesses.set(manifest.name, { deactivate });
+    manager.setBrowserAssistantRevocationHandler(revoke);
+
+    const disabling = manager.disablePlugin(manifest.name, { persist: false });
+    await vi.waitFor(() => expect(deactivate).toHaveBeenCalledOnce());
+
+    expect(revoke).toHaveBeenCalled();
+    expect(revoke.mock.invocationCallOrder[0]).toBeLessThan(deactivate.mock.invocationCallOrder[0]);
+    expect(manager.getInferenceProvider()).toBeNull();
+    expect(manager.inferenceProviderHasPermission(provider, 'browser:authenticated-session')).toBe(false);
+
+    releaseDeactivate();
+    await disabling;
+    expect(internal.plugins.get(manifest.name)?.state).toBe('disabled');
+  });
+
+  it('rejects disable and leaves the provider unavailable when Browser revocation fails', async () => {
+    const manager = makeManager([]);
+    const deactivate = vi.fn(async () => undefined);
+    const manifest = {
+      name: 'revocation-failure',
+      displayName: 'Revocation Failure',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => { state: string; tearingDown: boolean; inferenceProvider: PluginInferenceProvider | null };
+      plugins: Map<string, { state: string; tearingDown: boolean; inferenceProvider: PluginInferenceProvider | null }>;
+      pluginProcesses: Map<string, { deactivate: () => Promise<void> }>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/revocation-failure', 'active');
+    const provider = {
+      name: 'Backend AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    instance.inferenceProvider = provider;
+    internal.plugins.set(manifest.name, instance);
+    internal.pluginProcesses.set(manifest.name, { deactivate });
+    manager.setBrowserAssistantRevocationHandler(() => {
+      throw new Error('authority bookkeeping failed');
+    });
+
+    await expect(manager.disablePlugin(manifest.name, { persist: false })).rejects.toThrow(
+      /Browser assistant access could not be revoked/,
+    );
+
+    expect(deactivate).not.toHaveBeenCalled();
+    expect(instance.tearingDown).toBe(true);
+    expect(manager.getInferenceProvider()).toBeNull();
+    expect(manager.inferenceProviderHasPermission(provider, 'browser:authenticated-session')).toBe(false);
+    expect(internal.plugins.get(manifest.name)?.state).toBe('active');
+  });
+
+  it('rejects bulk unload without re-exposing a provider whose Browser revocation failed', async () => {
+    const manager = makeManager([]);
+    const manifest = {
+      name: 'unload-revocation-failure',
+      displayName: 'Unload Revocation Failure',
+      version: '1.0.0',
+      permissions: ['agent:inference-provider', 'browser:authenticated-session'],
+    };
+    const internal = manager as unknown as {
+      createPluginInstance: (
+        plugin: typeof manifest,
+        directory: string,
+        state: 'active',
+      ) => { tearingDown: boolean; inferenceProvider: PluginInferenceProvider | null };
+      plugins: Map<string, { tearingDown: boolean; inferenceProvider: PluginInferenceProvider | null }>;
+    };
+    const instance = internal.createPluginInstance(manifest, '/tmp/plugins-test/unload-revocation-failure', 'active');
+    instance.inferenceProvider = {
+      name: 'Backend AI',
+      isAvailable: () => true,
+      stream: vi.fn(),
+    } as unknown as PluginInferenceProvider;
+    internal.plugins.set(manifest.name, instance);
+    manager.setBrowserAssistantRevocationHandler(() => {
+      throw new Error('authority bookkeeping failed');
+    });
+
+    await expect(manager.unloadAll()).rejects.toThrow(/Browser assistant access could not be revoked/);
+    expect(instance.tearingDown).toBe(true);
+    expect(manager.getInferenceProvider()).toBeNull();
+  });
 });
 
 describe('getMarketplaceStatus', () => {

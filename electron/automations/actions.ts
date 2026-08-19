@@ -4,8 +4,15 @@ import { Notification } from 'electron';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 import { broadcastAgentStreamEvent, isConversationTurnActive } from '../ipc/agent.js';
-import { enqueueInject, hasInjects, drainInjects, reenqueueInject, reenqueueFreshAtFront } from '../agent/inject-queue.js';
+import {
+  enqueueInject,
+  hasInjects,
+  drainInjects,
+  reenqueueInject,
+  reenqueueFreshAtFront,
+} from '../agent/inject-queue.js';
 import { isCompacting } from '../agent/compaction-lock.js';
 import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
 import {
@@ -339,7 +346,7 @@ async function runAgentAction(
   const correlationId =
     opts?.correlationId ?? newDiagnosticCorrelationId(opts?.forceFreshTurn ? 'alert-resume' : 'automation');
   const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
-  const tools = action.tools ? deps.getRegisteredTools() : [];
+  const tools = action.tools ? deps.getRegisteredTools().filter((tool) => tool.source !== 'browser') : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
   // Background mode has no conversation to stream into — keep the simple
@@ -1037,17 +1044,18 @@ async function runAgentAction(
           appendTextPart(ev.text);
           lastEventWasToolResult = false;
         } else if (ev.type === 'tool-call' && ev.toolCallId) {
+          const exposedArgs = redactBrowserToolArgsForExposure(ev.toolName, ev.args);
           pendingToolCalls.set(ev.toolCallId, {
             toolName: ev.toolName ?? 'unknown',
-            args: ev.args,
+            args: exposedArgs,
             startedAt: Date.now(),
           });
           const part: ToolCallPart = {
             type: 'tool-call',
             toolCallId: ev.toolCallId,
             toolName: ev.toolName ?? 'unknown',
-            args: ev.args ?? {},
-            argsText: JSON.stringify(ev.args ?? {}, null, 2),
+            args: exposedArgs ?? {},
+            argsText: JSON.stringify(exposedArgs ?? {}, null, 2),
             startedAt: new Date().toISOString(),
           };
           toolPartById.set(ev.toolCallId, part);
@@ -1225,9 +1233,9 @@ async function runAgentAction(
     // already-committed id, else append; best-effort.
     for (const entry of failedBoundaryUsers) {
       try {
-        const onDisk = ((readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>).some(
-          (m) => m.id === entry.id,
-        );
+        const onDisk = (
+          (readConversation(deps.appHome, conversationId)?.messageTree ?? []) as Array<{ id?: unknown }>
+        ).some((m) => m.id === entry.id);
         if (onDisk) continue;
         const userMsg = {
           id: entry.id,
@@ -1354,7 +1362,11 @@ async function runAgentAction(
   // drains the queue so a transiently-failed follow-up still gets consumed +
   // persisted). Bounded to avoid loops.
   const continueBudget = opts?.continueBudget ?? 3;
-  if (turnSucceeded && continueBudget > 0 && (strandedInjects.length > 0 || (drainRequeued && hasInjects(conversationId)))) {
+  if (
+    turnSucceeded &&
+    continueBudget > 0 &&
+    (strandedInjects.length > 0 || (drainRequeued && hasInjects(conversationId)))
+  ) {
     try {
       // Force the SAME conversation (not per-invocation/singleton re-resolution)
       // and continue on its current branch without appending a new prompt.
@@ -1405,7 +1417,10 @@ async function runSingleAction(
     }
 
     case 'tool': {
-      const tools = [...deps.getRegisteredTools(), ...deps.getWorkspaceTools()];
+      const tools = [
+        ...deps.getRegisteredTools().filter((tool) => tool.source !== 'browser'),
+        ...deps.getWorkspaceTools(),
+      ];
       const tool = tools.find((t) => t.name === action.toolName || t.aliases?.includes(action.toolName));
       if (!tool) throw new Error(`Tool not found: ${action.toolName}`);
       const input = interpolateDeep(action.input, ctx);

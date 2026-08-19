@@ -3,9 +3,25 @@ import type { ComputerUseEvent, ComputerUsePermissionSection, ComputerUseSurface
 import type { AppShotPayload } from '../shared/app-shots.js';
 import type { Appshot } from '../shared/appshots.js';
 import type { DiffEvent, FileDiff } from '../shared/diff-types.js';
+import type {
+  BrowserBookmark,
+  BrowserBounds,
+  BrowserBridge,
+  BrowserCreateTabRequest,
+  BrowserDataClearOptions,
+  BrowserEvent,
+  BrowserMenuAction,
+  BrowserScreenshotRequest,
+  BrowserTabCommand,
+} from '../shared/browser.js';
 import type { AdapterCapabilities, PlatformPermissions } from './platform/types.js';
 import type { PlatformCapabilities } from './platform/capabilities.js';
 import type { CliInstallStatus as CliInstallStatusIpc } from './ipc/cli-install.js';
+import type {
+  ConversationClearResult,
+  ConversationDeleteManyResult,
+  ConversationDeleteResult,
+} from '../shared/conversation-delete.js';
 
 export type AppAPI = typeof appAPI;
 
@@ -82,6 +98,10 @@ const appAPI = {
       >,
     cancelInject: (conversationId: string, id: string) =>
       ipcRenderer.invoke('agent:cancel-inject', conversationId, id) as Promise<{ ok: boolean; text?: string }>,
+    getToolApprovalPrivateDetails: (toolCallId: string) =>
+      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId) as Promise<{
+        browserInput: unknown;
+      } | null>,
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
     dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
@@ -132,11 +152,17 @@ const appAPI = {
     search: (term: string) => ipcRenderer.invoke('conversations:search', term),
     get: (id: string) => ipcRenderer.invoke('conversations:get', id),
     put: (conversation: unknown) => ipcRenderer.invoke('conversations:put', conversation),
-    delete: (id: string) => ipcRenderer.invoke('conversations:delete', id),
-    deleteMany: (ids: string[]) => ipcRenderer.invoke('conversations:deleteMany', ids),
-    clear: () => ipcRenderer.invoke('conversations:clear'),
+    delete: (id: string) => ipcRenderer.invoke('conversations:delete', id) as Promise<ConversationDeleteResult>,
+    deleteMany: (ids: string[]) =>
+      ipcRenderer.invoke('conversations:deleteMany', ids) as Promise<ConversationDeleteManyResult>,
+    clear: () => ipcRenderer.invoke('conversations:clear') as Promise<ConversationClearResult>,
     getActiveId: () => ipcRenderer.invoke('conversations:get-active-id'),
-    setActiveId: (id: string) => ipcRenderer.invoke('conversations:set-active-id', id),
+    setActiveId: (id: string | null, expectedCurrentId?: string | null) =>
+      ipcRenderer.invoke('conversations:set-active-id', id, expectedCurrentId) as Promise<{
+        ok: boolean;
+        error?: 'active-conversation-changed' | 'conversation-not-found';
+        activeConversationId?: string | null;
+      }>,
     fork: (id: string, upToMessageIndex?: number) =>
       ipcRenderer.invoke('conversations:fork', id, upToMessageIndex) as Promise<{
         ok: boolean;
@@ -576,7 +602,7 @@ const appAPI = {
   realtime: {
     startSession: (conversationId: string) =>
       ipcRenderer.invoke('realtime:start-session', conversationId) as Promise<{ ok?: boolean; error?: string }>,
-    endSession: () => ipcRenderer.invoke('realtime:end-session') as Promise<{ ok?: boolean }>,
+    endSession: () => ipcRenderer.invoke('realtime:end-session') as Promise<{ ok?: boolean; error?: string }>,
     sendAudio: (pcmBase64: string) => ipcRenderer.send('realtime:send-audio', pcmBase64),
     getStatus: () => ipcRenderer.invoke('realtime:get-status') as Promise<{ status: string }>,
     onEvent: (callback: (event: unknown) => void) => {
@@ -965,12 +991,109 @@ const appAPI = {
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
   },
 
+  browser: {
+    available: () => ipcRenderer.invoke('browser:available'),
+    getState: (conversationId: string) => ipcRenderer.invoke('browser:get-state', conversationId),
+    getAttentionState: () => ipcRenderer.invoke('browser:get-attention-state'),
+    createTab: (request: BrowserCreateTabRequest) => ipcRenderer.invoke('browser:create-tab', request),
+    commandTab: (conversationId: string, tabId: string, command: BrowserTabCommand) =>
+      ipcRenderer.invoke('browser:command-tab', conversationId, tabId, command),
+    menuAction: (conversationId: string, action: BrowserMenuAction) =>
+      ipcRenderer.invoke('browser:menu-action', conversationId, action),
+    reorderTabs: (conversationId: string, orderedTabIds: string[]) =>
+      ipcRenderer.invoke('browser:reorder-tabs', conversationId, orderedTabIds),
+    navigate: (conversationId: string, tabId: string, input: string) =>
+      ipcRenderer.invoke('browser:navigate', conversationId, tabId, input),
+    mount: (conversationId: string, bounds: BrowserBounds | null) =>
+      ipcRenderer.invoke('browser:mount', conversationId, bounds),
+    setChromeFocus: (conversationId: string, focused: boolean) =>
+      ipcRenderer.invoke('browser:set-chrome-focus', conversationId, focused),
+    find: (
+      conversationId: string,
+      tabId: string,
+      text: string,
+      forward: boolean | undefined,
+      findNext: boolean | undefined,
+      requestId: number,
+    ) => ipcRenderer.invoke('browser:find', conversationId, tabId, text, forward, findNext, requestId),
+    stopFind: (conversationId: string, tabId: string) => ipcRenderer.invoke('browser:stop-find', conversationId, tabId),
+    setZoom: (conversationId: string, tabId: string, level: number) =>
+      ipcRenderer.invoke('browser:set-zoom', conversationId, tabId, level),
+    screenshot: (conversationId: string, request: BrowserScreenshotRequest) =>
+      ipcRenderer.invoke('browser:screenshot', conversationId, request),
+    pickElement: (conversationId: string, tabId: string) =>
+      ipcRenderer.invoke('browser:pick-element', conversationId, tabId),
+    listHistory: (conversationId: string, query?: string) =>
+      ipcRenderer.invoke('browser:list-history', conversationId, query),
+    clearHistory: (conversationId: string) => ipcRenderer.invoke('browser:clear-history', conversationId),
+    listBookmarks: (conversationId: string, query?: string) =>
+      ipcRenderer.invoke('browser:list-bookmarks', conversationId, query),
+    addBookmark: (conversationId: string, title: string, url: string, folder?: string) =>
+      ipcRenderer.invoke('browser:add-bookmark', conversationId, title, url, folder),
+    updateBookmark: (conversationId: string, bookmark: BrowserBookmark) =>
+      ipcRenderer.invoke('browser:update-bookmark', conversationId, bookmark),
+    removeBookmark: (conversationId: string, bookmarkId: string) =>
+      ipcRenderer.invoke('browser:remove-bookmark', conversationId, bookmarkId),
+    reorderBookmarks: (conversationId: string, orderedBookmarkIds: string[]) =>
+      ipcRenderer.invoke('browser:reorder-bookmarks', conversationId, orderedBookmarkIds),
+    importBookmarks: (conversationId: string) => ipcRenderer.invoke('browser:import-bookmarks', conversationId),
+    exportBookmarks: (conversationId: string) => ipcRenderer.invoke('browser:export-bookmarks', conversationId),
+    listDownloads: (conversationId: string) => ipcRenderer.invoke('browser:list-downloads', conversationId),
+    showDownload: (conversationId: string, downloadId: string) =>
+      ipcRenderer.invoke('browser:show-download', conversationId, downloadId),
+    cancelDownload: (conversationId: string, downloadId: string) =>
+      ipcRenderer.invoke('browser:cancel-download', conversationId, downloadId),
+    listSitePermissions: (conversationId: string, origin: string) =>
+      ipcRenderer.invoke('browser:list-site-permissions', conversationId, origin),
+    resetSitePermissions: (conversationId: string, origin: string, permission?: string) =>
+      ipcRenderer.invoke('browser:reset-site-permissions', conversationId, origin, permission),
+    listCredentials: (conversationId: string, query?: string) =>
+      ipcRenderer.invoke('browser:list-credentials', conversationId, query),
+    credentialAuthenticationAvailable: () => ipcRenderer.invoke('browser:credential-authentication-available'),
+    saveCredential: (conversationId: string, origin: string, username: string, password: string) =>
+      ipcRenderer.invoke('browser:save-credential', conversationId, origin, username, password),
+    updateCredential: (conversationId: string, credentialId: string, username: string, password: string) =>
+      ipcRenderer.invoke('browser:update-credential', conversationId, credentialId, username, password),
+    deleteCredential: (conversationId: string, credentialId: string) =>
+      ipcRenderer.invoke('browser:delete-credential', conversationId, credentialId),
+    revealCredential: (conversationId: string, credentialId: string) =>
+      ipcRenderer.invoke('browser:reveal-credential', conversationId, credentialId),
+    copyCredential: (conversationId: string, credentialId: string) =>
+      ipcRenderer.invoke('browser:copy-credential', conversationId, credentialId),
+    respondCredentialPrompt: (promptId: string, save: boolean) =>
+      ipcRenderer.invoke('browser:respond-credential', promptId, save),
+    respondAuthPrompt: (promptId: string, username?: string, password?: string) =>
+      ipcRenderer.invoke('browser:respond-auth', promptId, username, password),
+    respondPermissionPrompt: (promptId: string, decision: 'allow-once' | 'allow' | 'deny') =>
+      ipcRenderer.invoke('browser:respond-permission', promptId, decision),
+    autofill: (conversationId: string, tabId: string, credentialId?: string) =>
+      ipcRenderer.invoke('browser:autofill', conversationId, tabId, credentialId),
+    dataSummary: (conversationId?: string) => ipcRenderer.invoke('browser:data-summary', conversationId),
+    clearData: (options: BrowserDataClearOptions) => ipcRenderer.invoke('browser:clear-data', options),
+    onEvent: (callback: (event: BrowserEvent) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, browserEvent: BrowserEvent) => callback(browserEvent);
+      ipcRenderer.on('browser:event', handler);
+      return () => ipcRenderer.removeListener('browser:event', handler);
+    },
+  } satisfies BrowserBridge,
+
   partitions: {
-    list: () => ipcRenderer.invoke('partitions:list') as Promise<Array<{ name: string; sizeBytes: number }>>,
+    list: () =>
+      ipcRenderer.invoke('partitions:list') as Promise<
+        Array<{
+          name: string;
+          displayName?: string;
+          sizeBytes: number;
+          quarantined?: boolean;
+          recoveryRequired?: 'all-plugin-partitions';
+          corruptMarkerCount?: number;
+        }>
+      >,
     delete: (names: string[]) =>
       ipcRenderer.invoke('partitions:delete', names) as Promise<{
         success?: boolean;
         deleted?: string[];
+        recoveredCorruptMarkers?: number;
         error?: string;
       }>,
   },
@@ -1160,3 +1283,6 @@ const appAPI = {
 };
 
 contextBridge.exposeInMainWorld('app', appAPI);
+// Do not expose this capability to page code. Main enables Browser IPC only
+// after a newly loaded preload has installed the replacement context bridge.
+ipcRenderer.send('browser:host-renderer-ready');

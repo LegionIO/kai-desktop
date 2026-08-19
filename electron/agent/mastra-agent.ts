@@ -29,9 +29,14 @@ import { sanitizeMessagesForModel, deepSanitizeMessages } from './message-saniti
 import { applyPromptCachingToMessages, buildAnthropicCacheControl } from './prompt-caching.js';
 import { DEFAULT_PLAN_PROMPT } from './prompts.js';
 import { didHitStepLimit } from './step-limit.js';
-import { buildMastraPrepareStep, drainInjectConsumedMarkers, clearInjectConsumedMarkers } from './prepare-step-inject.js';
+import {
+  buildMastraPrepareStep,
+  drainInjectConsumedMarkers,
+  clearInjectConsumedMarkers,
+} from './prepare-step-inject.js';
 import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { redactBrowserErrorForExposure, redactBrowserToolErrorForExposure } from '../../shared/browser.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -272,7 +277,10 @@ function toMastraTools(
   hooks?: {
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
-  executionContext?: Pick<ToolExecutionContext, 'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey'>,
+  executionContext?: Pick<
+    ToolExecutionContext,
+    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'browserOwnerId'
+  >,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
   // tool named "__proto__"/"constructor" must create a plain entry, not invoke a
@@ -323,6 +331,7 @@ function toMastraTools(
           const ctx: ToolExecutionContext = {
             toolCallId,
             conversationId,
+            browserOwnerId: executionContext?.browserOwnerId,
             cwd: executionContext?.cwd,
             isHeadless: executionContext?.isHeadless,
             parentProfileKey: executionContext?.parentProfileKey,
@@ -1213,6 +1222,7 @@ export async function* streamAgentResponse(
      *  inherit the parent's profile + fallback chain. */
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
@@ -1276,6 +1286,7 @@ export async function* streamAgentResponse(
       isHeadless: options?.isHeadless,
       parentProfileKey: options?.parentProfileKey,
       parentModelKey: options?.parentModelKey,
+      browserOwnerId: options?.browserOwnerId,
     },
   );
   const providerDefinedTools = buildProviderDefinedTools(modelConfig);
@@ -1510,6 +1521,7 @@ async function* generateWithSyntheticEvents(
       break;
     } catch (error) {
       const emittedAnyOutput = eventQueue.length > 0;
+      const exposedErrorMessage = redactBrowserErrorForExposure(error);
       // If the caller aborted, do NOT retry — skip all retry branches and fall
       // through to the terminal path (which suppresses the error event for an
       // abort). Otherwise a cancel during the error/backoff window would still
@@ -1525,7 +1537,7 @@ async function* generateWithSyntheticEvents(
         activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
         console.warn(
           `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
-          getErrorMessage(error),
+          exposedErrorMessage,
         );
         continue;
       }
@@ -1534,7 +1546,7 @@ async function* generateWithSyntheticEvents(
         activeMessages = deepSanitizeMessages(activeMessages);
         console.warn(
           `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
-          getErrorMessage(error),
+          exposedErrorMessage,
         );
         continue;
       }
@@ -1546,7 +1558,7 @@ async function* generateWithSyntheticEvents(
         const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
         console.warn(
           `[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
-          errorInfo.message,
+          exposedErrorMessage,
         );
 
         yield {
@@ -1556,7 +1568,7 @@ async function* generateWithSyntheticEvents(
             attempt: attempt + 1,
             maxRetries: MAX_RETRIES,
             delayMs: delay,
-            reason: errorInfo.message,
+            reason: exposedErrorMessage,
             category: errorInfo.category,
           },
         };
@@ -1570,11 +1582,11 @@ async function* generateWithSyntheticEvents(
       }
 
       if (!options?.abortSignal?.aborted) {
-        console.error(`[Agent] Generate error for ${conversationId}:`, error);
+        console.error(`[Agent] Generate error for ${conversationId}:`, exposedErrorMessage);
         yield {
           conversationId,
           type: 'error',
-          error: error instanceof Error ? error.message : String(error),
+          error: exposedErrorMessage,
           errorCategory: errorInfo.category,
           errorStatusCode: errorInfo.statusCode,
         };
@@ -1639,414 +1651,416 @@ async function* streamWithRealEvents(
 
   try {
     compatibilityLoop: while (true) {
-    let requestCompleted = false;
-    let compatibilityRetryRequested = false;
-    let sanitizationRetryRequested = false;
-    const agent = await buildAgent(activeModelConfig);
+      let requestCompleted = false;
+      let compatibilityRetryRequested = false;
+      let sanitizationRetryRequested = false;
+      const agent = await buildAgent(activeModelConfig);
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-      try {
-        console.info(
-          `[Agent] Starting stream for ${conversationId}${attempt > 0 ? ` (retry ${attempt})` : ''}${compatibilityRetried ? ' [temp-omitted]' : ''}`,
-        );
-        const memoryOptions = buildMastraMemoryOptions(conversationId, memory, config);
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+        try {
+          console.info(
+            `[Agent] Starting stream for ${conversationId}${attempt > 0 ? ` (retry ${attempt})` : ''}${compatibilityRetried ? ' [temp-omitted]' : ''}`,
+          );
+          const memoryOptions = buildMastraMemoryOptions(conversationId, memory, config);
 
-        const streamOptions = {
-          maxSteps: maxStepsLimit,
-          abortSignal: options?.abortSignal,
-          // Cooperative mid-turn injection: drain the conversation's inject queue
-          // at each step boundary and splice queued follow-ups into this turn's
-          // context (no abort). No-op when the queue is empty.
-          prepareStep: buildMastraPrepareStep(conversationId, undefined, options?.onInjected),
-          experimental_generateMessageId: () => responseMessageId,
-          ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
-          ...(providerOptions ? { providerOptions } : {}),
-          ...(memoryOptions ?? {}),
-        };
-        const stream = agent.stream.bind(agent) as unknown as (
-          messageInput: Parameters<typeof agent.stream>[0],
-          options: Record<string, unknown>,
-        ) => ReturnType<typeof agent.stream>;
-        const streamResult = await stream(activeMessages as Parameters<typeof agent.stream>[0], streamOptions);
+          const streamOptions = {
+            maxSteps: maxStepsLimit,
+            abortSignal: options?.abortSignal,
+            // Cooperative mid-turn injection: drain the conversation's inject queue
+            // at each step boundary and splice queued follow-ups into this turn's
+            // context (no abort). No-op when the queue is empty.
+            prepareStep: buildMastraPrepareStep(conversationId, undefined, options?.onInjected),
+            experimental_generateMessageId: () => responseMessageId,
+            ...(Object.keys(activeModelSettings).length > 0 ? { modelSettings: activeModelSettings } : {}),
+            ...(providerOptions ? { providerOptions } : {}),
+            ...(memoryOptions ?? {}),
+          };
+          const stream = agent.stream.bind(agent) as unknown as (
+            messageInput: Parameters<typeof agent.stream>[0],
+            options: Record<string, unknown>,
+          ) => ReturnType<typeof agent.stream>;
+          const streamResult = await stream(activeMessages as Parameters<typeof agent.stream>[0], streamOptions);
 
-        const fullStream = streamResult.fullStream;
-        const iterator =
-          Symbol.asyncIterator in (fullStream as object)
-            ? (fullStream as AsyncIterable<unknown>)
-            : asAsyncIterable(fullStream as ReadableStream<unknown>);
+          const fullStream = streamResult.fullStream;
+          const iterator =
+            Symbol.asyncIterator in (fullStream as object)
+              ? (fullStream as AsyncIterable<unknown>)
+              : asAsyncIterable(fullStream as ReadableStream<unknown>);
 
-        for await (const chunk of iterator) {
-          // Surface injects prepareStep consumed for a step whose PRIOR step has
-          // now been fully consumed (currentStepCount steps finished). Tying the
-          // marker to the step number — rather than "the next chunk" — is race-free
-          // even when the upstream pipeline buffers ahead: a marker for step N is
-          // only emitted once step N-1's chunks (incl. its tool-result) are in the
-          // accumulator, so the boundary can't split before a buffered tool result.
-          const consumedBatches = drainInjectConsumedMarkers(conversationId, currentStepCount);
-          for (const batch of consumedBatches) {
+          for await (const chunk of iterator) {
+            // Surface injects prepareStep consumed for a step whose PRIOR step has
+            // now been fully consumed (currentStepCount steps finished). Tying the
+            // marker to the step number — rather than "the next chunk" — is race-free
+            // even when the upstream pipeline buffers ahead: a marker for step N is
+            // only emitted once step N-1's chunks (incl. its tool-result) are in the
+            // accumulator, so the boundary can't split before a buffered tool result.
+            const consumedBatches = drainInjectConsumedMarkers(conversationId, currentStepCount);
+            for (const batch of consumedBatches) {
+              yield {
+                conversationId,
+                type: 'inject-consumed',
+                data: { entries: batch },
+              };
+            }
+            const c = chunk as RawStreamChunk;
+            const type = c?.type;
+            const payload = (c?.payload ?? c) as Record<string, unknown> | undefined;
+
+            if (type === 'text-delta') {
+              const text = extractStreamText(payload);
+              if (!text) continue;
+              emittedAnyOutput = true;
+              yield {
+                conversationId,
+                type: 'text-delta',
+                text,
+              };
+            } else if (type === 'tool-call') {
+              emittedAnyOutput = true;
+              const toolCallId = (payload?.toolCallId as string) ?? `tc-${Date.now()}`;
+              const toolName = (payload?.toolName as string) ?? 'unknown';
+              const startedAt = new Date().toISOString();
+              traceDiagnostic({
+                scope: 'agent',
+                event: 'stream.tool-call',
+                conversationId,
+                toolName,
+                fields: { toolCallId, rawToolName: payload?.toolName ?? null },
+              });
+              toolStartByCallId.set(toolCallId, { startedAt, toolName });
+              yield {
+                conversationId,
+                type: 'tool-call',
+                toolCallId,
+                toolName,
+                args: payload?.args ?? {},
+                startedAt,
+              };
+            } else if (type === 'tool-result') {
+              emittedAnyOutput = true;
+              const toolCallId = (payload?.toolCallId as string) ?? '';
+              const finishedAt = new Date().toISOString();
+              const started = toolStartByCallId.get(toolCallId);
+              toolStartByCallId.delete(toolCallId);
+              yield {
+                conversationId,
+                type: 'tool-result',
+                toolCallId,
+                toolName: (payload?.toolName as string) ?? started?.toolName ?? '',
+                result: payload?.result,
+                startedAt: started?.startedAt ?? finishedAt,
+                finishedAt,
+              };
+            } else if (type === 'tool-error') {
+              emittedAnyOutput = true;
+              const toolCallId = (payload?.toolCallId as string) ?? '';
+              const finishedAt = new Date().toISOString();
+              const started = toolStartByCallId.get(toolCallId);
+              toolStartByCallId.delete(toolCallId);
+              const toolName = (payload?.toolName as string) ?? started?.toolName ?? '';
+              yield {
+                conversationId,
+                type: 'tool-result',
+                toolCallId,
+                toolName,
+                result: { isError: true, error: redactBrowserToolErrorForExposure(toolName, payload?.error) },
+                startedAt: started?.startedAt ?? finishedAt,
+                finishedAt,
+              };
+            } else if (type === 'error') {
+              const rawError = payload?.error ?? payload ?? 'Unknown stream error';
+              const errorMessage = redactBrowserErrorForExposure(rawError);
+              if (
+                !compatibilityRetried &&
+                shouldRetryWithoutTemperature(rawError, activeModelSettings, emittedAnyOutput)
+              ) {
+                compatibilityRetried = true;
+                activeModelSettings = omitTemperature(activeModelSettings);
+                activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
+                compatibilityRetryRequested = true;
+                console.warn(
+                  `[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`,
+                  errorMessage,
+                );
+                break;
+              }
+              if (!sanitizationRetried && shouldRetryWithSanitizedMessages(rawError, emittedAnyOutput)) {
+                sanitizationRetried = true;
+                activeMessages = deepSanitizeMessages(activeMessages);
+                sanitizationRetryRequested = true;
+                console.warn(
+                  `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`,
+                  errorMessage,
+                );
+                break;
+              }
+
+              emittedTerminalError = true;
+              const inStreamErrorInfo = classifyError(rawError);
+              yield {
+                conversationId,
+                type: 'error',
+                error: errorMessage,
+                errorCategory: inStreamErrorInfo.category,
+                errorStatusCode: inStreamErrorInfo.statusCode,
+              };
+            } else if (type === 'finish') {
+              const finishReason = extractStreamFinishReason(payload);
+              if (finishReason) {
+                terminalFinishReason = finishReason;
+              }
+              if (finishReason === 'error' && !emittedTerminalError && !options?.abortSignal?.aborted) {
+                emittedTerminalError = true;
+                yield {
+                  conversationId,
+                  type: 'error',
+                  error: 'The model ended the stream with an error.',
+                };
+              }
+            } else if (type === 'step-finish') {
+              const finishReason = extractStreamFinishReason(payload);
+              currentStepCount += 1;
+              emittedAnyOutput = true;
+              yield {
+                conversationId,
+                type: 'step-progress',
+                stepInfo: {
+                  currentStep: currentStepCount,
+                  maxSteps: maxStepsLimit,
+                  hitLimit: false,
+                  taskComplete: false,
+                },
+              };
+
+              if (finishReason) {
+                terminalFinishReason = finishReason;
+              }
+              if (finishReason === 'content-filter') {
+                console.info(`[Agent] Ending stream early for ${conversationId} after content-filter step finish`);
+                break;
+              }
+              // Accumulate token usage from each step.
+              // Mastra wraps the AI SDK step result — usage may sit at
+              // payload.usage (direct) or payload.output.usage (wrapped).
+              // Key names also vary: openai-compat uses inputTokens/outputTokens,
+              // Anthropic uses promptTokens/completionTokens.
+              const payloadOutput = payload?.output as Record<string, unknown> | undefined;
+              const stepUsage = (payload?.usage ?? payloadOutput?.usage) as
+                | { promptTokens?: number; completionTokens?: number; inputTokens?: number; outputTokens?: number }
+                | undefined;
+              if (stepUsage) {
+                accInputTokens += stepUsage.promptTokens ?? stepUsage.inputTokens ?? 0;
+                accOutputTokens += stepUsage.completionTokens ?? stepUsage.outputTokens ?? 0;
+              }
+              // Extract Anthropic cache token info from providerMetadata or directly from usage
+              const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
+                | Record<string, unknown>
+                | undefined;
+              const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
+              if (anthropicMeta) {
+                accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
+                accCacheWriteTokens += (anthropicMeta.cacheCreationInputTokens as number | undefined) ?? 0;
+              }
+              const bedrockMeta = stepMeta?.bedrock as { usage?: Record<string, unknown> } | undefined;
+              if (bedrockMeta?.usage) {
+                accCacheReadTokens += (bedrockMeta.usage.cacheReadInputTokens as number | undefined) ?? 0;
+                accCacheWriteTokens += (bedrockMeta.usage.cacheWriteInputTokens as number | undefined) ?? 0;
+              }
+              // openai-compat provider puts cache tokens directly on usage
+              if (stepUsage) {
+                accCacheReadTokens += ((stepUsage as Record<string, unknown>).cachedInputTokens as number) ?? 0;
+              }
+            } else if (type && isExpectedMastraStructuralEvent(type)) {
+              continue;
+            } else if (type) {
+              // Silently ignore workspace metadata and sandbox events — they are
+              // handled by the task agent stream consumer in agents.ts
+            }
+          }
+
+          // The chunk loop ended: emit any inject marker recorded on the final step
+          // (its prior step is necessarily done now) so a last-step follow-up still
+          // splits the branch. Use a high consumed-steps bound.
+          const trailingBatches = drainInjectConsumedMarkers(conversationId, Number.MAX_SAFE_INTEGER);
+          for (const batch of trailingBatches) {
             yield {
               conversationId,
               type: 'inject-consumed',
               data: { entries: batch },
             };
           }
-          const c = chunk as RawStreamChunk;
-          const type = c?.type;
-          const payload = (c?.payload ?? c) as Record<string, unknown> | undefined;
 
-          if (type === 'text-delta') {
-            const text = extractStreamText(payload);
-            if (!text) continue;
-            emittedAnyOutput = true;
+          if (compatibilityRetryRequested || sanitizationRetryRequested) {
+            // Signal a restart so cooperative-injection consumers (automations)
+            // replay any inject drained by prepareStep this attempt — this loop
+            // restarts from activeMessages with the queue already emptied.
             yield {
               conversationId,
-              type: 'text-delta',
-              text,
+              type: 'retry',
+              data: {
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES,
+                delayMs: 0,
+                reason: 'Adjusting request for provider compatibility',
+                category: 'compatibility',
+              },
             };
-          } else if (type === 'tool-call') {
-            emittedAnyOutput = true;
-            const toolCallId = (payload?.toolCallId as string) ?? `tc-${Date.now()}`;
-            const toolName = (payload?.toolName as string) ?? 'unknown';
-            const startedAt = new Date().toISOString();
-            traceDiagnostic({
-              scope: 'agent',
-              event: 'stream.tool-call',
-              conversationId,
-              toolName,
-              fields: { toolCallId, rawToolName: payload?.toolName ?? null },
-            });
-            toolStartByCallId.set(toolCallId, { startedAt, toolName });
-            yield {
-              conversationId,
-              type: 'tool-call',
-              toolCallId,
-              toolName,
-              args: payload?.args ?? {},
-              startedAt,
-            };
-          } else if (type === 'tool-result') {
-            emittedAnyOutput = true;
-            const toolCallId = (payload?.toolCallId as string) ?? '';
-            const finishedAt = new Date().toISOString();
-            const started = toolStartByCallId.get(toolCallId);
-            toolStartByCallId.delete(toolCallId);
-            yield {
-              conversationId,
-              type: 'tool-result',
-              toolCallId,
-              toolName: (payload?.toolName as string) ?? started?.toolName ?? '',
-              result: payload?.result,
-              startedAt: started?.startedAt ?? finishedAt,
-              finishedAt,
-            };
-          } else if (type === 'tool-error') {
-            emittedAnyOutput = true;
-            const toolCallId = (payload?.toolCallId as string) ?? '';
-            const finishedAt = new Date().toISOString();
-            const started = toolStartByCallId.get(toolCallId);
-            toolStartByCallId.delete(toolCallId);
-            yield {
-              conversationId,
-              type: 'tool-result',
-              toolCallId,
-              toolName: (payload?.toolName as string) ?? started?.toolName ?? '',
-              result: { isError: true, error: payload?.error },
-              startedAt: started?.startedAt ?? finishedAt,
-              finishedAt,
-            };
-          } else if (type === 'error') {
-            const rawError = payload?.error ?? payload ?? 'Unknown stream error';
-            const errorMessage = getErrorMessage(rawError);
-            if (
-              !compatibilityRetried &&
-              shouldRetryWithoutTemperature(rawError, activeModelSettings, emittedAnyOutput)
-            ) {
-              compatibilityRetried = true;
-              activeModelSettings = omitTemperature(activeModelSettings);
-              activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
-              compatibilityRetryRequested = true;
-              console.warn(
-                `[Agent] Retrying ${conversationId} without temperature after compatibility stream error:`,
-                errorMessage,
-              );
-              break;
-            }
-            if (!sanitizationRetried && shouldRetryWithSanitizedMessages(rawError, emittedAnyOutput)) {
-              sanitizationRetried = true;
-              activeMessages = deepSanitizeMessages(activeMessages);
-              sanitizationRetryRequested = true;
-              console.warn(
-                `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch stream error:`,
-                errorMessage,
-              );
-              break;
-            }
+            continue compatibilityLoop;
+          }
 
-            emittedTerminalError = true;
-            const inStreamErrorInfo = classifyError(rawError);
+          console.info(`[Agent] Stream completed for ${conversationId}`);
+          requestCompleted = true;
+          clearInjectConsumedMarkers(conversationId);
+          break;
+        } catch (error) {
+          if (options?.abortSignal?.aborted) break compatibilityLoop;
+          const exposedErrorMessage = redactBrowserErrorForExposure(error);
+
+          // Temperature compatibility retry (special case — not counted as a retry attempt)
+          if (!compatibilityRetried && shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)) {
+            compatibilityRetried = true;
+            activeModelSettings = omitTemperature(activeModelSettings);
+            activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
+            console.warn(
+              `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
+              exposedErrorMessage,
+            );
             yield {
               conversationId,
-              type: 'error',
-              error: errorMessage,
-              errorCategory: inStreamErrorInfo.category,
-              errorStatusCode: inStreamErrorInfo.statusCode,
+              type: 'retry',
+              data: {
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES,
+                delayMs: 0,
+                reason: 'Retrying without temperature for provider compatibility',
+                category: 'compatibility',
+              },
             };
-          } else if (type === 'finish') {
-            const finishReason = extractStreamFinishReason(payload);
-            if (finishReason) {
-              terminalFinishReason = finishReason;
-            }
-            if (finishReason === 'error' && !emittedTerminalError && !options?.abortSignal?.aborted) {
-              emittedTerminalError = true;
-              yield {
-                conversationId,
-                type: 'error',
-                error: 'The model ended the stream with an error.',
-              };
-            }
-          } else if (type === 'step-finish') {
-            const finishReason = extractStreamFinishReason(payload);
-            currentStepCount += 1;
-            emittedAnyOutput = true;
+            continue compatibilityLoop;
+          }
+
+          // Provider metadata sanitization retry (special case — not counted as a retry attempt)
+          if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
+            sanitizationRetried = true;
+            activeMessages = deepSanitizeMessages(activeMessages);
+            console.warn(
+              `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
+              exposedErrorMessage,
+            );
             yield {
               conversationId,
-              type: 'step-progress',
-              stepInfo: {
-                currentStep: currentStepCount,
-                maxSteps: maxStepsLimit,
-                hitLimit: false,
-                taskComplete: false,
+              type: 'retry',
+              data: {
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES,
+                delayMs: 0,
+                reason: 'Retrying with sanitized messages for provider compatibility',
+                category: 'compatibility',
+              },
+            };
+            continue compatibilityLoop;
+          }
+
+          // Classify error for retry decision
+          const errorInfo = classifyError(error);
+
+          // Only retry transient errors when no content has been emitted
+          if (isSameModelRetryable(errorInfo) && !emittedAnyOutput && attempt < MAX_RETRIES) {
+            const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
+            console.warn(
+              `[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
+              exposedErrorMessage,
+            );
+
+            // Emit retry event so UI can show progress
+            yield {
+              conversationId,
+              type: 'retry',
+              data: {
+                attempt: attempt + 1,
+                maxRetries: MAX_RETRIES,
+                delayMs: delay,
+                reason: exposedErrorMessage,
+                category: errorInfo.category,
               },
             };
 
-            if (finishReason) {
-              terminalFinishReason = finishReason;
-            }
-            if (finishReason === 'content-filter') {
-              console.info(`[Agent] Ending stream early for ${conversationId} after content-filter step finish`);
-              break;
-            }
-            // Accumulate token usage from each step.
-            // Mastra wraps the AI SDK step result — usage may sit at
-            // payload.usage (direct) or payload.output.usage (wrapped).
-            // Key names also vary: openai-compat uses inputTokens/outputTokens,
-            // Anthropic uses promptTokens/completionTokens.
-            const payloadOutput = payload?.output as Record<string, unknown> | undefined;
-            const stepUsage = (payload?.usage ?? payloadOutput?.usage) as
-              | { promptTokens?: number; completionTokens?: number; inputTokens?: number; outputTokens?: number }
-              | undefined;
-            if (stepUsage) {
-              accInputTokens += stepUsage.promptTokens ?? stepUsage.inputTokens ?? 0;
-              accOutputTokens += stepUsage.completionTokens ?? stepUsage.outputTokens ?? 0;
-            }
-            // Extract Anthropic cache token info from providerMetadata or directly from usage
-            const stepMeta = (payload?.providerMetadata ?? payloadOutput?.providerMetadata) as
-              | Record<string, unknown>
-              | undefined;
-            const anthropicMeta = stepMeta?.anthropic as Record<string, unknown> | undefined;
-            if (anthropicMeta) {
-              accCacheReadTokens += (anthropicMeta.cacheReadInputTokens as number | undefined) ?? 0;
-              accCacheWriteTokens += (anthropicMeta.cacheCreationInputTokens as number | undefined) ?? 0;
-            }
-            const bedrockMeta = stepMeta?.bedrock as { usage?: Record<string, unknown> } | undefined;
-            if (bedrockMeta?.usage) {
-              accCacheReadTokens += (bedrockMeta.usage.cacheReadInputTokens as number | undefined) ?? 0;
-              accCacheWriteTokens += (bedrockMeta.usage.cacheWriteInputTokens as number | undefined) ?? 0;
-            }
-            // openai-compat provider puts cache tokens directly on usage
-            if (stepUsage) {
-              accCacheReadTokens += ((stepUsage as Record<string, unknown>).cachedInputTokens as number) ?? 0;
-            }
-          } else if (type && isExpectedMastraStructuralEvent(type)) {
+            await sleep(delay);
+            // Abort may have fired DURING the backoff sleep — re-check before
+            // starting another attempt so a cancelled turn doesn't open a new
+            // stream with an already-aborted signal.
+            if (options?.abortSignal?.aborted) break compatibilityLoop;
             continue;
-          } else if (type) {
-            // Silently ignore workspace metadata and sandbox events — they are
-            // handled by the task agent stream consumer in agents.ts
           }
-        }
 
-        // The chunk loop ended: emit any inject marker recorded on the final step
-        // (its prior step is necessarily done now) so a last-step follow-up still
-        // splits the branch. Use a high consumed-steps bound.
-        const trailingBatches = drainInjectConsumedMarkers(conversationId, Number.MAX_SAFE_INTEGER);
-        for (const batch of trailingBatches) {
+          console.error(`[Agent] Stream error for ${conversationId}:`, exposedErrorMessage);
+          emittedTerminalError = true;
           yield {
             conversationId,
-            type: 'inject-consumed',
-            data: { entries: batch },
+            type: 'error',
+            error: exposedErrorMessage,
+            errorCategory: errorInfo.category,
+            errorStatusCode: errorInfo.statusCode,
           };
         }
+      }
 
-        if (compatibilityRetryRequested || sanitizationRetryRequested) {
-          // Signal a restart so cooperative-injection consumers (automations)
-          // replay any inject drained by prepareStep this attempt — this loop
-          // restarts from activeMessages with the queue already emptied.
-          yield {
-            conversationId,
-            type: 'retry',
-            data: {
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES,
-              delayMs: 0,
-              reason: 'Adjusting request for provider compatibility',
-              category: 'compatibility',
-            },
-          };
-          continue compatibilityLoop;
-        }
-
-        console.info(`[Agent] Stream completed for ${conversationId}`);
-        requestCompleted = true;
-        clearInjectConsumedMarkers(conversationId);
+      if (requestCompleted || options?.abortSignal?.aborted) {
         break;
-      } catch (error) {
-        if (options?.abortSignal?.aborted) break compatibilityLoop;
+      }
 
-        // Temperature compatibility retry (special case — not counted as a retry attempt)
-        if (!compatibilityRetried && shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)) {
-          compatibilityRetried = true;
-          activeModelSettings = omitTemperature(activeModelSettings);
-          activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
-          console.warn(
-            `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
-            getErrorMessage(error),
-          );
-          yield {
-            conversationId,
-            type: 'retry',
-            data: {
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES,
-              delayMs: 0,
-              reason: 'Retrying without temperature for provider compatibility',
-              category: 'compatibility',
-            },
-          };
-          continue compatibilityLoop;
-        }
+      break;
+    }
 
-        // Provider metadata sanitization retry (special case — not counted as a retry attempt)
-        if (!sanitizationRetried && shouldRetryWithSanitizedMessages(error, emittedAnyOutput)) {
-          sanitizationRetried = true;
-          activeMessages = deepSanitizeMessages(activeMessages);
-          console.warn(
-            `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
-            getErrorMessage(error),
-          );
-          yield {
-            conversationId,
-            type: 'retry',
-            data: {
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES,
-              delayMs: 0,
-              reason: 'Retrying with sanitized messages for provider compatibility',
-              category: 'compatibility',
-            },
-          };
-          continue compatibilityLoop;
-        }
-
-        // Classify error for retry decision
-        const errorInfo = classifyError(error);
-
-        // Only retry transient errors when no content has been emitted
-        if (isSameModelRetryable(errorInfo) && !emittedAnyOutput && attempt < MAX_RETRIES) {
-          const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
-          console.warn(
-            `[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
-            errorInfo.message,
-          );
-
-          // Emit retry event so UI can show progress
-          yield {
-            conversationId,
-            type: 'retry',
-            data: {
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES,
-              delayMs: delay,
-              reason: errorInfo.message,
-              category: errorInfo.category,
-            },
-          };
-
-          await sleep(delay);
-          // Abort may have fired DURING the backoff sleep — re-check before
-          // starting another attempt so a cancelled turn doesn't open a new
-          // stream with an already-aborted signal.
-          if (options?.abortSignal?.aborted) break compatibilityLoop;
-          continue;
-        }
-
-        console.error(`[Agent] Stream error for ${conversationId}:`, error);
-        emittedTerminalError = true;
+    if (options?.abortSignal?.aborted) {
+      const finishedAt = new Date().toISOString();
+      for (const [toolCallId, toolState] of toolStartByCallId.entries()) {
         yield {
           conversationId,
-          type: 'error',
-          error: getErrorMessage(error),
-          errorCategory: errorInfo.category,
-          errorStatusCode: errorInfo.statusCode,
+          type: 'tool-result',
+          toolCallId,
+          toolName: toolState.toolName,
+          result: { isError: true, error: 'Tool execution cancelled.' },
+          startedAt: toolState.startedAt,
+          finishedAt,
         };
       }
     }
 
-    if (requestCompleted || options?.abortSignal?.aborted) {
-      break;
-    }
+    const hitStepLimit = didHitStepLimit({
+      currentStepCount,
+      maxStepsLimit,
+      terminalFinishReason,
+    });
 
-    break;
-  }
-
-  if (options?.abortSignal?.aborted) {
-    const finishedAt = new Date().toISOString();
-    for (const [toolCallId, toolState] of toolStartByCallId.entries()) {
+    if (hitStepLimit && !maxStepsReachedEmitted) {
+      maxStepsReachedEmitted = true;
+      console.warn(`[Agent] Max steps reached for ${conversationId}: ${currentStepCount}/${maxStepsLimit}`);
       yield {
         conversationId,
-        type: 'tool-result',
-        toolCallId,
-        toolName: toolState.toolName,
-        result: { isError: true, error: 'Tool execution cancelled.' },
-        startedAt: toolState.startedAt,
-        finishedAt,
+        type: 'max-steps-reached',
+        stepInfo: {
+          currentStep: currentStepCount,
+          maxSteps: maxStepsLimit,
+          hitLimit: true,
+          taskComplete: false,
+        },
       };
     }
-  }
 
-  const hitStepLimit = didHitStepLimit({
-    currentStepCount,
-    maxStepsLimit,
-    terminalFinishReason,
-  });
-
-  if (hitStepLimit && !maxStepsReachedEmitted) {
-    maxStepsReachedEmitted = true;
-    console.warn(`[Agent] Max steps reached for ${conversationId}: ${currentStepCount}/${maxStepsLimit}`);
-    yield {
-      conversationId,
-      type: 'max-steps-reached',
-      stepInfo: {
-        currentStep: currentStepCount,
-        maxSteps: maxStepsLimit,
-        hitLimit: true,
-        taskComplete: false,
-      },
-    };
-  }
-
-  // Emit accumulated token usage before done
-  if (accInputTokens > 0 || accOutputTokens > 0) {
-    yield {
-      conversationId,
-      type: 'context-usage',
-      data: {
-        inputTokens: accInputTokens,
-        outputTokens: accOutputTokens,
-        cacheReadTokens: accCacheReadTokens,
-        cacheWriteTokens: accCacheWriteTokens,
-        totalTokens: accInputTokens + accOutputTokens,
-      },
-    };
+    // Emit accumulated token usage before done
+    if (accInputTokens > 0 || accOutputTokens > 0) {
+      yield {
+        conversationId,
+        type: 'context-usage',
+        data: {
+          inputTokens: accInputTokens,
+          outputTokens: accOutputTokens,
+          cacheReadTokens: accCacheReadTokens,
+          cacheWriteTokens: accCacheWriteTokens,
+          totalTokens: accInputTokens + accOutputTokens,
+        },
+      };
     }
 
     yield {
@@ -2082,6 +2096,7 @@ export async function* streamWithFallback(
     isHeadless?: boolean;
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
   } & ToolLifecycleHooks,
@@ -2256,7 +2271,11 @@ export async function* streamWithFallback(
           !emittedContent &&
           (event as { errorCategory?: string }).errorCategory !== 'context-overflow'
         ) {
-          yield { ...event, errorCategory: 'context-overflow', overflowRecoveryModelKey: overflowModelKey ?? undefined };
+          yield {
+            ...event,
+            errorCategory: 'context-overflow',
+            overflowRecoveryModelKey: overflowModelKey ?? undefined,
+          };
           continue;
         }
 
@@ -2334,6 +2353,7 @@ export async function* streamWithFallback(
       }
 
       const outerInfo = classifyError(outerError);
+      const exposedOuterError = redactBrowserErrorForExposure(outerError);
       // Fall back on a thrown error when fallbacks remain, IF either no content
       // was emitted yet, OR the error is transient (mid-stream provider failure).
       // A non-transient throw after content stays terminal (yielded below).
@@ -2355,7 +2375,7 @@ export async function* streamWithFallback(
             fromModelKey: entry.key,
             toModel: nextEntry.displayName,
             toModelKey: nextEntry.key,
-            error: getErrorMessage(outerError),
+            error: exposedOuterError,
             reason: 'transient',
             // Preserve the partial as a variant only if content actually streamed.
             preserveErroredVariant: emittedContent,
@@ -2381,7 +2401,7 @@ export async function* streamWithFallback(
       yield {
         conversationId,
         type: 'error',
-        error: getErrorMessage(outerError),
+        error: exposedOuterError,
         errorCategory: terminalCategory,
         errorStatusCode: lastErrorInfo.statusCode,
         ...(terminalCategory === 'context-overflow' && lastErrorInfo.category !== 'context-overflow'

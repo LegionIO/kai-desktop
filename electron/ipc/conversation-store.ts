@@ -386,7 +386,9 @@ export function readConversation(appHome: string, id: string): ConversationRecor
     const rec = JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
     // Advance the revision floor past any stored compaction revision so a clock rollback /
     // VM restore can't later issue a lower revision than what's already on disk.
-    observeCompactionRevision((rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision);
+    observeCompactionRevision(
+      (rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision,
+    );
     return rec;
   } catch {
     return null;
@@ -1250,7 +1252,7 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
  *  `fullyCleared` is false if ANY record file survived (an rm failure — indexed OR orphan), so the
  *  caller must NOT broadcast a full reset (that would drop clients' accumulators for a still-live
  *  surviving run). */
-export function clearAllConversations(appHome: string): { cleared: string[]; fullyCleared: boolean } {
+export function conversationIdsForClear(appHome: string): string[] {
   // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
   assertMigratedBeforeWrite(appHome);
   const priorIndex = readIndex(appHome);
@@ -1263,6 +1265,17 @@ export function clearAllConversations(appHome: string): { cleared: string[]; ful
       if (name.endsWith('.json')) candidateIds.add(name.slice(0, -'.json'.length));
     }
   }
+  return [...candidateIds];
+}
+
+export function clearAllConversations(
+  appHome: string,
+  ids: Iterable<string> = conversationIdsForClear(appHome),
+): { cleared: string[]; fullyCleared: boolean } {
+  // Migrate first (refuse if pending) so the monolith can't be re-split after clear.
+  assertMigratedBeforeWrite(appHome);
+  const priorIndex = readIndex(appHome);
+  const candidateIds = new Set(ids);
   // Remove each record file. A FAILED rm must NOT be treated as cleared — tombstoning/returning it
   // (and dropping the index entry) would leave the record on disk yet invisible + stop its stream,
   // stranding it. So preserve failures (per-file, like deleteConversations): only ids whose file is
@@ -1307,7 +1320,12 @@ export function clearAllConversations(appHome: string): { cleared: string[]; ful
 // ── active id + settings ───────────────────────────────────────────────────────
 
 export function getActiveConversationId(appHome: string): string | null {
-  return readIndex(appHome).activeConversationId;
+  const index = readIndex(appHome);
+  const activeId = index.activeConversationId;
+  // Older builds allowed callers to persist arbitrary ids. Treat an active id
+  // without an indexed conversation as empty so restart cannot restore a
+  // deleted chat into Browser ownership or any other conversation-scoped UI.
+  return activeId && index.conversations[activeId] ? activeId : null;
 }
 
 /**

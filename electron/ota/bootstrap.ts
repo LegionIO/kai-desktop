@@ -20,7 +20,12 @@ import { OTA_DIR_NAME, OTA_CURRENT_DIR, OTA_MANIFEST_FILE } from './types.js';
 import { computeFilesHash, shouldSkipOtaSignature, verifyOtaSignature } from './signing.js';
 
 /** Entrypoint files whose on-disk hash is re-checked against the signed manifest at boot. */
-const OTA_ENTRYPOINT_FILES = ['out/main/index.js', 'out/preload/index.mjs', 'out/renderer/index.html'] as const;
+const OTA_ENTRYPOINT_FILES = [
+  'out/main/index.js',
+  'out/preload/index.mjs',
+  'out/preload/browser-page.cjs',
+  'out/renderer/index.html',
+] as const;
 
 function hashFileSync(filePath: string): string {
   return createHash('sha512').update(readFileSync(filePath)).digest('hex');
@@ -178,6 +183,11 @@ export function resolveCodePaths(appSlug: string, shellVersion: string, bundledO
 
     if (!existsSync(join(overlayPreload, 'index.mjs'))) {
       console.warn('[ota-bootstrap] Overlay preload/index.mjs not found, falling back to bundled');
+      return bundledPaths;
+    }
+
+    if (!existsSync(join(overlayPreload, 'browser-page.cjs'))) {
+      console.warn('[ota-bootstrap] Overlay preload/browser-page.cjs not found, falling back to bundled');
       return bundledPaths;
     }
 

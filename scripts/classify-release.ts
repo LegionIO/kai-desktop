@@ -9,6 +9,7 @@
  * - Native dependencies have NOT changed (better-sqlite3, tiktoken, node-pty, libsql)
  * - Node engines requirement has NOT changed
  * - The plugin utility-process shell protocol has NOT changed
+ * - The desktop main-process/preload protocol has NOT changed
  *
  * Usage:  node --import tsx scripts/classify-release.ts [--base-tag <tag>]
  *
@@ -153,6 +154,18 @@ export function comparePackages(currentPkg: Record<string, unknown>, prevPkg: Re
   if (currentPluginProtocol !== prevPluginProtocol) {
     reasons.push(
       `Plugin process protocol changed: ${prevPluginProtocol ?? '(none)'} → ${currentPluginProtocol ?? '(none)'}`,
+    );
+  }
+
+  // OTA overlays replace preload/renderer assets but continue running the
+  // signed app bundle's main process. Any feature that requires new main IPC,
+  // native views, or main-process lifecycle behavior must bump this signal so
+  // older shells are not offered an overlay they cannot execute correctly.
+  const currentDesktopShellProtocol = currentPkg.desktopShellProtocolVersion as number | undefined;
+  const prevDesktopShellProtocol = prevPkg.desktopShellProtocolVersion as number | undefined;
+  if (currentDesktopShellProtocol !== prevDesktopShellProtocol) {
+    reasons.push(
+      `Desktop shell protocol changed: ${prevDesktopShellProtocol ?? '(none)'} → ${currentDesktopShellProtocol ?? '(none)'}`,
     );
   }
 

@@ -48,11 +48,17 @@ if (!existsSync(outDir)) {
 
 const mainIndex = resolve(outDir, 'main', 'index.js');
 const preloadIndex = resolve(outDir, 'preload', 'index.mjs');
+const browserPagePreload = resolve(outDir, 'preload', 'browser-page.cjs');
 const rendererIndex = resolve(outDir, 'renderer', 'index.html');
 
-if (!existsSync(mainIndex) || !existsSync(preloadIndex) || !existsSync(rendererIndex)) {
+if (
+  !existsSync(mainIndex) ||
+  !existsSync(preloadIndex) ||
+  !existsSync(browserPagePreload) ||
+  !existsSync(rendererIndex)
+) {
   console.error(
-    'Error: out/ directory is missing expected files (main/index.js, preload/index.mjs, renderer/index.html).',
+    'Error: out/ directory is missing expected files (main/index.js, preload/index.mjs, preload/browser-page.cjs, renderer/index.html).',
   );
   console.error('Run `pnpm build` first.');
   process.exit(1);

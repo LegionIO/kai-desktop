@@ -18,6 +18,20 @@ import {
 } from '../ota/ota-updater.js';
 import { manualRollback, getOtaMeta } from '../ota/rollback.js';
 import type { CodePaths } from '../ota/types.js';
+import { BROWSER_FORCE_EXIT_GRACE_MS } from '../browser/service.js';
+
+function relaunchAfterBrowserFlush(): void {
+  setTimeout(() => {
+    app.relaunch();
+    // Route through before-quit first so Browser history/download writes reach
+    // the bounded shutdown barrier. A renderer beforeunload veto can still
+    // cancel app.quit(), so force process exit only after that barrier's grace
+    // period has elapsed.
+    app.quit();
+    const forcedExit = setTimeout(() => app.exit(0), BROWSER_FORCE_EXIT_GRACE_MS);
+    forcedExit.unref?.();
+  }, 500);
+}
 
 /**
  * Register OTA-related IPC handlers.
@@ -65,11 +79,7 @@ export function registerOtaHandlers(
   ipcMain.handle('ota:apply-and-restart', () => {
     const result = applyOtaUpdate(appSlug, codePaths.codeVersion);
     if (result.success) {
-      // Relaunch the app to load the new code
-      setTimeout(() => {
-        app.relaunch();
-        app.exit(0);
-      }, 500);
+      relaunchAfterBrowserFlush();
     }
     return result;
   });
@@ -91,11 +101,7 @@ export function registerOtaHandlers(
   ipcMain.handle('ota:rollback', () => {
     const result = manualRollback(appSlug);
     if (result.success) {
-      // Relaunch to load bundled code
-      setTimeout(() => {
-        app.relaunch();
-        app.exit(0);
-      }, 500);
+      relaunchAfterBrowserFlush();
     }
     return result;
   });

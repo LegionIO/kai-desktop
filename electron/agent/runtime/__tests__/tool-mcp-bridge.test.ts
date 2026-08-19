@@ -5,10 +5,11 @@
  * handling), getTool, hasTool, updateTools, dispose.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import { ToolMcpBridge } from '../tool-mcp-bridge.js';
 import type { ToolDefinition } from '../../../tools/types.js';
+import { hookDispatcher } from '../../hooks/dispatcher.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -42,6 +43,7 @@ function createBridge(tools: ToolDefinition[] = [createTool()]): ToolMcpBridge {
     tools,
     conversationId: 'test-conv',
     cwd: '/tmp/test',
+    browserOwnerId: 'browser-run-1',
   });
 }
 
@@ -112,6 +114,42 @@ describe('ToolMcpBridge', () => {
   });
 
   describe('callTool', () => {
+    it('passes the assistant browser owner through to tool execution', async () => {
+      let browserOwnerId: string | undefined;
+      const bridge = createBridge([
+        createTool({
+          inputSchema: z.object({}),
+          execute: async (_input, context) => {
+            browserOwnerId = context.browserOwnerId;
+            return 'ok';
+          },
+        }),
+      ]);
+
+      await bridge.callTool('test-tool', {});
+
+      expect(browserOwnerId).toBe('browser-run-1');
+    });
+
+    it('assigns collision-resistant ids to concurrent tool calls', async () => {
+      const toolCallIds: string[] = [];
+      const bridge = createBridge([
+        createTool({
+          inputSchema: z.object({}),
+          execute: async (_input, context) => {
+            toolCallIds.push(context.toolCallId ?? '');
+            return 'ok';
+          },
+        }),
+      ]);
+
+      await Promise.all([bridge.callTool('test-tool', {}), bridge.callTool('test-tool', {})]);
+
+      expect(toolCallIds).toHaveLength(2);
+      expect(toolCallIds.every((id) => /^mcp-bridge-[0-9a-f-]{36}$/.test(id))).toBe(true);
+      expect(new Set(toolCallIds)).toHaveLength(2);
+    });
+
     it('executes a tool and returns text result', async () => {
       const bridge = createBridge();
       const result = await bridge.callTool('test-tool', { path: '/tmp/file.txt' });
@@ -145,6 +183,68 @@ describe('ToolMcpBridge', () => {
 
       expect(result.isError).toBe(true);
       expect(textOf(result.content[0])).toContain('Intentional test failure');
+    });
+
+    it('redacts credential-bearing Browser URLs from execution errors', async () => {
+      const secretUrl = 'https://alice:password@example.com/callback?token=bridge-secret';
+      const bridge = createBridge([
+        createTool({
+          name: 'browser_action',
+          source: 'browser',
+          inputSchema: z.object({}),
+          execute: async () => {
+            throw new Error(`ERR_FAILED while loading ${secretUrl}`);
+          },
+        }),
+      ]);
+
+      const result = await bridge.callTool('browser_action', {});
+      const exposed = textOf(result.content[0]);
+
+      expect(result.isError).toBe(true);
+      expect(exposed).toContain('[redacted browser URL: https://example.com]');
+      expect(exposed).not.toMatch(/bridge-secret|alice:password/);
+    });
+
+    it('enforces lifecycle hooks before Browser tools cross the Pi bridge', async () => {
+      const secret = 'bridge-denied-secret';
+      const execute = vi.fn(async () => ({ raw: true }));
+      let postPayload: unknown;
+      const unregisterPre = hookDispatcher.register(
+        'PreToolUse',
+        () => ({ decision: 'deny', reason: 'blocked by policy' }),
+        { mode: 'block', matcher: 'browser_evaluate' },
+      );
+      const unregisterPost = hookDispatcher.register(
+        'PostToolUse',
+        (payload) => {
+          postPayload = payload;
+          return { payload: { result: { isError: true, error: 'sanitized denial' } } };
+        },
+        { mode: 'modify', matcher: 'browser_evaluate' },
+      );
+      try {
+        const bridge = createBridge([
+          createTool({
+            name: 'browser_evaluate',
+            source: 'browser',
+            inputSchema: z.object({ script: z.string() }),
+            execute,
+          }),
+        ]);
+
+        const result = await bridge.callTool('browser_evaluate', { script: secret });
+        const exposed = JSON.stringify(result);
+
+        expect(execute).not.toHaveBeenCalled();
+        expect(result.isError).toBe(true);
+        expect(exposed).toContain('sanitized denial');
+        expect(exposed).not.toContain(secret);
+        expect(postPayload).toMatchObject({ args: { redacted: true, reason: 'blocked by policy' } });
+      } finally {
+        unregisterPost();
+        unregisterPre();
+      }
     });
 
     it('validates args before execution', async () => {

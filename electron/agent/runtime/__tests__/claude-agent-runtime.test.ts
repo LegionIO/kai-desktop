@@ -12,6 +12,9 @@ import { z } from 'zod';
 import type { AppConfig } from '../../../config/schema.js';
 import type { StreamOptions, StreamEvent } from '../types.js';
 import type { ToolDefinition } from '../../../tools/types.js';
+import { hookDispatcher } from '../../hooks/dispatcher.js';
+import { pendingToolApprovals } from '../../../ipc/tool-approval.js';
+import { pendingQuestionAnswers } from '../../../tools/ask-user.js';
 
 // ---------------------------------------------------------------------------
 // SDK mock — controls what `query()` yields per test.
@@ -22,10 +25,25 @@ const sdkState: {
   lastOptions?: Record<string, unknown>;
   queryCallCount: number;
   shouldThrow?: Error;
+  toolHandlers: Map<string, (args: unknown, extra: unknown) => Promise<unknown>>;
 } = {
   messages: [],
   queryCallCount: 0,
+  toolHandlers: new Map(),
 };
+
+const appendFileSyncMock = vi.hoisted(() => vi.fn());
+const mkdirSyncMock = vi.hoisted(() => vi.fn());
+
+vi.mock('fs', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  appendFileSync: appendFileSyncMock,
+  mkdirSync: mkdirSyncMock,
+}));
+
+vi.mock('electron', () => ({
+  BrowserWindow: { getAllWindows: vi.fn(() => []) },
+}));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => {
   return {
@@ -44,12 +62,17 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => {
       name: opts.name,
       toolCount: opts.tools?.length ?? 0,
     })),
-    tool: vi.fn((name: string, desc: string, schema: Record<string, unknown>) => ({
-      __tool: true,
-      name,
-      desc,
-      schema,
-    })),
+    tool: vi.fn(
+      (
+        name: string,
+        desc: string,
+        schema: Record<string, unknown>,
+        handler: (args: unknown, extra: unknown) => Promise<unknown>,
+      ) => {
+        sdkState.toolHandlers.set(name, handler);
+        return { __tool: true, name, desc, schema, handler };
+      },
+    ),
   };
 });
 
@@ -62,7 +85,11 @@ vi.mock('../detect.js', () => ({
 // ---------------------------------------------------------------------------
 // Imports — placed AFTER vi.mock so the mocks land first.
 // ---------------------------------------------------------------------------
+const previousClaudeDebug = process.env.KAI_DEBUG_CLAUDE_SDK;
+process.env.KAI_DEBUG_CLAUDE_SDK = '1';
 const { ClaudeAgentRuntime } = await import('../claude-agent-runtime.js');
+if (previousClaudeDebug === undefined) delete process.env.KAI_DEBUG_CLAUDE_SDK;
+else process.env.KAI_DEBUG_CLAUDE_SDK = previousClaudeDebug;
 // Read the SDK mock's spies to assert what got bridged.
 const sdkMock = (await import('@anthropic-ai/claude-agent-sdk')) as unknown as {
   createSdkMcpServer: ReturnType<typeof vi.fn>;
@@ -105,8 +132,13 @@ beforeEach(() => {
   sdkState.lastOptions = undefined;
   sdkState.queryCallCount = 0;
   sdkState.shouldThrow = undefined;
+  sdkState.toolHandlers.clear();
   sdkMock.createSdkMcpServer.mockClear();
   sdkMock.tool.mockClear();
+  appendFileSyncMock.mockClear();
+  mkdirSyncMock.mockClear();
+  pendingToolApprovals.clear();
+  pendingQuestionAnswers.clear();
 });
 
 // ---------------------------------------------------------------------------
@@ -156,6 +188,60 @@ describe('ClaudeAgentRuntime', () => {
       expect(sdkState.queryCallCount).toBe(1);
       expect(events.some((e) => e.type === 'text-delta' && e.text === 'Hi.')).toBe(true);
       expect(events[events.length - 1].type).toBe('done');
+    });
+
+    it('keeps SDK diagnostics structural when messages contain Browser secrets', async () => {
+      const secrets = [
+        'PROMPT_SECRET_7f196d',
+        'TYPED_PASSWORD_6c322a',
+        'RAW_SCRIPT_0f91ab',
+        'https://alice:password@example.com/private?token=URL_SECRET_485dc1',
+        'TOOL_RESULT_SECRET_2b2138',
+        'STRUCTURED_SECRET_a521e2',
+        'THROWN_SECRET_f4d2bc',
+      ];
+      sdkState.messages = [
+        {
+          type: 'assistant',
+          session_id: 'sess-secret',
+          message: {
+            content: [
+              { type: 'text', text: secrets[1] },
+              {
+                type: 'tool_use',
+                id: 'tool-secret',
+                name: 'mcp__kai__browser_evaluate',
+                input: { script: secrets[2], url: secrets[3] },
+              },
+            ],
+          },
+        },
+        {
+          type: 'user',
+          message: {
+            content: [{ type: 'tool_result', tool_use_id: 'tool-secret', content: secrets[4] }],
+          },
+        },
+        {
+          type: 'result',
+          subtype: 'success',
+          result: secrets[3],
+          structured_output: { private: secrets[5] },
+        },
+      ];
+
+      await collect(
+        new ClaudeAgentRuntime().stream(makeOptions({ messages: [{ role: 'user', content: secrets[0] }] })),
+      );
+      sdkState.messages = [];
+      sdkState.shouldThrow = new Error(secrets[6]);
+      await collect(new ClaudeAgentRuntime().stream(makeOptions()));
+
+      const diagnostics = appendFileSyncMock.mock.calls.map((call) => String(call[1])).join('\n');
+      expect(diagnostics).toContain('[MSG 1]');
+      expect(diagnostics).toContain('string(length=');
+      for (const secret of secrets) expect(diagnostics).not.toContain(secret);
+      expect(diagnostics).not.toContain('alice:password');
     });
   });
 
@@ -333,6 +419,238 @@ describe('ClaudeAgentRuntime', () => {
       );
       const serverCall = sdkMock.createSdkMcpServer.mock.calls.at(-1)?.[0] as { tools?: unknown[] };
       expect(serverCall.tools).toHaveLength(5);
+    });
+
+    it('redacts Browser execution failures before returning them through the SDK handler', async () => {
+      const secretUrl = 'https://alice:password@example.com/callback?token=claude-secret';
+      sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+      const rt = new ClaudeAgentRuntime();
+      await collect(
+        rt.stream(
+          makeOptions({
+            tools: [
+              {
+                name: 'browser_action',
+                description: 'Browser action',
+                source: 'browser',
+                inputSchema: z.object({}),
+                execute: async () => {
+                  throw new Error(`ERR_FAILED while loading ${secretUrl}`);
+                },
+              },
+            ],
+          }),
+        ),
+      );
+
+      const result = (await sdkState.toolHandlers.get('browser_action')?.({}, {})) as {
+        content?: Array<{ text?: string }>;
+        isError?: boolean;
+      };
+      const exposed = JSON.stringify(result);
+      expect(result.isError).toBe(true);
+      expect(exposed).toContain('[redacted browser URL: https://example.com]');
+      expect(exposed).not.toMatch(/claude-secret|alice:password/);
+    });
+
+    it('enforces lifecycle hook modifications for Claude Browser calls', async () => {
+      const execute = vi.fn(async (input) => ({ raw: true, input }));
+      const unregisterPre = hookDispatcher.register(
+        'PreToolUse',
+        () => ({ payload: { args: { script: 'safe-script' } } }),
+        { mode: 'modify', matcher: 'browser_evaluate' },
+      );
+      const unregisterPost = hookDispatcher.register(
+        'PostToolUse',
+        () => ({ payload: { result: { sanitized: true } } }),
+        { mode: 'modify', matcher: 'browser_evaluate' },
+      );
+      try {
+        sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+        const rt = new ClaudeAgentRuntime();
+        await collect(
+          rt.stream(
+            makeOptions({
+              browserOwnerId: 'browser-run-hooks',
+              tools: [
+                {
+                  name: 'browser_evaluate',
+                  description: 'Browser evaluation',
+                  source: 'browser',
+                  inputSchema: z.object({ script: z.string() }),
+                  execute,
+                },
+              ],
+            }),
+          ),
+        );
+
+        const result = (await sdkState.toolHandlers.get('browser_evaluate')?.({ script: 'raw-secret-script' }, {})) as {
+          content?: Array<{ text?: string }>;
+          isError?: boolean;
+        };
+
+        expect(execute).toHaveBeenCalledWith(
+          { script: 'safe-script' },
+          expect.objectContaining({
+            conversationId: 'conv-1',
+            browserOwnerId: 'browser-run-hooks',
+          }),
+        );
+        expect(result.isError).toBeUndefined();
+        expect(JSON.stringify(result)).toContain('sanitized');
+        expect(JSON.stringify(result)).not.toContain('raw-secret-script');
+      } finally {
+        unregisterPost();
+        unregisterPre();
+      }
+    });
+
+    it.each(['ask_user', 'exit_plan_mode'])('enforces PreToolUse denials for Claude special tool %s', async (name) => {
+      const execute = vi.fn(async () => ({ shouldNotRun: true }));
+      const unregister = hookDispatcher.register(
+        'PreToolUse',
+        () => ({ decision: 'deny', reason: 'blocked special tool' }),
+        { mode: 'block', matcher: name },
+      );
+      try {
+        sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+        const rt = new ClaudeAgentRuntime();
+        await collect(
+          rt.stream(
+            makeOptions({
+              tools: [
+                {
+                  name,
+                  description: name,
+                  source: 'builtin',
+                  inputSchema: z.object({ value: z.string() }),
+                  execute,
+                },
+              ],
+            }),
+          ),
+        );
+
+        const result = (await sdkState.toolHandlers.get(name)?.({ value: 'private input' }, {})) as {
+          content?: Array<{ text?: string }>;
+          isError?: boolean;
+        };
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result)).toContain('blocked special tool');
+        expect(pendingToolApprovals.size).toBe(0);
+        expect(execute).not.toHaveBeenCalled();
+      } finally {
+        unregister();
+      }
+    });
+
+    it('applies PreToolUse changes and PostToolUse redaction to ask_user answers', async () => {
+      let postPayload: unknown;
+      const unregisterPre = hookDispatcher.register(
+        'PreToolUse',
+        () => ({ payload: { args: { prompt: 'approved prompt' } } }),
+        { mode: 'modify', matcher: 'ask_user' },
+      );
+      const unregisterPost = hookDispatcher.register(
+        'PostToolUse',
+        (payload) => {
+          postPayload = payload;
+          return { payload: { result: { sanitized: true } } };
+        },
+        { mode: 'modify', matcher: 'ask_user' },
+      );
+      try {
+        sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+        const rt = new ClaudeAgentRuntime();
+        await collect(
+          rt.stream(
+            makeOptions({
+              tools: [
+                {
+                  name: 'ask_user',
+                  description: 'Ask the user',
+                  source: 'builtin',
+                  inputSchema: z.object({ prompt: z.string() }),
+                  execute: vi.fn(async () => null),
+                },
+              ],
+            }),
+          ),
+        );
+
+        const response = sdkState.toolHandlers.get('ask_user')?.({ prompt: 'private prompt' }, {});
+        await vi.waitFor(() => expect(pendingToolApprovals.size).toBe(1));
+        const [toolCallId, pending] = [...pendingToolApprovals.entries()][0]!;
+        pendingQuestionAnswers.set(toolCallId, { answer: 'private answer' });
+        pending.resolve(true);
+        const result = (await response) as { content?: Array<{ text?: string }>; isError?: boolean };
+
+        expect(postPayload).toMatchObject({
+          args: { prompt: 'approved prompt' },
+          result: { success: true, answers: { answer: 'private answer' } },
+        });
+        expect(JSON.stringify(result)).toContain('sanitized');
+        expect(JSON.stringify(result)).not.toMatch(/private prompt|private answer/);
+      } finally {
+        for (const pending of pendingToolApprovals.values()) pending.resolve('dismiss');
+        unregisterPost();
+        unregisterPre();
+      }
+    });
+
+    it('applies lifecycle changes around an approved exit_plan_mode execution', async () => {
+      const execute = vi.fn(async () => ({ rawPlanResult: true }));
+      const unregisterPre = hookDispatcher.register(
+        'PreToolUse',
+        () => ({ payload: { args: { plan: 'approved plan' } } }),
+        { mode: 'modify', matcher: 'exit_plan_mode' },
+      );
+      const unregisterPost = hookDispatcher.register(
+        'PostToolUse',
+        () => ({ payload: { result: { sanitized: true } } }),
+        { mode: 'modify', matcher: 'exit_plan_mode' },
+      );
+      try {
+        sdkState.messages = [{ type: 'system', session_id: 's', subtype: 'init' }];
+        const rt = new ClaudeAgentRuntime();
+        await collect(
+          rt.stream(
+            makeOptions({
+              browserOwnerId: 'plan-owner',
+              tools: [
+                {
+                  name: 'exit_plan_mode',
+                  description: 'Exit plan mode',
+                  source: 'builtin',
+                  inputSchema: z.object({ plan: z.string() }),
+                  execute,
+                },
+              ],
+            }),
+          ),
+        );
+
+        const response = sdkState.toolHandlers.get('exit_plan_mode')?.({ plan: 'private plan' }, {});
+        await vi.waitFor(() => expect(pendingToolApprovals.size).toBe(1));
+        [...pendingToolApprovals.values()][0]!.resolve(true);
+        const result = (await response) as { content?: Array<{ text?: string }>; isError?: boolean };
+
+        expect(execute).toHaveBeenCalledWith(
+          { plan: 'approved plan' },
+          expect.objectContaining({
+            conversationId: 'conv-1',
+            browserOwnerId: 'plan-owner',
+            toolCallId: expect.stringMatching(/^sdk-plan-/),
+          }),
+        );
+        expect(JSON.stringify(result)).toContain('sanitized');
+        expect(JSON.stringify(result)).not.toMatch(/private plan|rawPlanResult/);
+      } finally {
+        for (const pending of pendingToolApprovals.values()) pending.resolve('dismiss');
+        unregisterPost();
+        unregisterPre();
+      }
     });
   });
 });

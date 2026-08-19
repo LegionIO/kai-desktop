@@ -36,9 +36,12 @@ import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { z } from 'zod';
+import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
+import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging
@@ -135,6 +138,36 @@ function debugLog(msg: string): void {
   } catch {
     /* ignore */
   }
+}
+
+/** Diagnostics must describe SDK payload structure without copying payload
+ * content. Browser tools can carry typed passwords, scripts, authenticated
+ * URLs, and page text through any SDK message field. */
+function diagnosticValueShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `array(length=${value.length})`;
+  if (typeof value === 'string') return `string(length=${value.length})`;
+  if (typeof value === 'object') return `object(fields=${Object.keys(value).length})`;
+  return typeof value;
+}
+
+function diagnosticErrorShape(error: unknown): string {
+  if (!(error instanceof Error)) return diagnosticValueShape(error);
+  return `error(messageLength=${error.message.length},stackLength=${error.stack?.length ?? 0})`;
+}
+
+function diagnosticSdkMessageShape(msg: SdkMessageAny): string {
+  const event = msg.event as { content_block?: unknown; delta?: unknown } | undefined;
+  const message = msg.message as { content?: unknown } | undefined;
+  return [
+    `type=${diagnosticValueShape(msg.type)}`,
+    `subtype=${diagnosticValueShape(msg.subtype)}`,
+    `fields=${Object.keys(msg).length}`,
+    `event=${diagnosticValueShape(event)}`,
+    `content=${diagnosticValueShape(message?.content)}`,
+    `result=${diagnosticValueShape(msg.result)}`,
+    `structuredOutput=${diagnosticValueShape(msg.structured_output)}`,
+  ].join(' ');
 }
 // ---------------------------------------------------------------------------
 
@@ -307,18 +340,20 @@ export class ClaudeAgentRuntime implements AgentRuntime {
             let counter = 2;
             while (usedNames.has(`${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
             safeName = `${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
-            debugLog(`[BRIDGE] Collision-resolved tool name: ${t.name} → ${safeName}`);
+            debugLog(
+              `[BRIDGE] Collision-resolved tool name lengths source=${t.name.length} resolved=${safeName.length}`,
+            );
           }
           usedNames.add(safeName);
           if (safeName !== t.name) {
-            debugLog(`[BRIDGE] Truncated tool name: ${t.name} → ${safeName}`);
+            debugLog(`[BRIDGE] Truncated tool name lengths source=${t.name.length} resolved=${safeName.length}`);
           }
           const rawShape = extractZodShape(t.inputSchema);
           return sdkTool(
             safeName,
             t.description ?? '',
             rawShape,
-            createToolHandler(t, conversationId, cwd, abortSignal),
+            createToolHandler(t, conversationId, cwd, abortSignal, options.browserOwnerId),
           );
         });
 
@@ -329,13 +364,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         });
 
         mcpServers = { kai: kaiServer };
-        debugLog(
-          `[BRIDGE] Created MCP bridge with ${sdkTools.length} tools: ${bridgeableTools.map((t) => t.name).join(', ')}`,
-        );
+        debugLog(`[BRIDGE] Created MCP bridge toolCount=${sdkTools.length}`);
       } catch (bridgeErr) {
-        debugLog(
-          `[BRIDGE] Failed to create MCP bridge: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`,
-        );
+        debugLog(`[BRIDGE] Failed to create MCP bridge error=${diagnosticErrorShape(bridgeErr)}`);
         // Non-fatal — SDK can still work with its built-in tools only
       }
     }
@@ -445,7 +476,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     } else {
       const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
       if (persistedSessionId && !this.sessionMap.has(conversationId)) {
-        debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
+        debugLog(`[SESSION] Seeding sessionMap from persisted metadata sessionIdLength=${persistedSessionId.length}`);
         this.sessionMap.set(conversationId, persistedSessionId);
       }
       existingSessionId = this.sessionMap.get(conversationId);
@@ -456,12 +487,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // rather than silently falling back to ~/.claude/settings.json.
     const auth = options.modelAuth ?? null;
 
+    debugLog(`[STREAM] prompt=${diagnosticValueShape(prompt)} hasImages=${hasImages}`);
+    debugLog(`[STREAM] hasExistingSession=${existingSessionId !== undefined} sessionMapSize=${this.sessionMap.size}`);
     debugLog(
-      `[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`,
-    );
-    debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(
-      `[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`,
+      `[STREAM] hasCwd=${cwd !== undefined} maxTurns=${maxTurns} hasEffort=${effort !== undefined} permissionBypass=${permissionMode === 'bypassPermissions'} hasModel=${auth?.modelName !== undefined} hasBaseUrl=${auth?.baseUrl !== undefined}`,
     );
 
     const sdkOptions: SdkOptions = {
@@ -513,7 +542,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     let retryWithoutResume = false;
 
     try {
-      debugLog(`[QUERY] Starting query with resume=${existingSessionId ?? 'none'}`);
+      debugLog(`[QUERY] Starting query hasResume=${existingSessionId !== undefined}`);
       const queryIter = sdkQuery({ prompt, options: sdkOptions });
 
       let msgCount = 0;
@@ -524,11 +553,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         }
 
         msgCount++;
-        // Log every raw SDK message (truncate large ones)
-        const rawJson = JSON.stringify(msg);
-        debugLog(
-          `[MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
-        );
+        debugLog(`[MSG ${msgCount}] ${diagnosticSdkMessageShape(msg)}`);
 
         // Detect session resume failure — retry without resume
         if (
@@ -539,7 +564,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         ) {
           const rawStr = JSON.stringify(msg);
           if (rawStr.includes('No conversation found with session ID')) {
-            debugLog(`[SESSION] Resume failed for sessionId=${existingSessionId} — will retry without resume`);
+            debugLog(`[SESSION] Resume failed; retrying without resume`);
             this.sessionMap.delete(conversationId);
             retryWithoutResume = true;
             break;
@@ -549,7 +574,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // Capture session ID for future resume within this conversation
         const msgSessionId = (msg as { session_id?: string }).session_id;
         if (msgSessionId && !this.sessionMap.has(conversationId)) {
-          debugLog(`[SESSION] Captured sessionId=${msgSessionId} for conversationId=${conversationId}`);
+          debugLog(`[SESSION] Captured session id length=${msgSessionId.length}`);
           this.sessionMap.set(conversationId, msgSessionId);
         }
 
@@ -566,7 +591,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         yield { conversationId, type: 'done' };
       }
     } catch (err) {
-      debugLog(`[ERROR] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      debugLog(`[ERROR] ${diagnosticErrorShape(err)}`);
 
       // Session resume failure can also throw — detect and retry
       if (existingSessionId && err instanceof Error && err.message.includes('No conversation found with session ID')) {
@@ -594,7 +619,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // 8b. Retry without session resume if resume failed
     // -----------------------------------------------------------------------
     if (retryWithoutResume) {
-      debugLog(`[RETRY] Retrying without resume for conversationId=${conversationId}`);
+      debugLog(`[RETRY] Retrying without resume`);
       const retryOptions = { ...sdkOptions };
       delete retryOptions.resume;
 
@@ -609,15 +634,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
           }
 
           msgCount++;
-          const rawJson = JSON.stringify(msg);
-          debugLog(
-            `[RETRY-MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
-          );
+          debugLog(`[RETRY-MSG ${msgCount}] ${diagnosticSdkMessageShape(msg)}`);
 
           // Capture new session ID
           const msgSessionId = (msg as { session_id?: string }).session_id;
           if (msgSessionId && !this.sessionMap.has(conversationId)) {
-            debugLog(`[SESSION] Captured new sessionId=${msgSessionId} for conversationId=${conversationId}`);
+            debugLog(`[SESSION] Captured new session id length=${msgSessionId.length}`);
             this.sessionMap.set(conversationId, msgSessionId);
           }
 
@@ -630,9 +652,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         debugLog(`[RETRY] Finished after ${msgCount} messages`);
         yield { conversationId, type: 'done' };
       } catch (retryErr) {
-        debugLog(
-          `[RETRY-ERROR] ${retryErr instanceof Error ? (retryErr.stack ?? retryErr.message) : String(retryErr)}`,
-        );
+        debugLog(`[RETRY-ERROR] ${diagnosticErrorShape(retryErr)}`);
         if (!abortSignal?.aborted) {
           yield {
             conversationId,
@@ -761,7 +781,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           }
         | undefined;
       if (!event) {
-        debugLog(`[STREAM_EVENT] No event field in msg. keys=${Object.keys(msg).join(',')}`);
+        debugLog(`[STREAM_EVENT] No event field messageFieldCount=${Object.keys(msg).length}`);
         break;
       }
 
@@ -825,13 +845,11 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
         | undefined;
 
       if (!betaMessage?.content) {
-        debugLog(`[ASSISTANT] No content in message. msg keys: ${Object.keys(msg).join(',')}`);
+        debugLog(`[ASSISTANT] No content messageFieldCount=${Object.keys(msg).length}`);
         break;
       }
 
-      debugLog(
-        `[ASSISTANT] ${betaMessage.content.length} blocks: ${betaMessage.content.map((b) => `${b.type}${b.text ? '(text=' + b.text.slice(0, 80) + ')' : ''}`).join(', ')}`,
-      );
+      debugLog(`[ASSISTANT] blockCount=${betaMessage.content.length}`);
 
       for (const block of betaMessage.content) {
         if (block.type === 'tool_use') {
@@ -893,7 +911,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // ---------------------------------------------------------------
     case 'result': {
       debugLog(
-        `[RESULT] subtype=${msg.subtype} result_type=${typeof msg.result} result=${JSON.stringify(msg.result ?? null).slice(0, 300)} structured_output=${JSON.stringify(msg.structured_output ?? null).slice(0, 300)}`,
+        `[RESULT] subtype=${diagnosticValueShape(msg.subtype)} result=${diagnosticValueShape(msg.result)} structuredOutput=${diagnosticValueShape(msg.structured_output)}`,
       );
       const usage = msg.usage as
         | {
@@ -1025,7 +1043,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           const isError = block.is_error === true;
 
           debugLog(
-            `[TOOL_RESULT] toolUseId=${block.tool_use_id} isError=${isError} result=${resultText.slice(0, 200)}`,
+            `[TOOL_RESULT] toolUseIdLength=${block.tool_use_id.length} isError=${isError} result=${diagnosticValueShape(resultText)}`,
           );
 
           events.push({
@@ -1061,7 +1079,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // informational and don't need translation to StreamEvent.
     default:
       debugLog(
-        `[TRANSLATE-SKIP] Unhandled msg type=${msg.type} subtype=${msg.subtype ?? 'none'} keys=${Object.keys(msg).join(',')}`,
+        `[TRANSLATE-SKIP] Unhandled message type=${diagnosticValueShape(msg.type)} subtype=${diagnosticValueShape(msg.subtype)} fieldCount=${Object.keys(msg).length}`,
       );
       break;
   }
@@ -1104,6 +1122,8 @@ type CallToolResult = {
   isError?: boolean;
 };
 
+type ClaudeToolExecutionContext = ToolExecutionContext & { conversationId: string };
+
 /**
  * Create an MCP tool handler for a Kai tool definition.
  *
@@ -1115,42 +1135,43 @@ function createToolHandler(
   conversationId: string,
   cwd: string | undefined,
   abortSignal: AbortSignal | undefined,
+  browserOwnerId: string | undefined,
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  if (toolDef.name === 'ask_user') {
-    return createAskUserHandler(conversationId, abortSignal);
-  }
-  if (toolDef.name === 'exit_plan_mode') {
-    return createExitPlanModeHandler(toolDef, conversationId, cwd, abortSignal);
-  }
-
-  // Standard tool handler — validate args, call execute(), wrap the result
+  // Approval-backed special tools stay inside this wrapper so lifecycle hooks
+  // can deny or rewrite their input and sanitize their result.
   return async (args: unknown): Promise<CallToolResult> => {
-    const context: ToolExecutionContext = {
-      toolCallId: `sdk-bridge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    const toolCallPrefix =
+      toolDef.name === 'ask_user' ? 'sdk-ask' : toolDef.name === 'exit_plan_mode' ? 'sdk-plan' : 'sdk-bridge';
+    const toolCallId = `${toolCallPrefix}-${randomUUID()}`;
+    const context: ClaudeToolExecutionContext = {
+      toolCallId,
       conversationId,
+      browserOwnerId,
       cwd,
       abortSignal,
     };
 
     try {
-      // These tools run with full local privileges, so if the tool's Zod schema
-      // exists and rejects, fail the call rather than executing on raw input.
-      // Tools without a safeParse-capable schema pass through (nothing to check).
-      let validatedArgs: unknown = args;
-      const safeParse = (toolDef.inputSchema as { safeParse?: (v: unknown) => { success: boolean; data?: unknown } })
-        .safeParse;
-      if (typeof safeParse === 'function') {
-        const parsed = safeParse.call(toolDef.inputSchema, args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: 'text', text: `Invalid arguments for tool "${toolDef.name}".` }],
-            isError: true,
-          };
-        }
-        validatedArgs = parsed.data;
-      }
-
-      const result = await toolDef.execute(validatedArgs, context);
+      const result = await executeToolWithLifecycleHooks({
+        conversationId,
+        toolCallId,
+        toolName: toolDef.name,
+        args,
+        validate: (candidate) => {
+          const safeParse = (
+            toolDef.inputSchema as { safeParse?: (value: unknown) => { success: boolean; data?: unknown } }
+          ).safeParse;
+          if (typeof safeParse !== 'function') return candidate;
+          const parsed = safeParse.call(toolDef.inputSchema, candidate);
+          if (!parsed.success) throw new Error(`Invalid arguments for tool "${toolDef.name}".`);
+          return parsed.data;
+        },
+        execute: (validatedArgs) => {
+          if (toolDef.name === 'ask_user') return executeAskUserTool(validatedArgs, context);
+          if (toolDef.name === 'exit_plan_mode') return executeExitPlanModeTool(toolDef, validatedArgs, context);
+          return toolDef.execute(validatedArgs, context);
+        },
+      });
       // Surface an error-shaped tool result as a tool error, not a success.
       const resultIsError =
         !!result &&
@@ -1165,7 +1186,7 @@ function createToolHandler(
       return { content, ...(resultIsError ? { isError: true } : {}) };
     } catch (err) {
       return {
-        content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+        content: [{ type: 'text', text: redactBrowserToolErrorForExposure(toolDef.name, err) }],
         isError: true,
       };
     }
@@ -1173,7 +1194,8 @@ function createToolHandler(
 }
 
 /**
- * Create a tool handler for `ask_user` that orchestrates the full UI flow.
+ * Execute `ask_user` after schema validation and PreToolUse have produced the
+ * effective question. Its raw answer then passes through PostToolUse.
  *
  * 1. Broadcasts `tool-approval-required` to the renderer (shows question UI)
  * 2. Registers a pending approval and awaits the user's response
@@ -1183,54 +1205,49 @@ function createToolHandler(
  * The renderer doesn't need changes — it already handles `tool-approval-required`
  * events and sends answers via `agent:answer-tool-question` IPC.
  */
-function createAskUserHandler(
-  conversationId: string,
-  abortSignal: AbortSignal | undefined,
-): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  return async (args: unknown): Promise<CallToolResult> => {
-    const toolCallId = `sdk-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionContext): Promise<unknown> {
+  const { toolCallId, conversationId, abortSignal, browserOwnerId } = context;
 
-    debugLog(`[ASK_USER] Broadcasting question toolCallId=${toolCallId}`);
+  debugLog(`[ASK_USER] Broadcasting question toolCallIdLength=${toolCallId.length}`);
 
-    // 1. Broadcast to renderer — shows question UI
-    broadcastStreamEventRaw({
-      conversationId,
-      type: 'tool-approval-required',
-      toolCallId,
-      toolName: 'ask_user',
-      args,
-    });
+  // Register before broadcasting so a synchronous response cannot beat the
+  // waiter, and so a dedicated pop-out can be bound to this exact request.
+  const approvalDecision = registerPendingApproval(toolCallId, abortSignal ?? undefined, 'any-renderer', {
+    conversationId,
+    browserOwnerId,
+  });
 
-    // 2. Wait for user response via shared pending-approval infrastructure.
-    //    The IPC handler (agent:answer-tool-question) stores answers in
-    //    pendingQuestionAnswers and resolves the approval promise.
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined);
+  // 1. Broadcast to renderer — shows question UI
+  broadcastStreamEventRaw({
+    conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'ask_user',
+    args,
+  });
 
-    if (approved !== true) {
-      debugLog(`[ASK_USER] User dismissed/rejected toolCallId=${toolCallId}`);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],
-        isError: true,
-      };
-    }
+  // 2. Wait for user response via shared pending-approval infrastructure.
+  //    The IPC handler (agent:answer-tool-question) stores answers in
+  //    pendingQuestionAnswers and resolves the approval promise.
+  const approved = await approvalDecision;
 
-    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
-    const answers = pendingQuestionAnswers.get(toolCallId);
-    pendingQuestionAnswers.delete(toolCallId);
+  if (approved !== true) {
+    debugLog(`[ASK_USER] User dismissed/rejected question`);
+    return { error: 'User dismissed the question.' };
+  }
 
-    debugLog(
-      `[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`,
-    );
+  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
+  const answers = pendingQuestionAnswers.get(toolCallId);
+  pendingQuestionAnswers.delete(toolCallId);
 
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ success: true, answers: answers ?? {} }) }],
-    };
-  };
+  debugLog(`[ASK_USER] Got answers answerCount=${answers ? Object.keys(answers).length : 0}`);
+
+  return { success: true, answers: answers ?? {} };
 }
 
 /**
- * Create a tool handler for `exit_plan_mode` that gates execution behind
- * user approval.
+ * Execute `exit_plan_mode` after schema validation and PreToolUse have
+ * produced the effective plan, then gate it behind user approval.
  *
  * In the Mastra runtime, `agent.ts` intercepts `exit_plan_mode` via the
  * `onToolExecutionStart` hook and broadcasts `tool-approval-required` so the
@@ -1243,71 +1260,46 @@ function createAskUserHandler(
  * 4. On reject: returns an error telling Claude to keep planning
  * 5. On dismiss: returns an error indicating the plan was dismissed
  */
-function createExitPlanModeHandler(
+async function executeExitPlanModeTool(
   toolDef: ToolDefinition,
-  conversationId: string,
-  cwd: string | undefined,
-  abortSignal: AbortSignal | undefined,
-): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  return async (args: unknown): Promise<CallToolResult> => {
-    const toolCallId = `sdk-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  args: unknown,
+  context: ClaudeToolExecutionContext,
+): Promise<unknown> {
+  const { toolCallId, conversationId, abortSignal, browserOwnerId } = context;
 
-    debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallId=${toolCallId}`);
+  debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallIdLength=${toolCallId.length}`);
 
-    // 1. Broadcast to renderer — shows plan review UI with approve/reject
-    broadcastStreamEventRaw({
-      conversationId,
-      type: 'tool-approval-required',
-      toolCallId,
-      toolName: 'exit_plan_mode',
-      args,
-    });
+  const approvalDecision = registerPendingApproval(toolCallId, abortSignal ?? undefined, 'any-renderer', {
+    conversationId,
+    browserOwnerId,
+  });
 
-    // 2. Wait for user approval
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined);
+  // 1. Broadcast to renderer — shows plan review UI with approve/reject
+  broadcastStreamEventRaw({
+    conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'exit_plan_mode',
+    args,
+  });
 
-    if (approved === 'dismiss') {
-      debugLog(`[EXIT_PLAN_MODE] User dismissed plan toolCallId=${toolCallId}`);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the plan. Exiting plan mode.' }) }],
-        isError: true,
-      };
-    }
+  // 2. Wait for user approval
+  const approved = await approvalDecision;
 
-    if (approved !== true) {
-      debugLog(`[EXIT_PLAN_MODE] User rejected plan toolCallId=${toolCallId}`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error:
-                "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
-            }),
-          },
-        ],
-        isError: true,
-      };
-    }
+  if (approved === 'dismiss') {
+    debugLog(`[EXIT_PLAN_MODE] User dismissed plan`);
+    return { error: 'User dismissed the plan. Exiting plan mode.' };
+  }
 
-    // 3. Approved — execute the tool (writes plan file, broadcasts mode change)
-    debugLog(`[EXIT_PLAN_MODE] User approved plan toolCallId=${toolCallId}`);
-    const context: ToolExecutionContext = {
-      toolCallId,
-      conversationId,
-      cwd,
-      abortSignal,
+  if (approved !== true) {
+    debugLog(`[EXIT_PLAN_MODE] User rejected plan`);
+    return {
+      error:
+        "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
     };
+  }
 
-    try {
-      const result = await toolDef.execute(args, context);
-      const text = typeof result === 'string' ? result : JSON.stringify(result);
-      return { content: [{ type: 'text', text }] };
-    } catch (err) {
-      return {
-        content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
-        isError: true,
-      };
-    }
-  };
+  // 3. Approved — execute the tool (writes plan file, broadcasts mode change)
+  debugLog(`[EXIT_PLAN_MODE] User approved plan`);
+  return toolDef.execute(args, context);
 }

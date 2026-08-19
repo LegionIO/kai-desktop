@@ -108,6 +108,41 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: desktopConfigPayload round-trip', () => {
+  it('throws on a security-sensitive reload instead of substituting permissive defaults', () => {
+    const initial = readEffectiveConfig(appHome);
+    initial.browser.enabled = false;
+    initial.browser.structuredActions = 'deny';
+    initial.browser.scriptInjection = 'deny';
+    writeDesktopConfig(appHome, initial);
+    writeFileSync(join(appHome, 'settings', 'desktop.json'), '{"browser":', 'utf-8');
+
+    expect(() => readEffectiveConfig(appHome, { failOnInvalid: true })).toThrow();
+  });
+
+  it('returns isolated last-known-good config copies for malformed and missing non-strict reads', () => {
+    const initial = readEffectiveConfig(appHome);
+    initial.browser.enabled = false;
+    initial.browser.structuredActions = 'deny';
+    initial.browser.scriptInjection = 'deny';
+    writeDesktopConfig(appHome, initial);
+    const configPath = join(appHome, 'settings', 'desktop.json');
+
+    writeFileSync(configPath, '{"browser":', 'utf-8');
+    const malformedFallback = readEffectiveConfig(appHome);
+    expect(malformedFallback.browser.enabled).toBe(false);
+    expect(malformedFallback.browser.structuredActions).toBe('deny');
+    expect(malformedFallback.browser.scriptInjection).toBe('deny');
+
+    malformedFallback.browser.enabled = true;
+    expect(readEffectiveConfig(appHome).browser.enabled).toBe(false);
+
+    rmSync(configPath);
+    const missingFallback = readEffectiveConfig(appHome);
+    expect(missingFallback.browser.enabled).toBe(false);
+    expect(missingFallback.browser.structuredActions).toBe('deny');
+    expect(missingFallback.browser.scriptInjection).toBe('deny');
+  });
+
   it('defaults recent history to the Kai branch and persists an explicit merge mode', () => {
     const initial = readEffectiveConfig(appHome);
     expect(initial.memory.recentHistoryMode).toBe('kai-branch');
@@ -271,6 +306,40 @@ describe('agent.piSdk schema', () => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: registered channels', () => {
+  it('hot-reloads first-time llm.json creation before desktop.json exists', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(ipc as Parameters<typeof registerConfigHandlers>[0], appHome);
+      },
+    });
+
+    expect(existsSync(join(appHome, 'settings', 'desktop.json'))).toBe(false);
+    const beforeImport = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+    expect(beforeImport.models.providers.anthropic?.enabled).toBe(false);
+    expect(beforeImport.models.providers.anthropic?.apiKey).toBe('');
+
+    writeFileSync(
+      join(appHome, 'settings', 'llm.json'),
+      JSON.stringify({
+        llm: {
+          enabled: true,
+          providers: { anthropic: { api_key: 'sk-test', default_model: 'claude-first-import' } },
+        },
+      }),
+      'utf-8',
+    );
+
+    await vi.waitFor(
+      async () => {
+        const current = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+        expect(current.models.providers.anthropic?.apiKey).toBe('sk-test');
+        expect(current.models.catalog.some((entry) => entry.key === 'claude-first-import')).toBe(true);
+      },
+      { timeout: 2_000 },
+    );
+    expect(existsSync(join(appHome, 'settings', 'desktop.json'))).toBe(false);
+  });
+
   it('responds to config:get with the effective AppConfig shape', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
@@ -331,6 +400,76 @@ describe('config IPC: registered channels', () => {
     expect(reread.launchAtLogin).toBe(true);
     const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
     expect(onDisk.launchAtLogin).toBe(true);
+  });
+
+  it('rolls back an invalid whole web-server section in memory and on disk', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(ipc as Parameters<typeof registerConfigHandlers>[0], appHome);
+      },
+    });
+    const initial = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+    // Establish a persisted baseline so the rejected mutation can be compared
+    // against both the live object and desktop.json.
+    await harness.invoke('config:set', FAKE_EVENT, 'webServer.port', initial.webServer.port);
+    // config:get intentionally returns the live object in this in-process
+    // harness; clone it so the rejected mutation cannot alter our baseline.
+    const before = structuredClone(await harness.invoke<AppConfig>('config:get', FAKE_EVENT));
+
+    await expect(harness.invoke('config:set', FAKE_EVENT, 'webServer', null)).rejects.toThrow(
+      /Rejected config write at "webServer"/,
+    );
+
+    const after = await harness.invoke<AppConfig>('config:get', FAKE_EVENT);
+    expect(after.webServer).toEqual(before.webServer);
+    const onDisk = JSON.parse(readFileSync(join(appHome, 'settings', 'desktop.json'), 'utf-8'));
+    expect(onDisk.webServer).toEqual(before.webServer);
+  });
+
+  it('allows Browser policy writes only from the primary main frame', async () => {
+    const primaryEvent = Object.freeze({ sender: 'primary', senderFrame: 'main' });
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(
+          ipc as Parameters<typeof registerConfigHandlers>[0],
+          appHome,
+          undefined,
+          (event) => event === primaryEvent,
+        );
+      },
+    });
+
+    await expect(
+      harness.invoke('config:set', { __kaiWebBridge: true }, 'browser.aiAllowPrivateNetwork', true),
+    ).rejects.toThrow(/primary Kai window/);
+    expect((await harness.invoke<AppConfig>('config:get', FAKE_EVENT)).browser.aiAllowPrivateNetwork).toBe(false);
+
+    await harness.invoke('config:set', primaryEvent, 'browser.aiAllowPrivateNetwork', true);
+    expect((await harness.invoke<AppConfig>('config:get', FAKE_EVENT)).browser.aiAllowPrivateNetwork).toBe(true);
+  });
+
+  it('publishes every persisted Browser toggle before the coalesced config broadcast', async () => {
+    const primaryEvent = Object.freeze({ sender: 'primary', senderFrame: 'main' });
+    const onChanged = vi.fn();
+    const onBrowserChanged = vi.fn();
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConfigHandlers(
+          ipc as Parameters<typeof registerConfigHandlers>[0],
+          appHome,
+          onChanged,
+          (event) => event === primaryEvent,
+          onBrowserChanged,
+        );
+      },
+    });
+
+    await harness.invoke('config:set', primaryEvent, 'browser.enabled', false);
+    await harness.invoke('config:set', primaryEvent, 'browser.enabled', true);
+
+    expect(onBrowserChanged).toHaveBeenCalledTimes(2);
+    expect(onBrowserChanged.mock.calls.map(([browser]) => browser.enabled)).toEqual([false, true]);
+    expect(onChanged).not.toHaveBeenCalled();
   });
 
   it('reports homedir via platform:homedir', async () => {

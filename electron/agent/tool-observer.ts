@@ -5,6 +5,7 @@ import type { LLMModelConfig } from './model-catalog.js';
 import type { LanguageModel } from 'ai';
 import { runWithModelFallback, auxChainWithPrimary, readAmbientConfig } from './generate-fallback.js';
 import { OBSERVER_SYSTEM_PROMPT } from './prompts.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 
 export type ToolObserverConfig = {
   enabled: boolean;
@@ -299,12 +300,16 @@ export function toResultSummary(result: unknown): { isError: boolean; summary: s
  * next tick it fires again, starving completion in a loop. Pure + exported so
  * this policy is unit-tested independently of the LLM eval loop.
  */
-export function shouldSkipSubAgentNudge(tool: {
-  toolName: string;
-  running?: boolean;
-  declaredComplete?: boolean;
-  subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
-} | undefined): string | null {
+export function shouldSkipSubAgentNudge(
+  tool:
+    | {
+        toolName: string;
+        running?: boolean;
+        declaredComplete?: boolean;
+        subAgentSignal?: 'complete' | 'failed' | 'awaiting_response' | 'continue' | 'stopped' | 'paused';
+      }
+    | undefined,
+): string | null {
   if (!tool || tool.toolName !== 'sub_agent') return 'not a running sub_agent';
   // Not running (e.g. cancelled synchronously earlier in this same observer
   // decision) → don't message it; the run is torn down and the message drops.
@@ -357,11 +362,12 @@ export class ToolObserverManager {
 
   onToolExecutionStart(start: ToolStartState): void {
     if (!this.config.enabled || this.disposed) return;
+    const exposedArgs = redactBrowserToolArgsForExposure(start.toolName, start.args);
     const existing = this.tools.get(start.toolCallId);
     const state: ObservedToolState = existing ?? {
       toolCallId: start.toolCallId,
       toolName: start.toolName,
-      args: start.args,
+      args: exposedArgs,
       startedAt: new Date().toISOString(),
       running: true,
       observerInitiated: Boolean(start.observerInitiated),
@@ -375,7 +381,7 @@ export class ToolObserverManager {
     };
 
     state.toolName = start.toolName || state.toolName;
-    state.args = start.args;
+    state.args = exposedArgs;
     state.running = true;
     state.finishedAt = undefined;
     state.observerInitiated = Boolean(start.observerInitiated) || state.observerInitiated;

@@ -61,7 +61,9 @@ function launchArgs(mainPath: string): string[] {
   return args;
 }
 
-export async function launchElectronForSmoke(): Promise<ElectronHandle> {
+export async function launchElectronForSmoke(
+  options: { browserIntegrationTest?: boolean } = {},
+): Promise<ElectronHandle> {
   const userDataDir = mkdtempSync(join(tmpdir(), 'kai-ipc-smoke-'));
   const mainPath = mainEntryPoint();
 
@@ -79,6 +81,7 @@ export async function launchElectronForSmoke(): Promise<ElectronHandle> {
       // env in this run, so the updater is already inert, but we set
       // `NODE_ENV` explicitly to be safe.
       NODE_ENV: 'test',
+      ...(options.browserIntegrationTest ? { KAI_BROWSER_INTEGRATION_TEST: '1' } : {}),
     },
   });
 

@@ -139,7 +139,7 @@ export class OpencodeRuntime implements AgentRuntime {
 
     if (customTools.length > 0) {
       try {
-        bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal);
+        bridgeUrl = await bridge.start(customTools, conversationId, runDir, abortSignal, options.browserOwnerId);
         const token = bridge.getAuthToken();
         opencodeConfigDir = mkdtempSync(join(tmpdir(), 'kai-opencode-'));
         opencodeConfigPath = join(opencodeConfigDir, 'opencode.json');

@@ -30,6 +30,8 @@ import { createImageGenTool } from './image-gen.js';
 import { createVideoGenTool } from './video-gen.js';
 import { buildCliTools } from './cli-tools.js';
 import { createPluginInfoTool } from './plugin-info.js';
+import { createBrowserTools } from './browser.js';
+import { getExistingBrowserManager } from '../browser/service.js';
 import { z } from 'zod';
 import { readConversation } from '../ipc/conversation-store.js';
 import { getComputerUseManager } from '../computer-use/service.js';
@@ -193,6 +195,12 @@ export async function buildToolRegistry(
   // Artifact tools (agent-rendered live previews)
   if (config?.tools?.artifacts?.enabled !== false) {
     tools.push(...createArtifactTools());
+  }
+
+  // The native in-app browser only exists in a desktop GUI process. Headless
+  // and web clients intentionally do not receive these tools.
+  if (config.browser?.enabled !== false && getExistingBrowserManager()) {
+    tools.push(...createBrowserTools(getConfig));
   }
 
   // File-change inspection + rollback (agent-facing view of the diff tracker)

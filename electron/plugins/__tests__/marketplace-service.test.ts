@@ -18,8 +18,10 @@ vi.mock('electron', () => ({ net: { fetch: vi.fn() } }));
 import { net } from 'electron';
 import { __internal, MarketplaceService } from '../marketplace-service.js';
 import type { MarketplaceCatalogEntry } from '../marketplace-service.js';
+import { getPluginIntegrity } from '../plugin-integrity.js';
+import type { AppConfig } from '../../config/schema.js';
 
-const { assertSecureMarketplaceUrl, readCappedResponse } = __internal;
+const { assertSecureMarketplaceUrl, readCappedResponse, shouldAutoApproveMarketplacePlugin } = __internal;
 const mockFetch = vi.mocked(net.fetch);
 
 describe('assertSecureMarketplaceUrl', () => {
@@ -44,6 +46,87 @@ describe('assertSecureMarketplaceUrl', () => {
     expect(() => assertSecureMarketplaceUrl('file:///etc/passwd')).toThrow(/must be https/i);
     expect(() => assertSecureMarketplaceUrl('ftp://x/c.json')).toThrow(/must be https/i);
     expect(() => assertSecureMarketplaceUrl('not a url')).toThrow(/invalid marketplace url/i);
+  });
+});
+
+describe('required plugin permission migration', () => {
+  it('upgrades install metadata but preserves legacy approval for explicit Browser re-consent', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'kai-required-plugin-'));
+    try {
+      const pluginsDir = join(root, 'plugins');
+      const pluginDir = join(pluginsDir, 'required-ui');
+      mkdirSync(pluginDir, { recursive: true });
+      writeFileSync(
+        join(pluginDir, 'plugin.json'),
+        JSON.stringify({ name: 'required-ui', version: '1.0.0', permissions: ['ui:panel'] }),
+      );
+      writeFileSync(join(pluginDir, 'frontend.js'), 'export const panel = true;');
+      const integrity = getPluginIntegrity(pluginDir, 'required-ui');
+      const installedRecord = {
+        name: 'required-ui',
+        repository: 'owner/repo',
+        version: '1.0.0',
+        fileHash: integrity.fileHash,
+        permissions: ['ui:panel'],
+        installedAt: '2026-01-01T00:00:00.000Z',
+        marketplaceUrl: 'https://plugins.example/catalog.json',
+      };
+      let config = {
+        marketplace: { installedPlugins: { 'required-ui': installedRecord } },
+        pluginApprovals: {
+          'required-ui': {
+            hash: integrity.fileHash,
+            permissions: ['ui:panel'],
+            approvedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      } as unknown as AppConfig;
+      const setConfig = (path: string, value: unknown) => {
+        if (path === 'marketplace.installedPlugins') {
+          config = { ...config, marketplace: { installedPlugins: value as never } };
+        } else if (path === 'pluginApprovals') {
+          config = { ...config, pluginApprovals: value as AppConfig['pluginApprovals'] };
+        }
+      };
+      const service = new MarketplaceService(pluginsDir, root, () => config, setConfig, new Set(['required-ui']));
+      const entry: MarketplaceCatalogEntry = {
+        name: 'required-ui',
+        displayName: 'Required UI',
+        description: 'Required frontend',
+        repository: 'owner/repo',
+        version: '1.0.0',
+        fileHash: integrity.fileHash,
+        installed: true,
+        installedVersion: '1.0.0',
+        marketplaceUrl: 'https://plugins.example/catalog.json',
+      };
+
+      await expect(service.autoInstallRequired(new Set(['required-ui']), [entry])).resolves.toEqual([]);
+      expect(config.marketplace?.installedPlugins['required-ui'].permissions).toEqual([
+        'ui:panel',
+        'browser:authenticated-session',
+      ]);
+      expect(config.pluginApprovals?.['required-ui']).toMatchObject({
+        hash: integrity.fileHash,
+        permissions: ['ui:panel'],
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('marketplace plugin automatic approval', () => {
+  it('requires explicit consent for authenticated Browser access even when the plugin is brand-required', () => {
+    expect(shouldAutoApproveMarketplacePlugin(true, ['browser:authenticated-session'])).toBe(false);
+    expect(shouldAutoApproveMarketplacePlugin(true, ['ui:panel', 'browser:authenticated-session'])).toBe(false);
+  });
+
+  it('preserves the existing automatic-approval policy outside authenticated Browser access', () => {
+    expect(shouldAutoApproveMarketplacePlugin(true, ['exec:whitelisted'])).toBe(true);
+    expect(shouldAutoApproveMarketplacePlugin(false, ['exec:whitelisted'])).toBe(false);
+    expect(shouldAutoApproveMarketplacePlugin(false, ['ui:panel'])).toBe(true);
   });
 });
 

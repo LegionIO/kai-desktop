@@ -24,6 +24,8 @@ import {
   getOrCreateAssistantInAcc,
   resolveLiveInjectedParentId,
   reconnectActiveBranchRoot,
+  persistAdmissionRejectionMessage,
+  streamAdmissionRejectionMessage,
 } from '../RuntimeProvider';
 
 type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
@@ -31,6 +33,41 @@ type Node = { id: string; parentId: string | null; role: 'user' | 'assistant' };
 function n(id: string, parentId: string | null, role: 'user' | 'assistant' = 'user'): Node {
   return { id, parentId, role };
 }
+
+describe('streamAdmissionRejectionMessage', () => {
+  it('surfaces both native Browser authority rejections as desktop continuation guidance', () => {
+    expect(streamAdmissionRejectionMessage({ nativeBrowserAuthorityRequired: true })).toBe(
+      'Continue this Browser-assisted turn from the active Kai desktop window.',
+    );
+    expect(streamAdmissionRejectionMessage({ realtimeTurnActive: true })).toBe(
+      'End the active voice call before starting a text response.',
+    );
+    expect(streamAdmissionRejectionMessage({ nativeBrowserContinuationRequired: true })).toBe(
+      'Continue this Browser-assisted turn from the active Kai desktop window.',
+    );
+  });
+
+  it('keeps revoked authority and ordinary busy results distinct', () => {
+    expect(streamAdmissionRejectionMessage({ browserAuthorityRevoked: true })).toBe(
+      'The Browser sidebar reloaded before the request could start. Please retry.',
+    );
+    expect(streamAdmissionRejectionMessage({ busy: true })).toBe(
+      'Compacting the conversation — wait for it to finish, then retry.',
+    );
+  });
+});
+
+describe('persistAdmissionRejectionMessage', () => {
+  it('maps persisted native Browser admission rejections to desktop continuation guidance', () => {
+    expect(persistAdmissionRejectionMessage('native-browser-authority-required')).toBe(
+      'Continue this Browser-assisted turn from the active Kai desktop window.',
+    );
+    expect(persistAdmissionRejectionMessage('native-browser-continuation-required')).toBe(
+      'Continue this Browser-assisted turn from the active Kai desktop window.',
+    );
+    expect(persistAdmissionRejectionMessage('conversation-busy')).toBeNull();
+  });
+});
 
 describe('resolveLiveInjectedParentId', () => {
   it('uses the authoritative persisted parent when that node is already live', () => {
