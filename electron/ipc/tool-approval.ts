@@ -101,6 +101,31 @@ function settleReason(value: boolean | 'dismiss', aborted: boolean): ApprovalSet
   return 'dismiss';
 }
 
+/** DURABLE record of an approval's Browser/Realtime authority, keyed by toolCallId, that OUTLIVES
+ *  the pending entry (R174). A browser-authorized ask_user's pending entry is DELETED on abort, but
+ *  the raced-answer stash/recovery path still processes a late answer for that id — it must enforce
+ *  the SAME authority so a non-primary web surface can't inject an answer into a browser-authorized
+ *  successor/recovery turn. Bounded FIFO; entries are short-lived (one turn's recovery window). */
+type ApprovalAuthorityRecord = Pick<PendingToolApproval, 'authority' | 'streamOwner'>;
+const approvalAuthorityById = new Map<string, ApprovalAuthorityRecord>();
+const APPROVAL_AUTHORITY_MAP_MAX = 500;
+/** Returns the recorded authority for a toolCallId whose pending entry may already be gone (abort). */
+export function getRecordedApprovalAuthority(toolCallId: string): ApprovalAuthorityRecord | undefined {
+  return approvalAuthorityById.get(toolCallId);
+}
+function recordApprovalAuthority(toolCallId: string, record: ApprovalAuthorityRecord): void {
+  // Only record when authority actually matters (native-browser OR a resolved streamOwner) — a
+  // plain any-renderer approval has nothing to enforce after its pending entry is gone.
+  if (record.authority !== 'native-browser' && !record.streamOwner) return;
+  approvalAuthorityById.delete(toolCallId);
+  approvalAuthorityById.set(toolCallId, record);
+  while (approvalAuthorityById.size > APPROVAL_AUTHORITY_MAP_MAX) {
+    const oldest = approvalAuthorityById.keys().next().value;
+    if (oldest === undefined) break;
+    approvalAuthorityById.delete(oldest);
+  }
+}
+
 /** Dismiss only native Browser policy prompts for one assistant owner. Generic
  * approvals remain live while the owning text/Realtime turn itself is current. */
 export function dismissPendingNativeBrowserApprovalsForOwner(conversationId: string, browserOwnerId: string): void {
@@ -335,6 +360,9 @@ export function registerPendingApproval(
       ...(streamOwner ? { streamOwner } : {}),
       ...(context?.privateDetails ? { privateDetails: context.privateDetails } : {}),
     });
+    // Record the authority DURABLY (R174) so the raced-answer recovery path can enforce it even
+    // after abort deletes the pending entry above.
+    recordApprovalAuthority(toolCallId, { authority, streamOwner });
 
     // An already-aborted signal was rejected synchronously at the top of registerPendingApproval,
     // so here we only need to attach the listener for a future abort.

@@ -590,6 +590,7 @@ import {
   resolveApprovalBroadcastWindowIds,
   registerPendingApproval,
   broadcastStreamEventRaw,
+  getRecordedApprovalAuthority,
   type PendingToolApproval,
   type ToolApprovalAuthority,
 } from './tool-approval.js';
@@ -10438,6 +10439,27 @@ export function registerAgentHandlers(
         closeApprovalWindow(toolCallId);
       }
       return { ok: false, error: approvalError };
+    }
+    // PENDINGLESS authority enforcement (R174): the raced-answer stash path below accepts an answer
+    // even when `pending` was already deleted by an abort (that's the whole ask_user-race fix). But a
+    // browser-authorized approval's authority must STILL be enforced there — otherwise a non-primary
+    // web surface could submit an answer for a browser-owned ask_user after abort and have it injected
+    // into the successor/recovery turn that still holds authenticated Browser authority. Consult the
+    // DURABLE authority record (survives the pending deletion) and reject an unauthorized late answer.
+    if (!pending) {
+      const recordedAuthority = getRecordedApprovalAuthority(toolCallId);
+      const requiresNativeAuthority =
+        recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
+      if (requiresNativeAuthority) {
+        // Enforce CALLER authority (the primary window), NOT stream-current: the recovery path
+        // deliberately runs after the original stream ended, so a stream-current gate would wrongly
+        // reject a legitimate primary-surface answer. The pop-out capability lived on the (now-deleted)
+        // pending entry, so only the primary window can authorize a late answer. The threat is a
+        // non-primary web/secondary surface injecting — that fails this check.
+        if (!isPrimaryBrowserToolCaller(event, getPrimaryWindow)) {
+          return { ok: false, error: 'native-browser-authority-required' };
+        }
+      }
     }
     // Stash the answers before resolving. A fully-submitted answer can race an
     // abort (turn ended / superseded / plan-restart) that already settled + removed

@@ -43,6 +43,7 @@ import {
   setPrimaryApprovalWindowResolver,
   authorizePendingApprovalWindow,
   broadcastStreamEventRaw,
+  getRecordedApprovalAuthority,
 } from '../tool-approval.js';
 
 beforeEach(() => {
@@ -59,6 +60,30 @@ beforeEach(() => {
 });
 
 describe('registerPendingApproval', () => {
+  it('durably records a browser-owned approval authority that OUTLIVES abort deletion (R174)', async () => {
+    setToolApprovalOwnerResolver((conversationId, browserOwnerId) => ({ conversationId, streamToken: browserOwnerId }));
+    const ctrl = new AbortController();
+    const p = registerPendingApproval('browser-ask', ctrl.signal, 'native-browser', {
+      conversationId: 'chat-1',
+      browserOwnerId: 'run-1',
+    });
+    // Abort deletes the pending entry, but the durable authority record must remain so the
+    // pendingless raced-answer recovery path can still enforce browser authority.
+    ctrl.abort();
+    await p;
+    expect(pendingToolApprovals.has('browser-ask')).toBe(false);
+    expect(getRecordedApprovalAuthority('browser-ask')).toMatchObject({
+      authority: 'native-browser',
+      streamOwner: { conversationId: 'chat-1', streamToken: 'run-1' },
+    });
+    // A plain any-renderer approval with no owner records NOTHING (nothing to enforce post-deletion).
+    const p2 = registerPendingApproval('plain-ask');
+    pendingToolApprovals.get('plain-ask')!.resolve(true);
+    await p2;
+    expect(getRecordedApprovalAuthority('plain-ask')).toBeUndefined();
+    setToolApprovalOwnerResolver(null);
+  });
+
   it('resolves with the value the map entry is resolved with (approve)', async () => {
     const p = registerPendingApproval('call-1');
     expect(pendingToolApprovals.has('call-1')).toBe(true);
