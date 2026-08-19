@@ -6,14 +6,7 @@
  * transitioning to the unified TaskDetailPanel view.
  */
 
-import {
-  useState,
-  useRef,
-  useEffect,
-  useCallback,
-  type FC,
-  type KeyboardEvent,
-} from 'react';
+import { useState, useRef, useEffect, useCallback, type FC, type KeyboardEvent } from 'react';
 import {
   SendHorizonalIcon,
   PlusIcon,
@@ -65,14 +58,16 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   // Recording config (just to check enabled state)
   const recordingEnabled = (config as Record<string, unknown> | null)?.audio
-    ? ((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true
+    ? (((config as Record<string, unknown>).audio as { recording?: { enabled?: boolean } })?.recording?.enabled ?? true)
     : true;
 
   // ── CWD popover / split-button state ────────────────────────────────
   const [cwdPopoverOpen, setCwdPopoverOpen] = useState(false);
   const cwdRootRef = useRef<HTMLDivElement>(null);
   const cwdPopover = usePopoverAlign();
-  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({ popoverOpen: cwdPopoverOpen });
+  const { expanded: cwdExpanded, containerProps: cwdContainerProps } = useSplitButtonHover({
+    popoverOpen: cwdPopoverOpen,
+  });
 
   useEffect(() => {
     if (!cwdPopoverOpen) return;
@@ -90,9 +85,26 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   const canSend = input.trim().length > 0 || attachments.length > 0;
 
   // ── File attach / directory handlers ────────────────────────────────
-  const isWebBridge = Boolean((window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge);
+  const isWebBridge = Boolean(
+    (window as unknown as Record<string, unknown>).app && (window.app as Record<string, unknown>).__isWebBridge,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  // Transient notice for attachment files the main process SKIPPED (too large / not a regular
+  // file) (R183) — without this the user picks a file and nothing happens (silent no-op).
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const attachNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showAttachNotice = useCallback((skipped: string[]) => {
+    if (skipped.length === 0) return;
+    if (attachNoticeTimerRef.current) clearTimeout(attachNoticeTimerRef.current);
+    const names = skipped.join(', ');
+    setAttachNotice(
+      skipped.length === 1
+        ? `Couldn't attach ${names} (too large or not a regular file).`
+        : `Couldn't attach ${skipped.length} files (too large or not regular files): ${names}`,
+    );
+    attachNoticeTimerRef.current = setTimeout(() => setAttachNotice(null), 6000);
+  }, []);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -102,26 +114,43 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       return;
     }
     try {
-      const result = await app.dialog.openFile({ filters }) as { canceled: boolean; files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }> };
-      if (!result.canceled && result.files) addAttachments(result.files);
-    } catch (err) { console.error('Attach failed:', err); }
+      const result = (await app.dialog.openFile({ filters })) as {
+        canceled: boolean;
+        files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+        skipped?: string[];
+      };
+      if (result.canceled) return;
+      if (result.files && result.files.length > 0) addAttachments(result.files);
+      if (result.skipped) showAttachNotice(result.skipped);
+    } catch (err) {
+      console.error('Attach failed:', err);
+    }
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
-    const readers: Promise<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>[] = [];
+    const readers: Promise<{
+      name: string;
+      mime: string;
+      isImage: boolean;
+      size: number;
+      dataUrl: string;
+      text?: string;
+    }>[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      readers.push(new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          const isImage = file.type.startsWith('image/');
-          resolve({ name: file.name, mime: file.type, isImage, size: file.size, dataUrl });
-        };
-        reader.readAsDataURL(file);
-      }));
+      readers.push(
+        new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            const isImage = file.type.startsWith('image/');
+            resolve({ name: file.name, mime: file.type, isImage, size: file.size, dataUrl });
+          };
+          reader.readAsDataURL(file);
+        }),
+      );
     }
     void Promise.all(readers).then((results) => addAttachments(results));
     event.target.value = '';
@@ -140,7 +169,8 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     refocusComposer();
   };
 
-  const menuItemClassName = 'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
+  const menuItemClassName =
+    'flex cursor-default items-center gap-2 rounded-lg px-3 py-2 text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-muted/70';
 
   // Auto-resize textarea
   useEffect(() => {
@@ -208,11 +238,19 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
           />
         )}
         <div className="mx-auto w-full">
+          {attachNotice && (
+            <div className="mb-2 px-1 text-xs text-amber-600 dark:text-amber-400" role="status" aria-live="polite">
+              {attachNotice}
+            </div>
+          )}
           {/* File attachment chips */}
           {hasFileAttachments && (
             <div className="mb-3 flex flex-wrap gap-2">
               {attachments.map((file, i) => (
-                <div key={`${file.name}-${i}`} className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs">
+                <div
+                  key={`${file.name}-${i}`}
+                  className="group/att flex items-center gap-1.5 rounded-2xl border border-border/50 bg-muted/40 px-2.5 py-2 text-xs"
+                >
                   {file.isImage ? (
                     <img src={file.dataUrl} alt={file.name} className="h-10 w-10 rounded object-cover" />
                   ) : (
@@ -242,7 +280,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
               onKeyDown={handleKeyDown}
               placeholder="Describe what you want to accomplish..."
               rows={1}
-              className={cn('min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]', input.includes('\n') && 'pb-3')}
+              className={cn(
+                'min-h-[48px] max-h-[220px] w-full resize-none overflow-y-auto bg-transparent px-1 py-0.5 text-base text-foreground placeholder:text-muted-foreground/60 focus:outline-none md:text-[15px]',
+                input.includes('\n') && 'pb-3',
+              )}
             />
             <div className="flex flex-col gap-1.5 md:flex-row md:items-center md:justify-between md:gap-3">
               {/* Left side: add files + working directory */}
@@ -250,7 +291,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                 <DropdownMenu.Root>
                   <Tooltip content="Add files" side="top" sideOffset={8}>
                     <DropdownMenu.Trigger asChild>
-                      <button type="button" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground">
+                      <button
+                        type="button"
+                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 transition-colors hover:bg-muted/60 text-muted-foreground"
+                      >
                         <PlusIcon className="h-4 w-4" />
                       </button>
                     </DropdownMenu.Trigger>
@@ -261,20 +305,74 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                       sideOffset={8}
                       className="z-50 min-w-[240px] rounded-2xl border border-border/70 bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
                     >
-                      <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }]); }}>
+                      <DropdownMenu.Item
+                        className={menuItemClassName}
+                        onSelect={() => {
+                          void handleAttachFiles([
+                            { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+                          ]);
+                        }}
+                      >
                         <ImageIcon className="h-4 w-4 text-muted-foreground" />
                         <span>Image</span>
                       </DropdownMenu.Item>
-                      <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'PDF', extensions: ['pdf'] }]); }}>
+                      <DropdownMenu.Item
+                        className={menuItemClassName}
+                        onSelect={() => {
+                          void handleAttachFiles([{ name: 'PDF', extensions: ['pdf'] }]);
+                        }}
+                      >
                         <FileIcon className="h-4 w-4 text-muted-foreground" />
                         <span>PDF</span>
                       </DropdownMenu.Item>
-                      <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles([{ name: 'Documents', extensions: ['txt', 'md', 'json', 'csv', 'html', 'htm', 'js', 'jsx', 'ts', 'tsx', 'css', 'scss', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'hpp', 'sh', 'yaml', 'yml', 'toml', 'xml'] }]); }}>
+                      <DropdownMenu.Item
+                        className={menuItemClassName}
+                        onSelect={() => {
+                          void handleAttachFiles([
+                            {
+                              name: 'Documents',
+                              extensions: [
+                                'txt',
+                                'md',
+                                'json',
+                                'csv',
+                                'html',
+                                'htm',
+                                'js',
+                                'jsx',
+                                'ts',
+                                'tsx',
+                                'css',
+                                'scss',
+                                'py',
+                                'rb',
+                                'go',
+                                'rs',
+                                'java',
+                                'c',
+                                'cpp',
+                                'h',
+                                'hpp',
+                                'sh',
+                                'yaml',
+                                'yml',
+                                'toml',
+                                'xml',
+                              ],
+                            },
+                          ]);
+                        }}
+                      >
                         <FileTextIcon className="h-4 w-4 text-muted-foreground" />
                         <span>Text / Document</span>
                       </DropdownMenu.Item>
                       <DropdownMenu.Separator className="my-1 h-px bg-border/60" />
-                      <DropdownMenu.Item className={menuItemClassName} onSelect={() => { void handleAttachFiles(); }}>
+                      <DropdownMenu.Item
+                        className={menuItemClassName}
+                        onSelect={() => {
+                          void handleAttachFiles();
+                        }}
+                      >
                         <FileIcon className="h-4 w-4 text-muted-foreground" />
                         <span>Any File</span>
                       </DropdownMenu.Item>
@@ -283,15 +381,21 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                 </DropdownMenu.Root>
                 {/* Working directory split button */}
                 <div ref={cwdRootRef} {...cwdContainerProps} className="relative flex items-center">
-                  <div className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
-                    currentWorkingDirectory
-                      ? 'border-primary/50 bg-primary/10'
-                      : 'border-border/50 bg-muted/40'
-                  }`}>
-                    <Tooltip content={currentWorkingDirectory ? cwdName ?? 'Working directory' : 'Working directory'} side="top" sideOffset={8}>
+                  <div
+                    className={`flex items-center overflow-hidden rounded-lg border transition-colors ${
+                      currentWorkingDirectory ? 'border-primary/50 bg-primary/10' : 'border-border/50 bg-muted/40'
+                    }`}
+                  >
+                    <Tooltip
+                      content={currentWorkingDirectory ? (cwdName ?? 'Working directory') : 'Working directory'}
+                      side="top"
+                      sideOffset={8}
+                    >
                       <button
                         type="button"
-                        onClick={() => { void handleAttachDirectory(); }}
+                        onClick={() => {
+                          void handleAttachDirectory();
+                        }}
                         className={`flex h-10 w-10 shrink-0 items-center justify-center transition-colors ${
                           currentWorkingDirectory
                             ? 'hover:bg-primary/15 text-primary'
@@ -302,16 +406,20 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                       </button>
                     </Tooltip>
                     {currentWorkingDirectory && (
-                      <div className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-                        cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
-                      }`}>
+                      <div
+                        className={`overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
+                          cwdExpanded ? 'max-w-[2.5rem] opacity-100' : 'max-w-0 opacity-0'
+                        }`}
+                      >
                         <Tooltip content="Directory settings" side="top" sideOffset={8}>
                           <button
                             type="button"
                             onClick={() => setCwdPopoverOpen((o) => !o)}
                             className="flex h-10 w-10 shrink-0 items-center justify-center transition-colors hover:bg-primary/15 text-primary"
                           >
-                            <ChevronUpIcon className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`} />
+                            <ChevronUpIcon
+                              className={`h-3.5 w-3.5 transition-transform ${cwdPopoverOpen ? '' : 'rotate-180'}`}
+                            />
                           </button>
                         </Tooltip>
                       </div>
@@ -319,19 +427,35 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                   </div>
                   {/* CWD popover */}
                   {cwdPopoverOpen && currentWorkingDirectory && (
-                    <div ref={cwdPopover.ref} style={cwdPopover.style} className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl">
+                    <div
+                      ref={cwdPopover.ref}
+                      style={cwdPopover.style}
+                      className="absolute bottom-full left-0 z-50 mb-2 w-[280px] max-w-[calc(100vw-2rem)] rounded-2xl border border-border/70 bg-popover/95 p-1.5 shadow-[0_16px_40px_rgba(5,4,15,0.28)] backdrop-blur-xl"
+                    >
                       <div className="flex items-center gap-2 px-3 pt-2 pb-1">
                         <FolderOpenIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                        <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">Working Directory</span>
+                        <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+                          Working Directory
+                        </span>
                       </div>
                       <div className="px-3 py-2">
-                        <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>{cwdName}</p>
-                        <p className="mt-0.5 text-[10px] text-muted-foreground truncate" title={currentWorkingDirectory}>{currentWorkingDirectory}</p>
+                        <p className="text-xs font-medium text-foreground truncate" title={cwdName ?? undefined}>
+                          {cwdName}
+                        </p>
+                        <p
+                          className="mt-0.5 text-[10px] text-muted-foreground truncate"
+                          title={currentWorkingDirectory}
+                        >
+                          {currentWorkingDirectory}
+                        </p>
                       </div>
                       <div className="border-t border-border/50 mx-1.5 mt-0.5" />
                       <button
                         type="button"
-                        onClick={() => { void setCurrentWorkingDirectory(null); setCwdPopoverOpen(false); }}
+                        onClick={() => {
+                          void setCurrentWorkingDirectory(null);
+                          setCwdPopoverOpen(false);
+                        }}
                         className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
                       >
                         <XIcon className="h-3.5 w-3.5" />
@@ -343,9 +467,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
               </div>
               {/* Right side: recording, send */}
               <div className="flex items-center gap-1.5 md:gap-2">
-                {recordingEnabled && (
-                  <RecordingButton onStart={taskStartRecording} />
-                )}
+                {recordingEnabled && <RecordingButton onStart={taskStartRecording} />}
                 <Tooltip content="Send message" side="top" sideOffset={8}>
                   <button
                     type="button"

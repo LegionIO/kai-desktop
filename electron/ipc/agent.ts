@@ -92,7 +92,11 @@ import { COMPACTION_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { getAppHome } from '../local-bridge/paths.js';
-import { isRealtimeConversationBrowserAuthorized, isRealtimeConversationTurnActive } from './realtime.js';
+import {
+  isRealtimeConversationBrowserAuthorized,
+  isRealtimeConversationTurnActive,
+  onRealtimeExecutionModeChanged,
+} from './realtime.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging for stream pipeline diagnostics
@@ -3079,6 +3083,17 @@ function broadcastExecutionMode(mode: ExecutionMode, conversationId?: string): b
   // A conversationId-less broadcast (global default change) has nothing to persist → still send.
   if (persisted) {
     broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
+    // Re-gate any LIVE Realtime call for this conversation (R183): a Realtime session freezes its
+    // plan-first tool filter at install, so a mode toggle here must re-resolve + re-apply it or the
+    // connected socket keeps mutating tools. A conversationId-less (global default) change has no
+    // specific live session to target; those calls re-resolve on their own next tool reload.
+    if (conversationId) {
+      try {
+        onRealtimeExecutionModeChanged(conversationId);
+      } catch (err) {
+        console.warn('[Agent] onRealtimeExecutionModeChanged failed (non-fatal):', err);
+      }
+    }
   }
   return persisted;
 }

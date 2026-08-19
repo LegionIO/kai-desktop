@@ -50,6 +50,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
+import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 import { useAttachments } from '@/providers/AttachmentContext';
 import {
   useBranchNav,
@@ -2020,8 +2021,15 @@ const Composer: FC<{
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
+    const fileList = event.target.files;
+    if (!fileList || fileList.length === 0) return;
+    // Gate by size BEFORE reading (R183): FileReader materializes each file fully, concurrently, so an
+    // oversized or bulk selection would OOM the renderer if we read first. Reject over-cap files up front.
+    const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
+    if (skipped.length > 0) showComposerNotice(skippedAttachmentsNotice(skipped) ?? '');
+    // Reset early so the same file can be re-selected even if nothing is accepted.
+    event.target.value = '';
+    if (accepted.length === 0) return;
     const readers: Promise<{
       name: string;
       mime: string;
@@ -2030,8 +2038,7 @@ const Composer: FC<{
       dataUrl: string;
       text?: string;
     }>[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
@@ -2066,8 +2073,6 @@ const Composer: FC<{
       );
     }
     void Promise.all(readers).then((results) => addAttachments(results));
-    // Reset so the same file can be re-selected
-    event.target.value = '';
   };
 
   const handleAttachDirectory = async () => {

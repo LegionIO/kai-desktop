@@ -46,6 +46,12 @@ let pendingStart: {
 let startGeneration = 0;
 const assistantTabCleanupTails = new Map<string, Promise<void>>();
 
+// Registration-time refs so exported helpers invoked OUTSIDE a start handler (e.g. an executionMode
+// change broadcast) can re-resolve plan-first + re-gate the live session's tools (R183).
+let registeredGetTools: (() => ToolDefinition[]) | null = null;
+let registeredGetConfig: (() => AppConfig) | null = null;
+let registeredAppHome: string | null = null;
+
 function scheduleAssistantTabCleanup(conversationId: string, browserOwnerId: string): Promise<void> {
   const previous = assistantTabCleanupTails.get(conversationId) ?? Promise.resolve();
   const browserManager = getExistingBrowserManager();
@@ -180,6 +186,31 @@ export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void 
   }
 }
 
+/**
+ * Re-gate a LIVE Realtime call after its conversation's execution mode changes (R183). The install-time
+ * plan-first resolution froze `activeSessionPlanFirst`; a later Auto→Plan-First toggle (via
+ * broadcastExecutionMode) persists + updates the UI but would otherwise leave the connected session with
+ * mutating tools until the next registry reload — and that reload would itself reuse the stale flag.
+ * Re-resolve from disk/global config and re-apply the tool filter. Only ever TIGHTENS via re-resolution
+ * (resolveRealtimePlanFirst is itself fail-closed); an explicit relax to Auto is honored because the
+ * conversation record now says so. Scoped to the exact conversation that changed.
+ */
+export function onRealtimeExecutionModeChanged(conversationId: string): void {
+  if (!registeredGetTools || !registeredGetConfig || !registeredAppHome) return;
+  const tools = registeredGetTools();
+  const config = registeredGetConfig();
+  if (activeSession && sessionConversationId === conversationId) {
+    activeSessionPlanFirst = resolveRealtimePlanFirst(registeredAppHome, conversationId, config);
+    activeSession.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
+  }
+  if (pendingStart && pendingStart.conversationId === conversationId) {
+    pendingStart.planFirst = resolveRealtimePlanFirst(registeredAppHome, conversationId, config);
+    pendingStart.session?.updateTools(
+      gateRealtimeTools(tools, pendingStart.allowsBrowserTools, pendingStart.planFirst),
+    );
+  }
+}
+
 /** Permanently remove native Browser authority from the current call/start.
  * A later registry refresh or replacement primary window must not restore it. */
 export function revokeRealtimeBrowserTools(tools: ToolDefinition[]): void {
@@ -277,6 +308,9 @@ export function registerRealtimeHandlers(
   isTextTurnActive: (conversationId: string) => boolean = () => false,
 ): void {
   const dbPath = join(appHome, 'data', 'memory.db');
+  registeredGetTools = getTools;
+  registeredGetConfig = getConfig;
+  registeredAppHome = appHome;
 
   ipcMain.handle('realtime:start-session', async (event, conversationId: string) => {
     const browserManagerAtAuthorization = getExistingBrowserManager();

@@ -156,6 +156,21 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  // Transient notice for attachment files the main process SKIPPED (too large / not a regular file)
+  // (R183) — otherwise picking such a file is a silent no-op.
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const attachNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showAttachNotice = useCallback((skipped: string[]) => {
+    if (skipped.length === 0) return;
+    if (attachNoticeTimerRef.current) clearTimeout(attachNoticeTimerRef.current);
+    const names = skipped.join(', ');
+    setAttachNotice(
+      skipped.length === 1
+        ? `Couldn't attach ${names} (too large or not a regular file).`
+        : `Couldn't attach ${skipped.length} files (too large or not regular files): ${names}`,
+    );
+    attachNoticeTimerRef.current = setTimeout(() => setAttachNotice(null), 6000);
+  }, []);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -168,8 +183,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
         files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+        skipped?: string[];
       };
-      if (!result.canceled && result.files) addAttachments(result.files);
+      if (result.canceled) return;
+      if (result.files && result.files.length > 0) addAttachments(result.files);
+      if (result.skipped) showAttachNotice(result.skipped);
     } catch (err) {
       console.error('Attach failed:', err);
     }
@@ -598,6 +616,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     />
                   )}
                   {/* File attachment chips */}
+                  {attachNotice && (
+                    <div
+                      className="mb-2 px-1 text-xs text-amber-600 dark:text-amber-400"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {attachNotice}
+                    </div>
+                  )}
                   {hasFileAttachments && (
                     <div className="mb-3 flex flex-wrap gap-2">
                       {attachments.map((file, i) => (

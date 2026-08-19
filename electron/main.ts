@@ -2468,7 +2468,10 @@ if (gotSingleInstanceLock) {
         for (const filePath of result.filePaths) {
           let fd: number;
           try {
-            fd = openSync(filePath, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW);
+            // O_NONBLOCK (R183): opening a FIFO with a plain blocking O_RDONLY would hang main in the
+            // openSync call itself — before fstat could reject it. Open nonblocking; a regular file is
+            // unaffected, and a FIFO/device is rejected by the isFile() check below.
+            fd = openSync(filePath, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW | fsReadConstants.O_NONBLOCK);
           } catch {
             skipped.push(basename(filePath));
             continue;
@@ -2601,22 +2604,24 @@ if (gotSingleInstanceLock) {
         if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
           return { error: 'Not a directory', entries: [] };
         }
-        // Cap the enumeration (R180/R182): this web-bridge-reachable handler synchronously reads +
-        // sorts entries of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules) would
-        // freeze main and produce an enormous WebSocket response. Iterate with opendirSync and STOP
-        // after the cap — readdirSync would still materialize every Dirent before we could slice, so
-        // the cap alone would not bound peak allocation on a pathological directory.
+        // Cap the enumeration (R180/R182/R183): this web-bridge-reachable handler synchronously reads
+        // + sorts entries of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules, or a dir
+        // of millions of DOTFILES) would freeze main and produce an enormous response. Iterate with
+        // opendirSync and STOP after scanning the cap — bound the SCAN (every Dirent examined), not just
+        // the collected non-hidden entries, so a flood of hidden files can't keep the loop running.
         const MAX_DIR_ENTRIES = 5000;
         const collected: Array<{ name: string; isDirectory: boolean }> = [];
         let truncated = false;
+        let scanned = 0;
         const dir = opendirSync(resolved);
         try {
           let dirent = dir.readSync();
           while (dirent !== null) {
-            if (collected.length >= MAX_DIR_ENTRIES) {
+            if (scanned >= MAX_DIR_ENTRIES) {
               truncated = true;
               break;
             }
+            scanned++;
             if (!dirent.name.startsWith('.')) {
               collected.push({ name: dirent.name, isDirectory: dirent.isDirectory() });
             }

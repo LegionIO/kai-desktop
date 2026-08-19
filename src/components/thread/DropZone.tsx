@@ -1,11 +1,20 @@
-import { useState, useCallback, type FC, type ReactNode, type DragEvent } from 'react';
+import { useState, useCallback, useRef, type FC, type ReactNode, type DragEvent } from 'react';
 import { UploadIcon } from 'lucide-react';
 import { useAttachments } from '@/providers/AttachmentContext';
+import { filterAttachmentsBySize, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 
 export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const { addAttachments } = useAttachments();
   const dragCountRef = { current: 0 };
+  // Transient notice for dropped files SKIPPED by the size gate (R183).
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showNotice = useCallback((message: string) => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    setNotice(message);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), 6000);
+  }, []);
 
   const handleDragEnter = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -29,56 +38,69 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
     e.dataTransfer.dropEffect = 'copy';
   }, []);
 
-  const handleDrop = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    dragCountRef.current = 0;
-    setIsDragOver(false);
+  const handleDrop = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      dragCountRef.current = 0;
+      setIsDragOver(false);
 
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
 
-    const pending: Promise<void>[] = [];
-    for (const file of files) {
-      const filePath = (file as File & { path?: string }).path || undefined;
-      pending.push(
-        new Promise<void>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const dataUrl = reader.result as string;
-            const isText = file.type.startsWith('text/') || file.type === 'application/json';
-            if (isText) {
-              // Also read as text
-              const textReader = new FileReader();
-              textReader.onload = () => {
-                addAttachments([{
-                  name: file.name,
-                  mime: file.type,
-                  isImage: file.type.startsWith('image/'),
-                  size: file.size,
-                  dataUrl,
-                  text: textReader.result as string,
-                  filePath,
-                }]);
+      // Gate by size BEFORE reading (R183): each FileReader materializes the whole file, so an oversized
+      // or bulk drop would OOM the renderer if read first. Reject over-cap files up front and report them.
+      const { accepted, skipped } = filterAttachmentsBySize(files);
+      if (skipped.length > 0) showNotice(skippedAttachmentsNotice(skipped) ?? '');
+      if (accepted.length === 0) return;
+
+      const pending: Promise<void>[] = [];
+      for (const file of accepted) {
+        const filePath = (file as File & { path?: string }).path || undefined;
+        pending.push(
+          new Promise<void>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result as string;
+              const isText = file.type.startsWith('text/') || file.type === 'application/json';
+              if (isText) {
+                // Also read as text
+                const textReader = new FileReader();
+                textReader.onload = () => {
+                  addAttachments([
+                    {
+                      name: file.name,
+                      mime: file.type,
+                      isImage: file.type.startsWith('image/'),
+                      size: file.size,
+                      dataUrl,
+                      text: textReader.result as string,
+                      filePath,
+                    },
+                  ]);
+                  resolve();
+                };
+                textReader.readAsText(file);
+              } else {
+                addAttachments([
+                  {
+                    name: file.name,
+                    mime: file.type,
+                    isImage: file.type.startsWith('image/'),
+                    size: file.size,
+                    dataUrl,
+                    filePath,
+                  },
+                ]);
                 resolve();
-              };
-              textReader.readAsText(file);
-            } else {
-              addAttachments([{
-                name: file.name,
-                mime: file.type,
-                isImage: file.type.startsWith('image/'),
-                size: file.size,
-                dataUrl,
-                filePath,
-              }]);
-              resolve();
-            }
-          };
-          reader.readAsDataURL(file);
-        }),
-      );
-    }
-  }, [addAttachments]);
+              }
+            };
+            reader.readAsDataURL(file);
+          }),
+        );
+      }
+    },
+    [addAttachments, showNotice],
+  );
 
   return (
     <div
@@ -89,6 +111,17 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
       onDrop={handleDrop}
     >
       {children}
+
+      {/* Transient skipped-attachment notice */}
+      {notice && (
+        <div
+          className="absolute bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-amber-500/40 bg-background/95 px-3 py-2 text-xs text-amber-600 shadow-md dark:text-amber-400"
+          role="status"
+          aria-live="polite"
+        >
+          {notice}
+        </div>
+      )}
 
       {/* Full-window drop overlay */}
       {isDragOver && (
