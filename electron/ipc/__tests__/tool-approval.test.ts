@@ -60,6 +60,30 @@ beforeEach(() => {
 });
 
 describe('registerPendingApproval', () => {
+  it('never FIFO-evicts a LIVE-pending browser authority record (R177)', async () => {
+    setToolApprovalOwnerResolver((conversationId, browserOwnerId) => ({ conversationId, streamToken: browserOwnerId }));
+    // A live (still-pending) browser-owned approval.
+    const live = registerPendingApproval('browser-live', undefined, 'native-browser', {
+      conversationId: 'chat-1',
+      browserOwnerId: 'run-1',
+    });
+    expect(getRecordedApprovalAuthority('browser-live')).toBeDefined();
+    // Flood with 600 later browser-owned records (each also records authority), all settled so they
+    // are evictable. The live-pending record must survive despite exceeding the 500 FIFO cap.
+    for (let i = 0; i < 600; i++) {
+      const p = registerPendingApproval(`flood-${i}`, undefined, 'native-browser', {
+        conversationId: 'chat-2',
+        browserOwnerId: `r-${i}`,
+      });
+      pendingToolApprovals.get(`flood-${i}`)!.resolve(false);
+      await p;
+    }
+    expect(getRecordedApprovalAuthority('browser-live')).toMatchObject({ authority: 'native-browser' });
+    pendingToolApprovals.get('browser-live')!.resolve(false);
+    await live;
+    setToolApprovalOwnerResolver(null);
+  });
+
   it('durably records a browser-owned approval authority that OUTLIVES abort deletion (R174)', async () => {
     setToolApprovalOwnerResolver((conversationId, browserOwnerId) => ({ conversationId, streamToken: browserOwnerId }));
     const ctrl = new AbortController();

@@ -123,10 +123,22 @@ function recordApprovalAuthority(toolCallId: string, record: ApprovalAuthorityRe
   // plain any-renderer approval has nothing to enforce after its pending entry is gone.
   if (record.authority !== 'native-browser' && !record.streamOwner) return;
   approvalAuthorityById.set(toolCallId, record);
+  // FIFO-evict the oldest EVICTABLE record when over cap — but NEVER evict one whose approval is
+  // still PENDING (R177): evicting a live browser-owned entry would leave the pendingless recovery
+  // path with no authority to enforce, re-opening the R174 hole (a web client that saw the tool-call
+  // id could then answer a browser-owned ask_user). Walk oldest→newest and drop the first entry that
+  // is NOT a live pending approval; if every over-cap entry is pending (pathological — 500+ concurrent
+  // browser approvals), leave the map slightly over cap rather than evict a live one.
   while (approvalAuthorityById.size > APPROVAL_AUTHORITY_MAP_MAX) {
-    const oldest = approvalAuthorityById.keys().next().value;
-    if (oldest === undefined) break;
-    approvalAuthorityById.delete(oldest);
+    let evicted = false;
+    for (const key of approvalAuthorityById.keys()) {
+      if (!pendingToolApprovals.has(key)) {
+        approvalAuthorityById.delete(key);
+        evicted = true;
+        break;
+      }
+    }
+    if (!evicted) break; // all over-cap entries are live-pending; don't evict a live authority record
   }
 }
 
