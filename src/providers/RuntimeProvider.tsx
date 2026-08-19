@@ -1119,7 +1119,14 @@ const rejectedDrafts = new Map<string, RejectedDraft[]>();
 // double-commits, and a drop of an uncounted entry never over-releases.
 const draftBytesCounted = new Set<string>();
 function draftAttachmentBytes(entry: RejectedDraft): number {
-  return entry.attachments.reduce((sum, a) => sum + (a.size || 0), 0);
+  // Sanitize PER attachment (R196): a single negative/NaN size must not cancel valid sizes or make the
+  // whole sum NaN. Fall back to the dataUrl byte length when the recorded size is missing/invalid/zero
+  // but a payload is present, so a forged 0 on a large dataUrl can't hide its real memory cost.
+  return entry.attachments.reduce((sum, a) => {
+    const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
+    const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
+    return sum + Math.max(recorded, fromDataUrl);
+  }, 0);
 }
 function retainDraftAttachmentBytes(entry: RejectedDraft): void {
   if (draftBytesCounted.has(entry.id)) return;
@@ -1132,6 +1139,19 @@ function releaseDraftAttachmentBytes(entry: RejectedDraft): void {
   const bytes = draftAttachmentBytes(entry);
   if (bytes > 0) onAttachmentsReleased(bytes);
   draftBytesCounted.delete(entry.id);
+}
+// Unload the in-memory draft mirror for every conversation EXCEPT `keepConvId` (R196): the durable
+// pendingDrafts on disk survive, so an inactive conversation's mirror is redundant and its parked
+// attachment bytes stay counted against the renderer-wide ceiling — visiting many chats with drafts
+// would otherwise accumulate unbounded resident memory and could exceed the cap / OOM. Restore only
+// ever targets the ACTIVE conversation, so dropping inactive mirrors is safe; they re-hydrate on return.
+// A conversation with a claim in flight is left intact so we don't race its lease.
+function unloadInactiveDraftMirrors(keepConvId: string): void {
+  for (const [convId, q] of [...rejectedDrafts]) {
+    if (convId === keepConvId || draftClaimInFlight.has(convId)) continue;
+    for (const d of q) releaseDraftAttachmentBytes(d);
+    rejectedDrafts.delete(convId);
+  }
 }
 // Conversations with a draft claim currently in flight on THIS client — serializes the load-restore
 // and the composer-empty poll so they can't both claim (and double-restore) the same draft.
@@ -1422,15 +1442,32 @@ function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: u
   const raw = conv.pendingDrafts;
   if (!Array.isArray(raw) || raw.length === 0) return false;
   const restored: RejectedDraft[] = [];
+  const migratedLegacyIds: RejectedDraft[] = []; // id-less legacy entries we minted an id for
   for (const d of raw as Array<{ id?: unknown; text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
     const text = typeof d?.text === 'string' ? d.text : '';
-    const attachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
+    const rawAttachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
+    // Normalize each attachment's size on hydrate (R196): a corrupt persisted size (negative / NaN /
+    // string / forged 0 on a large payload) must not flow into the accounting or the store's arithmetic.
+    // Derive from the dataUrl when the recorded size is unusable.
+    const attachments = rawAttachments.map((a) => {
+      const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
+      const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
+      const size = Math.max(recorded, fromDataUrl);
+      return size === a.size ? a : { ...a, size };
+    });
     const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
-    const id = typeof d?.id === 'string' && d.id.length > 0 ? d.id : msgId();
+    const hadId = typeof d?.id === 'string' && d.id.length > 0;
+    const id = hadId ? (d.id as string) : msgId();
     if (text.trim().length === 0 && attachments.length === 0) continue;
-    restored.push({ id, text, attachments, stashedAt });
+    const entry = { id, text, attachments, stashedAt };
+    restored.push(entry);
+    if (!hadId) migratedLegacyIds.push(entry);
   }
   if (restored.length === 0) return false;
+  // A legacy/pre-id persisted draft got a freshly-minted id above; that id lives only in this renderer
+  // mirror, so main's id-specific claim can't match it (the draft would never restore, and a later
+  // remove-delta would drop it as invalid). Persist the minted id back to disk so both sides agree (R196).
+  if (migratedLegacyIds.length > 0) void applyPendingDraftsDelta(convId, migratedLegacyIds, []);
   // Count each hydrated draft's parked attachment bytes (R195): after a reload the live counter is 0
   // but these dataUrls are resident again. Idempotent per id, so a double-hydrate can't double-count.
   for (const entry of restored) retainDraftAttachmentBytes(entry);
@@ -3045,6 +3082,9 @@ export function RuntimeProvider({
     // First HYDRATE the in-memory queue from the durable copy on disk (survives a reload/crash
     // that dropped the volatile mirror) — only fills an empty slot, so a live in-session queue
     // is untouched.
+    // Unload other conversations' in-memory draft mirrors (R196) so parked attachment bytes don't
+    // accumulate unbounded across visited chats — the durable disk copy re-hydrates on return.
+    unloadInactiveDraftMirrors(id);
     hydrateRejectedDraftsFromDisk(id, conv as { pendingDrafts?: unknown });
     if (rejectedDrafts.has(id)) {
       setTimeout(() => {
