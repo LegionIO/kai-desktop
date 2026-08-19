@@ -595,6 +595,7 @@ import {
   registerPendingApproval,
   broadcastStreamEventRaw,
   getRecordedApprovalAuthority,
+  approvalKey,
   type PendingToolApproval,
   type ToolApprovalAuthority,
 } from './tool-approval.js';
@@ -1894,6 +1895,16 @@ export function recoverAskUserAnswerForRuntime(conversationId: string, answerKey
   recoverOrphanedAnswerKeys(conversationId, [answerKey]);
 }
 
+/** Validate the OPTIONAL, UNTRUSTED conversationId that arrives with an answer/reject/dismiss over the
+ *  (possibly web/WS) IPC boundary. Returns the string when it is a bounded non-empty string, else
+ *  undefined — makeAnswerKey then falls back to the raw id (legacy/headless behavior). Keeping this in
+ *  ONE place ensures the answer path and the reject/dismiss purge compose the SAME composite key (R192). */
+function sanitizeAnswerConversationId(conversationId: unknown): string | undefined {
+  return typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 200
+    ? conversationId
+    : undefined;
+}
+
 /** Find the conversation whose pending handoff OR live claimant holds `answerKey`
  *  (the answer-arrival side only knows the key). Bounded scan over small maps. */
 function conversationForRacedAnswerKey(answerKey: string): string | undefined {
@@ -2397,7 +2408,7 @@ function maybeOpenDedicatedApprovalWindow(event: StreamEvent): void {
   });
   const webContentsId = win?.webContents?.id;
   if (typeof webContentsId === 'number') {
-    authorizePendingApprovalWindow(event.toolCallId, webContentsId);
+    authorizePendingApprovalWindow(event.toolCallId, webContentsId, event.conversationId);
   }
 }
 
@@ -2565,7 +2576,10 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // nothing (R107 finding-1). A live/owning run's tool-result IS persisted, so
       // clearing is correct then; anything else leaves recovery to A's cleanup.
       const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
-      if (emittingToken !== undefined && emittingToken === activeTok) clearInFlightAnswer(event.toolCallId);
+      // The in-flight ledger is keyed by the conversation-scoped answerKey (R191/R192); clear the
+      // COMPOSITE key or the committed entry lingers and teardown re-delivers an already-committed answer.
+      if (emittingToken !== undefined && emittingToken === activeTok)
+        clearInFlightAnswer(makeAnswerKey(event.conversationId, event.toolCallId));
     } else if (event.type === 'done') {
       // Turn ended (completed/cancelled) — no approval can still be pending.
       // We don't have a per-id list here; the window's own resolve path + the
@@ -10354,8 +10368,27 @@ export function registerAgentHandlers(
   }
   cancelConversationStreamImpl = cancelConversationStreamInner;
 
-  ipcMain.handle('agent:approve-tool', (event, toolCallId: string) => {
-    const pending = pendingToolApprovals.get(toolCallId);
+  // Resolve a pending approval by the renderer-facing raw toolCallId, honoring the conversation-scoped
+  // key (R192). Tries the composite key first (when conversationId is provided), then falls back to the
+  // raw key so a caller that hasn't threaded conversationId (or a legacy/headless registration) still
+  // resolves. Returns the entry + the ACTUAL map key it was found under so the caller deletes the right one.
+  const resolvePendingApproval = (
+    toolCallId: string,
+    conversationId?: string,
+  ): { pending: PendingToolApproval; key: string } | undefined => {
+    const convId = sanitizeAnswerConversationId(conversationId);
+    if (convId) {
+      const composite = approvalKey(convId, toolCallId);
+      const p = pendingToolApprovals.get(composite);
+      if (p) return { pending: p, key: composite };
+    }
+    const raw = pendingToolApprovals.get(toolCallId);
+    return raw ? { pending: raw, key: toolCallId } : undefined;
+  };
+
+  ipcMain.handle('agent:approve-tool', (event, toolCallId: string, conversationId?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId);
+    const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
@@ -10364,9 +10397,9 @@ export function registerAgentHandlers(
       }
       return { ok: false, error: approvalError };
     }
-    if (pending) {
+    if (pending && resolved) {
       pending.resolve(true);
-      pendingToolApprovals.delete(toolCallId);
+      pendingToolApprovals.delete(resolved.key);
     }
     // Sync dismissal: if the user answered the INLINE card, close the dedicated
     // approval window too. (Approve normally emits a tool-result that also closes
@@ -10375,9 +10408,9 @@ export function registerAgentHandlers(
     return { ok: true };
   });
 
-  ipcMain.handle('agent:get-tool-approval-private-details', (event, toolCallId: string) => {
+  ipcMain.handle('agent:get-tool-approval-private-details', (event, toolCallId: string, conversationId?: string) => {
     if (typeof toolCallId !== 'string' || !toolCallId) return null;
-    const pending = pendingToolApprovals.get(toolCallId);
+    const pending = resolvePendingApproval(toolCallId, conversationId)?.pending;
     if (!pending?.privateDetails || !mayResolveToolApproval(event, pending, getPrimaryWindow)) return null;
     // This is intentionally the only path that returns exact Browser approval
     // input. It is restricted to the primary renderer or the exact one-shot
@@ -10385,8 +10418,9 @@ export function registerAgentHandlers(
     return { ...pending.privateDetails };
   });
 
-  ipcMain.handle('agent:reject-tool', (event, toolCallId: string) => {
-    const pending = pendingToolApprovals.get(toolCallId);
+  ipcMain.handle('agent:reject-tool', (event, toolCallId: string, conversationId?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId);
+    const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
@@ -10395,20 +10429,22 @@ export function registerAgentHandlers(
       }
       return { ok: false, error: approvalError };
     }
-    if (pending) {
+    if (pending && resolved) {
       pending.resolve(false);
-      pendingToolApprovals.delete(toolCallId);
+      pendingToolApprovals.delete(resolved.key);
     }
     // If the turn already aborted + registered a raced-answer handoff for this
     // question, an explicit reject must purge it so a delayed answer from another
-    // surface can't still be delivered to the successor.
-    purgeRacedAnswerForKey(toolCallId);
+    // surface can't still be delivered to the successor. The handoff/tombstone keys are
+    // conversation-scoped (R192), so purge under the composite key.
+    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
     closeApprovalWindow(toolCallId);
     return { ok: true };
   });
 
-  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string) => {
-    const pending = pendingToolApprovals.get(toolCallId);
+  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string, conversationId?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId);
+    const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
@@ -10417,11 +10453,11 @@ export function registerAgentHandlers(
       }
       return { ok: false, error: approvalError };
     }
-    if (pending) {
+    if (pending && resolved) {
       pending.resolve('dismiss');
-      pendingToolApprovals.delete(toolCallId);
+      pendingToolApprovals.delete(resolved.key);
     }
-    purgeRacedAnswerForKey(toolCallId);
+    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
     closeApprovalWindow(toolCallId);
     return { ok: true };
   });
@@ -10451,18 +10487,18 @@ export function registerAgentHandlers(
       for (const v of Object.values(answers)) {
         if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
       }
-      // Conversation-scoped answer key (R191): the stash + raced-recovery routing must key by
-      // conversationId::toolCallId so a provider that reuses `call_1` across conversations can't
-      // cross-route an answer. conversationId is optional/untrusted at this boundary — validate it as
-      // a bounded string; when absent (legacy/headless client), makeAnswerKey falls back to the raw id
-      // (unchanged behavior). The APPROVAL map + browser-authority checks below KEEP using the raw
-      // toolCallId (that map is keyed by the renderer-facing id).
-      const convId =
-        typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 200
-          ? conversationId
-          : undefined;
+      // Conversation-scoped keys (R191/R192): the stash + raced-recovery AND the pending-approval map
+      // are keyed by conversationId::toolCallId so a provider that reuses `call_1` across conversations
+      // can't cross-route an answer NOR fail-close a foreign conversation's live approval. conversationId
+      // is optional/untrusted here — validate it; when absent (legacy/headless client) the keys fall back
+      // to the raw id (unchanged behavior). The window-close map stays keyed by the raw wire id.
+      const convId = sanitizeAnswerConversationId(conversationId);
       const answerKey = makeAnswerKey(convId, toolCallId);
-      const pending = pendingToolApprovals.get(toolCallId);
+      const approvalMapKey = approvalKey(convId, toolCallId);
+      // Resolve the pending entry under the composite key, falling back to the raw key so a legacy
+      // caller that didn't thread conversationId still resolves a raw-keyed registration.
+      const pendingResolved = resolvePendingApproval(toolCallId, conversationId);
+      const pending = pendingResolved?.pending;
       // A Browser-authorized approval may only be answered by the authorized surface (main's authority
       // routing). A stale-browser-stream answer resolves the approval closed (dismiss) + closes the
       // pop-out; other authority errors reject the answer without touching the pending entry.
@@ -10481,7 +10517,10 @@ export function registerAgentHandlers(
       // into the successor/recovery turn that still holds authenticated Browser authority. Consult the
       // DURABLE authority record (survives the pending deletion) and reject an unauthorized late answer.
       if (!pending) {
-        const recordedAuthority = getRecordedApprovalAuthority(toolCallId);
+        // Authority record is keyed the same way registration keyed it (composite when the turn had a
+        // conversationId); fall back to the raw key for a legacy raw-keyed registration (R192).
+        const recordedAuthority =
+          getRecordedApprovalAuthority(approvalMapKey) ?? getRecordedApprovalAuthority(toolCallId);
         const requiresNativeAuthority =
           recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
         if (requiresNativeAuthority) {
@@ -10538,9 +10577,10 @@ export function registerAgentHandlers(
       });
       if (pending) {
         // Resolve with the explicit `answered` source so the trace distinguishes a
-        // real ask_user answer from a generic tool approval.
+        // real ask_user answer from a generic tool approval. (settle() already deletes the
+        // composite map key; this explicit delete is a belt-and-suspenders no-op under the SAME key.)
         pending.resolve(true, 'answered');
-        pendingToolApprovals.delete(toolCallId);
+        if (pendingResolved) pendingToolApprovals.delete(pendingResolved.key);
       }
       // Answer-arrival side of the raced-answer rendezvous: if this answer belongs
       // to a pending handoff whose successor is already live (the successor started

@@ -40,7 +40,10 @@ export const BrowserApprovalPrivateInput: FC<{
   approvalId: string;
   args: unknown;
   active?: boolean;
-}> = ({ approvalId, args, active = true }) => {
+  /** Conversation the approval belongs to. Threaded so main resolves the private details under the
+   *  conversation-scoped approval key (R192); omitted only where unavailable (main falls back to raw). */
+  conversationId?: string;
+}> = ({ approvalId, args, active = true, conversationId }) => {
   const [input, setInput] = useState<unknown>(undefined);
   const browserControl = isBrowserControlApproval(args);
 
@@ -56,7 +59,7 @@ export const BrowserApprovalPrivateInput: FC<{
       return () => {
         current = false;
       };
-    void getPrivateDetails(approvalId)
+    void getPrivateDetails(approvalId, conversationId)
       .then((details) => {
         if (current && details && Object.prototype.hasOwnProperty.call(details, 'browserInput')) {
           setInput(details.browserInput);
@@ -66,7 +69,7 @@ export const BrowserApprovalPrivateInput: FC<{
     return () => {
       current = false;
     };
-  }, [active, approvalId, browserControl]);
+  }, [active, approvalId, browserControl, conversationId]);
 
   const display = useMemo(() => exactInputText(input), [input]);
   if (!active || !display) return null;

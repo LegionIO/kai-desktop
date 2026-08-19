@@ -72,6 +72,18 @@ export type PendingToolApproval = {
 
 export const pendingToolApprovals = new Map<string, PendingToolApproval>();
 
+/** Compose the conversation-scoped key for {@link pendingToolApprovals} and {@link approvalAuthorityById}
+ *  (R192). Provider tool-call ids (e.g. `call_1`) are unique only WITHIN one provider response — a
+ *  custom/local provider reuses `call_1` across conversations — so two concurrent conversations would
+ *  collide in a globally raw-id-keyed map and the second registration would fail-close-evict the first's
+ *  LIVE approval. Prefixing with the conversationId disambiguates. Falls back to the raw id when
+ *  conversationId is absent (headless/legacy) so behavior is unchanged there. The renderer-facing WIRE id
+ *  stays the raw toolCallId; each IPC/authority lookup composes this key from the conversationId at hand.
+ *  Mirrors makeAnswerKey in ask-user.ts (same `::` scheme). */
+export function approvalKey(conversationId: string | undefined, toolCallId: string): string {
+  return conversationId ? `${conversationId}::${toolCallId}` : toolCallId;
+}
+
 /** Optional diagnostic context for an approval, so the (previously invisible)
  *  approve/reject/dismiss/abort lifecycle shows up in the diagnostic trace. */
 export type ApprovalTraceContext = {
@@ -191,16 +203,32 @@ export function setPrimaryApprovalWindowResolver(resolver: (() => BrowserWindow 
 /** Grant the dedicated window created for this exact pending request authority
  * to resolve it. Returns false if registration has not happened yet, making a
  * broadcast-before-register regression fail closed. */
-export function authorizePendingApprovalWindow(toolCallId: string, webContentsId: number): boolean {
-  const pending = pendingToolApprovals.get(toolCallId);
+export function authorizePendingApprovalWindow(
+  toolCallId: string,
+  webContentsId: number,
+  conversationId?: string,
+): boolean {
+  const key = approvalKey(conversationId, toolCallId);
+  const pending = pendingToolApprovals.get(key);
   if (!pending || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
   pending.approvalWindowWebContentsId = webContentsId;
   // Mirror onto the DURABLE authority record (R175) so a raced answer from the authorized pop-out is
   // still accepted after abort deletes the pending entry (the pendingless branch would otherwise only
   // accept the primary window, losing an answer submitted while the one-shot capability was valid).
-  const record = approvalAuthorityById.get(toolCallId);
+  const record = approvalAuthorityById.get(key);
   if (record) record.approvalWindowWebContentsId = webContentsId;
   return true;
+}
+
+/** Look up a pending approval from a stream EVENT, honoring the conversation-scoped key (R192):
+ *  compose conversationId::toolCallId, falling back to the raw id. Used by the broadcast-routing
+ *  guards, which only have the event (whose toolCallId is the renderer-facing raw id). */
+function lookupPendingByEvent(event: StreamEvent): PendingToolApproval | undefined {
+  if (!event.toolCallId) return undefined;
+  const composite = event.conversationId
+    ? pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId))
+    : undefined;
+  return composite ?? pendingToolApprovals.get(event.toolCallId);
 }
 
 /** Web clients cannot own the native Browser sidebar. Hide both Browser tool
@@ -213,7 +241,7 @@ export function mayBroadcastApprovalToWebClients(event: StreamEvent): boolean {
       ? (event.args as Record<string, unknown>)
       : null;
   if (approvalArgs?.approvalKind === 'browser-control') return false;
-  return !event.toolCallId || !pendingToolApprovals.get(event.toolCallId)?.streamOwner;
+  return !event.toolCallId || !lookupPendingByEvent(event)?.streamOwner;
 }
 
 /** Return the only Electron renderer ids allowed to receive a Browser-owned
@@ -225,7 +253,7 @@ export function resolveApprovalBroadcastWindowIds(event: StreamEvent): Set<numbe
     event.args && typeof event.args === 'object' && !Array.isArray(event.args)
       ? (event.args as Record<string, unknown>)
       : null;
-  const pendingApproval = event.toolCallId ? pendingToolApprovals.get(event.toolCallId) : undefined;
+  const pendingApproval = lookupPendingByEvent(event);
   const restricted =
     pendingApproval?.authority === 'native-browser' ||
     Boolean(pendingApproval?.streamOwner) ||
@@ -306,16 +334,22 @@ export function registerPendingApproval(
   if (authority === 'native-browser' && hasExplicitBrowserOwner && !streamOwner) {
     throw new Error('Browser approval is no longer authorized for this assistant turn.');
   }
-  // A duplicate toolCallId would overwrite the map entry and orphan the prior
+  // The pending map is CONVERSATION-SCOPED (R192): key by conversationId::toolCallId so two concurrent
+  // conversations reusing the same provider tool-call id (call_1) don't collide — the duplicate-evict
+  // below would otherwise fail-close a FOREIGN conversation's live approval. The renderer-facing wire id
+  // stays the raw toolCallId; every IPC/authority lookup composes this same key from its conversationId.
+  const key = approvalKey(context?.conversationId, toolCallId);
+  // A duplicate key would overwrite the map entry and orphan the prior
   // waiter's resolver forever (its Promise never settles → the earlier tool
   // call hangs). Settle any existing entry fail-closed (deny) before replacing.
   // Pass the explicit `duplicate-evict` source so the prior waiter's own settle
   // closure records exactly ONE settled event with that reason (not a spurious
-  // extra `reject` on top of a separately-logged eviction).
-  const existing = pendingToolApprovals.get(toolCallId);
+  // extra `reject` on top of a separately-logged eviction). Because the key is now
+  // conversation-scoped, this only evicts a genuine SAME-conversation same-id duplicate.
+  const existing = pendingToolApprovals.get(key);
   if (existing) {
     existing.resolve(false, 'duplicate-evict');
-    pendingToolApprovals.delete(toolCallId);
+    pendingToolApprovals.delete(key);
   }
   traceDiagnostic({
     scope: 'agent',
@@ -337,7 +371,7 @@ export function registerPendingApproval(
       if (settled) return;
       settled = true;
       abortSignal?.removeEventListener('abort', onAbort);
-      pendingToolApprovals.delete(toolCallId);
+      pendingToolApprovals.delete(key);
       const reason = source ?? settleReason(value, false);
       traceDiagnostic({
         scope: 'agent',
@@ -370,15 +404,15 @@ export function registerPendingApproval(
     // agent:answer-tool-question, `duplicate-evict` from an eviction) so the trace records the true
     // reason rather than one derived only from the value. Carries main's Browser/Realtime authority
     // + streamOwner + privateDetails.
-    pendingToolApprovals.set(toolCallId, {
+    pendingToolApprovals.set(key, {
       resolve: settle,
       authority,
       ...(streamOwner ? { streamOwner } : {}),
       ...(context?.privateDetails ? { privateDetails: context.privateDetails } : {}),
     });
     // Record the authority DURABLY (R174) so the raced-answer recovery path can enforce it even
-    // after abort deletes the pending entry above.
-    recordApprovalAuthority(toolCallId, { authority, streamOwner });
+    // after abort deletes the pending entry above. Keyed by the SAME conversation-scoped key (R192).
+    recordApprovalAuthority(key, { authority, streamOwner });
 
     // An already-aborted signal was rejected synchronously at the top of registerPendingApproval,
     // so here we only need to attach the listener for a future abort.

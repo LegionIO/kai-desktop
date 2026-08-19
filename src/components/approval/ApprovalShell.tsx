@@ -45,8 +45,10 @@ export const ApprovalShell: FC<{ approvalId: string }> = ({ approvalId }) => {
       // Await the IPC so the window stays up (showing the spinner) until main has
       // actually resolved the pending approval, then close — rather than racing a
       // fixed timer against the flush.
-      if (decision === 'approve') await app.agent.approveToolCall(approvalId);
-      else await app.agent.rejectToolCall(approvalId);
+      // Approve/reject under the conversation-scoped key (R192): the pending approval is keyed by
+      // conversationId::toolCallId, so pass the request's conversationId.
+      if (decision === 'approve') await app.agent.approveToolCall(approvalId, request?.conversationId);
+      else await app.agent.rejectToolCall(approvalId, request?.conversationId);
     } catch {
       /* main-side resolve is idempotent; close regardless */
     }
@@ -59,7 +61,13 @@ export const ApprovalShell: FC<{ approvalId: string }> = ({ approvalId }) => {
         <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Approval required</div>
         <div className="text-sm font-medium">{request ? request.toolName : 'Loading…'}</div>
         <p className="text-sm text-muted-foreground">{prompt}</p>
-        {request && <BrowserApprovalPrivateInput approvalId={approvalId} args={request.args} />}
+        {request && (
+          <BrowserApprovalPrivateInput
+            approvalId={approvalId}
+            args={request.args}
+            conversationId={request.conversationId}
+          />
+        )}
       </div>
       <div className="flex items-center justify-end gap-2 border-t border-border/70 p-4">
         <button

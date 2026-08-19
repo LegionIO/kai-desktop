@@ -246,8 +246,8 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
     if (submitting) return;
     setSubmitting(true);
     try {
-      if (decision === 'approve') await app.agent.approveToolCall(item.id);
-      else await app.agent.rejectToolCall(item.id);
+      if (decision === 'approve') await app.agent.approveToolCall(item.id, item.conversationId);
+      else await app.agent.rejectToolCall(item.id, item.conversationId);
     } catch {
       /* idempotent */
     }
@@ -270,7 +270,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
             </pre>
           </section>
         )}
-        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} />
+        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} conversationId={item.conversationId} />
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"

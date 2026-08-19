@@ -26,7 +26,7 @@ describe('BrowserApprovalPrivateInput', () => {
     expect(await screen.findByTestId('browser-private-approval-input')).toHaveTextContent(
       'document.querySelector("#save").click()',
     );
-    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('approval-1');
+    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('approval-1', undefined);
   });
 
   it('does not fetch or retain private input when the approval is inactive', async () => {

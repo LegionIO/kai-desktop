@@ -199,6 +199,7 @@ import {
   registerPendingApproval,
   setPrimaryApprovalWindowResolver,
   setToolApprovalOwnerResolver,
+  approvalKey,
 } from '../tool-approval.js';
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 import { closeApprovalWindow } from '../../approval-window.js';
@@ -324,16 +325,16 @@ describe('startup tool registration', () => {
         browserOwnerId: 'run-1',
       }),
     ).toThrow(/no longer authorized/);
-    expect(pendingToolApprovals.has('late-text-browser-approval')).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'late-text-browser-approval'))).toBe(false);
     const genericAfterRevocation = registerPendingApproval('late-text-generic-approval', undefined, 'any-renderer', {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    expect(pendingToolApprovals.get('late-text-generic-approval')?.streamOwner).toMatchObject({
+    expect(pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval'))?.streamOwner).toMatchObject({
       conversationId: 'chat-1',
       streamToken: 'run-1',
     });
-    pendingToolApprovals.get('late-text-generic-approval')!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval'))!.resolve(false);
     void genericAfterRevocation;
     setToolApprovalOwnerResolver(null);
   });

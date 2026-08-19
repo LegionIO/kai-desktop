@@ -98,13 +98,16 @@ const appAPI = {
       >,
     cancelInject: (conversationId: string, id: string) =>
       ipcRenderer.invoke('agent:cancel-inject', conversationId, id) as Promise<{ ok: boolean; text?: string }>,
-    getToolApprovalPrivateDetails: (toolCallId: string) =>
-      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId) as Promise<{
+    getToolApprovalPrivateDetails: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId, conversationId) as Promise<{
         browserInput: unknown;
       } | null>,
-    approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
-    rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
-    dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
+    approveToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:approve-tool', toolCallId, conversationId),
+    rejectToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:reject-tool', toolCallId, conversationId),
+    dismissToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:dismiss-tool', toolCallId, conversationId),
     answerToolQuestion: (toolCallId: string, answers: Record<string, string>, conversationId?: string) =>
       ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers, conversationId),
     generateTitle: (messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) =>
