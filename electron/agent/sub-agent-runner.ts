@@ -643,6 +643,15 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       // addFollowUpMessage before it's added/broadcast. So no per-turn gate here.
 
       let turnText = '';
+      // Accumulate this turn's TOOL calls + results so a `continue` (multi-turn) sub-agent carries
+      // the tool evidence + side effects it just observed into the next turn's context (R170 f-9):
+      // pushing only turnText dropped tool-only turns entirely, making the next turn repeat work or
+      // decide without the results. Parts are ordered assistant tool-call parts; toolResults become a
+      // following `tool` message. On model-fallback (turn restart) these reset alongside turnText.
+      type SubToolPart = { type: 'tool-call'; toolCallId: string; toolName: string; args?: unknown };
+      let turnToolParts: SubToolPart[] = [];
+      const turnToolIndex = new Map<string, number>();
+      let turnToolResults: Array<{ type: 'tool-result'; toolCallId: string; toolName: string; result: unknown }> = [];
       // Set if the model stream emits an `error` event this turn — a terminal
       // failure that must NOT fall through to a `completed` classification.
       let turnError: string | null = null;
@@ -901,6 +910,35 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       for await (const event of stream) {
         if (event.type === 'text-delta' && event.text) {
           turnText += event.text;
+        } else if (event.type === 'tool-call' && event.toolCallId) {
+          // Record the tool call for next-turn context (R170 f-9). Update-in-place on a repeat id.
+          const existing = turnToolIndex.get(event.toolCallId);
+          if (existing === undefined) {
+            turnToolIndex.set(event.toolCallId, turnToolParts.length);
+            turnToolParts.push({
+              type: 'tool-call',
+              toolCallId: event.toolCallId,
+              toolName: event.toolName ?? 'tool',
+              args: event.args,
+            });
+          } else {
+            turnToolParts[existing] = {
+              type: 'tool-call',
+              toolCallId: event.toolCallId,
+              toolName: event.toolName ?? turnToolParts[existing].toolName,
+              args: event.args ?? turnToolParts[existing].args,
+            };
+          }
+        } else if ((event.type === 'tool-result' || event.type === 'tool-error') && event.toolCallId) {
+          turnToolResults.push({
+            type: 'tool-result',
+            toolCallId: event.toolCallId,
+            toolName: event.toolName ?? 'tool',
+            result:
+              event.type === 'tool-error'
+                ? { isError: true, error: event.error ?? 'Tool execution failed' }
+                : event.result,
+          });
         } else if (event.type === 'error') {
           // Model/stream error this turn — terminal failure. Capture the reason;
           // handled after the loop so it can't be classified as `completed`.
@@ -912,6 +950,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           // concatenation. Only the LOCAL accumulation is reset — the event is
           // still enriched, broadcast, and yielded below like any other.
           turnText = '';
+          // Reset the tool accumulators too (R170 f-9) — the discarded attempt's tool calls/results
+          // must not carry into the successful retry's next-turn context.
+          turnToolParts = [];
+          turnToolIndex.clear();
+          turnToolResults = [];
           const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
           const nextEntry = toKey
             ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
@@ -972,7 +1015,24 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
       if (turnText) {
         fullResponseText += (fullResponseText ? '\n\n' : '') + turnText;
-        messages.push({ role: 'assistant', content: turnText });
+      }
+      // Push a structured assistant turn carrying BOTH text and tool calls into the next-turn context
+      // (R170 f-9). Previously only turnText was pushed, so a tool-only turn contributed nothing and a
+      // `continue` re-ran without the tool evidence/side effects. Build assistant content = [text?, …
+      // tool-call parts]; follow with a `tool` message holding the results so the model sees outcomes.
+      if (turnText || turnToolParts.length > 0) {
+        const assistantContent: Array<Record<string, unknown>> = [];
+        if (turnText) assistantContent.push({ type: 'text', text: turnText });
+        for (const p of turnToolParts) assistantContent.push({ ...p });
+        // If there are no tool parts, keep the legacy plain-string content shape for text-only turns.
+        messages.push(
+          turnToolParts.length > 0
+            ? { role: 'assistant', content: assistantContent }
+            : { role: 'assistant', content: turnText },
+        );
+        if (turnToolResults.length > 0) {
+          messages.push({ role: 'tool', content: turnToolResults.map((r) => ({ ...r })) });
+        }
       }
 
       if (abortSignal?.aborted) break;

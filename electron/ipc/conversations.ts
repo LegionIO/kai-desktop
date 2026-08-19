@@ -154,10 +154,21 @@ export function broadcastUpsert(appHome: string, conversation: ConversationRecor
   // deleted conversation absent from disk. Guard the single upsert chokepoint: if this id was
   // recently deleted AND is not in the index (the same condition that suppressed the write),
   // don't broadcast. A legitimate recreate re-adds the index entry, so this only drops phantoms.
-  if (isRecentlyDeleted(conversation.id) && !readIndex(appHome).conversations[conversation.id]) {
-    return;
+  //
+  // The whole body is throw-SAFE (R170 f-2): broadcastUpsert runs AFTER the conversation file has
+  // already committed (writeConversation returned), and callers on the persist path treat a throw
+  // here as a persist failure → retain + retry the accumulator → DOUBLE-PERSIST the committed reply
+  // under a collision id. A pre-fanout index read (readIndex / getActiveConversationId) can throw
+  // EMFILE/EACCES, so any failure here must be swallowed — a missed/late broadcast is harmless
+  // (clients re-fetch), a duplicated reply is not.
+  try {
+    if (isRecentlyDeleted(conversation.id) && !readIndex(appHome).conversations[conversation.id]) {
+      return;
+    }
+    broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
+  } catch (err) {
+    console.error('[conversations] broadcastUpsert failed (non-fatal; write already committed)', err);
   }
-  broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
 }
 function broadcastDelete(appHome: string, id: string): void {
   // If the DURABLE index write during delete/clear FAILED, the on-disk index still lists this id as

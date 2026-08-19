@@ -204,6 +204,40 @@ export function loadSkillsFromDisk(skillsDir: string): Array<{ manifest: SkillMa
   return results;
 }
 
+/** Cheap content signature of the skills DIRECTORY for hot-reload change detection (R170 f-6): the
+ *  skills.enabled fingerprint misses add/delete/edit under the default enabled=[] ("all") sentinel.
+ *  Lists each immediate subdirectory + its SKILL.md size+mtime so a deleted/edited/added skill flips
+ *  the signature. Best-effort (returns '' on any error → treated as "no info", falls back to other
+ *  fingerprint components). */
+export function skillsDirectoryFingerprint(skillsDir: string): string {
+  try {
+    if (!existsSync(skillsDir)) return '';
+    const parts: string[] = [];
+    for (const entry of readdirSync(skillsDir).sort()) {
+      const dir = join(skillsDir, entry);
+      try {
+        if (!statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      let sig = `${entry}`;
+      for (const mdName of ['SKILL.md', 'skill.md']) {
+        try {
+          const st = statSync(join(dir, mdName));
+          sig += `:${st.size}:${st.mtimeMs}`;
+          break;
+        } catch {
+          /* try next / none */
+        }
+      }
+      parts.push(sig);
+    }
+    return parts.join('|');
+  } catch {
+    return '';
+  }
+}
+
 /* ── Execution handler functions (used inside Mastra Steps) ── */
 
 async function runShellExecution(
@@ -211,6 +245,7 @@ async function runShellExecution(
   skillDir: string,
   input: Record<string, unknown>,
   getConfig: () => AppConfig,
+  abortSignal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const command = manifest.execution.command ?? './run.sh';
 
@@ -239,8 +274,12 @@ async function runShellExecution(
 
   const streaming = resolveProcessStreamingConfig(config);
 
-  // Create a minimal execution context for process-runner (no progress/abort in workflow steps)
-  const context: ToolExecutionContext = { toolCallId: `wf-${Date.now()}` };
+  // Execution context carrying the workflow step's abort signal so a Stop cancels the child process
+  // mid-run (R170 f-3) — runCommandWithStreaming honors context.abortSignal.
+  const context: ToolExecutionContext = {
+    toolCallId: `wf-${Date.now()}`,
+    ...(abortSignal ? { abortSignal } : {}),
+  };
 
   const result = await runCommandWithStreaming({
     command: resolvedCommand,
@@ -265,11 +304,16 @@ async function runScriptExecution(
   skillDir: string,
   input: Record<string, unknown>,
   getConfig: () => AppConfig,
+  abortSignal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const scriptFile = manifest.execution.scriptFile ?? 'index.mjs';
   const config = getConfig();
   const streaming = resolveProcessStreamingConfig(config);
-  const context: ToolExecutionContext = { toolCallId: `wf-${Date.now()}` };
+  // Carry the workflow step's abort signal so a Stop cancels the script child (R170 f-3).
+  const context: ToolExecutionContext = {
+    toolCallId: `wf-${Date.now()}`,
+    ...(abortSignal ? { abortSignal } : {}),
+  };
 
   // Resolve the script path and require it to stay inside the skill directory,
   // then run it with argv (shell:false). Passing it through a shell as
@@ -322,6 +366,7 @@ function runPromptExecution(manifest: SkillManifest, input: Record<string, unkno
 async function runHttpExecution(
   manifest: SkillManifest,
   input: Record<string, unknown>,
+  abortSignal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const exec = manifest.execution;
   const url = interpolateTemplate(exec.url ?? '', input);
@@ -347,13 +392,20 @@ async function runHttpExecution(
 
   // Bound the request: a slow/huge endpoint shouldn't hang the tool call or
   // buffer unbounded memory. Abort after HTTP_SKILL_TIMEOUT_MS and cap the body.
+  // Also abort if the workflow step is cancelled (R170 f-3) so a Stop cancels the request in flight.
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), HTTP_SKILL_TIMEOUT_MS);
+  const onParentAbort = () => abort.abort();
+  if (abortSignal) {
+    if (abortSignal.aborted) abort.abort();
+    else abortSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
   let resp: Response;
   try {
     resp = await fetch(url, { ...fetchOptions, signal: abort.signal });
   } finally {
     clearTimeout(timer);
+    if (abortSignal) abortSignal.removeEventListener('abort', onParentAbort);
   }
 
   const contentType = resp.headers.get('content-type') ?? '';
@@ -426,17 +478,20 @@ export function skillToWorkflow(
     description: manifest.description,
     inputSchema: anySchema,
     outputSchema: anySchema,
-    execute: async ({ inputData }) => {
+    execute: async ({ inputData, abortSignal }) => {
       const input = (inputData ?? {}) as Record<string, unknown>;
+      // Thread the workflow step's abortSignal into the side-effecting handlers (R170 f-3) so a Stop
+      // actually cancels a running shell/script/HTTP skill step — not just returns "cancelled" while
+      // the process/request keeps running to completion.
       switch (manifest.execution.type) {
         case 'shell':
-          return runShellExecution(manifest, skillDir, input, getConfig);
+          return runShellExecution(manifest, skillDir, input, getConfig, abortSignal);
         case 'script':
-          return runScriptExecution(manifest, skillDir, input, getConfig);
+          return runScriptExecution(manifest, skillDir, input, getConfig, abortSignal);
         case 'prompt':
           return runPromptExecution(manifest, input);
         case 'http':
-          return runHttpExecution(manifest, input);
+          return runHttpExecution(manifest, input, abortSignal);
         default:
           return { error: `Unknown execution type: ${manifest.execution.type}` };
       }
@@ -492,7 +547,7 @@ function buildCompositeWorkflow(
       description: `Step ${i + 1}: ${stepDef.tool}`,
       inputSchema: anySchema,
       outputSchema: anySchema,
-      execute: async ({ inputData }) => {
+      execute: async ({ inputData, abortSignal }) => {
         const prevOutput = (inputData ?? {}) as Record<string, unknown>;
         const tool = findToolByName(allTools, stepDef.tool);
         if (!tool) {
@@ -512,7 +567,12 @@ function buildCompositeWorkflow(
           }
         }
 
-        const context: ToolExecutionContext = { toolCallId: `wf-composite-${Date.now()}` };
+        // Thread the step's abort signal into the orchestrated tool so a Stop cancels a composite
+        // skill's child tool call mid-run (R170 f-3), not just after it finishes.
+        const context: ToolExecutionContext = {
+          toolCallId: `wf-composite-${Date.now()}`,
+          ...(abortSignal ? { abortSignal } : {}),
+        };
         const result = await tool.execute(interpolated, context);
         // Ensure we return an object for the next step
         if (result && typeof result === 'object' && !Array.isArray(result)) {

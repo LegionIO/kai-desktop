@@ -73,7 +73,7 @@ import { retryPendingSubAgentResumes } from './tools/sub-agent.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
-import { loadSkillsAsTools, resolveSkillsDir } from './tools/skill-loader.js';
+import { loadSkillsAsTools, resolveSkillsDir, skillsDirectoryFingerprint } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerPlatformHandlers } from './ipc/platform.js';
 import { registerAppshotHandlers } from './ipc/appshots.js';
@@ -1399,7 +1399,11 @@ if (gotSingleInstanceLock) {
       Object.fromEntries((Object.keys(cfg) as Array<keyof AppConfig>).map((k) => [k, JSON.stringify(cfg[k]) ?? '']));
     let lastConfigFingerprints = fingerprintConfig(getConfig());
     let lastMcpFingerprint = JSON.stringify(getConfig().mcpServers ?? []);
-    let lastSkillsFingerprint = JSON.stringify(getConfig().skills?.enabled ?? []);
+    let lastSkillsFingerprint = JSON.stringify({
+      enabled: getConfig().skills?.enabled ?? [],
+      directory: getConfig().skills?.directory ?? null,
+      contents: skillsDirectoryFingerprint(resolveSkillsDir(getConfig(), APP_HOME)),
+    });
     let lastCliToolsFingerprint = JSON.stringify(getConfig().cliTools ?? []);
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
@@ -1411,7 +1415,22 @@ if (gotSingleInstanceLock) {
       updateActiveRealtimeSessionTools(getRegisteredTools());
     };
 
+    // Gate config-driven hot-reloads until the INITIAL tool registry has been registered (R170 f-5):
+    // buildToolRegistry runs async; a config change (e.g. disable A + enable B) that lands during that
+    // build triggers a hot-reload rebuild, and if the (slower) initial build's registerTools completes
+    // AFTER the hot-reload's updateMcpTools, it CLOBBERS the reload's result with the stale set. So
+    // while the initial build is in flight we DEFER hot-reloads; once it registers we re-run
+    // handleConfigChanged(getConfig()) once so any drift that occurred during startup is applied ON TOP
+    // of the initial registration (the fingerprints stayed at their initial values, so the re-run
+    // detects and applies the real current config, winning deterministically).
+    let initialToolsRegistered = false;
+    let configChangedDuringStartup = false;
+
     const handleConfigChanged = (config: AppConfig) => {
+      if (!initialToolsRegistered) {
+        configChangedDuringStartup = true;
+        return;
+      }
       // MCP hot-reload
       const newMcpFp = JSON.stringify(config.mcpServers ?? []);
       if (newMcpFp !== lastMcpFingerprint) {
@@ -1428,12 +1447,22 @@ if (gotSingleInstanceLock) {
           });
       }
 
-      // Skills hot-reload
-      const newSkillsFp = JSON.stringify(config.skills?.enabled ?? []);
+      // Skills hot-reload. Fingerprint the skills DIRECTORY CONTENTS + directory path, not just
+      // skills.enabled (R170 f-6): with the default enabled=[] sentinel ("all enabled"), deleting a
+      // skill (or changing skills.directory) doesn't change the enabled array, so the reload was
+      // skipped and the removed skill's captured prompt/HTTP workflow stayed executable until restart.
+      const newSkillsFp = JSON.stringify({
+        enabled: config.skills?.enabled ?? [],
+        directory: config.skills?.directory ?? null,
+        contents: skillsDirectoryFingerprint(resolveSkillsDir(config, APP_HOME)),
+      });
       if (newSkillsFp !== lastSkillsFingerprint) {
         lastSkillsFingerprint = newSkillsFp;
         const skillsDir = resolveSkillsDir(config, APP_HOME);
-        const skillTools = loadSkillsAsTools(skillsDir, config.skills?.enabled ?? [], getConfig);
+        // Pass the CURRENT registered tool catalog (R170 f-10) so COMPOSITE skills can resolve the
+        // tools they orchestrate — omitting it made every composite skill capture an empty catalog
+        // after any reload and return "Tool not found" until restart.
+        const skillTools = loadSkillsAsTools(skillsDir, config.skills?.enabled ?? [], getConfig, getRegisteredTools());
         updateSkillTools(skillTools);
         syncRealtimeTools();
         console.info(`[${__BRAND_PRODUCT_NAME}] Skills hot-reload complete: ${skillTools.length} skill tools`);
@@ -2626,6 +2655,17 @@ if (gotSingleInstanceLock) {
         const allTools = [...tools, ...pluginTools];
         registerTools(allTools);
         console.info(`[${__BRAND_PRODUCT_NAME}] ${tools.length} tools + ${pluginTools.length} plugin tools registered`);
+        // The initial registry is now live. Enable hot-reloads and re-run once if any config change
+        // arrived DURING the build (R170 f-5), so it lands ON TOP of this registration.
+        initialToolsRegistered = true;
+        if (configChangedDuringStartup) {
+          configChangedDuringStartup = false;
+          try {
+            handleConfigChanged(getConfig());
+          } catch (err) {
+            console.error(`[${__BRAND_PRODUCT_NAME}] deferred config hot-reload failed:`, err);
+          }
+        }
 
         // Register realtime handlers (needs tool registry)
         registerRealtimeHandlers(ipcMain, getConfig, getRegisteredTools, APP_HOME);

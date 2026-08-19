@@ -478,11 +478,40 @@ export function reconcileGhostIndexEntries(appHome: string): number {
     }
     if (missing) ghostIds.push(id);
   }
-  if (ghostIds.length === 0) return 0;
+  // FORWARD reconcile (R170 f-8): a writeConversation whose index maintenance failed AFTER the file
+  // committed (R169 f-2) leaves a record FILE on disk with NO index entry — it's broadcast live but
+  // vanishes from the list after restart (readIndex only rebuilds a CORRUPT/missing index, not a
+  // parseable-but-incomplete one). Scan the conversations dir and re-add any present file whose id is
+  // absent from the index — UNLESS it's durably deleted (a tombstoned record whose file rm failed
+  // must NOT be resurrected into the catalog).
+  const orphanFileIds: string[] = [];
+  try {
+    const dir = conversationsDir(appHome);
+    if (existsSync(dir)) {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.json')) continue;
+        const id = name.slice(0, -'.json'.length);
+        if (!index.conversations[id] && !isDurablyDeleted(index, id) && !isRecentlyDeleted(id)) {
+          orphanFileIds.push(id);
+        }
+      }
+    }
+  } catch {
+    /* dir scan best-effort */
+  }
+  if (ghostIds.length === 0 && orphanFileIds.length === 0) return 0;
   for (const id of ghostIds) {
     delete index.conversations[id];
     if (index.activeConversationId === id) index.activeConversationId = null;
     pushDurableDeletedId(index, id); // durable tombstone so a stale writer can't resurrect it
+  }
+  for (const id of orphanFileIds) {
+    try {
+      const rec = readConversation(appHome, id);
+      if (rec) index.conversations[id] = toIndexEntry(rec);
+    } catch {
+      /* unreadable — skip (a later read handles it) */
+    }
   }
   try {
     writeIndex(appHome, index);
@@ -497,8 +526,10 @@ export function reconcileGhostIndexEntries(appHome: string): number {
     markIndexMayHaveGhosts();
     return 0;
   }
-  console.info(`[conversation-store] reconciled ${ghostIds.length} ghost index entr(y|ies) at startup`);
-  return ghostIds.length;
+  console.info(
+    `[conversation-store] reconciled ${ghostIds.length} ghost + ${orphanFileIds.length} orphan-file index entr(y|ies) at startup`,
+  );
+  return ghostIds.length + orphanFileIds.length;
 }
 
 // ── conversation read/write ───────────────────────────────────────────────────

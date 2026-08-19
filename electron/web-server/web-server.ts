@@ -284,6 +284,19 @@ const MIME_TYPES: Record<string, string> = {
 /** Base directory where generated media files are stored. */
 const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
 
+/** decodeURIComponent that returns null instead of THROWING on a malformed percent-escape (R170 f-7):
+ *  a bare `%` or `%zz` in a request path throws URIError, which — if uncaught in the request handler —
+ *  escapes to the global exception handler (log only) and STRANDS the response socket, so repeated
+ *  `/media/%` / `/plugin-renderer/%` requests exhaust file descriptors (unauthenticated DoS in
+ *  anonymous mode). Callers return 400 on null. */
+function safeDecodeURIComponent(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
+}
+
 /** Base directory where compiled plugin renderer bundles are cached. */
 const PLUGINS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins');
 
@@ -1052,7 +1065,12 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     // --- Serve generated media files (images, videos, audio) ---
     if (urlPath.startsWith('/media/')) {
-      const relativePath = decodeURIComponent(urlPath.slice('/media/'.length));
+      const relativePath = safeDecodeURIComponent(urlPath.slice('/media/'.length));
+      if (relativePath === null) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+        return;
+      }
       const filePath = join(MEDIA_DIR, relativePath);
 
       // Security: ensure the resolved path is under the media directory
@@ -1140,7 +1158,19 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     // --- Serve plugin frontend files directly from plugin directory ---
     if (urlPath.startsWith('/plugin-renderer/')) {
       // URL format: /plugin-renderer/<pluginName>/<assetPath>
-      const segments = urlPath.slice('/plugin-renderer/'.length).split('/').map(decodeURIComponent);
+      const rawSegments = urlPath.slice('/plugin-renderer/'.length).split('/');
+      const decodedSegments: string[] = [];
+      for (const seg of rawSegments) {
+        const dec = safeDecodeURIComponent(seg);
+        if (dec === null) {
+          // Malformed percent-escape — return 400 rather than throwing + stranding the socket (R170 f-7).
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+          return;
+        }
+        decodedSegments.push(dec);
+      }
+      const segments = decodedSegments;
       const [pluginName, ...assetParts] = segments;
       const assetPath = assetParts.join('/');
 

@@ -200,11 +200,18 @@ export function createSkillManageTool(appHome: string): ToolDefinition {
             }
           }
 
-          // Add to enabled list
-          const enabled = [...(config.skills?.enabled ?? [])];
-          if (!enabled.includes(safeName)) {
-            enabled.push(safeName);
-          }
+          // Add to enabled list — but PRESERVE the empty "all enabled" sentinel (R170 f-12):
+          // config.skills.enabled === [] means "every skill enabled". Pushing the new name onto []
+          // would turn it into an explicit allow-list of ONLY the new skill, silently DISABLING every
+          // existing skill on the ensuing reload. When the sentinel is active, leave it empty (the
+          // new skill is already enabled by the sentinel); otherwise append to the explicit list.
+          const prevEnabled = config.skills?.enabled ?? [];
+          const enabled =
+            prevEnabled.length === 0
+              ? []
+              : prevEnabled.includes(safeName)
+                ? [...prevEnabled]
+                : [...prevEnabled, safeName];
           config.skills = { ...config.skills, enabled, directory: config.skills?.directory ?? join(appHome, 'skills') };
           writeDesktopConfig(appHome, config);
 

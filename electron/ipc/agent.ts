@@ -7781,6 +7781,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           } catch {
             discardPersistenceAccumulator(conversationId); // fall back to release if finalize throws
           }
+          // finalizeInterruptedTurn RETAINS the accumulator on a (non-throwing) persist failure
+          // (R168 f-2). This is the terminal give-up: we've dropped ownership (above) and will reset
+          // runStatus + emit `done` below, so the accumulator can NEVER be persisted later — discard
+          // it explicitly (R170 f-1) rather than leave it ownerless and leaking for the process life.
+          if (hasPersistenceAccumulator(conversationId)) {
+            console.error(
+              `[agent] terminal finalize could not persist accumulated reply for ${conversationId}; discarding`,
+            );
+            discardPersistenceAccumulator(conversationId);
+          }
           try {
             const conv = readConversation(serverPersistAppHome, conversationId);
             if (conv && conv.runStatus === 'running') {
