@@ -63,6 +63,12 @@ const PERMISSION_DESCRIPTIONS: Record<
     level: 'high',
   },
   'tasks:write': { label: 'Create, edit, and archive tasks', icon: SquareKanban, level: 'high' },
+  'browser:authenticated-session': {
+    label:
+      'Run trusted plugin interface code that can access Kai desktop data and API keys and inspect or control authenticated Browser pages; a plugin-provided AI backend may also control those pages',
+    icon: MonitorSmartphone,
+    level: 'high',
+  },
   'fs:scoped-read': { label: 'Read files within declared directories', icon: Eye, level: 'medium' },
   // ── Medium risk ──
   'messages:hook': { label: 'Intercept messages before/after send', icon: MessageSquare, level: 'medium' },

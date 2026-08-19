@@ -1,8 +1,10 @@
 import type { IpcMain } from 'electron';
 import { BrowserWindow } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { openApprovalWindow, closeApprovalWindow, registerApprovalWindowIpc } from '../approval-window.js';
+import { getExistingBrowserManager } from '../browser/service.js';
 import { resolveApprovalPopOut } from '../agent/kai-presence.js';
 import { resolveModelCatalog, resolveStreamConfig } from '../agent/model-catalog.js';
 import { toolsForExecutionMode as filterToolsForExecutionMode } from '../agent/plan-mode-tools.js';
@@ -90,6 +92,7 @@ import { COMPACTION_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { getAppHome } from '../local-bridge/paths.js';
+import { isRealtimeConversationBrowserAuthorized, isRealtimeConversationTurnActive } from './realtime.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging for stream pipeline diagnostics
@@ -112,7 +115,7 @@ function ipcDebugLog(msg: string): void {
 import type { ToolCompactionConfig } from '../agent/compaction.js';
 import type { ChatMessage as ChatMessageForCompaction } from '../agent/compaction.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
-import { ensureSafeToolDefinitions, findToolByName, dedupeToolNames } from '../tools/naming.js';
+import { dedupeToolNames, ensureSafeToolDefinitions, findToolByName } from '../tools/naming.js';
 import { resolveRuntimeForStream } from '../agent/runtime/index.js';
 import { buildAgentChildEnv, resolveConfinedCwd, providerKeyEnv } from '../agent/runtime/confinement.js';
 import {
@@ -131,15 +134,105 @@ import {
 import { recordUsageEvent } from './usage.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { normalizeTokenUsage } from '../../shared/token-usage.js';
-import type { HookMessage } from '../plugins/types.js';
+import {
+  redactBrowserErrorForExposure,
+  redactBrowserToolArgsForExposure,
+  redactBrowserToolErrorForExposure,
+} from '../../shared/browser.js';
+import type { HookMessage, PluginInferenceProvider } from '../plugins/types.js';
 import { hookDispatcher } from '../agent/hooks/dispatcher.js';
+import { applyPostToolUseHooks, prepareToolUseWithHooks } from '../agent/hooks/tool-lifecycle.js';
 
-const activeStreams = new Map<string, { abort: () => void; token: string }>();
+type ActiveStreamState = {
+  abort: () => void;
+  token: string;
+  /** Sticky provenance: this run was admitted with native Browser authority.
+   * Revocation removes its tools but must not let a web/secondary surface take
+   * over the still-running private turn. */
+  nativeBrowserInitiator: boolean;
+  /** Current Browser-tool capability. This may be revoked independently of the
+   * initiator provenance above. */
+  nativeBrowserTools: boolean;
+};
+
+function shouldWarnAboutUnwrappedRuntimeTools(
+  capabilities: { builtInTools?: boolean },
+  enforcingHooksActive: boolean,
+): boolean {
+  return enforcingHooksActive && capabilities.builtInTools === true;
+}
+
+const UNCORRELATED_TOOL_ARGS_REASON =
+  'Arguments hidden because enforcing tool hooks cannot be correlated with this runtime event.';
+
+/** Prevent a streamed tool-call from exposing arguments before an enforcing
+ * PreToolUse hook has resolved. Mastra has an execution callback with the same
+ * call id, so its placeholder can be corrected later. Bridged runtimes and
+ * plugin providers use unrelated ids; fail closed with a permanent redacted
+ * sentinel rather than leaking the pre-hook payload or leaving a pending card. */
+function protectUnresolvedToolCallArgs(
+  event: StreamEvent,
+  enforcingHooksActive: boolean,
+  hookApplies: boolean,
+  correctionExpected: boolean,
+): void {
+  if (event.type !== 'tool-call' || !enforcingHooksActive || !hookApplies) return;
+  const mutableEvent = event as StreamEvent & { argsPending?: boolean };
+  if (correctionExpected) {
+    mutableEvent.args = { pending: true };
+    mutableEvent.argsPending = true;
+    return;
+  }
+  mutableEvent.args = { redacted: true, reason: UNCORRELATED_TOOL_ARGS_REASON };
+  mutableEvent.argsPending = false;
+}
+
+const activeStreams = new Map<string, ActiveStreamState>();
 
 /** True if any conversation currently has a live agent stream. Used by the
  *  headless update-restart watcher to avoid exiting mid-turn. */
 export function hasActiveStreams(): boolean {
   return activeStreams.size > 0;
+}
+
+function markTextBrowserCapabilitiesRevoked(streams: Iterable<Pick<ActiveStreamState, 'nativeBrowserTools'>>): void {
+  for (const stream of streams) stream.nativeBrowserTools = false;
+}
+
+function revokeTextBrowserCapabilities(
+  streams: Iterable<readonly [string, Pick<ActiveStreamState, 'token' | 'nativeBrowserTools'>]>,
+  approvals: Iterable<Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'resolve'>>,
+): void {
+  const revokedOwners = new Map<string, Set<string>>();
+  for (const [conversationId, stream] of streams) {
+    if (stream.nativeBrowserTools) {
+      const tokens = revokedOwners.get(conversationId) ?? new Set<string>();
+      tokens.add(stream.token);
+      revokedOwners.set(conversationId, tokens);
+    }
+    stream.nativeBrowserTools = false;
+  }
+
+  // A Browser policy prompt can no longer succeed after revocation. Settle
+  // only those native-browser waiters; generic ask_user/plan approvals remain
+  // live as long as their owning stream token is still current.
+  for (const approval of approvals) {
+    const owner = approval.streamOwner;
+    if (
+      approval.authority === 'native-browser' &&
+      owner &&
+      revokedOwners.get(owner.conversationId)?.has(owner.streamToken)
+    ) {
+      approval.resolve('dismiss');
+    }
+  }
+}
+
+/** Permanently remove the Browser bit from every live text stream. The Browser
+ * manager separately rotates its authority generation and clears run leases,
+ * so registry/tool refreshes after re-enable cannot restore the capability. */
+export function revokeActiveTextBrowserTools(): void {
+  revokeTextBrowserCapabilities(activeStreams.entries(), pendingToolApprovals.values());
 }
 
 // Delete the active-stream entry only if it still belongs to this run. A newer
@@ -207,6 +300,89 @@ function cleanupStreamIfOwned(conversationId: string, token: string): void {
   // (with a mid-turn inject) doesn't leak these module-level entries indefinitely.
   conversationsWithConsumedInject.delete(conversationId);
   consumedInjectBytes.delete(conversationId);
+}
+
+/** Close assistant-created browser tabs only while this exact turn still owns
+ * the conversation. A superseded turn must never close its replacement's tabs. */
+function cleanupAssistantTabsIfOwned(conversationId: string, token: string): boolean {
+  if (activeStreams.get(conversationId)?.token !== token) return false;
+  const cleanup = getExistingBrowserManager()?.cleanupAssistantTabs(conversationId, token);
+  if (cleanup) {
+    void cleanup.catch((error) => {
+      console.error('[Agent:stream] Failed to clean up assistant Browser tabs:', error);
+    });
+  }
+  return true;
+}
+
+/** A Browser-authorized turn can lose its renderer while waiting for preflight
+ * drains, before the normal stream/fallback terminal path exists. Clear only a
+ * still-running disk marker; a renderer that survived will persist its richer
+ * terminal error after receiving the rejection result. */
+function resetBrowserAuthorityRevokedRunStatus(appHome: string, conversationId: string): boolean {
+  try {
+    const conversation = readConversation(appHome, conversationId);
+    if (!conversation || conversation.runStatus !== 'running') return false;
+    conversation.runStatus = 'idle';
+    broadcastUpsert(appHome, writeConversation(appHome, conversation));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shouldPrepareBrowserContinuation(
+  event: { type: StreamEvent['type']; errorCategory?: string },
+  serverPersistedRun: boolean,
+  autoContinueOnMaxTurns: boolean,
+  allowNativeBrowserTools: boolean,
+): boolean {
+  return (
+    event.type === 'error' &&
+    event.errorCategory === 'max_turns' &&
+    !serverPersistedRun &&
+    autoContinueOnMaxTurns &&
+    allowNativeBrowserTools
+  );
+}
+
+function isBrowserDrainSuperseded(aborted: boolean, activeToken: string | undefined, streamToken: string): boolean {
+  return aborted || activeToken !== streamToken;
+}
+
+function isNativeBrowserAuthorityCurrent(
+  manager: ReturnType<typeof getExistingBrowserManager>,
+  generation: number | null | undefined,
+): generation is number {
+  return (
+    generation !== null && generation !== undefined && manager?.isHostRendererAuthorityCurrent(generation) === true
+  );
+}
+
+function isNativeBrowserAuthorityRevoked(
+  wasAuthorized: boolean,
+  managerAtAuthorization: ReturnType<typeof getExistingBrowserManager>,
+  currentManager: ReturnType<typeof getExistingBrowserManager>,
+  generation: number | null | undefined,
+): boolean {
+  return (
+    wasAuthorized &&
+    (managerAtAuthorization !== currentManager || !isNativeBrowserAuthorityCurrent(currentManager, generation))
+  );
+}
+
+function mayDriveBrowserContinuation(
+  manager: ReturnType<typeof getExistingBrowserManager>,
+  conversationId: string,
+  predecessorRunId: string,
+  hasNativeBrowserAuthority: boolean,
+): boolean {
+  return !manager?.hasPendingAssistantContinuation(conversationId, predecessorRunId) || hasNativeBrowserAuthority;
+}
+
+function pluginProviderErrorForExposure(error: unknown, allowNativeBrowserTools: boolean): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return allowNativeBrowserTools ? redactBrowserErrorForExposure(message) : message;
 }
 const activeObserverSessions = new Map<string, string>();
 
@@ -313,9 +489,23 @@ async function splitBranchMediaForTokenSum(
 function jsonStableString(value: unknown): string {
   if (value === undefined) return '';
   try {
-    return JSON.stringify(value) ?? '';
+    const seen = new WeakSet<object>();
+    return (
+      JSON.stringify(value, (_key, nested) => {
+        if (typeof nested === 'bigint') return `${nested.toString()}n`;
+        if (typeof nested === 'object' && nested !== null) {
+          if (seen.has(nested)) return '[Circular]';
+          seen.add(nested);
+        }
+        return nested;
+      }) ?? ''
+    );
   } catch {
-    return String(value);
+    try {
+      return String(value);
+    } catch {
+      return '[Unserializable value]';
+    }
   }
 }
 
@@ -391,8 +581,17 @@ function persistRedactedUserTurn(
 import {
   pendingToolApprovals,
   setServerPersistTagger,
+  setToolApprovalOwnerResolver,
+  setRawApprovalWindowOpener,
+  setRawApprovalWindowCloser,
+  setPrimaryApprovalWindowResolver,
+  authorizePendingApprovalWindow,
+  mayBroadcastApprovalToWebClients,
+  resolveApprovalBroadcastWindowIds,
   registerPendingApproval,
   broadcastStreamEventRaw,
+  type PendingToolApproval,
+  type ToolApprovalAuthority,
 } from './tool-approval.js';
 
 // Pending user answers for ask_user tool — populated by IPC handler before approval resolves
@@ -841,6 +1040,14 @@ function markTokenTerminalAbort(token: string): void {
  * usually discard it as busy. This closes that window.
  */
 export function isConversationTurnActive(conversationId: string): boolean {
+  if (isRealtimeConversationTurnActive(conversationId)) return true;
+  return isTextConversationTurnActive(conversationId);
+}
+
+/** Text-only half of the per-conversation turn exclusion contract. Realtime
+ * startup consumes this through an injected callback to avoid an agent↔realtime
+ * module cycle. */
+export function isTextConversationTurnActive(conversationId: string): boolean {
   if (activeStreams.has(conversationId)) return true;
   const pending = currentPendingSubmit.get(conversationId);
   return typeof pending === 'number' && !cancelledSubmits.has(pending);
@@ -2035,7 +2242,8 @@ function mergePendingHandoffIntoLiveClaimant(conversationId: string): void {
  * assistant reply is written via the server-persist accumulator (there may be
  * no renderer, e.g. an automation). Set by registerAgentHandlers (closes over
  * streamHandler + module state); consumed by the automations busy-inject path.
- * Returns { ok } — ok:false only for a genuinely missing conversation.
+ * Returns { ok }. Background callers are rejected before any mutation when a
+ * native Browser-authorized stream owns the conversation.
  */
 export type InjectUserTurnFn = (
   conversationId: string,
@@ -2159,6 +2367,34 @@ export function isSupersededRunEvent(emittingToken: string | undefined, activeTo
   return emittingToken !== activeToken;
 }
 
+/** Open the optional dedicated approval surface and bind that exact window to
+ * the already-registered pending request. Raw approval producers install this
+ * helper through tool-approval.ts so every approval path gets identical
+ * presence policy and one-shot authority. */
+function maybeOpenDedicatedApprovalWindow(event: StreamEvent): void {
+  if (event.type !== 'tool-approval-required' || !event.toolCallId || !event.conversationId) return;
+  let popOut = false;
+  if (serverPersistAppHome) {
+    try {
+      const raw = readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow;
+      popOut = resolveApprovalPopOut(raw);
+    } catch {
+      popOut = false;
+    }
+  }
+  if (!popOut) return;
+  const win = openApprovalWindow({
+    approvalId: event.toolCallId,
+    conversationId: event.conversationId,
+    toolName: event.toolName ?? 'tool',
+    args: event.args,
+  });
+  const webContentsId = win?.webContents?.id;
+  if (typeof webContentsId === 'number') {
+    authorizePendingApprovalWindow(event.toolCallId, webContentsId);
+  }
+}
+
 /**
  * @param emittingToken  The stream token of the run that produced this event.
  *   Persistence/accumulation is only applied when it matches BOTH the persist
@@ -2168,7 +2404,10 @@ export function isSupersededRunEvent(emittingToken: string | undefined, activeTo
  *   (automation / redaction), which are never server-persist owners.
  */
 function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void {
-  let eventToBroadcast = event;
+  let eventToBroadcast: StreamEvent =
+    event.type === 'tool-call'
+      ? { ...event, args: redactBrowserToolArgsForExposure(event.toolName, event.args) }
+      : event;
   // Debug: log every event broadcast
   const eventSummary =
     event.type === 'text-delta'
@@ -2228,7 +2467,7 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
         // Parent the persisted assistant turn on the head captured at submit
         // (the user node it answers), so a mid-run branch change can't reparent it.
         const parentId = serverPersistParents.get(event.conversationId);
-        const persistOutcome = accumulateForPersistence(serverPersistAppHome, event, parentId ?? undefined);
+        const persistOutcome = accumulateForPersistence(serverPersistAppHome, eventToBroadcast, parentId ?? undefined);
         if (event.type === 'done') {
           // Clear persistence ownership only when the terminal finalize did NOT fail with a retained
           // accumulator (R169 f-1): if the append hit a transient write/read failure,
@@ -2289,39 +2528,19 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       } else if (event.type !== 'done') {
         accumulateForPersistence(
           serverPersistAppHome,
-          event,
+          eventToBroadcast,
           guiFallbackParents.get(event.conversationId) ?? undefined,
         );
       }
     }
   }
 
-  // Dedicated approval window (ui.approvals.dedicatedWindow):
-  //   'auto' (default) → presence-aware: pop out ONLY when the user isn't on
-  //     Kai (no GUI focus, no recently-active CLI) — otherwise the inline
-  //     in-thread card / CLI prompt is the surface. 'always'/'never' force it.
-  // Close the window once the tool resolves or the turn ends. The inline card
-  // still renders and resolves the same pending entry (whichever surface the
-  // user answers first wins — resolve is idempotent).
+  // Dedicated approval window (ui.approvals.dedicatedWindow). Registration is
+  // synchronous and happens before this broadcast, so the exact pop-out can be
+  // attached as a one-shot resolver capability before any answer arrives.
   if (event.conversationId) {
     if (event.type === 'tool-approval-required' && event.toolCallId) {
-      let popOut = false;
-      if (serverPersistAppHome) {
-        try {
-          const raw = readEffectiveConfig(serverPersistAppHome).ui?.approvals?.dedicatedWindow;
-          popOut = resolveApprovalPopOut(raw);
-        } catch {
-          popOut = false;
-        }
-      }
-      if (popOut) {
-        openApprovalWindow({
-          approvalId: event.toolCallId,
-          conversationId: event.conversationId,
-          toolName: event.toolName ?? 'tool',
-          args: event.args,
-        });
-      }
+      maybeOpenDedicatedApprovalWindow(event);
     } else if (event.type === 'tool-result' && event.toolCallId) {
       closeApprovalWindow(event.toolCallId);
       // The tool-result committed — an ask_user answer consumed by execute() is now
@@ -2381,7 +2600,10 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   // persistence-owning renderer without its user node (→ discards the later
   // inject-consumed id, persists the continuation on the wrong branch) and could
   // leave agent:submit stuck 'running' before stream launch (R106 finding-1).
+  // Browser-owned approvals are restricted to authorized windows (main's authority routing).
+  const authorizedApprovalWindowIds = resolveApprovalBroadcastWindowIds(event);
   for (const win of BrowserWindow.getAllWindows()) {
+    if (authorizedApprovalWindowIds && !authorizedApprovalWindowIds.has(win.webContents.id)) continue;
     try {
       if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
         win.webContents.send('agent:stream-event', eventToBroadcast);
@@ -2393,10 +2615,12 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   // REMOTE clients are frame-capped (web WS 4 MiB / CLI local-bridge 8 MiB) — strip oversized
   // media/originals from the copy fanned out to them (local Electron windows keep the full event).
   // Shared with the sub-agent broadcast (electron/agent/remote-frame-cap.ts).
-  try {
-    broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
-  } catch {
-    /* web-client fan-out is best-effort; never abort the caller (R106 finding-1) */
+  if (mayBroadcastApprovalToWebClients(event)) {
+    try {
+      broadcastToWebClients('agent:stream-event', capRemoteEvent(eventToBroadcast));
+    } catch {
+      /* web-client fan-out is best-effort; never abort the caller (R106 finding-1) */
+    }
   }
 }
 
@@ -2554,6 +2778,257 @@ function reconcileExecutionMode(
   return submitted ?? 'auto';
 }
 
+function toolsForRun(
+  tools: ToolDefinition[],
+  executionMode: ExecutionMode,
+  allowNativeBrowserTools: boolean,
+): ToolDefinition[] {
+  const surfaceTools = allowNativeBrowserTools ? tools : tools.filter((tool) => tool.source !== 'browser');
+  return toolsForExecutionMode(surfaceTools, executionMode);
+}
+
+function toolsForPluginInferenceProvider(
+  tools: ToolDefinition[],
+  executionMode: ExecutionMode,
+  allowNativeBrowserTools: boolean,
+  pluginManager: PluginManager | undefined,
+  provider: PluginInferenceProvider,
+): ToolDefinition[] {
+  const providerMayUseBrowser =
+    allowNativeBrowserTools &&
+    pluginManager?.inferenceProviderHasPermission(provider, 'browser:authenticated-session') === true;
+  return toolsForRun(tools, executionMode, providerMayUseBrowser);
+}
+
+function validateToolInput(tool: ToolDefinition, input: unknown): unknown {
+  const parsed = tool.inputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new Error(`Invalid arguments for tool "${tool.name}".`);
+  }
+  return parsed.data;
+}
+
+function observerToolErrorForExposure(toolName: string, error: unknown): { isError: true; error: string } {
+  return {
+    isError: true,
+    error: redactBrowserToolErrorForExposure(toolName, error),
+  };
+}
+
+/** Plugin inference providers receive executable host tool definitions and may
+ * call them directly. Validate every host-tool invocation at this trust boundary,
+ * and bind every tool to the host turn so approvals cannot be detached from a
+ * Browser-authorized stream. Browser tools additionally rely on this binding
+ * for tab/control cleanup ownership. */
+function bindBrowserToolsToRun(
+  tools: ToolDefinition[],
+  conversationId: string,
+  browserOwnerId: string,
+  abortSignal: AbortSignal,
+  trustedContext: Pick<ToolExecutionContext, 'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey'>,
+  isCurrent: (tool: ToolDefinition) => boolean,
+): ToolDefinition[] {
+  return tools.map((tool) => ({
+    ...tool,
+    execute: async (input: unknown, _context: ToolExecutionContext) => {
+      const assertCurrent = (): void => {
+        if (abortSignal.aborted || !isCurrent(tool)) {
+          throw new Error('This plugin tool capability is no longer active.');
+        }
+      };
+      assertCurrent();
+      const toolCallId = `plugin-${tool.source === 'browser' ? 'browser-' : ''}tool-${randomUUID()}`;
+      const prepared = await prepareToolUseWithHooks(conversationId, toolCallId, tool.name, input);
+      assertCurrent();
+      if (!prepared.allowed) {
+        const denied = await applyPostToolUseHooks(
+          conversationId,
+          toolCallId,
+          tool.name,
+          prepared.exposedArgs,
+          prepared.result,
+        );
+        assertCurrent();
+        return denied.result;
+      }
+
+      let validatedInput: unknown;
+      try {
+        validatedInput = validateToolInput(tool, prepared.args);
+      } catch (error) {
+        const errorResult = {
+          isError: true,
+          error: redactBrowserToolErrorForExposure(tool.name, error),
+        };
+        const postTool = await applyPostToolUseHooks(
+          conversationId,
+          toolCallId,
+          tool.name,
+          prepared.exposedArgs,
+          errorResult,
+        );
+        assertCurrent();
+        if (postTool.denied || postTool.modified) return postTool.result;
+        throw new Error(errorResult.error);
+      }
+      const exposedArgs = redactBrowserToolArgsForExposure(tool.name, validatedInput);
+      const context: ToolExecutionContext = {
+        // The provider is a plugin trust boundary. Never preserve any context
+        // field supplied by the plugin. Bind only host-derived values so a
+        // supplied call id cannot collide with another pending approval and a
+        // supplied cwd/profile/model cannot redirect or re-parent host tools.
+        toolCallId,
+        conversationId,
+        browserOwnerId,
+        abortSignal,
+        cwd: trustedContext.cwd,
+        isHeadless: trustedContext.isHeadless,
+        parentProfileKey: trustedContext.parentProfileKey,
+        parentModelKey: trustedContext.parentModelKey,
+      };
+      try {
+        assertCurrent();
+        const result = await tool.execute(validatedInput, context);
+        assertCurrent();
+        const postTool = await applyPostToolUseHooks(conversationId, toolCallId, tool.name, exposedArgs, result);
+        assertCurrent();
+        return postTool.result;
+      } catch (error) {
+        // If disable/update/cancellation happened during execution, do not run
+        // more plugin hooks or deliver a stale result through the old provider.
+        assertCurrent();
+        const errorResult = {
+          isError: true,
+          error: redactBrowserToolErrorForExposure(tool.name, error),
+        };
+        const postTool = await applyPostToolUseHooks(conversationId, toolCallId, tool.name, exposedArgs, errorResult);
+        assertCurrent();
+        if (postTool.denied || postTool.modified) return postTool.result;
+        throw new Error(errorResult.error);
+      }
+    },
+  }));
+}
+
+function isPrimaryBrowserToolCaller(
+  event:
+    | {
+        sender?: { send?: (channel: string, ...args: unknown[]) => void; mainFrame?: unknown } | null;
+        senderFrame?: unknown;
+        __kaiWebBridge?: boolean;
+      }
+    | null
+    | undefined,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  const primaryWindow = getPrimaryWindow();
+  return (
+    !!primaryWindow &&
+    !primaryWindow.isDestroyed() &&
+    event?.__kaiWebBridge !== true &&
+    event?.sender === primaryWindow.webContents &&
+    event?.senderFrame === primaryWindow.webContents.mainFrame
+  );
+}
+
+function mayMutateBrowserAuthorizedStream(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  stream: Pick<ActiveStreamState, 'nativeBrowserInitiator' | 'nativeBrowserTools'> | undefined,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  return (
+    (!stream?.nativeBrowserInitiator && !stream?.nativeBrowserTools) ||
+    isPrimaryBrowserToolCaller(event, getPrimaryWindow)
+  );
+}
+
+/** Authoritative admission check for renderer-owned conversation persistence.
+ * A renderer persists its optimistic user turn before invoking `agent:stream`.
+ * Reject that write while another renderer owns a Browser-capable stream so a
+ * later stream rejection cannot leave the unauthorized branch active on disk. */
+export function mayPersistConversationForBrowserAuthority(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  conversationId: string,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  if (isRealtimeConversationBrowserAuthorized(conversationId) && !isPrimaryBrowserToolCaller(event, getPrimaryWindow)) {
+    return false;
+  }
+  const browserManager = getExistingBrowserManager();
+  if (browserManager?.hasPendingAssistantContinuationForConversation(conversationId)) {
+    const authorityGeneration = browserManager.getHostRendererAuthorityGeneration();
+    if (
+      !isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+      !isNativeBrowserAuthorityCurrent(browserManager, authorityGeneration)
+    ) {
+      return false;
+    }
+  }
+  return mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow);
+}
+
+/** Background automations have no native renderer capability. Keep this
+ * separate from mayMutateBrowserAuthorizedStream so a sender-less internal
+ * caller cannot accidentally be treated as a trusted continuation. */
+function mayInjectAutomationIntoActiveStream(
+  stream: Pick<ActiveStreamState, 'nativeBrowserInitiator' | 'nativeBrowserTools'> | undefined,
+): boolean {
+  return !stream?.nativeBrowserInitiator && !stream?.nativeBrowserTools;
+}
+
+function isAuthorizedApprovalWindowCaller(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'approvalWindowWebContentsId'>,
+): boolean {
+  const expectedId = pending.approvalWindowWebContentsId;
+  const sender = event?.sender as { id?: unknown; mainFrame?: unknown } | null | undefined;
+  return (
+    event?.__kaiWebBridge !== true &&
+    typeof expectedId === 'number' &&
+    sender?.id === expectedId &&
+    event?.senderFrame === sender.mainFrame
+  );
+}
+
+function isPendingApprovalStreamCurrent(
+  pending: Pick<PendingToolApproval, 'streamOwner'>,
+  streams: Pick<Map<string, ActiveStreamState>, 'get'> = activeStreams,
+): boolean {
+  if (!pending.streamOwner) return true;
+  if (pending.streamOwner.isCurrent) {
+    try {
+      return pending.streamOwner.isCurrent();
+    } catch {
+      return false;
+    }
+  }
+  const stream = streams.get(pending.streamOwner.conversationId);
+  return stream?.token === pending.streamOwner.streamToken;
+}
+
+function mayResolveToolApproval(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'approvalWindowWebContentsId'>,
+  getPrimaryWindow: () => BrowserWindow | null,
+): boolean {
+  if (!isPendingApprovalStreamCurrent(pending)) return false;
+  const requiresNativeAuthority = pending.authority === 'native-browser' || Boolean(pending.streamOwner);
+  return (
+    !requiresNativeAuthority ||
+    isPrimaryBrowserToolCaller(event, getPrimaryWindow) ||
+    isAuthorizedApprovalWindowCaller(event, pending)
+  );
+}
+
+function toolApprovalResolutionError(
+  event: Parameters<typeof isPrimaryBrowserToolCaller>[0],
+  pending: Pick<PendingToolApproval, 'authority' | 'streamOwner' | 'approvalWindowWebContentsId'>,
+  getPrimaryWindow: () => BrowserWindow | null,
+): 'stale-browser-stream' | 'native-browser-authority-required' | null {
+  if (!isPendingApprovalStreamCurrent(pending)) return 'stale-browser-stream';
+  return mayResolveToolApproval(event, pending, getPrimaryWindow) ? null : 'native-browser-authority-required';
+}
+
 function observerToolsForExecutionMode(
   customTools: ToolDefinition[],
   workspaceTools: ToolDefinition[],
@@ -2708,6 +3183,18 @@ function logToolCompactionDebug(stage: string, details: Record<string, unknown>)
 // Tool registry - will be populated by Phase 4
 let registeredTools: ToolDefinition[] = [];
 
+/** Browser tool names are a trusted app contract. Normalize/dedupe every live
+ * registry with Browser tools first so a plugin/MCP/CLI name or alias cannot
+ * capture browser_tabs/browser_action dispatch, then restore the public
+ * registry ordering with Browser tools last. */
+function normalizeRegisteredTools(tools: ToolDefinition[]): ToolDefinition[] {
+  const safe = ensureSafeToolDefinitions(tools);
+  const browserTools = safe.filter((tool) => tool.source === 'browser');
+  const nonBrowserTools = safe.filter((tool) => tool.source !== 'browser');
+  const prioritized = dedupeToolNames([...browserTools, ...nonBrowserTools]);
+  return [...prioritized.slice(browserTools.length), ...prioritized.slice(0, browserTools.length)];
+}
+
 // Resolves once the initial tool registry (built-in + MCP + skills + plugins +
 // CLI tools) has been registered. The local CLI bridge starts serving EARLY
 // (before this, for fast connect), so a CLI turn arriving in that window would
@@ -2719,11 +3206,19 @@ const toolsReady: Promise<void> = new Promise((r) => {
 let toolsRegistered = false;
 
 export function registerTools(tools: ToolDefinition[]): void {
-  registeredTools = ensureSafeToolDefinitions(tools);
+  registeredTools = normalizeRegisteredTools(tools);
   if (!toolsRegistered) {
     toolsRegistered = true;
     resolveToolsReady();
   }
+}
+
+/** Commit the asynchronously-built startup registry without overwriting the
+ * Browser source that the live window/config lifecycle already hot-swapped.
+ * Browser enablement can change while MCP connections are still resolving. */
+export function registerToolsPreservingBrowserState(tools: ToolDefinition[]): void {
+  const browserTools = registeredTools.filter((tool) => tool.source === 'browser');
+  registerTools([...tools.filter((tool) => tool.source !== 'browser'), ...browserTools]);
 }
 
 export function getRegisteredTools(): ToolDefinition[] {
@@ -2756,33 +3251,66 @@ export function getWorkspaceToolDefinitions(): ToolDefinition[] {
 /** Hot-swap MCP tools without touching built-in, skill, or plugin tools */
 export function updateMcpTools(mcpTools: ToolDefinition[]): void {
   const nonMcp = registeredTools.filter((t) => t.source !== 'mcp');
-  // Re-run dedup after every hot-swap (R153 f-1): appending safe-but-not-deduped names lets a
-  // reloaded tool SHADOW a built-in in the name-keyed tool map (a CLI/MCP `enter_plan_mode` would
-  // execute instead of entering plan mode). dedupeToolNames reserves built-in names + disambiguates.
-  registeredTools = dedupeToolNames([...nonMcp, ...ensureSafeToolDefinitions(mcpTools)]);
+  // normalizeRegisteredTools re-runs dedup after every hot-swap (R153 f-1): appending
+  // safe-but-not-deduped names lets a reloaded tool SHADOW a built-in in the name-keyed tool map (a
+  // CLI/MCP `enter_plan_mode` would execute instead of entering plan mode). It reserves built-in
+  // names + disambiguates (and applies ensureSafeToolDefinitions + browser-priority ordering).
+  registeredTools = normalizeRegisteredTools([...nonMcp, ...mcpTools]);
 }
 
 /** Hot-swap skill tools without touching built-in or MCP tools */
 export function updateSkillTools(skillTools: ToolDefinition[]): void {
   const nonSkill = registeredTools.filter((t) => t.source !== 'skill');
-  registeredTools = dedupeToolNames([...nonSkill, ...ensureSafeToolDefinitions(skillTools)]);
+  registeredTools = normalizeRegisteredTools([...nonSkill, ...skillTools]);
 }
 
 /** Hot-swap plugin tools without touching built-in, MCP, or skill tools */
 export function updatePluginTools(pluginTools: ToolDefinition[]): void {
   const nonPlugin = registeredTools.filter((t) => t.source !== 'plugin');
-  registeredTools = dedupeToolNames([...nonPlugin, ...ensureSafeToolDefinitions(pluginTools)]);
+  registeredTools = normalizeRegisteredTools([...nonPlugin, ...pluginTools]);
 }
 
 /** Hot-swap CLI tools without touching built-in, MCP, skill, or plugin tools */
 export function updateCliTools(cliTools: ToolDefinition[]): void {
   const nonCli = registeredTools.filter((t) => t.source !== 'cli');
-  registeredTools = dedupeToolNames([...nonCli, ...ensureSafeToolDefinitions(cliTools)]);
+  registeredTools = normalizeRegisteredTools([...nonCli, ...cliTools]);
 }
 
-export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginManager?: PluginManager): void {
+/** Hot-swap native browser tools as the desktop window is enabled/created/closed. */
+export function updateBrowserTools(browserTools: ToolDefinition[]): void {
+  const nonBrowser = registeredTools.filter((tool) => tool.source !== 'browser');
+  registeredTools = normalizeRegisteredTools([...nonBrowser, ...browserTools]);
+}
+
+export function registerAgentHandlers(
+  ipcMain: IpcMain,
+  appHome: string,
+  pluginManager?: PluginManager,
+  getPrimaryWindow: () => BrowserWindow | null = () => null,
+  resolveRealtimeBrowserApprovalOwner: (
+    conversationId: string,
+    browserOwnerId: string,
+    authority: ToolApprovalAuthority,
+  ) => (() => boolean) | undefined = () => undefined,
+): void {
   hookDispatcher.configure({ getConfig: () => readEffectiveConfig(appHome) });
   serverPersistAppHome = appHome;
+  setToolApprovalOwnerResolver((conversationId, browserOwnerId, authority) => {
+    const stream = activeStreams.get(conversationId);
+    const ownerCurrent =
+      stream?.token === browserOwnerId &&
+      (authority === 'native-browser'
+        ? stream.nativeBrowserTools
+        : stream.nativeBrowserInitiator || stream.nativeBrowserTools);
+    if (ownerCurrent) {
+      return { conversationId, streamToken: stream.token };
+    }
+    const isCurrent = resolveRealtimeBrowserApprovalOwner(conversationId, browserOwnerId, authority);
+    return isCurrent ? { conversationId, streamToken: browserOwnerId, isCurrent } : undefined;
+  });
+  setRawApprovalWindowOpener(maybeOpenDedicatedApprovalWindow);
+  setRawApprovalWindowCloser(closeApprovalWindow);
+  setPrimaryApprovalWindowResolver(getPrimaryWindow);
   // Persist cooperative injects for server-owned (CLI/headless) turns at the
   // ACTUAL prepareStep consumption boundary — after the prior tool step's results
   // have arrived. Splitting at enqueue time can clear the persistence tool index
@@ -2873,7 +3401,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   });
 
   const streamHandler = async (
-    event: { sender?: { send?: (channel: string, ...args: unknown[]) => void } } | null | undefined,
+    event:
+      | {
+          sender?: { send?: (channel: string, ...args: unknown[]) => void } | null;
+          __kaiWebBridge?: boolean;
+        }
+      | null
+      | undefined,
     conversationId: string,
     messages: unknown[],
     modelKey?: string,
@@ -2896,6 +3430,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       continuationPredecessorToken?: string;
     },
     responseMessageId?: string,
+    nativeBrowserToolsOverride?: boolean,
+    nativeBrowserAuthorityGenerationOverride?: number,
   ) => {
     messages = stripDisplayOnlyParts(messages);
     // Raw disk-equivalent per-id content signature of the turn's INPUT branch, captured
@@ -2942,6 +3478,50 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     } catch {
       // Even the probe path threw — fail CLOSED to plan-first rather than the submitted mode.
       effectiveExecutionMode = 'plan-first';
+    }
+    // Web/CLI/background callers have no native sidebar to render or own a
+    // WebContentsView. Only a real Electron renderer invocation may expose the
+    // in-app browser tools. Internal continuations inherit a generation-bound
+    // grant rather than a bare boolean: host reload/crash teardown increments
+    // the manager generation, so a delayed continuation cannot restore access
+    // to an authenticated Browser profile after its renderer authority ended.
+    const browserManagerAtAuthorization = getExistingBrowserManager();
+    const directRendererAuthorized = isPrimaryBrowserToolCaller(event, getPrimaryWindow);
+    const nativeBrowserAuthorityGeneration =
+      nativeBrowserToolsOverride === undefined
+        ? directRendererAuthorized
+          ? browserManagerAtAuthorization?.getHostRendererAuthorityGeneration()
+          : undefined
+        : nativeBrowserAuthorityGenerationOverride;
+    const hasNativeBrowserAuthority =
+      (nativeBrowserToolsOverride ?? directRendererAuthorized) &&
+      isNativeBrowserAuthorityCurrent(browserManagerAtAuthorization, nativeBrowserAuthorityGeneration);
+    const continuationPredecessorToken =
+      typeof threadOverrides?.continuationPredecessorToken === 'string' &&
+      threadOverrides.continuationPredecessorToken.length > 0
+        ? threadOverrides.continuationPredecessorToken
+        : undefined;
+
+    // Text and Realtime runtimes maintain independent accumulators, tool
+    // ownership, and terminal persistence. Never run them concurrently for the
+    // same conversation or their events can merge into one renderer branch.
+    if (isRealtimeConversationTurnActive(conversationId)) {
+      const sender = event?.sender;
+      let delivered = false;
+      if (sender && typeof sender.send === 'function') {
+        try {
+          sender.send('agent:stream-event', {
+            conversationId,
+            type: 'error',
+            error: 'End the active voice call before starting a text response.',
+            ...(responseMessageId ? { responseMessageId } : {}),
+          });
+          delivered = true;
+        } catch {
+          delivered = false;
+        }
+      }
+      return { conversationId, busy: true as const, delivered, realtimeTurnActive: true as const };
     }
 
     // An on-demand `/compact` is summarizing this conversation right now (a paid,
@@ -2992,8 +3572,8 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // rather than let its unconditional abort below clobber the genuine newer turn. (A continuation
     // whose predecessor IS still the latest proceeds normally.)
     {
-      const predToken = threadOverrides?.continuationPredecessorToken;
-      if (typeof predToken === 'string' && predToken) {
+      const predToken = continuationPredecessorToken;
+      if (predToken) {
         const latest = latestIssuedTurnToken.get(conversationId);
         if (latest !== undefined && latest !== predToken && turnTokenTime(latest) > turnTokenTime(predToken)) {
           return { conversationId, busy: true as const, delivered: false, staleContinuation: true as const };
@@ -3001,16 +3581,77 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
 
+    // A web/secondary renderer may observe this max-turn event, but it has no
+    // native Browser authority. Do not let a direct or stale bridge call bypass
+    // the continuation-driver authorization and abort the predecessor before
+    // adopting tabs it cannot control.
+    if (
+      continuationPredecessorToken &&
+      !mayDriveBrowserContinuation(
+        getExistingBrowserManager(),
+        conversationId,
+        continuationPredecessorToken,
+        hasNativeBrowserAuthority,
+      )
+    ) {
+      return {
+        conversationId,
+        busy: true as const,
+        delivered: false,
+        nativeBrowserContinuationRequired: true as const,
+      };
+    }
+
+    if (
+      !continuationPredecessorToken &&
+      !hasNativeBrowserAuthority &&
+      getExistingBrowserManager()?.hasPendingAssistantContinuationForConversation(conversationId)
+    ) {
+      return {
+        conversationId,
+        busy: true as const,
+        delivered: false,
+        nativeBrowserContinuationRequired: true as const,
+      };
+    }
+
     // Cancel any existing stream for this conversation
     const existing = activeStreams.get(conversationId);
     const supersededPredecessorToken = existing?.token;
-    if (existing) existing.abort();
     // Did this turn SUPERSEDE a live predecessor? If so, that predecessor may still
     // be awaiting a slow PreToolUse hook on an ask_user call and will register its
     // raced-answer handoff (bound to THIS successor) only AFTER we pass the claimant
     // registration below. We must register an (empty) claimant now so that late
     // handoff has something to merge into — see the claim site + finding note there.
     const supersededLivePredecessor = Boolean(existing);
+    if (existing) {
+      // A Browser-authorized turn carries access to the primary window's
+      // authenticated Chromium profile. Passive/web/secondary clients may view
+      // it, but must not abort and replace it with their own prompt. The only
+      // sender-less exception is the generation-bound continuation minted by
+      // this process for the exact predecessor token.
+      const trustedInternalContinuation =
+        event == null && hasNativeBrowserAuthority && continuationPredecessorToken === existing.token;
+      if (!trustedInternalContinuation && !mayMutateBrowserAuthorizedStream(event, existing, getPrimaryWindow)) {
+        return {
+          conversationId,
+          busy: true as const,
+          delivered: false,
+          nativeBrowserAuthorityRequired: true as const,
+        };
+      }
+      existing.abort();
+      if (continuationPredecessorToken === existing.token) {
+        // A renderer can launch the successor while the predecessor is still
+        // unwinding its finally block. Freeze that browser capability now, but
+        // retain its temporary tabs for the logical-turn handoff below.
+        getExistingBrowserManager()?.prepareAssistantContinuation(conversationId, existing.token);
+      } else {
+        // The old token still owns the map at this point and the replacement has
+        // not created tabs yet, so its temporary tabs can be reclaimed safely.
+        cleanupAssistantTabsIfOwned(conversationId, existing.token);
+      }
+    }
     // A live GUI persistence FALLBACK for the PRIOR turn is about to be discarded by this new turn.
     // If main still holds the authoritative full copy and it hasn't been superseded on disk, FLUSH
     // it first — else the prior turn's complete reply is lost (e.g. a sole renderer reloaded after
@@ -3259,7 +3900,40 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
 
     const controller = new AbortController();
     const streamToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    activeStreams.set(conversationId, { abort: () => controller.abort(), token: streamToken });
+    activeStreams.set(conversationId, {
+      abort: () => controller.abort(),
+      token: streamToken,
+      // Reserve Browser authority immediately for a primary-renderer request.
+      // Runtime/plugin filtering below may downgrade it, but while asynchronous
+      // admission drains are pending a remote renderer must not steal the run.
+      nativeBrowserInitiator: hasNativeBrowserAuthority,
+      nativeBrowserTools: hasNativeBrowserAuthority,
+    });
+    const rejectRevokedBrowserLaunch = () => {
+      releaseContinuationAuth(conversationId);
+      resetBrowserAuthorityRevokedRunStatus(appHome, conversationId);
+      let delivered = false;
+      const sender = event?.sender;
+      if (sender && typeof sender.send === 'function') {
+        try {
+          sender.send('agent:stream-event', {
+            conversationId,
+            type: 'error',
+            error: 'The Browser sidebar reloaded before the request could start. Please retry.',
+            ...(responseMessageId ? { responseMessageId } : {}),
+          });
+          delivered = true;
+        } catch {
+          delivered = false;
+        }
+      }
+      return {
+        conversationId,
+        busy: true as const,
+        delivered,
+        browserAuthorityRevoked: true as const,
+      };
+    };
     // Record the latest issued turn token so a delayed continuation request for an OLDER turn is
     // rejected even after a newer turn has already finished (see authorizeContinuation). Bounded.
     // Also assign a monotonic ordinal so turn recency comparisons are immune to system-clock jumps.
@@ -3422,6 +4096,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       if (serverPersistedRun) emit({ conversationId, type: 'done' });
       // Clean up the activeStreams entry set above — otherwise this conversation
       // stays "busy" forever and later agent:submit calls return conversation-busy.
+      cleanupAssistantTabsIfOwned(conversationId, streamToken);
       cleanupStreamIfOwned(conversationId, streamToken);
       pendingServerPersist.delete(conversationId);
       pendingServerPersistParent.delete(conversationId);
@@ -3482,6 +4157,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
         }
         cleanupStreamIfOwned(conversationId, streamToken);
         return { conversationId };
@@ -3534,6 +4210,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           if (serverPersistedRun) emit({ conversationId, type: 'done' });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
         }
         cleanupStreamIfOwned(conversationId, streamToken);
         return { conversationId };
@@ -3627,6 +4304,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         ...(warningMeta ? { messageMeta: warningMeta } : {}),
       });
       void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+      cleanupAssistantTabsIfOwned(conversationId, streamToken);
       cleanupStreamIfOwned(conversationId, streamToken);
       return { conversationId };
     }
@@ -3637,18 +4315,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       emit({ conversationId, type: 'text-delta', text: `> ⚠️ ${resolution.fallbackNotice}\n\n` });
     }
 
-    // Lifecycle tool hooks are only enforced by the Mastra runtime. If the
-    // user has block/modify PreToolUse/PostToolUse hooks configured but is
-    // running under an SDK runtime that executes tools directly, warn that
-    // those hooks will NOT be applied — a silently-bypassed DLP/deny policy
-    // is worse than none.
-    if (runtime.id !== 'mastra' && hookDispatcher.hasEnforcingToolHooks()) {
+    const enforcingToolHooksActive = hookDispatcher.hasEnforcingToolHooks();
+
+    // SDK/CLI runtimes can execute provider-owned shell, file, and web tools
+    // without crossing Kai's bridged-tool boundary. Keep this warning even
+    // though their Kai MCP tools now receive lifecycle hooks: otherwise a
+    // block/modify policy would look complete while silently covering only a
+    // subset of the runtime's tool surface.
+    if (shouldWarnAboutUnwrappedRuntimeTools(runtime.capabilities, enforcingToolHooksActive)) {
       emit({
         conversationId,
         type: 'text-delta',
         text:
-          `> ⚠️ Block/modify tool hooks are configured but the **${runtime.name}** runtime does not enforce them; ` +
-          `tool calls in this chat will run without PreToolUse/PostToolUse hooks. Switch to the Mastra runtime to enforce them.\n\n`,
+          `> ⚠️ The **${runtime.name}** runtime has built-in tools that run outside Kai's tool wrappers. ` +
+          `Those built-in shell, file, and web actions are NOT covered by your block/modify ` +
+          `PreToolUse/PostToolUse hooks; Kai MCP and Browser tools remain covered. ` +
+          `Use the Mastra runtime if complete hook enforcement is required.\n\n`,
       });
     }
 
@@ -3660,7 +4342,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // to a provider-tool model mid-stream where the hooks would be bypassed.
     const chainForProviderTools = [modelEntry, ...(fallbackEnabled ? (streamConfig?.fallbackModels ?? []) : [])];
     const hasProviderTools = chainForProviderTools.some((m) => (m?.modelConfig.providerTools?.length ?? 0) > 0);
-    if (runtime.id === 'mastra' && hasProviderTools && hookDispatcher.hasEnforcingToolHooks()) {
+    if (hasProviderTools && enforcingToolHooksActive) {
       emit({
         conversationId,
         type: 'text-delta',
@@ -3715,6 +4397,146 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         if (streamConfig) {
           streamConfig = { ...streamConfig, primaryModel: modelEntry };
         }
+      }
+    }
+
+    // Resolve the exact host-tool surface before registering Browser ownership.
+    // A primary renderer may have native Browser authority while this particular
+    // run still has no Browser tools (feature disabled, plan mode, or a plugin
+    // inference provider without authenticated-session permission). Registering
+    // those runs would needlessly conflict with Realtime and apply privileged
+    // cancellation/input rules to an ordinary stream.
+    const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
+    const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
+    const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
+    const isBuiltInRuntime = (id: string): boolean =>
+      id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
+    const pluginRuntimeId =
+      resolution.inferenceProviderRuntimeId ??
+      (!isBuiltInRuntime(resolution.runtimeId) ? resolution.runtimeId : undefined);
+    const inferenceProvider =
+      pluginManager?.getInferenceProvider({
+        runtimeId: pluginRuntimeId ?? resolution.runtimeId,
+        modelProviderKey,
+      }) ?? null;
+    const effectiveRunTools =
+      pluginRuntimeId && !inferenceProvider
+        ? toolsForRun(registeredTools, effectiveExecutionMode, false)
+        : inferenceProvider
+          ? toolsForPluginInferenceProvider(
+              registeredTools,
+              effectiveExecutionMode,
+              hasNativeBrowserAuthority,
+              pluginManager,
+              inferenceProvider,
+            )
+          : toolsForRun(registeredTools, effectiveExecutionMode, hasNativeBrowserAuthority);
+    const allowNativeBrowserTools = effectiveRunTools.some((tool) => tool.source === 'browser');
+    const admittedStream = activeStreams.get(conversationId);
+    if (admittedStream?.token === streamToken) {
+      // Renderer authority reserves the stream during async setup; once the
+      // effective tool set is known, retain that protection only for a run that
+      // can actually receive native Browser tools.
+      admittedStream.nativeBrowserInitiator = allowNativeBrowserTools;
+      admittedStream.nativeBrowserTools = allowNativeBrowserTools;
+    }
+
+    const rollbackBrowserAdmissionIfOwned = (): boolean => {
+      if (activeStreams.get(conversationId)?.token !== streamToken) return false;
+      releaseContinuationAuth(conversationId);
+      resetBrowserAuthorityRevokedRunStatus(appHome, conversationId);
+      if (serverPersistTokens.get(conversationId) === streamToken) {
+        serverPersistTokens.delete(conversationId);
+        serverPersistParents.delete(conversationId);
+        discardPersistenceAccumulator(conversationId);
+      }
+      cleanupStreamIfOwned(conversationId, streamToken);
+      void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+      return true;
+    };
+
+    // Browser continuation cleanup applies to every replacement turn, but only
+    // a run whose final tool array contains a Browser tool receives a Browser
+    // capability. Publish activeStreams.nativeBrowserTools only after admission
+    // succeeds, so a rejection cannot leave a phantom privileged/busy stream.
+    const browserManager = getExistingBrowserManager();
+    const browserAuthorityRevoked = () =>
+      isNativeBrowserAuthorityRevoked(
+        allowNativeBrowserTools,
+        browserManagerAtAuthorization,
+        getExistingBrowserManager(),
+        nativeBrowserAuthorityGeneration,
+      );
+    if (allowNativeBrowserTools && (!browserManager || browserAuthorityRevoked())) {
+      const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+      rollbackBrowserAdmissionIfOwned();
+      if (stillOwned) return rejectRevokedBrowserLaunch();
+      return { conversationId };
+    }
+    if (browserManager) {
+      try {
+        // Realtime terminal cleanup revokes its Browser owner synchronously but
+        // may still be draining an in-flight action. Do not race a replacement
+        // text turn into beginAssistantRun while that owner is still registered.
+        await browserManager.waitForAssistantTabCleanup(conversationId);
+        if (allowNativeBrowserTools && continuationPredecessorToken) {
+          await browserManager.beginAssistantContinuation(conversationId, streamToken, continuationPredecessorToken);
+        } else {
+          // A non-Browser run must reclaim a retained predecessor instead of
+          // adopting its authenticated temporary tabs.
+          await browserManager.cancelAssistantContinuations(conversationId);
+        }
+
+        // Browser drains can wait behind an in-flight action. A replacement
+        // turn may take ownership while this handler is suspended; do not let
+        // the old handler resume into shared bookkeeping or stream setup.
+        const drainSuperseded = isBrowserDrainSuperseded(
+          controller.signal.aborted,
+          activeStreams.get(conversationId)?.token,
+          streamToken,
+        );
+        const authorityRevoked = browserAuthorityRevoked();
+        if (drainSuperseded || authorityRevoked) {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+          const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+          rollbackBrowserAdmissionIfOwned();
+          if (authorityRevoked && stillOwned) return rejectRevokedBrowserLaunch();
+          return { conversationId };
+        }
+
+        if (allowNativeBrowserTools && !continuationPredecessorToken) {
+          browserManager.beginAssistantRun(conversationId, streamToken);
+        }
+
+        const postAdmissionSuperseded = isBrowserDrainSuperseded(
+          controller.signal.aborted,
+          activeStreams.get(conversationId)?.token,
+          streamToken,
+        );
+        const postAdmissionAuthorityRevoked = browserAuthorityRevoked();
+        if (postAdmissionSuperseded || postAdmissionAuthorityRevoked) {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+          const stillOwned = activeStreams.get(conversationId)?.token === streamToken;
+          rollbackBrowserAdmissionIfOwned();
+          if (postAdmissionAuthorityRevoked && stillOwned) return rejectRevokedBrowserLaunch();
+          return { conversationId };
+        }
+
+        if (allowNativeBrowserTools) {
+          const ownedStream = activeStreams.get(conversationId);
+          if (ownedStream?.token === streamToken) ownedStream.nativeBrowserTools = true;
+        }
+      } catch (error) {
+        // beginAssistantRun can reject when Realtime owns this conversation.
+        // Roll back every state item published before admission so the failed
+        // request does not remain phantom-busy and the conversation can retry.
+        try {
+          await browserManager.cleanupAssistantTabs(conversationId, streamToken);
+        } catch {
+          // The rejected run may never have reached the Browser registry.
+        }
+        rollbackBrowserAdmissionIfOwned();
+        throw error;
       }
     }
 
@@ -3918,36 +4740,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       }
     }
     for (const [index, message] of messageList.entries()) {
+      const serializedContent = jsonStableString(message.content ?? '');
       const contentPreview =
-        typeof message.content === 'string'
-          ? message.content.slice(0, 200)
-          : Array.isArray(message.content)
-            ? JSON.stringify(message.content).slice(0, 200)
-            : String(message.content ?? '').slice(0, 200);
+        typeof message.content === 'string' ? message.content.slice(0, 200) : serializedContent.slice(0, 200);
       console.info(
-        `[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${JSON.stringify(message.content ?? '').length} preview=${contentPreview}`,
+        `[Agent:stream]   msg[${index}] role=${message.role ?? '?'} contentLen=${serializedContent.length} preview=${contentPreview}`,
       );
     }
 
+    const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
+
     // Run streaming in background
     (async () => {
-      // Check for plugin inference provider — only use it when the resolved
-      // runtime or model belongs to the plugin that registered the provider.
-      // This prevents a plugin provider from hijacking requests meant for
-      // other configured providers (e.g. llm-gateway, OpenAI direct).
-      const effectiveModelKey = modelEntry?.key ?? modelKey ?? config.models.defaultModelKey;
-      const rawCatalogEntry = config.models.catalog.find((m) => m.key === effectiveModelKey);
-      const modelProviderKey = rawCatalogEntry?.provider ?? undefined;
-      const isBuiltInRuntime = (id: string): boolean =>
-        id === 'mastra' || id === 'claude-agent-sdk' || id === 'codex-sdk' || id === 'auto';
-      const pluginRuntimeId =
-        resolution.inferenceProviderRuntimeId ??
-        (!isBuiltInRuntime(resolution.runtimeId) ? resolution.runtimeId : undefined);
-      const inferenceProvider =
-        pluginManager?.getInferenceProvider({
-          runtimeId: pluginRuntimeId ?? resolution.runtimeId,
-          modelProviderKey,
-        }) ?? null;
       if (!inferenceProvider && pluginRuntimeId) {
         const meta = { runtimeId: pluginRuntimeId };
         emit({
@@ -3958,6 +4762,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         });
         emit({ conversationId, type: 'done', messageMeta: meta });
         void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: false });
+        cleanupAssistantTabsIfOwned(conversationId, streamToken);
         cleanupStreamIfOwned(conversationId, streamToken);
         return;
       }
@@ -3970,79 +4775,111 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         console.info(
           `[Agent:stream] Using plugin inference provider: ${inferenceProvider.name} for conv=${conversationId}`,
         );
-        // A plugin inference provider executes host tools inside the plugin,
-        // outside our onToolExecutionStart/augmentToolResult wrappers, so
-        // block/modify hooks can't be enforced there. Warn (same posture as
-        // non-Mastra runtimes) since the runtime.id check below won't fire.
-        if (hookDispatcher.hasEnforcingToolHooks()) {
-          emit({
-            conversationId,
-            type: 'text-delta',
-            text:
-              `> ⚠️ Block/modify tool hooks are configured but the **${inferenceProvider.name}** inference provider ` +
-              `executes tools outside hook enforcement; tool calls in this chat will not run PreToolUse/PostToolUse hooks.\n\n`,
-          });
-        }
         let emittedTextDelta = false;
         try {
           const providerModelKey =
             rawCatalogEntry?.provider === rawCatalogEntry?.key
               ? undefined
               : (modelEntry?.key ?? modelKey ?? config.models.defaultModelKey);
-          const providerStream = inferenceProvider.stream({
-            conversationId,
-            messages: messages as Array<{ role: string; content: unknown }>,
-            ...(providerModelKey ? { modelKey: providerModelKey } : {}),
-            systemPrompt: effectiveSystemPrompt,
-            reasoningEffort,
-            abortSignal: controller.signal,
-            // Forward host-registered tools, filtered by execution mode (plan-first
-            // strips mutating tools). Mirrors the standard runtime path at the
-            // `runtime.stream(...)` call below. Without this, the LLM behind a
-            // plugin inference provider has no awareness of any tools.
-            tools: toolsForExecutionMode(registeredTools, effectiveExecutionMode),
-          });
-
           let providerResponseText = '';
-          for await (const event of providerStream) {
-            if (controller.signal.aborted && event.type !== 'done') continue;
-            if (event.type === 'text-delta') {
-              emittedTextDelta = true;
-              providerResponseText += event.text ?? '';
-            }
-            // A plugin provider may YIELD an error event (not just throw). If it's a
-            // context overflow, classify it + append provider-appropriate guidance
-            // (parity with the throw path below) so the renderer surfaces recovery
-            // steps — the plugin runs outside Kai's compact-and-retry loop.
-            if (event.type === 'error' && !(event as { errorCategory?: unknown }).errorCategory) {
-              const evErr = (event as { error?: unknown }).error;
-              if (isContextOverflowError(evErr)) {
-                (event as Record<string, unknown>).errorCategory = 'context-overflow';
-                (event as Record<string, unknown>).error =
-                  `${evErr instanceof Error ? evErr.message : String(evErr ?? 'Context window exceeded.')}` +
-                  `\n\n> ℹ️ The request exceeded the context window. This model runs through a plugin provider that manages its own context — start a new chat or remove older messages/attachments, then resend.`;
-              }
-            }
-
-            // Stamp runtimeId on every event so the UI popover shows the
-            // inference provider name regardless of whether the stream ends
-            // with a normal done, an error, or an early abort.
-            const eventWithMeta = (() => {
-              const ev = event as Record<string, unknown>;
-              const existingMeta = (ev.messageMeta as Record<string, unknown> | undefined) ?? {};
-              return {
-                ...event,
+          const pluginToolCapability = new AbortController();
+          const pluginToolSignal = mergeAbortSignals(controller.signal, pluginToolCapability.signal)!;
+          try {
+            const providerStream = inferenceProvider.stream({
+              conversationId,
+              messages: messages as Array<{ role: string; content: unknown }>,
+              ...(providerModelKey ? { modelKey: providerModelKey } : {}),
+              systemPrompt: effectiveSystemPrompt,
+              reasoningEffort,
+              abortSignal: controller.signal,
+              // Forward host-registered tools, filtered by execution mode (plan-first
+              // strips mutating tools). Mirrors the standard runtime path at the
+              // `runtime.stream(...)` call below. Without this, the LLM behind a
+              // plugin inference provider has no awareness of any tools.
+              tools: bindBrowserToolsToRun(
+                effectiveRunTools,
                 conversationId,
-                messageMeta: { ...existingMeta, runtimeId: inferenceProvider.name },
-              };
-            })();
+                streamToken,
+                pluginToolSignal,
+                {
+                  cwd: effectiveCwd,
+                  isHeadless: false,
+                  parentProfileKey:
+                    profileKey ?? (config as { defaultProfileKey?: string | null }).defaultProfileKey ?? null,
+                  parentModelKey: modelEntry?.key ?? modelKey ?? null,
+                },
+                (tool) =>
+                  !controller.signal.aborted &&
+                  activeStreams.get(conversationId)?.token === streamToken &&
+                  pluginManager?.inferenceProviderHasPermission(inferenceProvider, 'agent:inference-provider') ===
+                    true &&
+                  (tool.source !== 'browser' ||
+                    pluginManager?.inferenceProviderHasPermission(
+                      inferenceProvider,
+                      'browser:authenticated-session',
+                    ) === true),
+              ),
+            });
 
-            if (event.type === 'done') {
+            for await (const event of providerStream) {
+              if (controller.signal.aborted && event.type !== 'done') continue;
+              if (event.type === 'text-delta') {
+                emittedTextDelta = true;
+                providerResponseText += event.text ?? '';
+              }
+              // A plugin provider may YIELD an error event (not just throw). If it's a
+              // context overflow, classify it + append provider-appropriate guidance
+              // (parity with the throw path below) so the renderer surfaces recovery
+              // steps — the plugin runs outside Kai's compact-and-retry loop.
+              if (event.type === 'error' && !(event as { errorCategory?: unknown }).errorCategory) {
+                const evErr = (event as { error?: unknown }).error;
+                if (isContextOverflowError(evErr)) {
+                  (event as Record<string, unknown>).errorCategory = 'context-overflow';
+                  (event as Record<string, unknown>).error =
+                    `${evErr instanceof Error ? evErr.message : String(evErr ?? 'Context window exceeded.')}` +
+                    `\n\n> ℹ️ The request exceeded the context window. This model runs through a plugin provider that manages its own context — start a new chat or remove older messages/attachments, then resend.`;
+                }
+              }
+              if (event.type === 'error' && (event as { error?: unknown }).error !== undefined) {
+                (event as Record<string, unknown>).error = pluginProviderErrorForExposure(
+                  (event as { error?: unknown }).error,
+                  allowNativeBrowserTools,
+                );
+              }
+              protectUnresolvedToolCallArgs(
+                event,
+                enforcingHooksActive,
+                event.type === 'tool-call' &&
+                  !!event.toolName &&
+                  findToolByName(effectiveRunTools, event.toolName) !== undefined,
+                false,
+              );
+
+              // Stamp runtimeId on every event so the UI popover shows the
+              // inference provider name regardless of whether the stream ends
+              // with a normal done, an error, or an early abort.
+              const eventWithMeta = (() => {
+                const ev = event as Record<string, unknown>;
+                const existingMeta = (ev.messageMeta as Record<string, unknown> | undefined) ?? {};
+                return {
+                  ...event,
+                  conversationId,
+                  messageMeta: { ...existingMeta, runtimeId: inferenceProvider.name },
+                };
+              })();
+
+              if (event.type === 'done') {
+                emit(eventWithMeta as typeof event);
+                break;
+              }
+
               emit(eventWithMeta as typeof event);
-              break;
             }
-
-            emit(eventWithMeta as typeof event);
+          } finally {
+            // A provider can retain executable tool closures after its iterator
+            // settles. Revoke them at that exact boundary, before post-receive
+            // hooks or later turns can run, even when the provider throws.
+            pluginToolCapability.abort();
           }
 
           // Run post-receive hooks for plugin inference provider path.
@@ -4073,6 +4910,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             conversationId,
             aborted: controller.signal.aborted,
           });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
 
           // Provider handled the request — clean up and exit. cleanupStreamIfOwned runs the
           // GUI-turn persistence fallback (finalize main's accumulated reply if the renderer never
@@ -4082,26 +4920,24 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         } catch (providerError) {
           if (emittedTextDelta) {
             // Already started streaming text — can't fall back mid-response
+            const exposedProviderError = pluginProviderErrorForExposure(providerError, allowNativeBrowserTools);
             console.error(
               `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed after emitting text:`,
-              providerError,
+              exposedProviderError,
             );
             const meta = { runtimeId: inferenceProvider.name };
             emit({
               conversationId,
               type: 'error',
-              error: `Inference provider error: ${providerError instanceof Error ? providerError.message : String(providerError)}`,
+              error: `Inference provider error: ${exposedProviderError}`,
               messageMeta: meta,
             });
             emit({ conversationId, type: 'done', messageMeta: meta });
             void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
+            cleanupAssistantTabsIfOwned(conversationId, streamToken);
             cleanupStreamIfOwned(conversationId, streamToken);
             return;
           }
-          console.error(
-            `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text:`,
-            providerError,
-          );
           const meta = { runtimeId: inferenceProvider.name };
           // A plugin inference provider runs OUTSIDE the Mastra do/while retry loop
           // AND doesn't consume Kai's persisted compaction record, so neither
@@ -4109,7 +4945,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           // and give actionable (provider-appropriate) guidance + the structured
           // category so the renderer surfaces a recovery hint.
           const pluginOverflow = isContextOverflowError(providerError);
-          const pluginBaseMsg = providerError instanceof Error ? providerError.message : String(providerError);
+          const pluginBaseMsg = pluginProviderErrorForExposure(providerError, allowNativeBrowserTools);
+          console.error(
+            `[Agent:stream] Plugin inference provider "${inferenceProvider.name}" failed before emitting text:`,
+            pluginBaseMsg,
+          );
           emit({
             conversationId,
             type: 'error',
@@ -4121,6 +4961,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           });
           emit({ conversationId, type: 'done', messageMeta: meta });
           void hookDispatcher.dispatch('AgentStop', { conversationId, aborted: controller.signal.aborted });
+          cleanupAssistantTabsIfOwned(conversationId, streamToken);
           cleanupStreamIfOwned(conversationId, streamToken);
           return;
         }
@@ -4142,28 +4983,31 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         const existing = preToolResults.get(toolCallId);
         if (existing) return existing;
         const p = (async (): Promise<PreToolResult> => {
+          // Browser typing can contain passwords, OTPs, recovery codes, and
+          // tokens. Hooks and their automation fan-out receive only the safe
+          // display form; the original remains private to the executor unless
+          // an enforcing modify hook explicitly supplies replacement args.
+          const exposedArgs = redactBrowserToolArgsForExposure(toolName, args);
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
             conversationId,
             toolCallId,
             toolName,
-            args,
+            args: exposedArgs,
           });
           if (preTool.denied) {
             const reason = preTool.reason ?? 'Blocked by PreToolUse hook.';
             return { denied: true, reason, args: { redacted: true, reason } };
           }
-          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+          const nextArgs = preTool.modified ? (preTool.payload as { args?: unknown } | undefined)?.args : undefined;
           return { denied: false, args: nextArgs !== undefined ? nextArgs : args };
         })();
         preToolResults.set(toolCallId, p);
         return p;
       };
       // When block/modify hooks are active, the UI-facing `tool-call` stream
-      // event can arrive before PreToolUse resolves. To guarantee raw args
-      // never reach the renderer/persistence, we SUPPRESS args on the initial
-      // broadcast (showing a pending placeholder) and fill them in via the
-      // corrective re-broadcast once the hook has run.
-      const enforcingHooksActive = hookDispatcher.hasEnforcingToolHooks();
+      // event can arrive before PreToolUse resolves. Mastra calls back with a
+      // matching id, so its initial pending placeholder is corrected below.
+      // Runtimes without correlatable ids remain permanently redacted.
       // Provider-native tool names for the CURRENTLY ACTIVE model. Provider-
       // native tools execute in-provider and never hit onToolExecutionStart,
       // so their args must not be suppressed (nothing would un-suppress them →
@@ -4178,6 +5022,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       const pendingObserverToolExecutions = new Set<Promise<void>>();
       let observerLaunchesEnabled = true;
       let observer: ToolObserverManager | null = null;
+      let browserContinuationPrepared = false;
       // Accumulate assistant response text for post-receive hooks
       let accumulatedResponseText = '';
       // Track the provider:modelName that is producing the current response.
@@ -5110,7 +5955,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         }
       };
 
-      const activeCustomTools = toolsForExecutionMode(registeredTools, effectiveExecutionMode);
+      const activeCustomTools = effectiveRunTools;
       let observerWorkspaceToolsPromise: Promise<ToolDefinition[]> | undefined;
       const getObserverWorkspaceTools = (): Promise<ToolDefinition[]> => {
         observerWorkspaceToolsPromise ??= createWorkspaceToolDefinitions(effectiveCwd, () => config, {
@@ -5202,13 +6047,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           toolCancels.delete(toolCallId);
           return { ok: false, details: reason };
         }
-        // Use the (possibly sanitized) args for observer, UI, and execution.
-        const effectiveArgs = preTool.args;
+        // Validate AFTER PreToolUse because a hook may replace the payload. Use
+        // the parsed (possibly transformed/defaulted) value for observer state,
+        // UI events, PostToolUse, compaction accounting, and execution.
+        let effectiveArgs: unknown;
+        try {
+          effectiveArgs = validateToolInput(tool, preTool.args);
+        } catch (error) {
+          toolCancels.delete(toolCallId);
+          return { ok: false, details: error instanceof Error ? error.message : String(error) };
+        }
+        const exposedEffectiveArgs = redactBrowserToolArgsForExposure(toolName, effectiveArgs);
 
         observer.onToolExecutionStart({
           toolCallId,
           toolName,
-          args: effectiveArgs,
+          args: exposedEffectiveArgs,
           observerInitiated: true,
         });
 
@@ -5217,7 +6071,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
           type: 'tool-call',
           toolCallId,
           toolName,
-          args: effectiveArgs,
+          args: exposedEffectiveArgs,
           startedAt,
           observerInitiated: true,
         });
@@ -5227,6 +6081,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             const context: ToolExecutionContext = {
               toolCallId,
               conversationId,
+              browserOwnerId: streamToken,
               cwd: effectiveCwd,
               abortSignal: mergedAbortSignal,
               onProgress: (progress) => {
@@ -5257,7 +6112,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               conversationId,
               toolCallId,
               toolName,
-              args: effectiveArgs,
+              args: exposedEffectiveArgs,
               result: rawResult,
             });
             if (postTool.denied) {
@@ -5273,7 +6128,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               toolName,
               observerAugmented,
               'direct',
-              effectiveArgs,
+              exposedEffectiveArgs,
             );
             const finishedAt = new Date().toISOString();
 
@@ -5291,17 +6146,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               });
             }
           } catch (error) {
-            let errorResult: unknown = {
-              isError: true,
-              error: error instanceof Error ? error.message : String(error),
-            };
+            let errorResult: unknown = observerToolErrorForExposure(toolName, error);
             // PostToolUse on the error path too, so a DLP hook can sanitize
             // error payloads from observer-launched tools.
             const postTool = await hookDispatcher.dispatch('PostToolUse', {
               conversationId,
               toolCallId,
               toolName,
-              args: effectiveArgs,
+              args: exposedEffectiveArgs,
               result: errorResult,
             });
             if (postTool.denied) {
@@ -5317,7 +6169,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               toolName,
               observerAugmented,
               'direct',
-              effectiveArgs,
+              exposedEffectiveArgs,
             );
             const finishedAt = new Date().toISOString();
 
@@ -6347,9 +7199,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // the paired stream id if available. The stream `tool-call`
               // handler resolves either — so a rebroadcast reaches the correct
               // rendered card regardless of which side fired first.
-              hookRewrittenArgs.set(state.toolCallId, preTool.args);
+              hookRewrittenArgs.set(state.toolCallId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
               const denyStreamId = streamToolCallIdByExecId.get(state.toolCallId);
-              if (denyStreamId) hookRewrittenArgs.set(denyStreamId, preTool.args);
+              if (denyStreamId) {
+                hookRewrittenArgs.set(denyStreamId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
+              }
               // Only rebroadcast when the stream id is known; otherwise the
               // stream `tool-call` handler will apply the stored args when it
               // fires (avoids emitting a duplicate card under the exec id).
@@ -6359,13 +7213,46 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   type: 'tool-call',
                   toolCallId: denyStreamId,
                   toolName: state.toolName,
-                  args: preTool.args,
+                  args: redactBrowserToolArgsForExposure(state.toolName, preTool.args),
                 });
               }
               return { skip: true as const, result: { isError: true, error: reason } };
             }
             const modStreamId = streamToolCallIdByExecId.get(state.toolCallId);
             if (preTool.args !== state.args) {
+              // A modify hook crosses a second trust boundary: parse it through
+              // the target tool's schema before touching the by-reference args.
+              // This also applies schema defaults/transforms consistently with
+              // observer-launched tools.
+              let parsedReplacement: unknown;
+              try {
+                let tool = findToolByName(activeCustomTools, state.toolName);
+                if (!tool && runtime.id === 'mastra') {
+                  const workspaceTools = await getObserverWorkspaceTools();
+                  tool = findToolByName(
+                    observerToolsForExecutionMode([], workspaceTools, effectiveExecutionMode),
+                    state.toolName,
+                  );
+                }
+                if (!tool) throw new Error(`Tool "${state.toolName}" is not registered.`);
+                parsedReplacement = validateToolInput(tool, preTool.args);
+              } catch (error) {
+                const reason =
+                  error instanceof Error ? error.message : `Invalid arguments for tool "${state.toolName}".`;
+                hookDeniedToolCalls.set(state.toolCallId, reason);
+                hookRewrittenArgs.set(state.toolCallId, { redacted: true, reason });
+                if (modStreamId) {
+                  hookRewrittenArgs.set(modStreamId, { redacted: true, reason });
+                  emit({
+                    conversationId,
+                    type: 'tool-call',
+                    toolCallId: modStreamId,
+                    toolName: state.toolName,
+                    args: { redacted: true, reason },
+                  });
+                }
+                return { skip: true as const, result: { isError: true, error: reason } };
+              }
               // The executor passes `state.args` to tool.execute() BY REFERENCE,
               // so the only way to deliver modified args is to mutate that object
               // in place. That works when both sides are plain objects. If a
@@ -6377,13 +7264,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 state.args &&
                 typeof state.args === 'object' &&
                 !Array.isArray(state.args) &&
-                preTool.args &&
-                typeof preTool.args === 'object' &&
-                !Array.isArray(preTool.args);
+                parsedReplacement &&
+                typeof parsedReplacement === 'object' &&
+                !Array.isArray(parsedReplacement);
               if (canMutateInPlace) {
                 const target = state.args as Record<string, unknown>;
                 for (const k of Object.keys(target)) delete target[k];
-                Object.assign(target, preTool.args as Record<string, unknown>);
+                Object.assign(target, parsedReplacement as Record<string, unknown>);
                 // The args were charged (pre-rewrite) at execution start; a hook that
                 // ENLARGED them must re-charge the delta so the media budget accounts
                 // for the bigger tool-call message sent to the next step.
@@ -6392,16 +7279,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                 const reason =
                   'PreToolUse modify hook returned args that cannot be applied to this tool (non-object replacement); failing closed to avoid running with unsanitized input.';
                 hookDeniedToolCalls.set(state.toolCallId, reason);
-                hookRewrittenArgs.set(state.toolCallId, preTool.args);
+                hookRewrittenArgs.set(state.toolCallId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
                 const failStreamId = streamToolCallIdByExecId.get(state.toolCallId);
                 if (failStreamId) {
-                  hookRewrittenArgs.set(failStreamId, preTool.args);
+                  hookRewrittenArgs.set(failStreamId, redactBrowserToolArgsForExposure(state.toolName, preTool.args));
                   emit({
                     conversationId,
                     type: 'tool-call',
                     toolCallId: failStreamId,
                     toolName: state.toolName,
-                    args: preTool.args,
+                    args: redactBrowserToolArgsForExposure(state.toolName, preTool.args),
                   });
                 }
                 return { skip: true as const, result: { isError: true, error: reason } };
@@ -6411,10 +7298,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // broadcast with suppressed ({pending}) args; emit the resolved
             // args now (sanitized or allowed-unchanged). Renderer upserts by id.
             if (enforcingHooksActive) {
+              const exposedResolvedArgs = redactBrowserToolArgsForExposure(state.toolName, state.args);
               // Store under exec id always; also under the stream id if paired.
               // The stream `tool-call` handler resolves either when it fires.
-              hookRewrittenArgs.set(state.toolCallId, preTool.args);
-              if (modStreamId) hookRewrittenArgs.set(modStreamId, preTool.args);
+              hookRewrittenArgs.set(state.toolCallId, exposedResolvedArgs);
+              if (modStreamId) hookRewrittenArgs.set(modStreamId, exposedResolvedArgs);
               // Only rebroadcast when the stream id is known; otherwise the
               // stream handler applies the stored args on arrival (no dup card).
               if (modStreamId) {
@@ -6423,7 +7311,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                   type: 'tool-call',
                   toolCallId: modStreamId,
                   toolName: state.toolName,
-                  args: preTool.args,
+                  args: exposedResolvedArgs,
                 });
               }
             }
@@ -6434,6 +7322,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate exit_plan_mode behind user approval regardless of execution mode
             if (state.toolName === 'exit_plan_mode') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              // Register before broadcasting so even a synchronous renderer
+              // answer resolves this waiter, and so the dedicated pop-out can
+              // receive a one-shot capability for the pending request.
+              const approvalDecision = registerPendingApproval(
+                streamId,
+                controller.signal,
+                'any-renderer',
+                { conversationId, browserOwnerId: streamToken },
+                { conversationId, toolName: state.toolName, execToolCallId: state.toolCallId },
+              );
               emit({
                 conversationId,
                 type: 'tool-approval-required',
@@ -6445,11 +7343,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               // Abort-aware: a cancel-stream aborts controller.signal, which
               // resolves this with 'dismiss' and deletes the pending entry, so a
               // later GUI approval can't resume a cancelled run (and no leak).
-              const approved = await registerPendingApproval(streamId, controller.signal, {
-                conversationId,
-                toolName: state.toolName,
-                execToolCallId: state.toolCallId,
-              });
+              const approved = await approvalDecision;
               if (approved !== true) {
                 state.cancel();
                 if (approved === 'dismiss') {
@@ -6525,6 +7419,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
+              const approvalDecision = registerPendingApproval(
+                streamId,
+                controller.signal,
+                'any-renderer',
+                { conversationId, browserOwnerId: streamToken },
+                { conversationId, toolName: state.toolName, execToolCallId: state.toolCallId },
+              );
               emit({
                 conversationId,
                 type: 'tool-approval-required',
@@ -6535,11 +7436,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               observer?.onToolAwaitingApproval(state.toolCallId);
               // Abort-aware (see exit_plan_mode above): cancel resolves this as
               // 'dismiss' and cleans up, instead of leaking a pending approval.
-              const approved = await registerPendingApproval(streamId, controller.signal, {
-                conversationId,
-                toolName: state.toolName,
-                execToolCallId: state.toolCallId,
-              });
+              const approved = await approvalDecision;
               const raced = pendingQuestionAnswers.get(streamId);
               const outcome = resolveAskUserGateOutcome(approved, controller.signal.aborted);
               // ── Abort path: register the successor handoff IMMEDIATELY ──────
@@ -6668,7 +7565,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // Use the redacted/sanitized args (if a PreToolUse hook rewrote or
             // denied them) so PostToolUse/observers never see the raw args.
             const execIdForArgs = execToolCallIdByStreamId.get(toolCallId) ?? toolCallId;
-            const postArgs = hookRewrittenArgs.get(toolCallId) ?? hookRewrittenArgs.get(execIdForArgs) ?? args;
+            const postArgs = redactBrowserToolArgsForExposure(
+              toolName,
+              hookRewrittenArgs.get(toolCallId) ?? hookRewrittenArgs.get(execIdForArgs) ?? args,
+            );
             const postTool = await hookDispatcher.dispatch('PostToolUse', {
               conversationId,
               toolCallId,
@@ -6830,6 +7730,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             cwd: effectiveCwd,
             reasoningEffort,
             abortSignal: controller.signal,
+            browserOwnerId: streamToken,
             streamConfig: streamConfig ?? undefined,
             primaryModel: modelEntry,
             // Thread this turn's active profile/model so a sub_agent tool can
@@ -6920,17 +7821,13 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
               if (rewritten !== undefined) {
                 // Hook already resolved — publish the sanitized args.
                 (event as Record<string, unknown>).args = rewritten;
-              } else if (
-                enforcingHooksActive &&
-                runtime.id === 'mastra' &&
-                !providerDefinedToolNames.has(event.toolName)
-              ) {
-                // Suppress raw args until the corrective re-broadcast fills them
-                // in — but ONLY under Mastra (which calls onToolExecutionStart)
-                // and NOT for provider-native tools (which execute in-provider
-                // and never un-suppress → would stick at {pending} forever).
-                (event as Record<string, unknown>).args = { pending: true };
-                (event as Record<string, unknown>).argsPending = true;
+              } else {
+                protectUnresolvedToolCallArgs(
+                  event,
+                  enforcingHooksActive,
+                  !providerDefinedToolNames.has(event.toolName),
+                  runtime.id === 'mastra',
+                );
               }
             }
             if (event.type === 'tool-result' && event.toolName === 'enter_plan_mode') {
@@ -7374,6 +8271,17 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
             // supersede the error write (a provider failure would flash then vanish). Track the
             // error and drop the following `done` for GUI turns. serverPersisted keeps its
             // accumulator on error and needs the `done`.
+            if (
+              shouldPrepareBrowserContinuation(
+                event,
+                serverPersistedRun,
+                config.agent?.autoContinueOnMaxTurns === true,
+                allowNativeBrowserTools,
+              ) &&
+              getExistingBrowserManager()?.prepareAssistantContinuation(conversationId, streamToken)
+            ) {
+              browserContinuationPrepared = true;
+            }
             if (event.type === 'error' && !serverPersistedRun) sawTerminalStreamError = true;
             if (event.type === 'done' && sawTerminalStreamError && !serverPersistedRun) continue;
             emit(event);
@@ -7475,6 +8383,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         // below reads the inject maps (their only readers are the tool-fit/recovery
         // paths that already ran during streaming), and the observer is disposed above.
         const stillOwnsRun = activeStreams.get(conversationId)?.token === streamToken;
+        if (!browserContinuationPrepared) cleanupAssistantTabsIfOwned(conversationId, streamToken);
         cleanupStreamIfOwned(conversationId, streamToken);
 
         // Drain-at-end safety net for a cooperative inject that arrived AFTER the
@@ -7575,6 +8484,9 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
                     effectiveCwd ?? undefined,
                     effectiveExecutionMode,
                     threadOverrides,
+                    undefined,
+                    allowNativeBrowserTools,
+                    nativeBrowserAuthorityGeneration,
                   );
                   // streamHandler consumes pendingServerPersist at its top on the NORMAL path.
                   // If it rejected EARLY (compaction lock held → `{busy}`) it did NOT consume,
@@ -7912,7 +8824,48 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { conversationId };
   };
 
-  ipcMain.handle('agent:stream', streamHandler);
+  // Keep the final browser-tools bit internal. Bridge clients can pass surplus
+  // positional arguments to an IPC handler, so registering streamHandler
+  // directly would let an untrusted web/local caller set that bit to true and
+  // obtain the primary window's authenticated browser tools. This explicit
+  // renderer-facing signature intentionally drops every argument after
+  // responseMessageId; only in-process continuation calls reach the override.
+  ipcMain.handle(
+    'agent:stream',
+    (
+      event,
+      conversationId: string,
+      messages: unknown[],
+      modelKey?: string,
+      reasoningEffort?: ReasoningEffort,
+      profileKey?: string,
+      fallbackEnabled?: boolean,
+      cwd?: string,
+      executionMode?: ExecutionMode,
+      threadOverrides?: {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+        continuationPredecessorToken?: string;
+      },
+      responseMessageId?: string,
+    ) =>
+      streamHandler(
+        event,
+        conversationId,
+        messages,
+        modelKey,
+        reasoningEffort,
+        profileKey,
+        fallbackEnabled,
+        cwd,
+        executionMode,
+        threadOverrides,
+        responseMessageId,
+      ),
+  );
 
   // ── Renderer-facing cooperative mid-turn injection ────────────────────────
   // The GUI composer, when a message is sent while a Mastra turn is still
@@ -7924,7 +8877,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   ipcMain.handle(
     'agent:inject-mid-turn',
     async (
-      _event,
+      event,
       conversationId: string,
       userText: string,
       expectedGeneration?: string,
@@ -7938,6 +8891,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // ownership check also revalidates it (a supersession during the async policy gate).
       if (expectedGeneration !== undefined && activeStreams.get(conversationId)?.token !== expectedGeneration) {
         return { ok: false, cooperative: false, error: 'expected-generation-superseded' };
+      }
+      // A Browser-authorized stream must not be mutated by a passive/web/secondary caller.
+      if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
       }
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
@@ -8094,7 +9051,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // the renderer's "edit" affordance can pre-fill the composer with it.
   ipcMain.handle(
     'agent:cancel-inject',
-    (_event, conversationId: string, id: string): { ok: boolean; text?: string } => {
+    (event, conversationId: string, id: string): { ok: boolean; text?: string; error?: string } => {
+      if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
+      }
       const text = removeInject(conversationId, id);
       return { ok: text !== null, text: text ?? undefined };
     },
@@ -8308,6 +9268,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   appHomeForRuntimeResolve = appHome;
 
   injectUserTurnAndRestart = async (conversationId, userText, opts) => {
+    // Automations are background principals, not the native Browser renderer.
+    // Reject synchronously before enqueueing, finalizing a partial reply,
+    // appending history, or arming server persistence. The initiator bit is
+    // sticky after Browser-tool revocation, so a still-private turn cannot be
+    // taken over merely because its tool list was downgraded.
+    if (!mayInjectAutomationIntoActiveStream(activeStreams.get(conversationId))) {
+      return { ok: false, error: 'native-browser-authority-required' };
+    }
     const existingConv = readConversation(appHome, conversationId);
     if (!existingConv) return { ok: false, error: 'conversation-not-found' };
     // Cancel generation at ENTRY. The abort+restart path below awaits a policy gate;
@@ -8853,7 +9821,11 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // could cancel the wrong one and let a detached run proceed. The post-
       // toolsReady busy-check covers the already-streaming case; this covers the
       // pre-toolsReady window.
-      if (currentPendingSubmit.has(conversationId) || activeStreams.has(conversationId)) {
+      if (
+        currentPendingSubmit.has(conversationId) ||
+        activeStreams.has(conversationId) ||
+        isRealtimeConversationTurnActive(conversationId)
+      ) {
         return { ok: false, error: 'conversation-busy' };
       }
 
@@ -8887,6 +9859,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
         busyCheck.runStatus === 'running' ||
         busyCheck.runStatus === 'awaiting-approval' ||
         activeStreams.has(conversationId) ||
+        isRealtimeConversationTurnActive(conversationId) ||
         isCompacting(conversationId)
       ) {
         // Distinguish a COMPACTION lock (drains on the conversations:compacting broadcast)
@@ -8948,6 +9921,14 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // The terminal assistant/error persist (or cancel) resets it to idle.
       // skipIfBusy guards against a run that started between the check above and
       // this write; a null return means we lost the race and must abort.
+      // A retained Browser continuation has no activeStreams entry and its disk
+      // status is idle, but its authenticated temporary tabs still belong to the
+      // desktop renderer. Re-check that authority immediately before the
+      // synchronous append so a web/CLI submit cannot durably move the head and
+      // only then be rejected by streamHandler.
+      if (!mayPersistConversationForBrowserAuthority(event, conversationId, getPrimaryWindow)) {
+        return { ok: false, error: 'native-browser-authority-required' };
+      }
       const promptWrite = appendConversationMessages(
         appHome,
         conversationId,
@@ -9048,7 +10029,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // winner simply isn't the one asking for the NEXT turn's authorization, so continuation resumes.
   ipcMain.handle(
     'agent:authorize-continuation',
-    (_event, conversationId: string, clientId: string, turnToken: string) => {
+    (event, conversationId: string, clientId: string, turnToken: string) => {
+      const browserManager = getExistingBrowserManager();
+      const browserAuthorityGeneration = browserManager?.getHostRendererAuthorityGeneration();
+      const hasNativeBrowserAuthority =
+        isPrimaryBrowserToolCaller(event, getPrimaryWindow) &&
+        isNativeBrowserAuthorityCurrent(browserManager, browserAuthorityGeneration);
+      if (!mayDriveBrowserContinuation(browserManager, conversationId, turnToken, hasNativeBrowserAuthority)) {
+        return { authorized: false };
+      }
       return { authorized: authorizeContinuation(conversationId, clientId, turnToken) };
     },
   );
@@ -9061,8 +10050,15 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   // { confirmed:false } when main has no fallback for this conv (the caller then uses its own
   // accumulator — it IS the originator, or the turn was server-persisted) OR when a REPLACEMENT turn
   // now owns the conversation (never finalize/discard a newer turn's accumulator).
-  ipcMain.handle('agent:finalize-gui-fallback', (_event, conversationId: string, turnToken?: string) => {
+  ipcMain.handle('agent:finalize-gui-fallback', (event, conversationId: string, turnToken?: string) => {
     if (typeof conversationId !== 'string' || !conversationId || !serverPersistAppHome) {
+      return { confirmed: false, headId: null as string | null };
+    }
+    // Finalizing consumes main's crash-recovery accumulator and can persist a
+    // still-partial assistant reply. A passive web/secondary renderer may see
+    // the same runGeneration, but it must not mutate a Browser-authorized turn
+    // owned by the primary desktop renderer.
+    if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
       return { confirmed: false, headId: null as string | null };
     }
     // TURN-TOKEN guard: only finalize the turn the caller was authorized for. If a REPLACEMENT turn
@@ -9107,7 +10103,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     }
   });
 
-  ipcMain.handle('agent:cancel-stream', async (_event, conversationId: string) => {
+  ipcMain.handle('agent:cancel-stream', async (event, conversationId: string) => {
+    if (!mayMutateBrowserAuthorizedStream(event, activeStreams.get(conversationId), getPrimaryWindow)) {
+      return { ok: false, error: 'native-browser-authority-required' };
+    }
     cancelConversationStreamInner(conversationId);
     return { ok: true };
   });
@@ -9148,6 +10147,10 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
       // being stopped.
       dropInFlightAnswersForToken(controller.token);
       controller.abort();
+      // Close this cancelled turn's temporary tabs while its token is still the
+      // active owner. Its finally block cannot do this after the map entry is
+      // removed below, and a future replacement must be left untouched.
+      cleanupAssistantTabsIfOwned(conversationId, controller.token);
       // Delete only the entry we just aborted (guard against a race where a
       // replacement run already took over).
       const stillOwnedAtCancel = activeStreams.get(conversationId)?.token === controller.token;
@@ -9329,8 +10332,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
   }
   cancelConversationStreamImpl = cancelConversationStreamInner;
 
-  ipcMain.handle('agent:approve-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:approve-tool', (event, toolCallId: string) => {
     const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve(true);
       pendingToolApprovals.delete(toolCallId);
@@ -9342,8 +10353,26 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:reject-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:get-tool-approval-private-details', (event, toolCallId: string) => {
+    if (typeof toolCallId !== 'string' || !toolCallId) return null;
     const pending = pendingToolApprovals.get(toolCallId);
+    if (!pending?.privateDetails || !mayResolveToolApproval(event, pending, getPrimaryWindow)) return null;
+    // This is intentionally the only path that returns exact Browser approval
+    // input. It is restricted to the primary renderer or the exact one-shot
+    // approval pop-out, and the pending map drops it on every settle path.
+    return { ...pending.privateDetails };
+  });
+
+  ipcMain.handle('agent:reject-tool', (event, toolCallId: string) => {
+    const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve(false);
       pendingToolApprovals.delete(toolCallId);
@@ -9356,8 +10385,16 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:dismiss-tool', (_event, toolCallId: string) => {
+  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string) => {
     const pending = pendingToolApprovals.get(toolCallId);
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     if (pending) {
       pending.resolve('dismiss');
       pendingToolApprovals.delete(toolCallId);
@@ -9367,7 +10404,7 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     return { ok: true };
   });
 
-  ipcMain.handle('agent:answer-tool-question', (_event, toolCallId: string, answers: Record<string, string>) => {
+  ipcMain.handle('agent:answer-tool-question', (event, toolCallId: string, answers: Record<string, string>) => {
     // Runtime type-guard (R132 finding-2): the web/WebSocket boundary is UNTYPED, so a client
     // can send a non-string toolCallId (e.g. a ~4 MiB object used as the Map key, whose bulk
     // slips past a length-based byte measure) or non-string answer values. Coerce/reject here
@@ -9390,6 +10427,18 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     for (const v of Object.values(answers)) {
       if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
     }
+    const pending = pendingToolApprovals.get(toolCallId);
+    // A Browser-authorized approval may only be answered by the authorized surface (main's authority
+    // routing). A stale-browser-stream answer resolves the approval closed (dismiss) + closes the
+    // pop-out; other authority errors reject the answer without touching the pending entry.
+    const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
+    if (pending && approvalError) {
+      if (approvalError === 'stale-browser-stream') {
+        pending.resolve(false);
+        closeApprovalWindow(toolCallId);
+      }
+      return { ok: false, error: approvalError };
+    }
     // Stash the answers before resolving. A fully-submitted answer can race an
     // abort (turn ended / superseded / plan-restart) that already settled + removed
     // the pending approval a beat earlier — the old `if (pending)` guard dropped the
@@ -9406,7 +10455,6 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, pluginM
     // would deliver the second surface's answer even though the first already
     // succeeded. So stash only when this is the first answer (no existing stash) OR a
     // pending approval is still live (this IS the winning surface resolving it now).
-    const pending = pendingToolApprovals.get(toolCallId);
     const alreadyStashed = pendingQuestionAnswers.has(toolCallId);
     let stashed = true;
     if (pending || !alreadyStashed) {
@@ -9633,4 +10681,27 @@ export const __internal = {
   // for run-starting deferred ops. A Stop flips the token regardless of stop-map eviction.
   registerCancelGenToken,
   releaseCancelGenToken,
+  isPrimaryBrowserToolCaller,
+  mayMutateBrowserAuthorizedStream,
+  mayInjectAutomationIntoActiveStream,
+  isAuthorizedApprovalWindowCaller,
+  isPendingApprovalStreamCurrent,
+  mayResolveToolApproval,
+  toolApprovalResolutionError,
+  shouldPrepareBrowserContinuation,
+  isBrowserDrainSuperseded,
+  isNativeBrowserAuthorityCurrent,
+  isNativeBrowserAuthorityRevoked,
+  mayDriveBrowserContinuation,
+  pluginProviderErrorForExposure,
+  resetBrowserAuthorityRevokedRunStatus,
+  toolsForPluginInferenceProvider,
+  bindBrowserToolsToRun,
+  redactBrowserToolArgsForExposure,
+  observerToolErrorForExposure,
+  validateToolInput,
+  markTextBrowserCapabilitiesRevoked,
+  revokeTextBrowserCapabilities,
+  shouldWarnAboutUnwrappedRuntimeTools,
+  protectUnresolvedToolCallArgs,
 };

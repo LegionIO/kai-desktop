@@ -10,7 +10,7 @@
  * Real temp dirs back the fs layer.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -18,7 +18,13 @@ import {
   hashPluginFile,
   getPluginIntegrity,
   arePermissionSetsEqual,
+  approvalPermissionsMatch,
+  isLegacyInferredBrowserPermissionSnapshot,
+  MAX_PLUGIN_DIRECTORY_DEPTH,
+  MAX_PLUGIN_FILE_BYTES,
+  MAX_PLUGIN_RENDERER_ASSET_BYTES,
   readPluginManifest,
+  snapshotPluginDirectory,
 } from '../plugin-integrity.js';
 
 let dir: string;
@@ -44,6 +50,23 @@ describe('hashPluginFile', () => {
     expect(backendHash).not.toBe(hashPluginDirectory(dir));
     write('plugin.json', '{"name":"p","version":"2"}');
     expect(hashPluginFile(join(dir, 'backend.js'))).toBe(backendHash);
+  });
+
+  it('rejects symbolic links and oversized files at the final file-open boundary', () => {
+    const target = join(dir, 'target.js');
+    writeFileSync(target, 'host data');
+    const linked = join(dir, 'linked.js');
+    try {
+      symlinkSync(target, linked);
+    } catch {
+      return;
+    }
+    expect(() => hashPluginFile(linked)).toThrow(/regular file|symbolic links/i);
+
+    const oversized = join(dir, 'oversized.js');
+    writeFileSync(oversized, '');
+    truncateSync(oversized, MAX_PLUGIN_FILE_BYTES + 1);
+    expect(() => hashPluginFile(oversized)).toThrow(/file exceeds/i);
   });
 });
 
@@ -100,6 +123,62 @@ describe('hashPluginDirectory', () => {
     expect(() => hashPluginDirectory(dir)).toThrow(/Symbolic links are not allowed/);
     rmSync(target, { recursive: true, force: true });
   });
+
+  it('bounds directory depth and rejects oversized files before reading them', () => {
+    let nested = dir;
+    for (let index = 0; index <= MAX_PLUGIN_DIRECTORY_DEPTH; index++) {
+      nested = join(nested, `d${index}`);
+      mkdirSync(nested);
+    }
+    writeFileSync(join(nested, 'too-deep.js'), 'x');
+    expect(() => hashPluginDirectory(dir)).toThrow(/maximum depth/i);
+
+    rmSync(join(dir, 'd0'), { recursive: true, force: true });
+    const oversized = join(dir, 'oversized.bin');
+    writeFileSync(oversized, '');
+    truncateSync(oversized, MAX_PLUGIN_FILE_BYTES + 1);
+    expect(() => hashPluginDirectory(dir)).toThrow(/file exceeds/i);
+  });
+});
+
+describe('snapshotPluginDirectory', () => {
+  it('does not apply renderer capture limits to backend-only plugin assets', () => {
+    write('backend.js', 'export function activate() {}');
+    write('plugin.json', JSON.stringify({ name: 'backend-only-plugin' }));
+    const backendAsset = join(dir, 'backend-model.bin');
+    writeFileSync(backendAsset, '');
+    truncateSync(backendAsset, MAX_PLUGIN_RENDERER_ASSET_BYTES + 1);
+
+    const snapshot = snapshotPluginDirectory(dir);
+
+    expect(snapshot.fileHash).toBe(hashPluginDirectory(dir));
+    expect([...snapshot.files]).toEqual([]);
+  });
+
+  it('hashes the complete plugin and retains renderer-safe plugin-local dependencies', () => {
+    write('frontend.js', "import './render.js';");
+    write('render.js', 'export const render = true;');
+    write('styles/panel.css', '.panel {}');
+    write('assets/report.csv', 'name,value');
+    write('assets/catalog', 'extensionless-data');
+    write('backend.js', 'export const secretBackend = true;');
+    write('plugin.json', JSON.stringify({ name: 'bounded-plugin' }));
+    write('frontend.js.map', '{}');
+    write('node_modules/dependency/index.js', 'export const dependency = true;');
+
+    const snapshot = snapshotPluginDirectory(dir);
+
+    expect(snapshot.fileHash).toBe(hashPluginDirectory(dir));
+    expect([...snapshot.files.keys()]).toEqual([
+      'assets/catalog',
+      'assets/report.csv',
+      'frontend.js',
+      'frontend.js.map',
+      'node_modules/dependency/index.js',
+      'render.js',
+      'styles/panel.css',
+    ]);
+  });
 });
 
 describe('arePermissionSetsEqual', () => {
@@ -127,7 +206,42 @@ describe('arePermissionSetsEqual', () => {
   });
 });
 
+describe('approvalPermissionsMatch', () => {
+  it('requires explicit re-consent when a legacy approval gains authenticated Browser access', () => {
+    expect(approvalPermissionsMatch(undefined, ['browser:authenticated-session'])).toBe(false);
+    expect(approvalPermissionsMatch(undefined, ['config:read'])).toBe(true);
+    expect(
+      approvalPermissionsMatch(
+        ['config:read', 'browser:authenticated-session'],
+        ['browser:authenticated-session', 'config:read'],
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('isLegacyInferredBrowserPermissionSnapshot', () => {
+  it('accepts only the exact host-inferred Browser permission delta', () => {
+    const current = ['ui:panel', 'browser:authenticated-session'];
+    expect(isLegacyInferredBrowserPermissionSnapshot(['ui:panel'], current)).toBe(true);
+    expect(isLegacyInferredBrowserPermissionSnapshot(undefined, current)).toBe(false);
+    expect(isLegacyInferredBrowserPermissionSnapshot(['ui:panel', 'config:read'], current)).toBe(false);
+    expect(isLegacyInferredBrowserPermissionSnapshot(current, current)).toBe(false);
+    expect(isLegacyInferredBrowserPermissionSnapshot(['ui:panel'], ['ui:panel'])).toBe(false);
+  });
+});
+
 describe('readPluginManifest execScope parsing', () => {
+  it('does not follow a symbolic-link manifest', () => {
+    const target = join(dir, 'manifest-target.json');
+    writeFileSync(target, JSON.stringify({ name: 'outside' }));
+    try {
+      symlinkSync(target, join(dir, 'plugin.json'));
+    } catch {
+      return;
+    }
+    expect(() => readPluginManifest(dir)).toThrow(/regular file|symbolic links/i);
+  });
+
   it('keeps only allowlisted binaries and drops unknown ones', () => {
     write('plugin.json', JSON.stringify({ name: 'p', execScope: { binaries: ['node', 'rm', 'git', 'curl'] } }));
     const manifest = readPluginManifest(dir);
@@ -167,5 +281,13 @@ describe('getPluginIntegrity', () => {
     expect(integrity.fileHash).toBe(hashPluginDirectory(dir));
     expect(integrity.permissions).toEqual(['fs', 'net']);
     expect(integrity.version).toBe('1.4.2');
+  });
+
+  it('requires elevated consent for frontend modules that share the privileged renderer', () => {
+    write('plugin.json', JSON.stringify({ name: 'p', version: '1.0.0', permissions: ['ui:panel'] }));
+    write('frontend.js', 'export const panel = true;');
+
+    expect(readPluginManifest(dir).permissions).toEqual(['ui:panel']);
+    expect(getPluginIntegrity(dir).permissions).toEqual(['ui:panel', 'browser:authenticated-session']);
   });
 });

@@ -47,12 +47,17 @@ describe('ipc-bridge invokeHandler', () => {
       return 'ok';
     });
     await invokeHandler('probe:event');
-    expect(sawEvent).toEqual({ sender: null });
+    expect(sawEvent).toEqual({ sender: null, __kaiWebBridge: true });
   });
 
   it('rejects an explicitly unsupported channel', async () => {
     await expect(invokeHandler('dialog:open-file')).rejects.toThrow(/not supported in web mode/);
     await expect(invokeHandler('image:fetch')).rejects.toThrow(/not supported in web mode/);
+  });
+
+  it('never exposes native in-app browser channels to web or local bridges', async () => {
+    ipc.handle('browser:get-state', () => ({ tabs: [] }));
+    await expect(invokeHandler('browser:get-state', 'chat-1')).rejects.toThrow(/not supported in web mode/);
   });
 
   it('rejects an unknown channel with a clear error', async () => {

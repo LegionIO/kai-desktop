@@ -207,6 +207,10 @@ async function ensureApproved(
   if (ruleTriggersOnHookEvents(rule)) {
     reasonParts.push('subscribes to agent lifecycle hook events and can observe raw prompts and tool payloads');
   }
+  const decisionPromise = registerPendingApproval(toolCallId, context.abortSignal, 'any-renderer', {
+    conversationId: context.conversationId,
+    browserOwnerId: context.browserOwnerId,
+  });
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
@@ -221,7 +225,7 @@ async function ensureApproved(
       reason: `This rule ${reasonParts.join('; ') || 'requires approval'}.`,
     },
   });
-  const decision = await registerPendingApproval(toolCallId, context.abortSignal);
+  const decision = await decisionPromise;
   if (decision === true) return { ok: true };
   return {
     ok: false,
@@ -309,7 +313,10 @@ export function createAutomationManageTool(appHome: string): ToolDefinition {
       switch (action) {
         case 'list': {
           const catalog = eventBus.getCatalog();
-          const toolNames = [...getRegisteredTools(), ...getWorkspaceToolDefinitions()].map((t) => ({
+          const toolNames = [
+            ...getRegisteredTools().filter((tool) => tool.source !== 'browser'),
+            ...getWorkspaceToolDefinitions(),
+          ].map((t) => ({
             name: t.name,
             source: t.source,
             aliases: t.aliases,

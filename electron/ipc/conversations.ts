@@ -1,4 +1,4 @@
-import type { IpcMain } from 'electron';
+import type { IpcMain, IpcMainInvokeEvent } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
@@ -45,6 +45,9 @@ import { COMPACTION_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { computeMessageCount } from '../agent/tokenization.js';
 import { resolveConversationTokenization } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
+import { removeBrowserConversationData, removeBrowserConversationsData } from '../browser/service.js';
+import { browserScopeKey } from '../browser/session.js';
+import { stopRealtimeSessionForConversation } from './realtime.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
   readIndex,
@@ -54,6 +57,7 @@ import {
   deleteConversation,
   deleteConversations,
   clearAllConversations,
+  conversationIdsForClear,
   getActiveConversationId,
   setActiveConversationId,
   nextCompactionRevision,
@@ -888,12 +892,16 @@ export function registerConversationHandlers(
   getConfig?: () => AppConfig,
   getPluginManager?: () => PluginManager | null,
   isTurnActive?: (conversationId: string) => boolean,
+  mayPersistForBrowserAuthority?: (event: IpcMainInvokeEvent, conversationId: string) => boolean,
 ): void {
   // In-flight guard for on-demand `/compact`: a summarization is an async PAID
   // model call, and the idle checks (runStatus) don't cover a second concurrent
   // `/compact` for the same conversation. Without this, two commands both pass the
   // checks, each bill a summary, and race to persist — wasting money and clobbering.
   const compactInFlight = new Set<string>();
+  const browserAuthorityRejects = (event: IpcMainInvokeEvent, conversationIds: Iterable<string>): boolean =>
+    !!mayPersistForBrowserAuthority &&
+    [...conversationIds].some((conversationId) => !mayPersistForBrowserAuthority(event, conversationId));
   ipcMain.handle('conversations:list', () => {
     // Reads only the lightweight index — no message bodies loaded.
     const index = readIndex(appHome);
@@ -950,7 +958,14 @@ export function registerConversationHandlers(
     return readConversation(appHome, id) ?? null;
   });
 
-  ipcMain.handle('conversations:put', (_event, conversation: ConversationRecord) => {
+  ipcMain.handle('conversations:put', (event, conversation: ConversationRecord) => {
+    // Renderer-owned turns optimistically persist before invoking agent:stream.
+    // If a Browser-authorized stream already owns this conversation, reject the
+    // non-owner's write before it can move the durable head; RuntimeProvider's
+    // existing rejected-put path rolls back the local optimistic branch/draft.
+    if (mayPersistForBrowserAuthority && !mayPersistForBrowserAuthority(event, conversation.id)) {
+      return { rejected: 'native-browser-authority-required' as const };
+    }
     const tree = Array.isArray(conversation.messageTree) ? conversation.messageTree : [];
     const prev = readConversation(appHome, conversation.id);
     const prevTreeLen = prev && Array.isArray(prev.messageTree) ? prev.messageTree.length : 0;
@@ -1316,7 +1331,10 @@ export function registerConversationHandlers(
     return { ok: true };
   });
 
-  ipcMain.handle('conversations:delete', (_event, id: string) => {
+  ipcMain.handle('conversations:delete', async (event, id: string) => {
+    if (browserAuthorityRejects(event, [id])) {
+      return { ok: false, error: 'native-browser-authority-required' as const };
+    }
     // Delete FIRST (synchronous), then act on the result. deleteConversation now preserves
     // the conversation if its file rm fails — cancelling/broadcasting before confirming
     // would abort a valid run + broadcast a deletion for a conversation still on disk.
@@ -1329,12 +1347,14 @@ export function registerConversationHandlers(
     // conversation" guard skips the cancel-gen bump — purge recovery state directly so a
     // late stale answer can't raise a FYI alert for the deleted chat (R132 finding-3).
     invalidateConversationRecovery(id);
+    stopRealtimeSessionForConversation(id);
     abortAutomationForConversation(id); // standalone automations use a separate abort registry
     abortActiveCompact(id); // stop a running /compact summarizer (not in activeStreams)
     broadcastDelete(appHome, id);
     clearConversationDiffs(id);
 
-    // Clean up associated computer-use sessions
+    // Stop heavyweight autonomous computer-use control before awaiting Browser
+    // profile cleanup, which may need active Browser operations to drain.
     if (getConfig) {
       try {
         const manager = getComputerUseManager(appHome, getConfig);
@@ -1344,12 +1364,39 @@ export function registerConversationHandlers(
       }
     }
 
-    return { ok: true };
+    let browserCleanupFailed = false;
+    try {
+      await removeBrowserConversationData(appHome, id);
+    } catch (error) {
+      browserCleanupFailed = true;
+      console.warn('[Conversations] Browser profile cleanup failed after deleting conversation:', id, error);
+    }
+
+    return {
+      ok: true,
+      ...(browserCleanupFailed
+        ? {
+            warnings: [
+              {
+                code: 'browser-cleanup-failed' as const,
+                conversationIds: [id],
+                browserScopeKeys: [browserScopeKey('conversation', id)],
+              },
+            ],
+          }
+        : {}),
+    };
   });
 
-  ipcMain.handle('conversations:deleteMany', (_event, ids: unknown) => {
+  ipcMain.handle('conversations:deleteMany', async (event, ids: unknown) => {
     const list = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
     if (list.length === 0) return { ok: true, deleted: 0 };
+    // Keep deletion atomic with respect to Browser authority. A secondary/web
+    // renderer must not delete the unprotected subset of a mixed selection and
+    // surprise the primary renderer after the protected item is rejected.
+    if (browserAuthorityRejects(event, list)) {
+      return { ok: false, error: 'native-browser-authority-required' as const };
+    }
     const removed = deleteConversations(appHome, list);
     // Abort live streams ONLY for conversations that were ACTUALLY removed. deleteConversations
     // is synchronous (rmSync) with no await, so no tool can execute between the delete and this
@@ -1358,6 +1405,7 @@ export function registerConversationHandlers(
     for (const id of removed) {
       cancelConversationStream(id);
       invalidateConversationRecovery(id); // purge recovery state for the deleted chat (R132 f-3)
+      stopRealtimeSessionForConversation(id);
       abortAutomationForConversation(id);
       abortActiveCompact(id);
     }
@@ -1379,19 +1427,40 @@ export function registerConversationHandlers(
         // Computer-use module may not be initialized yet — safe to ignore
       }
     }
-    return { ok: true, deleted: removed.length, removedIds: removed };
+    const browserCleanupFailures = await removeBrowserConversationsData(appHome, removed);
+    return {
+      ok: true,
+      deleted: removed.length,
+      removedIds: removed,
+      ...(browserCleanupFailures.length > 0
+        ? {
+            warnings: [
+              {
+                code: 'browser-cleanup-failed' as const,
+                conversationIds: browserCleanupFailures,
+                browserScopeKeys: browserCleanupFailures.map((id) => browserScopeKey('conversation', id)),
+              },
+            ],
+          }
+        : {}),
+    };
   });
 
-  ipcMain.handle('conversations:clear', () => {
+  ipcMain.handle('conversations:clear', async (event) => {
+    const candidateIds = conversationIdsForClear(appHome);
+    if (browserAuthorityRejects(event, candidateIds)) {
+      return { ok: false, error: 'native-browser-authority-required' as const };
+    }
     // clearAllConversations is synchronous (rmSync) with no await, so no tool can execute between
     // the wipe and the teardown below — same ordering guarantee as deleteMany. It returns the UNION
     // of indexed ids AND on-disk record files, so an ORPHAN record (file present, no index entry)
     // is torn down + tombstoned too (else its live stream keeps running / a stale persist recreates
     // it). Abort each cleared conversation's live agent stream, automation, and compaction.
-    const { cleared, fullyCleared } = clearAllConversations(appHome);
+    const { cleared, fullyCleared } = clearAllConversations(appHome, candidateIds);
     for (const conversationId of cleared) {
       cancelConversationStream(conversationId);
       invalidateConversationRecovery(conversationId); // purge recovery state (R132 f-3)
+      stopRealtimeSessionForConversation(conversationId);
       abortAutomationForConversation(conversationId);
       abortActiveCompact(conversationId);
     }
@@ -1406,13 +1475,15 @@ export function registerConversationHandlers(
         // Safe to ignore
       }
     }
-
     // A FULL reset tells clients to discard EVERY accumulator + supersede their generations. That's
     // correct only when EVERYTHING was actually removed. If ANY record's rm FAILED (an indexed OR an
     // orphan file survived), clearAllConversations reports fullyCleared=false and left that record +
     // its live stream intact — a full reset would then drop that surviving run's accumulator on
-    // clients (its tools keep executing, output ignored). So: reset only when fully cleared;
-    // otherwise clear diffs + broadcast a per-id DELETE for each successfully-cleared id.
+    // clients (its tools keep executing, output ignored). Publish the reset/deletes before awaiting
+    // Browser profile cleanup: a client may create a new conversation while that I/O is pending, and
+    // a delayed reset would incorrectly discard the new run's renderer accumulator. So: reset only
+    // when fully cleared; otherwise clear diffs + broadcast a per-id DELETE for each successfully-
+    // cleared id.
     if (fullyCleared) {
       clearAllDiffs();
       broadcastReset(appHome);
@@ -1422,7 +1493,21 @@ export function registerConversationHandlers(
         broadcastDelete(appHome, conversationId);
       }
     }
-    return { ok: true };
+    const browserCleanupFailures = await removeBrowserConversationsData(appHome, cleared);
+    return {
+      ok: true,
+      ...(browserCleanupFailures.length > 0
+        ? {
+            warnings: [
+              {
+                code: 'browser-cleanup-failed' as const,
+                conversationIds: browserCleanupFailures,
+                browserScopeKeys: browserCleanupFailures.map((id) => browserScopeKey('conversation', id)),
+              },
+            ],
+          }
+        : {}),
+    };
   });
 
   // ── edit / regenerate / variant navigation ────────────────────────────────
@@ -1456,9 +1541,16 @@ export function registerConversationHandlers(
     return written;
   };
 
+  const browserAuthorityMutationRejection = (event: IpcMainInvokeEvent, conversationId: string) => {
+    if (!mayPersistForBrowserAuthority || mayPersistForBrowserAuthority(event, conversationId)) return null;
+    return { ok: false, error: 'native-browser-authority-required' as const };
+  };
+
   ipcMain.handle(
     'conversations:edit-message',
-    (_event, conversationId: string, messageId: string, newContent: unknown) => {
+    (event, conversationId: string, messageId: string, newContent: unknown) => {
+      const authorityRejection = browserAuthorityMutationRejection(event, conversationId);
+      if (authorityRejection) return authorityRejection;
       const conv = readConversation(appHome, conversationId);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
       // A tree mutation during /compact would break the summary's final CAS (or leave a
@@ -1490,7 +1582,9 @@ export function registerConversationHandlers(
     },
   );
 
-  ipcMain.handle('conversations:regenerate', (_event, conversationId: string, assistantMessageId: string) => {
+  ipcMain.handle('conversations:regenerate', (event, conversationId: string, assistantMessageId: string) => {
+    const authorityRejection = browserAuthorityMutationRejection(event, conversationId);
+    if (authorityRejection) return authorityRejection;
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
     // A head-moving mutation during /compact would break the summary's final CAS or leave
@@ -1512,7 +1606,9 @@ export function registerConversationHandlers(
   // exchange(s). The shelved tail stays in the tree as a branch, so nothing is
   // lost. Refused if the conversation has been compacted (summary nodes make
   // "a turn" ambiguous and reviving pre-summary messages could double content).
-  ipcMain.handle('conversations:rewind', (_event, conversationId: string, steps = 1) => {
+  ipcMain.handle('conversations:rewind', (event, conversationId: string, steps = 1) => {
+    const authorityRejection = browserAuthorityMutationRejection(event, conversationId);
+    if (authorityRejection) return authorityRejection;
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
     if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
@@ -2807,7 +2903,9 @@ export function registerConversationHandlers(
     return { ok: true, summarizedCount: result.compactedMessageIds.length };
   };
 
-  ipcMain.handle('conversations:switch-variant', (_event, conversationId: string, variantId: string) => {
+  ipcMain.handle('conversations:switch-variant', (event, conversationId: string, variantId: string) => {
+    const authorityRejection = browserAuthorityMutationRejection(event, conversationId);
+    if (authorityRejection) return authorityRejection;
     const conv = readConversation(appHome, conversationId);
     if (!conv) return { ok: false, error: 'conversation-not-found' };
     if (isCompacting(conversationId)) return { ok: false, error: 'conversation-busy' };
@@ -2823,7 +2921,14 @@ export function registerConversationHandlers(
     return getActiveConversationId(appHome);
   });
 
-  ipcMain.handle('conversations:set-active-id', (_event, id: string) => {
+  ipcMain.handle('conversations:set-active-id', (_event, id: string | null, expectedCurrentId?: string | null) => {
+    const current = getActiveConversationId(appHome);
+    if (expectedCurrentId !== undefined && current !== expectedCurrentId) {
+      return { ok: false, error: 'active-conversation-changed', activeConversationId: current };
+    }
+    if (id !== null && !readConversation(appHome, id)) {
+      return { ok: false, error: 'conversation-not-found', activeConversationId: current };
+    }
     setActiveConversationId(appHome, id);
     broadcastActive(appHome);
     return { ok: true };
@@ -2835,7 +2940,9 @@ export function registerConversationHandlers(
   // the client can update its banner without extra catalog/get round-trips.
   ipcMain.handle(
     'conversations:set-selection',
-    (_event, id: string, kind: 'model' | 'profile', value: string | null) => {
+    (event, id: string, kind: 'model' | 'profile', value: string | null) => {
+      const authorityRejection = browserAuthorityMutationRejection(event, id);
+      if (authorityRejection) return authorityRejection;
       const conv = readConversation(appHome, id);
       if (!conv) return { ok: false, error: 'conversation-not-found' };
 

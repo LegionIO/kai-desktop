@@ -11,6 +11,7 @@ import type { ToolDefinition } from '../../tools/types.js';
 import type { UtilityTransport } from './utility-transport.js';
 import { zodSchemaToJsonSchema } from './wire.js';
 import { isAmbiguousPluginCallError } from './utility-transport.js';
+import { assertPluginBrowserConfigWriteAllowed } from '../browser-config-permission.js';
 
 function applyNestedWrite(root: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.').filter(Boolean);
@@ -133,6 +134,9 @@ export function createUtilityPluginAPI(options: {
       },
       set: (path, value) => {
         checkPermission('config:write');
+        // Fail in the utility process before mutating its synchronous mirror;
+        // the main-process PluginAPI repeats this check as the authority boundary.
+        assertPluginBrowserConfigWriteAllowed(path, manifest.permissions);
         const next = cloneRecord(configMirror.config);
         applyNestedWrite(next, path, value);
         configMirror.config = next;

@@ -4,6 +4,7 @@ import { Notification } from 'electron';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
 import type { PluginGenerateToolCall } from '../agent/plugin-generate.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 import { broadcastAgentStreamEvent, isConversationTurnActive } from '../ipc/agent.js';
 import {
   enqueueInject,
@@ -442,7 +443,9 @@ async function runAgentAction(
   const correlationId =
     opts?.correlationId ?? newDiagnosticCorrelationId(opts?.forceFreshTurn ? 'alert-resume' : 'automation');
   const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
-  const tools = action.tools ? withoutMidStreamPlanTools(deps.getRegisteredTools()) : [];
+  const tools = action.tools
+    ? withoutMidStreamPlanTools(deps.getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+    : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
   // Background mode has no conversation to stream into — keep the simple
@@ -1230,17 +1233,18 @@ async function runAgentAction(
           appendTextPart(ev.text);
           lastEventWasToolResult = false;
         } else if (ev.type === 'tool-call' && ev.toolCallId) {
+          const exposedArgs = redactBrowserToolArgsForExposure(ev.toolName, ev.args);
           pendingToolCalls.set(ev.toolCallId, {
             toolName: ev.toolName ?? 'unknown',
-            args: ev.args,
+            args: exposedArgs,
             startedAt: Date.now(),
           });
           const part: ToolCallPart = {
             type: 'tool-call',
             toolCallId: ev.toolCallId,
             toolName: ev.toolName ?? 'unknown',
-            args: ev.args ?? {},
-            argsText: JSON.stringify(ev.args ?? {}, null, 2),
+            args: exposedArgs ?? {},
+            argsText: JSON.stringify(exposedArgs ?? {}, null, 2),
             startedAt: new Date().toISOString(),
           };
           toolPartById.set(ev.toolCallId, part);
@@ -1602,7 +1606,10 @@ async function runSingleAction(
     }
 
     case 'tool': {
-      const tools = [...deps.getRegisteredTools(), ...deps.getWorkspaceTools()];
+      const tools = [
+        ...deps.getRegisteredTools().filter((tool) => tool.source !== 'browser'),
+        ...deps.getWorkspaceTools(),
+      ];
       const tool = tools.find((t) => t.name === action.toolName || t.aliases?.includes(action.toolName));
       if (!tool) throw new Error(`Tool not found: ${action.toolName}`);
       const input = interpolateDeep(action.input, ctx);

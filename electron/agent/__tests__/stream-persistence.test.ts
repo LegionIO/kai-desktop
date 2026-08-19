@@ -296,6 +296,56 @@ describe('stream persistence accumulator', () => {
     ]);
   });
 
+  it.each(['browser_action', 'kai/browser_action', 'mcp__kai__browser_action'])(
+    'never persists plaintext typed by %s',
+    (toolName) => {
+      const secret = 'vault-secret-123';
+      feed({
+        conversationId: 'browser-type-redaction',
+        type: 'tool-call',
+        toolCallId: 'browser-call-1',
+        toolName,
+        args: { kind: 'type', selector: '#password', value: secret },
+      });
+      feed({ conversationId: 'browser-type-redaction', type: 'done' });
+
+      const [, , messages] = appendMock.mock.calls[0];
+      const serialized = JSON.stringify(messages);
+      expect(serialized).not.toContain(secret);
+      expect(messages[0].content[0].args).toEqual({
+        kind: 'type',
+        selector: '[redacted browser selector: 9 characters]',
+        value: `[redacted typed text: ${secret.length} characters]`,
+      });
+    },
+  );
+
+  it.each([
+    [
+      'browser_tabs',
+      { action: 'open', url: 'https://alice:url-password@example.com/oauth?code=query-secret' },
+      /url-password|oauth|query-secret/,
+    ],
+    [
+      'browser_action',
+      { kind: 'navigate', url: 'https://example.com/reset?token=navigation-secret' },
+      /navigation-secret/,
+    ],
+    ['browser_action', { kind: 'press', keys: ['key-secret'] }, /key-secret/],
+  ] as const)('never persists secret-bearing Browser arguments from %s', (toolName, args, secretPattern) => {
+    feed({
+      conversationId: 'browser-argument-redaction',
+      type: 'tool-call',
+      toolCallId: 'browser-call-1',
+      toolName,
+      args,
+    });
+    feed({ conversationId: 'browser-argument-redaction', type: 'done' });
+
+    const [, , messages] = appendMock.mock.calls[0];
+    expect(JSON.stringify(messages)).not.toMatch(secretPattern);
+  });
+
   it('preserves compaction metadata on a compacted tool result', () => {
     feed({ conversationId: 'cc', type: 'tool-call', toolCallId: 't1', toolName: 'read_file', args: { path: 'big' } });
     feed({

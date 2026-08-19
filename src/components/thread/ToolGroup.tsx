@@ -47,6 +47,7 @@ import { ArtifactToolCard } from './ArtifactToolCard';
 import { useTasksOptional } from '@/providers/TaskProvider';
 import { refocusComposer } from '@/lib/utils';
 import { FileDiffResult, ToolDiffList, extractDiffTracking } from './tool-results/FileDiffResult';
+import { BrowserApprovalPrivateInput } from '@/components/approval/BrowserApprovalPrivateInput';
 
 type ToolCallPart = {
   type: 'tool-call';
@@ -413,23 +414,30 @@ export const ToolCallDisplay: FC<{
       )}
       {/* Tool approval — generic confirm-writes mode */}
       {isPendingApproval && !isPlanApproval && !isAskUser && (
-        <div className="ml-1 mt-1.5 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
-          <AlertTriangleIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-          <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">{approvalPrompt}</span>
-          <button
-            type="button"
-            onClick={handleReject}
-            className="rounded-md border border-border/70 bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-          >
-            Reject
-          </button>
-          <button
-            type="button"
-            onClick={handleApprove}
-            className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-          >
-            Approve
-          </button>
+        <div className="ml-1 mt-1.5 space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+          <div className="flex items-center gap-2">
+            <AlertTriangleIcon className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+            <span className="flex-1 text-xs text-amber-700 dark:text-amber-400">{approvalPrompt}</span>
+            <button
+              type="button"
+              onClick={handleReject}
+              className="rounded-md border border-border/70 bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+            >
+              Reject
+            </button>
+            <button
+              type="button"
+              onClick={handleApprove}
+              className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              Approve
+            </button>
+          </div>
+          <BrowserApprovalPrivateInput
+            approvalId={part.approvalId ?? part.toolCallId}
+            args={part.args}
+            active={isPendingApproval}
+          />
         </div>
       )}
       {!isPendingApproval &&

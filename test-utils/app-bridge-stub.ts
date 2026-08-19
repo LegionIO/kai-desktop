@@ -55,6 +55,7 @@ function buildDefaultStub(): AppLike {
       sendSubAgentMessage: async () => ({ ok: true }),
       stopSubAgent: async () => ({ ok: true }),
       generateTitle: async () => ({ title: null }),
+      getToolApprovalPrivateDetails: async () => null,
       approveToolCall: async () => ({ ok: true }),
       rejectToolCall: async () => ({ ok: true }),
       dismissToolCall: async () => ({ ok: true }),
@@ -68,9 +69,10 @@ function buildDefaultStub(): AppLike {
       get: async () => null,
       put: async (c: unknown) => c,
       delete: async () => ({ ok: true }),
+      deleteMany: async () => ({ ok: true, deleted: 0, removedIds: [] }),
       clear: async () => ({ ok: true }),
       getActiveId: async () => null,
-      setActiveId: async () => undefined,
+      setActiveId: async () => ({ ok: true }),
       onChanged: (_cb: (s: unknown) => void): UnsubFn => noopUnsub(),
     },
     platform: {
@@ -106,6 +108,66 @@ function buildDefaultStub(): AppLike {
       onEvent: (_cb: (e: unknown) => void): UnsubFn => noopUnsub(),
       onOverlayState: (_cb: (s: unknown) => void): UnsubFn => noopUnsub(),
       onFocusThread: (_cb: () => void): UnsubFn => noopUnsub(),
+    },
+    browser: {
+      available: async () => false,
+      getState: async (conversationId: string) => ({
+        conversationId,
+        tabs: [],
+        activeTabId: null,
+      }),
+      getAttentionState: async () => [],
+      createTab: async () => {
+        throw new Error('Browser unavailable in test stub');
+      },
+      commandTab: async () => undefined,
+      menuAction: async () => undefined,
+      reorderTabs: async () => undefined,
+      navigate: async () => undefined,
+      mount: async () => undefined,
+      setChromeFocus: async () => undefined,
+      find: async () => undefined,
+      stopFind: async () => undefined,
+      setZoom: async (_conversationId: string, _tabId: string, level: number) => level,
+      screenshot: async () => {
+        throw new Error('Browser unavailable in test stub');
+      },
+      pickElement: async () => {
+        throw new Error('Browser unavailable in test stub');
+      },
+      listHistory: async () => [],
+      clearHistory: async () => undefined,
+      listBookmarks: async () => [],
+      addBookmark: async () => {
+        throw new Error('Browser unavailable in test stub');
+      },
+      updateBookmark: async (conversationId: string, bookmark: unknown) => {
+        void conversationId;
+        return bookmark;
+      },
+      removeBookmark: async () => undefined,
+      reorderBookmarks: async () => undefined,
+      importBookmarks: async () => ({ imported: 0, canceled: true }),
+      exportBookmarks: async () => ({ exported: 0, canceled: true }),
+      listDownloads: async () => [],
+      showDownload: async () => undefined,
+      cancelDownload: async () => undefined,
+      listSitePermissions: async () => [],
+      resetSitePermissions: async () => undefined,
+      listCredentials: async () => [],
+      credentialAuthenticationAvailable: async () => true,
+      saveCredential: async () => undefined,
+      updateCredential: async () => undefined,
+      deleteCredential: async () => undefined,
+      revealCredential: async () => '',
+      copyCredential: async () => undefined,
+      respondCredentialPrompt: async () => undefined,
+      respondAuthPrompt: async () => undefined,
+      respondPermissionPrompt: async () => undefined,
+      autofill: async () => undefined,
+      dataSummary: async () => [],
+      clearData: async () => undefined,
+      onEvent: (_cb: (e: unknown) => void): UnsubFn => noopUnsub(),
     },
     realtime: {
       getStatus: async () => ({ status: 'idle' }),

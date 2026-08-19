@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  ToolObserverManager,
   summarizeLatestUserRequest,
   summarizeThreadContext,
   clampHeadTail,
@@ -14,6 +15,47 @@ import {
   toResultSummary,
   shouldSkipSubAgentNudge,
 } from '../tool-observer.js';
+
+describe('ToolObserverManager Browser argument exposure', () => {
+  it('redacts typed page content before building the observer prompt', () => {
+    const secret = 'observer-secret-456';
+    const manager = new ToolObserverManager({
+      conversationId: 'browser-observer-redaction',
+      modelConfig: {} as never,
+      config: {
+        enabled: true,
+        intervalMs: 60_000,
+        maxSnapshotChars: 1_000,
+        maxMessagesPerTool: 1,
+        maxTotalLaunchedTools: 1,
+      },
+      userRequestSummary: 'Sign in',
+      baseThreadContext: '',
+      emitMidToolMessage: () => undefined,
+      cancelToolCall: () => false,
+    });
+    Reflect.set(manager, 'lastEvaluatedAtMs', Date.now());
+
+    try {
+      manager.onToolExecutionStart({
+        toolCallId: 'browser-call-1',
+        toolName: 'browser_action',
+        args: { kind: 'type', selector: '#password', value: secret },
+      });
+      const tools = Reflect.get(manager, 'tools') as Map<string, unknown>;
+      const buildPromptPayload = Reflect.get(manager, 'buildPromptPayload') as (
+        this: ToolObserverManager,
+        runningTools: unknown[],
+      ) => string;
+      const prompt = buildPromptPayload.call(manager, [...tools.values()]);
+
+      expect(prompt).not.toContain(secret);
+      expect(prompt).toContain(`[redacted typed text: ${secret.length} characters]`);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
 
 describe('summarizeLatestUserRequest', () => {
   it('returns the most recent user message text', () => {
@@ -193,9 +235,7 @@ describe('shouldSkipSubAgentNudge', () => {
   });
 
   it('skips a sub_agent that is no longer running (e.g. cancelled earlier in the same decision)', () => {
-    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', running: false })).toBe(
-      'sub-agent is no longer running',
-    );
+    expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', running: false })).toBe('sub-agent is no longer running');
     // running true/undefined does not trigger this skip on its own.
     expect(shouldSkipSubAgentNudge({ toolName: 'sub_agent', running: true })).toBeNull();
   });

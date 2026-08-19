@@ -17,6 +17,7 @@ import { WebServerSettings } from './WebServerSettings';
 import { GeneralSettings } from './GeneralSettings';
 import { AutomationsSettings } from './AutomationsSettings';
 import { DiagnosticsSettings } from './DiagnosticsSettings';
+import { BrowserSettings } from './BrowserSettings';
 import { searchSettings, breadcrumb, type SettingsSearchEntry } from './search-index';
 import type { SettingsProps } from './shared';
 
@@ -26,6 +27,7 @@ export type SettingsSection =
   | 'tools'
   | 'automations'
   | 'general'
+  | 'browser'
   | 'audio'
   | 'voice'
   | 'computer-use'
@@ -39,6 +41,7 @@ const sections: Array<{ key: SettingsSection; label: string }> = [
   { key: 'tools', label: 'Tools' },
   { key: 'automations', label: 'Automations' },
   { key: 'general', label: 'Application' },
+  { key: 'browser', label: 'Browser' },
   { key: 'audio', label: 'Audio' },
   { key: 'voice', label: 'Voice' },
   { key: 'computer-use', label: 'Autopilot' },
@@ -60,10 +63,11 @@ if (typeof window !== 'undefined') {
   });
 }
 
-export const SettingsPanel: FC<{ onClose: () => void; onOpenConversation?: (id: string) => void }> = ({
-  onClose,
-  onOpenConversation,
-}) => {
+export const SettingsPanel: FC<{
+  onClose: () => void;
+  onOpenConversation?: (id: string) => void;
+  selectedConversationId: string | null;
+}> = ({ onClose, onOpenConversation, selectedConversationId }) => {
   const { config, updateConfig } = useConfig();
   const [activeSection, setActiveSection] = useState<SettingsSection>('models');
   const [query, setQuery] = useState('');
@@ -261,6 +265,9 @@ export const SettingsPanel: FC<{ onClose: () => void; onOpenConversation?: (id: 
             focusTab={focusTab}
             focusNonce={focusNonce}
           />
+        )}
+        {activeSection === 'browser' && (
+          <BrowserSettings config={config} updateConfig={updateConfig} conversationId={selectedConversationId} />
         )}
       </div>
     </div>

@@ -61,10 +61,11 @@ export class PiToolBridge {
     conversationId: string,
     cwd?: string,
     abortSignal?: AbortSignal,
+    browserOwnerId?: string,
   ): Promise<PiToolBridgeHandle | null> {
     if (!tools || tools.length === 0) return null;
     this.abortSignal = abortSignal;
-    this.bridge = new ToolMcpBridge({ tools, conversationId, cwd });
+    this.bridge = new ToolMcpBridge({ tools, conversationId, cwd, browserOwnerId });
 
     const token = randomUUID();
     // Unique env-var names per bridge so concurrent pi runs don't race a shared key.

@@ -12,7 +12,7 @@ import {
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { atomicWriteFileSync } from '../atomic-write.js';
+import { atomicWriteFile, atomicWriteFileSync } from '../atomic-write.js';
 
 describe('atomicWriteFileSync', () => {
   let dir: string;
@@ -95,5 +95,14 @@ describe('atomicWriteFileSync', () => {
     expect(lstatSync(dest).isSymbolicLink()).toBe(false);
     expect(readFileSync(dest, 'utf-8')).toBe('payload');
     expect(readFileSync(outside, 'utf-8')).toBe('original-outside');
+  });
+
+  it('writes asynchronously with restrictive permissions and no temp residue', async () => {
+    const dest = join(dir, 'async.json');
+    await atomicWriteFile(dest, '{"async":true}', { mode: 0o600 });
+
+    expect(readFileSync(dest, 'utf8')).toBe('{"async":true}');
+    expect(readdirSync(dir).filter((file) => file.includes('.tmp-'))).toEqual([]);
+    if (process.platform !== 'win32') expect(statSync(dest).mode & 0o777).toBe(0o600);
   });
 });

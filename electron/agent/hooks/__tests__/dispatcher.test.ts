@@ -159,7 +159,26 @@ describe('HookDispatcher rule throttling', () => {
       messages: [{ role: 'user', content: 'secret' }],
     });
     expect(ok.denied).toBe(false);
+    expect(ok.modified).toBe(true);
     expect((ok.payload as { messages: { content: string }[] }).messages[0].content).toBe('redacted');
+  });
+
+  it('distinguishes an unchanged payload from an enforcing replacement', async () => {
+    const cfg = {
+      hooks: { enabled: true, timeoutMs: 5000 },
+      automations: { enabled: false, rules: [] },
+    } as unknown as AppConfig;
+    const d = new HookDispatcher();
+    d.configure({ getConfig: () => cfg });
+    d.register('PreToolUse', () => ({ decision: 'allow' }), { source: 'plugin', mode: 'block' });
+
+    const result = await d.dispatch('PreToolUse', {
+      conversationId: 'c',
+      toolName: 'browser_action',
+      args: { kind: 'type', value: '[redacted typed text: 6 characters]' },
+    });
+
+    expect(result).toMatchObject({ denied: false, modified: false });
   });
 
   it('suppressObserve dispatch does NOT consume a shell rule throttle budget', async () => {

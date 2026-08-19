@@ -80,7 +80,7 @@ import { SearchBar } from './SearchBar';
 import type { ReasoningEffort } from './ReasoningEffortSelector';
 import { ChatSettingsButton } from './ChatSettingsButton';
 import { Tooltip } from '@/components/ui/Tooltip';
-import { FallbackBanner, ComputerUseFallbackBanner } from './FallbackBanner';
+import { FallbackBanner, ComputerUseFallbackBanner, RuntimeNoticeBanner } from './FallbackBanner';
 import { usePopoverAlign } from '@/hooks/usePopoverAlign';
 import { useSplitButtonHover } from '@/hooks/useSplitButtonHover';
 import { useFullWidthContent } from '@/hooks/useFullWidthContent';
@@ -224,6 +224,7 @@ export const Thread: FC<{
           }}
         />
         <SearchBar visible={searchOpen} onClose={() => setSearchOpen(false)} viewportRef={viewportRef} />
+        <RuntimeNoticeBanner />
         <FallbackBanner />
         <ComputerUseFallbackBanner />
         {mode === 'chat' ? (

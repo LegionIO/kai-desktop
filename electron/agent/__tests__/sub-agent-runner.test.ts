@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { sanitizedMessageDisplayText, buildSubAgentTaskMessage } from '../sub-agent-runner.js';
+import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import type { ToolDefinition } from '../../tools/types.js';
+import {
+  sanitizedMessageDisplayText,
+  buildSubAgentTaskMessage,
+  validateSubAgentToolInput,
+} from '../sub-agent-runner.js';
 
 describe('sanitizedMessageDisplayText', () => {
   it('returns a string message as-is', () => {
@@ -45,5 +51,29 @@ describe('buildSubAgentTaskMessage', () => {
     const msg = buildSubAgentTaskMessage('do X', 'ctx here');
     expect(msg).toContain('do X');
     expect(msg).toContain('ctx here');
+  });
+});
+
+describe('validateSubAgentToolInput', () => {
+  const tool = {
+    name: 'safe_tool',
+    description: 'safe',
+    inputSchema: z
+      .object({ value: z.string().max(5), count: z.number().default(1) })
+      .transform(({ value, count }) => ({ value: value.trim(), count })),
+    execute: vi.fn(async () => null),
+  } satisfies ToolDefinition;
+
+  it('rejects invalid hook replacements and returns schema-transformed arguments', () => {
+    expect(() => validateSubAgentToolInput([tool], 'safe_tool', { value: 'too-long' })).toThrow(
+      'Invalid arguments for tool "safe_tool".',
+    );
+    expect(validateSubAgentToolInput([tool], 'safe_tool', { value: ' ok ' })).toEqual({
+      value: 'ok',
+      count: 1,
+    });
+    expect(() => validateSubAgentToolInput([tool], 'missing_tool', { value: 'ok' })).toThrow(
+      'Invalid arguments for tool "missing_tool".',
+    );
   });
 });

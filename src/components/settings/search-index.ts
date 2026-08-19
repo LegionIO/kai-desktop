@@ -19,6 +19,7 @@ export const SECTION_LABELS: Record<SettingsSection, string> = {
   tools: 'Tools',
   automations: 'Automations',
   general: 'Application',
+  browser: 'Browser',
   audio: 'Audio',
   voice: 'Voice',
   'computer-use': 'Autopilot',
@@ -52,6 +53,42 @@ export const TAB_LABELS: Record<string, string> = {
 };
 
 export const SETTINGS_INDEX: SettingsSearchEntry[] = [
+  {
+    id: 'browser.dataScope',
+    label: 'Browser data scope',
+    section: 'browser',
+    keywords: ['global', 'conversation', 'cookies', 'sessions', 'storage'],
+  },
+  {
+    id: 'browser.readAccess',
+    label: 'AI browser read policy',
+    section: 'browser',
+    keywords: ['allow', 'ask', 'deny', 'tabs', 'inspect', 'screenshots'],
+  },
+  {
+    id: 'browser.structuredActions',
+    label: 'AI browser action policy',
+    section: 'browser',
+    keywords: ['allow', 'ask', 'deny', 'click', 'typing', 'scroll'],
+  },
+  {
+    id: 'browser.scriptInjection',
+    label: 'Browser JavaScript policy',
+    section: 'browser',
+    keywords: ['evaluate', 'injected scripts', 'allow', 'ask', 'deny'],
+  },
+  {
+    id: 'browser.passwordAccess',
+    label: 'AI saved-password access',
+    section: 'browser',
+    keywords: ['autofill', 'credentials', 'vault', 'passwords'],
+  },
+  {
+    id: 'browser.data',
+    label: 'Clear browser data',
+    section: 'browser',
+    keywords: ['cookies', 'cache', 'sessions', 'history', 'bookmarks', 'passwords'],
+  },
   // ─── Models › Advanced (global defaults; profiles override) ───
   {
     id: 'advanced.maxSteps',
@@ -374,8 +411,7 @@ export const SETTINGS_INDEX: SettingsSearchEntry[] = [
   {
     id: 'partitions',
     label: 'Browser partitions',
-    section: 'general',
-    tab: 'general',
+    section: 'browser',
     keywords: ['cookies', 'cache', 'storage', 'clear', 'delete'],
   },
 

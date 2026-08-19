@@ -14,9 +14,21 @@ import { join } from 'node:path';
 
 import { createIpcHarness } from '../../../test-utils/ipc-harness.js';
 
+const stopRealtimeSessionForConversation = vi.hoisted(() => vi.fn());
+const removeBrowserConversationData = vi.hoisted(() =>
+  vi.fn(async (_appHome: string, _conversationId: string): Promise<void> => undefined),
+);
+const removeBrowserConversationsData = vi.hoisted(() =>
+  vi.fn(async (_appHome: string, _conversationIds: Iterable<string>): Promise<string[]> => []),
+);
+const removeComputerUseSessions = vi.hoisted(() => vi.fn());
+const getAllWindows = vi.hoisted(() =>
+  vi.fn((): Array<{ webContents: { send: (channel: string, payload: unknown) => void } }> => []),
+);
+
 vi.mock('electron', () => ({
   BrowserWindow: {
-    getAllWindows: vi.fn(() => []),
+    getAllWindows,
   },
 }));
 
@@ -27,9 +39,18 @@ vi.mock('electron', () => ({
 // stubbing here just keeps the import graph small.
 vi.mock('../../computer-use/service.js', () => ({
   getComputerUseManager: vi.fn(() => ({
-    removeSessionsByConversation: vi.fn(),
+    removeSessionsByConversation: removeComputerUseSessions,
   })),
 }));
+
+// Browser profile removal is covered by the browser service tests. Keep this
+// conversation IPC harness independent of Electron's session implementation.
+vi.mock('../../browser/service.js', () => ({
+  removeBrowserConversationData,
+  removeBrowserConversationsData,
+}));
+
+vi.mock('../realtime.js', () => ({ stopRealtimeSessionForConversation }));
 
 import {
   appendConversationMessages,
@@ -41,6 +62,7 @@ import {
   summarizablePrefixMatchesDisk,
 } from '../conversations.js';
 import { sumBranchTokenCounts } from '../../agent/tokenization.js';
+import { browserScopeKey } from '../../browser/session.js';
 import {
   readIndex,
   readConversation,
@@ -124,6 +146,14 @@ function makeConversation(id: string, overrides: Record<string, unknown> = {}): 
 }
 
 beforeEach(() => {
+  stopRealtimeSessionForConversation.mockClear();
+  removeBrowserConversationData.mockReset();
+  removeBrowserConversationData.mockResolvedValue(undefined);
+  removeBrowserConversationsData.mockReset();
+  removeBrowserConversationsData.mockResolvedValue([]);
+  removeComputerUseSessions.mockReset();
+  getAllWindows.mockReset();
+  getAllWindows.mockReturnValue([]);
   tempRoot = mkdtempSync(join(tmpdir(), 'kai-conv-ipc-'));
   appHome = join(tempRoot, 'app-home');
   mkdirSync(join(appHome, 'data'), { recursive: true });
@@ -209,6 +239,155 @@ describe('conversations IPC: list / get / put round-trip', () => {
     // The on-disk per-file store should contain the entry as well.
     const onDisk = JSON.parse(readFileSync(join(appHome, 'data', 'conversations', 'conv-1.json'), 'utf-8'));
     expect(onDisk.id).toBe('conv-1');
+  });
+
+  it('rejects a Browser-unauthorized put before it changes the durable branch', async () => {
+    const originalTree = [
+      { id: 'user-owner', parentId: null, role: 'user', content: 'owner prompt', createdAt: '2026-01-01' },
+    ];
+    writeConversation(
+      appHome,
+      makeConversation('browser-owned', {
+        messages: originalTree,
+        messageTree: originalTree,
+        headId: 'user-owner',
+        runStatus: 'running',
+      }) as ConversationRecord,
+    );
+    const mayPersist = vi.fn(() => false);
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(
+          ipc as Parameters<typeof registerConversationHandlers>[0],
+          appHome,
+          undefined,
+          undefined,
+          undefined,
+          mayPersist,
+        );
+      },
+    });
+    const foreignTree = [
+      ...originalTree,
+      { id: 'user-foreign', parentId: 'user-owner', role: 'user', content: 'foreign prompt', createdAt: '2026-01-02' },
+    ];
+
+    const result = await harness.invoke(
+      'conversations:put',
+      FAKE_EVENT,
+      makeConversation('browser-owned', {
+        messages: foreignTree,
+        messageTree: foreignTree,
+        headId: 'user-foreign',
+        runStatus: 'running',
+      }),
+    );
+
+    expect(result).toEqual({ rejected: 'native-browser-authority-required' });
+    expect(mayPersist).toHaveBeenCalledWith(FAKE_EVENT, 'browser-owned');
+    expect(readConversation(appHome, 'browser-owned')).toMatchObject({
+      headId: 'user-owner',
+      messageTree: originalTree,
+    });
+  });
+
+  it('rejects direct tree mutations from a renderer that does not own Browser authority', async () => {
+    const originalTree = [
+      { id: 'user-owner', parentId: null, role: 'user', content: 'owner prompt', createdAt: '2026-01-01' },
+      {
+        id: 'assistant-owner',
+        parentId: 'user-owner',
+        role: 'assistant',
+        content: 'owner reply',
+        createdAt: '2026-01-01',
+      },
+    ];
+    writeConversation(
+      appHome,
+      makeConversation('browser-owned-tree', {
+        messages: originalTree,
+        messageTree: originalTree,
+        headId: 'assistant-owner',
+        runStatus: 'running',
+        selectedModelKey: 'model-owner',
+      }) as ConversationRecord,
+    );
+    const mayPersist = vi.fn(() => false);
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(
+          ipc as Parameters<typeof registerConversationHandlers>[0],
+          appHome,
+          undefined,
+          undefined,
+          undefined,
+          mayPersist,
+        );
+      },
+    });
+
+    await expect(
+      harness.invoke('conversations:edit-message', FAKE_EVENT, 'browser-owned-tree', 'user-owner', 'foreign edit'),
+    ).resolves.toEqual({ ok: false, error: 'native-browser-authority-required' });
+    await expect(
+      harness.invoke('conversations:regenerate', FAKE_EVENT, 'browser-owned-tree', 'assistant-owner'),
+    ).resolves.toEqual({ ok: false, error: 'native-browser-authority-required' });
+    await expect(harness.invoke('conversations:rewind', FAKE_EVENT, 'browser-owned-tree', 1)).resolves.toEqual({
+      ok: false,
+      error: 'native-browser-authority-required',
+    });
+    await expect(
+      harness.invoke('conversations:switch-variant', FAKE_EVENT, 'browser-owned-tree', 'assistant-owner'),
+    ).resolves.toEqual({ ok: false, error: 'native-browser-authority-required' });
+    await expect(
+      harness.invoke('conversations:set-selection', FAKE_EVENT, 'browser-owned-tree', 'model', 'model-foreign'),
+    ).resolves.toEqual({ ok: false, error: 'native-browser-authority-required' });
+
+    expect(mayPersist).toHaveBeenCalledTimes(5);
+    expect(readConversation(appHome, 'browser-owned-tree')).toMatchObject({
+      headId: 'assistant-owner',
+      messageTree: originalTree,
+      selectedModelKey: 'model-owner',
+    });
+  });
+
+  it('rejects single, batch, and clear deletion before mutating a Browser-authorized conversation', async () => {
+    writeConversation(appHome, makeConversation('browser-protected') as ConversationRecord);
+    writeConversation(appHome, makeConversation('ordinary-chat') as ConversationRecord);
+    const mayPersist = vi.fn((_event: unknown, conversationId: string) => conversationId !== 'browser-protected');
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(
+          ipc as Parameters<typeof registerConversationHandlers>[0],
+          appHome,
+          undefined,
+          undefined,
+          undefined,
+          mayPersist,
+        );
+      },
+    });
+
+    await expect(harness.invoke('conversations:delete', FAKE_EVENT, 'browser-protected')).resolves.toEqual({
+      ok: false,
+      error: 'native-browser-authority-required',
+    });
+    await expect(
+      harness.invoke('conversations:deleteMany', FAKE_EVENT, ['ordinary-chat', 'browser-protected']),
+    ).resolves.toEqual({
+      ok: false,
+      error: 'native-browser-authority-required',
+    });
+    await expect(harness.invoke('conversations:clear', FAKE_EVENT)).resolves.toEqual({
+      ok: false,
+      error: 'native-browser-authority-required',
+    });
+
+    expect(readConversation(appHome, 'browser-protected')).not.toBeNull();
+    expect(readConversation(appHome, 'ordinary-chat')).not.toBeNull();
+    expect(removeBrowserConversationData).not.toHaveBeenCalled();
+    expect(removeBrowserConversationsData).not.toHaveBeenCalled();
+    expect(stopRealtimeSessionForConversation).not.toHaveBeenCalled();
   });
 
   it('conversations:put unions on-disk messages the incoming write is missing', async () => {
@@ -616,6 +795,109 @@ describe('conversations IPC: pending-draft claim (atomic single-winner)', () => 
 });
 
 describe('conversations IPC: error paths', () => {
+  it('returns typed browser cleanup warnings after a successful single or batch deletion', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('cleanup-single'));
+    removeBrowserConversationData.mockRejectedValueOnce(new Error('session clear failed'));
+
+    await expect(harness.invoke('conversations:delete', FAKE_EVENT, 'cleanup-single')).resolves.toEqual({
+      ok: true,
+      warnings: [
+        {
+          code: 'browser-cleanup-failed',
+          conversationIds: ['cleanup-single'],
+          browserScopeKeys: [browserScopeKey('conversation', 'cleanup-single')],
+        },
+      ],
+    });
+
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('cleanup-batch-a'));
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('cleanup-batch-b'));
+    removeBrowserConversationsData.mockResolvedValueOnce(['cleanup-batch-a']);
+
+    await expect(
+      harness.invoke('conversations:deleteMany', FAKE_EVENT, ['cleanup-batch-a', 'cleanup-batch-b']),
+    ).resolves.toEqual({
+      ok: true,
+      deleted: 2,
+      removedIds: ['cleanup-batch-a', 'cleanup-batch-b'],
+      warnings: [
+        {
+          code: 'browser-cleanup-failed',
+          conversationIds: ['cleanup-batch-a'],
+          browserScopeKeys: [browserScopeKey('conversation', 'cleanup-batch-a')],
+        },
+      ],
+    });
+    expect(removeBrowserConversationsData).toHaveBeenCalledWith(appHome, ['cleanup-batch-a', 'cleanup-batch-b']);
+  });
+
+  it('stops computer-use sessions before awaiting Browser profile cleanup', async () => {
+    const order: string[] = [];
+    removeComputerUseSessions.mockImplementation((id: string) => order.push(`computer:${id}`));
+    removeBrowserConversationData.mockImplementation(async (_home: string, id: string) => {
+      order.push(`browser:${id}`);
+    });
+    removeBrowserConversationsData.mockImplementation(async (_home: string, ids: Iterable<string>) => {
+      order.push(`browser:${[...ids].join(',')}`);
+      return [];
+    });
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(
+          ipc as Parameters<typeof registerConversationHandlers>[0],
+          appHome,
+          () => ({}) as never,
+        );
+      },
+    });
+
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('ordered-single'));
+    await harness.invoke('conversations:delete', FAKE_EVENT, 'ordered-single');
+    expect(order).toEqual(['computer:ordered-single', 'browser:ordered-single']);
+
+    order.length = 0;
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('ordered-a'));
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('ordered-b'));
+    await harness.invoke('conversations:deleteMany', FAKE_EVENT, ['ordered-a', 'ordered-b']);
+    expect(order).toEqual(['computer:ordered-a', 'computer:ordered-b', 'browser:ordered-a,ordered-b']);
+
+    order.length = 0;
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('ordered-clear'));
+    await harness.invoke('conversations:clear', FAKE_EVENT);
+    expect(order).toEqual(['computer:ordered-clear', 'browser:ordered-clear']);
+  });
+
+  it('broadcasts a clear before Browser cleanup can yield to a newly created conversation', async () => {
+    let finishCleanup!: (failures: string[]) => void;
+    removeBrowserConversationsData.mockReturnValueOnce(
+      new Promise<string[]>((resolve) => {
+        finishCleanup = resolve;
+      }),
+    );
+    const send = vi.fn();
+    getAllWindows.mockReturnValue([{ webContents: { send } }]);
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('clear-before-cleanup'));
+    send.mockClear();
+
+    const clear = harness.invoke('conversations:clear', FAKE_EVENT);
+    await vi.waitFor(() => expect(removeBrowserConversationsData).toHaveBeenCalledOnce());
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('created-during-cleanup'));
+
+    expect(send.mock.calls.map(([, change]) => change.kind)).toEqual(['reset', 'upsert']);
+    finishCleanup([]);
+    await expect(clear).resolves.toEqual({ ok: true });
+  });
+
   it('conversations:put of a just-deleted (tombstoned) conversation is rejected, not a phantom upsert', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
@@ -693,11 +975,57 @@ describe('conversations IPC: active-id handling', () => {
     const before = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(before).toBeNull();
 
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('conv-active'));
     const setResult = await harness.invoke<{ ok: boolean }>('conversations:set-active-id', FAKE_EVENT, 'conv-active');
     expect(setResult).toEqual({ ok: true });
 
     const after = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(after).toBe('conv-active');
+  });
+
+  it('compares the expected active id before applying an async selection fallback', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('conv-a'));
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('fallback'));
+    await harness.invoke('conversations:set-active-id', FAKE_EVENT, 'conv-a');
+
+    const stale = await harness.invoke<{
+      ok: boolean;
+      error?: string;
+      activeConversationId?: string | null;
+    }>('conversations:set-active-id', FAKE_EVENT, 'fallback', 'conv-stale');
+    expect(stale).toEqual({
+      ok: false,
+      error: 'active-conversation-changed',
+      activeConversationId: 'conv-a',
+    });
+    await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('conv-a');
+
+    await expect(harness.invoke('conversations:set-active-id', FAKE_EVENT, 'fallback', 'conv-a')).resolves.toEqual({
+      ok: true,
+    });
+    await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBe('fallback');
+  });
+
+  it('rejects a missing active conversation and hides legacy stale ids', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+
+    await expect(harness.invoke('conversations:set-active-id', FAKE_EVENT, 'missing-chat')).resolves.toEqual({
+      ok: false,
+      error: 'conversation-not-found',
+      activeConversationId: null,
+    });
+
+    setActiveConversationId(appHome, 'legacy-stale-chat');
+    await expect(harness.invoke('conversations:get-active-id', FAKE_EVENT)).resolves.toBeNull();
   });
 
   it('clears the active id when the active conversation is deleted', async () => {
@@ -713,6 +1041,7 @@ describe('conversations IPC: active-id handling', () => {
 
     await harness.invoke('conversations:delete', FAKE_EVENT, 'drop');
 
+    expect(stopRealtimeSessionForConversation).toHaveBeenCalledWith('drop');
     const activeAfter = await harness.invoke<string | null>('conversations:get-active-id', FAKE_EVENT);
     expect(activeAfter).toBeNull();
     const remaining = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
@@ -732,6 +1061,8 @@ describe('conversations IPC: active-id handling', () => {
 
     const result = await harness.invoke<{ ok: boolean }>('conversations:clear', FAKE_EVENT);
     expect(result).toEqual({ ok: true });
+    expect(stopRealtimeSessionForConversation).toHaveBeenCalledWith('a');
+    expect(stopRealtimeSessionForConversation).toHaveBeenCalledWith('b');
 
     const list = await harness.invoke<unknown[]>('conversations:list', FAKE_EVENT);
     expect(list).toEqual([]);

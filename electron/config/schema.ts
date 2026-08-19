@@ -277,6 +277,36 @@ const fallbackConfigSchema = z.object({
   modelKeys: z.array(z.string()),
 });
 
+const browserConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    dataScope: z.enum(['global', 'conversation']).default('global'),
+    readAccess: z.enum(['allow', 'ask', 'deny']).default('allow'),
+    structuredActions: z.enum(['allow', 'ask', 'deny']).default('allow'),
+    scriptInjection: z.enum(['allow', 'ask', 'deny']).default('allow'),
+    passwordAccess: z.enum(['user-only', 'ask', 'automatic']).default('user-only'),
+    offerToSavePasswords: z.boolean().default(true),
+    searchProvider: z.enum(['duckduckgo', 'google', 'bing']).default('duckduckgo'),
+    aiAllowPrivateNetwork: z.boolean().default(false),
+    idleDiscardMinutes: z.number().int().min(1).max(1440).default(10),
+    maxTabsPerConversation: z.number().int().min(1).max(100).default(20),
+    showBookmarksBar: z.boolean().default(false),
+  })
+  .default({
+    enabled: true,
+    dataScope: 'global',
+    readAccess: 'allow',
+    structuredActions: 'allow',
+    scriptInjection: 'allow',
+    passwordAccess: 'user-only',
+    offerToSavePasswords: true,
+    searchProvider: 'duckduckgo',
+    aiAllowPrivateNetwork: false,
+    idleDiscardMinutes: 10,
+    maxTabsPerConversation: 20,
+    showBookmarksBar: false,
+  });
+
 const computerUseConfigSchema = z.object({
   enabled: z.boolean(),
   showStepLog: z.boolean(),
@@ -1067,6 +1097,7 @@ export const appConfigSchema = z.object({
   webServer: webServerConfigSchema,
   audio: audioConfigSchema,
   realtime: realtimeConfigSchema,
+  browser: browserConfigSchema,
   computerUse: computerUseConfigSchema,
   dictation: z
     .object({
@@ -1194,12 +1225,7 @@ export const appConfigSchema = z.object({
            * 10 MiB so a burst of recovery/display events can't evict the
            * overnight heap trajectory before a crash. Bounded 1–50 MiB.
            */
-          windowHealthLogMaxBytes: z
-            .number()
-            .int()
-            .min(1048576)
-            .max(52428800)
-            .default(10485760),
+          windowHealthLogMaxBytes: z.number().int().min(1048576).max(52428800).default(10485760),
           /**
            * Auto-capture a V8 heap snapshot (.heapsnapshot) of the renderer when
            * its heap crosses `thresholdPct` of the limit — so a slow leak that

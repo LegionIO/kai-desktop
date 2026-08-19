@@ -26,6 +26,16 @@ export function getAppLlmConfigPath(): string {
 }
 const DESKTOP_SETTINGS_FILENAME = 'desktop.json';
 const DEFAULT_SYSTEM_PROMPT = `You are ${__BRAND_ASSISTANT_NAME}, a powerful local AI assistant with access to the user's computer. You can execute shell commands, read/write files, search codebases, and connect to external services via MCP. Be proactive, thorough, and helpful. When executing tools, explain what you're doing and why.`;
+const lastKnownGoodConfigs = new Map<string, AppConfig>();
+
+function rememberEffectiveConfig(appHome: string, config: AppConfig): void {
+  lastKnownGoodConfigs.set(appHome, structuredClone(config));
+}
+
+function lastKnownGoodConfig(appHome: string): AppConfig | undefined {
+  const config = lastKnownGoodConfigs.get(appHome);
+  return config ? structuredClone(config) : undefined;
+}
 
 export function getDesktopSettingsPath(appHome: string): string {
   return join(appHome, 'settings', DESKTOP_SETTINGS_FILENAME);
@@ -242,6 +252,20 @@ function getDefaultConfig() {
         onSessionCompleted: true,
         onSessionFailed: true,
       },
+    },
+    browser: {
+      enabled: true,
+      dataScope: 'global' as const,
+      readAccess: 'allow' as const,
+      structuredActions: 'allow' as const,
+      scriptInjection: 'allow' as const,
+      passwordAccess: 'user-only' as const,
+      offerToSavePasswords: true,
+      searchProvider: 'duckduckgo' as const,
+      aiAllowPrivateNetwork: false,
+      idleDiscardMinutes: 10,
+      maxTabsPerConversation: 20,
+      showBookmarksBar: false,
     },
     computerUse: {
       enabled: true,
@@ -1069,6 +1093,7 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
     webServer: config.webServer,
     audio: config.audio,
     realtime: config.realtime,
+    browser: config.browser,
     computerUse: config.computerUse,
     dictation: config.dictation,
     appShots: config.appShots,
@@ -1087,27 +1112,54 @@ export function desktopConfigPayload(config: AppConfig): Record<string, unknown>
   };
 }
 
-export function readEffectiveConfig(appHome: string): AppConfig {
+export function readEffectiveConfig(
+  appHome: string,
+  options: { failOnInvalid?: boolean; allowMissingDesktopConfig?: boolean } = {},
+): AppConfig {
   const configPath = getDesktopSettingsPath(appHome);
   const defaults = getDefaultConfig();
 
   if (existsSync(configPath)) {
     try {
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-      return ensureDefaultProfile(
+      const raw = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      const config = ensureDefaultProfile(
         normalizeResponsesApiConfig(applyExternalModelConfig(deepMerge(defaults, raw) as AppConfig, appHome)),
       );
+      rememberEffectiveConfig(appHome, config);
+      return config;
     } catch (error) {
-      console.error('[Config] Failed to parse desktop.json, using defaults:', error);
+      if (options.failOnInvalid) throw error;
+      const cached = lastKnownGoodConfig(appHome);
+      if (cached) {
+        console.error('[Config] Failed to parse desktop.json, using the last valid config:', error);
+        return cached;
+      }
+      console.error('[Config] Failed to parse desktop.json, using defaults because no valid config was cached:', error);
       return ensureDefaultProfile(
         normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
       );
     }
   }
 
-  return ensureDefaultProfile(
+  if (options.failOnInvalid && !options.allowMissingDesktopConfig) {
+    throw new Error(`Config file is unavailable: ${configPath}`);
+  }
+
+  // A watcher on a genuinely fresh install must be able to pick up first-time
+  // llm.json creation before any desktop setting has caused desktop.json to be
+  // written. In that explicit case, rebuild from defaults plus the current LLM
+  // file instead of returning the pre-import cache. Ordinary non-strict reads
+  // still retain the last-known-good config across a transient file replace.
+  if (!options.failOnInvalid) {
+    const cached = lastKnownGoodConfig(appHome);
+    if (cached) return cached;
+  }
+
+  const config = ensureDefaultProfile(
     normalizeResponsesApiConfig(applyExternalModelConfig(defaults as unknown as AppConfig, appHome)),
   );
+  rememberEffectiveConfig(appHome, config);
+  return config;
 }
 
 /**
@@ -1174,6 +1226,7 @@ export function writeDesktopConfig(appHome: string, config: AppConfig): void {
   // Atomic write with mode 0o600 enforced on the temp before rename, so the
   // secret never lands with wider perms and a crash can't leave a torn file.
   atomicWriteFileSync(configPath, JSON.stringify(desktopConfigPayload(config), null, 2), { mode: 0o600 });
+  rememberEffectiveConfig(appHome, config);
 }
 
 function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
@@ -1219,12 +1272,31 @@ export function registerConfigHandlers(
   ipcMain: IpcMain,
   appHome: string,
   onChanged?: (config: AppConfig) => void,
+  mayWriteBrowserConfig: (event: unknown) => boolean = () => false,
+  onBrowserChanged?: (config: AppConfig['browser']) => void,
 ): { setConfig: (path: string, value: unknown) => void } {
   let currentConfig = readEffectiveConfig(appHome);
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
+  let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
 
   // Watch for external config changes
   const configPath = getDesktopSettingsPath(appHome);
+  const desktopSettingsDir = dirname(configPath);
+  const desktopSettingsBasename = basename(configPath);
+  // Once desktop.json has existed, a missing file during an external reload is
+  // treated as an editor replace window rather than permission to fall back to
+  // Browser defaults. Before first creation, however, llm.json is independently
+  // authoritative and must remain hot-reloadable.
+  let desktopSettingsEstablished = existsSync(configPath);
+  const readWatchedConfig = (): AppConfig => {
+    const allowMissingDesktopConfig = !desktopSettingsEstablished && !existsSync(configPath);
+    const next = readEffectiveConfig(appHome, {
+      failOnInvalid: true,
+      allowMissingDesktopConfig,
+    });
+    if (existsSync(configPath)) desktopSettingsEstablished = true;
+    return next;
+  };
   let reloadDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let broadcastTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1249,9 +1321,22 @@ export function registerConfigHandlers(
     broadcastTimer = setTimeout(flushConfigBroadcast, 25);
   };
 
+  // Browser lifecycle/security changes cannot wait for the renderer-broadcast
+  // debounce: a disable followed quickly by an enable must still revoke every
+  // capability minted by the disabled lifetime. External reloads are deduped
+  // against the last observed Browser value; persisted Browser writes are
+  // forced through even when a caller writes the same value deliberately.
+  const publishBrowserConfig = (force: boolean): void => {
+    const snapshot = JSON.stringify(currentConfig.browser);
+    if (!force && snapshot === lastBrowserSnapshot) return;
+    lastBrowserSnapshot = snapshot;
+    onBrowserChanged?.(structuredClone(currentConfig.browser));
+  };
+
   const applyReload = () => {
     try {
-      currentConfig = readEffectiveConfig(appHome);
+      currentConfig = readWatchedConfig();
+      publishBrowserConfig(false);
       // External edit to desktop.json (enabled/content/scopes/retention) must
       // take effect without an internal write or restart.
       invalidateDiagnosticTraceConfig();
@@ -1262,6 +1347,19 @@ export function registerConfigHandlers(
   };
 
   const reloadConfig = () => {
+    // Do not put Browser lifecycle changes behind the general file-watch
+    // debounce. Atomic external edits normally emit more than one fs event;
+    // snapshot deduplication makes those cheap while preserving a disable that
+    // is followed quickly by an enable.
+    try {
+      const nextConfig = readWatchedConfig();
+      if (JSON.stringify(nextConfig.browser) !== lastBrowserSnapshot) {
+        currentConfig = nextConfig;
+        publishBrowserConfig(false);
+      }
+    } catch {
+      // The debounced retry below handles transient editor replace windows.
+    }
     if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
     reloadDebounceTimer = setTimeout(() => {
       reloadDebounceTimer = null;
@@ -1304,10 +1402,25 @@ export function registerConfigHandlers(
   for (const [dir, basenames] of watchedBasenamesByDir) {
     try {
       mkdirSync(dir, { recursive: true });
-      watch(dir, (_event, changed) => {
+      const watcher = watch(dir, (_event, changed) => {
         // Some platforms report a null filename; fall back to reloading.
-        if (changed == null || basenames.has(changed)) reloadConfig();
+        if (changed == null || basenames.has(changed)) {
+          // Seeing desktop.json itself means future absence must fail closed,
+          // even if this particular event caught a partial or malformed write.
+          if (
+            dir === desktopSettingsDir &&
+            (changed === desktopSettingsBasename || (changed == null && existsSync(configPath)))
+          ) {
+            desktopSettingsEstablished = true;
+          }
+          reloadConfig();
+        }
       });
+      // Native watcher setup can fail asynchronously (for example if an
+      // external cleanup removes the directory immediately after watch()). The
+      // watcher is best-effort, so do not let its EventEmitter error terminate
+      // the main process.
+      watcher.on('error', (error) => console.warn('[Config] Settings watcher stopped:', error));
     } catch {
       // Watching is best-effort; config still loads and persists without it.
     }
@@ -1323,6 +1436,7 @@ export function registerConfigHandlers(
     flushPendingReload();
     if (path === 'models') {
       currentConfig = readEffectiveConfig(appHome);
+      publishBrowserConfig(false);
       scheduleConfigBroadcast();
       return;
     }
@@ -1346,6 +1460,7 @@ export function registerConfigHandlers(
       setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
       validateOrRollback();
       writeDesktopConfig(appHome, currentConfig);
+      desktopSettingsEstablished = true;
 
       // Also persist to llm.json for built-in provider paths
       if (path === 'models.defaultModelKey' || path === 'models.catalog') {
@@ -1358,32 +1473,42 @@ export function registerConfigHandlers(
       }
 
       currentConfig = readEffectiveConfig(appHome);
+      publishBrowserConfig(false);
       scheduleConfigBroadcast();
       return;
     }
 
-    setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
+    try {
+      setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
 
-    // Security: never let the web server start in password mode with an empty
-    // password. Auto-generate one whenever a webServer.* write would leave the
-    // server enabled in password mode without a credential — covers first
-    // enable, switching auth.mode anonymous→password while enabled, and
-    // clearing the password while enabled.
-    if (
-      path.startsWith('webServer.') &&
-      currentConfig.webServer?.enabled &&
-      currentConfig.webServer?.auth?.mode === 'password' &&
-      !currentConfig.webServer?.auth?.password
-    ) {
-      setNestedValue(
-        currentConfig as unknown as Record<string, unknown>,
-        'webServer.auth.password',
-        randomBytes(12).toString('base64url'),
-      );
+      // Security: never let the web server start in password mode with an empty
+      // password. Auto-generate one whenever a webServer.* write would leave the
+      // server enabled in password mode without a credential — covers first
+      // enable, switching auth.mode anonymous→password while enabled, and
+      // clearing the password while enabled.
+      if (
+        path.startsWith('webServer.') &&
+        currentConfig.webServer?.enabled &&
+        currentConfig.webServer?.auth?.mode === 'password' &&
+        !currentConfig.webServer?.auth?.password
+      ) {
+        setNestedValue(
+          currentConfig as unknown as Record<string, unknown>,
+          'webServer.auth.password',
+          randomBytes(12).toString('base64url'),
+        );
+      }
+      validateOrRollback();
+      writeDesktopConfig(appHome, currentConfig);
+    } catch (error) {
+      // Roll back every failure after mutation, including transformation and
+      // persistence errors that happen before/after schema validation.
+      currentConfig = snapshot;
+      throw error;
     }
-    validateOrRollback();
-    writeDesktopConfig(appHome, currentConfig);
+    desktopSettingsEstablished = true;
     currentConfig = readEffectiveConfig(appHome);
+    publishBrowserConfig(path === 'browser' || path.startsWith('browser.'));
     scheduleConfigBroadcast();
   };
 
@@ -1391,7 +1516,14 @@ export function registerConfigHandlers(
     return currentConfig;
   });
 
-  ipcMain.handle('config:set', (_event, path: string, value: unknown) => {
+  ipcMain.handle('config:set', (event, path: string, value: unknown) => {
+    // Browser policy controls access to an authenticated native Chromium
+    // profile. Web clients and secondary/plugin renderers may change ordinary
+    // app settings, but must not weaken script/action/password/private-network
+    // policy or switch the Browser data scope behind the primary UI.
+    if ((path === 'browser' || path.startsWith('browser.')) && !mayWriteBrowserConfig(event)) {
+      throw new Error('Browser settings can only be changed from the primary Kai window.');
+    }
     setConfigImpl(path, value);
     return currentConfig;
   });

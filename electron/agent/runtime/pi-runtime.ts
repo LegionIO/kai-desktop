@@ -223,7 +223,7 @@ export class PiRuntime implements AgentRuntime {
     if (bridgeableTools.length > 0) {
       try {
         piBridge = new PiToolBridge();
-        const handle = await piBridge.start(bridgeableTools, conversationId, cwd, abortSignal);
+        const handle = await piBridge.start(bridgeableTools, conversationId, cwd, abortSignal, options.browserOwnerId);
         if (handle) {
           args.push('-e', handle.extensionPath);
           env[handle.urlEnvVar] = handle.url;

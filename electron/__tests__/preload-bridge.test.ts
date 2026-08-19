@@ -25,6 +25,7 @@ import { describe, it, expect, vi, beforeAll } from 'vitest';
 // Capture the object passed to `contextBridge.exposeInMainWorld`.
 let exposedAPI: Record<string, Record<string, unknown>> | undefined;
 const invokeMock = vi.fn();
+const sendMock = vi.fn();
 const onMock = vi.fn();
 const removeListenerMock = vi.fn();
 
@@ -41,6 +42,7 @@ vi.mock('electron', () => ({
       // not blow up with "Cannot read property of undefined".
       return Promise.resolve(undefined);
     },
+    send: sendMock,
     on: onMock,
     removeListener: removeListenerMock,
   },
@@ -55,6 +57,11 @@ beforeAll(async () => {
 describe('preload bridge contract', () => {
   it('exposes the `app` namespace via contextBridge.exposeInMainWorld', () => {
     expect(exposedAPI).toBeDefined();
+  });
+
+  it('privately announces that the replacement renderer bridge is ready', () => {
+    expect(sendMock).toHaveBeenCalledWith('browser:host-renderer-ready');
+    expect(exposedAPI).not.toHaveProperty('browserHostRendererReady');
   });
 
   // Every namespace the renderer code consumes from `window.app.*`. If a new
@@ -85,6 +92,7 @@ describe('preload bridge contract', () => {
     'mic',
     'usage',
     'autoUpdate',
+    'browser',
     'partitions',
     'debug',
     'dictation',
@@ -100,12 +108,35 @@ describe('preload bridge contract', () => {
   // the assertion catches a typo/rename without being overly brittle.
   const namespaceMethodChecks: Array<{ ns: keyof typeof exposedAPIShape; methods: string[] }> = [
     { ns: 'config', methods: ['get', 'set', 'onChanged'] },
-    { ns: 'agent', methods: ['stream', 'cancelStream', 'approveToolCall', 'rejectToolCall', 'onStreamEvent'] },
+    {
+      ns: 'agent',
+      methods: [
+        'stream',
+        'cancelStream',
+        'getToolApprovalPrivateDetails',
+        'approveToolCall',
+        'rejectToolCall',
+        'onStreamEvent',
+      ],
+    },
     { ns: 'conversations', methods: ['list', 'get', 'put', 'delete', 'getActiveId', 'setActiveId'] },
     { ns: 'workspaces', methods: ['create', 'rename', 'delete', 'setActive'] },
     { ns: 'memory', methods: ['clear', 'testEmbedding'] },
     { ns: 'mcp', methods: ['testConnection'] },
     { ns: 'plugins', methods: ['pause', 'resume', 'kill', 'disable', 'enable'] },
+    {
+      ns: 'browser',
+      methods: [
+        'available',
+        'getState',
+        'createTab',
+        'navigate',
+        'setChromeFocus',
+        'screenshot',
+        'credentialAuthenticationAvailable',
+        'onEvent',
+      ],
+    },
     { ns: 'dialog', methods: [] },
   ];
 
@@ -134,6 +165,15 @@ describe('preload bridge contract', () => {
     expect(invokeMock).toHaveBeenCalledWith('conversations:put', payload);
   });
 
+  it('agent.getToolApprovalPrivateDetails(...) uses the private approval channel', async () => {
+    invokeMock.mockClear();
+    const agentNs = exposedAPI?.agent as {
+      getToolApprovalPrivateDetails: (toolCallId: string) => Promise<unknown>;
+    };
+    await agentNs.getToolApprovalPrivateDetails('browser-approval-1');
+    expect(invokeMock).toHaveBeenCalledWith('agent:get-tool-approval-private-details', 'browser-approval-1');
+  });
+
   it('config.onChanged subscribes via ipcRenderer.on and returns an unsubscribe', () => {
     onMock.mockClear();
     removeListenerMock.mockClear();
@@ -160,6 +200,51 @@ describe('preload bridge contract', () => {
     await pluginsNs[method]('fixture-plugin');
     expect(invokeMock).toHaveBeenCalledWith(channel, 'fixture-plugin');
   });
+
+  it.each([
+    [
+      'respondCredentialPrompt',
+      ['credential-prompt-1', true],
+      ['browser:respond-credential', 'credential-prompt-1', true],
+    ],
+    [
+      'respondAuthPrompt',
+      ['auth-prompt-1', 'alice', 'page-password'],
+      ['browser:respond-auth', 'auth-prompt-1', 'alice', 'page-password'],
+    ],
+    [
+      'respondPermissionPrompt',
+      ['permission-prompt-1', 'allow-once'],
+      ['browser:respond-permission', 'permission-prompt-1', 'allow-once'],
+    ],
+    ['autofill', ['chat-1', 'tab-1', 'credential-1'], ['browser:autofill', 'chat-1', 'tab-1', 'credential-1']],
+    [
+      'resetSitePermissions',
+      ['chat-1', 'https://example.com', 'camera'],
+      ['browser:reset-site-permissions', 'chat-1', 'https://example.com', 'camera'],
+    ],
+    [
+      'clearData',
+      [{ conversationId: 'chat-1', includeGlobal: true, includeConversation: true }],
+      ['browser:clear-data', { conversationId: 'chat-1', includeGlobal: true, includeConversation: true }],
+    ],
+  ] as const)('browser.%s routes sensitive operations through the matching channel', async (method, args, expected) => {
+    invokeMock.mockClear();
+    const browserNs = exposedAPI?.browser as Record<string, (...values: unknown[]) => Promise<unknown>>;
+    await browserNs[method](...args);
+    expect(invokeMock).toHaveBeenCalledWith(...expected);
+  });
+
+  it('browser.onEvent subscribes and unsubscribes on the Browser event channel', () => {
+    onMock.mockClear();
+    removeListenerMock.mockClear();
+    const browserNs = exposedAPI?.browser as { onEvent: (callback: (event: unknown) => void) => () => void };
+    const unsubscribe = browserNs.onEvent(vi.fn());
+
+    expect(onMock).toHaveBeenCalledWith('browser:event', expect.any(Function));
+    unsubscribe();
+    expect(removeListenerMock).toHaveBeenCalledWith('browser:event', expect.any(Function));
+  });
 });
 
 // Local shape map — keyof drives the `it.each` type narrowing above.
@@ -172,5 +257,6 @@ const exposedAPIShape = {
   memory: 1,
   mcp: 1,
   plugins: 1,
+  browser: 1,
   dialog: 1,
 } as const;

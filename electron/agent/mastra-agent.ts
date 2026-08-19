@@ -37,6 +37,7 @@ import {
 } from './prepare-step-inject.js';
 import { createRecentHistoryReconciler } from './recent-history-reconciler.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { redactBrowserErrorForExposure, redactBrowserToolErrorForExposure } from '../../shared/browser.js';
 
 export type { ReasoningEffort } from './model-catalog.js';
 
@@ -279,7 +280,7 @@ function toMastraTools(
   } & ToolLifecycleHooks,
   executionContext?: Pick<
     ToolExecutionContext,
-    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'planModeGateable'
+    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'planModeGateable' | 'browserOwnerId'
   >,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
@@ -331,6 +332,7 @@ function toMastraTools(
           const ctx: ToolExecutionContext = {
             toolCallId,
             conversationId,
+            browserOwnerId: executionContext?.browserOwnerId,
             cwd: executionContext?.cwd,
             isHeadless: executionContext?.isHeadless,
             parentProfileKey: executionContext?.parentProfileKey,
@@ -1234,6 +1236,7 @@ export async function* streamAgentResponse(
      *  inherit the parent's profile + fallback chain. */
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
     /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
@@ -1310,6 +1313,7 @@ export async function* streamAgentResponse(
       parentProfileKey: options?.parentProfileKey,
       parentModelKey: options?.parentModelKey,
       planModeGateable: options?.planModeGateable,
+      browserOwnerId: options?.browserOwnerId,
     },
   );
   // Provider-DEFINED tools (server-side web_search / code_interpreter / bash / computer, from
@@ -1550,6 +1554,7 @@ async function* generateWithSyntheticEvents(
       break;
     } catch (error) {
       const emittedAnyOutput = eventQueue.length > 0;
+      const exposedErrorMessage = redactBrowserErrorForExposure(error);
       // If the caller aborted, do NOT retry — skip all retry branches and fall
       // through to the terminal path (which suppresses the error event for an
       // abort). Otherwise a cancel during the error/backoff window would still
@@ -1565,7 +1570,7 @@ async function* generateWithSyntheticEvents(
         activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
         console.warn(
           `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
-          getErrorMessage(error),
+          exposedErrorMessage,
         );
         continue;
       }
@@ -1574,7 +1579,7 @@ async function* generateWithSyntheticEvents(
         activeMessages = deepSanitizeMessages(activeMessages);
         console.warn(
           `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
-          getErrorMessage(error),
+          exposedErrorMessage,
         );
         continue;
       }
@@ -1586,7 +1591,7 @@ async function* generateWithSyntheticEvents(
         const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
         console.warn(
           `[Agent:generate] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
-          errorInfo.message,
+          exposedErrorMessage,
         );
 
         yield {
@@ -1596,7 +1601,7 @@ async function* generateWithSyntheticEvents(
             attempt: attempt + 1,
             maxRetries: MAX_RETRIES,
             delayMs: delay,
-            reason: errorInfo.message,
+            reason: exposedErrorMessage,
             category: errorInfo.category,
           },
         };
@@ -1610,11 +1615,11 @@ async function* generateWithSyntheticEvents(
       }
 
       if (!options?.abortSignal?.aborted) {
-        console.error(`[Agent] Generate error for ${conversationId}:`, error);
+        console.error(`[Agent] Generate error for ${conversationId}:`, exposedErrorMessage);
         yield {
           conversationId,
           type: 'error',
-          error: error instanceof Error ? error.message : String(error),
+          error: exposedErrorMessage,
           errorCategory: errorInfo.category,
           errorStatusCode: errorInfo.statusCode,
         };
@@ -1785,18 +1790,19 @@ async function* streamWithRealEvents(
               const finishedAt = new Date().toISOString();
               const started = toolStartByCallId.get(toolCallId);
               toolStartByCallId.delete(toolCallId);
+              const toolName = (payload?.toolName as string) ?? started?.toolName ?? '';
               yield {
                 conversationId,
                 type: 'tool-result',
                 toolCallId,
-                toolName: (payload?.toolName as string) ?? started?.toolName ?? '',
-                result: { isError: true, error: payload?.error },
+                toolName,
+                result: { isError: true, error: redactBrowserToolErrorForExposure(toolName, payload?.error) },
                 startedAt: started?.startedAt ?? finishedAt,
                 finishedAt,
               };
             } else if (type === 'error') {
               const rawError = payload?.error ?? payload ?? 'Unknown stream error';
-              const errorMessage = getErrorMessage(rawError);
+              const errorMessage = redactBrowserErrorForExposure(rawError);
               if (
                 !compatibilityRetried &&
                 shouldRetryWithoutTemperature(rawError, activeModelSettings, emittedAnyOutput)
@@ -1941,6 +1947,7 @@ async function* streamWithRealEvents(
           break;
         } catch (error) {
           if (options?.abortSignal?.aborted) break compatibilityLoop;
+          const exposedErrorMessage = redactBrowserErrorForExposure(error);
 
           // Temperature compatibility retry (special case — not counted as a retry attempt)
           if (!compatibilityRetried && shouldRetryWithoutTemperature(error, activeModelSettings, emittedAnyOutput)) {
@@ -1949,7 +1956,7 @@ async function* streamWithRealEvents(
             activeModelConfig = withTemperatureOmissionHeader(activeModelConfig);
             console.warn(
               `[Agent] Retrying ${conversationId} without temperature after compatibility error:`,
-              getErrorMessage(error),
+              exposedErrorMessage,
             );
             yield {
               conversationId,
@@ -1971,7 +1978,7 @@ async function* streamWithRealEvents(
             activeMessages = deepSanitizeMessages(activeMessages);
             console.warn(
               `[Agent] Retrying ${conversationId} with sanitized messages after provider mismatch:`,
-              getErrorMessage(error),
+              exposedErrorMessage,
             );
             yield {
               conversationId,
@@ -1995,7 +2002,7 @@ async function* streamWithRealEvents(
             const delay = calculateDelay(attempt, errorInfo, BASE_DELAY_MS, MAX_DELAY_MS);
             console.warn(
               `[Agent] Transient ${errorInfo.category} error for ${conversationId} (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms:`,
-              errorInfo.message,
+              exposedErrorMessage,
             );
 
             // Emit retry event so UI can show progress
@@ -2006,7 +2013,7 @@ async function* streamWithRealEvents(
                 attempt: attempt + 1,
                 maxRetries: MAX_RETRIES,
                 delayMs: delay,
-                reason: errorInfo.message,
+                reason: exposedErrorMessage,
                 category: errorInfo.category,
               },
             };
@@ -2019,12 +2026,12 @@ async function* streamWithRealEvents(
             continue;
           }
 
-          console.error(`[Agent] Stream error for ${conversationId}:`, error);
+          console.error(`[Agent] Stream error for ${conversationId}:`, exposedErrorMessage);
           emittedTerminalError = true;
           yield {
             conversationId,
             type: 'error',
-            error: getErrorMessage(error),
+            error: exposedErrorMessage,
             errorCategory: errorInfo.category,
             errorStatusCode: errorInfo.statusCode,
           };
@@ -2122,6 +2129,7 @@ export async function* streamWithFallback(
     isHeadless?: boolean;
     parentProfileKey?: string | null;
     parentModelKey?: string | null;
+    browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
     /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
@@ -2384,6 +2392,7 @@ export async function* streamWithFallback(
       }
 
       const outerInfo = classifyError(outerError);
+      const exposedOuterError = redactBrowserErrorForExposure(outerError);
       // Fall back on a thrown error when fallbacks remain, IF either no content
       // was emitted yet, OR the error is transient (mid-stream provider failure).
       // A non-transient throw after content stays terminal (yielded below).
@@ -2405,7 +2414,7 @@ export async function* streamWithFallback(
             fromModelKey: entry.key,
             toModel: nextEntry.displayName,
             toModelKey: nextEntry.key,
-            error: getErrorMessage(outerError),
+            error: exposedOuterError,
             reason: 'transient',
             // Preserve the partial as a variant only if content actually streamed.
             preserveErroredVariant: emittedContent,
@@ -2431,7 +2440,7 @@ export async function* streamWithFallback(
       yield {
         conversationId,
         type: 'error',
-        error: getErrorMessage(outerError),
+        error: exposedOuterError,
         errorCategory: terminalCategory,
         errorStatusCode: lastErrorInfo.statusCode,
         ...(terminalCategory === 'context-overflow' && lastErrorInfo.category !== 'context-overflow'

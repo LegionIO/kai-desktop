@@ -16,6 +16,7 @@ import { BrowserWindow } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import type { StreamEvent } from '../agent/mastra-agent.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 
 // ---------------------------------------------------------------------------
 // Pending tool approvals
@@ -41,7 +42,40 @@ type PendingApproval = { resolve: (approved: boolean | 'dismiss', source?: Appro
  * the caller registers a pending entry and awaits the returned Promise.
  * The IPC handlers in agent.ts resolve the entry when the user responds.
  */
-export const pendingToolApprovals = new Map<string, PendingApproval>();
+export type ToolApprovalAuthority = 'any-renderer' | 'native-browser';
+
+/** A pending approval that belongs to a Browser-authorized text or Realtime
+ * turn. Realtime owners supply their own liveness check because they are not
+ * represented in agent.ts's activeStreams map. */
+export type ToolApprovalStreamOwner = {
+  conversationId: string;
+  streamToken: string;
+  isCurrent?: () => boolean;
+};
+
+export type ToolApprovalPrivateDetails = {
+  browserInput: unknown;
+};
+
+/** A pending approval. `resolve` accepts an optional CATEGORICAL settle `source`
+ *  (R94, ask_user-race) so the IPC handler that settles the entry can name the
+ *  true reason for the trace (answered vs approve vs abort vs duplicate-evict);
+ *  when omitted it is derived from the resolved value. Also carries main's
+ *  Browser/Realtime authority + streamOwner + one-shot pop-out plumbing. */
+export type PendingToolApproval = {
+  resolve: (approved: boolean | 'dismiss', source?: ApprovalSettleSource) => void;
+  authority: ToolApprovalAuthority;
+  streamOwner?: ToolApprovalStreamOwner;
+  /** Exact Browser input shown only through the authority-checked native
+   * approval-details IPC. Never include this value in stream events, logs,
+   * persistence, observer output, or web-client broadcasts. */
+  privateDetails?: ToolApprovalPrivateDetails;
+  /** One-shot capability for the dedicated approval pop-out created for this
+   * exact approval id. Deleted with the pending entry on every settle path. */
+  approvalWindowWebContentsId?: number;
+};
+
+export const pendingToolApprovals = new Map<string, PendingToolApproval>();
 
 /** Optional diagnostic context for an approval, so the (previously invisible)
  *  approve/reject/dismiss/abort lifecycle shows up in the diagnostic trace. */
@@ -67,11 +101,124 @@ function settleReason(value: boolean | 'dismiss', aborted: boolean): ApprovalSet
   return 'dismiss';
 }
 
+/** Dismiss only native Browser policy prompts for one assistant owner. Generic
+ * approvals remain live while the owning text/Realtime turn itself is current. */
+export function dismissPendingNativeBrowserApprovalsForOwner(conversationId: string, browserOwnerId: string): void {
+  for (const pending of pendingToolApprovals.values()) {
+    const owner = pending.streamOwner;
+    if (
+      pending.authority === 'native-browser' &&
+      owner?.conversationId === conversationId &&
+      owner.streamToken === browserOwnerId
+    ) {
+      pending.resolve('dismiss');
+    }
+  }
+}
+
+type ApprovalOwnerResolver = (
+  conversationId: string,
+  browserOwnerId: string,
+  authority: ToolApprovalAuthority,
+) => ToolApprovalStreamOwner | undefined;
+
+let approvalOwnerResolver: ApprovalOwnerResolver | null = null;
+let rawApprovalWindowOpener: ((event: StreamEvent) => void) | null = null;
+let rawApprovalWindowCloser: ((toolCallId: string) => void) | null = null;
+let primaryApprovalWindowResolver: (() => BrowserWindow | null) | null = null;
+
+/** Bind approval ownership to agent.ts without importing it here (which would
+ * create an IPC/runtime cycle). */
+export function setToolApprovalOwnerResolver(resolver: ApprovalOwnerResolver | null): void {
+  approvalOwnerResolver = resolver;
+}
+
+/** Install the pop-out opener for approvals emitted through the low-level raw
+ * broadcaster (Browser, MCP bridge, and Claude SDK tool paths). */
+export function setRawApprovalWindowOpener(opener: ((event: StreamEvent) => void) | null): void {
+  rawApprovalWindowOpener = opener;
+}
+
+/** Install the matching pop-out closer. Resolution can happen through abort,
+ * duplicate eviction, Realtime teardown, or authority revocation without
+ * passing through agent.ts's renderer IPC handlers. */
+export function setRawApprovalWindowCloser(closer: ((toolCallId: string) => void) | null): void {
+  rawApprovalWindowCloser = closer;
+}
+
+/** Browser-control prompts contain private page/action metadata. Route them
+ * only to Kai's primary renderer and the exact one-shot approval pop-out. */
+export function setPrimaryApprovalWindowResolver(resolver: (() => BrowserWindow | null) | null): void {
+  primaryApprovalWindowResolver = resolver;
+}
+
+/** Grant the dedicated window created for this exact pending request authority
+ * to resolve it. Returns false if registration has not happened yet, making a
+ * broadcast-before-register regression fail closed. */
+export function authorizePendingApprovalWindow(toolCallId: string, webContentsId: number): boolean {
+  const pending = pendingToolApprovals.get(toolCallId);
+  if (!pending || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
+  pending.approvalWindowWebContentsId = webContentsId;
+  return true;
+}
+
+/** Web clients cannot own the native Browser sidebar. Hide both Browser tool
+ * approvals and generic question/plan approvals belonging to a Browser-
+ * authorized stream; the IPC resolver separately enforces the same boundary. */
+export function mayBroadcastApprovalToWebClients(event: StreamEvent): boolean {
+  if (event.type !== 'tool-approval-required') return true;
+  const approvalArgs =
+    event.args && typeof event.args === 'object' && !Array.isArray(event.args)
+      ? (event.args as Record<string, unknown>)
+      : null;
+  if (approvalArgs?.approvalKind === 'browser-control') return false;
+  return !event.toolCallId || !pendingToolApprovals.get(event.toolCallId)?.streamOwner;
+}
+
+/** Return the only Electron renderer ids allowed to receive a Browser-owned
+ * approval, or null when the event is unrestricted. Both stream broadcasters
+ * use this so generic question/plan approvals cannot leak through one path. */
+export function resolveApprovalBroadcastWindowIds(event: StreamEvent): Set<number> | null {
+  if (event.type !== 'tool-approval-required') return null;
+  const approvalArgs =
+    event.args && typeof event.args === 'object' && !Array.isArray(event.args)
+      ? (event.args as Record<string, unknown>)
+      : null;
+  const pendingApproval = event.toolCallId ? pendingToolApprovals.get(event.toolCallId) : undefined;
+  const restricted =
+    pendingApproval?.authority === 'native-browser' ||
+    Boolean(pendingApproval?.streamOwner) ||
+    approvalArgs?.approvalKind === 'browser-control';
+  if (!restricted) return null;
+
+  const authorizedWindowIds = new Set<number>();
+  try {
+    const primary = primaryApprovalWindowResolver?.();
+    if (primary && !primary.isDestroyed() && !primary.webContents.isDestroyed()) {
+      authorizedWindowIds.add(primary.webContents.id);
+    }
+  } catch {
+    // Missing primary authority fails closed; an exact pop-out may still be authorized.
+  }
+  if (pendingApproval?.approvalWindowWebContentsId) {
+    authorizedWindowIds.add(pendingApproval.approvalWindowWebContentsId);
+  }
+  return authorizedWindowIds;
+}
+
+export type ToolApprovalRegistrationContext = {
+  conversationId?: string;
+  browserOwnerId?: string;
+  privateDetails?: ToolApprovalPrivateDetails;
+};
+
 /**
  * Register a pending approval for a tool call and return a Promise that
  * resolves when the user approves, rejects, or dismisses.
  *
- * If an `abortSignal` is provided, aborting it will reject with 'dismiss'.
+ * If an `abortSignal` is provided, aborting a registered approval resolves it
+ * with 'dismiss'. A signal already aborted at registration throws synchronously
+ * so callers cannot broadcast UI for an approval that was never registered.
  *
  * ⚠️ The resolved value is `true` (approved), `false` (rejected), or the string
  * `'dismiss'` (dismissed/aborted). `'dismiss'` is TRUTHY — callers MUST gate on
@@ -85,8 +232,39 @@ function settleReason(value: boolean | 'dismiss', aborted: boolean): ApprovalSet
 export function registerPendingApproval(
   toolCallId: string,
   abortSignal?: AbortSignal,
+  authority: ToolApprovalAuthority = 'any-renderer',
+  context?: ToolApprovalRegistrationContext,
   trace?: ApprovalTraceContext,
 ): Promise<boolean | 'dismiss'> {
+  // Callers synchronously broadcast the approval UI immediately after this
+  // function returns. Fail synchronously when cancellation already happened so
+  // they cannot publish a prompt whose map entry was removed before the UI was
+  // created. Once registration returns, the following broadcast is in the same
+  // main-process turn and cannot race a later AbortController.abort().
+  if (abortSignal?.aborted) {
+    throw new Error('Tool approval was canceled before it could be registered.');
+  }
+  const hasExplicitBrowserOwner =
+    typeof context?.conversationId === 'string' &&
+    context.conversationId.length > 0 &&
+    typeof context.browserOwnerId === 'string' &&
+    context.browserOwnerId.length > 0;
+  let streamOwner: ToolApprovalStreamOwner | undefined;
+  if (hasExplicitBrowserOwner) {
+    try {
+      streamOwner = approvalOwnerResolver?.(context.conversationId!, context.browserOwnerId!, authority);
+    } catch {
+      streamOwner = undefined;
+    }
+  }
+  // Browser policy prompts are capabilities of one exact text/Realtime run.
+  // Target capture can await; if that owner was revoked during the await, do
+  // not create an unowned native prompt after the revoker already swept the
+  // pending map. Throw synchronously so the caller cannot broadcast a stale
+  // approval card before observing the failure.
+  if (authority === 'native-browser' && hasExplicitBrowserOwner && !streamOwner) {
+    throw new Error('Browser approval is no longer authorized for this assistant turn.');
+  }
   // A duplicate toolCallId would overwrite the map entry and orphan the prior
   // waiter's resolver forever (its Promise never settles → the earlier tool
   // call hangs). Settle any existing entry fail-closed (deny) before replacing.
@@ -139,21 +317,28 @@ export function registerPendingApproval(
       } catch {
         /* observer must never break the settle path */
       }
+      try {
+        rawApprovalWindowCloser?.(toolCallId);
+      } catch {
+        // Approval settlement must not depend on an optional window surface.
+      }
       resolve(value);
     };
 
-    // The stored resolver forwards the explicit settle source (e.g. `answered`
-    // from agent:answer-tool-question, `duplicate-evict` from an eviction) so the
-    // trace records the true reason rather than one derived only from the value.
-    pendingToolApprovals.set(toolCallId, { resolve: (value, source) => settle(value, source) });
+    // The stored resolver (`settle`) forwards the explicit settle source (e.g. `answered` from
+    // agent:answer-tool-question, `duplicate-evict` from an eviction) so the trace records the true
+    // reason rather than one derived only from the value. Carries main's Browser/Realtime authority
+    // + streamOwner + privateDetails.
+    pendingToolApprovals.set(toolCallId, {
+      resolve: settle,
+      authority,
+      ...(streamOwner ? { streamOwner } : {}),
+      ...(context?.privateDetails ? { privateDetails: context.privateDetails } : {}),
+    });
 
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        settle('dismiss', 'abort');
-      } else {
-        abortSignal.addEventListener('abort', onAbort, { once: true });
-      }
-    }
+    // An already-aborted signal was rejected synchronously at the top of registerPendingApproval,
+    // so here we only need to attach the listener for a future abort.
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -185,11 +370,29 @@ export function setServerPersistTagger(fn: (event: StreamEvent) => StreamEvent):
  * persist a partial branch.
  */
 export function broadcastStreamEventRaw(event: StreamEvent): void {
-  const tagged = serverPersistTagger ? serverPersistTagger(event) : event;
-  // Per-recipient guarded fan-out: one window's send throwing must not abort delivery
-  // to the rest or propagate to the caller — a raw loop that threw here could drop the
-  // event on the run-owning renderer and leave a turn stuck (R106 finding-1).
+  const exposedEvent: StreamEvent =
+    event.type === 'tool-call'
+      ? { ...event, args: redactBrowserToolArgsForExposure(event.toolName, event.args) }
+      : event;
+  const tagged = serverPersistTagger ? serverPersistTagger(exposedEvent) : exposedEvent;
+  if (event.type === 'tool-approval-required' && event.toolCallId) {
+    // Callers register synchronously BEFORE broadcasting. That lets the opener
+    // attach its exact webContents id to the pending entry before a renderer can
+    // answer, closing both the response-before-registration race and the generic
+    // Browser-approval bypass of the dedicated-window path.
+    try {
+      rawApprovalWindowOpener?.(event);
+    } catch {
+      // Approval remains available inline; never fail the tool because the
+      // optional pop-out could not be created.
+    }
+  }
+  const authorizedWindowIds = resolveApprovalBroadcastWindowIds(event);
+  // Per-recipient guarded fan-out: one window's send throwing must not abort delivery to the rest
+  // or propagate to the caller — a raw loop that threw here could drop the event on the run-owning
+  // renderer and leave a turn stuck (R106 finding-1).
   for (const win of BrowserWindow.getAllWindows()) {
+    if (authorizedWindowIds && !authorizedWindowIds.has(win.webContents.id)) continue;
     try {
       if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
         win.webContents.send('agent:stream-event', tagged);
@@ -198,9 +401,15 @@ export function broadcastStreamEventRaw(event: StreamEvent): void {
       /* window disappeared between check and send; keep fanning out */
     }
   }
-  try {
-    broadcastToWebClients('agent:stream-event', tagged);
-  } catch {
-    /* best-effort remote fan-out */
+  // Web clients cannot own or render the native Browser sidebar. Do not expose
+  // an actionable-looking Browser approval card on a surface that is forbidden
+  // from resolving it; the main-process resolver independently enforces the
+  // same authority if a client invokes the raw channel anyway.
+  if (mayBroadcastApprovalToWebClients(event)) {
+    try {
+      broadcastToWebClients('agent:stream-event', tagged);
+    } catch {
+      /* best-effort remote fan-out */
+    }
   }
 }

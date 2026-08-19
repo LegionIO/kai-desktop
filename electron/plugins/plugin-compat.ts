@@ -55,6 +55,7 @@ const HOST_CAPABILITIES: ReadonlySet<string> = new Set([
   'agent:inference-provider',
   'safe-storage',
   'browser:window',
+  'browser:authenticated-session',
   'exec:whitelisted',
   'system:env',
   'audit:log',

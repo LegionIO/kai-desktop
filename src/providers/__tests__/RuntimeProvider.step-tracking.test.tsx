@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act, waitFor } from '@testing-library/react';
 import { type ReactNode } from 'react';
-import { RuntimeProvider, useStepTracking, useRuntimeConversationId } from '../RuntimeProvider';
+import { RuntimeProvider, useRuntimeNotice, useStepTracking, useRuntimeConversationId } from '../RuntimeProvider';
 import { AttachmentProvider } from '../AttachmentContext';
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,7 @@ vi.mock('@/lib/ipc-client', () => ({
     platform: {
       homedir: (...args: unknown[]) => mockHomedir(...args),
     },
+    realtime: {},
   },
 }));
 
@@ -339,6 +340,7 @@ const ACTIVE_CONV_ID = 'conv-active';
 function StepTrackingConsumer() {
   const { stepInfo, showIncompleteTaskBanner, onContinueTask, onAdjustSettings, onDismissBanner } = useStepTracking();
   const activeConvId = useRuntimeConversationId();
+  const runtimeNotice = useRuntimeNotice();
   return (
     <div>
       <span data-testid="active-conv-id">{activeConvId ?? 'null'}</span>
@@ -346,6 +348,7 @@ function StepTrackingConsumer() {
       <span data-testid="max-steps">{stepInfo?.maxSteps ?? 'null'}</span>
       <span data-testid="hit-limit">{stepInfo?.hitLimit ? 'true' : 'false'}</span>
       <span data-testid="show-banner">{showIncompleteTaskBanner ? 'true' : 'false'}</span>
+      <span data-testid="runtime-notice">{runtimeNotice.message ?? 'null'}</span>
       <button data-testid="btn-continue" onClick={onContinueTask}>
         continue
       </button>
@@ -414,7 +417,8 @@ async function emitStreamEvent(event: Record<string, unknown>) {
 beforeEach(() => {
   streamEventCallback = null;
   _conversationsChangedCallback = null;
-  mockStream.mockClear();
+  mockStream.mockReset().mockResolvedValue(undefined);
+  mockPut.mockReset().mockResolvedValue(undefined);
   (window as unknown as Record<string, unknown>).app = buildWindowApp();
   // Suppress expected console output
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -633,6 +637,29 @@ describe('RuntimeProvider - Step Tracking', () => {
         await new Promise((r) => setTimeout(r, 0));
       });
       expect(directStreamSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not launch a continuation when its conversation write is unconfirmed', async () => {
+      await renderWithProviders();
+
+      await emitStreamEvent({
+        conversationId: ACTIVE_CONV_ID,
+        type: 'max-steps-reached',
+        stepInfo: { currentStep: 25, maxSteps: 25, hitLimit: true, taskComplete: false },
+      });
+      await waitFor(() => expect(screen.getByTestId('show-banner').textContent).toBe('true'));
+      mockPut.mockResolvedValue({ ok: false });
+
+      act(() => {
+        screen.getByTestId('btn-continue').click();
+      });
+
+      await waitFor(() => {
+        expect(mockPut).toHaveBeenCalled();
+        expect(screen.getByTestId('show-banner').textContent).toBe('true');
+        expect(screen.getByTestId('runtime-notice')).toHaveTextContent(/request was not run/i);
+      });
+      expect(mockStream).not.toHaveBeenCalled();
     });
   });
 

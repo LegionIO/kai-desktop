@@ -4,6 +4,7 @@ import { app } from '@/lib/ipc-client';
 import type { Alert, AlertQuestion } from '@/lib/ipc-client';
 import { AlertCard } from '@/components/alerts/AlertCard';
 import { AlertQuestionPicker } from '@/components/alerts/AlertQuestionPicker';
+import { BrowserApprovalPrivateInput } from '@/components/approval/BrowserApprovalPrivateInput';
 
 /**
  * The dedicated pop-out window's root. Renders ANY notification-tab item:
@@ -29,6 +30,89 @@ type ToolApprovalItem = {
 };
 type AlertItem = { source: 'alert'; id: string; alert: Alert };
 type NotificationItem = ToolApprovalItem | AlertItem;
+
+const MAX_BROWSER_APPROVAL_DETAIL_CHARS = 8_192;
+const MAX_BROWSER_APPROVAL_STRING_CHARS = 2_048;
+const MAX_BROWSER_APPROVAL_ENTRIES = 64;
+const MAX_BROWSER_APPROVAL_DEPTH = 6;
+
+function boundedBrowserApprovalValue(
+  value: unknown,
+  depth: number,
+  budget: { entries: number },
+  seen: WeakSet<object>,
+): unknown {
+  if (typeof value === 'string')
+    return value.length > MAX_BROWSER_APPROVAL_STRING_CHARS
+      ? `${value.slice(0, MAX_BROWSER_APPROVAL_STRING_CHARS)}… [truncated]`
+      : value;
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'bigint') return `${value.toString()}n`;
+  if (typeof value !== 'object') return `[${typeof value}]`;
+  if (seen.has(value)) return '[circular]';
+  if (depth >= MAX_BROWSER_APPROVAL_DEPTH) return '[depth limit]';
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    for (let index = 0; index < value.length && budget.entries > 0; index += 1) {
+      budget.entries -= 1;
+      result.push(boundedBrowserApprovalValue(value[index], depth + 1, budget, seen));
+    }
+    if (result.length < value.length) result.push('[entry limit]');
+    return result;
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const key in value as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (budget.entries <= 0) {
+      result['…'] = '[entry limit]';
+      break;
+    }
+    budget.entries -= 1;
+    const boundedKey = key.length > 128 ? `${key.slice(0, 128)}…` : key;
+    try {
+      result[boundedKey] = boundedBrowserApprovalValue(
+        (value as Record<string, unknown>)[key],
+        depth + 1,
+        budget,
+        seen,
+      );
+    } catch {
+      result[boundedKey] = '[unavailable]';
+    }
+  }
+  return result;
+}
+
+function browserApprovalDetails(args: unknown): string | null {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const record = args as Record<string, unknown>;
+  if (record.approvalKind !== 'browser-control') return null;
+  const details: Record<string, unknown> = {};
+  const budget = { entries: MAX_BROWSER_APPROVAL_ENTRIES };
+  const seen = new WeakSet<object>([record]);
+  for (const key in record) {
+    if (!Object.prototype.hasOwnProperty.call(record, key) || key === 'approvalKind' || key === 'reason') continue;
+    if (budget.entries <= 0) {
+      details['…'] = '[entry limit]';
+      break;
+    }
+    budget.entries -= 1;
+    const boundedKey = key.length > 128 ? `${key.slice(0, 128)}…` : key;
+    try {
+      details[boundedKey] = boundedBrowserApprovalValue(record[key], 1, budget, seen);
+    } catch {
+      details[boundedKey] = '[unavailable]';
+    }
+  }
+  if (Object.keys(details).length === 0) return null;
+  const serialized = JSON.stringify(details, null, 2);
+  return serialized.length > MAX_BROWSER_APPROVAL_DETAIL_CHARS
+    ? `${serialized.slice(0, MAX_BROWSER_APPROVAL_DETAIL_CHARS)}\n… [truncated]`
+    : serialized;
+}
 
 /** Window frame: draggable header + ✕ (close only) + a measured body. */
 const NotificationChrome: FC<{ title: string; onClose: () => void; children: ReactNode }> = ({
@@ -156,6 +240,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       : undefined;
   const prompt =
     typeof reason === 'string' && reason.trim() ? reason.trim() : 'This action requires your approval to continue.';
+  const operationDetails = browserApprovalDetails(item.args);
 
   const resolve = async (decision: 'approve' | 'reject') => {
     if (submitting) return;
@@ -174,6 +259,18 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       <div className="space-y-3 p-5">
         <div className="text-sm font-medium">{item.toolName}</div>
         <p className="text-sm text-muted-foreground">{prompt}</p>
+        {operationDetails && (
+          <section aria-label="Browser operation details" className="space-y-1.5">
+            <p className="text-xs font-medium text-foreground">Operation details</p>
+            <pre
+              data-testid="browser-approval-details"
+              className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border/70 bg-muted/40 p-2 text-[11px] leading-relaxed text-foreground"
+            >
+              {operationDetails}
+            </pre>
+          </section>
+        )}
+        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} />
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"

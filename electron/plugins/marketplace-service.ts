@@ -5,16 +5,29 @@ import { execFile } from 'child_process';
 import { net } from 'electron';
 import type { AppConfig } from '../config/schema.js';
 import {
+  AUTHENTICATED_BROWSER_PERMISSION,
   arePermissionSetsEqual,
+  effectivePluginPermissions,
   getPluginIntegrity,
   hashPluginDirectory,
+  isLegacyInferredBrowserPermissionSnapshot,
   readPluginManifest,
 } from './plugin-integrity.js';
 import type { PluginIntegrity } from './plugin-integrity.js';
 import { DANGEROUS_PLUGIN_PERMISSIONS } from './types.js';
+import type { PluginPermission } from './types.js';
 
 type InstalledPluginRecord = NonNullable<NonNullable<AppConfig['marketplace']>['installedPlugins']>[string];
 type PluginApprovalRecord = NonNullable<AppConfig['pluginApprovals']>[string];
+
+function shouldAutoApproveMarketplacePlugin(
+  isBrandRequired: boolean,
+  permissions: readonly PluginPermission[],
+): boolean {
+  const hasDangerous = permissions.some((permission) => DANGEROUS_PLUGIN_PERMISSIONS.has(permission));
+  const needsAuthenticatedBrowserConsent = permissions.includes(AUTHENTICATED_BROWSER_PERMISSION);
+  return !hasDangerous || (isBrandRequired && !needsAuthenticatedBrowserConsent);
+}
 
 export type InstallResult = PluginIntegrity & {
   backupDir?: string;
@@ -491,6 +504,7 @@ export class MarketplaceService {
       if (manifest.name !== entry.name) {
         throw new Error(`Plugin archive name mismatch: expected "${entry.name}", got "${manifest.name}"`);
       }
+      const effectivePermissions = effectivePluginPermissions(tmpDir, manifest.permissions);
 
       const fileHash = hashPluginDirectory(tmpDir);
       const expectedFileHash = this.getExpectedFileHash(entry);
@@ -519,7 +533,7 @@ export class MarketplaceService {
           repository: entry.repository,
           version: entry.version,
           fileHash,
-          permissions: manifest.permissions,
+          permissions: effectivePermissions,
           installedAt: new Date().toISOString(),
           marketplaceUrl: entry.marketplaceUrl,
         },
@@ -527,9 +541,8 @@ export class MarketplaceService {
       this.setConfig('marketplace.installedPlugins', installedPlugins);
 
       const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
-      const hasDangerous = manifest.permissions.some((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p));
-      if (isBrandRequired || !hasDangerous) {
-        this.persistPluginApproval(entry.name, fileHash, manifest.permissions);
+      if (shouldAutoApproveMarketplacePlugin(isBrandRequired, effectivePermissions)) {
+        this.persistPluginApproval(entry.name, fileHash, effectivePermissions);
       }
       if (this.cachedCatalog) {
         this.cachedCatalog = this.cachedCatalog.map((catalogEntry) =>
@@ -543,7 +556,7 @@ export class MarketplaceService {
       console.info(`[Marketplace] Installed plugin "${entry.name}" from ${entry.repository}@v${entry.version}`);
       return {
         fileHash,
-        permissions: manifest.permissions,
+        permissions: effectivePermissions,
         version: manifest.version,
         backupDir: backedUp ? backupDir : undefined,
         priorInstalledRecord: priorInstalledRecord ? { ...priorInstalledRecord } : undefined,
@@ -757,7 +770,11 @@ export class MarketplaceService {
     if (!installedInfo.permissions) return 'untrusted permission metadata';
     if (installedInfo.version !== entry.version || installed.version !== entry.version)
       return `update available ${installedInfo.version ?? installed.version} -> ${entry.version}`;
-    if (!arePermissionSetsEqual(installedInfo.permissions, installed.permissions)) return 'permissions changed';
+    if (
+      !arePermissionSetsEqual(installedInfo.permissions, installed.permissions) &&
+      !this.migrateLegacyRequiredBrowserPermission(entry, installed, installedInfo)
+    )
+      return 'permissions changed';
 
     const approval = this.getConfig().pluginApprovals?.[entry.name];
     if (
@@ -766,13 +783,47 @@ export class MarketplaceService {
       !arePermissionSetsEqual(approval.permissions, installed.permissions)
     ) {
       const isBrandRequired = this.brandRequiredPluginNames.has(entry.name);
-      const hasDangerous = installed.permissions.some((p) => DANGEROUS_PLUGIN_PERMISSIONS.has(p));
-      if (isBrandRequired || !hasDangerous) {
+      if (shouldAutoApproveMarketplacePlugin(isBrandRequired, installed.permissions)) {
         this.persistPluginApproval(entry.name, installed.fileHash, installed.permissions);
       }
     }
 
     return null;
+  }
+
+  private migrateLegacyRequiredBrowserPermission(
+    entry: MarketplaceCatalogEntry,
+    installed: PluginIntegrity,
+    installedInfo: InstalledPluginRecord,
+  ): boolean {
+    if (!this.brandRequiredPluginNames.has(entry.name)) return false;
+    const pluginDir = join(this.pluginsDir, entry.name);
+    if (!existsSync(join(pluginDir, 'frontend.js'))) return false;
+    try {
+      if (readPluginManifest(pluginDir, entry.name).permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    if (!isLegacyInferredBrowserPermissionSnapshot(installedInfo.permissions, installed.permissions)) return false;
+
+    const approval = this.getConfig().pluginApprovals?.[entry.name];
+    if (approval?.hash && approval.hash !== installed.fileHash) return false;
+    if (
+      approval?.permissions &&
+      !arePermissionSetsEqual(approval.permissions, installed.permissions) &&
+      !isLegacyInferredBrowserPermissionSnapshot(approval.permissions, installed.permissions)
+    ) {
+      return false;
+    }
+
+    this.setConfig('marketplace.installedPlugins', {
+      ...(this.getConfig().marketplace?.installedPlugins ?? {}),
+      [entry.name]: { ...installedInfo, permissions: [...installed.permissions] },
+    });
+    console.info(`[Marketplace] Upgraded install metadata for required plugin "${entry.name}"`);
+    return true;
   }
 
   private persistPluginApproval(pluginName: string, fileHash: string, permissions: readonly string[]): void {
@@ -843,4 +894,9 @@ export class MarketplaceService {
 }
 
 /** Exposed for unit tests only. */
-export const __internal = { assertSecureMarketplaceUrl, readCappedResponse, MARKETPLACE_FETCH_TIMEOUT_MS };
+export const __internal = {
+  assertSecureMarketplaceUrl,
+  readCappedResponse,
+  shouldAutoApproveMarketplacePlugin,
+  MARKETPLACE_FETCH_TIMEOUT_MS,
+};

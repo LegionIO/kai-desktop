@@ -43,7 +43,7 @@ const OTA_CURRENT = join(HOME, '.' + SLUG, 'ota', 'current');
 
 const sha512 = (buf: Buffer | string) => createHash('sha512').update(buf).digest('hex');
 
-/** Write the 3 overlay entrypoint files with given contents; return the files map. */
+/** Write the required overlay entrypoint files with given contents; return the files map. */
 function writeOverlayFiles(contents: Record<string, string>): Record<string, { sha512: string }> {
   const files: Record<string, { sha512: string }> = {};
   for (const [rel, body] of Object.entries(contents)) {
@@ -58,6 +58,7 @@ function writeOverlayFiles(contents: Record<string, string>): Record<string, { s
 const ENTRYPOINTS = {
   'out/main/index.js': 'main-code',
   'out/preload/index.mjs': 'preload-code',
+  'out/preload/browser-page.cjs': 'sandboxed-browser-preload',
   'out/renderer/index.html': '<html>',
 };
 

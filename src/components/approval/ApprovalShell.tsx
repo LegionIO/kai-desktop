@@ -1,6 +1,7 @@
 import { useEffect, useState, type FC } from 'react';
 import { LoaderIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { BrowserApprovalPrivateInput } from './BrowserApprovalPrivateInput';
 
 type ApprovalRequest = {
   approvalId: string;
@@ -58,6 +59,7 @@ export const ApprovalShell: FC<{ approvalId: string }> = ({ approvalId }) => {
         <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Approval required</div>
         <div className="text-sm font-medium">{request ? request.toolName : 'Loading…'}</div>
         <p className="text-sm text-muted-foreground">{prompt}</p>
+        {request && <BrowserApprovalPrivateInput approvalId={approvalId} args={request.args} />}
       </div>
       <div className="flex items-center justify-end gap-2 border-t border-border/70 p-4">
         <button

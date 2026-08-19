@@ -49,11 +49,25 @@ import {
   writeConversation,
   setActiveConversationId,
 } from '../ipc/conversation-store.js';
-import { buildPluginRendererBundle } from './renderer-build.js';
+import {
+  assertActivePluginRendererBudget,
+  buildPluginRendererBundle,
+  pluginRendererBuildBytes,
+} from './renderer-build.js';
 import { MarketplaceService, UnverifiedPluginError } from './marketplace-service.js';
 import type { MarketplaceCatalogEntry, InstallResult } from './marketplace-service.js';
 import { getBundledPluginIntegrity } from './plugin-bootstrap.js';
-import { arePermissionSetsEqual, hashPluginDirectory, hashPluginFile, readPluginManifest } from './plugin-integrity.js';
+import {
+  AUTHENTICATED_BROWSER_PERMISSION,
+  arePermissionSetsEqual,
+  approvalPermissionsMatch,
+  effectivePluginPermissions,
+  hashPluginDirectory,
+  hashPluginFile,
+  isLegacyInferredBrowserPermissionSnapshot,
+  readPluginManifest,
+  snapshotPluginDirectory,
+} from './plugin-integrity.js';
 import { checkPluginCompatibility } from './plugin-compat.js';
 import { PluginProcessHost } from './process/plugin-process-host.js';
 import { selectPluginHostRuntime } from './process/runtime-selection.js';
@@ -134,6 +148,7 @@ export class PluginManager {
   private pluginProcesses: Map<string, PluginProcessHost> = new Map();
   private toolChangeCallback: ((tools: ToolDefinition[]) => void) | null = null;
   private cliToolChangeCallback: (() => void) | null = null;
+  private browserAssistantRevocationCallback: (() => void) | null = null;
   private actionHandlers: Map<string, Map<string, PluginActionHandler>> = new Map();
   private notificationTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private nativeNotifications: Map<string, Notification> = new Map();
@@ -163,6 +178,15 @@ export class PluginManager {
   private lastUpdateCount = 0;
   private pendingRestart: Set<string> = new Set();
   private rendererLoadedThisSession: Set<string> = new Set();
+  /** Bytes admitted for frontend snapshots whose backend activation is still
+   * pending. Different plugin install locks may run concurrently. */
+  private pendingRendererAssetBytes = 0;
+  /** Frontends awaiting primary-renderer replacement. Exclude them from every
+   * UI/asset response before slow backend teardown begins. */
+  private rendererRevocations: Set<string> = new Set();
+  /** Supplied by the desktop IPC layer so background marketplace updates can
+   * revoke a frontend realm before changing its code or permissions. */
+  private rendererReplacementHandler: ((pluginName: string) => Promise<void>) | null = null;
   private failedUpdates: Map<string, { attemptedVersion: string; runningVersion: string; error: string }> = new Map();
   private installLocks: Map<string, Promise<unknown>> = new Map();
   /** Plugins disabled for the current session only (not persisted to config). */
@@ -187,7 +211,8 @@ export class PluginManager {
     private appHome: string,
     private getConfig: () => AppConfig,
     private setConfig: (path: string, value: unknown) => void,
-    private brandRequiredPluginNames: string[] = [],
+    private brandRequiredPluginNames: string[],
+    private revokePrimaryRendererAuthority: () => void,
   ) {
     this.brandRequiredPluginNamesSet = new Set(brandRequiredPluginNames);
   }
@@ -220,6 +245,7 @@ export class PluginManager {
 
       try {
         const manifest = readPluginManifest(pluginDir, entry);
+        manifest.permissions = effectivePluginPermissions(pluginDir, manifest.permissions);
         // The plugin name is used as an on-disk path segment (plugin-settings/
         // <name>/) and as an identity key. Reject a name that isn't a strict slug
         // or that doesn't match its directory — a crafted name like "../../x"
@@ -263,7 +289,7 @@ export class PluginManager {
   private isPluginApproved(pluginName: string, fileHash: string, permissions: readonly string[]): boolean {
     const approval = this.getPluginApprovals()[pluginName];
     if (!approval || approval.hash !== fileHash) return false;
-    return !approval.permissions || arePermissionSetsEqual(approval.permissions, permissions);
+    return approvalPermissionsMatch(approval.permissions, permissions);
   }
 
   private persistPluginApproval(pluginName: string, fileHash: string, permissions: readonly string[]): void {
@@ -301,13 +327,57 @@ export class PluginManager {
     };
   }
 
-  private ensurePluginApproved(manifest: PluginManifest, fileHash: string): boolean {
+  private migrateLegacyRequiredBrowserPermission(manifest: PluginManifest, fileHash: string, pluginDir: string): void {
+    if (!this.marketplaceService || !this.brandRequiredPluginNamesSet.has(manifest.name)) return;
+    if (!existsSync(join(pluginDir, 'frontend.js'))) return;
+    const declaredPermissions = readPluginManifest(pluginDir, manifest.name).permissions;
+    if (declaredPermissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) return;
+
+    const config = this.getConfig();
+    const installed = config.marketplace?.installedPlugins?.[manifest.name];
+    const approval = config.pluginApprovals?.[manifest.name];
+    if (!installed?.fileHash || installed.fileHash !== fileHash || installed.version !== manifest.version) return;
+
+    const installedCurrent = arePermissionSetsEqual(installed.permissions, manifest.permissions);
+    const installedLegacy = isLegacyInferredBrowserPermissionSnapshot(installed.permissions, manifest.permissions);
+    if (!installedCurrent && !installedLegacy) return;
+    if (approval?.hash && approval.hash !== fileHash) return;
+    const approvalCurrent =
+      !!approval?.permissions && arePermissionSetsEqual(approval.permissions, manifest.permissions);
+    const approvalLegacy = isLegacyInferredBrowserPermissionSnapshot(approval?.permissions, manifest.permissions);
+    if (approval?.permissions && !approvalCurrent && !approvalLegacy) return;
+    if (!installedLegacy && approvalCurrent) return;
+
+    const catalogEntry = this.marketplaceService.getCachedCatalog()?.find((entry) => entry.name === manifest.name);
+    if (catalogEntry) {
+      if (catalogEntry.version !== manifest.version) return;
+      const expectedHash = this.getMarketplaceExpectedFileHash(catalogEntry);
+      if (expectedHash && expectedHash !== fileHash) return;
+    }
+
+    this.setConfig('marketplace.installedPlugins', {
+      ...(config.marketplace?.installedPlugins ?? {}),
+      [manifest.name]: { ...installed, permissions: [...manifest.permissions] },
+    });
+    console.info(`[PluginManager] Upgraded install metadata for required plugin "${manifest.name}"`);
+  }
+
+  private ensurePluginApproved(manifest: PluginManifest, fileHash: string, pluginDir: string): boolean {
     if (this.brandRequiredPluginNamesSet.has(manifest.name)) {
+      this.migrateLegacyRequiredBrowserPermission(manifest, fileHash, pluginDir);
       if (!this.isRequiredPluginIntegrityTrusted(manifest, fileHash)) {
         console.error(`[PluginManager] Required plugin "${manifest.name}" failed integrity verification`);
         return false;
       }
       if (!this.isPluginApproved(manifest.name, fileHash, manifest.permissions)) {
+        if (manifest.permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) {
+          this.pendingConsent.set(manifest.name, { manifest, fileHash });
+          broadcastToAllWindows('plugin:consent-required', this.buildConsentRequest(manifest, fileHash));
+          console.info(
+            `[PluginManager] Required plugin "${manifest.name}" needs consent for authenticated Browser access`,
+          );
+          return false;
+        }
         this.persistPluginApproval(manifest.name, fileHash, manifest.permissions);
       }
       return true;
@@ -402,9 +472,12 @@ export class PluginManager {
       runningVersion,
       error: error ?? 'Update was not approved',
     });
-    if (this.rendererLoadedThisSession.has(pluginName)) {
-      this.markPendingRestart(pluginName);
-    }
+    // The rejected generation never exposed renderer assets: loadPlugin stops
+    // at the consent gate before assigning rendererBuild. An active frontend
+    // update already replaced the renderer before installing, while a disabled
+    // or backend-only plugin had no old frontend in this renderer generation.
+    // The restored build can therefore load normally without a restart banner.
+    this.clearPendingRestart(pluginName);
     this.broadcastUpdateCount();
   }
 
@@ -600,16 +673,36 @@ export class PluginManager {
     }
 
     const instance: PluginInstance = this.createPluginInstance(manifest, dir, 'loading');
+    let rendererReservationBytes = 0;
+    const releaseRendererReservation = (): void => {
+      if (rendererReservationBytes === 0) return;
+      this.pendingRendererAssetBytes = Math.max(0, this.pendingRendererAssetBytes - rendererReservationBytes);
+      rendererReservationBytes = 0;
+    };
 
     this.plugins.set(manifest.name, instance);
 
     try {
-      instance.fileHash = hashPluginDirectory(dir);
-      if (!this.ensurePluginApproved(manifest, instance.fileHash)) {
+      // Capture the renderer bytes before backend activation. A plugin backend
+      // is unrestricted code and may mutate its own install directory; it must
+      // not be able to create or replace frontend.js after consent and thereby
+      // gain the primary renderer's authenticated Browser bridge.
+      const approvedSnapshot = snapshotPluginDirectory(dir);
+      instance.fileHash = approvedSnapshot.fileHash;
+      if (
+        approvedSnapshot.files.has('frontend.js') &&
+        !manifest.permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)
+      ) {
+        manifest.permissions = [...manifest.permissions, AUTHENTICATED_BROWSER_PERMISSION];
+      }
+      if (!this.ensurePluginApproved(manifest, instance.fileHash, dir)) {
+        const awaitingConsent = this.pendingConsent.has(manifest.name);
         instance.state = 'error';
-        instance.error = this.brandRequiredPluginNamesSet.has(manifest.name)
-          ? 'Required plugin integrity verification failed. Reinstall or update the plugin from a trusted source.'
-          : 'Plugin permission approval is required before it can be loaded.';
+        instance.error = awaitingConsent
+          ? 'Plugin permission approval is required before it can be loaded.'
+          : this.brandRequiredPluginNamesSet.has(manifest.name)
+            ? 'Required plugin integrity verification failed. Reinstall or update the plugin from a trusted source.'
+            : 'Plugin permission approval is required before it can be loaded.';
         this.broadcastUIState();
         this.notifyToolsChanged();
         traceDiagnostic({
@@ -618,11 +711,19 @@ export class PluginManager {
           level: 'warn',
           correlationId: pluginCorrelationId,
           pluginName: manifest.name,
-          fields: { reason: 'approval-required' },
+          fields: { reason: awaitingConsent ? 'approval-required' : 'integrity-verification-failed' },
         });
         return;
       }
 
+      const approvedRendererBuild = approvedSnapshot.files.has('frontend.js')
+        ? buildPluginRendererBundle({
+            pluginName: manifest.name,
+            pluginDir: dir,
+            rendererPath: 'frontend.js',
+            snapshot: approvedSnapshot,
+          })
+        : null;
       this.ensurePluginConfigNormalized(manifest.name);
 
       // Check plugin compatibility constraints (engines.kai + capabilities)
@@ -724,6 +825,7 @@ export class PluginManager {
         onUIStateChanged: () => this.broadcastUIState(),
         onToolsChanged: () => this.notifyToolsChanged(),
         onCliToolsChanged: () => this.notifyCliToolsChanged(),
+        onInferenceProviderChanging: (provider) => this.revokeBrowserAssistantAccessForInstance(instance, provider),
         registerActionHandler: (targetId, handler) => {
           // Ignore registrations from a stale activation generation so old async
           // code can't write into the current generation's action map.
@@ -775,6 +877,17 @@ export class PluginManager {
       if (verifiedDirectoryHash !== instance.fileHash) {
         throw new Error(`Plugin "${manifest.name}" changed after integrity verification`);
       }
+      if (approvedRendererBuild) {
+        assertActivePluginRendererBudget(
+          [...this.plugins.values()]
+            .filter((candidate) => candidate !== instance)
+            .flatMap((candidate) => (candidate.rendererBuild ? [candidate.rendererBuild] : [])),
+          approvedRendererBuild,
+          this.pendingRendererAssetBytes,
+        );
+        rendererReservationBytes = pluginRendererBuildBytes(approvedRendererBuild);
+        this.pendingRendererAssetBytes += rendererReservationBytes;
+      }
       const processHost = new PluginProcessHost({
         manifest,
         pluginDir: dir,
@@ -791,14 +904,9 @@ export class PluginManager {
       this.pluginProcesses.set(manifest.name, processHost);
       await processHost.activate();
 
-      // Check for frontend entry point at frontend.js
-      const frontendPath = join(dir, 'frontend.js');
-      if (existsSync(frontendPath)) {
-        instance.rendererBuild = buildPluginRendererBundle({
-          pluginName: manifest.name,
-          pluginDir: dir,
-          rendererPath: 'frontend.js',
-        });
+      if (approvedRendererBuild) {
+        releaseRendererReservation();
+        instance.rendererBuild = approvedRendererBuild;
         this.rendererLoadedThisSession.add(manifest.name);
       }
 
@@ -828,6 +936,14 @@ export class PluginManager {
       this.notifyToolsChanged();
       console.info(`[PluginManager] Plugin "${manifest.name}" activated`);
     } catch (err) {
+      releaseRendererReservation();
+      let browserRevocationFailure: unknown = null;
+      try {
+        this.revokeBrowserAssistantAccessForInstance(instance);
+      } catch (error) {
+        browserRevocationFailure = error;
+        instance.tearingDown = true;
+      }
       traceDiagnostic({
         scope: 'plugin',
         event: 'plugin.load-failed',
@@ -874,6 +990,7 @@ export class PluginManager {
       this.broadcastUIState();
       this.notifyToolsChanged();
       console.error(`[PluginManager] Failed to load plugin "${manifest.name}":`, err);
+      if (browserRevocationFailure) throw browserRevocationFailure;
     }
   }
 
@@ -889,6 +1006,48 @@ export class PluginManager {
   ): Promise<void> {
     if (!this.isCurrentInstance(instance) || instance.tearingDown) return;
     const pluginName = instance.manifest.name;
+    const rendererReplacementRequired = this.rendererUnloadRequired(pluginName);
+    try {
+      this.beginRendererUnload(pluginName);
+    } catch (error) {
+      // The crashed provider is already blocked by rendererRevocations (for a
+      // frontend) or tearingDown (for a backend-only provider). Continue
+      // resource cleanup, but retain the revocation failure for diagnostics.
+      instance.tearingDown = true;
+      console.error(`[PluginManager] Error revoking Browser access for crashed plugin "${pluginName}":`, error);
+    }
+    let rendererReplacement: Promise<boolean> | null = null;
+    if (rendererReplacementRequired) {
+      const replaceRenderer = this.rendererReplacementHandler;
+      if (!replaceRenderer) {
+        console.error(
+          `[PluginManager] Cannot revoke crashed frontend plugin "${pluginName}" because no renderer replacement handler is registered.`,
+        );
+      } else {
+        try {
+          // Start revocation before any asynchronous API cleanup. A crashed
+          // backend must not leave its frontend realm using the authenticated
+          // Browser bridge while teardown waits on unrelated resources.
+          rendererReplacement = replaceRenderer(pluginName).then(
+            () => true,
+            (error) => {
+              console.error(`[PluginManager] Error replacing renderer for crashed plugin "${pluginName}":`, error);
+              return false;
+            },
+          );
+        } catch (error) {
+          console.error(`[PluginManager] Error replacing renderer for crashed plugin "${pluginName}":`, error);
+        }
+      }
+    }
+    if (!rendererReplacementRequired) {
+      try {
+        this.revokeBrowserAssistantAccessForInstance(instance);
+      } catch (error) {
+        instance.tearingDown = true;
+        console.error(`[PluginManager] Error revoking Browser access for crashed plugin "${pluginName}":`, error);
+      }
+    }
     instance.state = 'error';
     instance.error = details.error ?? `Plugin process exited unexpectedly (code ${details.code})`;
     instance.registeredTools = [];
@@ -943,6 +1102,14 @@ export class PluginManager {
     } catch (error) {
       console.error(`[PluginManager] Error cleaning up crashed plugin "${pluginName}":`, error);
     }
+    if (await rendererReplacement) {
+      // The replacement destroyed the only renderer realm that could consume
+      // this immutable snapshot. The errored instance remains visible in the UI,
+      // but retaining its assets would leak memory and keep counting against the
+      // process-wide frontend budget until a later explicit unload.
+      instance.rendererBuild = null;
+      this.acknowledgeRendererUnload(pluginName);
+    }
     this.broadcastUIState();
     this.notifyToolsChanged();
     this.notifyCliToolsChanged();
@@ -974,6 +1141,7 @@ export class PluginManager {
 
     for (const [name, instance] of sorted) {
       instance.tearingDown = true;
+      this.revokeBrowserAssistantAccessForInstance(instance);
       try {
         await this.pluginProcesses.get(name)?.deactivate();
       } catch (err) {
@@ -1007,7 +1175,11 @@ export class PluginManager {
     const instance = this.plugins.get(pluginName);
     if (!instance) return;
 
+    // Revoke before deactivate(): a backend process may take its full timeout
+    // to acknowledge teardown while an already-running turn still holds tool
+    // definitions bound from this provider.
     instance.tearingDown = true;
+    this.revokeBrowserAssistantAccessForInstance(instance);
     try {
       await this.pluginProcesses.get(pluginName)?.deactivate();
     } catch (err) {
@@ -1105,57 +1277,59 @@ export class PluginManager {
     // Serialize with marketplace install/update/uninstall for the same plugin so
     // two unload/load sequences can't interleave and leave duplicate side effects
     // or a transiently-missing instance.
-    await this.withInstallLock(pluginName, async () => {
-      const existing = this.plugins.get(pluginName);
-      if (!existing) {
-        throw new Error(`Unknown plugin "${pluginName}"`);
-      }
+    await this.withInstallLock(pluginName, () =>
+      this.withRendererReplacementForUpdate(pluginName, async () => {
+        const existing = this.plugins.get(pluginName);
+        if (!existing) {
+          throw new Error(`Unknown plugin "${pluginName}"`);
+        }
 
-      // A plugin in 'loading' state has an in-flight loadPlugin()/activate()
-      // promise that unloadPlugin() cannot cancel — tearing it down now would race
-      // the activation and could leave handlers/timers registered after the stub
-      // is installed. Reject; the caller can retry once it settles.
-      if (existing.state === 'loading') {
-        throw new Error(`Plugin "${pluginName}" is still loading — try again once it finishes`);
-      }
+        // A plugin in 'loading' state has an in-flight loadPlugin()/activate()
+        // promise that unloadPlugin() cannot cancel — tearing it down now would race
+        // the activation and could leave handlers/timers registered after the stub
+        // is installed. Reject; the caller can retry once it settles.
+        if (existing.state === 'loading') {
+          throw new Error(`Plugin "${pluginName}" is still loading — try again once it finishes`);
+        }
 
-      // A plugin awaiting permission consent is driven by a blocking consent modal
-      // (pendingConsent / pendingConsentRollback). Disabling it here would leave
-      // that modal stranded and a later approve/deny could reload or roll back a
-      // plugin the user disabled. Make the user resolve consent first.
-      if (this.pendingConsent.has(pluginName) || this.pendingConsentRollback.has(pluginName)) {
-        throw new Error(`Plugin "${pluginName}" is awaiting permission approval — approve or deny it first`);
-      }
+        // A plugin awaiting permission consent is driven by a blocking consent modal
+        // (pendingConsent / pendingConsentRollback). Disabling it here would leave
+        // that modal stranded and a later approve/deny could reload or roll back a
+        // plugin the user disabled. Make the user resolve consent first.
+        if (this.pendingConsent.has(pluginName) || this.pendingConsentRollback.has(pluginName)) {
+          throw new Error(`Plugin "${pluginName}" is awaiting permission approval — approve or deny it first`);
+        }
 
-      const { manifest, dir } = existing;
-      const hadRenderer = this.rendererLoadedThisSession.has(pluginName);
+        const { manifest, dir } = existing;
+        const hadRenderer = this.rendererLoadedThisSession.has(pluginName);
 
-      await this.unloadPlugin(pluginName);
+        await this.unloadPlugin(pluginName);
 
-      // Keep a stub so the plugin remains visible (and re-enablable) in the UI.
-      this.plugins.set(pluginName, this.createPluginInstance(manifest, dir, 'disabled'));
+        // Keep a stub so the plugin remains visible (and re-enablable) in the UI.
+        this.plugins.set(pluginName, this.createPluginInstance(manifest, dir, 'disabled'));
 
-      if (opts.persist) {
-        // A persistent disable supersedes any prior session-only disable.
-        this.sessionDisabled.delete(pluginName);
-        const next = this.getPersistentlyDisabled();
-        next.add(pluginName);
-        this.setConfig('pluginSystem.disabledPlugins', [...next]);
-      } else {
-        // Session-only: tracked in memory so mid-session reload paths (marketplace
-        // update, consent approval) keep it disabled until the next app launch.
-        this.sessionDisabled.add(pluginName);
-      }
+        if (opts.persist) {
+          // A persistent disable supersedes any prior session-only disable.
+          this.sessionDisabled.delete(pluginName);
+          const next = this.getPersistentlyDisabled();
+          next.add(pluginName);
+          this.setConfig('pluginSystem.disabledPlugins', [...next]);
+        } else {
+          // Session-only: tracked in memory so mid-session reload paths (marketplace
+          // update, consent approval) keep it disabled until the next app launch.
+          this.sessionDisabled.add(pluginName);
+        }
 
-      if (hadRenderer) {
-        this.markPendingRestart(pluginName);
-      }
+        if (hadRenderer) {
+          this.markPendingRestart(pluginName);
+        }
 
-      this.broadcastUIState();
-      this.notifyToolsChanged();
-      this.notifyCliToolsChanged();
-      console.info(`[PluginManager] Plugin "${pluginName}" disabled (persist=${opts.persist})`);
-    });
+        this.broadcastUIState();
+        this.notifyToolsChanged();
+        this.notifyCliToolsChanged();
+        console.info(`[PluginManager] Plugin "${pluginName}" disabled (persist=${opts.persist})`);
+      }),
+    );
   }
 
   /** Re-enable a previously disabled plugin and load it now. */
@@ -1178,6 +1352,17 @@ export class PluginManager {
 
     // Serialize with marketplace lifecycle ops for the same plugin (see disablePlugin).
     await this.withInstallLock(pluginName, async () => {
+      // Multiple enable requests can all observe the disabled stub while they
+      // wait behind another lifecycle operation. Re-check after acquiring the
+      // lock so a queued duplicate cannot unload the generation just activated
+      // by the preceding request.
+      const lockedCurrent = this.plugins.get(pluginName);
+      const stillDisabled =
+        lockedCurrent?.state === 'disabled' ||
+        this.getPersistentlyDisabled().has(pluginName) ||
+        this.sessionDisabled.has(pluginName);
+      if (!stillDisabled) return;
+
       this.clearDisabledState(pluginName);
 
       // If this plugin's frontend bundle already shipped earlier this session, the
@@ -1227,6 +1412,23 @@ export class PluginManager {
 
   hasPermission(pluginName: string, permission: PluginPermission): boolean {
     return this.plugins.get(pluginName)?.manifest.permissions.includes(permission) ?? false;
+  }
+
+  /** Authorize host capabilities for the plugin that owns an inference
+   * provider. Provider names are display strings and are not an identity; use
+   * the registered object identity so one plugin cannot impersonate another. */
+  inferenceProviderHasPermission(provider: PluginInferenceProvider, permission: PluginPermission): boolean {
+    for (const instance of this.plugins.values()) {
+      if (
+        instance.state !== 'active' ||
+        instance.tearingDown ||
+        this.rendererRevocations.has(instance.manifest.name) ||
+        instance.inferenceProvider !== provider
+      )
+        continue;
+      return instance.manifest.permissions.includes(permission);
+    }
+    return false;
   }
 
   getPluginCount(): number {
@@ -1334,26 +1536,15 @@ export class PluginManager {
     return this.validatePluginConfig(instance.manifest, {});
   }
 
-  resolveRendererAssetRequest(
-    pluginName: string,
-    assetPath: string,
-  ): { filePath: string; baseDir: string; contentType: string } | null {
+  resolveRendererAssetRequest(pluginName: string, assetPath: string): { data: Uint8Array; contentType: string } | null {
     const instance = this.plugins.get(pluginName);
-    if (!instance || instance.state !== 'active' || !instance.rendererBuild) return null;
+    if (!instance || instance.state !== 'active' || !instance.rendererBuild || this.rendererRevocations.has(pluginName))
+      return null;
 
-    const filePath = join(instance.dir, assetPath);
-    const resolvedPath = resolve(filePath);
-    const baseDir = resolve(instance.dir);
-    if (resolvedPath !== baseDir && !resolvedPath.startsWith(baseDir + sep)) return null;
-    if (!existsSync(resolvedPath)) return null;
+    const data = instance.rendererBuild.assets.get(assetPath);
+    if (!data) return null;
 
-    const ext = assetPath.split('.').pop()?.toLowerCase() ?? '';
-    const mimeTypes: Record<string, string> = {
-      js: 'text/javascript; charset=utf-8',
-      css: 'text/css; charset=utf-8',
-      json: 'application/json; charset=utf-8',
-    };
-    return { filePath: resolvedPath, baseDir, contentType: mimeTypes[ext] ?? 'application/octet-stream' };
+    return { data, contentType: instance.rendererBuild.mimeTypes[assetPath] ?? 'application/octet-stream' };
   }
 
   setPluginConfig(pluginName: string, path: string, value: unknown): void {
@@ -1456,6 +1647,26 @@ export class PluginManager {
     this.cliToolChangeCallback = callback;
   }
 
+  setBrowserAssistantRevocationHandler(callback: () => void): void {
+    this.browserAssistantRevocationCallback = callback;
+  }
+
+  private revokeBrowserAssistantAccessForInstance(
+    instance: PluginInstance,
+    provider: PluginInferenceProvider | null = instance.inferenceProvider,
+  ): void {
+    if (!provider || !instance.manifest.permissions.includes(AUTHENTICATED_BROWSER_PERMISSION)) {
+      return;
+    }
+    const revoke = this.browserAssistantRevocationCallback;
+    if (!revoke) throw new Error('Browser assistant access could not be revoked because no handler is registered.');
+    try {
+      revoke();
+    } catch (error) {
+      throw new Error('Browser assistant access could not be revoked.', { cause: error });
+    }
+  }
+
   private notifyCliToolsChanged(): void {
     this.cliToolChangeCallback?.();
   }
@@ -1476,7 +1687,8 @@ export class PluginManager {
    */
   getInferenceProvider(context?: { runtimeId?: string; modelProviderKey?: string }): PluginInferenceProvider | null {
     for (const instance of this.plugins.values()) {
-      if (instance.state !== 'active') continue;
+      if (instance.state !== 'active' || instance.tearingDown || this.rendererRevocations.has(instance.manifest.name))
+        continue;
       if (!instance.inferenceProvider || !instance.inferenceProvider.isAvailable()) continue;
 
       // If no context provided, return first available (legacy behavior)
@@ -1640,7 +1852,9 @@ export class PluginManager {
       pluginStatuses[instance.manifest.name] = instance.state;
       pluginErrors[instance.manifest.name] = instance.error;
       const isActive = instance.state === 'active';
-      const shouldExposeUi = instance.state === 'loading' || instance.state === 'active';
+      const shouldExposeUi =
+        !this.rendererRevocations.has(instance.manifest.name) &&
+        (instance.state === 'loading' || instance.state === 'active');
 
       if (!isActive && this.brandRequiredPluginNamesSet.has(instance.manifest.name)) {
         requiredPluginsReady = false;
@@ -1967,7 +2181,7 @@ export class PluginManager {
       const catalog = await service.fetchCatalog(urls);
       if (this.brandRequiredPluginNames.length > 0) {
         const updated = await service.autoInstallRequired(this.brandRequiredPluginNamesSet, catalog, {
-          serialize: (name, fn) => this.withInstallLock(name, fn),
+          serialize: (name, fn) => this.withInstallLock(name, () => this.withRendererReplacementForUpdate(name, fn)),
           afterInstall: async (name, result) => {
             await this.swapToInstalledPlugin(name, result.version, result);
           },
@@ -2118,6 +2332,99 @@ export class PluginManager {
     return [...this.pendingRestart];
   }
 
+  /** A frontend plugin shares the primary renderer's authenticated Browser
+   * bridge. Disabling/uninstalling it must therefore replace that renderer,
+   * rather than merely waiting for an optional later app restart. */
+  rendererUnloadRequired(pluginName: string): boolean {
+    return this.rendererLoadedThisSession.has(pluginName);
+  }
+
+  setRendererReplacementHandler(handler: (pluginName: string) => Promise<void>): void {
+    this.rendererReplacementHandler = handler;
+  }
+
+  /** Mark the frontend unavailable synchronously, before IPC waits on renderer
+   * replacement or plugin process/API teardown. */
+  beginRendererUnload(pluginName: string): boolean {
+    const required = this.rendererUnloadRequired(pluginName);
+    if (required) {
+      this.rendererRevocations.add(pluginName);
+      this.broadcastUIState();
+      // Revoke the authenticated primary-renderer bridge synchronously. This
+      // callback is constructor-required, so a missing async replacement
+      // handler can reject the lifecycle operation without leaving the old
+      // plugin realm able to drive Browser IPC.
+      try {
+        this.revokePrimaryRendererAuthority();
+      } catch (error) {
+        // Replacement below is the second fail-closed path. Do not let broken
+        // revocation bookkeeping abort before Chromium is reloaded/crashed.
+        console.error(`[PluginManager] Error revoking primary renderer for "${pluginName}":`, error);
+      }
+      const instance = this.plugins.get(pluginName);
+      if (instance) {
+        try {
+          this.revokeBrowserAssistantAccessForInstance(instance);
+        } catch (error) {
+          // rendererRevocations already removes the provider from future
+          // selection, and replacement tears down any retained frontend realm.
+          console.error(`[PluginManager] Error revoking Browser assistant access for "${pluginName}":`, error);
+        }
+      }
+    }
+    return required;
+  }
+
+  /** Roll back a pre-reload frontend revocation when disable/uninstall fails
+   * and the same plugin generation is still live. The replacement renderer can
+   * safely load the plugin again from the restored UI-state broadcast. */
+  cancelRendererUnload(pluginName: string): boolean {
+    if (!this.rendererRevocations.has(pluginName)) return false;
+    const instance = this.plugins.get(pluginName);
+    if (!instance || (instance.state !== 'active' && instance.state !== 'loading')) return false;
+    this.rendererRevocations.delete(pluginName);
+    this.broadcastUIState();
+    return true;
+  }
+
+  acknowledgeRendererUnload(pluginName: string): void {
+    const instance = this.plugins.get(pluginName);
+    if (!this.rendererRevocations.has(pluginName) && instance && instance.state !== 'disabled') return;
+    const replacementWillLoad = instance?.state === 'active' && !!instance.rendererBuild;
+    this.rendererLoadedThisSession.delete(pluginName);
+    this.rendererRevocations.delete(pluginName);
+    this.clearPendingRestart(pluginName);
+    // An update may already have activated its replacement frontend while the
+    // revocation was held. Publish it only after the old renderer realm is gone.
+    this.broadcastUIState();
+    if (replacementWillLoad) this.rendererLoadedThisSession.add(pluginName);
+  }
+
+  /** Replace a privileged frontend realm before an update mutates plugin bytes,
+   * approvals, or permissions. Background required-plugin refreshes use this
+   * wrapper too, not only renderer-initiated marketplace IPC. */
+  private async withRendererReplacementForUpdate<T>(pluginName: string, operation: () => Promise<T>): Promise<T> {
+    const required = this.beginRendererUnload(pluginName);
+    if (!required) return operation();
+    if (!this.rendererReplacementHandler) {
+      throw new Error(`Cannot update frontend plugin "${pluginName}" before its renderer is replaced.`);
+    }
+
+    let rendererReplaced = false;
+    try {
+      await this.rendererReplacementHandler(pluginName);
+      rendererReplaced = true;
+      return await operation();
+    } finally {
+      // Once replacement succeeds, the old realm is gone even when installation
+      // later fails. Re-expose whichever generation is active to the fresh
+      // renderer. A failed replacement stays revoked: its crash/navigation may
+      // still be in flight, so restoring UI state here could re-enable the old
+      // privileged realm before renderer death is confirmed.
+      if (rendererReplaced) this.acknowledgeRendererUnload(pluginName);
+    }
+  }
+
   private markPendingRestart(pluginName: string): void {
     if (this.pendingRestart.has(pluginName)) return;
     this.pendingRestart.add(pluginName);
@@ -2256,10 +2563,12 @@ export class PluginManager {
       throw new UnverifiedPluginError(pluginName);
     }
 
-    await this.withInstallLock(pluginName, async () => {
-      const result = await this.marketplaceService!.installPlugin(entry, opts);
-      await this.swapToInstalledPlugin(pluginName, entry.version, result);
-    });
+    await this.withInstallLock(pluginName, () =>
+      this.withRendererReplacementForUpdate(pluginName, async () => {
+        const result = await this.marketplaceService!.installPlugin(entry, opts);
+        await this.swapToInstalledPlugin(pluginName, entry.version, result);
+      }),
+    );
 
     // Update count changed since we just installed/updated a plugin
     this.broadcastUpdateCount();
@@ -2284,18 +2593,20 @@ export class PluginManager {
       throw new Error(`Plugin "${pluginName}" is required and cannot be uninstalled`);
     }
 
-    await this.withInstallLock(pluginName, async () => {
-      await this.unloadPlugin(pluginName);
-      this.marketplaceService!.uninstallPlugin(pluginName);
+    await this.withInstallLock(pluginName, () => {
+      return this.withRendererReplacementForUpdate(pluginName, async () => {
+        await this.unloadPlugin(pluginName);
+        this.marketplaceService!.uninstallPlugin(pluginName);
+        // Clear every piece of lifecycle state before releasing the same lock
+        // used by install/update/disable. A replacement install must not start
+        // and then have this uninstall's delayed cleanup mutate its generation.
+        this.clearDisabledState(pluginName);
+        this.clearPendingRestart(pluginName);
+        this.setFailedUpdate(pluginName, null);
+        this.broadcastUIState();
+        this.notifyToolsChanged();
+      });
     });
-
-    // Clear any disable flag so a future reinstall of the same plugin loads
-    // active rather than inheriting a stale disabled state.
-    this.clearDisabledState(pluginName);
-    this.clearPendingRestart(pluginName);
-    this.setFailedUpdate(pluginName, null);
-    this.broadcastUIState();
-    this.notifyToolsChanged();
   }
 
   async refreshMarketplace(marketplaceUrls?: string[]): Promise<MarketplaceCatalogEntry[]> {

@@ -21,6 +21,7 @@ import { hookDispatcher } from './hooks/dispatcher.js';
 import type { LLMModelConfig, ResolvedStreamConfig } from './model-catalog.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition, ToolExecutionContext } from '../tools/types.js';
+import { findToolByName } from '../tools/naming.js';
 import {
   ToolObserverManager,
   resolveToolObserverConfig,
@@ -29,6 +30,7 @@ import {
 } from './tool-observer.js';
 import { type MediaFitConfig } from './media-fit.js';
 import { createSubAgentMediaFitter, estimateSubAgentStaticTokens } from './sub-agent-media-fit.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 
 export type SubAgentEvent =
   | (StreamEvent & { subAgentConversationId: string; parentConversationId: string; parentToolCallId: string })
@@ -152,13 +154,17 @@ export function releaseSubAgentSlot(): void {
 }
 
 function broadcastSubAgentEvent(event: SubAgentEvent): void {
+  const exposedEvent =
+    event.type === 'tool-call'
+      ? ({ ...event, args: redactBrowserToolArgsForExposure(event.toolName, event.args) } as SubAgentEvent)
+      : event;
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:stream-event', event);
+    win.webContents.send('agent:stream-event', exposedEvent);
   }
   // REMOTE clients are frame-capped (web 4 MiB / CLI 8 MiB) — a sub-agent tool result can retain
   // large media/originals that would exceed a frame and disconnect the socket. Strip the remote
   // copy (same shared cap as the parent stream); local Electron windows get the full event.
-  broadcastToWebClients('agent:stream-event', capRemoteEvent(event));
+  broadcastToWebClients('agent:stream-event', capRemoteEvent(exposedEvent));
 }
 
 /** Sub-agent control signal — set by the sub_agent_control tool */
@@ -257,6 +263,18 @@ export function sanitizedMessageDisplayText(content: unknown): string {
   return '';
 }
 
+/** Parse a PreToolUse replacement through the exact sub-agent tool schema.
+ * Exported so the fail-closed transform/default behavior can be unit-tested
+ * without booting a provider runtime. */
+export function validateSubAgentToolInput(tools: ToolDefinition[], toolName: string, input: unknown): unknown {
+  const tool = findToolByName(tools, toolName);
+  const parsed = tool?.inputSchema.safeParse(input);
+  if (!tool || !parsed?.success) {
+    throw new Error(`Invalid arguments for tool "${toolName}".`);
+  }
+  return parsed.data;
+}
+
 export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<SubAgentEvent> {
   const {
     subAgentConversationId,
@@ -352,7 +370,13 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     });
 
     // Inject the control tool into the sub-agent's toolset
-    const allTools = [...tools.filter((t) => t.name !== 'sub_agent_control'), controlTool];
+    // Sub-agents have their own hidden conversation ids and no renderer-owned
+    // Browser panel. Exposing native browser tools here would create tabs that
+    // neither the parent nor the user can see or control.
+    const allTools = [
+      ...tools.filter((tool) => tool.name !== 'sub_agent_control' && tool.source !== 'browser'),
+      controlTool,
+    ];
 
     let fullResponseText = '';
     let turnCount = 0;
@@ -761,13 +785,16 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           // any denial early-return (parallel-safe; idempotent per id).
           subMediaFitter.chargeArgs(state.toolCallId, state.args);
           // PreToolUse BEFORE the observer so a block/modify hook can deny or
-          // sanitize args before the observer model sees them.
+          // sanitize args before the observer model sees them. Browser typing
+          // stays private to the executor and is redacted before hook/plugin or
+          // automation fan-out.
+          const exposedArgs = redactBrowserToolArgsForExposure(state.toolName, state.args);
           const preTool = await hookDispatcher.dispatch('PreToolUse', {
             conversationId: subAgentConversationId,
             parentConversationId,
             toolCallId: state.toolCallId,
             toolName: state.toolName,
-            args: state.args,
+            args: exposedArgs,
           });
           // Resolve the stream id the renderer used. If the stream event
           // already arrived it's queued here; otherwise (exec-first) we get
@@ -817,8 +844,15 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
               result: { isError: true, error: reason },
             };
           }
-          const nextArgs = (preTool.payload as { args?: unknown } | undefined)?.args;
+          let nextArgs = preTool.modified ? (preTool.payload as { args?: unknown } | undefined)?.args : undefined;
           if (nextArgs !== undefined && nextArgs !== state.args) {
+            try {
+              nextArgs = validateSubAgentToolInput(allTools, state.toolName, nextArgs);
+            } catch {
+              const reason = `Invalid arguments for tool "${state.toolName}".`;
+              publishResolved({ redacted: true, reason });
+              return { skip: true as const, result: { isError: true, error: reason } };
+            }
             const canMutateInPlace =
               state.args &&
               typeof state.args === 'object' &&
@@ -845,8 +879,11 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           }
           // Emit resolved args (sanitized or allowed-unchanged) so the
           // suppressed initial tool-call event is corrected in place.
-          publishResolved(state.args);
-          subObserver?.onToolExecutionStart(state);
+          publishResolved(redactBrowserToolArgsForExposure(state.toolName, state.args));
+          subObserver?.onToolExecutionStart({
+            ...state,
+            args: redactBrowserToolArgsForExposure(state.toolName, state.args),
+          });
         },
         onToolExecutionEnd: ({ toolCallId }) => {
           toolCancels.delete(toolCallId);
@@ -855,7 +892,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
         augmentToolResult: async ({ toolCallId, toolName, args, result }) => {
           // Use redacted/sanitized args (if PreToolUse rewrote/denied them) so
           // PostToolUse hooks/observers never see the raw denied args.
-          const postArgs = subHookRewrittenArgs.get(toolCallId) ?? args;
+          const postArgs = redactBrowserToolArgsForExposure(toolName, subHookRewrittenArgs.get(toolCallId) ?? args);
           const postTool = await hookDispatcher.dispatch('PostToolUse', {
             conversationId: subAgentConversationId,
             parentConversationId,
@@ -1006,10 +1043,17 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
             }
           }
         }
+        const exposedEnriched =
+          enriched.type === 'tool-call'
+            ? ({
+                ...enriched,
+                args: redactBrowserToolArgsForExposure(enriched.toolName, enriched.args),
+              } as SubAgentEvent)
+            : enriched;
         if (event.type !== 'done') {
-          broadcastSubAgentEvent(enriched);
+          broadcastSubAgentEvent(exposedEnriched);
         }
-        yield enriched;
+        yield exposedEnriched;
         if (event.type === 'done') break;
       }
 

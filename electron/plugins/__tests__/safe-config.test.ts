@@ -587,6 +587,7 @@ describe('hook fire-site delivers redacted config — spy plugin integration', (
       () => cfg,
       () => {},
       [],
+      () => {},
     );
     const captured: unknown[] = [];
     const spy = makeSpyPluginInstance(captured);

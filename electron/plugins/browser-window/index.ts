@@ -14,8 +14,15 @@ import {
 
 import type { CodePaths } from '../../ota/types.js';
 import type { PluginBrowserWindowOptions } from '../types.js';
+import {
+  assertPluginBrowserPartitionAvailable,
+  beginPluginBrowserPartitionOperation,
+  initializePluginBrowserPartitionLifecycle,
+  trackPluginBrowserWindow,
+} from './lifecycle.js';
 import { getBrandUserAgent } from '../../utils/user-agent.js';
 import { PB, type AuthSubmitPayload, type DownloadPayload, type ShortcutAction } from './ipc.js';
+import { hardenRemoteWebPreferences, isInAppBrowserPartition } from '../../browser/session.js';
 
 let codePaths: CodePaths | null = null;
 let globalsRegistered = false;
@@ -42,36 +49,29 @@ const GUEST_ALLOWED_PERMISSIONS = ['clipboard-read', 'clipboard-sanitized-write'
  * `webPreferences` and `params` are the mutable objects Electron hands the
  * `will-attach-webview` event; the loose typing mirrors that event's signature.
  */
-export function hardenWebviewAttach(webPreferences: Record<string, unknown>, params: Record<string, unknown>): void {
-  // A preload here would run inside the untrusted guest — never allow one.
-  delete webPreferences.preload;
-  webPreferences.nodeIntegration = false;
-  webPreferences.nodeIntegrationInSubFrames = false;
-  webPreferences.nodeIntegrationInWorker = false;
-  webPreferences.contextIsolation = true;
-  webPreferences.sandbox = true;
-  webPreferences.webSecurity = true;
-  // Keep the guest on standard, secure web platform behavior: no mixed-content
-  // downgrade, no non-standard/experimental Blink features that widen the
-  // attack surface for an untrusted page.
-  webPreferences.allowRunningInsecureContent = false;
-  webPreferences.experimentalFeatures = false;
-  delete webPreferences.enableBlinkFeatures;
-  // Strip tag attributes that would otherwise re-enable Node / inject a preload
-  // on the guest regardless of the webPreferences above.
-  delete params.nodeintegration;
-  delete params.nodeintegrationinsubframes;
-  delete params.preload;
-  delete params.webpreferences;
-  delete params.enableblinkfeatures;
+export function hardenWebviewAttach(
+  trustedSession: Session,
+  webPreferences: Record<string, unknown>,
+  params: Record<string, unknown>,
+): void {
+  hardenRemoteWebPreferences(webPreferences, params);
+  // A <webview partition> is a session-selection capability, not harmless
+  // chrome. Guests must inherit the already-validated plugin BrowserWindow
+  // session; otherwise a plugin could name Kai's reserved authenticated
+  // in-app Browser partition and read that profile's cookies/storage.
+  delete webPreferences.partition;
+  delete webPreferences.session;
+  delete params.partition;
+  webPreferences.session = trustedSession;
 }
 
 function isHttpUrl(u: string): boolean {
   return typeof u === 'string' && /^https?:\/\//i.test(u);
 }
 
-export function initPluginBrowser(paths: CodePaths): void {
+export function initPluginBrowser(paths: CodePaths, appHome: string): void {
   codePaths = paths;
+  initializePluginBrowserPartitionLifecycle(appHome);
   registerGlobalHandlers();
 }
 
@@ -82,36 +82,52 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
 
   const { url, title = 'Browser', width = 1280, height = 900, partition, customUserAgent } = options;
 
-  // Never share the app's default session with arbitrary guest content.
-  const effectivePartition = partition || 'persist:kai-plugin-browser';
-  const ses = session.fromPartition(effectivePartition);
-  wireSessionDownloads(ses);
-  if (!permissionWiredSessions.has(ses)) {
-    permissionWiredSessions.add(ses);
-    ses.setPermissionRequestHandler((_wc, permission, cb) => cb(GUEST_ALLOWED_PERMISSIONS.includes(permission)));
-    ses.setPermissionCheckHandler((_wc, permission) => GUEST_ALLOWED_PERMISSIONS.includes(permission));
+  if (partition && isInAppBrowserPartition(partition)) {
+    throw new Error("Plugin browser windows cannot access Kai's reserved in-app Browser profiles.");
   }
 
+  // Never share the app's default session with arbitrary guest content.
+  const effectivePartition = partition || 'persist:kai-plugin-browser';
   const ua =
     customUserAgent === false ? undefined : typeof customUserAgent === 'string' ? customUserAgent : getBrandUserAgent();
+  const { ses, win, stopTrackingWindow } = (() => {
+    // Hold the lifecycle lease from the preflight through renderer tracking. A
+    // concurrent Browser Data clear installs its fence, waits for this lease,
+    // and either destroys the tracked window or makes track() reject it.
+    const releasePartitionOperation = beginPluginBrowserPartitionOperation(effectivePartition);
+    try {
+      assertPluginBrowserPartitionAvailable(effectivePartition);
+      const ses = session.fromPartition(effectivePartition);
+      wireSessionDownloads(ses);
+      if (!permissionWiredSessions.has(ses)) {
+        permissionWiredSessions.add(ses);
+        ses.setPermissionRequestHandler((_wc, permission, cb) => cb(GUEST_ALLOWED_PERMISSIONS.includes(permission)));
+        ses.setPermissionCheckHandler((_wc, permission) => GUEST_ALLOWED_PERMISSIONS.includes(permission));
+      }
 
-  const win = new BrowserWindow({
-    width,
-    height,
-    title,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: false,
-      webviewTag: true,
-      session: ses,
-      preload: join(codePaths.preload, 'plugin-browser.mjs'),
-    },
-  });
-
+      const win = new BrowserWindow({
+        width,
+        height,
+        title,
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: false,
+          webviewTag: true,
+          session: ses,
+          preload: join(codePaths.preload, 'plugin-browser.mjs'),
+        },
+      });
+      const stopTrackingWindow = trackPluginBrowserWindow(win, effectivePartition);
+      return { ses, win, stopTrackingWindow };
+    } finally {
+      releasePartitionOperation();
+    }
+  })();
   pluginBrowserWindows.add(win);
   windowGuests.set(win, new Set());
   win.on('closed', () => {
+    stopTrackingWindow();
     pluginBrowserWindows.delete(win);
     for (const id of windowGuests.get(win) ?? []) guestIds.delete(id);
     windowGuests.delete(win);
@@ -133,6 +149,7 @@ export function openPluginBrowserWindow(options: PluginBrowserWindowOptions): vo
   // BEFORE the guest webContents is created, so it can't be bypassed by tag attrs.
   win.webContents.on('will-attach-webview', (_event, webPreferences, params) => {
     hardenWebviewAttach(
+      ses,
       webPreferences as unknown as Record<string, unknown>,
       params as unknown as Record<string, unknown>,
     );

@@ -90,6 +90,7 @@ const KNOWN_PERMISSIONS = [
   'agent:register-cli-tool',
   'safe-storage',
   'browser:window',
+  'browser:authenticated-session',
   'exec:whitelisted',
   'tools:detect',
   'system:env',

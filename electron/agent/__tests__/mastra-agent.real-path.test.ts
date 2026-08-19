@@ -447,6 +447,112 @@ describe('streamAgentResponse — real path (mocked @mastra/core)', () => {
       expect(events[events.length - 1].type).toBe('done');
     });
 
+    it('redacts Browser URLs from streamed tool exceptions before exposing them', async () => {
+      const secretUrl = 'https://alice:password@example.com/account?token=secret-token';
+      agentState.streamImpl = () => ({
+        textStream: (async function* () {})(),
+        fullStream: (async function* () {
+          yield {
+            type: 'tool-call',
+            payload: { toolCallId: 'browser-call-1', toolName: 'browser_action', args: { kind: 'reload' } },
+          };
+          yield {
+            type: 'tool-error',
+            payload: {
+              toolCallId: 'browser-call-1',
+              toolName: 'browser_action',
+              error: new Error(`ERR_FAILED while loading ${secretUrl}`),
+            },
+          };
+          yield { type: 'finish', payload: { finishReason: 'stop' } };
+        })(),
+      });
+
+      const events = await collect(
+        streamAgentResponse(
+          'conv-browser-error-redaction',
+          [{ role: 'user', content: 'Reload the page.' }],
+          makeModelConfig(),
+          makeConfig(),
+          [],
+          '/tmp/browser-error-redaction.db',
+        ),
+      );
+      const result = events.find((event) => event.type === 'tool-result')?.result;
+
+      expect(JSON.stringify(result)).not.toContain('secret-token');
+      expect(result).toEqual({
+        isError: true,
+        error: 'ERR_FAILED while loading [redacted browser URL: https://example.com]',
+      });
+    });
+
+    it('redacts Browser URLs from in-band stream errors before exposing them', async () => {
+      const secretUrl = 'https://alice:password@example.com/account?token=stream-secret';
+      agentState.streamImpl = () => ({
+        fullStream: (async function* () {
+          yield {
+            type: 'error',
+            payload: { error: new Error(`Browser navigation failed at ${secretUrl}`) },
+          };
+          yield { type: 'finish', payload: { finishReason: 'error' } };
+        })(),
+      });
+
+      const events = await collect(
+        streamAgentResponse(
+          'conv-browser-stream-error-redaction',
+          [{ role: 'user', content: 'Open the page.' }],
+          makeModelConfig(),
+          makeConfig(),
+          [],
+          '/tmp/browser-stream-error-redaction.db',
+        ),
+      );
+      const errorEvents = events.filter((event) => event.type === 'error');
+
+      expect(errorEvents).toHaveLength(1);
+      expect(JSON.stringify(errorEvents)).not.toContain('stream-secret');
+      expect(errorEvents[0]?.error).toBe('Browser navigation failed at [redacted browser URL: https://example.com]');
+    });
+
+    it('redacts Browser URLs when the full-stream iterator throws', async () => {
+      const secretUrl = 'https://alice:password@example.com/account?token=iterator-secret';
+      let invocation = 0;
+      agentState.streamImpl = () => {
+        invocation += 1;
+        if (invocation > 1) {
+          return {
+            fullStream: (async function* () {
+              yield { type: 'finish', payload: { finishReason: 'stop' } };
+            })(),
+          };
+        }
+        return {
+          fullStream: (async function* () {
+            yield { type: 'text-delta', payload: { text: 'Opening it now.' } };
+            throw new Error(`Browser iterator failed at ${secretUrl}`);
+          })(),
+        };
+      };
+
+      const events = await collect(
+        streamAgentResponse(
+          'conv-browser-iterator-error-redaction',
+          [{ role: 'user', content: 'Open the page.' }],
+          makeModelConfig(),
+          makeConfig(),
+          [],
+          '/tmp/browser-iterator-error-redaction.db',
+        ),
+      );
+      const errorEvents = events.filter((event) => event.type === 'error');
+
+      expect(errorEvents).toHaveLength(1);
+      expect(JSON.stringify(errorEvents)).not.toContain('iterator-secret');
+      expect(errorEvents[0]?.error).toBe('Browser iterator failed at [redacted browser URL: https://example.com]');
+    });
+
     it('uses the same caller-supplied id for the non-streaming generate path', async () => {
       const responseMessageId = 'msg-kai-generate-1';
       const reasoningGatewayModel = {

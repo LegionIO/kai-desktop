@@ -8,9 +8,11 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { z } from 'zod';
 import type { AppConfig } from '../../../config/schema.js';
 import type { StreamOptions, StreamEvent } from '../types.js';
 import type { ModelCatalogEntry } from '../../model-catalog.js';
+import type { ToolDefinition } from '../../../tools/types.js';
 
 // ---------------------------------------------------------------------------
 // child_process mock
@@ -27,8 +29,14 @@ const spawnState: {
   events: object[];
   exitCode: number;
   emitErrorCode?: string;
+  throwError?: Error;
   stdinWrites: string[];
 } = { calls: [], events: [], exitCode: 0, stdinWrites: [] };
+
+const piBridgeState = vi.hoisted(() => ({
+  start: vi.fn(),
+  stop: vi.fn(),
+}));
 
 function makeFakeChild() {
   const handlers: Record<string, Array<(...a: unknown[]) => void>> = {};
@@ -90,9 +98,17 @@ function makeFakeChild() {
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn((command: string, args: string[], options: SpawnCall['options']) => {
+    if (spawnState.throwError) throw spawnState.throwError;
     spawnState.calls.push({ command, args, options });
     return makeFakeChild();
   }),
+}));
+
+vi.mock('../pi-tool-bridge.js', () => ({
+  PiToolBridge: class {
+    start = piBridgeState.start;
+    stop = piBridgeState.stop;
+  },
 }));
 
 vi.mock('../detect.js', () => ({
@@ -158,6 +174,16 @@ function makeOptions(overrides: Partial<StreamOptions> = {}): StreamOptions {
   } as StreamOptions;
 }
 
+function browserTool(): ToolDefinition {
+  return {
+    name: 'browser_tabs',
+    description: 'Browser tabs',
+    source: 'browser',
+    inputSchema: z.object({}),
+    execute: vi.fn(),
+  };
+}
+
 async function collect(gen: AsyncGenerator<StreamEvent>): Promise<StreamEvent[]> {
   const out: StreamEvent[] = [];
   for await (const e of gen) out.push(e);
@@ -169,7 +195,12 @@ beforeEach(() => {
   spawnState.events = [];
   spawnState.exitCode = 0;
   spawnState.emitErrorCode = undefined;
+  spawnState.throwError = undefined;
   spawnState.stdinWrites = [];
+  piBridgeState.start.mockReset();
+  piBridgeState.stop.mockReset();
+  piBridgeState.start.mockResolvedValue(null);
+  piBridgeState.stop.mockResolvedValue(undefined);
   (detect.detectPiCli as ReturnType<typeof vi.fn>).mockResolvedValue(true);
   (detect.resolvePiCliPath as ReturnType<typeof vi.fn>).mockResolvedValue('/usr/local/bin/pi');
 });
@@ -366,6 +397,55 @@ describe('PiRuntime', () => {
       spawnState.exitCode = 2;
       const events = await collect(new PiRuntime().stream(makeOptions()));
       expect(events.some((e) => e.type === 'error')).toBe(true);
+    });
+
+    it('stops the tool bridge when a synchronous spawn failure occurs', async () => {
+      piBridgeState.start.mockResolvedValue({
+        extensionPath: '/tmp/pi-extension.ts',
+        url: 'http://127.0.0.1:1234',
+        token: 'test-token',
+        urlEnvVar: 'KAI_PI_BRIDGE_URL',
+        tokenEnvVar: 'KAI_PI_BRIDGE_TOKEN',
+      });
+      spawnState.throwError = new Error('synchronous spawn failure');
+
+      const events = await collect(
+        new PiRuntime().stream(
+          makeOptions({
+            tools: [browserTool()],
+          }),
+        ),
+      );
+
+      expect(events.some((event) => event.type === 'error' && event.error?.includes('synchronous spawn failure'))).toBe(
+        true,
+      );
+      expect(events.at(-1)?.type).toBe('done');
+      expect(piBridgeState.stop).toHaveBeenCalledOnce();
+    });
+
+    it('stops the tool bridge when the generator is abandoned before spawn', async () => {
+      piBridgeState.start.mockResolvedValue({
+        extensionPath: '/tmp/pi-extension.ts',
+        url: 'http://127.0.0.1:1234',
+        token: 'test-token',
+        urlEnvVar: 'KAI_PI_BRIDGE_URL',
+        tokenEnvVar: 'KAI_PI_BRIDGE_TOKEN',
+      });
+      const generator = new PiRuntime().stream(
+        makeOptions({
+          primaryModel: customEndpointModel(),
+          tools: [browserTool()],
+        }),
+      );
+
+      const first = await generator.next();
+      expect(first.done).toBe(false);
+      expect((first.value as StreamEvent).type).toBe('text-delta');
+      expect(spawnState.calls).toHaveLength(0);
+      await generator.return({ conversationId: 'conv-1', type: 'done' });
+
+      expect(piBridgeState.stop).toHaveBeenCalledOnce();
     });
   });
 });

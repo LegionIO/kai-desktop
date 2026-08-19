@@ -6,8 +6,230 @@
  * The bug it fixes: the CLI creating/selecting a chat yanked the GUI user's
  * selection outline onto a different conversation.
  */
-import { describe, it, expect } from 'vitest';
-import { shouldAdoptBroadcastActiveId } from '../conversation-selection';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  commitLocalConversationSelection,
+  filterConversationDeleteFallbackCandidates,
+  isConversationWorkspaceRestorationCurrent,
+  openBrowserConversationInWorkspace,
+  prepareConversationWorkspaceSwitch,
+  selectConversationDeleteFallback,
+  shouldAdoptBroadcastActiveId,
+  shouldApplyConversationDeleteFallback,
+  shouldClearSelectionForNullActiveBroadcast,
+} from '../conversation-selection';
+
+describe('isConversationWorkspaceRestorationCurrent', () => {
+  const current = {
+    workspaceId: 'workspace-b',
+    currentWorkspaceId: 'workspace-b',
+    selectionSequence: 4,
+    currentSelectionSequence: 4,
+    selectionWhenStarted: 'conv-a',
+    currentSelection: 'conv-a',
+  };
+
+  it('accepts only an unchanged workspace and selection attempt', () => {
+    expect(isConversationWorkspaceRestorationCurrent(current)).toBe(true);
+    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentWorkspaceId: 'workspace-c' })).toBe(false);
+    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelectionSequence: 5 })).toBe(false);
+    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelection: 'conv-user-choice' })).toBe(false);
+  });
+});
+
+describe('filterConversationDeleteFallbackCandidates', () => {
+  const conversations = [
+    { id: 'visible', workspaceId: 'workspace-a', archived: false, messageCount: 1 },
+    { id: 'legacy', archived: false, messageCount: 1 },
+    { id: 'other-workspace', workspaceId: 'workspace-b', archived: false, messageCount: 1 },
+    { id: 'archived', workspaceId: 'workspace-a', archived: true, messageCount: 1 },
+    { id: 'empty', workspaceId: 'workspace-a', archived: false, messageCount: 0 },
+  ];
+
+  it('uses the caller snapshot as the exact visible fallback scope', () => {
+    expect(
+      filterConversationDeleteFallbackCandidates(conversations, ['visible'], {
+        fallbackCandidateIds: ['visible', 'archived'],
+        workspaceId: 'workspace-a',
+      }).map((conversation) => conversation.id),
+    ).toEqual(['archived']);
+  });
+
+  it('falls back to normal visible chats in the active workspace when no snapshot is available', () => {
+    expect(
+      filterConversationDeleteFallbackCandidates(conversations, [], {
+        workspaceId: 'workspace-a',
+      }).map((conversation) => conversation.id),
+    ).toEqual(['visible', 'legacy']);
+  });
+});
+
+describe('prepareConversationWorkspaceSwitch', () => {
+  it('uses workspace state observed after the conversation lookup resolves', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let resolveConversation: (conversation: { workspaceId: string }) => void = () => {};
+    const getConversation = vi.fn(
+      () =>
+        new Promise<{ workspaceId: string }>((resolve) => {
+          resolveConversation = resolve;
+        }),
+    );
+    const saveLastConversation = vi.fn(async () => undefined);
+    const setActiveWorkspace = vi.fn(async () => undefined);
+    const switchConversation = vi.fn(async () => true);
+    const cancelObservation = vi.fn();
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      getConversation,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+      saveLastConversation,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: Promise.resolve(true),
+        cancel: cancelObservation,
+      }),
+      switchConversation,
+    });
+
+    activeWorkspaceId = 'workspace-b';
+    resolveConversation({ workspaceId: 'workspace-b' });
+
+    await expect(opening).resolves.toBe(true);
+    expect(saveLastConversation).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(switchConversation).toHaveBeenCalledWith('chat-b');
+    expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('waits for a configured workspace whose transition effect is still pending', async () => {
+    let resolveObservation: (observed: boolean) => void = () => {};
+    let settled = false;
+    const saveLastConversation = vi.fn(async () => undefined);
+    const setActiveWorkspace = vi.fn(async () => undefined);
+    const cancelObservation = vi.fn();
+
+    const preparation = prepareConversationWorkspaceSwitch({
+      conversationId: 'chat-b',
+      conversationWorkspaceId: 'workspace-b',
+      activeWorkspaceId: 'workspace-b',
+      knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+      saveLastConversation,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: cancelObservation,
+      }),
+    }).then((ready) => {
+      settled = true;
+      return ready;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(saveLastConversation).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).not.toHaveBeenCalled();
+
+    resolveObservation(true);
+    await expect(preparation).resolves.toBe(true);
+    expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('waits for the departing-workspace effect before the caller selects the destination chat', async () => {
+    const calls: string[] = [];
+    const lastConversation = new Map<string, string>();
+    let currentConversation = 'chat-a';
+    let resolveObservation: (observed: boolean) => void = () => {};
+    let signalWorkspaceSet: () => void = () => {};
+    const workspaceSet = new Promise<void>((resolve) => {
+      signalWorkspaceSet = resolve;
+    });
+    let preparationSettled = false;
+
+    const preparation = prepareConversationWorkspaceSwitch({
+      conversationId: 'chat-b',
+      conversationWorkspaceId: 'workspace-b',
+      activeWorkspaceId: 'workspace-a',
+      knownWorkspaceIds: ['workspace-a', 'workspace-b'],
+      saveLastConversation: async ({ workspaceId, conversationId }) => {
+        calls.push(`save:${workspaceId}:${conversationId}`);
+        lastConversation.set(workspaceId, conversationId);
+      },
+      setActiveWorkspace: async (workspaceId) => {
+        calls.push(`switch:${workspaceId}`);
+        signalWorkspaceSet();
+      },
+      createWorkspaceObservationWait: (workspaceId) => {
+        calls.push(`wait:${workspaceId}`);
+        return {
+          promise: new Promise<boolean>((resolve) => {
+            resolveObservation = resolve;
+          }),
+          cancel: () => calls.push(`cancel:${workspaceId}`),
+        };
+      },
+    }).then((ready) => {
+      preparationSettled = true;
+      if (ready) currentConversation = 'chat-b';
+      return ready;
+    });
+
+    await workspaceSet;
+    expect(preparationSettled).toBe(false);
+
+    // This models App's workspace-change effect. It must observe chat A before
+    // Browser attention is allowed to publish chat B as the current selection.
+    lastConversation.set('workspace-a', currentConversation);
+    resolveObservation(true);
+
+    await expect(preparation).resolves.toBe(true);
+    expect(lastConversation).toEqual(
+      new Map([
+        ['workspace-b', 'chat-b'],
+        ['workspace-a', 'chat-a'],
+      ]),
+    );
+    expect(calls).toEqual(['wait:workspace-b', 'save:workspace-b:chat-b', 'switch:workspace-b', 'cancel:workspace-b']);
+  });
+
+  it('fails closed when the conversation references a workspace that no longer exists', async () => {
+    const saveLastConversation = vi.fn(async () => undefined);
+    const setActiveWorkspace = vi.fn(async () => undefined);
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-orphaned',
+        conversationWorkspaceId: 'workspace-deleted',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a'],
+        saveLastConversation,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: vi.fn(() => ({
+          promise: Promise.resolve(true),
+          cancel: vi.fn(),
+        })),
+      }),
+    ).resolves.toBe(false);
+    expect(saveLastConversation).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe('commitLocalConversationSelection', () => {
+  it('publishes the ref before scheduling React selection state', () => {
+    const selectionRef = { current: 'conv-old' as string | null };
+    const setSelection = vi.fn(() => {
+      expect(selectionRef.current).toBe('conv-new');
+    });
+
+    commitLocalConversationSelection(selectionRef, 'conv-new', setSelection);
+
+    expect(selectionRef.current).toBe('conv-new');
+    expect(setSelection).toHaveBeenCalledWith('conv-new');
+  });
+});
 
 describe('shouldAdoptBroadcastActiveId', () => {
   it('adopts when this window has no selection yet (initial load)', () => {
@@ -27,5 +249,126 @@ describe('shouldAdoptBroadcastActiveId', () => {
   it('does NOT adopt a null active-id here (null is handled by a separate branch)', () => {
     expect(shouldAdoptBroadcastActiveId('conv-a', null)).toBe(false);
     expect(shouldAdoptBroadcastActiveId(null, null)).toBe(false);
+  });
+});
+
+describe('shouldClearSelectionForNullActiveBroadcast', () => {
+  it('preserves this window selection when another client deletes its globally active background chat', () => {
+    expect(shouldClearSelectionForNullActiveBroadcast('conv-a', { kind: 'delete', id: 'conv-b' })).toBe(false);
+  });
+
+  it('clears when this window selected the deleted chat or the whole store was reset', () => {
+    expect(shouldClearSelectionForNullActiveBroadcast('conv-a', { kind: 'delete', id: 'conv-a' })).toBe(true);
+    expect(shouldClearSelectionForNullActiveBroadcast('conv-a', { kind: 'reset' })).toBe(true);
+  });
+
+  it('keeps a valid local selection across an unrelated explicit null active-id', () => {
+    expect(shouldClearSelectionForNullActiveBroadcast('conv-a', { kind: 'active' })).toBe(false);
+    expect(shouldClearSelectionForNullActiveBroadcast(null, { kind: 'active' })).toBe(true);
+  });
+});
+
+describe('shouldApplyConversationDeleteFallback', () => {
+  it('applies the fallback only while the deleted chat remains this window selection', () => {
+    expect(shouldApplyConversationDeleteFallback('conv-a', 'conv-a', 'conv-a')).toBe(true);
+    expect(shouldApplyConversationDeleteFallback('conv-a', 'conv-b', 'conv-b')).toBe(false);
+    expect(shouldApplyConversationDeleteFallback('conv-a', 'conv-a', 'conv-c')).toBe(false);
+    expect(shouldApplyConversationDeleteFallback('conv-a', 'conv-a', null)).toBe(false);
+  });
+
+  it('relists when another window deletes the preselected fallback during cleanup', async () => {
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce([{ id: 'conv-c' }])
+      .mockResolvedValueOnce([{ id: 'conv-c' }])
+      .mockResolvedValueOnce([{ id: 'conv-c' }]);
+    const setActiveId = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, activeConversationId: null })
+      .mockResolvedValueOnce({ ok: true });
+
+    await expect(
+      selectConversationDeleteFallback({
+        deletedId: 'conv-a',
+        expectedBackendId: 'conv-b',
+        list,
+        setActiveId,
+      }),
+    ).resolves.toEqual({ id: 'conv-c' });
+    expect(setActiveId).toHaveBeenNthCalledWith(1, 'conv-c', 'conv-b');
+    expect(setActiveId).toHaveBeenNthCalledWith(2, 'conv-c', null);
+  });
+
+  it('adopts a concurrently selected surviving backend conversation instead of overwriting it', async () => {
+    const conversations = [{ id: 'conv-b' }, { id: 'conv-c' }];
+    const setActiveId = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, activeConversationId: 'conv-c' })
+      .mockResolvedValueOnce({ ok: true });
+
+    await expect(
+      selectConversationDeleteFallback({
+        deletedId: 'conv-a',
+        expectedBackendId: 'conv-b',
+        list: async () => conversations,
+        setActiveId,
+      }),
+    ).resolves.toEqual({ id: 'conv-c' });
+    expect(setActiveId).toHaveBeenNthCalledWith(2, 'conv-c', 'conv-c');
+  });
+
+  it('preserves a concurrent backend selection outside this window fallback list', async () => {
+    const setActiveId = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      activeConversationId: 'conv-other-workspace',
+    });
+
+    await expect(
+      selectConversationDeleteFallback({
+        deletedId: 'conv-a',
+        expectedBackendId: 'conv-old-fallback',
+        list: async () => [{ id: 'conv-visible-fallback' }],
+        setActiveId,
+      }),
+    ).resolves.toBeNull();
+
+    expect(setActiveId).toHaveBeenCalledOnce();
+    expect(setActiveId).toHaveBeenCalledWith('conv-visible-fallback', 'conv-old-fallback');
+  });
+
+  it('clears a fallback that is deleted after its selection CAS succeeds', async () => {
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce([{ id: 'conv-b' }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    const setActiveId = vi.fn().mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: true });
+
+    await expect(
+      selectConversationDeleteFallback({
+        deletedId: 'conv-a',
+        expectedBackendId: null,
+        list,
+        setActiveId,
+      }),
+    ).resolves.toBeNull();
+
+    expect(setActiveId).toHaveBeenNthCalledWith(1, 'conv-b', null);
+    expect(setActiveId).toHaveBeenNthCalledWith(2, null, 'conv-b');
+  });
+
+  it('clears a stale backend fallback when no conversations survive cleanup', async () => {
+    const setActiveId = vi.fn(async () => ({ ok: true }));
+
+    await expect(
+      selectConversationDeleteFallback({
+        deletedId: 'conv-a',
+        expectedBackendId: 'conv-b',
+        list: async () => [],
+        setActiveId,
+      }),
+    ).resolves.toBeNull();
+
+    expect(setActiveId).toHaveBeenCalledWith(null, 'conv-b');
   });
 });

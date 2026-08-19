@@ -39,12 +39,14 @@ import {
   pendingQuestionAnswers,
   getAskUserRecoveryRouter,
   getActiveStreamTokenForConversation,
-  getPlanModeDismissHandler,
 } from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { z } from 'zod';
+import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
+import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // Debug logging
@@ -142,6 +144,36 @@ function debugLog(msg: string): void {
     /* ignore */
   }
 }
+
+/** Diagnostics must describe SDK payload structure without copying payload
+ * content. Browser tools can carry typed passwords, scripts, authenticated
+ * URLs, and page text through any SDK message field. */
+function diagnosticValueShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `array(length=${value.length})`;
+  if (typeof value === 'string') return `string(length=${value.length})`;
+  if (typeof value === 'object') return `object(fields=${Object.keys(value).length})`;
+  return typeof value;
+}
+
+function diagnosticErrorShape(error: unknown): string {
+  if (!(error instanceof Error)) return diagnosticValueShape(error);
+  return `error(messageLength=${error.message.length},stackLength=${error.stack?.length ?? 0})`;
+}
+
+function diagnosticSdkMessageShape(msg: SdkMessageAny): string {
+  const event = msg.event as { content_block?: unknown; delta?: unknown } | undefined;
+  const message = msg.message as { content?: unknown } | undefined;
+  return [
+    `type=${diagnosticValueShape(msg.type)}`,
+    `subtype=${diagnosticValueShape(msg.subtype)}`,
+    `fields=${Object.keys(msg).length}`,
+    `event=${diagnosticValueShape(event)}`,
+    `content=${diagnosticValueShape(message?.content)}`,
+    `result=${diagnosticValueShape(msg.result)}`,
+    `structuredOutput=${diagnosticValueShape(msg.structured_output)}`,
+  ].join(' ');
+}
 // ---------------------------------------------------------------------------
 
 /** Tools excluded from the MCP bridge (SDK has its own equivalents). */
@@ -230,13 +262,6 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
   async *stream(options: StreamOptions): AsyncGenerator<StreamEvent> {
     const { conversationId, config, tools, cwd, reasoningEffort, abortSignal } = options;
-    // Capture the OWNING run's stream token NOW, at stream start — activeStreams
-    // holds this run's token here (streamHandler set it before calling us). Binding
-    // the token to the run (not re-reading it when a queued tool callback later
-    // fires) is essential for ask_user recovery classification: a callback that runs
-    // after Stop removed activeStreams would otherwise read `undefined` and treat a
-    // terminal Stop as recoverable, resurrecting the stopped turn (R100 finding-6).
-    const owningStreamToken = getActiveStreamTokenForConversation(conversationId);
 
     // -----------------------------------------------------------------------
     // 1. Dynamic SDK import
@@ -320,18 +345,20 @@ export class ClaudeAgentRuntime implements AgentRuntime {
             let counter = 2;
             while (usedNames.has(`${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`)) counter++;
             safeName = `${safeName.slice(0, MAX_TOOL_NAME_LENGTH - 2)}_${counter}`;
-            debugLog(`[BRIDGE] Collision-resolved tool name: ${t.name} → ${safeName}`);
+            debugLog(
+              `[BRIDGE] Collision-resolved tool name lengths source=${t.name.length} resolved=${safeName.length}`,
+            );
           }
           usedNames.add(safeName);
           if (safeName !== t.name) {
-            debugLog(`[BRIDGE] Truncated tool name: ${t.name} → ${safeName}`);
+            debugLog(`[BRIDGE] Truncated tool name lengths source=${t.name.length} resolved=${safeName.length}`);
           }
           const rawShape = extractZodShape(t.inputSchema);
           return sdkTool(
             safeName,
             t.description ?? '',
             rawShape,
-            createToolHandler(t, conversationId, cwd, abortSignal, owningStreamToken),
+            createToolHandler(t, conversationId, cwd, abortSignal, options.browserOwnerId),
           );
         });
 
@@ -342,13 +369,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         });
 
         mcpServers = { kai: kaiServer };
-        debugLog(
-          `[BRIDGE] Created MCP bridge with ${sdkTools.length} tools: ${bridgeableTools.map((t) => t.name).join(', ')}`,
-        );
+        debugLog(`[BRIDGE] Created MCP bridge toolCount=${sdkTools.length}`);
       } catch (bridgeErr) {
-        debugLog(
-          `[BRIDGE] Failed to create MCP bridge: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`,
-        );
+        debugLog(`[BRIDGE] Failed to create MCP bridge error=${diagnosticErrorShape(bridgeErr)}`);
         // Non-fatal — SDK can still work with its built-in tools only
       }
     }
@@ -361,12 +384,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
 
     // Kai manages its own UX — bypass Claude Code's permission prompts entirely.
     // Without this, the SDK blocks on interactive approval for writes/bash/etc.
-    // EXCEPT in plan-first mode: a planning turn must be read-only (parity with the
-    // Mastra path's executionMode tool filtering). Both narrow the SDK built-in tool
-    // list to read-only AND request the SDK's 'plan' permission mode, so a restarted
-    // planning turn can't mutate files/run shell (R122 finding-1).
-    const isPlanFirst = (config as { tools?: { executionMode?: string } }).tools?.executionMode === 'plan-first';
-    const permissionMode = isPlanFirst ? 'plan' : 'bypassPermissions';
+    const permissionMode = 'bypassPermissions';
     const maxTurns = (agentConfig?.maxTurns as number) ?? (sdkConfig.maxTurns as number) ?? 25;
     const thinkingConfig = (sdkConfig.thinking as { type: string; budgetTokens?: number }) ?? { type: 'adaptive' };
 
@@ -463,7 +481,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     } else {
       const persistedSessionId = options.conversationMetadata?.claudeSdkSessionId as string | undefined;
       if (persistedSessionId && !this.sessionMap.has(conversationId)) {
-        debugLog(`[SESSION] Seeding sessionMap from persisted metadata: sessionId=${persistedSessionId}`);
+        debugLog(`[SESSION] Seeding sessionMap from persisted metadata sessionIdLength=${persistedSessionId.length}`);
         this.sessionMap.set(conversationId, persistedSessionId);
       }
       existingSessionId = this.sessionMap.get(conversationId);
@@ -474,12 +492,10 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // rather than silently falling back to ~/.claude/settings.json.
     const auth = options.modelAuth ?? null;
 
+    debugLog(`[STREAM] prompt=${diagnosticValueShape(prompt)} hasImages=${hasImages}`);
+    debugLog(`[STREAM] hasExistingSession=${existingSessionId !== undefined} sessionMapSize=${this.sessionMap.size}`);
     debugLog(
-      `[STREAM] conversationId=${conversationId} prompt=${hasImages ? '[structured with images]' : JSON.stringify(prompt).slice(0, 200)}`,
-    );
-    debugLog(`[STREAM] existingSessionId=${existingSessionId ?? 'none'} sessionMapSize=${this.sessionMap.size}`);
-    debugLog(
-      `[STREAM] cwd=${cwd} maxTurns=${maxTurns} effort=${effort} permissionMode=${permissionMode} model=${auth?.modelName ?? 'default'} baseUrl=${auth?.baseUrl ?? 'sdk-default'}`,
+      `[STREAM] hasCwd=${cwd !== undefined} maxTurns=${maxTurns} hasEffort=${effort !== undefined} permissionBypass=${permissionMode === 'bypassPermissions'} hasModel=${auth?.modelName !== undefined} hasBaseUrl=${auth?.baseUrl !== undefined}`,
     );
 
     const sdkOptions: SdkOptions = {
@@ -498,13 +514,9 @@ export class ClaudeAgentRuntime implements AgentRuntime {
       allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
       includePartialMessages: true,
       persistSession: true,
-      // Use specific Claude Code tools — SDK's built-in file/code tools. In plan-first
-      // mode, expose ONLY read-only built-ins (drop Write/Edit/Bash) so a planning turn
-      // can't mutate the workspace (R122 finding-1). Kai's custom tools are gated
-      // separately by executionMode via the MCP bridge above.
-      tools: isPlanFirst
-        ? ['Read', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch']
-        : ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch', 'Agent', 'Monitor'],
+      // Use specific Claude Code tools — SDK's built-in file/code tools.
+      // Kai's custom tools are available via the MCP bridge above.
+      tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LSP', 'WebFetch', 'WebSearch', 'Agent', 'Monitor'],
       // Expose Kai's custom tools via in-process MCP server
       ...(mcpServers ? { mcpServers } : {}),
       // Pass Kai's system prompt appended to Claude Code's default.
@@ -535,7 +547,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     let retryWithoutResume = false;
 
     try {
-      debugLog(`[QUERY] Starting query with resume=${existingSessionId ?? 'none'}`);
+      debugLog(`[QUERY] Starting query hasResume=${existingSessionId !== undefined}`);
       const queryIter = sdkQuery({ prompt, options: sdkOptions });
 
       let msgCount = 0;
@@ -546,11 +558,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         }
 
         msgCount++;
-        // Log every raw SDK message (truncate large ones)
-        const rawJson = JSON.stringify(msg);
-        debugLog(
-          `[MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
-        );
+        debugLog(`[MSG ${msgCount}] ${diagnosticSdkMessageShape(msg)}`);
 
         // Detect session resume failure — retry without resume
         if (
@@ -561,7 +569,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         ) {
           const rawStr = JSON.stringify(msg);
           if (rawStr.includes('No conversation found with session ID')) {
-            debugLog(`[SESSION] Resume failed for sessionId=${existingSessionId} — will retry without resume`);
+            debugLog(`[SESSION] Resume failed; retrying without resume`);
             this.sessionMap.delete(conversationId);
             retryWithoutResume = true;
             break;
@@ -571,7 +579,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         // Capture session ID for future resume within this conversation
         const msgSessionId = (msg as { session_id?: string }).session_id;
         if (msgSessionId && !this.sessionMap.has(conversationId)) {
-          debugLog(`[SESSION] Captured sessionId=${msgSessionId} for conversationId=${conversationId}`);
+          debugLog(`[SESSION] Captured session id length=${msgSessionId.length}`);
           this.sessionMap.set(conversationId, msgSessionId);
         }
 
@@ -588,7 +596,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         yield { conversationId, type: 'done' };
       }
     } catch (err) {
-      debugLog(`[ERROR] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      debugLog(`[ERROR] ${diagnosticErrorShape(err)}`);
 
       // Session resume failure can also throw — detect and retry
       if (existingSessionId && err instanceof Error && err.message.includes('No conversation found with session ID')) {
@@ -616,7 +624,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
     // 8b. Retry without session resume if resume failed
     // -----------------------------------------------------------------------
     if (retryWithoutResume) {
-      debugLog(`[RETRY] Retrying without resume for conversationId=${conversationId}`);
+      debugLog(`[RETRY] Retrying without resume`);
       const retryOptions = { ...sdkOptions };
       delete retryOptions.resume;
 
@@ -631,15 +639,12 @@ export class ClaudeAgentRuntime implements AgentRuntime {
           }
 
           msgCount++;
-          const rawJson = JSON.stringify(msg);
-          debugLog(
-            `[RETRY-MSG ${msgCount}] type=${msg.type} subtype=${msg.subtype ?? 'none'} raw=${rawJson.slice(0, 500)}${rawJson.length > 500 ? '...(truncated)' : ''}`,
-          );
+          debugLog(`[RETRY-MSG ${msgCount}] ${diagnosticSdkMessageShape(msg)}`);
 
           // Capture new session ID
           const msgSessionId = (msg as { session_id?: string }).session_id;
           if (msgSessionId && !this.sessionMap.has(conversationId)) {
-            debugLog(`[SESSION] Captured new sessionId=${msgSessionId} for conversationId=${conversationId}`);
+            debugLog(`[SESSION] Captured new session id length=${msgSessionId.length}`);
             this.sessionMap.set(conversationId, msgSessionId);
           }
 
@@ -652,9 +657,7 @@ export class ClaudeAgentRuntime implements AgentRuntime {
         debugLog(`[RETRY] Finished after ${msgCount} messages`);
         yield { conversationId, type: 'done' };
       } catch (retryErr) {
-        debugLog(
-          `[RETRY-ERROR] ${retryErr instanceof Error ? (retryErr.stack ?? retryErr.message) : String(retryErr)}`,
-        );
+        debugLog(`[RETRY-ERROR] ${diagnosticErrorShape(retryErr)}`);
         if (!abortSignal?.aborted) {
           yield {
             conversationId,
@@ -766,7 +769,6 @@ function rewriteSdkError(text: string): string {
     .replace(/Run `claude login`[^.]*/gi, 'Check your API key in Settings → Model Providers.');
 }
 
-// The SDK reports a tool RESULT with only its tool_use_id (no name), but MAIN's mid-stream
 // enter_plan_mode interception (agent.ts) matches on toolName. Record tool_use_id → name at the
 // tool-CALL block so the result event can be stamped with the real name (R138 f-4) — otherwise
 // an SDK enter_plan_mode never triggers the plan-first restart and the query keeps its mutating
@@ -784,6 +786,7 @@ function recordSdkToolName(toolUseId: string, name: string): void {
 
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
   const events: StreamEvent[] = [];
+
   switch (msg.type) {
     // ---------------------------------------------------------------
     // Streaming text deltas (partial assistant messages)
@@ -798,7 +801,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           }
         | undefined;
       if (!event) {
-        debugLog(`[STREAM_EVENT] No event field in msg. keys=${Object.keys(msg).join(',')}`);
+        debugLog(`[STREAM_EVENT] No event field messageFieldCount=${Object.keys(msg).length}`);
         break;
       }
 
@@ -823,7 +826,9 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
         const block = event.content_block;
         const toolCallId = (block.id as string) ?? `tool-${Date.now()}`;
         const toolName = normalizeToolName((block.name as string) ?? 'unknown');
-        recordSdkToolName(toolCallId, toolName); // so the later result event can carry the name
+        // Record id → name so the later `user`-message tool_result block (which carries no name)
+        // can be stamped with the real tool name (R138 f-4).
+        if (block.id) recordSdkToolName(block.id as string, toolName);
         events.push({
           conversationId,
           type: 'tool-call',
@@ -865,24 +870,21 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
         | undefined;
 
       if (!betaMessage?.content) {
-        debugLog(`[ASSISTANT] No content in message. msg keys: ${Object.keys(msg).join(',')}`);
+        debugLog(`[ASSISTANT] No content messageFieldCount=${Object.keys(msg).length}`);
         break;
       }
 
-      debugLog(
-        `[ASSISTANT] ${betaMessage.content.length} blocks: ${betaMessage.content.map((b) => `${b.type}${b.text ? '(text=' + b.text.slice(0, 80) + ')' : ''}`).join(', ')}`,
-      );
+      debugLog(`[ASSISTANT] blockCount=${betaMessage.content.length}`);
 
       for (const block of betaMessage.content) {
         if (block.type === 'tool_use') {
           // Complete tool call from assistant message
-          const toolCallId = block.id ?? `tool-${Date.now()}`;
           const toolName = normalizeToolName(block.name ?? 'unknown');
-          recordSdkToolName(toolCallId, toolName);
+          if (block.id) recordSdkToolName(block.id, toolName);
           events.push({
             conversationId,
             type: 'tool-call',
-            toolCallId,
+            toolCallId: block.id ?? `tool-${Date.now()}`,
             toolName,
             args: block.input ?? {},
             startedAt: new Date().toISOString(),
@@ -936,7 +938,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // ---------------------------------------------------------------
     case 'result': {
       debugLog(
-        `[RESULT] subtype=${msg.subtype} result_type=${typeof msg.result} result=${JSON.stringify(msg.result ?? null).slice(0, 300)} structured_output=${JSON.stringify(msg.structured_output ?? null).slice(0, 300)}`,
+        `[RESULT] subtype=${diagnosticValueShape(msg.subtype)} result=${diagnosticValueShape(msg.result)} structuredOutput=${diagnosticValueShape(msg.structured_output)}`,
       );
       const usage = msg.usage as
         | {
@@ -1068,16 +1070,14 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
           const isError = block.is_error === true;
 
           debugLog(
-            `[TOOL_RESULT] toolUseId=${block.tool_use_id} isError=${isError} result=${resultText.slice(0, 200)}`,
+            `[TOOL_RESULT] toolUseIdLength=${block.tool_use_id.length} isError=${isError} result=${diagnosticValueShape(resultText)}`,
           );
 
           events.push({
             conversationId,
             type: 'tool-result',
             toolCallId: block.tool_use_id,
-            // Recover the tool name recorded at the tool-CALL block so MAIN's mid-stream
-            // enter_plan_mode / exit_plan_mode interception fires for SDK runs too (R138 f-4).
-            toolName: sdkToolNameById.get(block.tool_use_id) ?? '',
+            toolName: sdkToolNameById.get(block.tool_use_id) ?? '', // stamped from the tool-CALL block (R138 f-4)
             result: isError ? { isError: true, error: resultText } : resultText,
             finishedAt,
           });
@@ -1106,7 +1106,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
     // informational and don't need translation to StreamEvent.
     default:
       debugLog(
-        `[TRANSLATE-SKIP] Unhandled msg type=${msg.type} subtype=${msg.subtype ?? 'none'} keys=${Object.keys(msg).join(',')}`,
+        `[TRANSLATE-SKIP] Unhandled message type=${diagnosticValueShape(msg.type)} subtype=${diagnosticValueShape(msg.subtype)} fieldCount=${Object.keys(msg).length}`,
       );
       break;
   }
@@ -1149,6 +1149,14 @@ type CallToolResult = {
   isError?: boolean;
 };
 
+type ClaudeToolExecutionContext = ToolExecutionContext & {
+  conversationId: string;
+  /** The OWNING run's stream token, captured at handler creation (bound to THIS run). Lets the
+   *  ask_user path classify an abort-driven recovery as terminal (Stop/dismiss) vs recoverable
+   *  supersession (R95/R100 f-6) without re-reading activeStreams (which may be torn down). */
+  owningStreamToken?: string;
+};
+
 /**
  * Create an MCP tool handler for a Kai tool definition.
  *
@@ -1160,57 +1168,61 @@ function createToolHandler(
   conversationId: string,
   cwd: string | undefined,
   abortSignal: AbortSignal | undefined,
-  owningStreamToken: string | undefined,
+  browserOwnerId: string | undefined,
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  if (toolDef.name === 'ask_user') {
-    return createAskUserHandler(conversationId, abortSignal, owningStreamToken);
-  }
-  if (toolDef.name === 'exit_plan_mode') {
-    return createExitPlanModeHandler(toolDef, conversationId, cwd, abortSignal);
-  }
-
-  // Standard tool handler — validate args, call execute(), wrap the result
+  // Bind the owning run's stream token at creation (NOT re-read later): a post-Stop queued callback
+  // must still classify correctly even after activeStreams is torn down (R100 f-6).
+  const owningStreamToken = getActiveStreamTokenForConversation(conversationId);
+  // Approval-backed special tools stay inside this wrapper so lifecycle hooks
+  // can deny or rewrite their input and sanitize their result.
   return async (args: unknown): Promise<CallToolResult> => {
-    // If THIS run was already aborted (superseded / Stopped) before a queued callback fires, do
-    // NOT execute enter_plan_mode (R144 f-1): it would persist plan-first but never emit the
-    // result MAIN's mid-stream interception needs to restart, so the SUCCESSOR run continues with
-    // its mutating tool set while disk/UI show Plan-First. The turn is over — refuse.
+    // If THIS run was already aborted (superseded / Stopped) before a queued callback fires, do NOT
+    // execute enter_plan_mode (R144 f-1): it would persist plan-first but never emit the result
+    // MAIN's mid-stream interception needs to restart, so the SUCCESSOR run continues with its
+    // mutating tool set while disk/UI show Plan-First. The turn is over — refuse.
     if (toolDef.name === 'enter_plan_mode' && abortSignal?.aborted) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'The turn was stopped.' }) }],
         isError: true,
       };
     }
-    const context: ToolExecutionContext = {
-      toolCallId: `sdk-bridge-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    const toolCallPrefix =
+      toolDef.name === 'ask_user' ? 'sdk-ask' : toolDef.name === 'exit_plan_mode' ? 'sdk-plan' : 'sdk-bridge';
+    const toolCallId = `${toolCallPrefix}-${randomUUID()}`;
+    const context: ClaudeToolExecutionContext = {
+      toolCallId,
       conversationId,
+      browserOwnerId,
       cwd,
       abortSignal,
+      owningStreamToken,
       // The SDK runtime IS a gateable plan-mode context: enter_plan_mode restarts via MAIN's
-      // name-stamped mid-stream interception (R139), and exit_plan_mode is gated by the
-      // dedicated createExitPlanModeHandler. So the plan tools may execute here (R141).
+      // name-stamped mid-stream interception (R139) and exit_plan_mode is gated below. So the plan
+      // tools may execute here (R141).
       planModeGateable: true,
     };
 
     try {
-      // These tools run with full local privileges, so if the tool's Zod schema
-      // exists and rejects, fail the call rather than executing on raw input.
-      // Tools without a safeParse-capable schema pass through (nothing to check).
-      let validatedArgs: unknown = args;
-      const safeParse = (toolDef.inputSchema as { safeParse?: (v: unknown) => { success: boolean; data?: unknown } })
-        .safeParse;
-      if (typeof safeParse === 'function') {
-        const parsed = safeParse.call(toolDef.inputSchema, args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: 'text', text: `Invalid arguments for tool "${toolDef.name}".` }],
-            isError: true,
-          };
-        }
-        validatedArgs = parsed.data;
-      }
-
-      const result = await toolDef.execute(validatedArgs, context);
+      const result = await executeToolWithLifecycleHooks({
+        conversationId,
+        toolCallId,
+        toolName: toolDef.name,
+        args,
+        validate: (candidate) => {
+          const safeParse = (
+            toolDef.inputSchema as { safeParse?: (value: unknown) => { success: boolean; data?: unknown } }
+          ).safeParse;
+          if (typeof safeParse !== 'function') return candidate;
+          const parsed = safeParse.call(toolDef.inputSchema, candidate);
+          if (!parsed.success) throw new Error(`Invalid arguments for tool "${toolDef.name}".`);
+          return parsed.data;
+        },
+        execute: (validatedArgs) => {
+          if (toolDef.name === 'ask_user') return executeAskUserTool(validatedArgs, context);
+          if (toolDef.name === 'exit_plan_mode') return executeExitPlanModeTool(toolDef, validatedArgs, context);
+          return toolDef.execute(validatedArgs, context);
+        },
+      });
       // Surface an error-shaped tool result as a tool error, not a success.
       const resultIsError =
         !!result &&
@@ -1225,7 +1237,7 @@ function createToolHandler(
       return { content, ...(resultIsError ? { isError: true } : {}) };
     } catch (err) {
       return {
-        content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+        content: [{ type: 'text', text: redactBrowserToolErrorForExposure(toolDef.name, err) }],
         isError: true,
       };
     }
@@ -1233,7 +1245,8 @@ function createToolHandler(
 }
 
 /**
- * Create a tool handler for `ask_user` that orchestrates the full UI flow.
+ * Execute `ask_user` after schema validation and PreToolUse have produced the
+ * effective question. Its raw answer then passes through PostToolUse.
  *
  * 1. Broadcasts `tool-approval-required` to the renderer (shows question UI)
  * 2. Registers a pending approval and awaits the user's response
@@ -1243,124 +1256,81 @@ function createToolHandler(
  * The renderer doesn't need changes — it already handles `tool-approval-required`
  * events and sends answers via `agent:answer-tool-question` IPC.
  */
-function createAskUserHandler(
-  conversationId: string,
-  abortSignal: AbortSignal | undefined,
-  owningStreamToken: string | undefined,
-): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  return async (args: unknown): Promise<CallToolResult> => {
-    // Reject a callback that fires AFTER this run was already aborted/stopped: the
-    // SDK may invoke a queued tool callback post-abort, which would broadcast a stale
-    // question card and (worse) record a post-Stop recovery tombstone that a later
-    // answer could use to resurrect the stopped conversation. Bail before any
-    // broadcast/stash (R100 finding-6).
-    if (abortSignal?.aborted) {
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'The turn was stopped before this question ran.' }) }],
-        isError: true,
-      };
-    }
-    const toolCallId = `sdk-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionContext): Promise<unknown> {
+  const { toolCallId, conversationId, abortSignal, browserOwnerId, owningStreamToken } = context;
 
-    // The OWNING run's token, captured at stream start (bound to THIS run). Used to
-    // classify an abort-driven recovery as terminal (Stop / dismiss → no recovery)
-    // vs. a recoverable supersession (R95). Binding at creation — not re-reading
-    // activeStreams here — is what makes a post-Stop callback classify correctly
-    // (activeStreams may already be torn down, reading undefined) (R100 finding-6).
-    const streamTokenAtAsk = owningStreamToken;
+  // Reject a callback that fires AFTER this run was already aborted/stopped (R100 f-6): the SDK may
+  // invoke a queued tool callback post-abort, which would broadcast a stale question card and record
+  // a post-Stop recovery tombstone a later answer could use to resurrect the stopped conversation.
+  // Bail before any broadcast/stash.
+  if (abortSignal?.aborted) {
+    return { error: 'The turn was stopped before this question ran.' };
+  }
 
-    debugLog(`[ASK_USER] Broadcasting question toolCallId=${toolCallId}`);
+  debugLog(`[ASK_USER] Broadcasting question toolCallIdLength=${toolCallId.length}`);
 
-    // 1. Broadcast to renderer — shows question UI
-    broadcastStreamEventRaw({
-      conversationId,
-      type: 'tool-approval-required',
-      toolCallId,
-      toolName: 'ask_user',
-      args,
-    });
-
-    // 2. Wait for user response via shared pending-approval infrastructure.
-    //    The IPC handler (agent:answer-tool-question) stores answers in
-    //    pendingQuestionAnswers and resolves the approval promise.
-    //    Capture the CATEGORICAL settle source: abort resolves with the same
-    //    'dismiss' VALUE as a real user dismiss, so only onSettle can tell a
-    //    recoverable abort (turn torn down mid-answer) apart from a deliberate
-    //    reject/dismiss (user said no — must NOT be resurrected). R94.
-    let settleSource: ApprovalSettleSource | undefined;
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined, {
+  // Capture the CATEGORICAL settle source (R94): abort resolves with the same 'dismiss' VALUE as a
+  // real user dismiss, so only onSettle can tell a recoverable abort (turn torn down mid-answer)
+  // apart from a deliberate reject/dismiss (user said no — must NOT be resurrected).
+  let settleSource: ApprovalSettleSource | undefined;
+  // Register before broadcasting so a synchronous response cannot beat the
+  // waiter, and so a dedicated pop-out can be bound to this exact request.
+  const approvalDecision = registerPendingApproval(
+    toolCallId,
+    abortSignal ?? undefined,
+    'any-renderer',
+    { conversationId, browserOwnerId },
+    {
       conversationId,
       toolName: 'ask_user',
       onSettle: (source) => {
         settleSource = source;
       },
-    });
+    },
+  );
 
-    if (approved !== true) {
-      // The SDK runtime can't recover the answer INLINE — the abortSignal has
-      // already torn down the `query()` subprocess and its stream loop has exited,
-      // so returning a result here goes into a dead call; and a replacement turn
-      // mints a fresh random `sdk-ask-*` id, so an answer stashed under THIS id
-      // can't be matched by a later query either.
-      //
-      // Route the durable recovered-answer path ONLY for a genuine ABORT (the turn
-      // was superseded / torn down while an answer raced in). A deliberate
-      // reject/dismiss means the user declined THIS question — resurrecting a late
-      // answer would override that choice; and on an explicit Stop the abort's
-      // cancel-generation bump would let a stale surface's answer restart a stopped
-      // turn. So for reject/dismiss (and any non-abort settle) leave the stash
-      // untouched: the answer stays in the bounded (FIFO-evicted) stash, not routed
-      // into a new turn. (R93 introduced the routing; R94 scopes it to abort.)
-      debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
-      if (settleSource === 'abort') {
-        try {
-          getAskUserRecoveryRouter()?.(conversationId, toolCallId, streamTokenAtAsk);
-        } catch {
-          /* best-effort — the bounded stash copy remains as the last resort */
-        }
+  // 1. Broadcast to renderer — shows question UI
+  broadcastStreamEventRaw({
+    conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'ask_user',
+    args,
+  });
+
+  // 2. Wait for user response via shared pending-approval infrastructure.
+  //    The IPC handler (agent:answer-tool-question) stores answers in
+  //    pendingQuestionAnswers and resolves the approval promise.
+  const approved = await approvalDecision;
+
+  if (approved !== true) {
+    // Route the durable recovered-answer path ONLY for a genuine ABORT (turn superseded / torn down
+    // while an answer raced in). A deliberate reject/dismiss means the user declined THIS question —
+    // resurrecting a late answer would override that, and on explicit Stop the cancel-generation
+    // bump could let a stale surface's answer restart a stopped turn. (R93 routing; R94 abort-scope.)
+    debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
+    if (settleSource === 'abort') {
+      try {
+        getAskUserRecoveryRouter()?.(conversationId, toolCallId, owningStreamToken);
+      } catch {
+        /* best-effort — the bounded stash copy remains as the last resort */
       }
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the question.' }) }],
-        isError: true,
-      };
     }
+    return { error: 'User dismissed the question.' };
+  }
 
-    // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler) and
-    //    embed them in the tool result handed back to the SDK query(), which
-    //    translates + commits the user/tool_result. The answer is consumed here.
-    //
-    // ┌─ SETTLED DECISION (do not re-open without a NEW argument) ──────────────────┐
-    // │ We deliberately do NOT ledger the APPROVED SDK answer for recovery. This was │
-    // │ tried (R101 f-3) and it spawned a P1 EITHER way, because the SDK emits its    │
-    // │ tool-result under its own real tool_use_id (NOT this synthetic sdk-ask-* id)  │
-    // │ and exposes no reliable correlation:                                         │
-    // │   • clear-on-commit can't match the id  → ledger lingers → re-delivery (R102 f-1) │
-    // │   • clear-on-return  → lost on a mid-commit supersession (R103 f-1)           │
-    // │ R103 f-1 DIRECTED removing the ledger (commit 855881e0). R108 f-3 asked to    │
-    // │ re-add it — that is CIRCULAR and is intentionally NOT actioned. The genuine   │
-    // │ fix would require correlating the synthetic id with the SDK tool_use_id (the  │
-    // │ MCP `extra` arg does not currently carry it); until that correlation exists a │
-    // │ ledger is strictly worse than consuming plainly. The recoverable window (this │
-    // │ synchronous return → the SDK's own commit) is sub-millisecond, and the        │
-    // │ raced/aborted-BEFORE-approval case is already handled by the recovery router  │
-    // │ above. So: consume plainly (pre-R101 behavior).                              │
-    // └──────────────────────────────────────────────────────────────────────────────┘
-    const answers = pendingQuestionAnswers.get(toolCallId);
-    pendingQuestionAnswers.delete(toolCallId);
+  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
+  const answers = pendingQuestionAnswers.get(toolCallId);
+  pendingQuestionAnswers.delete(toolCallId);
 
-    debugLog(
-      `[ASK_USER] Got answers toolCallId=${toolCallId} keys=${answers ? Object.keys(answers).join(',') : 'none'}`,
-    );
+  debugLog(`[ASK_USER] Got answers answerCount=${answers ? Object.keys(answers).length : 0}`);
 
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ success: true, answers: answers ?? {} }) }],
-    };
-  };
+  return { success: true, answers: answers ?? {} };
 }
 
 /**
- * Create a tool handler for `exit_plan_mode` that gates execution behind
- * user approval.
+ * Execute `exit_plan_mode` after schema validation and PreToolUse have
+ * produced the effective plan, then gate it behind user approval.
  *
  * In the Mastra runtime, `agent.ts` intercepts `exit_plan_mode` via the
  * `onToolExecutionStart` hook and broadcasts `tool-approval-required` so the
@@ -1373,115 +1343,57 @@ function createAskUserHandler(
  * 4. On reject: returns an error telling Claude to keep planning
  * 5. On dismiss: returns an error indicating the plan was dismissed
  */
-function createExitPlanModeHandler(
+async function executeExitPlanModeTool(
   toolDef: ToolDefinition,
-  conversationId: string,
-  cwd: string | undefined,
-  abortSignal: AbortSignal | undefined,
-): (args: unknown, extra: unknown) => Promise<CallToolResult> {
-  return async (args: unknown): Promise<CallToolResult> => {
-    const toolCallId = `sdk-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    // If THIS run was already aborted (a superseding GUI/CLI run replaced it) before the
-    // queued exit_plan_mode callback fires, do NOT broadcast an approval request (R128
-    // finding-3). The broadcast is UNTAGGED (no owning stream token), so the renderer would
-    // apply it to the SUCCESSOR run — setting awaitingApproval on a run that has no pending
-    // approval to resolve, wedging it at 'awaiting-approval'. registerPendingApproval would
-    // itself immediately settle 'dismiss' on the already-aborted signal, but only AFTER the
-    // stray broadcast landed. Bail before broadcasting — the aborted run's turn is over.
-    if (abortSignal?.aborted) {
-      debugLog(`[EXIT_PLAN_MODE] run already aborted before approval broadcast toolCallId=${toolCallId}`);
-      return {
-        content: [
-          { type: 'text', text: JSON.stringify({ error: 'The turn was stopped before the plan was reviewed.' }) },
-        ],
-        isError: true,
-      };
-    }
-    // Capture the owning stream token at ask time (mirrors createAskUserHandler):
-    // the plan-exit seam must target the run that raised the plan, not whatever
-    // run happens to be active when the user finally answers the modal.
-    const streamTokenAtAsk = getActiveStreamTokenForConversation(conversationId);
+  args: unknown,
+  context: ClaudeToolExecutionContext,
+): Promise<unknown> {
+  const { toolCallId, conversationId, abortSignal, browserOwnerId } = context;
 
-    debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallId=${toolCallId}`);
+  // If THIS run was already aborted (a superseding GUI/CLI run replaced it) before the queued
+  // exit_plan_mode callback fires, do NOT broadcast an approval request (R128 f-3). The broadcast is
+  // UNTAGGED (no owning stream token), so the renderer would apply it to the SUCCESSOR run — wedging
+  // it at 'awaiting-approval' with no pending approval to resolve. Bail before broadcasting.
+  if (abortSignal?.aborted) {
+    return { error: 'The turn was stopped before the plan could be reviewed.' };
+  }
 
-    // 1. Broadcast to renderer — shows plan review UI with approve/reject
-    broadcastStreamEventRaw({
-      conversationId,
-      type: 'tool-approval-required',
-      toolCallId,
-      toolName: 'exit_plan_mode',
-      args,
-    });
+  debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallIdLength=${toolCallId.length}`);
 
-    // 2. Wait for user approval
-    const approved = await registerPendingApproval(toolCallId, abortSignal ?? undefined, {
-      conversationId,
-      toolName: 'exit_plan_mode',
-    });
+  const approvalDecision = registerPendingApproval(
+    toolCallId,
+    abortSignal ?? undefined,
+    'any-renderer',
+    { conversationId, browserOwnerId },
+    { conversationId, toolName: 'exit_plan_mode' },
+  );
 
-    if (approved === 'dismiss') {
-      debugLog(`[EXIT_PLAN_MODE] User dismissed plan toolCallId=${toolCallId}`);
-      // registerPendingApproval resolves 'dismiss' for BOTH a genuine user dismiss
-      // AND a controller abort (a superseding turn / Stop). Only a GENUINE dismiss
-      // (the run's signal is NOT aborted) actually leaves plan mode. On an abort a
-      // successor already owns the conversation — routing the seam then would let
-      // MAIN persist 'auto' + terminal-mark/abort the SUCCESSOR run using this
-      // (superseded) run's captured token (finding-1). The MAIN handler is itself
-      // token-scoped, but the definitive signal that this is NOT a user decision is
-      // the run's own aborted signal — so gate here and never hand a superseded
-      // abort to the seam.
-      if (!abortSignal?.aborted) {
-        // Dismiss = "exit plan mode without accepting a plan." The run is leaving
-        // plan mode, so hand the exit back to MAIN: it persists+broadcasts `auto`
-        // (MAIN owns the authoritative executionMode), marks the turn terminal so
-        // a late raced answer/inject can't resurrect the planning turn, and aborts
-        // the still-running SDK query (there is no plan to execute — the turn is
-        // done). The MCP error result below is what Claude sees, but the query is
-        // torn down by MAIN before it can act on it.
-        getPlanModeDismissHandler()?.(conversationId, streamTokenAtAsk);
-      }
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'User dismissed the plan. Exiting plan mode.' }) }],
-        isError: true,
-      };
-    }
+  // 1. Broadcast to renderer — shows plan review UI with approve/reject
+  broadcastStreamEventRaw({
+    conversationId,
+    type: 'tool-approval-required',
+    toolCallId,
+    toolName: 'exit_plan_mode',
+    args,
+  });
 
-    if (approved !== true) {
-      debugLog(`[EXIT_PLAN_MODE] User rejected plan toolCallId=${toolCallId}`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error:
-                "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
-            }),
-          },
-        ],
-        isError: true,
-      };
-    }
+  // 2. Wait for user approval
+  const approved = await approvalDecision;
 
-    // 3. Approved — execute the tool (writes plan file, broadcasts mode change)
-    debugLog(`[EXIT_PLAN_MODE] User approved plan toolCallId=${toolCallId}`);
-    const context: ToolExecutionContext = {
-      toolCallId,
-      conversationId,
-      cwd,
-      abortSignal,
-      // Reached only AFTER user approval in createExitPlanModeHandler — a gated context (R141).
-      planModeGateable: true,
+  if (approved === 'dismiss') {
+    debugLog(`[EXIT_PLAN_MODE] User dismissed plan`);
+    return { error: 'User dismissed the plan. Exiting plan mode.' };
+  }
+
+  if (approved !== true) {
+    debugLog(`[EXIT_PLAN_MODE] User rejected plan`);
+    return {
+      error:
+        "User rejected the plan. Continue planning — refine the approach based on the user's feedback and call exit_plan_mode again when ready.",
     };
+  }
 
-    try {
-      const result = await toolDef.execute(args, context);
-      const text = typeof result === 'string' ? result : JSON.stringify(result);
-      return { content: [{ type: 'text', text }] };
-    } catch (err) {
-      return {
-        content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
-        isError: true,
-      };
-    }
-  };
+  // 3. Approved — execute the tool (writes plan file, broadcasts mode change)
+  debugLog(`[EXIT_PLAN_MODE] User approved plan`);
+  return toolDef.execute(args, context);
 }

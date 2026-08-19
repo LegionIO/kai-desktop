@@ -82,6 +82,11 @@ import {
 } from '../ipc/conversation-store.js';
 import { getHostPluginApiVersion, getHostCapabilities } from './plugin-compat.js';
 import { openPluginBrowserWindow } from './browser-window/index.js';
+import {
+  assertPluginBrowserPartitionAvailable,
+  beginPluginBrowserPartitionOperation,
+  trackPluginBrowserWindow,
+} from './browser-window/lifecycle.js';
 import { hookDispatcher, HOOK_EVENTS } from '../agent/hooks/dispatcher.js';
 import {
   archivePluginTask,
@@ -93,6 +98,8 @@ import {
   upsertExternalPluginTask,
 } from '../ipc/tasks.js';
 import { subscribeToTaskChanges } from '../tasks/task-sync.js';
+import { isInAppBrowserPartition } from '../browser/session.js';
+import { assertPluginBrowserConfigWriteAllowed } from './browser-config-permission.js';
 
 /** Max buffered body for a plugin HTTP server request (1 MB). */
 const PLUGIN_HTTP_MAX_BODY_BYTES = 1_048_576;
@@ -127,6 +134,18 @@ function isListenHostAllowed(host: string, permissions: readonly string[]): bool
   return isLoopbackHost(host) || permissions.includes('http:listen:network');
 }
 
+function assertPluginPartitionAllowed(partition: string | undefined): void {
+  if (partition && isInAppBrowserPartition(partition)) {
+    throw new Error("Plugin browser APIs cannot access Kai's reserved in-app Browser profiles.");
+  }
+}
+
+function trackPartitionedPluginAuthWindow(window: BrowserWindow, partition: string | undefined): void {
+  if (!partition) return;
+  const stopTracking = trackPluginBrowserWindow(window, partition);
+  window.once('closed', stopTracking);
+}
+
 // ─── Session Cookie Promotion ────────────────────────────────────────────────
 // Electron drops session cookies (those without an Expires/Max-Age) when the
 // last BrowserWindow using that partition's session closes.  For auth windows
@@ -146,6 +165,7 @@ function persistentPluginCallback<T extends (...args: never[]) => unknown>(callb
 
 interface SessionPromotionState {
   config: CookiePromotionConfig | undefined;
+  partition: string;
 }
 
 const sessionPromotionState = new WeakMap<Electron.Session, SessionPromotionState>();
@@ -224,7 +244,11 @@ async function resolveCookiePromotion(
  * Configures session cookie promotion for a partition's session.
  * Installs the cookie listener once; subsequent calls update the config.
  */
-function configureSessionCookiePromotion(ses: Electron.Session, config?: CookiePromotionConfig): void {
+function configureSessionCookiePromotion(
+  ses: Electron.Session,
+  partition: string,
+  config?: CookiePromotionConfig,
+): void {
   const existing = sessionPromotionState.get(ses);
 
   if (existing) {
@@ -232,45 +256,70 @@ function configureSessionCookiePromotion(ses: Electron.Session, config?: CookieP
     if (config !== undefined) {
       existing.config = config;
     }
+    existing.partition = partition;
     return;
   }
 
   // First time: install the listener and store state
-  const state: SessionPromotionState = { config };
+  const state: SessionPromotionState = { config, partition };
   sessionPromotionState.set(ses, state);
 
-  ses.cookies.on('changed', async (_event, cookie, _cause, removed) => {
+  ses.cookies.on('changed', (_event, cookie, _cause, removed) => {
     // Only promote cookies that were just set (not removed) and lack an expiry
     if (removed || cookie.expirationDate) return;
 
     const currentState = sessionPromotionState.get(ses);
     if (!currentState) return;
 
-    let ttlSeconds: number | false;
+    let releasePartitionOperation: (() => void) | null = null;
     try {
-      ttlSeconds = await resolveCookiePromotion(currentState.config, cookie);
-    } catch (error) {
-      console.warn('[PluginAPI] Session-cookie promotion callback failed:', error);
+      // A Browser Data clear installs its fence before waiting for admitted
+      // operations. Acquire the lease before invoking a plugin-controlled
+      // callback and retain it through the Chromium cookie write so a clear
+      // cannot finish and then have this listener recreate authentication.
+      releasePartitionOperation = beginPluginBrowserPartitionOperation(currentState.partition);
+    } catch {
+      // The profile is clearing or quarantined. Fail closed: the original
+      // session cookie will be removed by the clear and must not be promoted.
       return;
     }
-    if (ttlSeconds === false) return;
 
-    const expirationDate = Math.floor(Date.now() / 1000) + ttlSeconds;
-    ses.cookies
-      .set({
-        url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
-        name: cookie.name,
-        value: cookie.value,
-        domain: cookie.domain,
-        path: cookie.path,
-        secure: cookie.secure,
-        httpOnly: cookie.httpOnly,
-        sameSite: cookie.sameSite,
-        expirationDate,
-      })
-      .catch(() => {
-        /* best-effort — ignore failures */
-      });
+    void (async () => {
+      try {
+        let ttlSeconds: number | false;
+        try {
+          ttlSeconds = await resolveCookiePromotion(currentState.config, cookie);
+        } catch (error) {
+          console.warn('[PluginAPI] Session-cookie promotion callback failed:', error);
+          return;
+        }
+        if (ttlSeconds === false) return;
+
+        const expirationDate = Math.floor(Date.now() / 1000) + ttlSeconds;
+        try {
+          await ses.cookies.set({
+            url: `http${cookie.secure ? 's' : ''}://${cookie.domain?.replace(/^\./, '') ?? 'unknown'}${cookie.path ?? '/'}`,
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path,
+            secure: cookie.secure,
+            httpOnly: cookie.httpOnly,
+            sameSite: cookie.sameSite,
+            expirationDate,
+          });
+        } catch {
+          /* best-effort — ignore failures */
+        }
+      } finally {
+        releasePartitionOperation?.();
+      }
+    })().catch((error) => {
+      // EventEmitter does not observe returned promises. Keep unexpected async
+      // failures contained instead of surfacing an unhandled rejection.
+      releasePartitionOperation?.();
+      console.warn('[PluginAPI] Session-cookie promotion failed:', error);
+    });
   });
 }
 
@@ -294,8 +343,26 @@ type PluginAPICallbacks = {
   onUIStateChanged: () => void;
   onToolsChanged: () => void;
   onCliToolsChanged?: () => void;
+  /** Called synchronously before an existing inference provider is replaced or
+   * removed so the host can revoke capabilities already bound to live turns. */
+  onInferenceProviderChanging?: (provider: PluginInferenceProvider) => void;
   registerActionHandler: (targetId: string, handler: PluginActionHandler) => void;
 };
+
+function replaceInferenceProviderFailClosed(
+  instance: Pick<PluginInstance, 'inferenceProvider'>,
+  nextProvider: PluginInferenceProvider | null,
+  onChanging?: (provider: PluginInferenceProvider) => void,
+): void {
+  const previousProvider = instance.inferenceProvider;
+  if (previousProvider === nextProvider) return;
+  // Remove the old provider from selection before revoking capabilities bound
+  // to it. If revocation throws, neither the old nor the not-yet-installed new
+  // provider remains available with authenticated Browser authority.
+  instance.inferenceProvider = null;
+  if (previousProvider) onChanging?.(previousProvider);
+  instance.inferenceProvider = nextProvider;
+}
 
 function isZodSchema(schema: unknown): schema is z.ZodTypeAny {
   return Boolean(
@@ -583,6 +650,10 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
 
       set: (path: string, value: unknown) => {
         requirePermission('config:write');
+        // Browser policy controls authenticated Chromium state and can enable
+        // script execution, private-network access, or saved-password autofill.
+        // The ordinary config writer is intentionally not sufficient authority.
+        assertPluginBrowserConfigWriteAllowed(path, manifest.permissions);
         const hasAgentHook = manifest.permissions.includes('agent:hook' as (typeof manifest.permissions)[number]);
         if (!hasAgentHook) {
           // Hook enforcement is gated by the dangerous `agent:hook` permission.
@@ -1049,6 +1120,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           onReady,
           customUserAgent,
         } = options;
+        assertPluginPartitionAllowed(partition);
 
         return new Promise((resolve) => {
           let settled = false;
@@ -1058,20 +1130,30 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
           // (avoids a redirect loop if the IdP keeps bouncing to the tokenless callback).
           let hiddenRedirectRecovered = false;
 
-          const ses = partition ? session.fromPartition(partition) : undefined;
-          if (ses) configureSessionCookiePromotion(ses, options.cookiePromotion);
+          const { ses, authWin } = (() => {
+            const releasePartitionOperation = partition ? beginPluginBrowserPartitionOperation(partition) : null;
+            try {
+              if (partition) assertPluginBrowserPartitionAvailable(partition);
+              const ses = partition ? session.fromPartition(partition) : undefined;
+              if (ses && partition) configureSessionCookiePromotion(ses, partition, options.cookiePromotion);
 
-          const authWin = new BrowserWindow({
-            width,
-            height,
-            show: showOnCreate,
-            title,
-            webPreferences: {
-              nodeIntegration: false,
-              contextIsolation: true,
-              ...(ses ? { session: ses } : {}),
-            },
-          });
+              const authWin = new BrowserWindow({
+                width,
+                height,
+                show: showOnCreate,
+                title,
+                webPreferences: {
+                  nodeIntegration: false,
+                  contextIsolation: true,
+                  ...(ses ? { session: ses } : {}),
+                },
+              });
+              trackPartitionedPluginAuthWindow(authWin, partition);
+              return { ses, authWin };
+            } finally {
+              releasePartitionOperation?.();
+            }
+          })();
           if (customUserAgent !== false) {
             authWin.webContents.setUserAgent(
               typeof customUserAgent === 'string' ? customUserAgent : getBrandUserAgent(),
@@ -1291,9 +1373,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             settle({ success: false, error: `Failed to load auth URL: ${err.message}` });
           });
 
-          authWin.once('close', () => {
+          authWin.once('closed', () => {
             if (!settled) {
-              settle({ success: false, error: 'Auth window closed by user' }, false);
+              settle({ success: false, error: 'Auth window closed' }, false);
             }
           });
         });
@@ -1332,8 +1414,19 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     browser: {
       open: (options: PluginBrowserWindowOptions) => {
         requirePermission('browser:window');
+        assertPluginPartitionAllowed(options.partition);
         if (options.partition) {
-          configureSessionCookiePromotion(session.fromPartition(options.partition), options.cookiePromotion);
+          const releasePartitionOperation = beginPluginBrowserPartitionOperation(options.partition);
+          try {
+            assertPluginBrowserPartitionAvailable(options.partition);
+            configureSessionCookiePromotion(
+              session.fromPartition(options.partition),
+              options.partition,
+              options.cookiePromotion,
+            );
+          } finally {
+            releasePartitionOperation();
+          }
         }
         openPluginBrowserWindow(options);
       },
@@ -1342,26 +1435,33 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     session: {
       clearCookies: async (partition: string, filter?: { domain?: string }): Promise<number> => {
         requirePermission('auth:window');
-        const ses = session.fromPartition(partition);
-        const allCookies = await ses.cookies.get({});
+        assertPluginPartitionAllowed(partition);
+        const releasePartitionOperation = beginPluginBrowserPartitionOperation(partition);
+        try {
+          assertPluginBrowserPartitionAvailable(partition);
+          const ses = session.fromPartition(partition);
+          const allCookies = await ses.cookies.get({});
 
-        let targetCookies = allCookies;
-        if (filter?.domain) {
-          const domains = Array.isArray(filter.domain) ? filter.domain : [filter.domain];
-          targetCookies = allCookies.filter((cookie) => {
-            const d = cookie.domain?.toLowerCase() ?? '';
-            return domains.some((pattern) => d.includes(pattern.toLowerCase()));
-          });
+          let targetCookies = allCookies;
+          if (filter?.domain) {
+            const domains = Array.isArray(filter.domain) ? filter.domain : [filter.domain];
+            targetCookies = allCookies.filter((cookie) => {
+              const d = cookie.domain?.toLowerCase() ?? '';
+              return domains.some((pattern) => d.includes(pattern.toLowerCase()));
+            });
+          }
+
+          for (const cookie of targetCookies) {
+            const protocol = cookie.secure ? 'https' : 'http';
+            const domain = cookie.domain?.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
+            const cookieUrl = `${protocol}://${domain}${cookie.path}`;
+            await ses.cookies.remove(cookieUrl, cookie.name);
+          }
+
+          return targetCookies.length;
+        } finally {
+          releasePartitionOperation();
         }
-
-        for (const cookie of targetCookies) {
-          const protocol = cookie.secure ? 'https' : 'http';
-          const domain = cookie.domain?.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
-          const cookieUrl = `${protocol}://${domain}${cookie.path}`;
-          await ses.cookies.remove(cookieUrl, cookie.name);
-        }
-
-        return targetCookies.length;
       },
     },
 
@@ -1483,7 +1583,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       generate: async (options) => {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
+        const allTools = options.tools
+          ? withoutMidStreamPlanTools(getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+          : [];
         // Host-owned abort controller (R172 f-4): if the plugin omits abortSignal, an orphaned
         // main-process generation (and any tool execution it drives) would keep running after the
         // plugin is disabled/crashes/unloads. Link the plugin's signal (if any) into a host controller
@@ -1515,7 +1617,9 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       stream: async function* (options) {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? withoutMidStreamPlanTools(getRegisteredTools()) : [];
+        const allTools = options.tools
+          ? withoutMidStreamPlanTools(getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+          : [];
         // Host-owned controller so unload aborts an in-flight stream + its tool execution (R172 f-4).
         const hostController = new AbortController();
         inFlightAgentControllers.add(hostController);
@@ -1551,17 +1655,16 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         if (!provider || typeof provider.stream !== 'function' || typeof provider.isAvailable !== 'function') {
           throw new Error('Invalid inference provider: must have name, isAvailable(), and stream().');
         }
-        instance.inferenceProvider = provider;
+        replaceInferenceProviderFailClosed(instance, provider, callbacks.onInferenceProviderChanging);
         console.info(`[PluginAPI:${manifest.name}] Registered inference provider: ${provider.name}`);
       },
 
       unregisterInferenceProvider: () => {
         requirePermission('agent:inference-provider');
         if (instance.inferenceProvider) {
-          console.info(
-            `[PluginAPI:${manifest.name}] Unregistered inference provider: ${instance.inferenceProvider.name}`,
-          );
-          instance.inferenceProvider = null;
+          const previousProvider = instance.inferenceProvider;
+          replaceInferenceProviderFailClosed(instance, null, callbacks.onInferenceProviderChanging);
+          console.info(`[PluginAPI:${manifest.name}] Unregistered inference provider: ${previousProvider.name}`);
         }
       },
 
@@ -1909,4 +2012,11 @@ export async function cleanupPluginAPI(api: PluginAPI): Promise<void> {
 }
 
 /** Test-only exposure of pure helpers. */
-export const __internal = { isLoopbackHost, isListenHostAllowed };
+export const __internal = {
+  isLoopbackHost,
+  isListenHostAllowed,
+  assertPluginPartitionAllowed,
+  configureSessionCookiePromotion,
+  trackPartitionedPluginAuthWindow,
+  replaceInferenceProviderFailClosed,
+};

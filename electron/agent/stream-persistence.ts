@@ -11,6 +11,7 @@ import { readConversation, writeConversation, nextCompactionRevision } from '../
 import { getAppHome } from '../local-bridge/paths.js';
 import { isStrictPrefix, messageContentSignature } from './compaction.js';
 import type { StreamEvent } from './mastra-agent.js';
+import { redactBrowserToolArgsForExposure } from '../../shared/browser.js';
 
 // Re-exported from ./compaction (single canonical home, cycle-free for the agent /
 // conversations / stream-persistence trio). See its definition for why it hashes.
@@ -164,6 +165,7 @@ export function accumulateForPersistence(
     }
     case 'tool-call': {
       if (!event.toolCallId) break;
+      const exposedArgs = redactBrowserToolArgsForExposure(event.toolName, event.args);
       const acc = ensureAcc(conversationId, parentId, event.responseMessageId);
       const idx = acc.toolIndex.get(event.toolCallId);
       if (idx === undefined) {
@@ -171,12 +173,12 @@ export function accumulateForPersistence(
           type: 'tool-call',
           toolCallId: event.toolCallId,
           toolName: event.toolName ?? 'tool',
-          args: event.args,
+          args: exposedArgs,
         });
         acc.toolIndex.set(event.toolCallId, acc.parts.length - 1);
       } else {
         const part = acc.parts[idx] as ToolPart;
-        part.args = event.args ?? part.args;
+        part.args = exposedArgs ?? part.args;
         part.toolName = event.toolName ?? part.toolName;
       }
       acc.sawContent = true;

@@ -10,6 +10,7 @@ import {
   constants as fsConstants,
 } from 'fs';
 import { randomUUID } from 'crypto';
+import { chmod, open, rename, rm } from 'node:fs/promises';
 
 export interface AtomicWriteOptions {
   /**
@@ -23,6 +24,10 @@ export interface AtomicWriteOptions {
 }
 
 const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+
+async function closeAsyncHandle(handle: Awaited<ReturnType<typeof open>> | null): Promise<void> {
+  if (handle) await handle.close();
+}
 
 /**
  * Write a file atomically: write to a sibling temp file, then rename into place.
@@ -93,6 +98,54 @@ export function atomicWriteFileSync(destPath: string, data: string | Uint8Array,
   } catch (err) {
     try {
       if (existsSync(tmp)) rmSync(tmp, { force: true });
+    } catch {
+      /* ignore cleanup failure */
+    }
+    throw err;
+  }
+}
+
+/** Async counterpart used by browser metadata fed by untrusted page events.
+ * File-system work stays off Electron's main thread while retaining the same
+ * sibling-temp, no-follow, restrictive-mode, and atomic-rename guarantees. */
+export async function atomicWriteFile(
+  destPath: string,
+  data: string | Uint8Array,
+  opts: AtomicWriteOptions = {},
+): Promise<void> {
+  const tmp = `${destPath}.tmp-${process.pid}-${randomUUID()}`;
+  const mode = opts.mode ?? 0o666;
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW;
+    try {
+      handle = await open(tmp, flags, mode);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ELOOP' || code === 'EEXIST') {
+        throw new Error(`Refusing to write temp file at ${tmp} (pre-existing file or symlink)`);
+      }
+      throw err;
+    }
+    await handle.writeFile(data);
+    await handle.close();
+    handle = null;
+    if (opts.mode !== undefined) {
+      try {
+        await chmod(tmp, opts.mode);
+      } catch {
+        /* best-effort on platforms without POSIX perms */
+      }
+    }
+    await rename(tmp, destPath);
+  } catch (err) {
+    try {
+      await closeAsyncHandle(handle);
+    } catch {
+      /* ignore close failure while preserving the original error */
+    }
+    try {
+      await rm(tmp, { force: true });
     } catch {
       /* ignore cleanup failure */
     }

@@ -8,10 +8,12 @@
  */
 
 import { BrowserWindow } from 'electron';
+import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
 import { z } from 'zod';
 import type { AppConfig } from '../config/schema.js';
+import { sanitizeRealtimeToolResult } from './tool-result.js';
 import { resolveModelForThread } from '../agent/model-catalog.js';
 import { compactToolResult, estimateToolTokens } from '../agent/compaction.js';
 import type { ToolCompactionConfig } from '../agent/compaction.js';
@@ -21,12 +23,22 @@ import type { ComputerUseEvent } from '../../shared/computer-use.js';
 import { getExistingComputerUseManager } from '../computer-use/service.js';
 import type { IncomingMessage } from 'http';
 import { withBrandUserAgent } from '../utils/user-agent.js';
+import { redactBrowserToolArgsForExposure, redactBrowserToolErrorForExposure } from '../../shared/browser.js';
+import { applyPostToolUseHooks, prepareToolUseWithHooks } from '../agent/hooks/tool-lifecycle.js';
+import { hookDispatcher } from '../agent/hooks/dispatcher.js';
 
 /* ── Types ── */
 
 export type RealtimeProvider = 'openai' | 'azure' | 'custom';
 
 export type RealtimeSessionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+
+type ActiveRealtimeToolCall = {
+  toolName: string;
+  tool: ToolDefinition;
+  abort: AbortController;
+  startedAt: string;
+};
 
 export type RealtimeEvent =
   | { type: 'status'; status: RealtimeSessionStatus; error?: string }
@@ -97,6 +109,7 @@ type PendingToolCall = {
   name: string;
   argumentsJson: string;
   startedAt: string;
+  argumentsSuppressed: boolean;
 };
 
 const WS_OPEN = 1; // WS_OPEN constant
@@ -104,7 +117,6 @@ const WS_OPEN = 1; // WS_OPEN constant
 /** Cap accumulated function-call args (provider-streamed deltas) so a buggy or
  *  hostile realtime endpoint can't grow memory unbounded over a session. */
 const MAX_FUNCTION_ARGS_BYTES = 1024 * 1024;
-
 /**
  * Redact a WebSocket/HTTP URL for logging: strips userinfo and masks any
  * query param whose name looks credential-bearing (token/key/secret/password).
@@ -131,8 +143,43 @@ function redactUrlForLog(raw: string): string {
   }
 }
 
+export function realtimeServerEventPreview(eventType: string, event: Record<string, unknown>): string {
+  if (eventType === 'response.audio.delta') return '(audio data)';
+  // The aggregate response repeats completed output items, including full
+  // function-call arguments. Never stringify it: Browser typing, passwords,
+  // OTPs, and scripts may all be present even though their delta/item events
+  // were redacted individually.
+  if (eventType === 'response.done') return '(response aggregate redacted)';
+  if (eventType === 'response.function_call_arguments.delta' || eventType === 'response.function_call_arguments.done') {
+    return '(function-call arguments redacted)';
+  }
+  if (
+    (eventType === 'response.output_item.added' ||
+      eventType === 'response.output_item.done' ||
+      eventType === 'conversation.item.created') &&
+    (event.item as { type?: unknown } | undefined)?.type === 'function_call'
+  ) {
+    return '(function-call arguments redacted)';
+  }
+  if (
+    (eventType === 'response.output_item.added' ||
+      eventType === 'response.output_item.done' ||
+      eventType === 'conversation.item.created') &&
+    (event.item as { type?: unknown } | undefined)?.type === 'function_call_output'
+  ) {
+    return '(function-call output redacted)';
+  }
+  // Provider event schemas can grow without a Kai release. Default-deny the
+  // payload so newly introduced transcript, tool, or credential fields do not
+  // silently become plaintext diagnostics.
+  return '(event payload redacted)';
+}
+
 export class RealtimeSession {
+  /** Unique owner for browser tabs and control leases created by this call. */
+  readonly browserOwnerId = randomUUID();
   private ws: WebSocket | null = null;
+  private connectionGeneration = 0;
   private _status: RealtimeSessionStatus = 'idle';
   private conversationId: string = '';
   private config: AppConfig['realtime'];
@@ -144,17 +191,19 @@ export class RealtimeSession {
    *  result that arrives after teardown (it would otherwise broadcast a
    *  tool-result for a dead session). */
   private toolAbort: AbortController = new AbortController();
+  private activeToolCalls: Map<string, ActiveRealtimeToolCall> = new Map();
   /** True once the session has been torn down (close/failAndClose). */
   private torndown = false;
+  private terminalNotified = false;
+  private pendingStart: { reject: (error: Error) => void } | null = null;
+  private lastSessionUpdatePayload: string | null = null;
+  private greetingRequested = false;
 
   /** Whether the AI has requested to end the call (deferred until response completes) */
   private _endCallRequested = false;
 
   /** Tracks whether we are inside a response (between response.created and response.done) */
   private _inResponse = false;
-  /** True once the initial "call answered" greeting has been injected on the FIRST session.updated,
-   *  so later session.update echoes (e.g. mid-call updateTools) don't re-greet (R172 f-6). */
-  private _greetedOnSessionUpdate = false;
   private functionCallBuffers: Map<string, { name: string; args: string; itemId: string; callId: string }> = new Map();
 
   /** Audio tracking for barge-in truncation */
@@ -177,7 +226,11 @@ export class RealtimeSession {
   private userTranscriptBuffers: Map<string, string> = new Map();
   private assistantTranscriptBuffers: Map<string, string> = new Map();
 
-  constructor(getConfig: () => AppConfig, tools: ToolDefinition[]) {
+  constructor(
+    getConfig: () => AppConfig,
+    tools: ToolDefinition[],
+    private readonly onTerminal?: () => void,
+  ) {
     this.getFullConfig = getConfig;
     this.config = getConfig().realtime;
     this.tools = tools;
@@ -185,6 +238,23 @@ export class RealtimeSession {
 
   get status(): RealtimeSessionStatus {
     return this._status;
+  }
+
+  private notifyTerminal(): void {
+    if (this.terminalNotified) return;
+    this.terminalNotified = true;
+    try {
+      this.onTerminal?.();
+    } catch {
+      // Session teardown must not depend on an observer callback.
+    }
+  }
+
+  private rejectPendingStart(error: Error): void {
+    const pending = this.pendingStart;
+    if (!pending) return;
+    this.pendingStart = null;
+    pending.reject(error);
   }
 
   /* ── Public API ── */
@@ -195,6 +265,15 @@ export class RealtimeSession {
     }
 
     this.conversationId = conversationId;
+    this.torndown = false;
+    // These guards belong to one WebSocket connection, not the reusable
+    // RealtimeSession object. A fresh socket must receive its initial session
+    // configuration and greeting, and must notify its own terminal observer.
+    this.terminalNotified = false;
+    this.lastSessionUpdatePayload = null;
+    this.greetingRequested = false;
+    if (this.toolAbort.signal.aborted) this.toolAbort = new AbortController();
+    this.activeToolCalls.clear();
     this.config = this.getFullConfig().realtime;
     this.memoryContext = memoryContext ?? '';
     this.pendingToolCalls.clear();
@@ -203,16 +282,17 @@ export class RealtimeSession {
     this.assistantTranscriptBuffers.clear();
     this._endCallRequested = false;
     this._inResponse = false;
-    this._greetedOnSessionUpdate = false;
     this._audioChunkCount = 0;
     this._serverEventCount = 0;
 
     this.setupComputerUseTracking();
     this.setStatus('connecting');
+    const connectionGeneration = ++this.connectionGeneration;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+      let pendingStart!: { reject: (error: Error) => void };
       const settle = (fn: () => void) => {
         if (!settled) {
           settled = true;
@@ -220,42 +300,50 @@ export class RealtimeSession {
             clearTimeout(handshakeTimer);
             handshakeTimer = null;
           }
+          if (this.pendingStart === pendingStart) this.pendingStart = null;
           fn();
         }
       };
+      pendingStart = { reject: (error) => settle(() => reject(error)) };
+      this.pendingStart = pendingStart;
 
       try {
         const { url, headers } = this.buildConnection();
         console.info(`[RealtimeSession] Connecting to: ${redactUrlForLog(url)}`);
         console.info(`[RealtimeSession] Headers: ${Object.keys(headers).join(', ')}`);
-        this.ws = new WebSocket(url, { headers });
+        const socket = new WebSocket(url, { headers });
+        this.ws = socket;
+        const isCurrentSocket = () => this.connectionGeneration === connectionGeneration && this.ws === socket;
 
         // Handshake timeout (R172): a peer that accepts the TCP connection but never completes the
         // WebSocket upgrade would otherwise leave start() pending FOREVER — and the IPC layer only
         // installs activeSession after start() resolves, so Hang Up can't close the hung socket.
-        // Terminate the socket + reject so the connection + listeners don't leak on repeated starts.
+        // (main's pendingStart handle also lets Hang Up reject a pending start; this timer bounds the
+        // wait even when nothing cancels.) Terminate the socket + reject so it doesn't leak.
         handshakeTimer = setTimeout(() => {
           if (settled) return;
           console.error('[RealtimeSession] WebSocket handshake timed out');
           this.setStatus('error', 'connection timed out');
           try {
-            this.ws?.terminate();
+            socket.terminate();
           } catch {
             /* ignore */
           }
           this.teardownComputerUseTracking();
-          this.ws = null;
+          if (this.ws === socket) this.ws = null;
           settle(() => reject(new Error('Realtime connection timed out')));
         }, 20_000);
         if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref();
 
-        this.ws.on('open', () => {
+        socket.on('open', () => {
+          if (!isCurrentSocket()) return;
           this.setStatus('connected');
           this.sendSessionUpdate();
           settle(() => resolve());
         });
 
-        this.ws.on('message', (data: WebSocket.RawData) => {
+        socket.on('message', (data: WebSocket.RawData) => {
+          if (!isCurrentSocket()) return;
           try {
             const event = JSON.parse(data.toString());
             this.handleServerEvent(event);
@@ -264,7 +352,10 @@ export class RealtimeSession {
           }
         });
 
-        this.ws.on('close', (code: number, reason: Buffer) => {
+        socket.on('close', (code: number, reason: Buffer) => {
+          if (!isCurrentSocket()) return;
+          this.connectionGeneration++;
+          this.ws = null;
           console.info(`[RealtimeSession] WebSocket closed: code=${code} reason=${reason.toString()}`);
           if (this._status !== 'error') {
             this.setStatus('disconnected');
@@ -281,30 +372,35 @@ export class RealtimeSession {
           // socket (setupComputerUseTracking ran before connect).
           this.teardownComputerUseTracking();
           this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
-          this.ws = null;
+          this.notifyTerminal();
+          settle(() => reject(new Error('Realtime connection closed before session start completed.')));
         });
 
-        this.ws.on('error', (err: Error) => {
+        socket.on('error', (err: Error) => {
+          if (!isCurrentSocket()) return;
           // ECONNRESET after intentional close is expected — just log it
           if (settled) {
             console.info(`[RealtimeSession] Post-settle WebSocket error (safe to ignore): ${err.message}`);
             return;
           }
+          this.connectionGeneration++;
+          this.ws = null;
           console.error('[RealtimeSession] WebSocket error:', err.message);
           this.setStatus('error', err.message);
           this.teardownComputerUseTracking();
-          this.ws = null;
           settle(() => reject(err));
         });
 
         // Capture the actual HTTP response body on upgrade failure (400, 401, etc.)
-        this.ws.on('unexpected-response', (_req: unknown, res: IncomingMessage) => {
+        socket.on('unexpected-response', (_req: unknown, res: IncomingMessage) => {
+          if (!isCurrentSocket()) return;
           let body = '';
           // Cap the error body: a failed handshake response is provider-controlled
           // and could otherwise stream unbounded before 'end'.
           const MAX_UPGRADE_BODY = 16 * 1024;
           let truncated = false;
           res.on('data', (chunk: Buffer) => {
+            if (!isCurrentSocket()) return;
             if (body.length >= MAX_UPGRADE_BODY) {
               truncated = true;
               return;
@@ -316,13 +412,15 @@ export class RealtimeSession {
             }
           });
           res.on('end', () => {
+            if (!isCurrentSocket()) return;
+            this.connectionGeneration++;
+            this.ws = null;
             const shown = truncated ? `${body}…(truncated)` : body;
             const msg = `HTTP ${res.statusCode}: ${shown || res.statusMessage || 'Unknown error'}`;
             console.error(`[RealtimeSession] WebSocket upgrade rejected: ${msg}`);
             console.error(`[RealtimeSession] Response headers:`, JSON.stringify(res.headers, null, 2));
             this.setStatus('error', msg);
             this.teardownComputerUseTracking();
-            this.ws = null;
             settle(() => reject(new Error(msg)));
           });
         });
@@ -337,19 +435,23 @@ export class RealtimeSession {
   }
 
   close(): void {
+    this.rejectPendingStart(new Error('Realtime session closed before startup completed.'));
     this.torndown = true;
     this.toolAbort.abort();
     this.teardownComputerUseTracking();
-    if (this.ws) {
+    const socket = this.ws;
+    this.connectionGeneration++;
+    this.ws = null;
+    if (socket) {
       try {
-        this.ws.close(1000, 'Client closing');
+        socket.close(1000, 'Client closing');
       } catch {
         // Ignore close errors
       }
-      this.ws = null;
     }
     this.setStatus('disconnected');
     this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
+    this.notifyTerminal();
   }
 
   /**
@@ -361,20 +463,24 @@ export class RealtimeSession {
    */
   private failAndClose(message: string): void {
     if (!this.ws && this._status === 'error') return; // already failed+closed
+    this.rejectPendingStart(new Error(`Realtime session failed before startup completed: ${message}`));
     this.torndown = true;
     this.toolAbort.abort();
     this.teardownComputerUseTracking();
-    if (this.ws) {
+    const socket = this.ws;
+    this.connectionGeneration++;
+    this.ws = null;
+    if (socket) {
       try {
-        this.ws.close(1011, 'Fatal error');
+        socket.close(1011, 'Fatal error');
       } catch {
         // Ignore close errors
       }
-      this.ws = null;
     }
     // setStatus already broadcasts the status event (both realtime + stream).
     this.setStatus('error', message);
     this.broadcastStreamEvent({ type: 'done', conversationId: this.conversationId, source: 'realtime' });
+    this.notifyTerminal();
   }
 
   private _audioChunkCount = 0;
@@ -405,10 +511,33 @@ export class RealtimeSession {
 
   updateTools(tools: ToolDefinition[]): void {
     this.tools = tools;
-    // If connected, send an updated session config
+    const revokedCalls: Array<[string, ActiveRealtimeToolCall]> = [];
+    for (const [callId, active] of [...this.activeToolCalls]) {
+      if (findToolByName(tools, active.toolName) === active.tool) continue;
+      // Revocation must both stop privileged execution and settle the provider's
+      // outstanding function call. Silently dropping it leaves the Realtime
+      // response waiting forever for a function_call_output that can never arrive.
+      this.activeToolCalls.delete(callId);
+      active.abort.abort();
+      revokedCalls.push([callId, active]);
+    }
+    // Update the provider-visible tool surface before asking it to resume from
+    // any revoked calls, so the replacement response cannot select a stale tool.
     if (this.ws && this.ws.readyState === WS_OPEN) {
       this.sendSessionUpdate();
     }
+    for (const [callId, active] of revokedCalls) {
+      this.finishToolCall(
+        callId,
+        active.toolName,
+        { error: 'Tool access was revoked before completion.' },
+        true,
+        active.startedAt,
+        undefined,
+        false,
+      );
+    }
+    if (revokedCalls.length > 0) this.requestModelContinuation();
   }
 
   /* ── Computer-Use Live Tracking ── */
@@ -652,9 +781,12 @@ export class RealtimeSession {
       },
     };
 
+    const payload = JSON.stringify(sessionConfig);
+    if (payload === this.lastSessionUpdatePayload) return;
     console.info('[RealtimeSession] Sending session.update with', toolDefinitions.length, 'tools');
-    console.info('[RealtimeSession] Instructions preview:', composedInstructions?.slice(0, 500) ?? '(none)');
-    this.ws.send(JSON.stringify(sessionConfig));
+    console.info('[RealtimeSession] Instructions prepared:', composedInstructions ? 'yes' : 'no');
+    this.ws.send(payload);
+    this.lastSessionUpdatePayload = payload;
   }
 
   /* ── Server Event Handling ── */
@@ -667,22 +799,22 @@ export class RealtimeSession {
 
     // Log all events for first 20, then periodically
     if (this._serverEventCount <= 20 || this._serverEventCount % 50 === 0) {
-      const preview = eventType === 'response.audio.delta' ? '(audio data)' : JSON.stringify(event).slice(0, 200);
+      const preview = realtimeServerEventPreview(eventType, event);
       console.info(`[RealtimeSession] Server event #${this._serverEventCount}: ${eventType} ${preview}`);
     }
 
     switch (eventType) {
       case 'session.created':
-        console.info('[RealtimeSession] Session created:', JSON.stringify(event).slice(0, 500));
+        console.info('[RealtimeSession] Session created');
         break;
       case 'session.updated':
         console.info('[RealtimeSession] Session updated');
         // Inject the "call answered" greeting prompt ONLY on the FIRST session.updated — the initial
-        // connection (R172 f-6). Every subsequent session.update we send (e.g. updateTools() on an
-        // MCP/skill/CLI hot reload DURING a call) also echoes a session.updated; re-injecting the
-        // greeting + response.create there produced an unsolicited extra greeting mid-call.
-        if (!this._greetedOnSessionUpdate && this.ws?.readyState === WS_OPEN) {
-          this._greetedOnSessionUpdate = true;
+        // connection. Every subsequent session.update we send (e.g. updateTools() on an MCP/skill/CLI
+        // hot reload DURING a call) also echoes a session.updated; re-injecting the greeting +
+        // response.create there produced an unsolicited extra greeting mid-call.
+        if (!this.greetingRequested && this.ws?.readyState === WS_OPEN) {
+          this.greetingRequested = true;
           this.ws.send(
             JSON.stringify({
               type: 'conversation.item.create',
@@ -761,13 +893,13 @@ export class RealtimeSession {
         break;
 
       case 'input_audio_buffer.committed':
-        console.info('[RealtimeSession] Input audio buffer committed:', JSON.stringify(event).slice(0, 300));
+        console.info('[RealtimeSession] Input audio buffer committed');
         break;
 
       case 'conversation.item.input_audio_transcription.completed': {
         const itemId = event.item_id as string;
         const transcript = event.transcript as string;
-        console.info(`[RealtimeSession] User transcription completed: itemId=${itemId} transcript="${transcript}"`);
+        console.info('[RealtimeSession] User transcription completed');
         if (transcript) {
           this.userTranscriptBuffers.set(itemId, transcript);
           this.broadcastRealtimeEvent({
@@ -937,11 +1069,15 @@ export class RealtimeSession {
 
         // Broadcast tool-call event
         const startedAt = new Date().toISOString();
+        const argumentsSuppressed = hookDispatcher.hasEnforcingToolHooks();
+        const exposedArgs = argumentsSuppressed
+          ? { pending: true }
+          : redactBrowserToolArgsForExposure(toolName, safeParseJSON(argsJson));
         this.broadcastRealtimeEvent({
           type: 'tool-call',
           toolCallId: callId,
           toolName,
-          args: argsJson,
+          args: JSON.stringify(exposedArgs),
           status: 'running',
         });
         this.broadcastStreamEvent({
@@ -949,13 +1085,19 @@ export class RealtimeSession {
           conversationId: this.conversationId,
           toolCallId: callId,
           toolName,
-          args: safeParseJSON(argsJson),
+          args: exposedArgs,
           startedAt,
           source: 'realtime',
         });
 
         // Execute tool
-        this.pendingToolCalls.set(callId, { callId, name: toolName, argumentsJson: argsJson, startedAt });
+        this.pendingToolCalls.set(callId, {
+          callId,
+          name: toolName,
+          argumentsJson: argsJson,
+          startedAt,
+          argumentsSuppressed,
+        });
         void this.executeTool(callId, toolName, argsJson);
         break;
       }
@@ -1006,12 +1148,12 @@ export class RealtimeSession {
 
       case 'conversation.item.truncated':
         // Confirmation that our truncation was applied. Logged for debugging.
-        console.info(`[RealtimeSession] Audio truncated: item=${event.item_id} at ${event.audio_end_ms}ms`);
+        console.info('[RealtimeSession] Audio truncation confirmed');
         break;
 
       default:
         // Log unhandled events so we can spot transcription failures or other issues
-        console.info(`[RealtimeSession] Unhandled event: ${eventType} ${JSON.stringify(event).slice(0, 300)}`);
+        console.info(`[RealtimeSession] Unhandled event: ${eventType} ${realtimeServerEventPreview(eventType, event)}`);
         break;
     }
   }
@@ -1037,6 +1179,7 @@ export class RealtimeSession {
     callId: string,
     toolName: string,
     result: unknown,
+    isCurrent: () => boolean,
   ): Promise<{
     result: unknown;
     compaction?: {
@@ -1061,9 +1204,18 @@ export class RealtimeSession {
       return { result };
     }
 
+    const conversationId = this.conversationId;
+    const connectionGeneration = this.connectionGeneration;
+    const isCurrentSessionCall = (): boolean =>
+      isCurrent() &&
+      !this.torndown &&
+      this.connectionGeneration === connectionGeneration &&
+      this.conversationId === conversationId;
+    if (!isCurrentSessionCall()) return { result };
+
     this.broadcastStreamEvent({
       type: 'tool-compaction',
-      conversationId: this.conversationId,
+      conversationId,
       toolCallId: callId,
       toolName,
       source: 'realtime',
@@ -1084,10 +1236,11 @@ export class RealtimeSession {
         modelName,
       );
 
+      if (!isCurrentSessionCall()) return { result };
       if (compacted.wasCompacted) {
         this.broadcastStreamEvent({
           type: 'tool-compaction',
-          conversationId: this.conversationId,
+          conversationId,
           toolCallId: callId,
           toolName,
           source: 'realtime',
@@ -1117,9 +1270,31 @@ export class RealtimeSession {
   private async executeTool(callId: string, toolName: string, argsJson: string): Promise<void> {
     const pending = this.pendingToolCalls.get(callId);
     const startedAt = pending?.startedAt ?? new Date().toISOString();
+    let resolvedArgsPublished = !pending?.argumentsSuppressed;
+    const publishResolvedArgs = (args: unknown): void => {
+      if (resolvedArgsPublished) return;
+      resolvedArgsPublished = true;
+      this.broadcastRealtimeEvent({
+        type: 'tool-call',
+        toolCallId: callId,
+        toolName,
+        args: JSON.stringify(args),
+        status: 'running',
+      });
+      this.broadcastStreamEvent({
+        type: 'tool-call',
+        conversationId: this.conversationId,
+        toolCallId: callId,
+        toolName,
+        args,
+        startedAt,
+        source: 'realtime',
+      });
+    };
 
     // Handle the built-in end_call tool
     if (toolName === 'end_call') {
+      publishResolvedArgs({});
       console.info('[RealtimeSession] AI requested end_call — notifying renderer');
       this.finishToolCall(
         callId,
@@ -1136,24 +1311,158 @@ export class RealtimeSession {
     const tool = findToolByName(this.tools, toolName);
 
     if (!tool) {
+      publishResolvedArgs({ redacted: true, reason: 'Unknown tool.' });
       const errorResult = { error: `Unknown tool: ${toolName}` };
       this.finishToolCall(callId, toolName, errorResult, true, startedAt);
       return;
     }
 
+    const duplicate = this.activeToolCalls.get(callId);
+    if (duplicate) {
+      this.activeToolCalls.delete(callId);
+      duplicate.abort.abort();
+      this.finishToolCall(
+        callId,
+        duplicate.toolName,
+        { error: 'Realtime protocol error: duplicate active tool call id.' },
+        true,
+        duplicate.startedAt,
+      );
+      return;
+    }
+
+    const callAbort = new AbortController();
+    const abortForSession = () => callAbort.abort();
+    const sessionToolSignal = this.toolAbort.signal;
+    if (sessionToolSignal.aborted) callAbort.abort();
+    else sessionToolSignal.addEventListener('abort', abortForSession, { once: true });
+    const activeCall = { toolName, tool, abort: callAbort, startedAt };
+    this.activeToolCalls.set(callId, activeCall);
+    const isCurrent = (): boolean =>
+      !this.torndown &&
+      !callAbort.signal.aborted &&
+      this.activeToolCalls.get(callId) === activeCall &&
+      findToolByName(this.tools, toolName) === tool;
+    const dropRevokedCall = (): void => {
+      this.pendingToolCalls.delete(callId);
+    };
+
+    let exposedArgs = redactBrowserToolArgsForExposure(toolName, safeParseJSON(argsJson));
     try {
-      const args = safeParseJSON(argsJson);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      const prepared = await prepareToolUseWithHooks(this.conversationId, callId, toolName, safeParseJSON(argsJson));
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      exposedArgs = prepared.exposedArgs;
+      if (!prepared.allowed) {
+        publishResolvedArgs(prepared.exposedArgs);
+        const postTool = await applyPostToolUseHooks(
+          this.conversationId,
+          callId,
+          toolName,
+          prepared.exposedArgs,
+          prepared.result,
+        );
+        if (!isCurrent()) {
+          dropRevokedCall();
+          return;
+        }
+        const compacted = await this.maybeCompactToolOutput(
+          callId,
+          toolName,
+          sanitizeRealtimeToolResult(postTool.result),
+          isCurrent,
+        );
+        if (!isCurrent()) {
+          dropRevokedCall();
+          return;
+        }
+        this.finishToolCall(
+          callId,
+          toolName,
+          compacted.result,
+          postTool.denied || !postTool.modified,
+          startedAt,
+          compacted.compaction,
+        );
+        return;
+      }
+
+      const args = tool.inputSchema.parse(prepared.args);
+      exposedArgs = redactBrowserToolArgsForExposure(toolName, args);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      publishResolvedArgs(exposedArgs);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
       const rawResult = await tool.execute(args, {
         toolCallId: callId,
         conversationId: this.conversationId,
-        abortSignal: this.toolAbort.signal,
+        browserOwnerId: this.browserOwnerId,
+        abortSignal: callAbort.signal,
       });
-      const compacted = await this.maybeCompactToolOutput(callId, toolName, rawResult);
-      this.finishToolCall(callId, toolName, compacted.result, false, startedAt, compacted.compaction);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      const postTool = await applyPostToolUseHooks(this.conversationId, callId, toolName, exposedArgs, rawResult);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      const compacted = await this.maybeCompactToolOutput(
+        callId,
+        toolName,
+        sanitizeRealtimeToolResult(postTool.result),
+        isCurrent,
+      );
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      this.finishToolCall(callId, toolName, compacted.result, postTool.denied, startedAt, compacted.compaction);
     } catch (err) {
-      const rawErrorResult = { error: err instanceof Error ? err.message : String(err) };
-      const compacted = await this.maybeCompactToolOutput(callId, toolName, rawErrorResult);
-      this.finishToolCall(callId, toolName, compacted.result, true, startedAt, compacted.compaction);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      const rawErrorResult = { error: redactBrowserToolErrorForExposure(toolName, err) };
+      publishResolvedArgs({ redacted: true, reason: 'Tool arguments were rejected.' });
+      const postTool = await applyPostToolUseHooks(this.conversationId, callId, toolName, exposedArgs, rawErrorResult);
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      const compacted = await this.maybeCompactToolOutput(
+        callId,
+        toolName,
+        sanitizeRealtimeToolResult(postTool.result),
+        isCurrent,
+      );
+      if (!isCurrent()) {
+        dropRevokedCall();
+        return;
+      }
+      this.finishToolCall(
+        callId,
+        toolName,
+        compacted.result,
+        postTool.denied || !postTool.modified,
+        startedAt,
+        compacted.compaction,
+      );
+    } finally {
+      sessionToolSignal.removeEventListener('abort', abortForSession);
+      if (this.activeToolCalls.get(callId) === activeCall) this.activeToolCalls.delete(callId);
     }
   }
 
@@ -1168,6 +1477,7 @@ export class RealtimeSession {
       wasCompacted: boolean;
       extractionDurationMs: number;
     },
+    requestContinuation = true,
   ): void {
     const finishedAt = new Date().toISOString();
     this.pendingToolCalls.delete(callId);
@@ -1213,12 +1523,7 @@ export class RealtimeSession {
         }),
       );
 
-      // Request the model to continue generating
-      this.ws.send(
-        JSON.stringify({
-          type: 'response.create',
-        }),
-      );
+      if (requestContinuation) this.requestModelContinuation();
 
       // Auto-track computer-use sessions started via tool calls
       if (toolName === 'computer_use_session' && !isError) {
@@ -1228,6 +1533,15 @@ export class RealtimeSession {
         }
       }
     }
+  }
+
+  private requestModelContinuation(): void {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) return;
+    this.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+      }),
+    );
   }
 
   /* ── Broadcasting ── */

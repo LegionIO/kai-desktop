@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import { XIcon, RotateCcwIcon } from 'lucide-react';
 import { app } from '@/lib/ipc-client';
+import { putConversationChecked } from '@/lib/conversation-writes';
 import { useConfig } from '@/providers/ConfigProvider';
 import type { ConversationRecord, ReasoningEffort } from '@/providers/RuntimeProvider';
 
@@ -49,6 +50,21 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
   const promptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptFocusedRef = useRef(false);
   const [promptDraft, setPromptDraft] = useState('');
+  const settingsRef = useRef<ThreadSettings | null>(null);
+  const settingPersistTailRef = useRef<Promise<void>>(Promise.resolve());
+  const settingUpdateSeqRef = useRef(new Map<keyof ThreadSettings, number>());
+  const settingContextRef = useRef({ open, conversationId, generation: 0 });
+  if (settingContextRef.current.open !== open || settingContextRef.current.conversationId !== conversationId) {
+    settingContextRef.current = {
+      open,
+      conversationId,
+      generation: settingContextRef.current.generation + 1,
+    };
+  }
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   // Load conversation settings
   useEffect(() => {
@@ -119,59 +135,90 @@ export const ThreadSettingsModal: FC<Props> = ({ open, conversationId, onClose, 
 
   // Persist a setting change
   const persistSetting = useCallback(
-    async (field: string, value: unknown) => {
-      if (!conversationId) return;
-      // executionMode is MAIN-authoritative: the generic conversations:put keeps the prev-disk
-      // mode unconditionally (so a stale put can't clobber a plan-mode transition), so writing it
-      // through the put would be silently dropped. Route it through the dedicated authoritative
-      // setter instead (R127) — the same channel the composer toggle uses.
+    (field: string, value: unknown): Promise<boolean> => {
+      if (!conversationId) return Promise.resolve(false);
+      // executionMode is MAIN-authoritative: the generic conversations:put keeps the prev-disk mode
+      // unconditionally (so a stale put can't clobber a plan-mode transition), so writing it through
+      // the put would be silently dropped. Route it through the dedicated authoritative setter (R127)
+      // — the same channel the composer toggle uses.
       if (field === 'executionMode') {
+        const task = settingPersistTailRef.current.then(async () => {
+          try {
+            await app.conversations.setExecutionMode?.(conversationId, value as 'auto' | 'plan-first' | null);
+          } catch {
+            // Persist failed silently
+          }
+        });
+        settingPersistTailRef.current = task.catch(() => undefined);
+        return task.then(() => true);
+      }
+      let persisted = false;
+      const task = settingPersistTailRef.current.then(async () => {
         try {
-          await app.conversations.setExecutionMode?.(conversationId, value as 'auto' | 'plan-first' | null);
+          const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
+          if (!conv) return;
+          const result = await putConversationChecked({
+            ...conv,
+            [field]: value,
+            updatedAt: new Date().toISOString(),
+          } as ConversationRecord);
+          persisted = result.persisted;
         } catch {
-          // Persist failed silently
+          persisted = false;
         }
-        return;
-      }
-      try {
-        const conv = (await app.conversations.get(conversationId)) as ConversationRecord | null;
-        if (!conv) return;
-        await app.conversations.put({
-          ...conv,
-          [field]: value,
-          updatedAt: new Date().toISOString(),
-        } as ConversationRecord);
-      } catch {
-        // Persist failed silently
-      }
+      });
+      settingPersistTailRef.current = task.catch(() => undefined);
+      return task.then(() => persisted);
     },
     [conversationId],
   );
 
-  // Update local state + persist + notify active conversation
+  // Persist first; only then finalize local state and notify the active thread.
+  // This keeps a Browser-authority rejection from leaving controls/config in a
+  // state that was never written to the conversation.
   const updateSetting = useCallback(
     <K extends keyof ThreadSettings>(field: K, value: ThreadSettings[K]) => {
-      setSettings((prev) => (prev ? { ...prev, [field]: value } : prev));
+      const nextSeq = (settingUpdateSeqRef.current.get(field) ?? 0) + 1;
+      settingUpdateSeqRef.current.set(field, nextSeq);
+      const targetContext = settingContextRef.current;
+      const targetConversationId = conversationId;
+      const targetWasActive = isActiveConversation;
+      void (async () => {
+        const persisted = await persistSetting(field, value);
+        // A newer write for this field owns both UI and persisted side effects.
+        // Closing the modal alone must not discard the successful write below.
+        if (settingUpdateSeqRef.current.get(field) !== nextSeq) return;
+        const targetStillOpen =
+          settingContextRef.current.generation === targetContext.generation &&
+          settingContextRef.current.open === true &&
+          settingContextRef.current.conversationId === targetContext.conversationId;
+        if (!persisted) {
+          if (targetStillOpen && field === 'systemPromptOverride') {
+            setPromptDraft(settingsRef.current?.systemPromptOverride ?? '');
+          }
+          return;
+        }
 
-      // Map field names to ConversationRecord field names
-      void persistSetting(field, value);
+        // Modal-local state belongs to the currently open conversation only.
+        if (targetStillOpen) setSettings((prev) => (prev ? { ...prev, [field]: value } : prev));
 
-      // When the runtime override changes, also update the global agent.runtime so
-      // new conversations inherit the user's preference instead of reverting to the
-      // previous global default on restart.
-      if (field === 'runtimeOverride') {
-        const runtime = (value as string | null) ?? 'auto';
-        void app.config.set('agent.runtime', runtime);
-      }
+        // When the runtime override changes, also update the global agent.runtime so
+        // new conversations inherit the user's preference instead of reverting to the
+        // previous global default on restart.
+        if (field === 'runtimeOverride') {
+          const runtime = (value as string | null) ?? 'auto';
+          void app.config.set('agent.runtime', runtime);
+        }
 
-      // Notify App.tsx if this is the active conversation
-      if (isActiveConversation && conversationId) {
-        window.dispatchEvent(
-          new CustomEvent('thread-settings-changed', {
-            detail: { conversationId, [field]: value },
-          }),
-        );
-      }
+        // Notify App.tsx if this is the active conversation.
+        if (targetWasActive && targetConversationId) {
+          window.dispatchEvent(
+            new CustomEvent('thread-settings-changed', {
+              detail: { conversationId: targetConversationId, [field]: value },
+            }),
+          );
+        }
+      })();
     },
     [conversationId, isActiveConversation, persistSetting],
   );

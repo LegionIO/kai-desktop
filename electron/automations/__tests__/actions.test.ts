@@ -425,6 +425,27 @@ describe('agent conversationTarget', () => {
     expect(String(rec.results[0].error ?? '')).toMatch(/injection into convA failed|conversation-not-found/);
   });
 
+  it('does not fall through to persistence when Browser authority rejects background injection', async () => {
+    resetMockStore({
+      convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },
+    });
+    const injectUserTurnAndRestart = vi.fn(async () => ({
+      ok: false,
+      error: 'native-browser-authority-required',
+    }));
+
+    const rec = await executeActions(
+      agentAction({ type: 'existing', conversationId: 'convA' }),
+      evt,
+      deps({ injectUserTurnAndRestart }),
+    );
+
+    expect(rec.results[0].ok).toBe(false);
+    expect(String(rec.results[0].error ?? '')).toContain('native-browser-authority-required');
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(appendConversationMessages).not.toHaveBeenCalled();
+  });
+
   it('busy existing target with onBusyTarget:"divert" still diverts even when a helper is bound', async () => {
     resetMockStore({
       convA: { id: 'convA', messageTree: [], headId: null, metadata: {}, runStatus: 'running' },

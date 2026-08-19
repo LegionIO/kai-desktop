@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import {
 } from '../codex-mcp-bridge.js';
 import type { ToolDefinition } from '../../../tools/types.js';
 import { RUNTIME_BRIDGE_SKIP_TOOLS } from '../types.js';
+import { hookDispatcher } from '../../hooks/dispatcher.js';
 
 function createTool(overrides: Partial<ToolDefinition> = {}): ToolDefinition {
   return {
@@ -68,6 +69,7 @@ describe('CodexMcpBridge', () => {
 
   it('exposes Kai plugin tools through streamable HTTP MCP', async () => {
     let receivedAbortSignal: AbortSignal | undefined;
+    let receivedBrowserOwnerId: string | undefined;
     const abortController = new AbortController();
     bridge = new CodexMcpBridge();
     const url = await bridge.start(
@@ -75,6 +77,7 @@ describe('CodexMcpBridge', () => {
         createTool({
           execute: async (_input, context) => {
             receivedAbortSignal = context.abortSignal;
+            receivedBrowserOwnerId = context.browserOwnerId;
             return { ok: true, input: _input };
           },
         }),
@@ -82,6 +85,7 @@ describe('CodexMcpBridge', () => {
       'test-conversation',
       '/tmp',
       abortController.signal,
+      'browser-run-1',
     );
     const client = new Client({ name: 'kai-test-client', version: '1.0.0' });
     const authToken = bridge.getAuthToken();
@@ -119,8 +123,99 @@ describe('CodexMcpBridge', () => {
         },
       ]);
       expect(receivedAbortSignal).toBe(abortController.signal);
+      expect(receivedBrowserOwnerId).toBe('browser-run-1');
     } finally {
       await client.close();
+    }
+  });
+
+  it('redacts Browser failures before returning them to Codex or OpenCode', async () => {
+    const secretUrl = 'https://alice:password@example.com/callback?code=codex-secret';
+    bridge = new CodexMcpBridge();
+    const url = await bridge.start(
+      [
+        createTool({
+          name: 'browser_action',
+          originalName: 'browser_action',
+          source: 'browser',
+          sourceId: undefined,
+          inputSchema: z.object({}),
+          execute: async () => {
+            throw new Error(`ERR_FAILED while loading ${secretUrl}`);
+          },
+        }),
+      ],
+      'test-conversation',
+      '/tmp',
+    );
+    const client = new Client({ name: 'kai-test-client', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: `Bearer ${bridge.getAuthToken()}` } },
+    });
+
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({ name: 'browser_action', arguments: {} });
+      const exposed = JSON.stringify(result);
+      expect(result.isError).toBe(true);
+      expect(exposed).toContain('[redacted browser URL: https://example.com]');
+      expect(exposed).not.toMatch(/codex-secret|alice:password/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('enforces lifecycle hook modifications for Codex and OpenCode Browser calls', async () => {
+    const execute = vi.fn(async (input) => ({ raw: true, input }));
+    const unregisterPre = hookDispatcher.register(
+      'PreToolUse',
+      () => ({ payload: { args: { script: 'safe-script' } } }),
+      { mode: 'modify', matcher: 'browser_evaluate' },
+    );
+    const unregisterPost = hookDispatcher.register(
+      'PostToolUse',
+      () => ({ payload: { result: { sanitized: true } } }),
+      { mode: 'modify', matcher: 'browser_evaluate' },
+    );
+    bridge = new CodexMcpBridge();
+    let client: Client | undefined;
+    try {
+      const url = await bridge.start(
+        [
+          createTool({
+            name: 'browser_evaluate',
+            originalName: 'browser_evaluate',
+            source: 'browser',
+            sourceId: undefined,
+            inputSchema: z.object({ script: z.string() }),
+            execute,
+          }),
+        ],
+        'test-conversation-hooks',
+        '/tmp',
+      );
+      client = new Client({ name: 'kai-test-client', version: '1.0.0' });
+      const transport = new StreamableHTTPClientTransport(new URL(url), {
+        requestInit: { headers: { Authorization: `Bearer ${bridge.getAuthToken()}` } },
+      });
+      await client.connect(transport);
+
+      const result = await client.callTool({
+        name: 'browser_evaluate',
+        arguments: { script: 'raw-secret-script' },
+      });
+
+      expect(execute).toHaveBeenCalledWith(
+        { script: 'safe-script' },
+        expect.objectContaining({ conversationId: 'test-conversation-hooks' }),
+      );
+      expect(result.isError).toBeUndefined();
+      expect(JSON.stringify(result)).toContain('sanitized');
+      expect(JSON.stringify(result)).not.toContain('raw-secret-script');
+    } finally {
+      await client?.close();
+      unregisterPost();
+      unregisterPre();
     }
   });
 

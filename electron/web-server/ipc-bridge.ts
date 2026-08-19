@@ -3,6 +3,10 @@ import type { IpcMain, IpcMainInvokeEvent, IpcMainEvent } from 'electron';
 type HandlerFn = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown;
 type ListenerFn = (event: IpcMainEvent, ...args: unknown[]) => void;
 
+type BridgeInvokeEvent = IpcMainInvokeEvent & {
+  __kaiWebBridge: true;
+};
+
 /** Captured IPC handlers keyed by channel name (from ipcMain.handle). */
 const handlers = new Map<string, HandlerFn>();
 
@@ -46,20 +50,26 @@ export function installIpcCapture(ipcMain: IpcMain): void {
  * the Electron IPC transport (i.e. from the WebSocket bridge).
  */
 export async function invokeHandler(channel: string, ...args: unknown[]): Promise<unknown> {
-  if (UNSUPPORTED_CHANNELS.has(channel)) {
+  if (UNSUPPORTED_CHANNELS.has(channel) || channel.startsWith('browser:')) {
     throw new Error(`Channel "${channel}" is not supported in web mode`);
   }
 
   const handler = handlers.get(channel);
   if (handler) {
-    const fakeEvent = { sender: null } as unknown as IpcMainInvokeEvent;
+    const fakeEvent = {
+      sender: null,
+      __kaiWebBridge: true,
+    } as unknown as BridgeInvokeEvent;
     return handler(fakeEvent, ...args);
   }
 
   // Fall back to fire-and-forget listeners (ipcMain.on)
   const listener = listeners.get(channel);
   if (listener) {
-    const fakeEvent = { sender: null } as unknown as IpcMainEvent;
+    const fakeEvent = {
+      sender: null,
+      __kaiWebBridge: true,
+    } as unknown as IpcMainEvent;
     listener(fakeEvent, ...args);
     return undefined;
   }

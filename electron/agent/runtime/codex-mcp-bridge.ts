@@ -19,6 +19,8 @@ import { randomUUID } from 'crypto';
 import type { ToolDefinition, ToolExecutionContext } from '../../tools/types.js';
 import { MAX_TOOL_NAME_LENGTH, makeSafeToolName } from '../../tools/naming.js';
 import { buildMcpToolContent } from '../tool-model-content.js';
+import { redactBrowserToolErrorForExposure } from '../../../shared/browser.js';
+import { executeToolWithLifecycleHooks } from '../hooks/tool-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // Types (dynamic imports — avoid hard compile-time dependency on MCP SDK)
@@ -210,6 +212,7 @@ export class CodexMcpBridge {
     conversationId: string,
     cwd?: string,
     abortSignal?: AbortSignal,
+    browserOwnerId?: string,
   ): Promise<string> {
     // Serialize concurrent start() calls: a second caller awaits the first's
     // in-flight promise instead of racing past the already-running guard (which
@@ -221,7 +224,7 @@ export class CodexMcpBridge {
         await this.stop();
       }
       try {
-        return await this.startInternal(tools, conversationId, cwd, abortSignal);
+        return await this.startInternal(tools, conversationId, cwd, abortSignal, browserOwnerId);
       } catch (err) {
         // Partial start (e.g. listen() succeeded but connect() threw) would leave
         // a live HTTP server + stale state; tear everything down before rethrowing.
@@ -241,6 +244,7 @@ export class CodexMcpBridge {
     conversationId: string,
     cwd?: string,
     abortSignal?: AbortSignal,
+    browserOwnerId?: string,
   ): Promise<string> {
     // Dynamic imports to avoid hard dependency if SDK is not installed
     const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
@@ -300,41 +304,36 @@ export class CodexMcpBridge {
       // Build the handler
       const boundTool = tool;
       const handler = async (args: Record<string, unknown>) => {
+        const toolCallId = `codex-mcp-${randomUUID()}`;
         const context: ToolExecutionContext = {
-          toolCallId: `codex-mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          toolCallId,
           conversationId,
+          browserOwnerId,
           cwd,
           abortSignal,
         };
 
         try {
-          // Validate against the tool's Zod schema. These tools run with full
-          // local privileges, so if the schema EXISTS and rejects, fail the call
-          // instead of passing unvalidated input through. Tools without a
-          // safeParse-capable schema can't be validated here — pass args as-is.
-          let validatedArgs: unknown = args;
-          const safeParse = (
-            boundTool.inputSchema as {
-              safeParse?: (v: unknown) => { success: boolean; data?: unknown; error?: unknown };
-            }
-          ).safeParse;
-          if (typeof safeParse === 'function') {
-            const parseResult = safeParse.call(boundTool.inputSchema, args);
-            if (!parseResult.success) {
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: `Invalid arguments for tool "${finalName}": ${describeZodError(parseResult.error)}`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-            validatedArgs = parseResult.data;
-          }
-
-          const result = await boundTool.execute(validatedArgs, context);
+          const result = await executeToolWithLifecycleHooks({
+            conversationId,
+            toolCallId,
+            toolName: boundTool.name,
+            args,
+            validate: (candidate) => {
+              const safeParse = (
+                boundTool.inputSchema as {
+                  safeParse?: (value: unknown) => { success: boolean; data?: unknown; error?: unknown };
+                }
+              ).safeParse;
+              if (typeof safeParse !== 'function') return candidate;
+              const parsed = safeParse.call(boundTool.inputSchema, candidate);
+              if (!parsed.success) {
+                throw new Error(`Invalid arguments for tool "${finalName}": ${describeZodError(parsed.error)}`);
+              }
+              return parsed.data;
+            },
+            execute: (validatedArgs) => boundTool.execute(validatedArgs, context),
+          });
           // A tool that returns an error-shaped result (isError / error field)
           // must surface as an MCP error, not a successful call — otherwise Codex
           // treats a failed tool as success.
@@ -344,7 +343,7 @@ export class CodexMcpBridge {
           return { content, ...(isErr ? { isError: true } : {}) };
         } catch (error) {
           return {
-            content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }],
+            content: [{ type: 'text' as const, text: redactBrowserToolErrorForExposure(boundTool.name, error) }],
             isError: true,
           };
         }

@@ -35,8 +35,22 @@ describe('PiToolBridge', () => {
   });
 
   it('GET /tools lists tools with a JSON Schema; POST /call executes them; auth is enforced', async () => {
+    let receivedBrowserOwnerId: string | undefined;
     bridge = new PiToolBridge();
-    const h = await bridge.start([fakeTool()], 'conv', process.cwd());
+    const h = await bridge.start(
+      [
+        fakeTool({
+          execute: async (input, context) => {
+            receivedBrowserOwnerId = context.browserOwnerId;
+            return { value: `echoed: ${(input as { text: string }).text}` };
+          },
+        }),
+      ],
+      'conv',
+      process.cwd(),
+      undefined,
+      'browser-run-1',
+    );
     expect(h).not.toBeNull();
     const { url, token } = h!;
     const auth = { authorization: `Bearer ${token}` };
@@ -63,6 +77,7 @@ describe('PiToolBridge', () => {
     ).json()) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
     expect(call.isError).toBeFalsy();
     expect(call.content[0]!.text).toContain('echoed: hi');
+    expect(receivedBrowserOwnerId).toBe('browser-run-1');
   });
 
   it('POST /call surfaces an unknown tool as isError, and invalid args are rejected', async () => {

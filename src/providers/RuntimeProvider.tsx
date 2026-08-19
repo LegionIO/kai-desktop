@@ -21,6 +21,11 @@ import {
   type AudioProvider,
 } from '@/lib/audio/speech-adapters';
 import { buildResponseTiming, getResponseTiming, withResponseTiming } from '@/lib/response-timing';
+import {
+  BROWSER_AUTHORITY_CONTINUATION_MESSAGE,
+  conversationWriteRejectionMessage,
+  putConversationChecked,
+} from '@/lib/conversation-writes';
 import { normalizeTokenUsage, type TokenUsageData as NormalizedTokenUsageData } from '../../shared/token-usage';
 
 export type DebateEnrichment = {
@@ -994,7 +999,7 @@ const CONTINUATION_CLIENT_ID = msgId();
 // passive mirror, instead of continuing from (and overwriting the full nodes with) the capped copy.
 const IS_WEB_BRIDGE = Boolean((window as unknown as { app?: { __isWebBridge?: boolean } }).app?.__isWebBridge);
 /** Automation conversations we've begun async-seeding a background accumulator for
- *  (dedupes the disk fetch while events stream in before the seed resolves). */
+ * (dedupes the disk fetch while events stream in before the seed resolves). */
 const automationSeedInProgress = new Set<string>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
@@ -1136,9 +1141,9 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
   // drafts; never wholesale-replaces). loadConversationState hydrates from it; restore removes it.
   void applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
 }
-// Re-enqueue an EXISTING draft entry (preserving its id + stashedAt) — used when an atomic claim
-// removed a draft from disk but the restore couldn't apply (chat switched / composer busy). Push
-// to the FRONT so it's the next one restored, and re-ADD it durably so it survives across reload.
+// Re-enqueue an EXISTING draft entry (preserving its id + stashedAt) — used by the legacy/local
+// fallback when a restore couldn't apply (chat switched / composer busy). Push it to the FRONT so
+// it's the next one restored, and re-ADD it durably so it survives across reload.
 function enqueueRejectedDraftEntry(convId: string, entry: RejectedDraft): void {
   if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
   if (deletedConversationIds.has(convId)) return; // deleted mid-flight → don't resurrect (R133 f-2)
@@ -1162,8 +1167,8 @@ function peekOldestRejectedDraftId(convId: string): string | undefined {
   const q = rejectedDrafts.get(convId);
   return q && q.length > 0 ? q[0]?.id : undefined;
 }
-// Remove a specific draft id from the in-memory queue only (no durable delta — the atomic claim
-// on main already mutated disk). Used to keep the local mirror consistent after a claim resolves.
+// Remove a specific draft id from the in-memory queue only (no durable delta — main owns the
+// reservation and eventual ACK mutation). Used to keep the local mirror consistent while claimed.
 function dropRejectedDraftLocal(convId: string, id: string): void {
   const q = rejectedDrafts.get(convId);
   if (!q) return;
@@ -1181,15 +1186,13 @@ function requeueRejectedDraftLocalOnly(convId: string, entry: RejectedDraft): vo
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
   rejectedDrafts.set(convId, q);
 }
-// ATOMICALLY claim the oldest pending draft on MAIN and restore it into the composer — but only if
-// THIS client won the claim. When several clients hydrated the same durable pendingDrafts, main's
-// single-threaded remove-and-return guarantees exactly one `draft !== null`, so the others don't
-// populate a duplicate composer. Because main removes the draft BEFORE `restore` runs, `restore`
-// must ACK whether it actually applied: it returns true if it populated the composer, false if it
-// bailed (the user switched chats / started typing / added an attachment during the async claim).
-// On a false ack we REQUEUE the claimed draft — durably (re-add via delta) AND locally — so the
-// input is never lost (the r162 claim otherwise dropped it from both disk and memory). Falls back
-// to the local dequeue if the claim IPC is unavailable, so a single-client session is unchanged.
+// ATOMICALLY reserve the oldest pending draft on MAIN and restore it into the composer — but only
+// if THIS client won the lease. When several clients hydrated the same durable pendingDrafts,
+// main's single-threaded reservation guarantees exactly one live claimant, so the others don't
+// populate a duplicate composer. The draft remains on disk while reserved; `restore` reports
+// whether it actually populated the composer, and the ACK either removes it (true) or releases the
+// lease (false). A crash or lost ACK leaves the draft recoverable after lease expiry. Falls back to
+// the local dequeue/re-enqueue path if the claim IPC is unavailable.
 async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) => boolean): Promise<void> {
   // Renderer-side claim-in-flight guard: the load-time restore and the composer-empty poll can
   // overlap for the SAME conversation, and main treats THIS client's own live reservation as
@@ -2331,6 +2334,32 @@ export function preserveErroredAssistantVariant(acc: MessageAccumulator, errorTe
   return true;
 }
 
+export function streamAdmissionRejectionMessage(result: unknown): string {
+  const rejection = (result ?? {}) as {
+    browserAuthorityRevoked?: unknown;
+    nativeBrowserContinuationRequired?: unknown;
+    nativeBrowserAuthorityRequired?: unknown;
+    realtimeTurnActive?: unknown;
+  };
+  if (rejection.browserAuthorityRevoked === true) {
+    return 'The Browser sidebar reloaded before the request could start. Please retry.';
+  }
+  if (rejection.nativeBrowserContinuationRequired === true || rejection.nativeBrowserAuthorityRequired === true) {
+    return BROWSER_AUTHORITY_CONTINUATION_MESSAGE;
+  }
+  if (rejection.realtimeTurnActive === true) {
+    return 'End the active voice call before starting a text response.';
+  }
+  return 'Compacting the conversation — wait for it to finish, then retry.';
+}
+
+export function persistAdmissionRejectionMessage(rejected: unknown): string | null {
+  if (rejected !== 'native-browser-authority-required' && rejected !== 'native-browser-continuation-required') {
+    return null;
+  }
+  return conversationWriteRejectionMessage(rejected);
+}
+
 // --- Persistence ---
 
 async function persistConversation(
@@ -2423,25 +2452,27 @@ async function persistConversation(
     const branch = getActiveBranch(safeTree, headId);
     const now = nowIso();
 
-    const res = await app.conversations.put({
-      ...conv,
-      messages: branch, // linear view for backward compat
-      messageTree: safeTree,
-      headId,
-      fallbackTitle: conv.fallbackTitle ?? null,
-      updatedAt: now,
-      lastMessageAt: now,
-      messageCount: branch.length,
-      userMessageCount: branch.filter((m) => m.role === 'user').length,
-      ...updates,
-    });
+    const write = await putConversationChecked(
+      {
+        ...conv,
+        messages: branch, // linear view for backward compat
+        messageTree: safeTree,
+        headId,
+        fallbackTitle: conv.fallbackTitle ?? null,
+        updatedAt: now,
+        lastMessageAt: now,
+        messageCount: branch.length,
+        userMessageCount: branch.filter((m) => m.role === 'user').length,
+        ...updates,
+      },
+      { surfaceRejection: false, surfaceError: false },
+    );
     // Main rejects a turn-starting put while the conversation is being /compact-ed
     // (returns { rejected: 'conversation-busy' } and persists nothing new). Surface it so
     // the caller can roll back the optimistic turn instead of launching a stream that
     // would also be rejected.
-    if (res && typeof res === 'object' && (res as { rejected?: unknown }).rejected) {
-      return { rejected: String((res as { rejected?: unknown }).rejected) };
-    }
+    if (write.rejected) return { rejected: write.rejected };
+    if (!write.persisted) return {};
     // The write landed. If it carried the handed-off compaction, clear the handoff (it's
     // now durably on disk — and the main-side put-preservation keeps it against staler
     // writes). Only clear when it's still the SAME record we recorded (a newer one may
@@ -2501,7 +2532,7 @@ async function updateConversation(
 ): Promise<void> {
   const latest = (await app.conversations.get(conversationId)) as ConversationRecord | null;
   if (!latest) return;
-  await app.conversations.put({ ...latest, ...createPatch(latest) });
+  await putConversationChecked({ ...latest, ...createPatch(latest) }, { surfaceRejection: false, surfaceError: false });
 }
 
 async function patchConversation(conversationId: string, patch: Partial<ConversationRecord>): Promise<void> {
@@ -2647,6 +2678,20 @@ export function useFallbackBanner(): FallbackBannerActions {
   return useCtx(FallbackBannerContext);
 }
 
+type RuntimeNoticeState = {
+  message: string | null;
+  dismiss: () => void;
+};
+
+const RuntimeNoticeContext = createCtx<RuntimeNoticeState>({
+  message: null,
+  dismiss: () => {},
+});
+
+export function useRuntimeNotice(): RuntimeNoticeState {
+  return useCtx(RuntimeNoticeContext);
+}
+
 const MaxTurnsContinueContext = createCtx<((messageId: string) => void) | null>(null);
 
 export function useMaxTurnsContinue(): ((messageId: string) => void) | null {
@@ -2705,6 +2750,7 @@ export function RuntimeProvider({
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [currentWorkingDirectory, setCurrentWorkingDirectoryState] = useState<string | null>(null);
   const [fallbackBanner, setFallbackBanner] = useState<FallbackBannerState>(null);
+  const [runtimeNotice, setRuntimeNotice] = useState<{ conversationId: string; message: string } | null>(null);
   const fallbackBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Step tracking state
@@ -3105,7 +3151,7 @@ export function RuntimeProvider({
         } catch {
           /* fallback to null */
         }
-        await app.conversations.put({
+        const createResult = await putConversationChecked({
           id: newId,
           title: null,
           fallbackTitle: null,
@@ -3127,6 +3173,7 @@ export function RuntimeProvider({
           selectedModelKey: null,
           currentWorkingDirectory: defaultCwd,
         } as ConversationRecord);
+        if (!createResult.persisted) return;
         await app.conversations.setActiveId(newId);
         setActiveConversationId(newId);
         setTree([]);
@@ -3345,6 +3392,22 @@ export function RuntimeProvider({
     }
   };
 
+  const clearRuntimeNoticeFor = useCallback((conversationId: string): void => {
+    setRuntimeNotice((current) => (current?.conversationId === conversationId ? null : current));
+  }, []);
+
+  const surfacePersistAdmissionRejection = useCallback((conversationId: string, rejected: unknown): void => {
+    const message = persistAdmissionRejectionMessage(rejected);
+    if (message) setRuntimeNotice({ conversationId, message });
+  }, []);
+
+  const surfaceUnconfirmedTurnPersist = useCallback((conversationId: string): void => {
+    setRuntimeNotice({
+      conversationId,
+      message: 'Kai could not save this chat before starting the assistant. Your request was not run; please retry.',
+    });
+  }, []);
+
   // Launch an agent stream and, if the call resolves `{busy:true}` (the conversation is
   // being /compact-ed), synthesize the busy error+done locally so the turn settles
   // instead of leaving the accumulator + runStatus stuck running forever. On the Electron
@@ -3393,10 +3456,11 @@ export function RuntimeProvider({
             // ONE terminal event only. The error handler is fully terminal; a trailing
             // `done` would recreate the accumulator from the pre-error tree and supersede
             // the error persist (user message left with no visible error).
+            const rejectionMessage = streamAdmissionRejectionMessage(res);
             h({
               conversationId,
               type: 'error',
-              error: 'Compacting the conversation — wait for it to finish, then retry.',
+              error: rejectionMessage,
               responseMessageId,
             });
           }
@@ -5825,6 +5889,7 @@ export function RuntimeProvider({
     async (message: AppendMessage) => {
       const convId = activeIdRef.current;
       if (!convId) return;
+      clearRuntimeNoticeFor(convId);
 
       const pendingAttachments = consumeAttachments();
       // Capture the submitted text so a /compact-busy rejection (below) can restore the
@@ -6111,15 +6176,12 @@ export function RuntimeProvider({
         { runStatus: 'running', ...(supersededCompaction ? { conversationCompaction: supersededCompaction } : {}) },
         supersededSeed,
       );
-      // Did the initial persist CONFIRM landing on disk? Unknown ({} from a caught write error)
-      // or superseded means the supersededCompaction it carried may NOT be on disk — the launch
-      // below must then confirm it before running (else the stream re-summarizes the raw branch).
-      const initialPersistConfirmed = persistRes?.persisted === true;
-      // Main rejected the optimistic turn because a /compact holds the conversation. Roll
-      // back the optimistic user message + running state and DON'T launch the stream (it
-      // would be rejected too). The user can resend once compaction finishes.
-      if (persistRes?.rejected) {
-        const rejectedKind = persistRes.rejected;
+      // A Browser-capable run can perform authenticated external side effects.
+      // Launch only after the optimistic user turn is durably confirmed; a
+      // rejected, superseded, or unknown write must fail closed and restore the
+      // draft so those side effects always have an audit trail in chat history.
+      if (!persistRes?.persisted) {
+        const rejectedKind = persistRes?.rejected;
         // Only tear down if we STILL OWN the accumulator. A /compact-concurrent send can
         // await this persist while a Stop or a superseding turn (run C) replaces the
         // accumulator with a new pendingAssistantId; our stale rejection must not delete
@@ -6135,7 +6197,7 @@ export function RuntimeProvider({
           // user's own newer send, so requeuing this draft would resurface it as a duplicate.
           const supersededByReplacement = streamAccumulators.has(convId);
           if (
-            rejectedKind === 'conversation-busy' &&
+            rejectedKind !== 'conversation-deleted' &&
             !supersededByReplacement &&
             (submittedText.trim().length > 0 || pendingAttachments.length > 0)
           ) {
@@ -6143,6 +6205,8 @@ export function RuntimeProvider({
           }
           return;
         }
+        if (rejectedKind) surfacePersistAdmissionRejection(convId, rejectedKind);
+        else surfaceUnconfirmedTurnPersist(convId);
         streamAccumulators.delete(convId);
         // Restore the submitted input so it isn't lost. If THIS conversation is active AND
         // the composer is empty, put it straight back. Otherwise (the user switched to
@@ -6253,18 +6317,10 @@ export function RuntimeProvider({
         setTimeout(() => {
           if (!ownsNew()) return;
           const lateComp = streamAccumulators.get(convId)?.pendingCompaction;
-          // The compaction that MUST be on disk before launching is the late one if newer,
-          // else the supersededCompaction the FIRST persist tried to write. That first persist
-          // can return UNKNOWN (catch → {}) or fail WITHOUT a rejected flag, in which case its
-          // compaction never landed — launching then reads the raw branch and re-summarizes.
-          // So confirm-then-launch whenever there is ANY intended compaction that the initial
-          // persist did not CONFIRM (persisted:true).
-          const intended =
-            lateComp && lateComp.compactionId !== persistedCompactionId
-              ? lateComp
-              : !initialPersistConfirmed && supersededCompaction
-                ? supersededCompaction
-                : undefined;
+          // The initial turn persist is confirmed before reaching this point,
+          // so only a newer compaction that arrived during the macrotask yield
+          // still needs a confirm-before-launch cycle.
+          const intended = lateComp && lateComp.compactionId !== persistedCompactionId ? lateComp : undefined;
           if (intended) {
             const confirmThenLaunch = (remaining: number): void => {
               if (!ownsNew()) return;
@@ -6308,6 +6364,9 @@ export function RuntimeProvider({
       threadOverrides,
       consumeAttachments,
       addAttachments,
+      clearRuntimeNoticeFor,
+      surfacePersistAdmissionRejection,
+      surfaceUnconfirmedTurnPersist,
     ],
   );
 
@@ -6315,6 +6374,7 @@ export function RuntimeProvider({
     async (parentId: string | null) => {
       const convId = activeIdRef.current;
       if (!convId) return;
+      clearRuntimeNoticeFor(convId);
       // Same concurrency guard as onEdit: don't start a second run while one is
       // streaming or awaiting a tool approval (accumulator still present), or the
       // new controller would replace the live one and break cancel.
@@ -6365,10 +6425,13 @@ export function RuntimeProvider({
       const branch = getActiveBranch(newTree, actualParent);
       const reloadPreHead = headIdRef.current;
       const reloadPersistRes = await persistConversation(convId, newTree, actualParent, { runStatus: 'running' });
-      // /compact holds the conversation — a regenerate is a head-changing op the put-guard
-      // rejects. Roll back head + running state and don't launch (no draft to preserve).
-      if (reloadPersistRes?.rejected) {
+      // Fail closed on every unconfirmed write, not only explicit /compact
+      // rejection: a Browser-capable regenerate must never run without a
+      // durable branch/running record.
+      if (!reloadPersistRes?.persisted) {
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
+        if (reloadPersistRes?.rejected) surfacePersistAdmissionRejection(convId, reloadPersistRes.rejected);
+        else surfaceUnconfirmedTurnPersist(convId);
         streamAccumulators.delete(convId);
         if (activeIdRef.current === convId) {
           setHeadId(reloadPreHead);
@@ -6404,6 +6467,9 @@ export function RuntimeProvider({
       selectedProfileKey,
       fallbackEnabled,
       threadOverrides,
+      clearRuntimeNoticeFor,
+      surfacePersistAdmissionRejection,
+      surfaceUnconfirmedTurnPersist,
     ],
   );
 
@@ -6411,6 +6477,7 @@ export function RuntimeProvider({
     async (message: AppendMessage) => {
       const convId = activeIdRef.current;
       if (!convId) return;
+      clearRuntimeNoticeFor(convId);
       // Don't start a concurrent run: if a response is streaming, editing would
       // spawn a second run whose controller replaces the live one in
       // activeStreams, breaking cancel. Ignore edits while running. `isRunning`
@@ -6530,10 +6597,11 @@ export function RuntimeProvider({
       const branch = getActiveBranch(newTree, newHead);
 
       const editPersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
-      // /compact holds the conversation: roll back the optimistic edit, restore the
-      // composer draft, and don't launch (the stream would be rejected too).
-      if (editPersistRes?.rejected) {
-        const rejectedKind = editPersistRes.rejected;
+      // Require a confirmed write before starting a potentially privileged
+      // Browser-capable edit run. Unknown/superseded outcomes restore the edit
+      // just like an explicit admission rejection.
+      if (!editPersistRes?.persisted) {
+        const rejectedKind = editPersistRes?.rejected;
         // If a Stop / superseding turn replaced the accumulator during the await we no longer
         // own it (must not delete it / touch the tree). The edited text was already consumed,
         // so ENQUEUE it — but ONLY when genuinely lost: a compaction-BUSY reject (retryable)
@@ -6543,7 +6611,7 @@ export function RuntimeProvider({
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) {
           const supersededByReplacement = streamAccumulators.has(convId);
           if (
-            rejectedKind === 'conversation-busy' &&
+            rejectedKind !== 'conversation-deleted' &&
             !supersededByReplacement &&
             (editedText.trim().length > 0 || editedAttachments.length > 0)
           ) {
@@ -6551,6 +6619,8 @@ export function RuntimeProvider({
           }
           return;
         }
+        if (rejectedKind) surfacePersistAdmissionRejection(convId, rejectedKind);
+        else surfaceUnconfirmedTurnPersist(convId);
         streamAccumulators.delete(convId);
         // Roll back the optimistic edit + restore the edited text so it isn't lost. Mirror
         // onNew: only put the text straight back if THIS chat is active AND the composer is
@@ -6602,7 +6672,18 @@ export function RuntimeProvider({
         responseMessageId,
       );
     },
-    [tree, selectedModelKey, reasoningEffort, executionMode, selectedProfileKey, fallbackEnabled, threadOverrides],
+    [
+      tree,
+      selectedModelKey,
+      reasoningEffort,
+      executionMode,
+      selectedProfileKey,
+      fallbackEnabled,
+      threadOverrides,
+      clearRuntimeNoticeFor,
+      surfacePersistAdmissionRejection,
+      surfaceUnconfirmedTurnPersist,
+    ],
   );
 
   const onCancel = useCallback(async () => {
@@ -7066,6 +7147,7 @@ export function RuntimeProvider({
     async (messageId: string) => {
       const convId = activeIdRef.current;
       if (!convId || isRunning) return;
+      clearRuntimeNoticeFor(convId);
 
       // Compute the updated tree PURELY (mark the max-turns part 'continued'), then do the
       // persist/launch OUTSIDE a setState updater so we can await the persist and roll back
@@ -7109,8 +7191,10 @@ export function RuntimeProvider({
         locallyOriginated: true, // user-initiated continue-after-max-turns → this client drives it
       });
       const persistRes = await persistConversation(convId, updated, newHead, { runStatus: 'running' });
-      if (persistRes?.rejected) {
+      if (!persistRes?.persisted) {
         if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
+        if (persistRes?.rejected) surfacePersistAdmissionRejection(convId, persistRes.rejected);
+        else surfaceUnconfirmedTurnPersist(convId);
         streamAccumulators.delete(convId);
         if (activeIdRef.current === convId) {
           setTree(prevTree);
@@ -7134,7 +7218,7 @@ export function RuntimeProvider({
         responseMessageId,
       );
     },
-    [isRunning, executionMode],
+    [isRunning, executionMode, clearRuntimeNoticeFor, surfacePersistAdmissionRejection, surfaceUnconfirmedTurnPersist],
   );
 
   const dismissFallbackBanner = useCallback(() => {
@@ -7153,10 +7237,23 @@ export function RuntimeProvider({
     [fallbackBanner, dismissFallbackBanner],
   );
 
+  const dismissRuntimeNotice = useCallback(() => {
+    setRuntimeNotice(null);
+  }, []);
+
+  const runtimeNoticeActions = useMemo<RuntimeNoticeState>(
+    () => ({
+      message: runtimeNotice?.conversationId === activeConversationId ? runtimeNotice.message : null,
+      dismiss: dismissRuntimeNotice,
+    }),
+    [activeConversationId, dismissRuntimeNotice, runtimeNotice],
+  );
+
   // Step tracking callbacks
   const handleContinueTask = useCallback(async () => {
     const convId = activeIdRef.current;
     if (!convId || isRunning) return;
+    clearRuntimeNoticeFor(convId);
 
     console.info(`[RuntimeProvider] Continue task for conversation ${convId}`);
 
@@ -7202,10 +7299,12 @@ export function RuntimeProvider({
     });
     const branch = getActiveBranch(newTree, newHead);
     const continuePersistRes = await persistConversation(convId, newTree, newHead, { runStatus: 'running' });
-    // /compact holds the conversation: roll back the optimistic continue turn + running
-    // state and don't launch (the stream would be rejected as busy too).
-    if (continuePersistRes?.rejected) {
+    // A continuation may receive Browser tools, so an unknown/superseded write
+    // must fail closed just like an explicit admission rejection.
+    if (!continuePersistRes?.persisted) {
       if (streamAccumulators.get(convId)?.pendingAssistantId !== responseMessageId) return;
+      if (continuePersistRes?.rejected) surfacePersistAdmissionRejection(convId, continuePersistRes.rejected);
+      else surfaceUnconfirmedTurnPersist(convId);
       streamAccumulators.delete(convId);
       if (activeIdRef.current === convId) {
         setTree(currentTree);
@@ -7232,7 +7331,13 @@ export function RuntimeProvider({
     );
 
     console.info('[Analytics] step_limit_continue_clicked', { conversationId: convId });
-  }, [isRunning, executionMode]);
+  }, [
+    isRunning,
+    executionMode,
+    clearRuntimeNoticeFor,
+    surfacePersistAdmissionRejection,
+    surfaceUnconfirmedTurnPersist,
+  ]);
 
   const handleAdjustSettings = useCallback(() => {
     console.info('[RuntimeProvider] Adjust settings clicked');
@@ -7270,25 +7375,27 @@ export function RuntimeProvider({
 
   return (
     <MaxTurnsContinueContext.Provider value={handleContinueAfterMaxTurns}>
-      <FallbackBannerContext.Provider value={fallbackBannerActions}>
-        <SubAgentContext.Provider value={subAgentActions}>
-          <BranchNavContext.Provider value={branchNav}>
-            <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
-              <PromptHistoryContext.Provider value={promptHistory}>
-                <MidTurnComposerContext.Provider value={midTurnComposerState}>
-                  <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
-                    <StepTrackingContext.Provider value={stepTrackingState}>
-                      <RuntimeConversationIdContext.Provider value={activeConversationId}>
-                        <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
-                      </RuntimeConversationIdContext.Provider>
-                    </StepTrackingContext.Provider>
-                  </CurrentWorkingDirectoryContext.Provider>
-                </MidTurnComposerContext.Provider>
-              </PromptHistoryContext.Provider>
-            </AssistantResponseTimingContext.Provider>
-          </BranchNavContext.Provider>
-        </SubAgentContext.Provider>
-      </FallbackBannerContext.Provider>
+      <RuntimeNoticeContext.Provider value={runtimeNoticeActions}>
+        <FallbackBannerContext.Provider value={fallbackBannerActions}>
+          <SubAgentContext.Provider value={subAgentActions}>
+            <BranchNavContext.Provider value={branchNav}>
+              <AssistantResponseTimingContext.Provider value={assistantResponseTiming}>
+                <PromptHistoryContext.Provider value={promptHistory}>
+                  <MidTurnComposerContext.Provider value={midTurnComposerState}>
+                    <CurrentWorkingDirectoryContext.Provider value={currentWorkingDirectoryState}>
+                      <StepTrackingContext.Provider value={stepTrackingState}>
+                        <RuntimeConversationIdContext.Provider value={activeConversationId}>
+                          <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+                        </RuntimeConversationIdContext.Provider>
+                      </StepTrackingContext.Provider>
+                    </CurrentWorkingDirectoryContext.Provider>
+                  </MidTurnComposerContext.Provider>
+                </PromptHistoryContext.Provider>
+              </AssistantResponseTimingContext.Provider>
+            </BranchNavContext.Provider>
+          </SubAgentContext.Provider>
+        </FallbackBannerContext.Provider>
+      </RuntimeNoticeContext.Provider>
     </MaxTurnsContinueContext.Provider>
   );
 }

@@ -89,6 +89,8 @@ export type StreamOptions = {
   appHome: string;
   reasoningEffort?: ReasoningEffort;
   abortSignal?: AbortSignal;
+  /** Unique id for browser tabs/control created by this assistant run. */
+  browserOwnerId?: string;
   cwd?: string;
 
   /** The active profile/model key of THIS turn, threaded to tool execution

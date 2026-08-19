@@ -38,6 +38,7 @@ const allPermissions: PluginManifest['permissions'] = [
   'agent:register-cli-tool',
   'safe-storage',
   'browser:window',
+  'browser:authenticated-session',
   'exec:whitelisted',
   'tools:detect',
   'system:env',
@@ -139,6 +140,21 @@ describe('utility-process plugin API compatibility proxy', () => {
       { method: 'config.set', args: ['ui.theme', 'light'] },
       { method: 'config.setPluginData', args: ['nested.count', 8] },
     ]);
+  });
+
+  it('rejects Browser config writes without authenticated-session authority before updating the mirror', () => {
+    const { api, calls } = setup(['config:read', 'config:write']);
+
+    expect(() => api.config.set('browser.aiAllowPrivateNetwork', true)).toThrow(/browser:authenticated-session/);
+    expect(api.config.get()).toEqual({ ui: { theme: 'dark' } });
+    expect(calls).toEqual([]);
+
+    const authorized = setup(['config:read', 'config:write', 'browser:authenticated-session']);
+    expect(() => authorized.api.config.set('browser.aiAllowPrivateNetwork', true)).not.toThrow();
+    expect(authorized.calls).toContainEqual({
+      method: 'config.set',
+      args: ['browser.aiAllowPrivateNetwork', true],
+    });
   });
 
   it('routes task sync calls asynchronously and registers a disposable change hook', async () => {

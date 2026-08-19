@@ -1,6 +1,24 @@
-import { app, session, type IpcMain } from 'electron';
+import { app, type IpcMain } from 'electron';
 import { join, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, rmSync } from 'fs';
+import { isInAppBrowserPartition, isInAppBrowserPartitionName } from '../browser/session.js';
+import { clearPluginBrowserPartitions } from '../browser/plugin-partitions.js';
+import {
+  clearCorruptPluginBrowserQuarantineMarkers,
+  inspectQuarantinedPluginBrowserPartitions,
+  listKnownPluginBrowserPartitionNames,
+} from '../plugins/browser-window/lifecycle.js';
+
+export const CORRUPT_PLUGIN_BROWSER_QUARANTINE_RECOVERY_ID = '\0kai:recover-plugin-browser-quarantine';
+
+type PartitionEntry = {
+  name: string;
+  displayName?: string;
+  sizeBytes: number;
+  quarantined?: boolean;
+  recoveryRequired?: 'all-plugin-partitions';
+  corruptMarkerCount?: number;
+};
 
 /**
  * Recursively calculate total size of a directory in bytes. Bounded by depth and
@@ -54,28 +72,50 @@ export function resolveSafePartitionDir(name: unknown, partitionsDir: string): s
   return dirPath;
 }
 
+function listPluginPartitionDirectoryNames(partitionsDir: string): string[] {
+  if (!existsSync(partitionsDir)) return [];
+  return readdirSync(partitionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !isInAppBrowserPartitionName(entry.name))
+    .map((entry) => entry.name);
+}
+
 export function registerPartitionHandlers(ipcMain: IpcMain): void {
   const partitionsDir = join(app.getPath('userData'), 'Partitions');
 
   ipcMain.handle('partitions:list', async () => {
-    if (!existsSync(partitionsDir)) return [];
-
+    const partitions = new Map<string, PartitionEntry>();
     try {
-      const entries = readdirSync(partitionsDir, { withFileTypes: true });
-      const partitions: Array<{ name: string; sizeBytes: number }> = [];
-
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const fullPath = join(partitionsDir, entry.name);
-        const sizeBytes = dirSize(fullPath);
-        partitions.push({ name: entry.name, sizeBytes });
+      for (const name of listPluginPartitionDirectoryNames(partitionsDir)) {
+        partitions.set(name, { name, sizeBytes: dirSize(join(partitionsDir, name)) });
       }
-
-      return partitions;
     } catch (error) {
-      console.warn('[Partitions] Failed to list partitions:', error);
-      return [];
+      // Durable quarantine rows remain useful even when Chromium's Partitions
+      // directory is temporarily unreadable, so do not collapse the whole list.
+      console.warn('[Partitions] Failed to enumerate Chromium partitions:', error);
     }
+
+    const quarantine = inspectQuarantinedPluginBrowserPartitions();
+    for (const name of quarantine.partitionNames) {
+      if (isInAppBrowserPartitionName(name) || resolveSafePartitionDir(name, partitionsDir) === null) continue;
+      const existing = partitions.get(name);
+      partitions.set(name, {
+        name,
+        sizeBytes: existing?.sizeBytes ?? 0,
+        quarantined: true,
+      });
+    }
+    if (quarantine.corruptMarkerCount > 0 || quarantine.directoryUnreadable) {
+      partitions.set(CORRUPT_PLUGIN_BROWSER_QUARANTINE_RECOVERY_ID, {
+        name: CORRUPT_PLUGIN_BROWSER_QUARANTINE_RECOVERY_ID,
+        displayName: 'Unreadable plugin Browser cleanup state',
+        sizeBytes: 0,
+        quarantined: true,
+        recoveryRequired: 'all-plugin-partitions',
+        corruptMarkerCount: quarantine.corruptMarkerCount,
+      });
+    }
+
+    return [...partitions.values()];
   });
 
   ipcMain.handle('partitions:delete', async (_event, names: string[]) => {
@@ -86,40 +126,42 @@ export function registerPartitionHandlers(ipcMain: IpcMain): void {
     const deleted: string[] = [];
 
     try {
-      for (const name of names) {
+      const recoverAll = names.includes(CORRUPT_PLUGIN_BROWSER_QUARANTINE_RECOVERY_ID);
+      const requestedNames = new Set(names.filter((name) => name !== CORRUPT_PLUGIN_BROWSER_QUARANTINE_RECOVERY_ID));
+      if (recoverAll) {
+        for (const name of listPluginPartitionDirectoryNames(partitionsDir)) requestedNames.add(name);
+        const quarantine = inspectQuarantinedPluginBrowserPartitions();
+        for (const name of quarantine.partitionNames) requestedNames.add(name);
+        for (const name of listKnownPluginBrowserPartitionNames()) requestedNames.add(name);
+      }
+      const validPartitions = [...requestedNames].filter((name): name is string => {
+        if (typeof name !== 'string') return false;
+        // In-app Browser profiles have their own lifecycle-aware clearing path.
+        // Never let the legacy plugin-partition manager tear one down behind a
+        // live WebContentsView or contradict the settings UI's scope controls.
+        if (isInAppBrowserPartition(name)) return false;
         // Reject anything that isn't a plain single-segment name resolving to a
         // DIRECT child of partitionsDir (see resolveSafePartitionDir). `''`/`.`
         // would otherwise resolve back to partitionsDir and rmSync the whole tree.
-        const dirPath = resolveSafePartitionDir(name, partitionsDir);
-        if (dirPath === null) continue;
+        return resolveSafePartitionDir(name, partitionsDir) !== null;
+      });
+      await clearPluginBrowserPartitions(validPartitions, {
+        removePersistentData: (name) => {
+          const dirPath = resolveSafePartitionDir(name, partitionsDir)!;
+          if (existsSync(dirPath)) {
+            rmSync(dirPath, { recursive: true, force: true });
+          }
+          deleted.push(name);
+        },
+      });
 
-        // Clear in-memory session data first
-        try {
-          const ses = session.fromPartition(`persist:${name}`);
-          await ses.clearStorageData();
-          await ses.clearCache();
-        } catch {
-          // Session might not exist in-memory — that's fine
-        }
+      const recoveredCorruptMarkers = recoverAll ? clearCorruptPluginBrowserQuarantineMarkers() : 0;
 
-        // Also try without persist: prefix (plugins may use either form)
-        try {
-          const ses = session.fromPartition(name as string);
-          await ses.clearStorageData();
-          await ses.clearCache();
-        } catch {
-          // Ignore
-        }
-
-        // Remove the directory from disk (dirPath validated above).
-        if (existsSync(dirPath)) {
-          rmSync(dirPath, { recursive: true, force: true });
-        }
-
-        deleted.push(name as string);
-      }
-
-      return { success: true, deleted };
+      return {
+        success: true,
+        deleted,
+        ...(recoverAll ? { recoveredCorruptMarkers } : {}),
+      };
     } catch (error) {
       return {
         error: error instanceof Error ? error.message : 'Failed to delete partitions.',
