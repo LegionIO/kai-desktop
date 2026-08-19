@@ -37,17 +37,21 @@ export type AttachmentFilterResult = {
 
 /**
  * Partition a File selection into the files safe to read and the names to report as skipped.
- * Enforces the per-file cap and a running aggregate cap that INCLUDES bytes already reserved by other
- * in-flight batches (R187), so concurrent drops/pastes can't collectively exceed the ceiling. Reserves
- * the accepted bytes against the global in-flight counter; the caller must release `reservedBytes` when
- * the reads settle. Order-preserving.
+ * Enforces the per-file cap and a running aggregate cap that INCLUDES both bytes already reserved by
+ * other in-flight batches (R187) AND `residentBytes` already committed to the caller's store (R188), so
+ * neither concurrent drops nor a large already-staged set can push total resident memory past the
+ * ceiling. Reserves the accepted bytes against the global in-flight counter; the caller must release
+ * `reservedBytes` when the reads settle. Order-preserving.
+ *
+ * `residentBytes` is the total size of attachments already committed to the store this selection will be
+ * added to (the shared chat store or a task-local store) — pass 0 if unknown.
  */
-export function filterAttachmentsBySize(files: readonly File[]): AttachmentFilterResult {
+export function filterAttachmentsBySize(files: readonly File[], residentBytes = 0): AttachmentFilterResult {
   const accepted: File[] = [];
   const skipped: string[] = [];
   let batchBytes = 0;
   for (const file of files) {
-    const wouldTotal = inFlightReservedBytes + batchBytes + file.size;
+    const wouldTotal = residentBytes + inFlightReservedBytes + batchBytes + file.size;
     if (file.size > MAX_ATTACHMENT_BYTES || wouldTotal > MAX_ATTACHMENT_TOTAL_BYTES) {
       skipped.push(file.name);
       continue;

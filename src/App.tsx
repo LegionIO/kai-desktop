@@ -2224,7 +2224,7 @@ function AppShell() {
     <AttachmentProvider>
       <AppShotsBridge />
       <DropZone
-        enabled={activeView === CHAT_VIEW || activeView === CHAT_LIST_VIEW || activeView === activeConversationId}
+        enabled={activeView === CHAT_VIEW || activeView === activeConversationId}
         activeConversationId={activeConversationId}
       >
         <RuntimeProvider

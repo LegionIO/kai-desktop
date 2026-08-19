@@ -68,7 +68,7 @@ export function useAppShots(): void {
  * Returns `true` when the paste was an App Shot and was fully handled.
  */
 export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLElement>) => boolean {
-  const { addAttachments } = useAttachments();
+  const { addAttachments, getResidentBytes } = useAttachments();
   const { getActiveConversationId } = useMidTurnComposer();
 
   return useCallback(
@@ -99,14 +99,20 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       void app.appShots.resolveRef(refId).then((payload) => {
         if (getActiveConversationId() !== originConversationId) return;
         if (payload) {
-          addAttachments(appShotPayloadToAttachments(payload));
+          // Surface a partial/failed attach near the aggregate cap (R188): appShotPayloadToAttachments
+          // returns the image + a metadata sidecar, either of which addAttachments may reject when the
+          // store is near the ceiling. The paste is reported as handled, so warn rather than fail silent.
+          const { skipped } = addAttachments(appShotPayloadToAttachments(payload));
+          if (skipped.length > 0) {
+            console.warn(`[appshot] Couldn't attach ${skipped.length} app-shot part(s) — attachment size cap reached.`);
+          }
           return;
         }
         if (imageFiles.length === 0) return;
         // Gate the WHOLE batch before reading (R186): a per-file-only cap lets several raw clipboard
         // images materialize concurrently past the aggregate limit. filterAttachmentsBySize applies the
         // per-file AND running aggregate caps up front.
-        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles);
+        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
         // Release the in-flight reservation once every reader settles (R187).
         let outstanding = accepted.length;
         const settleOne = () => {
@@ -136,6 +142,6 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       });
       return true;
     },
-    [addAttachments, getActiveConversationId],
+    [addAttachments, getActiveConversationId, getResidentBytes],
   );
 }

@@ -765,7 +765,17 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         return { taskId };
       }
 
-      if (!userMessage || typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
+      // userMessage must be a string within the length cap. Empty text is allowed ONLY when at least
+      // one image attachment is present (R188): the composers permit an image-only send, so rejecting
+      // empty text here would drop those. A non-string / oversized message is always invalid.
+      const hasImageAttachment =
+        Array.isArray(attachments) && attachments.some((a) => typeof a?.image === 'string' && a.image.length > 0);
+      if (typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
+        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done' });
+        return { taskId };
+      }
+      if (userMessage.length === 0 && !hasImageAttachment) {
         broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
         broadcastTaskStreamEvent({ taskId, type: 'done' });
         return { taskId };
@@ -862,7 +872,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         }
       }
       if (imageParts.length > 0) {
-        messages.push({ role: 'user', content: [{ type: 'text', text: userMessage }, ...imageParts] });
+        // Omit an empty text part (image-only send) — some providers reject a zero-length text part.
+        const parts =
+          userMessage.length > 0 ? [{ type: 'text' as const, text: userMessage }, ...imageParts] : imageParts;
+        messages.push({ role: 'user', content: parts });
       } else {
         messages.push({ role: 'user', content: userMessage });
       }

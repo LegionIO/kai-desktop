@@ -49,5 +49,7 @@ export function useLocalAttachments() {
     setAttachments([]);
   }, []);
 
-  return { attachments, addAttachments, removeAttachment, clearAttachments };
+  const getResidentBytes = useCallback((): number => ref.current.reduce((sum, f) => sum + (f.size || 0), 0), []);
+
+  return { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes };
 }

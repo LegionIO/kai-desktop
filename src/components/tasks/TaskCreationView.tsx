@@ -54,7 +54,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
   // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
   // is discarded on unmount automatically, so no cross-surface clearing is needed.
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -132,8 +132,16 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
         skipped?: string[];
       };
       if (result.canceled) return;
-      if (result.files && result.files.length > 0) addAttachments(result.files);
-      if (result.skipped) showAttachNotice(result.skipped);
+      // Task plans can only submit IMAGES (R188), so only stage images — drop non-image files with a
+      // notice instead of showing a chip that would be silently cleared without being sent.
+      const images = (result.files ?? []).filter((f) => f.isImage);
+      const nonImages = (result.files ?? []).filter((f) => !f.isImage).map((f) => f.name);
+      if (images.length > 0) addAttachments(images);
+      if (nonImages.length > 0) {
+        showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImages.join(', ')}`);
+      } else if (result.skipped && result.skipped.length > 0) {
+        showAttachNotice(result.skipped);
+      }
     } catch (err) {
       console.error('Attach failed:', err);
     }
@@ -142,9 +150,17 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
-    // Gate by size BEFORE reading (R184): FileReader materializes each file fully → renderer OOM risk.
-    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
-    if (skipped.length > 0) showAttachNotice(skipped);
+    // Task plans can only submit IMAGES (R188) — keep only image files so no non-submittable chip is
+    // ever staged. Gate by size BEFORE reading (R184): FileReader materializes each file fully.
+    const allFiles = Array.from(fileList);
+    const imageFiles = allFiles.filter((f) => f.type.startsWith('image/'));
+    const nonImageNames = allFiles.filter((f) => !f.type.startsWith('image/')).map((f) => f.name);
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
+    if (nonImageNames.length > 0) {
+      showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImageNames.join(', ')}`);
+    } else if (skipped.length > 0) {
+      showAttachNotice(skipped);
+    }
     event.target.value = '';
     if (accepted.length === 0) {
       releaseAttachmentReservation(reservedBytes);

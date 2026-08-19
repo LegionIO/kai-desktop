@@ -69,7 +69,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -115,6 +115,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       setActiveTab(preserved);
     }
   });
+
+  // Clear staged attachments when the panel is reused for a DIFFERENT task (R188): TaskQueue reuses this
+  // component instance across task.id changes, so without this an image staged for task A could be
+  // submitted to task B. Keyed on task.id so switching tasks resets the (task-local) attachment store.
+  useEffect(() => {
+    clearAttachments();
+  }, [task.id, clearAttachments]);
 
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId
@@ -197,8 +204,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         skipped?: string[];
       };
       if (result.canceled) return;
-      if (result.files && result.files.length > 0) addAttachments(result.files);
-      if (result.skipped) showAttachNotice(result.skipped);
+      // Task plans can only submit IMAGES (R188) — only stage images; drop non-images with a notice.
+      const images = (result.files ?? []).filter((f) => f.isImage);
+      const nonImages = (result.files ?? []).filter((f) => !f.isImage).map((f) => f.name);
+      if (images.length > 0) addAttachments(images);
+      if (nonImages.length > 0) {
+        showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImages.join(', ')}`);
+      } else if (result.skipped && result.skipped.length > 0) {
+        showAttachNotice(result.skipped);
+      }
     } catch (err) {
       console.error('Attach failed:', err);
     }
@@ -207,9 +221,16 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
-    // Gate by size BEFORE reading (R184): FileReader materializes each file fully → renderer OOM risk.
-    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
-    if (skipped.length > 0) showAttachNotice(skipped);
+    // Task plans can only submit IMAGES (R188) — keep only image files. Gate by size BEFORE reading (R184).
+    const allFiles = Array.from(fileList);
+    const imageFiles = allFiles.filter((f) => f.type.startsWith('image/'));
+    const nonImageNames = allFiles.filter((f) => !f.type.startsWith('image/')).map((f) => f.name);
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles, getResidentBytes());
+    if (nonImageNames.length > 0) {
+      showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImageNames.join(', ')}`);
+    } else if (skipped.length > 0) {
+      showAttachNotice(skipped);
+    }
     event.target.value = '';
     if (accepted.length === 0) {
       releaseAttachmentReservation(reservedBytes);

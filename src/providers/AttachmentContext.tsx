@@ -26,6 +26,9 @@ type AttachmentContextValue = {
    *  the stale render-time `attachments` — e.g. revalidating before a deferred
    *  mid-turn fallback send that would otherwise consume a just-added attachment. */
   getAttachmentCount: () => number;
+  /** Live total bytes of currently-staged attachments (ref-backed) — passed to filterAttachmentsBySize
+   *  so a new selection's pre-read budget accounts for what's ALREADY staged (R188). */
+  getResidentBytes: () => number;
 };
 
 const AttachmentContext = createContext<AttachmentContextValue>({
@@ -35,6 +38,7 @@ const AttachmentContext = createContext<AttachmentContextValue>({
   clearAttachments: () => {},
   consumeAttachments: () => [],
   getAttachmentCount: () => 0,
+  getResidentBytes: () => 0,
 });
 
 export function AttachmentProvider({ children }: { children: ReactNode }) {
@@ -89,6 +93,11 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
 
   const getAttachmentCount = useCallback((): number => attachmentsRef.current.length, []);
 
+  const getResidentBytes = useCallback(
+    (): number => attachmentsRef.current.reduce((sum, f) => sum + (f.size || 0), 0),
+    [],
+  );
+
   return (
     <AttachmentContext.Provider
       value={{
@@ -98,6 +107,7 @@ export function AttachmentProvider({ children }: { children: ReactNode }) {
         clearAttachments,
         consumeAttachments,
         getAttachmentCount,
+        getResidentBytes,
       }}
     >
       {children}
