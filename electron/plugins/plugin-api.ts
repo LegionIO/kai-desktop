@@ -1592,9 +1592,14 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         // that cleanupPluginAPI aborts on unload, so teardown always cancels in-flight generation.
         const hostController = new AbortController();
         inFlightAgentControllers.add(hostController);
+        // Link the plugin's (possibly long-lived) signal into the host controller with a REMOVABLE
+        // listener, and remove it in finally (R201): a bare {once:true} listener that never fires (the
+        // common case — generation completes without an abort) lingers on the plugin's signal forever,
+        // leaking one listener + host controller per call.
+        const onPluginAbort = () => hostController.abort();
         if (options.abortSignal) {
           if (options.abortSignal.aborted) hostController.abort();
-          else options.abortSignal.addEventListener('abort', () => hostController.abort(), { once: true });
+          else options.abortSignal.addEventListener('abort', onPluginAbort, { once: true });
         }
         try {
           return await generateForPlugin({
@@ -1610,6 +1615,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             abortSignal: hostController.signal,
           });
         } finally {
+          options.abortSignal?.removeEventListener('abort', onPluginAbort);
           inFlightAgentControllers.delete(hostController);
         }
       },
@@ -1623,9 +1629,12 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
         // Host-owned controller so unload aborts an in-flight stream + its tool execution (R172 f-4).
         const hostController = new AbortController();
         inFlightAgentControllers.add(hostController);
+        // Removable linked listener + finally removal (R201) — see generate() above: a never-firing
+        // {once:true} listener would otherwise leak on the plugin's long-lived signal per stream call.
+        const onPluginAbort = () => hostController.abort();
         if (options.abortSignal) {
           if (options.abortSignal.aborted) hostController.abort();
-          else options.abortSignal.addEventListener('abort', () => hostController.abort(), { once: true });
+          else options.abortSignal.addEventListener('abort', onPluginAbort, { once: true });
         }
         try {
           for await (const ev of streamForPlugin({
@@ -1646,6 +1655,7 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
             yield ev as unknown as PluginAgentStreamEvent;
           }
         } finally {
+          options.abortSignal?.removeEventListener('abort', onPluginAbort);
           inFlightAgentControllers.delete(hostController);
         }
       },

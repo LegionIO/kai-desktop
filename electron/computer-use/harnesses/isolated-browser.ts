@@ -186,13 +186,17 @@ function ensureWindow(sessionId: string): BrowserWindow {
         callback({});
         return;
       }
-      // Only vet http(s) subresources; data:/blob:/about: don't hit the network and would be
-      // spuriously rejected by the http-normalizing guard.
-      if (!/^https?:/i.test(details.url)) {
+      // Vet http(s) AND ws(s) subresources: WebSockets hit the network too, so an untrusted page could
+      // otherwise open ws://127.0.0.1 / ws://<LAN> and reach internal services, bypassing the SSRF guard
+      // (R201). data:/blob:/about: don't hit the network and would be spuriously rejected by the
+      // http-normalizing guard, so let them through. Normalize ws→http / wss→https for the host/port check.
+      const wsMatch = /^wss?:/i.test(details.url);
+      if (!/^https?:/i.test(details.url) && !wsMatch) {
         callback({});
         return;
       }
-      const decision = checkIsolatedBrowserNavigation(details.url, false);
+      const urlForGuard = wsMatch ? details.url.replace(/^ws(s?):/i, (_m, s) => (s ? 'https:' : 'http:')) : details.url;
+      const decision = checkIsolatedBrowserNavigation(urlForGuard, false);
       if (!decision.ok) {
         callback({ cancel: true });
         return;
