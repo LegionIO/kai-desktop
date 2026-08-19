@@ -7,6 +7,7 @@ import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvide
 import { isCompactCommand } from '@/lib/slash-commands';
 import { useCompactingIds, markConversationCompacting, clearConversationCompacting } from '@/lib/compaction-ui-store';
 import { cn } from '@/lib/utils';
+import { MAX_ATTACHMENT_BYTES, skippedAttachmentsNotice } from '@/lib/attachment-limits';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
   placeholder = 'Discuss your thoughts and ideas...',
@@ -279,9 +280,17 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       if (imageItems.length === 0) return false;
 
       event.preventDefault();
+      const skippedPastes: string[] = [];
       for (const item of imageItems) {
         const file = item.getAsFile();
         if (!file) continue;
+
+        // Gate by size BEFORE reading (R184): a pasted image is read fully by FileReader, so an
+        // oversized paste would exhaust renderer memory. Reject over-cap pastes up front.
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          skippedPastes.push(file.name || 'pasted image');
+          continue;
+        }
 
         const reader = new FileReader();
         reader.onload = () => {
@@ -297,6 +306,14 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
         };
         reader.readAsDataURL(file);
       }
+      if (skippedPastes.length > 0) {
+        const notice = skippedAttachmentsNotice(skippedPastes);
+        if (notice) {
+          if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+          setSendBlockFor({ id: conversationId, msg: notice });
+          sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+        }
+      }
 
       const pastedText = event.clipboardData.getData('text/plain');
       if (pastedText) {
@@ -305,7 +322,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
 
       return true;
     },
-    [addAttachments, handleAppShotPaste],
+    [addAttachments, handleAppShotPaste, conversationId],
   );
 
   const isMultiline = text.includes('\n');

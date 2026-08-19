@@ -27,6 +27,7 @@ import {
   lstatSync,
   fstatSync,
   openSync,
+  readSync,
   closeSync,
   renameSync,
   constants as fsReadConstants,
@@ -2489,7 +2490,18 @@ if (gotSingleInstanceLock) {
               skipped.push(basename(filePath));
               continue;
             }
-            data = readFileSync(fd);
+            // Read at most the VALIDATED size (R184): readFileSync(fd) reads the file's CURRENT length,
+            // so a regular file grown between fstat and read could exceed the caps. Allocate a buffer of
+            // the fstat'd size and read exactly that many bytes — the allocation is bounded by the size
+            // we already checked, and any bytes appended after fstat are simply not read.
+            const buf = Buffer.allocUnsafe(st.size);
+            let off = 0;
+            while (off < st.size) {
+              const n = readSync(fd, buf, off, st.size - off, off);
+              if (n === 0) break; // truncated after fstat — use what we got
+              off += n;
+            }
+            data = off === st.size ? buf : buf.subarray(0, off);
           } catch {
             skipped.push(basename(filePath));
             continue;

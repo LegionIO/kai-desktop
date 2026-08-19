@@ -47,7 +47,7 @@ import { resolveConversationTokenization } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import { removeBrowserConversationData, removeBrowserConversationsData } from '../browser/service.js';
 import { browserScopeKey } from '../browser/session.js';
-import { stopRealtimeSessionForConversation } from './realtime.js';
+import { stopRealtimeSessionForConversation, onRealtimeExecutionModeChanged } from './realtime.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
   readIndex,
@@ -1715,6 +1715,15 @@ export function registerConversationHandlers(
     // payload shape as broadcastExecutionMode so every window/web client reconciles its toggle.
     writeConversation(appHome, updated);
     broadcastToAllWindows('agent:execution-mode-changed', { conversationId, mode: nextMode ?? 'auto' });
+    // Re-gate a LIVE Realtime call for this conversation (R184): this is the authoritative user-toggle
+    // setter, so an Auto→Plan-First change here must re-resolve + re-apply the Realtime tool filter —
+    // otherwise the connected socket keeps mutating tools until the next reload (same fix as the
+    // broadcastExecutionMode plan-mode path in agent.ts, R183).
+    try {
+      onRealtimeExecutionModeChanged(conversationId);
+    } catch (err) {
+      console.warn('[conversations] onRealtimeExecutionModeChanged failed (non-fatal):', err);
+    }
     return { ok: true };
   });
 

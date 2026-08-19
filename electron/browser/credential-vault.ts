@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   mkdirSync,
-  readFileSync,
   readdirSync,
   rmSync,
   openSync,
   fstatSync,
+  readSync,
   closeSync,
   constants as fsConstants,
 } from 'node:fs';
@@ -57,11 +57,17 @@ function readCredentialVaultBytes(filePath: string): Buffer {
     if (!Number.isSafeInteger(st.size) || st.size < 0 || st.size > MAX_CREDENTIAL_VAULT_BYTES) {
       throw new Error('Credential vault exceeds its size limit.');
     }
-    const contents = readFileSync(fd);
-    if (contents.byteLength > MAX_CREDENTIAL_VAULT_BYTES) {
-      throw new Error('Credential vault exceeds its size limit.');
+    // Read at most the VALIDATED size (R184): readFileSync(fd) would read the file's CURRENT length, so
+    // a file enlarged between fstat and read could allocate past the cap before the post-read check.
+    // Allocate a buffer of the fstat'd size and read exactly that many bytes.
+    const contents = Buffer.allocUnsafe(st.size);
+    let off = 0;
+    while (off < st.size) {
+      const n = readSync(fd, contents, off, st.size - off, off);
+      if (n === 0) break; // truncated after fstat
+      off += n;
     }
-    return contents;
+    return off === st.size ? contents : contents.subarray(0, off);
   } finally {
     closeSync(fd);
   }

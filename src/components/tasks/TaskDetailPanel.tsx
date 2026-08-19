@@ -33,6 +33,7 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
+import { filterAttachmentsBySize } from '@/lib/attachment-limits';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
@@ -194,8 +195,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
+    const fileList = event.target.files;
+    if (!fileList || fileList.length === 0) return;
+    // Gate by size BEFORE reading (R184): FileReader materializes each file fully → renderer OOM risk.
+    const { accepted, skipped } = filterAttachmentsBySize(Array.from(fileList));
+    if (skipped.length > 0) showAttachNotice(skipped);
+    event.target.value = '';
+    if (accepted.length === 0) return;
     const readers: Promise<{
       name: string;
       mime: string;
@@ -204,8 +210,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       dataUrl: string;
       text?: string;
     }>[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
@@ -219,7 +224,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       );
     }
     void Promise.all(readers).then((results) => addAttachments(results));
-    event.target.value = '';
   };
 
   const handleAttachDirectory = async () => {
