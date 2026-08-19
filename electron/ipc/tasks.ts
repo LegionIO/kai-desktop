@@ -940,9 +940,14 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
             const filePath = join(getTasksDir(appHome), `${taskId}.json`);
             if (existsSync(filePath)) {
               const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+              // For an image-only turn userMessage is '' — persisting content:'' would replay as a
+              // zero-length text block on refinement, which some providers reject (R204). Store a
+              // non-empty placeholder so the history turn always has usable text. (The images themselves
+              // aren't persisted into history — the plan text below captures the outcome.)
+              const historyUserContent = userMessage.length > 0 ? userMessage : '[image attached]';
               const newHistory: TaskConversationMessage[] = [
                 ...(existingHistory ?? []),
-                { role: 'user', content: userMessage, timestamp: new Date().toISOString() },
+                { role: 'user', content: historyUserContent, timestamp: new Date().toISOString() },
                 { role: 'assistant', content: fullText, timestamp: new Date().toISOString() },
               ];
               const updated: TaskFile = {

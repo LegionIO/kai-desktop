@@ -36,7 +36,10 @@ export function checkIsolatedBrowserNavigation(
   const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   let host: string;
   try {
-    host = new URL(normalized).hostname.toLowerCase();
+    // Strip IPv6 brackets (R204): URL.hostname returns `[::1]` for IPv6 literals, and isIP('[::1]') is 0 —
+    // without stripping, a public IPv6 literal over http would be misclassified as a hostname and wrongly
+    // blocked by the HTTPS-for-hostnames rule below.
+    host = new URL(normalized).hostname.toLowerCase().replace(/^\[|\]$/g, '');
   } catch {
     return { ok: false, reason: `invalid URL ${normalized}` };
   }
@@ -161,7 +164,18 @@ function resolveIsolatedBrowserAllowPrivate(): boolean {
 
 function ensureWindow(sessionId: string): BrowserWindow {
   const existing = windows.get(sessionId);
-  if (existing && !existing.isDestroyed()) return existing;
+  if (existing && !existing.isDestroyed()) {
+    // Reapply the WebRTC policy on a REUSED window (R204): a paused/approval-waiting session returns the
+    // existing window, but the private-network setting may have been toggled off since creation — leaving
+    // WebRTC on `default` would permit new direct LAN UDP despite the live request guards using the
+    // disabled setting. Re-derive it from current config each time the window is handed out.
+    try {
+      configureBrowserWebContents(existing.webContents, resolveIsolatedBrowserAllowPrivate());
+    } catch {
+      /* setWebRTCIPHandlingPolicy unavailable */
+    }
+    return existing;
+  }
 
   const win = new BrowserWindow({
     width: 1440,

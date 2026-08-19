@@ -11,9 +11,10 @@ import {
   rmSync,
   appendFileSync,
   mkdirSync,
-  lstatSync,
   openSync,
   closeSync,
+  fstatSync,
+  readSync,
   constants as fsConstants,
 } from 'fs';
 import { join } from 'path';
@@ -323,24 +324,37 @@ export function consumePostUpdateMarker(): { version: string; fromVersion: strin
     // otherwise make readFileSync follow the link (leaking/blocking) or read an
     // unbounded stream. The marker is a tiny JSON blob — reject anything that
     // isn't a small regular file and never follow a link.
-    let st: ReturnType<typeof lstatSync>;
+    // Single-descriptor validation (R181/R204): a pre-open lstat cap is a TOCTOU — a symlink/FIFO/device
+    // or a grown/replaced regular file between the lstat and the read could bypass the cap or block. Open
+    // FIRST with O_NOFOLLOW|O_NONBLOCK (nonblocking so a FIFO can't hang startup), then fstat the SAME
+    // descriptor to confirm a small regular file, and read exactly the fstat'd size. The marker is a tiny
+    // JSON blob.
+    const MARKER_MAX_BYTES = 1024 * 1024;
+    let fd: number;
     try {
-      st = lstatSync(POST_UPDATE_MARKER);
+      fd = openSync(POST_UPDATE_MARKER, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch {
-      return null;
+      return null; // absent, symlink (O_NOFOLLOW → ELOOP), or unopenable — nothing to consume
     }
-    if (st.isSymbolicLink() || !st.isFile() || st.size > 1024 * 1024) {
-      try {
-        unlinkSync(POST_UPDATE_MARKER);
-      } catch {
-        /* */
-      }
-      return null;
-    }
-    const fd = openSync(POST_UPDATE_MARKER, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     let raw: string;
     try {
-      raw = readFileSync(fd, 'utf-8');
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > MARKER_MAX_BYTES) {
+        try {
+          unlinkSync(POST_UPDATE_MARKER);
+        } catch {
+          /* */
+        }
+        return null;
+      }
+      const buf = Buffer.allocUnsafe(st.size);
+      let off = 0;
+      while (off < st.size) {
+        const n = readSync(fd, buf, off, st.size - off, off);
+        if (n === 0) break;
+        off += n;
+      }
+      raw = buf.subarray(0, off).toString('utf-8');
     } finally {
       closeSync(fd);
     }

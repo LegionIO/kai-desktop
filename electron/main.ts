@@ -24,7 +24,6 @@ import {
   readdirSync,
   opendirSync,
   statSync,
-  lstatSync,
   fstatSync,
   openSync,
   readSync,
@@ -2662,26 +2661,34 @@ if (gotSingleInstanceLock) {
         // Use lstatSync (NOT statSync) so a SYMLINK at the target is detected and REJECTED rather
         // than followed (R168): statSync follows the link, so `~/.kai/plans/x.md → ~/.ssh/id_ed25519`
         // would leak the target's contents through this IPC channel. Plan files are ephemeral
-        // working artifacts written by write_plan (with O_NOFOLLOW) — never legitimately symlinks.
-        let st: ReturnType<typeof lstatSync>;
+        // Byte cap (R180) + single-descriptor validation (R204): a pre-open lstat cap is a TOCTOU — a
+        // regular file grown/replaced between the lstat and the read could exceed the cap, and a FIFO swap
+        // could block a plain openSync. Open FIRST with O_NOFOLLOW|O_NONBLOCK (nonblocking so a FIFO can't
+        // hang the open), then fstat the SAME descriptor to confirm a regular file + enforce the cap, and
+        // read exactly the fstat'd size with a bounded loop (bytes appended after fstat are not read).
+        const MAX_PLAN_READ_BYTES = 4 * 1024 * 1024;
+        let fd: number;
         try {
-          st = lstatSync(resolved);
+          fd = openSync(resolved, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW | fsReadConstants.O_NONBLOCK);
         } catch {
           return { error: 'File not found' };
         }
-        if (st.isSymbolicLink() || !st.isFile()) {
-          return { error: 'File not found' };
-        }
-        // Byte cap (R180): an externally-created large regular file under ~/.kai/plans would otherwise
-        // cause a large allocation / main-process OOM. Plans are small markdown working artifacts.
-        const MAX_PLAN_READ_BYTES = 4 * 1024 * 1024;
-        if (st.size > MAX_PLAN_READ_BYTES) {
-          return { error: 'Plan file too large' };
-        }
-        // O_NOFOLLOW backstops a TOCTOU swap of the file for a symlink between lstat and open.
-        const fd = openSync(resolved, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW);
         try {
-          return { content: readFileSync(fd, 'utf-8') };
+          const st = fstatSync(fd);
+          if (!st.isFile()) {
+            return { error: 'File not found' };
+          }
+          if (st.size > MAX_PLAN_READ_BYTES) {
+            return { error: 'Plan file too large' };
+          }
+          const buf = Buffer.allocUnsafe(st.size);
+          let off = 0;
+          while (off < st.size) {
+            const n = readSync(fd, buf, off, st.size - off, off);
+            if (n === 0) break; // truncated after fstat — use what we got
+            off += n;
+          }
+          return { content: buf.subarray(0, off).toString('utf-8') };
         } finally {
           closeSync(fd);
         }
