@@ -65,11 +65,12 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, updateTaskStatus, refineTaskPlan, clearDroppedImageNotice } = useTasks();
+  const { state, updateTask, updateTaskStatus, refineTaskPlan, clearDroppedImageNotice, clearFailedSubmission } =
+    useTasks();
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature } =
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature, getResidentBytes } =
     useLocalAttachments();
   // Synchronous single-submission latch for refine (R212): isActivelyStreaming stays false until
   // refineTaskPlan finishes its tasks.get, so rapid submits could start competing plan streams.
@@ -211,6 +212,33 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       clearDroppedImageNotice();
     }
   }, [state.droppedImageNotice, task.id, showAttachMessage, clearDroppedImageNotice]);
+
+  // Restore a submission whose background plan stream failed AFTER admission with no text produced (R217):
+  // the create composer already unmounted (or a refine cleared) at admission, so the provider stashed the
+  // prompt+images. Repopulate THIS task's composer with them so the user can retry, then clear the payload.
+  // Only restore into an empty composer so we don't clobber something the user has since typed.
+  useEffect(() => {
+    const failed = state.failedSubmission;
+    if (!failed || failed.taskId !== task.id) return;
+    const composerBusy = (textareaRef.current?.value ?? '').trim().length > 0 || getResidentBytes() > 0;
+    if (!composerBusy) {
+      if (failed.text) setInput(failed.text);
+      if (failed.attachments && failed.attachments.length > 0) {
+        // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
+        addAttachments(
+          failed.attachments.map((a, i) => ({
+            name: `image-${i + 1}.${(a.mimeType?.split('/')[1] ?? 'png').split('+')[0]}`,
+            mime: a.mimeType ?? 'image/png',
+            isImage: true,
+            size: Math.floor((a.image.length * 3) / 4),
+            dataUrl: a.image,
+          })),
+        );
+      }
+      showAttachMessage('The plan failed to generate — your message was restored. Try again.');
+    }
+    clearFailedSubmission();
+  }, [state.failedSubmission, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {

@@ -37,6 +37,9 @@ interface TaskState {
   /** Transient notice: images the plan-side caps dropped on the last CREATION submission, keyed by the
    *  task it belongs to (R210/R211) so a different task's detail panel can't consume it. Cleared once shown. */
   droppedImageNotice: { taskId: string; count: number } | null;
+  /** A submission whose background plan stream terminated in error having produced NO text (R217): the
+   *  surviving UI restores this prompt+images into the composer so it isn't lost. Cleared once restored. */
+  failedSubmission: { taskId: string; text: string; attachments?: Array<{ image: string; mimeType?: string }> } | null;
 }
 
 type TaskAction =
@@ -51,7 +54,11 @@ type TaskAction =
   | { type: 'STREAM_TEXT_DELTA'; text: string }
   | { type: 'STREAM_DONE' }
   | { type: 'CANCEL_AI_CREATE' }
-  | { type: 'SET_DROPPED_IMAGE_NOTICE'; notice: { taskId: string; count: number } | null };
+  | { type: 'SET_DROPPED_IMAGE_NOTICE'; notice: { taskId: string; count: number } | null }
+  | {
+      type: 'SET_FAILED_SUBMISSION';
+      failed: { taskId: string; text: string; attachments?: Array<{ image: string; mimeType?: string }> } | null;
+    };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
@@ -71,6 +78,7 @@ const initialState: TaskState = {
   streamingText: '',
   isStreamingPlan: false,
   droppedImageNotice: null,
+  failedSubmission: null,
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -106,6 +114,8 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
       return { ...state, creatingTaskId: null, streamingText: '', isStreamingPlan: false };
     case 'SET_DROPPED_IMAGE_NOTICE':
       return { ...state, droppedImageNotice: action.notice };
+    case 'SET_FAILED_SUBMISSION':
+      return { ...state, failedSubmission: action.failed };
     default:
       return state;
   }
@@ -175,6 +185,8 @@ interface TaskContextValue {
   exitAICreation: () => void;
   /** Clear the transient dropped-image notice once the surviving UI has surfaced it (R210). */
   clearDroppedImageNotice: () => void;
+  /** Clear the failed-submission restore payload once the composer has restored it (R217). */
+  clearFailedSubmission: () => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -460,6 +472,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // (stuck streaming). Events land here until the dispatch flushes them.
   const streamBufferRef = useRef<{ taskId: string; text: string; done: boolean } | null>(null);
   const streamStartedRef = useRef<string | null>(null); // taskId whose START_AI_CREATE has been dispatched
+  // The submitted prompt+attachments per streaming task + whether any plan text has arrived (R217). If a
+  // task's background stream terminates in ERROR having produced NO text (a clean provider/network failure,
+  // nothing persisted), the surviving UI restores this payload so the user's prompt isn't lost — the
+  // composer already cleared/unmounted at admission, before the stream could fail.
+  const submittedPayloadRef = useRef<
+    Map<string, { text: string; attachments?: Array<{ image: string; mimeType?: string }>; producedText: boolean }>
+  >(new Map());
   // Called synchronously right after dispatching START_AI_CREATE for taskId: flush any events buffered
   // before the dispatch so early output isn't lost and an early terminal event isn't overwritten.
   const flushStreamBuffer = useCallback((taskId: string) => {
@@ -497,15 +516,33 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
       switch (evt.type) {
         case 'text-delta':
-          if (evt.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: evt.text });
+          if (evt.text) {
+            const p = submittedPayloadRef.current.get(evt.taskId);
+            if (p) p.producedText = true; // plan text arrived → a later error left partial output, don't restore
+            dispatch({ type: 'STREAM_TEXT_DELTA', text: evt.text });
+          }
           break;
         case 'done':
+          submittedPayloadRef.current.delete(evt.taskId); // terminal success — drop the restore payload
           dispatch({ type: 'STREAM_DONE' });
           break;
-        case 'error':
+        case 'error': {
           console.error('[TaskProvider] Stream error:', evt.error);
+          // Terminal stream failure AFTER admission (R217): if NO plan text was produced (clean failure,
+          // nothing persisted), surface the submitted prompt+attachments for restore so it isn't lost —
+          // the composer already cleared/unmounted at admission. If text WAS produced, the partial plan +
+          // user turn are on the task, so don't restore (would duplicate).
+          const payload = submittedPayloadRef.current.get(evt.taskId);
+          submittedPayloadRef.current.delete(evt.taskId);
+          if (payload && !payload.producedText) {
+            dispatch({
+              type: 'SET_FAILED_SUBMISSION',
+              failed: { taskId: evt.taskId, text: payload.text, attachments: payload.attachments },
+            });
+          }
           dispatch({ type: 'STREAM_DONE' });
           break;
+        }
       }
     });
     return unsub;
@@ -537,6 +574,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // deltas/errors (stuck stream) and, during a task switch, could route them to the wrong buffer.
         // Setting the ref here makes the listener accept this task's events immediately.
         creatingTaskIdRef.current = task.id;
+        // Remember the submitted payload so a terminal stream error (no text produced) can restore it (R217).
+        submittedPayloadRef.current.set(task.id, { text: userMessage, attachments, producedText: false });
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
@@ -591,6 +630,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         flushStreamBuffer(taskId); // marks streamStartedRef so subsequent events dispatch live (R215)
         // Register stream ownership synchronously before awaiting streamPlan (R214) — see startAITaskCreation.
         creatingTaskIdRef.current = taskId;
+        // Remember the submitted payload for terminal-stream-error restore (R217).
+        submittedPayloadRef.current.set(taskId, { text: userMessage, attachments, producedText: false });
 
         // streamPlan resolves {taskId, error:true} for in-band failures (R207) — roll back on those too.
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);
@@ -627,6 +668,9 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const clearDroppedImageNotice = useCallback(() => {
     dispatch({ type: 'SET_DROPPED_IMAGE_NOTICE', notice: null });
   }, []);
+  const clearFailedSubmission = useCallback(() => {
+    dispatch({ type: 'SET_FAILED_SUBMISSION', failed: null });
+  }, []);
 
   const value = useMemo<TaskContextValue>(
     () => ({
@@ -645,6 +689,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       cancelAIStream,
       exitAICreation,
       clearDroppedImageNotice,
+      clearFailedSubmission,
     }),
     [
       state,
@@ -662,6 +707,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       cancelAIStream,
       exitAICreation,
       clearDroppedImageNotice,
+      clearFailedSubmission,
     ],
   );
 
