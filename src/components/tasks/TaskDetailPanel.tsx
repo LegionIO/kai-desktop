@@ -69,7 +69,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature } =
+    useLocalAttachments();
+  // Synchronous single-submission latch for refine (R212): isActivelyStreaming stays false until
+  // refineTaskPlan finishes its tasks.get, so rapid submits could start competing plan streams.
+  const refineSubmittingRef = useRef(false);
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -431,39 +435,39 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const handleComposerSubmit = useCallback(() => {
     const text = input.trim();
     if (isActivelyStreaming) return;
+    if (refineSubmittingRef.current) return; // single-submission latch (R212) — block competing streams
     const images = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) return;
+    refineSubmittingRef.current = true;
 
     // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
-    // snapshot while clearAttachments() released their bytes from the global counter (uncounted memory +
-    // near-cap rollback rejection). Submit with the composer intact; on SUCCESS clear it (fenced to the
-    // originating task + an empty live composer so we don't wipe a newer draft the user started meanwhile);
-    // on failure leave the input untouched — no snapshot, no rollback.
+    // snapshot while clearAttachments() released their bytes from the global counter. Submit with the
+    // composer intact; on SUCCESS clear it (fenced to the originating task, unchanged live text, AND an
+    // IDENTITY-unchanged attachment set), else leave the input untouched.
     const originTaskId = task.id;
-    // Snapshot the live attachment byte total at submit time so we can detect an attachment added/removed
-    // (or one that finished loading) during admission and NOT clear it on success (R211).
-    const submittedResidentBytes = getResidentBytes();
-    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((res) => {
-      if (res.ok) {
-        // Clear only if the user is still on the originating task, hasn't edited the composer text, AND the
-        // attachment set is unchanged since submit (don't wipe a newer draft / a just-added attachment).
+    // Capture the exact attachment set (identity signature, not byte total — a same-sized replacement must
+    // NOT pass, R212) so we don't wipe an attachment added/replaced/finished-loading during admission.
+    const submittedSignature = getAttachmentSignature();
+    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined)
+      .then((res) => {
+        if (!res.ok) return; // composer keeps the user's input/attachments; nothing to restore
+        const stillOriginTask = activeTaskIdRef.current === originTaskId;
         const liveText = textareaRef.current?.value ?? '';
-        if (
-          activeTaskIdRef.current === originTaskId &&
-          liveText.trim() === text &&
-          getResidentBytes() === submittedResidentBytes
-        ) {
+        if (stillOriginTask && liveText.trim() === text && getAttachmentSignature() === submittedSignature) {
           setInput('');
           clearAttachments();
         }
-        if (res.droppedImages && res.droppedImages > 0) {
+        // Task-scope the warning (R212): only show it while still on the originating task — the panel is
+        // reused across task.id changes, so a switch during admission must not show task A's warning on B.
+        if (stillOriginTask && res.droppedImages && res.droppedImages > 0) {
           showAttachMessage(
             `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
           );
         }
-      }
-      // On failure the composer keeps the user's input/attachments; nothing to restore.
-    });
+      })
+      .finally(() => {
+        refineSubmittingRef.current = false;
+      });
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
@@ -471,7 +475,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     input,
     attachments,
     clearAttachments,
-    getResidentBytes,
+    getAttachmentSignature,
     task.id,
     refineTaskPlan,
     isActivelyStreaming,
