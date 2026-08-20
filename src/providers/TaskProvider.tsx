@@ -41,10 +41,7 @@ interface TaskState {
   /** Submissions whose background plan stream failed/ended without persisting (R217/R219): keyed by taskId
    *  (a per-task MAP so a concurrent task's failure can't overwrite another's), each holding the prompt+images
    *  the surviving UI restores into that task's composer. An entry is cleared once fully restored. */
-  failedSubmissions: Record<
-    string,
-    { text: string; attachments?: Array<{ image: string; mimeType?: string }>; bytes: number }
-  >;
+  failedSubmissions: Record<string, { text: string; attachments?: Array<{ image: string; mimeType?: string }> }>;
 }
 
 type TaskAction =
@@ -63,7 +60,7 @@ type TaskAction =
   | {
       type: 'SET_FAILED_SUBMISSION';
       taskId: string;
-      failed: { text: string; attachments?: Array<{ image: string; mimeType?: string }>; bytes: number } | null;
+      failed: { text: string; attachments?: Array<{ image: string; mimeType?: string }> } | null;
     };
 
 const emptyOrder: KaiTaskOrder = {
@@ -366,27 +363,48 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     [updateTask, state.tasks],
   );
 
-  const deleteTask = useCallback(async (id: string) => {
-    try {
-      dispatch({ type: 'DELETE_TASK', id });
-      await app.tasks.delete(id);
-    } catch (err) {
-      console.error('[TaskProvider] Failed to delete task:', err);
-      const tasks = await app.tasks.list();
-      dispatch({ type: 'SET_TASKS', tasks });
+  // R221: release any in-flight/parked payload a task is holding so a deleted/archived task can't strand its
+  // charged attachment bytes or leave an unreachable recovery entry. In-flight bytes live on submittedPayloadRef
+  // (release them); a recovery entry in failedSubmissions holds no charge (single-owner accounting) so it's a
+  // pure state removal. Safe to reference the refs here — this runs on a user event, long after mount.
+  const purgeTaskPayload = useCallback((id: string) => {
+    const p = submittedPayloadRef.current.get(id);
+    if (p) {
+      onAttachmentsReleased(p.bytes);
+      submittedPayloadRef.current.delete(id);
     }
+    dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
   }, []);
 
-  const archiveTask = useCallback(async (id: string) => {
-    try {
-      dispatch({ type: 'DELETE_TASK', id }); // remove from active list optimistically
-      await app.tasks.update(id, { archivedAt: new Date().toISOString() });
-    } catch (err) {
-      console.error('[TaskProvider] Failed to archive task:', err);
-      const tasks = await app.tasks.list();
-      dispatch({ type: 'SET_TASKS', tasks });
-    }
-  }, []);
+  const deleteTask = useCallback(
+    async (id: string) => {
+      try {
+        purgeTaskPayload(id);
+        dispatch({ type: 'DELETE_TASK', id });
+        await app.tasks.delete(id);
+      } catch (err) {
+        console.error('[TaskProvider] Failed to delete task:', err);
+        const tasks = await app.tasks.list();
+        dispatch({ type: 'SET_TASKS', tasks });
+      }
+    },
+    [purgeTaskPayload],
+  );
+
+  const archiveTask = useCallback(
+    async (id: string) => {
+      try {
+        purgeTaskPayload(id);
+        dispatch({ type: 'DELETE_TASK', id }); // remove from active list optimistically
+        await app.tasks.update(id, { archivedAt: new Date().toISOString() });
+      } catch (err) {
+        console.error('[TaskProvider] Failed to archive task:', err);
+        const tasks = await app.tasks.list();
+        dispatch({ type: 'SET_TASKS', tasks });
+      }
+    },
+    [purgeTaskPayload],
+  );
 
   const selectTask = useCallback((id: string | null) => {
     dispatch({ type: 'SELECT_TASK', id });
@@ -494,10 +512,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       { text: string; attachments?: Array<{ image: string; mimeType?: string }>; producedText: boolean; bytes: number }
     >
   >(new Map());
-  // R220: bytes for payloads currently PARKED IN failedSubmissions state (ownership transferred out of
-  // submittedPayloadRef but still committed to the renderer-wide counter). clearFailedSubmission releases
-  // these; a ref (not state) so the release is stale-closure-free and can't double-release.
-  const recoveryBytesRef = useRef<Map<string, number>>(new Map());
   // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
   const rememberSubmission = useCallback(
     (taskId: string, text: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
@@ -506,6 +520,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       const bytes = (attachments ?? []).reduce((sum, a) => sum + (a.image?.length ?? 0), 0);
       if (bytes > 0) onAttachmentsCommitted(bytes);
       submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes });
+      // R221: a NEW submission for this task supersedes any stale recovery entry from a prior failed attempt —
+      // the user is actively retrying, so the earlier stashed draft is obsolete. Removing it here also means a
+      // subsequent failure of THIS submission can't be confused with the prior one. Recovery entries hold no
+      // byte charge (single-owner accounting), so this is a pure state removal.
+      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
     },
     [],
   );
@@ -516,14 +535,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       submittedPayloadRef.current.delete(taskId);
     }
   }, []);
-  // R220: when a payload is HANDED to failedSubmissions for recovery, ownership of its parked bytes moves
-  // with it — we must NOT release here (the draft still holds those attachments in state). We return the
-  // byte count so the failedSubmission entry can carry it and clearFailedSubmission can release it later.
-  const transferSubmissionToRecovery = useCallback((taskId: string): number => {
-    const p = submittedPayloadRef.current.get(taskId);
-    if (!p) return 0;
-    submittedPayloadRef.current.delete(taskId); // delete WITHOUT releasing — bytes now owned by failedSubmissions
-    return p.bytes;
+  const clearFailedSubmission = useCallback((taskId: string) => {
+    // R221: a parked recovery payload holds NO renderer-wide byte charge (released when it left flight in
+    // resolveTerminalOutcome), so clearing is pure state removal. Restore charges via addAttachments.
+    dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
   }, []);
   const resolveTerminalOutcome = useCallback(
     (taskId: string, isError: boolean) => {
@@ -533,19 +548,24 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       // text produced is genuinely persisted — just drop the payload.
       const needsRecovery = isError || !payload.producedText;
       if (needsRecovery) {
-        const bytes = transferSubmissionToRecovery(taskId); // keeps bytes accounted; ownership → failedSubmissions
-        if (bytes > 0) recoveryBytesRef.current.set(taskId, bytes); // clearFailedSubmission releases these (R220)
+        // R221: bytes are charged ONLY while in-flight (submittedPayloadRef). A recovery payload parked in
+        // failedSubmissions is inert serialized data — NOT resident in any composer — so we RELEASE the charge
+        // as it moves out of flight. Restore re-charges through addAttachments' own accounting. This single-owner
+        // model (charge at rememberSubmission, release at every out-of-flight exit) removes the transfer-race,
+        // the double-count at restore, and the hidden reservation that prior rounds kept re-finding.
+        onAttachmentsReleased(payload.bytes);
+        submittedPayloadRef.current.delete(taskId);
         // failedSubmission is a per-task MAP (R219): a concurrent task's failure must not overwrite this one.
         dispatch({
           type: 'SET_FAILED_SUBMISSION',
           taskId,
-          failed: { text: payload.text, attachments: payload.attachments, bytes },
+          failed: { text: payload.text, attachments: payload.attachments },
         });
       } else {
         dropSubmission(taskId); // genuinely persisted → release parked bytes
       }
     },
-    [dropSubmission, transferSubmissionToRecovery],
+    [dropSubmission],
   );
   // Called synchronously right after dispatching START_AI_CREATE for taskId: flush any events buffered
   // before the dispatch so early output isn't lost and an early terminal event isn't overwritten.
@@ -691,15 +711,19 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
-        // Delete the orphaned placeholder task created before the throw (R213) + release its parked payload (R219).
+        // Delete the orphaned placeholder task created before the throw (R213). A concurrently-broadcast stream
+        // `error` may already have moved the payload from in-flight (submittedPayloadRef) to failedSubmissions
+        // (R221) — so purge BOTH: dropSubmission releases the charge if still in-flight, clearFailedSubmission
+        // removes an unreachable recovery entry for a task that no longer exists. Exactly one holds the charge.
         if (createdTaskId) {
           dropSubmission(createdTaskId);
+          clearFailedSubmission(createdTaskId);
           void app.tasks.delete?.(createdTaskId).catch(() => {});
         }
         return { ok: false };
       }
     },
-    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission],
+    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission],
   );
 
   const refineTaskPlan = useCallback(
@@ -761,17 +785,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const clearDroppedImageNotice = useCallback(() => {
     dispatch({ type: 'SET_DROPPED_IMAGE_NOTICE', notice: null });
-  }, []);
-  const clearFailedSubmission = useCallback((taskId: string) => {
-    // R220: release the parked bytes this recovery draft was holding (ownership came from
-    // submittedPayloadRef via transferSubmissionToRecovery). Delete-then-release is idempotent:
-    // a second clear finds no ref entry and releases nothing.
-    const bytes = recoveryBytesRef.current.get(taskId);
-    if (bytes) {
-      recoveryBytesRef.current.delete(taskId);
-      onAttachmentsReleased(bytes);
-    }
-    dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
   }, []);
 
   const value = useMemo<TaskContextValue>(

@@ -70,7 +70,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature, getResidentBytes } =
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature } =
     useLocalAttachments();
   // Synchronous single-submission latch for refine (R212): isActivelyStreaming stays false until
   // refineTaskPlan finishes its tasks.get, so rapid submits could start competing plan streams.
@@ -220,15 +220,16 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   useEffect(() => {
     const failed = state.failedSubmissions[task.id];
     if (!failed) return;
-    // Only restore into an EMPTY composer (a newer draft in progress takes precedence). If busy, leave the
-    // entry set; this effect re-runs when failedSubmissions changes, and the user can clear their draft.
-    const composerBusy = (textareaRef.current?.value ?? '').trim().length > 0 || getResidentBytes() > 0;
+    // Only restore into an EMPTY composer (a newer draft in progress takes precedence). R221: the busy check
+    // reads REACTIVE state (`input`, `attachments`) — not the non-reactive textarea ref — and both are in the
+    // dependency array, so when the user clears their draft this effect re-runs and the deferred restore fires.
+    // (The parked entry holds no budget reservation in the single-owner accounting model, so waiting is free.)
+    const composerBusy = input.trim().length > 0 || attachments.length > 0;
     if (composerBusy) return;
-    // R220: restore is ALL-AT-ONCE and TERMINAL — we clear the entry unconditionally at the end. The prior
-    // "leave it set for a later retry" path was dead (no dependency re-triggered on freed budget) and, having
-    // already called setInput + staged partial attachments, left the composer permanently `busy` so it could
-    // never retry AND could double-stage. If some images exceed the current renderer-wide budget we restore the
-    // text, stage what fits, and surface a notice for the rest rather than stranding recovery state forever.
+    // R220/R221: restore is ALL-AT-ONCE and TERMINAL — we clear the entry unconditionally at the end. Recovery
+    // holds no renderer-wide byte charge while parked, so addAttachments' own capacity check is authoritative and
+    // can't double-count. If some images exceed the current budget we restore the text, stage what fits, and
+    // surface a notice for the rest rather than stranding recovery state forever.
     if (failed.text) setInput(failed.text);
     let skippedCount = 0;
     if (failed.attachments && failed.attachments.length > 0) {
@@ -249,8 +250,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         ? `The plan failed to generate — your message was restored (${skippedCount} image${skippedCount === 1 ? '' : 's'} exceeded the limit). Try again.`
         : 'The plan failed to generate — your message was restored. Try again.',
     );
-    clearFailedSubmission(task.id); // terminal: releases parked bytes and removes the entry (R220)
-  }, [state.failedSubmissions, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
+    clearFailedSubmission(task.id); // terminal: removes the entry (holds no byte charge in single-owner model, R221)
+  }, [state.failedSubmissions, task.id, input, attachments, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
