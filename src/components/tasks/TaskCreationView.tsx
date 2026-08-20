@@ -69,6 +69,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // (R214): text/attachments added after Send but before the (successful) transition unmounts the view
   // would otherwise be silently discarded. Disabling makes "pending" unambiguous.
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Count of attachment FileReader batches still in flight (R216): a read started before Send can finish
+  // after, and its addAttachments would land after the submit snapshot — lost on the success unmount. Block
+  // submit while any read is outstanding so the composer waits for them to settle first.
+  const pendingReadsRef = useRef(0);
 
   // Voice recording hook
   const { startRecording: taskStartRecording } = useVoiceRecording();
@@ -182,6 +186,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       releaseAttachmentReservation(reservedBytes);
       return;
     }
+    pendingReadsRef.current += 1; // this batch is in flight — blocks submit until it settles (R216)
     const readers: Promise<{
       name: string;
       mime: string;
@@ -207,6 +212,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       );
     }
     void Promise.all(readers).then((results) => {
+      pendingReadsRef.current = Math.max(0, pendingReadsRef.current - 1); // batch settled (R216)
       releaseAttachmentReservation(reservedBytes);
       const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
       const unreadable = accepted.length - attachable.length;
@@ -249,6 +255,12 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();
+    // Wait for any in-flight attachment reads to settle before submitting (R216): a read started before Send
+    // would otherwise land after the submit snapshot and be lost on the success unmount.
+    if (pendingReadsRef.current > 0) {
+      showAttachMessage('Still reading attachments — try again in a moment.');
+      return;
+    }
     const { images, dropped } = attachmentsToImagePayload(attachments);
     // Require text OR at least one image (R187). If images were staged but the renderer-side plan caps
     // dropped ALL of them AND there's no text, there's nothing to submit — warn and bail rather than

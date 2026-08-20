@@ -76,16 +76,20 @@ export function useLocalAttachments() {
   }, []);
 
   const getResidentBytes = useCallback((): number => ref.current.reduce((sum, f) => sum + (f.size || 0), 0), []);
-  // Live IDENTITY signature of the staged set (R212/R213): a byte-total match doesn't prove the SAME files
-  // (a same-sized replacement passes). Use CHEAP per-file discriminators (name + size + dataUrl length +
-  // a 24-char prefix) — NOT the full dataUrls — so building the signature can't add hundreds of MiB of heap
-  // for large image sets (R213). Collision risk is negligible for the "did the user swap a file mid-submit"
-  // check this guards.
+  // Live IDENTITY signature of the staged set (R212/R213/R216): a byte-total match doesn't prove the SAME
+  // files (a same-sized replacement passes). Use CHEAP per-file discriminators — NOT the full dataUrls (that
+  // added hundreds of MiB of heap, R213). Sample the dataUrl at THREE points past the constant
+  // `data:<mime>;base64,` header (a 24-char head is ~all header, so a same-name/size replacement collides,
+  // R216): a mid-point + tail sample over the actual payload makes a same-name/size swap distinguishable.
+  const dataUrlSample = (d: string | undefined): string => {
+    if (!d) return '';
+    const n = d.length;
+    const mid = Math.floor(n / 2);
+    return `${d.slice(64, 96)}|${d.slice(mid, mid + 32)}|${d.slice(Math.max(0, n - 32))}`;
+  };
   const getAttachmentSignature = useCallback(
     (): string =>
-      ref.current
-        .map((f) => `${f.name} ${f.size ?? 0} ${f.dataUrl?.length ?? 0} ${f.dataUrl?.slice(0, 24) ?? ''}`)
-        .join(''),
+      ref.current.map((f) => `${f.name} ${f.size ?? 0} ${f.dataUrl?.length ?? 0} ${dataUrlSample(f.dataUrl)}`).join(''),
     [],
   );
 
