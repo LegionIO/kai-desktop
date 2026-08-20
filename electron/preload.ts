@@ -751,8 +751,9 @@ const appAPI = {
       userMessage: string,
       history?: unknown[],
       attachments?: Array<{ image: string; mimeType?: string }>,
+      streamId?: string,
     ) =>
-      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history, attachments) as Promise<{
+      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history, attachments, streamId) as Promise<{
         taskId: string;
         error?: boolean;
         droppedImages?: number;

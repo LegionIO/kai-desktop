@@ -19,6 +19,7 @@ import {
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
 import { onAttachmentsCommitted, onAttachmentsReleased } from '@/lib/attachment-limits';
+import { generateId } from '@/lib/utils';
 import type { TaskFile, KaiTaskStatus, KaiTaskOrder, KaiTaskMetadata } from '@/types/task';
 import { isValidTransition } from '../../shared/task-state-machine';
 
@@ -571,47 +572,62 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // both the charge and the heap) — a rare recovery draft is worth losing before the renderer OOMs.
   const recoveryBytesRef = useRef<Map<string, number>>(new Map());
   const RECOVERY_BYTES_CAP = 48 * 1024 * 1024; // 48 MiB total parked recovery payloads (≈4 max-size task submissions)
-  // Record the owned stream instance id for a task once streamPlan resolves (R223).
-  const setOwnedStreamId = useCallback((taskId: string, streamId: string | undefined) => {
-    if (!streamId) return;
-    const p = submittedPayloadRef.current.get(taskId);
-    if (p) p.streamId = streamId;
-  }, []);
-  // Decide whether an incoming stream event may act on THIS window's view/recovery for the task. Cases:
-  //  - We hold an in-flight payload WITH a recorded streamId  → accept iff the event's streamId matches.
-  //  - We hold a payload but no streamId yet (PENDING ADMISSION — streamPlan hasn't resolved):
-  //      · unstamped event → accept (legacy / our own pre-assignment event).
-  //      · STAMPED event   → REJECT (R225). During the pending window we cannot yet confirm an id is ours, and a
-  //        stamped event here is just as likely to be ANOTHER stream's (e.g. main broadcasts a prior stream's
-  //        supersession error, stamped with the OLD id, before returning OUR id — accepting it made us discard
-  //        our own ownership and self-recover while our stream kept running). Our own early deltas are still
-  //        captured by the display buffer (streamStartedRef, keyed by taskId); the recovery-relevant terminal for
-  //        our stream arrives AFTER our id is recorded, so nothing recoverable is lost.
-  //  - We hold NO payload for this task → no in-flight ownership. R224: a STAMPED event belongs to some other
-  //    stream instance; rejecting it stops its deltas from appending to our stale streamingText. An UNSTAMPED
-  //    event falls through (the display path's creatingTaskIdRef/streamStartedRef gates still bound it).
+  // R226: the client MINTS the stream instance id and records it SYNCHRONOUSLY at submission (rememberSubmission),
+  // then passes it to streamPlan so main stamps every event with it. This eliminates the pending-admission window
+  // that R223-R225 kept creating races around: there is no interval where we own an in-flight payload but don't
+  // yet know its streamId, so streamMatchesOwned always has the real id and neither our own fast terminal nor a
+  // superseding stream's stamped error can be misattributed.
+  // Decide whether an incoming stream event may act on THIS window's view/recovery for the task. R226: the
+  // streamId is minted client-side and recorded synchronously at rememberSubmission, so a payload we own ALWAYS
+  // has its streamId — there is no pending-admission window. Cases:
+  //  - We hold a payload → accept iff the event's streamId matches ours (an unstamped event, e.g. a pre-stream
+  //    validation terminal or a legacy emitter, is accepted for backward-compat — it carries our taskId and the
+  //    display gate bounds it).
+  //  - We hold NO payload → no in-flight ownership; reject any STAMPED (foreign) event so its deltas can't append
+  //    to our stale streamingText (R224). Unstamped events fall through (display gate handles them).
   const streamMatchesOwned = useCallback((taskId: string, eventStreamId: string | undefined): boolean => {
     const entry = submittedPayloadRef.current.get(taskId);
     if (!entry) return !eventStreamId; // no local ownership: reject any stamped (foreign) event
-    if (!entry.streamId) return !eventStreamId; // pending admission: accept only UNSTAMPED events (R225)
-    if (!eventStreamId) return true; // unstamped event (backward-compat)
+    if (!eventStreamId) return true; // unstamped event (backward-compat / pre-stream validation terminal)
     return entry.streamId === eventStreamId;
   }, []);
-  // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
-  const rememberSubmission = useCallback(
-    (taskId: string, text: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
-      const prev = submittedPayloadRef.current.get(taskId);
-      if (prev) onAttachmentsReleased(prev.bytes);
-      const bytes = (attachments ?? []).reduce((sum, a) => sum + (a.image?.length ?? 0), 0);
-      if (bytes > 0) onAttachmentsCommitted(bytes);
-      submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes });
-      // R221: a NEW submission for this task supersedes any stale recovery entry from a prior failed attempt —
-      // the user is actively retrying, so the earlier stashed draft is obsolete. Removing it here also means a
-      // subsequent failure of THIS submission can't be confused with the prior one. Recovery entries hold no
-      // byte charge (single-owner accounting), so this is a pure state removal.
-      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
+  // R226: a recovery payload's accounted size counts BOTH the prompt text and the attachment data URLs. Counting
+  // only attachments (R225) let text-only failures have zero cost, so they were never evicted and repeated
+  // background failures could retain unbounded ~50k-char prompts. Text length is a fair proxy for its heap cost.
+  const computePayloadBytes = useCallback(
+    (text: string, attachments?: Array<{ image: string; mimeType?: string }>): number => {
+      const attBytes = (attachments ?? []).reduce((sum, a) => sum + (a.image?.length ?? 0), 0);
+      return (text?.length ?? 0) + attBytes;
     },
     [],
+  );
+  // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
+  const rememberSubmission = useCallback(
+    (
+      taskId: string,
+      text: string,
+      attachments: Array<{ image: string; mimeType?: string }> | undefined,
+      streamId: string,
+    ) => {
+      const prev = submittedPayloadRef.current.get(taskId);
+      if (prev) onAttachmentsReleased(prev.bytes);
+      const bytes = computePayloadBytes(text, attachments);
+      if (bytes > 0) onAttachmentsCommitted(bytes);
+      // R226: streamId is minted by the caller and stored HERE, synchronously, before streamPlan is awaited —
+      // no pending-admission window (streamId is known before streamPlan is awaited).
+      submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes, streamId });
+      // R221/R226: a NEW submission for this task supersedes any stale recovery entry from a prior failed attempt —
+      // the user is actively retrying, so the earlier stashed draft is obsolete. Release the prior recovery entry's
+      // byte charge from recoveryBytesRef (R226: previously only the state was cleared, leaving a phantom charge
+      // that reduced the global budget after a successful retry) AND remove the state entry.
+      const staleRecovery = recoveryBytesRef.current.get(taskId);
+      if (staleRecovery !== undefined) {
+        recoveryBytesRef.current.delete(taskId);
+        if (staleRecovery > 0) onAttachmentsReleased(staleRecovery);
+      }
+      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
+    },
+    [computePayloadBytes],
   );
   const dropSubmission = useCallback((taskId: string) => {
     const p = submittedPayloadRef.current.get(taskId);
@@ -803,15 +819,19 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // deltas/errors (stuck stream) and, during a task switch, could route them to the wrong buffer.
         // Setting the ref here makes the listener accept this task's events immediately.
         creatingTaskIdRef.current = task.id;
-        // Remember the submitted payload so a terminal stream error / empty-done can restore it (R217/R219).
-        rememberSubmission(task.id, userMessage, attachments);
+        // R226: mint the stream instance id client-side and record it SYNCHRONOUSLY (rememberSubmission) before
+        // awaiting streamPlan, then pass it to main so every event is stamped with it. No pending-admission
+        // window — the listener always knows our id, so our own fast terminal and a superseding stream's error
+        // are never confused.
+        const streamId = generateId();
+        rememberSubmission(task.id, userMessage, attachments, streamId);
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
         // roll back into an unmounted/disposed composer and lose the prompt. streamPlan resolves almost
         // immediately (it launches the stream in the background and returns), and its deltas are broadcast
         // async — so deferring the transition until after this await does not drop early stream events.
-        const res = await app.tasks.streamPlan(task.id, userMessage, undefined, attachments);
+        const res = await app.tasks.streamPlan(task.id, userMessage, undefined, attachments, streamId);
         if (res && (res as { error?: boolean }).error) {
           // Admission failed before streaming began — the composer is still mounted with the user's
           // input/attachments intact (we never transitioned), so just clean up the placeholder task and
@@ -837,10 +857,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           }
           return { ok: false };
         }
-
-        // R223: record the stream instance id we own so the event listener ignores a replacement stream
-        // (e.g. started by another window) that would otherwise resolve/feed this window's payload.
-        setOwnedStreamId(task.id, (res as { streamId?: string })?.streamId);
 
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
         flushStreamBuffer(task.id); // flush events buffered before this dispatch (R215)
@@ -870,7 +886,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission, setOwnedStreamId],
+    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission],
   );
 
   const refineTaskPlan = useCallback(
@@ -888,11 +904,12 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         flushStreamBuffer(taskId); // marks streamStartedRef so subsequent events dispatch live (R215)
         // Register stream ownership synchronously before awaiting streamPlan (R214) — see startAITaskCreation.
         creatingTaskIdRef.current = taskId;
-        // Remember the submitted payload for terminal-stream-error / empty-done restore (R217/R219).
-        rememberSubmission(taskId, userMessage, attachments);
+        // R226: mint + record the stream id synchronously (see startAITaskCreation), pass it to streamPlan.
+        const streamId = generateId();
+        rememberSubmission(taskId, userMessage, attachments, streamId);
 
         // streamPlan resolves {taskId, error:true} for in-band admission failures (R207).
-        const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);
+        const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments, streamId);
         if (res && (res as { error?: boolean }).error) {
           // R225: a SYNCHRONOUS admission failure does NOT park recovery. Unlike create (whose composer unmounts
           // at admission), the refine composer stays mounted and KEEPS the user's input/attachments on !res.ok
@@ -905,9 +922,6 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           dispatch({ type: 'STREAM_DONE' });
           return { ok: false };
         }
-        // R223: record the stream instance id we own so a replacement stream (another window) can't resolve
-        // this refine's in-flight payload.
-        setOwnedStreamId(taskId, (res as { streamId?: string })?.streamId);
         return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
@@ -917,7 +931,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [flushStreamBuffer, rememberSubmission, dropSubmission, setOwnedStreamId],
+    [flushStreamBuffer, rememberSubmission, dropSubmission],
   );
 
   const cancelAIStream = useCallback(() => {

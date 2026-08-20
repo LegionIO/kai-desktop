@@ -786,13 +786,18 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       userMessage: string,
       existingHistory?: TaskConversationMessage[],
       attachments?: Array<{ image: string; mimeType?: string }>,
+      clientStreamId?: string,
     ) => {
-      // R224: assign the stream INSTANCE id at handler entry (before any validation) so EVERY event this
-      // request emits — including pre-stream validation errors — carries a unique per-request identity. Without
-      // this, an unstamped validation error from ANOTHER window's invalid request for the same taskId would be
-      // accepted by a live owner's streamId gate (absent-streamId == match, R223) and wrongly
-      // terminate/recover that owner's submission while its main-process stream kept running (R224).
-      const streamId = `${typeof taskId === 'string' ? taskId : 'invalid'}:${randomUUID()}`;
+      // R224/R226: the stream INSTANCE id stamps EVERY event this request emits (incl. pre-stream validation
+      // errors) so a renderer can attribute each event to a specific request. R226: prefer the CLIENT-minted id
+      // when provided — the renderer records it synchronously before awaiting this call, eliminating the
+      // pending-admission window where the renderer owned a payload but didn't yet know its id. Fall back to a
+      // main-minted id for older callers. Validate it's a well-formed non-empty string to avoid a caller
+      // injecting a colliding/empty id.
+      const streamId =
+        typeof clientStreamId === 'string' && clientStreamId.length > 0 && clientStreamId.length <= 128
+          ? clientStreamId
+          : `${typeof taskId === 'string' ? taskId : 'invalid'}:${randomUUID()}`;
       // Validate taskId to prevent path traversal
       if (!isValidTaskId(taskId)) {
         broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', streamId, error: 'Invalid task ID' });
