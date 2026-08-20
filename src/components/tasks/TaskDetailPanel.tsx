@@ -220,13 +220,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   useEffect(() => {
     const failed = state.failedSubmissions[task.id];
     if (!failed) return;
-    // Only clear the entry after a COMPLETE successful restore (R218): if the composer is busy (a newer
-    // draft) or addAttachments rejects some images (over the cap), leave the entry set so the prompt isn't
-    // permanently discarded — a later empty-composer render (or freed budget) can retry the restore.
+    // Only restore into an EMPTY composer (a newer draft in progress takes precedence). If busy, leave the
+    // entry set; this effect re-runs when failedSubmissions changes, and the user can clear their draft.
     const composerBusy = (textareaRef.current?.value ?? '').trim().length > 0 || getResidentBytes() > 0;
     if (composerBusy) return;
+    // R220: restore is ALL-AT-ONCE and TERMINAL — we clear the entry unconditionally at the end. The prior
+    // "leave it set for a later retry" path was dead (no dependency re-triggered on freed budget) and, having
+    // already called setInput + staged partial attachments, left the composer permanently `busy` so it could
+    // never retry AND could double-stage. If some images exceed the current renderer-wide budget we restore the
+    // text, stage what fits, and surface a notice for the rest rather than stranding recovery state forever.
     if (failed.text) setInput(failed.text);
-    let allAttachmentsRestored = true;
+    let skippedCount = 0;
     if (failed.attachments && failed.attachments.length > 0) {
       // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
       const { skipped } = addAttachments(
@@ -238,11 +242,14 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           dataUrl: a.image,
         })),
       );
-      if (skipped.length > 0) allAttachmentsRestored = false;
+      skippedCount = skipped.length;
     }
-    showAttachMessage('The plan failed to generate — your message was restored. Try again.');
-    // Keep the entry if some attachments couldn't be re-staged (budget) so they aren't lost; retry later.
-    if (allAttachmentsRestored) clearFailedSubmission(task.id);
+    showAttachMessage(
+      skippedCount > 0
+        ? `The plan failed to generate — your message was restored (${skippedCount} image${skippedCount === 1 ? '' : 's'} exceeded the limit). Try again.`
+        : 'The plan failed to generate — your message was restored. Try again.',
+    );
+    clearFailedSubmission(task.id); // terminal: releases parked bytes and removes the entry (R220)
   }, [state.failedSubmissions, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
