@@ -240,7 +240,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();
-    const images = attachmentsToImagePayload(attachments);
+    const { images } = attachmentsToImagePayload(attachments);
     // Require text OR at least one image (R187).
     if (!text && images.length === 0) return;
     if (submittingRef.current) return; // single-submission latch (R211) — block a double Enter/click

@@ -436,7 +436,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const text = input.trim();
     if (isActivelyStreaming) return;
     if (refineSubmittingRef.current) return; // single-submission latch (R212) — block competing streams
-    const images = attachmentsToImagePayload(attachments);
+    const { images } = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) return;
     refineSubmittingRef.current = true;
 

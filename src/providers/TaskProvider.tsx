@@ -483,6 +483,9 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       metadata?: KaiTaskMetadata,
       attachments?: Array<{ image: string; mimeType?: string }>,
     ): Promise<{ ok: boolean; droppedImages?: number }> => {
+      // Track the placeholder task id outside the try so the catch can delete it if streamPlan (or a later
+      // step) THROWS after creation — otherwise a durable orphaned "New Task" is left behind (R213).
+      let createdTaskId: string | null = null;
       try {
         // Create a placeholder task
         const task = await app.tasks.create({
@@ -493,6 +496,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           metadata,
         });
         if (!task || !task.id) return { ok: false };
+        createdTaskId = task.id;
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
@@ -523,6 +527,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
+        // Delete the orphaned placeholder task created before the throw (R213).
+        if (createdTaskId) void app.tasks.delete?.(createdTaskId).catch(() => {});
         return { ok: false };
       }
     },

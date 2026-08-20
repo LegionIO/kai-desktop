@@ -108,11 +108,32 @@ export function skippedAttachmentsNotice(skipped: readonly string[]): string | n
  * Map staged attachments to the `{ image, mimeType }[]` shape the task-plan IPC accepts (R187).
  * Only IMAGE attachments are forwarded — the task-plan model request is multimodal for images only;
  * non-image files (PDF/text) are ignored here so they aren't silently mis-sent as images.
+ *
+ * Enforce the task-plan caps HERE, in the renderer, BEFORE IPC serialization (R213): main applies the same
+ * 8-image / 6 MiB-per-image / 12 MiB-total caps, but only AFTER structured-cloning the payload across the
+ * IPC boundary — so without a pre-serialization cap the renderer would clone up to the full 256 MiB store
+ * (≈341 MiB as base64), risking an IPC failure / main-process OOM for a consumer that will keep ≤12 MiB.
+ * Mirrors electron/ipc/tasks.ts (MAX_PLAN_ATTACHMENTS / *_BYTES / *_TOTAL_BYTES). Returns the count DROPPED
+ * by these caps so the caller can warn (droppedImages), consistent with main's own accounting.
  */
+const MAX_PLAN_IMAGES = 8;
+const MAX_PLAN_IMAGE_BYTES = 6 * 1024 * 1024; // per image (data-URL string length ≈ bytes)
+const MAX_PLAN_IMAGES_TOTAL_BYTES = 12 * 1024 * 1024;
 export function attachmentsToImagePayload(
   attachments: ReadonlyArray<{ isImage: boolean; dataUrl: string; mime?: string }>,
-): Array<{ image: string; mimeType?: string }> {
-  return attachments
-    .filter((a) => a.isImage && typeof a.dataUrl === 'string' && a.dataUrl.length > 0)
-    .map((a) => (a.mime ? { image: a.dataUrl, mimeType: a.mime } : { image: a.dataUrl }));
+): { images: Array<{ image: string; mimeType?: string }>; dropped: number } {
+  const images: Array<{ image: string; mimeType?: string }> = [];
+  let supplied = 0;
+  let totalBytes = 0;
+  for (const a of attachments) {
+    if (!a.isImage || typeof a.dataUrl !== 'string' || a.dataUrl.length === 0) continue;
+    supplied += 1;
+    if (images.length >= MAX_PLAN_IMAGES) continue;
+    const bytes = a.dataUrl.length;
+    if (bytes > MAX_PLAN_IMAGE_BYTES) continue;
+    if (totalBytes + bytes > MAX_PLAN_IMAGES_TOTAL_BYTES) continue;
+    totalBytes += bytes;
+    images.push(a.mime ? { image: a.dataUrl, mimeType: a.mime } : { image: a.dataUrl });
+  }
+  return { images, dropped: supplied - images.length };
 }
