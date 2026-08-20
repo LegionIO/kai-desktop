@@ -470,45 +470,75 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // before START_AI_CREATE (R214). Without buffering, an early delta would be appended and then wiped by
   // START_AI_CREATE's streamingText reset, and an early `done` would be overwritten by isStreamingPlan=true
   // (stuck streaming). Events land here until the dispatch flushes them.
-  const streamBufferRef = useRef<{ taskId: string; text: string; done: boolean } | null>(null);
+  const streamBufferRef = useRef<{ taskId: string; text: string; done: boolean; error: boolean } | null>(null);
   const streamStartedRef = useRef<string | null>(null); // taskId whose START_AI_CREATE has been dispatched
   // The submitted prompt+attachments per streaming task + whether any plan text has arrived (R217). If a
   // task's background stream terminates in ERROR having produced NO text (a clean provider/network failure,
   // nothing persisted), the surviving UI restores this payload so the user's prompt isn't lost — the
-  // composer already cleared/unmounted at admission, before the stream could fail.
+  // Recovery is keyed PER TASK (R218): main supports concurrent per-task streams, so a terminal outcome for
+  // task A must resolve A's payload even if the UI is currently showing task B. Persistence happens only on a
+  // normal `done` (tasks.ts writes history after the stream completes) — so an `error` (even after some text)
+  // means NOTHING was persisted and the prompt must be recovered; a `done` means it's safe to drop the payload.
   const submittedPayloadRef = useRef<
-    Map<string, { text: string; attachments?: Array<{ image: string; mimeType?: string }>; producedText: boolean }>
+    Map<string, { text: string; attachments?: Array<{ image: string; mimeType?: string }> }>
   >(new Map());
+  const resolveTerminalOutcome = useCallback((taskId: string, isError: boolean) => {
+    const payload = submittedPayloadRef.current.get(taskId);
+    if (!payload) return;
+    if (isError) {
+      // Failed before persistence — surface for restore (per-task; the panel matches taskId).
+      dispatch({
+        type: 'SET_FAILED_SUBMISSION',
+        failed: { taskId, text: payload.text, attachments: payload.attachments },
+      });
+    }
+    // On `done` the turn is persisted; on `error` we've handed the payload to failedSubmission. Either way
+    // this task's payload is now resolved.
+    submittedPayloadRef.current.delete(taskId);
+  }, []);
   // Called synchronously right after dispatching START_AI_CREATE for taskId: flush any events buffered
   // before the dispatch so early output isn't lost and an early terminal event isn't overwritten.
-  const flushStreamBuffer = useCallback((taskId: string) => {
-    streamStartedRef.current = taskId;
-    const buf = streamBufferRef.current;
-    streamBufferRef.current = null;
-    if (!buf || buf.taskId !== taskId) return;
-    if (buf.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: buf.text });
-    if (buf.done) dispatch({ type: 'STREAM_DONE' });
-  }, []);
+  const flushStreamBuffer = useCallback(
+    (taskId: string) => {
+      streamStartedRef.current = taskId;
+      const buf = streamBufferRef.current;
+      streamBufferRef.current = null;
+      if (!buf || buf.taskId !== taskId) return;
+      if (buf.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: buf.text });
+      if (buf.done) {
+        // A terminal event arrived while buffered — resolve recovery (R218: a buffered ERROR must still
+        // trigger restore) then finalize the stream UI.
+        resolveTerminalOutcome(taskId, buf.error);
+        dispatch({ type: 'STREAM_DONE' });
+      }
+    },
+    [resolveTerminalOutcome],
+  );
 
   // Subscribe to task stream events from main process
   useEffect(() => {
     if (!window.app?.tasks?.onStreamEvent) return;
     const unsub = app.tasks.onStreamEvent((evt) => {
-      // Only process events for the task we're currently creating
-      if (evt.taskId !== creatingTaskIdRef.current) return;
-      // Buffer until START_AI_CREATE has run for this task (R215) so its reset can't clobber early events.
+      // Recovery outcome is resolved PER TASK regardless of which task the UI currently shows (R218) —
+      // do it before the display gate below.
+      // Buffer events for a task whose START_AI_CREATE hasn't run yet (R215), capturing a terminal error flag.
       if (streamStartedRef.current !== evt.taskId) {
-        const buf = streamBufferRef.current ?? { taskId: evt.taskId, text: '', done: false };
+        // Only buffer for a task we're actually creating; ignore unrelated ids.
+        if (evt.taskId !== creatingTaskIdRef.current) return;
+        const buf = streamBufferRef.current ?? { taskId: evt.taskId, text: '', done: false, error: false };
         if (buf.taskId !== evt.taskId) {
-          // A newer task's events supersede a stale buffer.
           buf.taskId = evt.taskId;
           buf.text = '';
           buf.done = false;
+          buf.error = false;
         }
         if (evt.type === 'text-delta' && evt.text) buf.text += evt.text;
         else if (evt.type === 'done' || evt.type === 'error') {
           buf.done = true;
-          if (evt.type === 'error') console.error('[TaskProvider] Stream error (buffered):', evt.error);
+          if (evt.type === 'error') {
+            buf.error = true;
+            console.error('[TaskProvider] Stream error (buffered):', evt.error);
+          }
         }
         streamBufferRef.current = buf;
         return;
@@ -516,37 +546,23 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
       switch (evt.type) {
         case 'text-delta':
-          if (evt.text) {
-            const p = submittedPayloadRef.current.get(evt.taskId);
-            if (p) p.producedText = true; // plan text arrived → a later error left partial output, don't restore
+          if (evt.text && evt.taskId === creatingTaskIdRef.current)
             dispatch({ type: 'STREAM_TEXT_DELTA', text: evt.text });
-          }
           break;
         case 'done':
-          submittedPayloadRef.current.delete(evt.taskId); // terminal success — drop the restore payload
-          dispatch({ type: 'STREAM_DONE' });
+          resolveTerminalOutcome(evt.taskId, false);
+          if (evt.taskId === creatingTaskIdRef.current) dispatch({ type: 'STREAM_DONE' });
           break;
         case 'error': {
           console.error('[TaskProvider] Stream error:', evt.error);
-          // Terminal stream failure AFTER admission (R217): if NO plan text was produced (clean failure,
-          // nothing persisted), surface the submitted prompt+attachments for restore so it isn't lost —
-          // the composer already cleared/unmounted at admission. If text WAS produced, the partial plan +
-          // user turn are on the task, so don't restore (would duplicate).
-          const payload = submittedPayloadRef.current.get(evt.taskId);
-          submittedPayloadRef.current.delete(evt.taskId);
-          if (payload && !payload.producedText) {
-            dispatch({
-              type: 'SET_FAILED_SUBMISSION',
-              failed: { taskId: evt.taskId, text: payload.text, attachments: payload.attachments },
-            });
-          }
-          dispatch({ type: 'STREAM_DONE' });
+          resolveTerminalOutcome(evt.taskId, true);
+          if (evt.taskId === creatingTaskIdRef.current) dispatch({ type: 'STREAM_DONE' });
           break;
         }
       }
     });
     return unsub;
-  }, []);
+  }, [resolveTerminalOutcome]);
 
   const startAITaskCreation = useCallback(
     async (
@@ -575,7 +591,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // Setting the ref here makes the listener accept this task's events immediately.
         creatingTaskIdRef.current = task.id;
         // Remember the submitted payload so a terminal stream error (no text produced) can restore it (R217).
-        submittedPayloadRef.current.set(task.id, { text: userMessage, attachments, producedText: false });
+        submittedPayloadRef.current.set(task.id, { text: userMessage, attachments });
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
@@ -631,7 +647,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // Register stream ownership synchronously before awaiting streamPlan (R214) — see startAITaskCreation.
         creatingTaskIdRef.current = taskId;
         // Remember the submitted payload for terminal-stream-error restore (R217).
-        submittedPayloadRef.current.set(taskId, { text: userMessage, attachments, producedText: false });
+        submittedPayloadRef.current.set(taskId, { text: userMessage, attachments });
 
         // streamPlan resolves {taskId, error:true} for in-band failures (R207) — roll back on those too.
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);

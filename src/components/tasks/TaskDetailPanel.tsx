@@ -220,24 +220,29 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   useEffect(() => {
     const failed = state.failedSubmission;
     if (!failed || failed.taskId !== task.id) return;
+    // Only clear the payload after a COMPLETE successful restore (R218): if the composer is busy (a newer
+    // draft) or addAttachments rejects some images (over the cap), leave failedSubmission set so the prompt
+    // isn't permanently discarded — a later empty-composer render (or freed budget) can retry the restore.
     const composerBusy = (textareaRef.current?.value ?? '').trim().length > 0 || getResidentBytes() > 0;
-    if (!composerBusy) {
-      if (failed.text) setInput(failed.text);
-      if (failed.attachments && failed.attachments.length > 0) {
-        // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
-        addAttachments(
-          failed.attachments.map((a, i) => ({
-            name: `image-${i + 1}.${(a.mimeType?.split('/')[1] ?? 'png').split('+')[0]}`,
-            mime: a.mimeType ?? 'image/png',
-            isImage: true,
-            size: Math.floor((a.image.length * 3) / 4),
-            dataUrl: a.image,
-          })),
-        );
-      }
-      showAttachMessage('The plan failed to generate — your message was restored. Try again.');
+    if (composerBusy) return;
+    if (failed.text) setInput(failed.text);
+    let allAttachmentsRestored = true;
+    if (failed.attachments && failed.attachments.length > 0) {
+      // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
+      const { skipped } = addAttachments(
+        failed.attachments.map((a, i) => ({
+          name: `image-${i + 1}.${(a.mimeType?.split('/')[1] ?? 'png').split('+')[0]}`,
+          mime: a.mimeType ?? 'image/png',
+          isImage: true,
+          size: Math.floor((a.image.length * 3) / 4),
+          dataUrl: a.image,
+        })),
+      );
+      if (skipped.length > 0) allAttachmentsRestored = false;
     }
-    clearFailedSubmission();
+    showAttachMessage('The plan failed to generate — your message was restored. Try again.');
+    // Keep the payload if some attachments couldn't be re-staged (budget) so they aren't lost; retry later.
+    if (allAttachmentsRestored) clearFailedSubmission();
   }, [state.failedSubmission, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
