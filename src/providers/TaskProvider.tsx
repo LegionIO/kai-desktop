@@ -911,27 +911,29 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // streamPlan resolves {taskId, error:true} for in-band admission failures (R207).
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments, streamId);
         if (res && (res as { error?: boolean }).error) {
-          // R225: a SYNCHRONOUS admission failure does NOT park recovery. Unlike create (whose composer unmounts
-          // at admission), the refine composer stays mounted and KEEPS the user's input/attachments on !res.ok
-          // (see TaskDetailPanel.handleComposerSubmit). Parking recovery too would give BOTH the composer and
-          // failedSubmissions ownership of the same draft — clearing the composer later would resurrect it and
-          // its images were already charged by the composer, so a parked charge double-counts. Just release the
-          // in-flight payload. (An ASYNC terminal stream error AFTER a successful admission still parks recovery
-          // via the stream-event listener — there the composer was cleared on success, so recovery is needed.)
+          // R225/R228: a refine failure NEVER keeps recovery — the refine composer stays mounted and KEEPS the
+          // user's draft on !res.ok (TaskDetailPanel.handleComposerSubmit), so parking recovery would give BOTH
+          // the composer and failedSubmissions ownership (clearing the composer later resurrects it; images
+          // double-charged). Release the in-flight payload (dropSubmission) AND clear any recovery the async
+          // stream-event listener may have ALREADY parked before this resolved — R226's client-minted streamId
+          // makes a stamped broadcast `error` match immediately, so the listener can park recovery before this
+          // {error:true} arrives, and a bare dropSubmission would then no-op. Both calls are idempotent.
           dropSubmission(taskId);
+          clearFailedSubmission(taskId);
           dispatch({ type: 'STREAM_DONE' });
           return { ok: false };
         }
         return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
-        // Thrown BEFORE/at admission → composer still holds the draft (as above); release, don't park (R225).
+        // Thrown BEFORE/at admission → composer still holds the draft (as above); release + clear, don't park.
         dropSubmission(taskId);
+        clearFailedSubmission(taskId);
         dispatch({ type: 'STREAM_DONE' });
         return { ok: false };
       }
     },
-    [flushStreamBuffer, rememberSubmission, dropSubmission],
+    [flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission],
   );
 
   const cancelAIStream = useCallback(() => {

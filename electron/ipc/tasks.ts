@@ -854,6 +854,28 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         }
       }
 
+      // R228: the task must still EXIST and be UNARCHIVED before we register/start a stream. A delete or archive
+      // that completed after the renderer initiated this call (but before we get here) leaves R227's abort with
+      // nothing to abort; without this guard we'd start an unreachable stream that either strands recovery on a
+      // later error (its removal broadcast already passed) or, worse, modifies an archived task on success. Emit a
+      // stamped terminal so the owner drops its in-flight payload WITHOUT recovery (the task is gone/archived).
+      {
+        const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+        let taskExists = false;
+        if (existsSync(filePath)) {
+          try {
+            const t = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            taskExists = !t.archivedAt;
+          } catch {
+            taskExists = false;
+          }
+        }
+        if (!taskExists) {
+          broadcastTaskStreamEvent({ taskId, type: 'done', streamId, reason: 'deleted' });
+          return { taskId, streamId, error: true };
+        }
+      }
+
       // Cancel any existing stream for this task. R224: notify the OLD stream's owner with a terminal error
       // stamped with the OLD streamId, so the window that started it resolves its in-flight payload (recovering
       // its draft) and releases its attachment charge — otherwise, since the replaced stream's own terminals are
