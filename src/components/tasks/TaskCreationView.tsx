@@ -127,6 +127,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   );
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
+    if (submittingRef.current) return; // don't stage attachments during a pending submit — they'd be lost on unmount (R215)
     if (isWebBridge) {
       const accept = filters?.flatMap((f) => f.extensions.map((e) => `.${e}`)).join(',') || '*/*';
       setPendingFileAccept(accept);
@@ -161,6 +162,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files;
     if (!fileList || fileList.length === 0) return;
+    if (submittingRef.current) {
+      event.target.value = '';
+      return; // don't stage during a pending submit (R215) — a late add would be lost on the success unmount
+    }
     // Task plans can only submit IMAGES (R188) — keep only image files so no non-submittable chip is
     // ever staged. Gate by size BEFORE reading (R184): FileReader materializes each file fully.
     const allFiles = Array.from(fileList);
@@ -259,9 +264,9 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     if (submittingRef.current) return; // single-submission latch (R211) — block a double Enter/click
     submittingRef.current = true;
     setIsSubmitting(true);
-    // Warn immediately for a PARTIAL drop (text + some images survive) — renderer-side + deterministic,
-    // before the view transitions away (R214). The provider's create-time notice covers main-side drops.
-    if (dropped > 0 && images.length > 0) {
+    // Warn for ANY drop (R215): including the case where text is present but EVERY image was dropped
+    // (images.length === 0) — the task would otherwise run text-only with no indication the images were lost.
+    if (dropped > 0) {
       showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
     }
 

@@ -453,6 +453,23 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     creatingTaskIdRef.current = state.creatingTaskId;
   }, [state.creatingTaskId]);
+  // Buffer for stream events that arrive for a task BEFORE its START_AI_CREATE dispatch has initialized the
+  // stream UI state (R215): main begins broadcasting as soon as streamPlan launches, and we register the ref
+  // before START_AI_CREATE (R214). Without buffering, an early delta would be appended and then wiped by
+  // START_AI_CREATE's streamingText reset, and an early `done` would be overwritten by isStreamingPlan=true
+  // (stuck streaming). Events land here until the dispatch flushes them.
+  const streamBufferRef = useRef<{ taskId: string; text: string; done: boolean } | null>(null);
+  const streamStartedRef = useRef<string | null>(null); // taskId whose START_AI_CREATE has been dispatched
+  // Called synchronously right after dispatching START_AI_CREATE for taskId: flush any events buffered
+  // before the dispatch so early output isn't lost and an early terminal event isn't overwritten.
+  const flushStreamBuffer = useCallback((taskId: string) => {
+    streamStartedRef.current = taskId;
+    const buf = streamBufferRef.current;
+    streamBufferRef.current = null;
+    if (!buf || buf.taskId !== taskId) return;
+    if (buf.text) dispatch({ type: 'STREAM_TEXT_DELTA', text: buf.text });
+    if (buf.done) dispatch({ type: 'STREAM_DONE' });
+  }, []);
 
   // Subscribe to task stream events from main process
   useEffect(() => {
@@ -460,6 +477,23 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     const unsub = app.tasks.onStreamEvent((evt) => {
       // Only process events for the task we're currently creating
       if (evt.taskId !== creatingTaskIdRef.current) return;
+      // Buffer until START_AI_CREATE has run for this task (R215) so its reset can't clobber early events.
+      if (streamStartedRef.current !== evt.taskId) {
+        const buf = streamBufferRef.current ?? { taskId: evt.taskId, text: '', done: false };
+        if (buf.taskId !== evt.taskId) {
+          // A newer task's events supersede a stale buffer.
+          buf.taskId = evt.taskId;
+          buf.text = '';
+          buf.done = false;
+        }
+        if (evt.type === 'text-delta' && evt.text) buf.text += evt.text;
+        else if (evt.type === 'done' || evt.type === 'error') {
+          buf.done = true;
+          if (evt.type === 'error') console.error('[TaskProvider] Stream error (buffered):', evt.error);
+        }
+        streamBufferRef.current = buf;
+        return;
+      }
 
       switch (evt.type) {
         case 'text-delta':
@@ -519,6 +553,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         }
 
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
+        flushStreamBuffer(task.id); // flush events buffered before this dispatch (R215)
 
         // Generate title in parallel (non-blocking)
         void app.tasks.generateTitle(userMessage).then(({ title }) => {
@@ -538,7 +573,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [activeWorkspaceId],
+    [activeWorkspaceId, flushStreamBuffer],
   );
 
   const refineTaskPlan = useCallback(
@@ -553,6 +588,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         const history = task?.conversationHistory ?? [];
 
         dispatch({ type: 'START_AI_CREATE', taskId });
+        flushStreamBuffer(taskId); // marks streamStartedRef so subsequent events dispatch live (R215)
         // Register stream ownership synchronously before awaiting streamPlan (R214) — see startAITaskCreation.
         creatingTaskIdRef.current = taskId;
 
@@ -569,7 +605,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [],
+    [flushStreamBuffer],
   );
 
   const cancelAIStream = useCallback(() => {
