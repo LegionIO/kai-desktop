@@ -563,13 +563,21 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     const p = submittedPayloadRef.current.get(taskId);
     if (p) p.streamId = streamId;
   }, []);
-  // True when an event may act on the task's in-flight payload: either the payload has no streamId yet (early),
-  // or the event carries no streamId (pre-assignment terminal event), or the two match. A MISMATCH means the
-  // event belongs to a different stream instance (e.g. another window's replacement) and must be ignored here.
+  // Decide whether an incoming stream event may act on THIS window's view/recovery for the task. Three cases:
+  //  - We hold an in-flight payload WITH a recorded streamId  → accept iff the event's streamId matches.
+  //  - We hold a payload but no streamId yet (pending admission, streamPlan hasn't resolved) → accept (these are
+  //    our own early events before the id was recorded).
+  //  - We hold NO payload for this task → we have no in-flight ownership. R224: a STAMPED event here belongs to
+  //    some other stream instance (e.g. a stream another window started for the same task); rejecting it stops
+  //    that stream's deltas from appending to our stale streamingText and masking the persisted plan. An
+  //    UNSTAMPED event (legacy/pre-assignment) falls through — it carries no recovery consequence and the
+  //    display path's creatingTaskIdRef/streamStartedRef gates still bound it.
   const streamMatchesOwned = useCallback((taskId: string, eventStreamId: string | undefined): boolean => {
-    const owned = submittedPayloadRef.current.get(taskId)?.streamId;
-    if (!owned || !eventStreamId) return true;
-    return owned === eventStreamId;
+    const entry = submittedPayloadRef.current.get(taskId);
+    if (!entry) return !eventStreamId; // no local ownership: reject any stamped (foreign) event
+    if (!entry.streamId) return true; // pending admission — our own event before the id was recorded
+    if (!eventStreamId) return true; // unstamped event (backward-compat)
+    return entry.streamId === eventStreamId;
   }, []);
   // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
   const rememberSubmission = useCallback(

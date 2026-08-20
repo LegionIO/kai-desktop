@@ -635,20 +635,34 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle('tasks:delete', (_e, id: string) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
-    try {
-      // R222/R223: abort any in-flight plan-generation stream for this task BEFORE removing it. Deletion already
-      // stops the assigned running agent (onTaskDeleted below), but a background plan stream lives in
-      // activeTaskStreams and would otherwise keep consuming the provider connection and broadcasting deltas
-      // for a task that no longer exists. Aborting suppresses the stream's own terminal events, so emit a
-      // dedicated terminal `done` stamped with the stream's id + reason:'deleted' so ANY window owning that
-      // in-flight payload drops it WITHOUT triggering draft recovery (a deliberate delete is not a failure).
-      // Idempotent: no-op when there is no active stream.
-      const activeStream = activeTaskStreams.get(id);
-      if (activeStream) {
-        activeStream.abort();
-        activeTaskStreams.delete(id);
+    // R222/R223/R224: abort any in-flight plan-generation stream for this task. Deletion stops the assigned
+    // running agent (onTaskDeleted below), but a background plan stream lives in activeTaskStreams and would
+    // otherwise keep consuming the provider connection and broadcasting deltas for a task that no longer exists.
+    // Aborting suppresses the stream's own terminal events, so we emit a dedicated terminal to release the
+    // owning window's in-flight payload — but ONLY after we know whether the task actually went away:
+    //   - unlink succeeded  → done{reason:'deleted'}: owner drops the payload WITHOUT recovery (task is gone).
+    //   - unlink FAILED      → error: the task survives, so the owner should recover its draft (R224).
+    // Idempotent: no-op when there is no active stream. Capture the stream up front (abort now to stop the
+    // provider work) but defer the terminal broadcast until the filesystem outcome is known.
+    const activeStream = activeTaskStreams.get(id);
+    if (activeStream) {
+      activeStream.abort();
+      activeTaskStreams.delete(id);
+    }
+    const emitStreamTerminal = (ok: boolean) => {
+      if (!activeStream) return;
+      if (ok) {
         broadcastTaskStreamEvent({ taskId: id, type: 'done', streamId: activeStream.streamId, reason: 'deleted' });
+      } else {
+        broadcastTaskStreamEvent({
+          taskId: id,
+          type: 'error',
+          streamId: activeStream.streamId,
+          error: 'Task deletion failed',
+        });
       }
+    };
+    try {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       // Clear the terminal output buffers (memory + disk) for this task's
       // execution + review sessions before removing it, so deleted tasks don't
@@ -677,9 +691,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         unlinkSync(filePath);
       }
       broadcastTaskChange(appHome);
+      emitStreamTerminal(true); // task is gone → owner drops payload without recovery
       return { ok: true };
     } catch (err) {
       console.error(`[tasks] Failed to delete task ${id}:`, err);
+      emitStreamTerminal(false); // task survives → owner recovers its draft
       return { error: String(err) };
     }
   });
@@ -771,11 +787,17 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       existingHistory?: TaskConversationMessage[],
       attachments?: Array<{ image: string; mimeType?: string }>,
     ) => {
+      // R224: assign the stream INSTANCE id at handler entry (before any validation) so EVERY event this
+      // request emits — including pre-stream validation errors — carries a unique per-request identity. Without
+      // this, an unstamped validation error from ANOTHER window's invalid request for the same taskId would be
+      // accepted by a live owner's streamId gate (absent-streamId == match, R223) and wrongly
+      // terminate/recover that owner's submission while its main-process stream kept running (R224).
+      const streamId = `${typeof taskId === 'string' ? taskId : 'invalid'}:${randomUUID()}`;
       // Validate taskId to prevent path traversal
       if (!isValidTaskId(taskId)) {
-        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', error: 'Invalid task ID' });
-        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done' });
-        return { taskId, error: true };
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', streamId, error: 'Invalid task ID' });
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done', streamId });
+        return { taskId, streamId, error: true };
       }
 
       // userMessage must be a string within the length cap. Empty text is allowed ONLY when at least
@@ -784,39 +806,49 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       const hasImageAttachment =
         Array.isArray(attachments) && attachments.some((a) => typeof a?.image === 'string' && a.image.length > 0);
       if (typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        return { taskId, error: true };
+        broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+        return { taskId, streamId, error: true };
       }
       if (userMessage.length === 0 && !hasImageAttachment) {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        return { taskId, error: true };
+        broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+        return { taskId, streamId, error: true };
       }
 
       if (existingHistory) {
         const historyCheck = z.array(conversationMessageSchema).max(100).safeParse(existingHistory);
         if (!historyCheck.success) {
-          broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Invalid conversation history' });
-          broadcastTaskStreamEvent({ taskId, type: 'done' });
-          return { taskId, error: true };
+          broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'Invalid conversation history' });
+          broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+          return { taskId, streamId, error: true };
         }
       }
 
-      // Cancel any existing stream for this task
+      // Cancel any existing stream for this task. R224: notify the OLD stream's owner with a terminal error
+      // stamped with the OLD streamId, so the window that started it resolves its in-flight payload (recovering
+      // its draft) and releases its attachment charge — otherwise, since the replaced stream's own terminals are
+      // suppressed (isCurrent() is now false for it) AND this new stream's events are rejected by the old owner's
+      // streamId gate (R223), the original window would stream forever and leak its charge.
       const existing = activeTaskStreams.get(taskId);
-      if (existing) existing.abort();
+      if (existing) {
+        existing.abort();
+        broadcastTaskStreamEvent({
+          taskId,
+          type: 'error',
+          streamId: existing.streamId,
+          error: 'Plan generation was superseded by a newer request',
+        });
+      }
 
       const controller = new AbortController();
       // Token identifies THIS stream so a later stream replacing it under the
       // same taskId isn't torn down by this one's finally (which would make the
       // new stream uncancellable and race plan writes).
       const streamToken = Symbol(taskId);
-      // R223: a STRING instance id stamped on every broadcast event so a renderer can tell which stream
-      // instance emitted it. A task's stream can be replaced (another window issues a new streamPlan for the
-      // same taskId); without this, the replacement's events would resolve/clear the first window's in-flight
-      // payload. Returned in the resolved result so the caller records the id it owns.
-      const streamId = `${taskId}:${randomUUID()}`;
+      // R223/R224: streamId (the per-request instance id) was assigned at handler entry so validation errors
+      // could be stamped too. Reuse it here as the active stream's id — every broadcast for this run carries it,
+      // and a renderer records the id it owns to reject a replacement stream's events.
       activeTaskStreams.set(taskId, { token: streamToken, streamId, abort: () => controller.abort() });
       const isCurrent = () => activeTaskStreams.get(taskId)?.token === streamToken;
       const clearIfCurrent = () => {
