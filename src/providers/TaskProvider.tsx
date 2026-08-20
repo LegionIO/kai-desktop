@@ -152,14 +152,14 @@ interface TaskContextValue {
     userMessage: string,
     metadata?: KaiTaskMetadata,
     attachments?: Array<{ image: string; mimeType?: string }>,
-  ) => Promise<boolean>;
+  ) => Promise<{ ok: boolean; droppedImages?: number }>;
 
   /** Send a follow-up message to refine the currently streaming task plan. */
   refineTaskPlan: (
     taskId: string,
     userMessage: string,
     attachments?: Array<{ image: string; mimeType?: string }>,
-  ) => Promise<boolean>;
+  ) => Promise<{ ok: boolean; droppedImages?: number }>;
 
   /** Cancel any active AI plan stream. */
   cancelAIStream: () => void;
@@ -473,7 +473,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       userMessage: string,
       metadata?: KaiTaskMetadata,
       attachments?: Array<{ image: string; mimeType?: string }>,
-    ): Promise<boolean> => {
+    ): Promise<{ ok: boolean; droppedImages?: number }> => {
       try {
         // Create a placeholder task
         const task = await app.tasks.create({
@@ -483,7 +483,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           workspaceId: activeWorkspaceId || undefined,
           metadata,
         });
-        if (!task || !task.id) return false;
+        if (!task || !task.id) return { ok: false };
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
@@ -496,7 +496,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           // input/attachments intact (we never transitioned), so just clean up the placeholder task and
           // report failure; no rollback into a live composer is needed.
           void app.tasks.delete?.(task.id).catch(() => {});
-          return false;
+          return { ok: false };
         }
 
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
@@ -508,11 +508,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             void app.tasks.update(task.id, { title });
           }
         });
-        return true;
+        return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
-        return false;
+        return { ok: false };
       }
     },
     [activeWorkspaceId],
@@ -523,7 +523,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       taskId: string,
       userMessage: string,
       attachments?: Array<{ image: string; mimeType?: string }>,
-    ): Promise<boolean> => {
+    ): Promise<{ ok: boolean; droppedImages?: number }> => {
       try {
         // Fetch fresh task from IPC to avoid stale closure over state.tasks
         const task = await app.tasks.get(taskId);
@@ -535,13 +535,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);
         if (res && (res as { error?: boolean }).error) {
           dispatch({ type: 'STREAM_DONE' });
-          return false;
+          return { ok: false };
         }
-        return true;
+        return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
         dispatch({ type: 'STREAM_DONE' });
-        return false;
+        return { ok: false };
       }
     },
     [],

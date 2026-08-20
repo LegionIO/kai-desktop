@@ -250,8 +250,18 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       text,
       currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
       images.length > 0 ? images : undefined,
-    ).then((ok) => {
-      if (ok) return;
+    ).then((res) => {
+      if (res.ok) {
+        // The plan-side caps may have dropped some images (measured on the actual payload in main) even
+        // though the submission succeeded — warn deterministically from the resolved result (R209), since a
+        // stream-event warning would race the post-await ownership registration and be discarded.
+        if (res.droppedImages && res.droppedImages > 0) {
+          showAttachMessage(
+            `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
+          );
+        }
+        return;
+      }
       // Don't clobber a newer draft the user started while the submission awaited (R207/R208): read LIVE
       // composer text + LIVE attachment state (getResidentBytes, not the stale closure snapshot).
       const liveText = textareaRef.current?.value ?? '';
@@ -267,6 +277,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     getResidentBytes,
     startAITaskCreation,
     currentWorkingDirectory,
+    showAttachMessage,
   ]);
 
   const handleKeyDown = useCallback(

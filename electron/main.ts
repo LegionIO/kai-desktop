@@ -1559,6 +1559,14 @@ if (gotSingleInstanceLock) {
     let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
     let lastAutopilotFingerprint = JSON.stringify(getConfig().autopilot ?? {});
     let lastSubAgentCapsFingerprint = JSON.stringify(getConfig().tools?.subAgents ?? {});
+    // Security re-gating fingerprints (R209): a pure executionMode or isolated-browser-allow-private change
+    // has no MCP/skills/CLI/browser fingerprint, so it never triggered syncRealtimeTools() — leaving a
+    // recordless Realtime session with mutating tools and a live isolated browser with direct UDP after a
+    // global plan-first / private-network toggle. Track them explicitly and re-gate on change.
+    let lastExecutionModeFp = JSON.stringify(getConfig().tools?.executionMode ?? 'auto');
+    let lastIsolatedBrowserPrivateFp = JSON.stringify(
+      getConfig().computerUse?.safety?.isolatedBrowserAllowPrivateNetwork ?? false,
+    );
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
@@ -1675,6 +1683,21 @@ if (gotSingleInstanceLock) {
       if (newSubAgentCapsFp !== lastSubAgentCapsFingerprint) {
         lastSubAgentCapsFingerprint = newSubAgentCapsFp;
         retryPendingSubAgentResumes();
+      }
+
+      // Security re-gating on a pure executionMode / isolated-browser-private toggle (R209): neither has an
+      // MCP/skills/CLI/browser fingerprint, so without this a global Auto->Plan-First switch would leave a
+      // recordless Realtime session with mutating tools, and disabling private access would leave a live
+      // isolated browser on WebRTC `default`. syncRealtimeTools() re-resolves realtime plan-first AND
+      // reapplies the isolated-browser WebRTC policy (R206).
+      const newExecutionModeFp = JSON.stringify(config.tools?.executionMode ?? 'auto');
+      const newIsolatedBrowserPrivateFp = JSON.stringify(
+        config.computerUse?.safety?.isolatedBrowserAllowPrivateNetwork ?? false,
+      );
+      if (newExecutionModeFp !== lastExecutionModeFp || newIsolatedBrowserPrivateFp !== lastIsolatedBrowserPrivateFp) {
+        lastExecutionModeFp = newExecutionModeFp;
+        lastIsolatedBrowserPrivateFp = newIsolatedBrowserPrivateFp;
+        syncRealtimeTools();
       }
 
       // Display list change detection — auto-update maxDimension when allowed displays change

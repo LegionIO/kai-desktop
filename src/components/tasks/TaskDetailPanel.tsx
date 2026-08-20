@@ -428,8 +428,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const stagedAttachments = [...attachments];
     setInput('');
     clearAttachments();
-    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((ok) => {
-      if (ok) return;
+    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((res) => {
+      if (res.ok) {
+        // Warn deterministically if the plan-side caps dropped images (R209) — via the resolved result,
+        // not a stream event that would race ownership registration.
+        if (res.droppedImages && res.droppedImages > 0) {
+          showAttachMessage(
+            `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
+          );
+        }
+        return;
+      }
       if (activeTaskIdRef.current !== originTaskId) return; // switched task — keep the newer context intact
       const liveText = textareaRef.current?.value ?? '';
       if (liveText.trim().length > 0 || getResidentBytes() > 0) return; // a newer draft exists — don't clobber
@@ -448,6 +457,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     task.id,
     refineTaskPlan,
     isActivelyStreaming,
+    showAttachMessage,
   ]);
 
   const handleKeyDown = useCallback(

@@ -910,19 +910,12 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         return { taskId, error: true };
       }
 
-      // Stream in background (handler returns immediately)
+      // Stream in background (handler returns immediately). NOTE: the dropped-image warning is NOT emitted
+      // as a stream event here (R209) — it would be broadcast before the renderer registers stream
+      // ownership (START_AI_CREATE now fires only after this handler returns), so the listener would
+      // discard it. Instead droppedImages is returned in the resolved result below and the composer warns.
       void (async () => {
         try {
-          // Warn (non-fatal) if the plan-side caps dropped supplied images while text still proceeds —
-          // the renderer already cleared the chips, so without this the user never learns their image
-          // wasn't included (R195). Emitted as a leading notice so it shows above the generated plan.
-          if (droppedImages > 0) {
-            emitTerminalIfCurrent({
-              taskId,
-              type: 'text-delta',
-              text: `> ⚠️ ${droppedImages} image${droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit of 8 images · 6 MiB each · 12 MiB total).\n\n`,
-            });
-          }
           const { streamText } = await import('ai');
           const { createLanguageModelFromConfig } = await import('../agent/language-model.js');
           const model = await createLanguageModelFromConfig(modelEntry.modelConfig);
@@ -982,7 +975,9 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         }
       })();
 
-      return { taskId };
+      // Return droppedImages in the RESOLVED result (R209) so the composer can warn deterministically —
+      // a stream-event warning would race the renderer's post-await ownership registration and be dropped.
+      return droppedImages > 0 ? { taskId, droppedImages } : { taskId };
     },
   );
 
