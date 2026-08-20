@@ -203,13 +203,6 @@ const TaskContext = createContext<TaskContextValue | null>(null);
 export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const [state, dispatch] = useReducer(taskReducer, initialState);
   const { config } = useConfig();
-  // R222: a stable mirror of the current recovery-entry ids so the remote `tasks:changed` reconciler (whose
-  // effect has [] deps) can find recovery entries orphaned by a delete performed in ANOTHER window/plugin
-  // without re-subscribing on every state change. Kept in sync by the effect just below.
-  const failedSubmissionIdsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    failedSubmissionIdsRef.current = new Set(Object.keys(state.failedSubmissions));
-  }, [state.failedSubmissions]);
   const activeWorkspaceId =
     (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
 
@@ -272,15 +265,22 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     if (!window.app?.tasks?.onChanged) return;
     const unsub = app.tasks.onChanged((tasks) => {
-      // R222: a task deleted in ANOTHER window (or by a plugin) arrives here only as a replaced list. Reconcile
-      // orphaned recovery entries: any failedSubmissions id no longer present in the incoming list is
-      // unreachable (its TaskDetailPanel will never mount) so remove it. Recovery entries hold no renderer-wide
-      // byte charge (single-owner accounting, R221), so a plain state removal is sufficient. We intentionally do
-      // NOT touch submittedPayloadRef here — an in-flight entry is THIS window's live creation/refine and the
-      // broadcast list may simply not include it yet.
+      // R222/R225: a task deleted in ANOTHER window (or by a plugin) arrives here only as a replaced list.
+      // Reconcile orphaned recovery entries: any parked recovery whose id is no longer in the incoming list is
+      // unreachable (its TaskDetailPanel will never mount) so remove it AND release its byte charge (parked
+      // recovery stays accounted, R225). We iterate recoveryBytesRef — a ref mutated SYNCHRONOUSLY by
+      // parkRecovery/clearFailedSubmission — NOT a passive state-mirror — so a recovery entry
+      // parked microseconds before this broadcast is still seen (fixes the stale-mirror miss, R225). We
+      // intentionally do NOT touch submittedPayloadRef here — an in-flight entry is THIS window's live
+      // creation/refine and the broadcast list may simply not include it yet.
       const liveIds = new Set(tasks.map((t) => t.id));
-      for (const id of failedSubmissionIdsRef.current) {
-        if (!liveIds.has(id)) dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
+      for (const id of Array.from(recoveryBytesRef.current.keys())) {
+        if (!liveIds.has(id)) {
+          const bytes = recoveryBytesRef.current.get(id) ?? 0;
+          recoveryBytesRef.current.delete(id);
+          if (bytes > 0) onAttachmentsReleased(bytes);
+          dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
+        }
       }
       dispatch({ type: 'SET_TASKS', tasks: tasks });
     });
@@ -380,15 +380,20 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     [updateTask, state.tasks],
   );
 
-  // R221: release any in-flight/parked payload a task is holding so a deleted/archived task can't strand its
-  // charged attachment bytes or leave an unreachable recovery entry. In-flight bytes live on submittedPayloadRef
-  // (release them); a recovery entry in failedSubmissions holds no charge (single-owner accounting) so it's a
-  // pure state removal. Safe to reference the refs here — this runs on a user event, long after mount.
+  // R221/R225: release any in-flight/parked payload a task is holding so a deleted/archived task can't strand
+  // its charged attachment bytes or leave an unreachable recovery entry. In-flight bytes live on
+  // submittedPayloadRef; parked recovery bytes live on recoveryBytesRef (R225 — parked payloads stay accounted).
+  // Release from whichever holds it. Safe to reference the refs here — this runs on a user event, long after mount.
   const purgeTaskPayload = useCallback((id: string) => {
     const p = submittedPayloadRef.current.get(id);
     if (p) {
       onAttachmentsReleased(p.bytes);
       submittedPayloadRef.current.delete(id);
+    }
+    const recoveryBytes = recoveryBytesRef.current.get(id);
+    if (recoveryBytes !== undefined) {
+      recoveryBytesRef.current.delete(id);
+      if (recoveryBytes > 0) onAttachmentsReleased(recoveryBytes);
     }
     dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
   }, []);
@@ -557,25 +562,38 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       }
     >
   >(new Map());
+  // R225: parked recovery payloads (moved to failedSubmissions) DO consume renderer heap — the data-URL strings
+  // live on until the entry is cleared, so R221's "release the charge because it's not composer-resident" was a
+  // memory-leak premise. We keep the charge accounted while parked (recoveryBytesRef mirrors each entry's bytes
+  // so clearFailedSubmission can release exactly once, stale-closure-free) AND bound the total: parking a new
+  // recovery entry evicts the OLDEST entries (insertion order) until the total is under the cap, so background
+  // failures across many tasks can't accumulate unbounded 12 MiB payloads. Eviction drops the strings (releasing
+  // both the charge and the heap) — a rare recovery draft is worth losing before the renderer OOMs.
+  const recoveryBytesRef = useRef<Map<string, number>>(new Map());
+  const RECOVERY_BYTES_CAP = 48 * 1024 * 1024; // 48 MiB total parked recovery payloads (≈4 max-size task submissions)
   // Record the owned stream instance id for a task once streamPlan resolves (R223).
   const setOwnedStreamId = useCallback((taskId: string, streamId: string | undefined) => {
     if (!streamId) return;
     const p = submittedPayloadRef.current.get(taskId);
     if (p) p.streamId = streamId;
   }, []);
-  // Decide whether an incoming stream event may act on THIS window's view/recovery for the task. Three cases:
+  // Decide whether an incoming stream event may act on THIS window's view/recovery for the task. Cases:
   //  - We hold an in-flight payload WITH a recorded streamId  → accept iff the event's streamId matches.
-  //  - We hold a payload but no streamId yet (pending admission, streamPlan hasn't resolved) → accept (these are
-  //    our own early events before the id was recorded).
-  //  - We hold NO payload for this task → we have no in-flight ownership. R224: a STAMPED event here belongs to
-  //    some other stream instance (e.g. a stream another window started for the same task); rejecting it stops
-  //    that stream's deltas from appending to our stale streamingText and masking the persisted plan. An
-  //    UNSTAMPED event (legacy/pre-assignment) falls through — it carries no recovery consequence and the
-  //    display path's creatingTaskIdRef/streamStartedRef gates still bound it.
+  //  - We hold a payload but no streamId yet (PENDING ADMISSION — streamPlan hasn't resolved):
+  //      · unstamped event → accept (legacy / our own pre-assignment event).
+  //      · STAMPED event   → REJECT (R225). During the pending window we cannot yet confirm an id is ours, and a
+  //        stamped event here is just as likely to be ANOTHER stream's (e.g. main broadcasts a prior stream's
+  //        supersession error, stamped with the OLD id, before returning OUR id — accepting it made us discard
+  //        our own ownership and self-recover while our stream kept running). Our own early deltas are still
+  //        captured by the display buffer (streamStartedRef, keyed by taskId); the recovery-relevant terminal for
+  //        our stream arrives AFTER our id is recorded, so nothing recoverable is lost.
+  //  - We hold NO payload for this task → no in-flight ownership. R224: a STAMPED event belongs to some other
+  //    stream instance; rejecting it stops its deltas from appending to our stale streamingText. An UNSTAMPED
+  //    event falls through (the display path's creatingTaskIdRef/streamStartedRef gates still bound it).
   const streamMatchesOwned = useCallback((taskId: string, eventStreamId: string | undefined): boolean => {
     const entry = submittedPayloadRef.current.get(taskId);
     if (!entry) return !eventStreamId; // no local ownership: reject any stamped (foreign) event
-    if (!entry.streamId) return true; // pending admission — our own event before the id was recorded
+    if (!entry.streamId) return !eventStreamId; // pending admission: accept only UNSTAMPED events (R225)
     if (!eventStreamId) return true; // unstamped event (backward-compat)
     return entry.streamId === eventStreamId;
   }, []);
@@ -603,10 +621,48 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     }
   }, []);
   const clearFailedSubmission = useCallback((taskId: string) => {
-    // R221: a parked recovery payload holds NO renderer-wide byte charge (released when it left flight in
-    // resolveTerminalOutcome), so clearing is pure state removal. Restore charges via addAttachments.
+    // R225: release the parked recovery payload's byte charge (kept accounted while parked so the renderer-wide
+    // ceiling reflects the strings actually resident in failedSubmissions state). Delete-then-release is
+    // idempotent — a second clear finds no ref entry and releases nothing.
+    const bytes = recoveryBytesRef.current.get(taskId);
+    if (bytes !== undefined) {
+      recoveryBytesRef.current.delete(taskId);
+      if (bytes > 0) onAttachmentsReleased(bytes);
+    }
     dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
   }, []);
+  // R225: park a recovery payload, keeping its bytes accounted and bounding the total. Evicts OLDEST parked
+  // entries (Map insertion order) until this new entry fits under RECOVERY_BYTES_CAP. Evicting drops the entry's
+  // strings + releases its charge so parked recovery can't grow the heap without limit.
+  const parkRecovery = useCallback(
+    (
+      taskId: string,
+      text: string,
+      attachments: Array<{ image: string; mimeType?: string }> | undefined,
+      bytes: number,
+    ) => {
+      // Drop any prior parked entry for THIS task first (superseded), releasing its charge.
+      const prior = recoveryBytesRef.current.get(taskId);
+      if (prior !== undefined) {
+        recoveryBytesRef.current.delete(taskId);
+        if (prior > 0) onAttachmentsReleased(prior);
+      }
+      // Evict oldest until the new entry fits (never evict below zero / infinite-loop-safe: stop when empty).
+      let total = 0;
+      for (const b of recoveryBytesRef.current.values()) total += b;
+      while (total + bytes > RECOVERY_BYTES_CAP && recoveryBytesRef.current.size > 0) {
+        const oldestId = recoveryBytesRef.current.keys().next().value as string;
+        const oldestBytes = recoveryBytesRef.current.get(oldestId) ?? 0;
+        recoveryBytesRef.current.delete(oldestId);
+        if (oldestBytes > 0) onAttachmentsReleased(oldestBytes);
+        total -= oldestBytes;
+        dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: oldestId, failed: null });
+      }
+      recoveryBytesRef.current.set(taskId, bytes); // keep the charge accounted while parked
+      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: { text, attachments } });
+    },
+    [RECOVERY_BYTES_CAP],
+  );
   const resolveTerminalOutcome = useCallback(
     (taskId: string, isError: boolean) => {
       const payload = submittedPayloadRef.current.get(taskId);
@@ -615,24 +671,17 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       // text produced is genuinely persisted — just drop the payload.
       const needsRecovery = isError || !payload.producedText;
       if (needsRecovery) {
-        // R221: bytes are charged ONLY while in-flight (submittedPayloadRef). A recovery payload parked in
-        // failedSubmissions is inert serialized data — NOT resident in any composer — so we RELEASE the charge
-        // as it moves out of flight. Restore re-charges through addAttachments' own accounting. This single-owner
-        // model (charge at rememberSubmission, release at every out-of-flight exit) removes the transfer-race,
-        // the double-count at restore, and the hidden reservation that prior rounds kept re-finding.
-        onAttachmentsReleased(payload.bytes);
+        // R225: move the payload OUT of the in-flight ref (delete WITHOUT releasing here) and hand its bytes to
+        // parkRecovery, which keeps the charge accounted while the strings live in failedSubmissions and evicts
+        // to a hard cap. Exactly one owner holds the charge at all times: submittedPayloadRef → recoveryBytesRef.
+        const bytes = payload.bytes;
         submittedPayloadRef.current.delete(taskId);
-        // failedSubmission is a per-task MAP (R219): a concurrent task's failure must not overwrite this one.
-        dispatch({
-          type: 'SET_FAILED_SUBMISSION',
-          taskId,
-          failed: { text: payload.text, attachments: payload.attachments },
-        });
+        parkRecovery(taskId, payload.text, payload.attachments, bytes);
       } else {
         dropSubmission(taskId); // genuinely persisted → release parked bytes
       }
     },
-    [dropSubmission],
+    [dropSubmission, parkRecovery],
   );
   // Called synchronously right after dispatching START_AI_CREATE for taskId: flush any events buffered
   // before the dispatch so early output isn't lost and an early terminal event isn't overwritten.
@@ -842,13 +891,17 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         // Remember the submitted payload for terminal-stream-error / empty-done restore (R217/R219).
         rememberSubmission(taskId, userMessage, attachments);
 
-        // streamPlan resolves {taskId, error:true} for in-band failures (R207) — recover the draft on those too.
+        // streamPlan resolves {taskId, error:true} for in-band admission failures (R207).
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);
         if (res && (res as { error?: boolean }).error) {
-          // R220: route through resolveTerminalOutcome (idempotent) so an in-band failure recovers the draft the
-          // SAME way a broadcast `error` would, and a concurrently-broadcast stream `error` can't double-recover
-          // (the first call deletes the map entry; the second finds nothing and no-ops).
-          resolveTerminalOutcome(taskId, true);
+          // R225: a SYNCHRONOUS admission failure does NOT park recovery. Unlike create (whose composer unmounts
+          // at admission), the refine composer stays mounted and KEEPS the user's input/attachments on !res.ok
+          // (see TaskDetailPanel.handleComposerSubmit). Parking recovery too would give BOTH the composer and
+          // failedSubmissions ownership of the same draft — clearing the composer later would resurrect it and
+          // its images were already charged by the composer, so a parked charge double-counts. Just release the
+          // in-flight payload. (An ASYNC terminal stream error AFTER a successful admission still parks recovery
+          // via the stream-event listener — there the composer was cleared on success, so recovery is needed.)
+          dropSubmission(taskId);
           dispatch({ type: 'STREAM_DONE' });
           return { ok: false };
         }
@@ -858,12 +911,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
-        resolveTerminalOutcome(taskId, true); // recover the draft on a thrown failure too (R220, idempotent)
+        // Thrown BEFORE/at admission → composer still holds the draft (as above); release, don't park (R225).
+        dropSubmission(taskId);
         dispatch({ type: 'STREAM_DONE' });
         return { ok: false };
       }
     },
-    [flushStreamBuffer, rememberSubmission, resolveTerminalOutcome, setOwnedStreamId],
+    [flushStreamBuffer, rememberSubmission, dropSubmission, setOwnedStreamId],
   );
 
   const cancelAIStream = useCallback(() => {

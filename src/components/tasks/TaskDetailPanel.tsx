@@ -223,19 +223,21 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     // Only restore into an EMPTY composer (a newer draft in progress takes precedence). R221: the busy check
     // reads REACTIVE state (`input`, `attachments`) — not the non-reactive textarea ref — and both are in the
     // dependency array, so when the user clears their draft this effect re-runs and the deferred restore fires.
-    // (The parked entry holds no budget reservation in the single-owner accounting model, so waiting is free.)
     const composerBusy = input.trim().length > 0 || attachments.length > 0;
     if (composerBusy) return;
-    // R220/R221: restore is ALL-AT-ONCE and TERMINAL — we clear the entry unconditionally at the end. Recovery
-    // holds no renderer-wide byte charge while parked, so addAttachments' own capacity check is authoritative and
-    // can't double-count. If some images exceed the current budget we restore the text, stage what fits, and
-    // surface a notice for the rest rather than stranding recovery state forever.
-    if (failed.text) setInput(failed.text);
+    // R225: clear the recovery entry FIRST — this releases the parked byte charge (kept accounted while parked,
+    // R225) and removes the entry BEFORE addAttachments re-charges, so there is no transient double-count of the
+    // same images against the renderer-wide ceiling. Capture the payload into a local before clearing. Restore is
+    // ALL-AT-ONCE and TERMINAL; over-budget images are dropped with a notice rather than stranding recovery state.
+    const restoreText = failed.text;
+    const restoreAttachments = failed.attachments;
+    clearFailedSubmission(task.id);
+    if (restoreText) setInput(restoreText);
     let skippedCount = 0;
-    if (failed.attachments && failed.attachments.length > 0) {
+    if (restoreAttachments && restoreAttachments.length > 0) {
       // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
       const { skipped } = addAttachments(
-        failed.attachments.map((a, i) => ({
+        restoreAttachments.map((a, i) => ({
           name: `image-${i + 1}.${(a.mimeType?.split('/')[1] ?? 'png').split('+')[0]}`,
           mime: a.mimeType ?? 'image/png',
           isImage: true,
@@ -250,7 +252,6 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         ? `The plan failed to generate — your message was restored (${skippedCount} image${skippedCount === 1 ? '' : 's'} exceeded the limit). Try again.`
         : 'The plan failed to generate — your message was restored. Try again.',
     );
-    clearFailedSubmission(task.id); // terminal: removes the entry (holds no byte charge in single-owner model, R221)
   }, [state.failedSubmissions, task.id, input, attachments, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
