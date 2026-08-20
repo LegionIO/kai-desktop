@@ -69,7 +69,7 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -195,15 +195,18 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   );
 
   // Surface a dropped-image notice raised during task CREATION (R210): the create composer unmounts on the
-  // transition into this detail view, so the provider stashes the count in state; show it here once (the
-  // surviving UI) and clear it. Refine-path drops are shown inline by handleComposerSubmit.
+  // transition into this detail view, so the provider stashes it in state; show it here once (the surviving
+  // UI) and clear it. Consume ONLY the notice for THIS task (R211) — the notice is keyed by taskId, so a
+  // different task's detail panel must not display it. Refine-path drops are shown inline by handleComposerSubmit.
   useEffect(() => {
-    const dropped = state.droppedImageNotice;
-    if (dropped && dropped > 0) {
-      showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
+    const notice = state.droppedImageNotice;
+    if (notice && notice.taskId === task.id && notice.count > 0) {
+      showAttachMessage(
+        `${notice.count} image${notice.count === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
+      );
       clearDroppedImageNotice();
     }
-  }, [state.droppedImageNotice, showAttachMessage, clearDroppedImageNotice]);
+  }, [state.droppedImageNotice, task.id, showAttachMessage, clearDroppedImageNotice]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -437,12 +440,19 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     // originating task + an empty live composer so we don't wipe a newer draft the user started meanwhile);
     // on failure leave the input untouched — no snapshot, no rollback.
     const originTaskId = task.id;
+    // Snapshot the live attachment byte total at submit time so we can detect an attachment added/removed
+    // (or one that finished loading) during admission and NOT clear it on success (R211).
+    const submittedResidentBytes = getResidentBytes();
     void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((res) => {
       if (res.ok) {
-        // Clear only if the user is still on the originating task and hasn't edited the composer text
-        // since submitting (don't wipe a newer draft they started while awaiting).
+        // Clear only if the user is still on the originating task, hasn't edited the composer text, AND the
+        // attachment set is unchanged since submit (don't wipe a newer draft / a just-added attachment).
         const liveText = textareaRef.current?.value ?? '';
-        if (activeTaskIdRef.current === originTaskId && liveText.trim() === text) {
+        if (
+          activeTaskIdRef.current === originTaskId &&
+          liveText.trim() === text &&
+          getResidentBytes() === submittedResidentBytes
+        ) {
           setInput('');
           clearAttachments();
         }
@@ -457,7 +467,16 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, attachments, clearAttachments, task.id, refineTaskPlan, isActivelyStreaming, showAttachMessage]);
+  }, [
+    input,
+    attachments,
+    clearAttachments,
+    getResidentBytes,
+    task.id,
+    refineTaskPlan,
+    isActivelyStreaming,
+    showAttachMessage,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

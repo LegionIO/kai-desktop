@@ -61,6 +61,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Synchronous single-submission latch (R211): the composer stays populated/enabled while creation awaits
+  // two IPC calls (create + streamPlan), so a double Enter / double-click would create TWO persistent tasks.
+  // Guard synchronously and release when the submission settles.
+  const submittingRef = useRef(false);
 
   // Voice recording hook
   const { startRecording: taskStartRecording } = useVoiceRecording();
@@ -239,6 +243,8 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     const images = attachmentsToImagePayload(attachments);
     // Require text OR at least one image (R187).
     if (!text && images.length === 0) return;
+    if (submittingRef.current) return; // single-submission latch (R211) — block a double Enter/click
+    submittingRef.current = true;
 
     // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
     // local snapshot while clearAttachments() released their bytes from the global counter (uncounted
@@ -249,7 +255,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
       text,
       currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
       images.length > 0 ? images : undefined,
-    );
+    ).finally(() => {
+      // Release the latch on failure so the user can retry; on success the view unmounts anyway.
+      submittingRef.current = false;
+    });
     // The composer's text/attachments stay intact on failure (no optimistic clear, R210); on success the
     // view transitions away. A dropped-image warning is surfaced by the provider's surviving UI, not here.
   }, [input, attachments, startAITaskCreation, currentWorkingDirectory]);
