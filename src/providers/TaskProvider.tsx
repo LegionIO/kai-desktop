@@ -34,6 +34,9 @@ interface TaskState {
   streamingText: string;
   /** Whether a plan stream is currently in flight. */
   isStreamingPlan: boolean;
+  /** Transient notice: count of images the plan-side caps dropped on the last submission, surfaced by
+   *  the surviving task UI after the creation composer unmounts (R210). Cleared once shown. */
+  droppedImageNotice: number | null;
 }
 
 type TaskAction =
@@ -47,7 +50,8 @@ type TaskAction =
   | { type: 'START_AI_CREATE'; taskId: string }
   | { type: 'STREAM_TEXT_DELTA'; text: string }
   | { type: 'STREAM_DONE' }
-  | { type: 'CANCEL_AI_CREATE' };
+  | { type: 'CANCEL_AI_CREATE' }
+  | { type: 'SET_DROPPED_IMAGE_NOTICE'; count: number | null };
 
 const emptyOrder: KaiTaskOrder = {
   todo: [],
@@ -66,6 +70,7 @@ const initialState: TaskState = {
   creatingTaskId: null,
   streamingText: '',
   isStreamingPlan: false,
+  droppedImageNotice: null,
 };
 
 function taskReducer(state: TaskState, action: TaskAction): TaskState {
@@ -99,6 +104,8 @@ function taskReducer(state: TaskState, action: TaskAction): TaskState {
       return { ...state, isStreamingPlan: false };
     case 'CANCEL_AI_CREATE':
       return { ...state, creatingTaskId: null, streamingText: '', isStreamingPlan: false };
+    case 'SET_DROPPED_IMAGE_NOTICE':
+      return { ...state, droppedImageNotice: action.count };
     default:
       return state;
   }
@@ -166,6 +173,8 @@ interface TaskContextValue {
 
   /** Exit AI creation mode (reset state, keep the task). */
   exitAICreation: () => void;
+  /** Clear the transient dropped-image notice once the surviving UI has surfaced it (R210). */
+  clearDroppedImageNotice: () => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -508,7 +517,9 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
             void app.tasks.update(task.id, { title });
           }
         });
-        return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
+        const dropped = (res as { droppedImages?: number })?.droppedImages ?? 0;
+        if (dropped > 0) dispatch({ type: 'SET_DROPPED_IMAGE_NOTICE', count: dropped });
+        return { ok: true, droppedImages: dropped || undefined };
       } catch (err) {
         console.error('[TaskProvider] Failed to start AI task creation:', err);
         dispatch({ type: 'CANCEL_AI_CREATE' });
@@ -563,6 +574,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   // ── Memoized context value ───────────────────────────────────────────
 
+  const clearDroppedImageNotice = useCallback(() => {
+    dispatch({ type: 'SET_DROPPED_IMAGE_NOTICE', count: null });
+  }, []);
+
   const value = useMemo<TaskContextValue>(
     () => ({
       state,
@@ -579,6 +594,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       refineTaskPlan,
       cancelAIStream,
       exitAICreation,
+      clearDroppedImageNotice,
     }),
     [
       state,
@@ -595,6 +611,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       refineTaskPlan,
       cancelAIStream,
       exitAICreation,
+      clearDroppedImageNotice,
     ],
   );
 

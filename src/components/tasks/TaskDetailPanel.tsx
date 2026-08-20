@@ -65,11 +65,11 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
+  const { state, updateTask, updateTaskStatus, refineTaskPlan, clearDroppedImageNotice } = useTasks();
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
   // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
   // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment, clearAttachments } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -193,6 +193,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     },
     [showAttachMessage],
   );
+
+  // Surface a dropped-image notice raised during task CREATION (R210): the create composer unmounts on the
+  // transition into this detail view, so the provider stashes the count in state; show it here once (the
+  // surviving UI) and clear it. Refine-path drops are shown inline by handleComposerSubmit.
+  useEffect(() => {
+    const dropped = state.droppedImageNotice;
+    if (dropped && dropped > 0) {
+      showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
+      clearDroppedImageNotice();
+    }
+  }, [state.droppedImageNotice, showAttachMessage, clearDroppedImageNotice]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -420,45 +431,33 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const images = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) return;
 
-    // Snapshot so a FAILED refine (IPC reject / in-band error) restores the text + attachments rather
-    // than discarding them (R206). Fence the rollback to the ORIGINATING task + an empty composer (R207):
-    // the user may switch tasks or type a new draft while the submission awaits, and an unconditional
-    // restore would clobber that newer draft or attach task A's files to task B.
+    // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
+    // snapshot while clearAttachments() released their bytes from the global counter (uncounted memory +
+    // near-cap rollback rejection). Submit with the composer intact; on SUCCESS clear it (fenced to the
+    // originating task + an empty live composer so we don't wipe a newer draft the user started meanwhile);
+    // on failure leave the input untouched — no snapshot, no rollback.
     const originTaskId = task.id;
-    const stagedAttachments = [...attachments];
-    setInput('');
-    clearAttachments();
     void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined).then((res) => {
       if (res.ok) {
-        // Warn deterministically if the plan-side caps dropped images (R209) — via the resolved result,
-        // not a stream event that would race ownership registration.
+        // Clear only if the user is still on the originating task and hasn't edited the composer text
+        // since submitting (don't wipe a newer draft they started while awaiting).
+        const liveText = textareaRef.current?.value ?? '';
+        if (activeTaskIdRef.current === originTaskId && liveText.trim() === text) {
+          setInput('');
+          clearAttachments();
+        }
         if (res.droppedImages && res.droppedImages > 0) {
           showAttachMessage(
             `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
           );
         }
-        return;
       }
-      if (activeTaskIdRef.current !== originTaskId) return; // switched task — keep the newer context intact
-      const liveText = textareaRef.current?.value ?? '';
-      if (liveText.trim().length > 0 || getResidentBytes() > 0) return; // a newer draft exists — don't clobber
-      setInput(text);
-      if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
+      // On failure the composer keeps the user's input/attachments; nothing to restore.
     });
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [
-    input,
-    attachments,
-    clearAttachments,
-    addAttachments,
-    getResidentBytes,
-    task.id,
-    refineTaskPlan,
-    isActivelyStreaming,
-    showAttachMessage,
-  ]);
+  }, [input, attachments, clearAttachments, task.id, refineTaskPlan, isActivelyStreaming, showAttachMessage]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

@@ -54,7 +54,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // Task-local attachment store (R186): the shared AttachmentProvider spans chat + tasks, so using it
   // here leaked task files into chat and let leaving Tasks clear unsent chat attachments. Local state
   // is discarded on unmount automatically, so no cross-surface clearing is needed.
-  const { attachments, addAttachments, removeAttachment, clearAttachments, getResidentBytes } = useLocalAttachments();
+  const { attachments, addAttachments, removeAttachment } = useLocalAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -240,45 +240,19 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     // Require text OR at least one image (R187).
     if (!text && images.length === 0) return;
 
-    // Snapshot the staged attachments so a FAILED submission (create returns no id / IPC rejects) can
-    // restore them instead of discarding the user's selection (R206). Clear the composer optimistically
-    // for responsiveness, then roll back both text and attachments if submission never started.
-    const stagedAttachments = [...attachments];
-    setInput('');
-    clearAttachments();
+    // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
+    // local snapshot while clearAttachments() released their bytes from the global counter (uncounted
+    // memory + a near-cap rollback would be rejected). Instead keep the composer's text + attachments
+    // intact until submission SUCCEEDS; on success the view transitions away (unmount) so an explicit
+    // clear is unnecessary, and on failure the user's input simply stays put — no snapshot, no rollback.
     void startAITaskCreation(
       text,
       currentWorkingDirectory ? { cwd: currentWorkingDirectory } : undefined,
       images.length > 0 ? images : undefined,
-    ).then((res) => {
-      if (res.ok) {
-        // The plan-side caps may have dropped some images (measured on the actual payload in main) even
-        // though the submission succeeded — warn deterministically from the resolved result (R209), since a
-        // stream-event warning would race the post-await ownership registration and be discarded.
-        if (res.droppedImages && res.droppedImages > 0) {
-          showAttachMessage(
-            `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
-          );
-        }
-        return;
-      }
-      // Don't clobber a newer draft the user started while the submission awaited (R207/R208): read LIVE
-      // composer text + LIVE attachment state (getResidentBytes, not the stale closure snapshot).
-      const liveText = textareaRef.current?.value ?? '';
-      if (liveText.trim().length > 0 || getResidentBytes() > 0) return;
-      setInput(text);
-      if (stagedAttachments.length > 0) addAttachments(stagedAttachments);
-    });
-  }, [
-    input,
-    attachments,
-    clearAttachments,
-    addAttachments,
-    getResidentBytes,
-    startAITaskCreation,
-    currentWorkingDirectory,
-    showAttachMessage,
-  ]);
+    );
+    // The composer's text/attachments stay intact on failure (no optimistic clear, R210); on success the
+    // view transitions away. A dropped-image warning is surfaced by the provider's surviving UI, not here.
+  }, [input, attachments, startAITaskCreation, currentWorkingDirectory]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
