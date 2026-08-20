@@ -222,6 +222,23 @@ const conversationMessageSchema = z.object({
 /** Active plan generation streams, keyed by taskId. */
 const activeTaskStreams = new Map<string, { token: symbol; streamId: string; abort: () => void }>();
 
+/**
+ * R227: abort a task's in-flight plan-generation stream when the task is REMOVED FROM THE ACTIVE LIST
+ * (deleted or archived). Archiving, like deleting, drops the task from every window's active view via the
+ * `tasks:changed` broadcast, but the background stream in activeTaskStreams would keep running — and a later
+ * error/empty-done would park recovery in the owning window AFTER the removal broadcast already passed,
+ * stranding an inaccessible payload + byte charge. Aborting suppresses the stream's own terminal, so we emit a
+ * dedicated terminal `done{reason:'deleted'}` stamped with the stream's id so the owner drops its in-flight
+ * payload WITHOUT recovery (the task is no longer reachable in the active list). Idempotent: no-op with no stream.
+ */
+function abortActiveTaskStream(id: string): void {
+  const activeStream = activeTaskStreams.get(id);
+  if (!activeStream) return;
+  activeStream.abort();
+  activeTaskStreams.delete(id);
+  broadcastTaskStreamEvent({ taskId: id, type: 'done', streamId: activeStream.streamId, reason: 'deleted' });
+}
+
 // ── Async Mutex ─────────────────────────────────────────────────────────
 
 /**
@@ -400,6 +417,13 @@ function updateTaskWith(
         ...(isMeaningful && { updatedAt: new Date().toISOString() }),
       };
       atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
+      // R227: if this update newly ARCHIVES the task (drops it from the active list), abort its in-flight plan
+      // stream and emit a stamped terminal — the same treatment tasks:delete gives — so the owning window drops
+      // its in-flight recovery payload instead of stranding it after the removal broadcast. Only on the
+      // transition into archived (not a re-write of an already-archived task).
+      if (cleanUpdates.archivedAt && !existing.archivedAt) {
+        abortActiveTaskStream(id);
+      }
       broadcastTaskChange(appHome, origin);
       return updated;
     } catch {
