@@ -943,7 +943,10 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const cancelAIStream = useCallback(() => {
     if (state.creatingTaskId) {
-      void app.tasks.cancelPlanStream(state.creatingTaskId);
+      // R232: pass the streamId we own so a stale window can't abort a newer stream for the same task. Read it
+      // BEFORE dropSubmission removes the in-flight entry.
+      const ownedStreamId = submittedPayloadRef.current.get(state.creatingTaskId)?.streamId;
+      void app.tasks.cancelPlanStream(state.creatingTaskId, ownedStreamId);
       dropSubmission(state.creatingTaskId); // R220: a deliberate cancel releases the parked payload (no recovery)
     }
     dispatch({ type: 'CANCEL_AI_CREATE' });
@@ -951,7 +954,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
 
   const exitAICreation = useCallback(() => {
     if (state.creatingTaskId) {
-      if (state.isStreamingPlan) void app.tasks.cancelPlanStream(state.creatingTaskId);
+      const ownedStreamId = submittedPayloadRef.current.get(state.creatingTaskId)?.streamId;
+      if (state.isStreamingPlan) void app.tasks.cancelPlanStream(state.creatingTaskId, ownedStreamId);
       dropSubmission(state.creatingTaskId); // R220: releasing here prevents a leaked committed-bytes reservation
     }
     dispatch({ type: 'CANCEL_AI_CREATE' });

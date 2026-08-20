@@ -550,7 +550,7 @@ type AppAPI = {
       attachments?: Array<{ image: string; mimeType?: string }>,
       streamId?: string,
     ) => Promise<{ taskId: string; error?: boolean; droppedImages?: number; streamId?: string }>;
-    cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
+    cancelPlanStream: (taskId: string, streamId?: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
   };

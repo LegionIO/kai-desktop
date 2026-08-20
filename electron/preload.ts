@@ -759,7 +759,8 @@ const appAPI = {
         droppedImages?: number;
         streamId?: string;
       }>,
-    cancelPlanStream: (taskId: string) => ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
+    cancelPlanStream: (taskId: string, streamId?: string) =>
+      ipcRenderer.invoke('tasks:cancel-stream', taskId, streamId) as Promise<{ ok: boolean }>,
     generateTitle: (userMessage: string) =>
       ipcRenderer.invoke('tasks:generate-title', userMessage) as Promise<{ title: string | null }>,
     onStreamEvent: (callback: (event: unknown) => void) => {

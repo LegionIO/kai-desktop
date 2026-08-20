@@ -686,7 +686,7 @@ export function getBridgeScript(): string {
       onTerminalData: function(cb) { return on('tasks:terminal-data', cb); },
       onTerminalExit: function(cb) { return on('tasks:terminal-exit', cb); },
       streamPlan: function(taskId, userMessage, history, attachments, streamId) { return invoke('tasks:stream-plan', taskId, userMessage, history, attachments, streamId); },
-      cancelPlanStream: function(taskId) { return invoke('tasks:cancel-stream', taskId); },
+      cancelPlanStream: function(taskId, streamId) { return invoke('tasks:cancel-stream', taskId, streamId); },
       generateTitle: function(userMessage) { return invoke('tasks:generate-title', userMessage); },
       onStreamEvent: function(cb) { return on('tasks:stream-event', cb); }
     },

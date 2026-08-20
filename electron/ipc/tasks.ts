@@ -1088,11 +1088,21 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
     },
   );
 
-  ipcMain.handle('tasks:cancel-stream', (_e, taskId: string) => {
+  ipcMain.handle('tasks:cancel-stream', (_e, taskId: string, streamId?: string) => {
     const stream = activeTaskStreams.get(taskId);
     if (stream) {
+      // R232: when the caller names a streamId, only cancel if it matches the ACTIVE stream — a superseded
+      // window must not abort a NEWER window's stream for the same task (which would leave the newer stream with
+      // no terminal event, stuck streaming with its recovery bytes retained). A legacy caller (no streamId)
+      // keeps the prior unconditional behavior.
+      if (typeof streamId === 'string' && streamId.length > 0 && stream.streamId !== streamId) {
+        return { ok: false };
+      }
       stream.abort();
       activeTaskStreams.delete(taskId);
+      // Emit a stamped terminal so the owning window resolves its in-flight payload (drops it — a deliberate
+      // cancel is not a failure needing draft recovery, matching the renderer's cancel semantics).
+      broadcastTaskStreamEvent({ taskId, type: 'done', streamId: stream.streamId, reason: 'deleted' });
     }
     return { ok: true };
   });

@@ -75,6 +75,10 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   // Synchronous single-submission latch for refine (R212): isActivelyStreaming stays false until
   // refineTaskPlan finishes its tasks.get, so rapid submits could start competing plan streams.
   const refineSubmittingRef = useRef(false);
+  // R232: count in-flight FileReader batches (web-bridge <input type=file>) so a submit fired before the reads
+  // settle can't send text-only and drop the still-loading image (mirrors TaskCreationView's pendingReadsRef,
+  // R216). Incremented when a read batch starts, decremented when it settles.
+  const pendingReadsRef = useRef(0);
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -332,18 +336,23 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         }),
       );
     }
-    void Promise.all(readers).then((results) => {
-      releaseAttachmentReservation(reservedBytes);
-      // Discard reads that resolved after a switch to a different task (R189).
-      if (activeTaskIdRef.current !== originTaskId) return;
-      const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
-      const unreadable = accepted.length - attachable.length;
-      if (attachable.length > 0) {
-        const { skipped: overCap } = addAttachments(attachable);
-        if (overCap.length > 0) showAttachNotice(overCap);
-      }
-      if (unreadable > 0) showAttachMessage(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
-    });
+    pendingReadsRef.current += 1; // R232: block submit until this read batch settles
+    void Promise.all(readers)
+      .then((results) => {
+        releaseAttachmentReservation(reservedBytes);
+        // Discard reads that resolved after a switch to a different task (R189).
+        if (activeTaskIdRef.current !== originTaskId) return;
+        const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+        const unreadable = accepted.length - attachable.length;
+        if (attachable.length > 0) {
+          const { skipped: overCap } = addAttachments(attachable);
+          if (overCap.length > 0) showAttachNotice(overCap);
+        }
+        if (unreadable > 0) showAttachMessage(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+      })
+      .finally(() => {
+        pendingReadsRef.current = Math.max(0, pendingReadsRef.current - 1);
+      });
   };
 
   const handleAttachDirectory = async () => {
@@ -478,6 +487,13 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const text = input.trim();
     if (isActivelyStreaming) return;
     if (refineSubmittingRef.current) return; // single-submission latch (R212) — block competing streams
+    // R232: block while a web FileReader batch is still in flight — otherwise a quick send after selecting an
+    // image submits text-only and the image lands afterward for a LATER turn. Warn and bail; the user retries
+    // once the read settles (it clears pendingReadsRef and re-enables the composer's next submit).
+    if (pendingReadsRef.current > 0) {
+      showAttachMessage('Still attaching your image — try again in a moment.');
+      return;
+    }
     const { images, dropped } = attachmentsToImagePayload(attachments);
     if (!text && images.length === 0) {
       // All staged images dropped by the renderer plan caps + no text → nothing to submit; warn + bail (R214).
