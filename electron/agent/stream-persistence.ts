@@ -532,6 +532,15 @@ export function persistCooperativeInjectedUserTurn(
     },
   );
   if (!updated?.headId) return null;
+  // R231: when the prefix persist FAILED and its content is still held in the retained accumulator, that same
+  // accumulator will keep accumulating the CONTINUATION — but its parentId is still the PRE-INJECT head, so the
+  // continuation would persist as a sibling of the inject and the head would move back OVER the inject (leaving
+  // the accepted user off-branch). Rebind the retained accumulator's parent onto the just-persisted injected user
+  // so continuation flows `…pre → inject → continuation`. (The retained prefix, if a later finalize recovers it,
+  // lands as a sibling under the pre-inject head — branch selection handles that; the ACTIVE chain is correct.)
+  if (retainedPrefixParent !== undefined) {
+    rebindPersistenceAccumulatorParent(conversationId, messageId);
+  }
   return { messageId, parentId, createdAt };
 }
 
@@ -815,6 +824,14 @@ export function hasPersistenceAccumulator(conversationId: string): boolean {
 export function getPersistenceAccumulatorParentId(conversationId: string): string | null | undefined {
   const acc = accumulators.get(conversationId);
   return acc ? (acc.parentId ?? null) : undefined;
+}
+
+/** R231: repoint the held accumulator's parent (used when a failed-prefix inject boundary must make the
+ *  RETAINED accumulator's continuation flow under the newly-persisted injected user instead of the stale
+ *  pre-inject head). No-op if there is no accumulator. */
+export function rebindPersistenceAccumulatorParent(conversationId: string, parentId: string | null): void {
+  const acc = accumulators.get(conversationId);
+  if (acc) acc.parentId = parentId ?? undefined;
 }
 
 /** Whether the held accumulator (if any) has non-empty content to persist. Lets an on-demand
