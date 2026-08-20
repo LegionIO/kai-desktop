@@ -881,7 +881,20 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         if (createdTaskId) {
           dropSubmission(createdTaskId);
           clearFailedSubmission(createdTaskId);
-          void app.tasks.delete?.(createdTaskId).catch(() => {});
+          // R229: mirror R223's in-band branch — tasks.delete resolves {error}/{ok:false} rather than rejecting,
+          // so a fire-and-forget .catch() leaves a durable orphaned "New Task" on a filesystem delete failure.
+          // Await + re-sync the list if the delete didn't succeed.
+          try {
+            const del = await app.tasks.delete?.(createdTaskId);
+            if (del && !del.ok) {
+              const tasks = await app.tasks.list();
+              dispatch({ type: 'SET_TASKS', tasks });
+            }
+          } catch (delErr) {
+            console.error('[TaskProvider] Failed to clean up placeholder task after throw:', delErr);
+            const tasks = await app.tasks.list();
+            dispatch({ type: 'SET_TASKS', tasks });
+          }
         }
         return { ok: false };
       }

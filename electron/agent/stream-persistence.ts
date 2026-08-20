@@ -474,6 +474,20 @@ export function persistCooperativeInjectedUserTurn(
 ): PersistedInjectedUserTurn | null {
   if (!conversationId || !userText) return null;
   const partialAssistantHead = finalizeInterruptedTurn(appHome, conversationId);
+  // R229: finalizeInterruptedTurn returns null in TWO distinct situations: (a) genuinely nothing to persist
+  // (no prefix), and (b) there WAS a partial prefix but its persist FAILED and R168 RETAINED the accumulator.
+  // Treating (b) as "no prefix" would pin the injected user on the current head and leave the continuation
+  // parented BEFORE the inject — eventually making the accepted answer/follow-up an off-branch sibling (the exact
+  // corruption the boundary split exists to prevent). Distinguish them: if content is still held, the prefix
+  // persist failed — DEFER the inject entirely (return null) rather than commit it to a wrong parent. The
+  // retained accumulator will be finalized by a later finalize/`done`, and the inject can be re-attempted then.
+  if (partialAssistantHead === null && persistenceAccumulatorHasContent(conversationId)) {
+    treeDebugLog(
+      `[INJECT-BOUNDARY-DEFER] conv=${conversationId} prefix persist FAILED but content retained — ` +
+        `deferring inject to avoid mis-parenting the continuation`,
+    );
+    return null;
+  }
   const current = readConversation(appHome, conversationId);
   if (!current) return null;
   // Resolve the parent to pin the inject on:
@@ -552,6 +566,19 @@ export function finalizeGuiFallbackPrefixAtInject(
         restoreParentFromAcc: true,
       })
     : null;
+  // R229: if there WAS prefix content but the persist FAILED (R168 retained the accumulator, prefixHead === null),
+  // do NOT overwrite the accumulator with a fresh continuation seed below — that would permanently DESTROY the
+  // retained prefix content that hasn't made it to disk. Leave the retained accumulator intact so a later
+  // finalize/`done` can recover it, and signal the caller (null) to defer the boundary rather than reparent onto
+  // a lost prefix. Only re-seed the continuation accumulator when the prefix genuinely persisted (or there was
+  // none to begin with).
+  if (hasPrefix && prefixHead === null) {
+    treeDebugLog(
+      `[INJECT-GUI-DEFER] conv=${conversationId} GUI prefix persist FAILED but content retained — ` +
+        `not overwriting the accumulator; deferring`,
+    );
+    return null;
+  }
   // Re-seed a fresh continuation accumulator parented on the injected user, with
   // a DETERMINISTIC responseMessageId derived from the injected user id
   // (`${injectedUserId}-cont`). The RENDERER derives the identical id for its
