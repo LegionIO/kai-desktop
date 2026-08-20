@@ -203,6 +203,13 @@ const TaskContext = createContext<TaskContextValue | null>(null);
 export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const [state, dispatch] = useReducer(taskReducer, initialState);
   const { config } = useConfig();
+  // R222: a stable mirror of the current recovery-entry ids so the remote `tasks:changed` reconciler (whose
+  // effect has [] deps) can find recovery entries orphaned by a delete performed in ANOTHER window/plugin
+  // without re-subscribing on every state change. Kept in sync by the effect just below.
+  const failedSubmissionIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    failedSubmissionIdsRef.current = new Set(Object.keys(state.failedSubmissions));
+  }, [state.failedSubmissions]);
   const activeWorkspaceId =
     (config?.ui as { activeWorkspaceId?: string | null } | undefined)?.activeWorkspaceId ?? null;
 
@@ -265,6 +272,16 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     if (!window.app?.tasks?.onChanged) return;
     const unsub = app.tasks.onChanged((tasks) => {
+      // R222: a task deleted in ANOTHER window (or by a plugin) arrives here only as a replaced list. Reconcile
+      // orphaned recovery entries: any failedSubmissions id no longer present in the incoming list is
+      // unreachable (its TaskDetailPanel will never mount) so remove it. Recovery entries hold no renderer-wide
+      // byte charge (single-owner accounting, R221), so a plain state removal is sufficient. We intentionally do
+      // NOT touch submittedPayloadRef here — an in-flight entry is THIS window's live creation/refine and the
+      // broadcast list may simply not include it yet.
+      const liveIds = new Set(tasks.map((t) => t.id));
+      for (const id of failedSubmissionIdsRef.current) {
+        if (!liveIds.has(id)) dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
+      }
       dispatch({ type: 'SET_TASKS', tasks: tasks });
     });
     return unsub;
@@ -379,9 +396,19 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const deleteTask = useCallback(
     async (id: string) => {
       try {
-        purgeTaskPayload(id);
+        // R222: purge the recovery/in-flight payload ONLY after the delete is confirmed. Task IPC returns
+        // {error} (or {ok:false}) as a RESOLVED promise, not a rejection — so purging before the await would
+        // irrecoverably lose the prompt/attachments while the task remains on disk. Optimistically remove from
+        // the visible list (cheap to re-sync), but keep the payload until success.
         dispatch({ type: 'DELETE_TASK', id });
-        await app.tasks.delete(id);
+        const res = await app.tasks.delete(id);
+        if (res && res.ok) {
+          purgeTaskPayload(id);
+        } else {
+          console.error('[TaskProvider] Delete task did not succeed:', id, res);
+          const tasks = await app.tasks.list();
+          dispatch({ type: 'SET_TASKS', tasks });
+        }
       } catch (err) {
         console.error('[TaskProvider] Failed to delete task:', err);
         const tasks = await app.tasks.list();
@@ -394,9 +421,17 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const archiveTask = useCallback(
     async (id: string) => {
       try {
-        purgeTaskPayload(id);
         dispatch({ type: 'DELETE_TASK', id }); // remove from active list optimistically
-        await app.tasks.update(id, { archivedAt: new Date().toISOString() });
+        // R222: archive via tasks:update returns the updated TaskFile on success or an {error} object on
+        // failure (resolved, not rejected). Only purge the payload once we confirm the archive succeeded.
+        const res = await app.tasks.update(id, { archivedAt: new Date().toISOString() });
+        if (res && !(res as { error?: string }).error) {
+          purgeTaskPayload(id);
+        } else {
+          console.error('[TaskProvider] Archive task did not succeed:', id, res);
+          const tasks = await app.tasks.list();
+          dispatch({ type: 'SET_TASKS', tasks });
+        }
       } catch (err) {
         console.error('[TaskProvider] Failed to archive task:', err);
         const tasks = await app.tasks.list();
@@ -687,10 +722,12 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         if (res && (res as { error?: boolean }).error) {
           // Admission failed before streaming began — the composer is still mounted with the user's
           // input/attachments intact (we never transitioned), so just clean up the placeholder task and
-          // report failure; no rollback into a live composer is needed. DROP the recovery payload so a
-          // concurrently-broadcast stream `error` event can't ALSO create a failedSubmission entry that a
-          // later successful retry wouldn't clear (R219 #5) — the in-band path owns this failure.
+          // report failure; no rollback into a live composer is needed. The placeholder is DELETED, so purge
+          // BOTH the in-flight payload (dropSubmission) AND any recovery entry a concurrently-broadcast stream
+          // `error` already created (clearFailedSubmission) — otherwise a deleted task strands an unreachable
+          // data-URL recovery entry (R222). Exactly one of the two holds the payload.
           dropSubmission(task.id);
+          clearFailedSubmission(task.id);
           void app.tasks.delete?.(task.id).catch(() => {});
           return { ok: false };
         }

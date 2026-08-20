@@ -636,6 +636,15 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
   ipcMain.handle('tasks:delete', (_e, id: string) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     try {
+      // R222: abort any in-flight plan-generation stream for this task BEFORE removing it. Deletion already
+      // stops the assigned running agent (onTaskDeleted below), but a background plan stream lives in
+      // activeTaskStreams and would otherwise keep consuming the provider connection and broadcasting deltas
+      // for a task that no longer exists. Idempotent: no-op when there is no active stream.
+      const activeStream = activeTaskStreams.get(id);
+      if (activeStream) {
+        activeStream.abort();
+        activeTaskStreams.delete(id);
+      }
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       // Clear the terminal output buffers (memory + disk) for this task's
       // execution + review sessions before removing it, so deleted tasks don't
