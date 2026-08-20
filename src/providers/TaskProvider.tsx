@@ -497,6 +497,12 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         });
         if (!task || !task.id) return { ok: false };
         createdTaskId = task.id;
+        // Register stream ownership SYNCHRONOUSLY before awaiting streamPlan (R214): main begins
+        // broadcasting deltas as soon as streamPlan launches its background stream, but the React effect
+        // that syncs creatingTaskIdRef from state runs later — so the listener would discard early
+        // deltas/errors (stuck stream) and, during a task switch, could route them to the wrong buffer.
+        // Setting the ref here makes the listener accept this task's events immediately.
+        creatingTaskIdRef.current = task.id;
 
         // Start streaming the plan BEFORE transitioning the UI (R208): START_AI_CREATE unmounts the
         // TaskCreationView composer, so dispatching it up front means an in-band {error:true} failure would
@@ -547,6 +553,8 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         const history = task?.conversationHistory ?? [];
 
         dispatch({ type: 'START_AI_CREATE', taskId });
+        // Register stream ownership synchronously before awaiting streamPlan (R214) — see startAITaskCreation.
+        creatingTaskIdRef.current = taskId;
 
         // streamPlan resolves {taskId, error:true} for in-band failures (R207) — roll back on those too.
         const res = await app.tasks.streamPlan(taskId, userMessage, history, attachments);

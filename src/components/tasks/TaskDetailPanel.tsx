@@ -436,9 +436,22 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     const text = input.trim();
     if (isActivelyStreaming) return;
     if (refineSubmittingRef.current) return; // single-submission latch (R212) — block competing streams
-    const { images } = attachmentsToImagePayload(attachments);
-    if (!text && images.length === 0) return;
+    const { images, dropped } = attachmentsToImagePayload(attachments);
+    if (!text && images.length === 0) {
+      // All staged images dropped by the renderer plan caps + no text → nothing to submit; warn + bail (R214).
+      if (dropped > 0) {
+        showAttachMessage(
+          `${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit); add text or a smaller image.`,
+        );
+      }
+      return;
+    }
     refineSubmittingRef.current = true;
+    // Warn immediately for a renderer-side drop (deterministic, before any async) — the composer survives
+    // here, so show it inline (R214). Main receives only what the renderer sent, so its droppedImages is 0.
+    if (dropped > 0) {
+      showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
+    }
 
     // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
     // snapshot while clearAttachments() released their bytes from the global counter. Submit with the
@@ -457,13 +470,8 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
           setInput('');
           clearAttachments();
         }
-        // Task-scope the warning (R212): only show it while still on the originating task — the panel is
-        // reused across task.id changes, so a switch during admission must not show task A's warning on B.
-        if (stillOriginTask && res.droppedImages && res.droppedImages > 0) {
-          showAttachMessage(
-            `${res.droppedImages} image${res.droppedImages === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
-          );
-        }
+        // (No main-side dropped-image warning here: the renderer caps the payload before IPC — R213/R214 —
+        // so main's droppedImages is always 0. The renderer-side warning above covers all drops.)
       })
       .finally(() => {
         refineSubmittingRef.current = false;

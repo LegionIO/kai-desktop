@@ -65,6 +65,10 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
   // two IPC calls (create + streamPlan), so a double Enter / double-click would create TWO persistent tasks.
   // Guard synchronously and release when the submission settles.
   const submittingRef = useRef(false);
+  // Mirror the submit latch into state so the composer can DISABLE editing while a submission is pending
+  // (R214): text/attachments added after Send but before the (successful) transition unmounts the view
+  // would otherwise be silently discarded. Disabling makes "pending" unambiguous.
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Voice recording hook
   const { startRecording: taskStartRecording } = useVoiceRecording();
@@ -240,11 +244,26 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
 
   const handleSubmit = useCallback(() => {
     const text = input.trim();
-    const { images } = attachmentsToImagePayload(attachments);
-    // Require text OR at least one image (R187).
-    if (!text && images.length === 0) return;
+    const { images, dropped } = attachmentsToImagePayload(attachments);
+    // Require text OR at least one image (R187). If images were staged but the renderer-side plan caps
+    // dropped ALL of them AND there's no text, there's nothing to submit — warn and bail rather than
+    // silently no-op (R214): main never receives dropped files, so the renderer must report them.
+    if (!text && images.length === 0) {
+      if (dropped > 0) {
+        showAttachMessage(
+          `${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit); add text or a smaller image.`,
+        );
+      }
+      return;
+    }
     if (submittingRef.current) return; // single-submission latch (R211) — block a double Enter/click
     submittingRef.current = true;
+    setIsSubmitting(true);
+    // Warn immediately for a PARTIAL drop (text + some images survive) — renderer-side + deterministic,
+    // before the view transitions away (R214). The provider's create-time notice covers main-side drops.
+    if (dropped > 0 && images.length > 0) {
+      showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
+    }
 
     // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
     // local snapshot while clearAttachments() released their bytes from the global counter (uncounted
@@ -258,10 +277,9 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
     ).finally(() => {
       // Release the latch on failure so the user can retry; on success the view unmounts anyway.
       submittingRef.current = false;
+      setIsSubmitting(false);
     });
-    // The composer's text/attachments stay intact on failure (no optimistic clear, R210); on success the
-    // view transitions away. A dropped-image warning is surfaced by the provider's surviving UI, not here.
-  }, [input, attachments, startAITaskCreation, currentWorkingDirectory]);
+  }, [input, attachments, startAITaskCreation, currentWorkingDirectory, showAttachMessage]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -348,6 +366,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
+              disabled={isSubmitting}
               placeholder="Describe what you want to accomplish..."
               rows={1}
               className={cn(
@@ -542,7 +561,7 @@ export const TaskCreationView: FC<TaskCreationViewProps> = ({ onDone, onCancel: 
                   <button
                     type="button"
                     onClick={handleSubmit}
-                    disabled={!canSend}
+                    disabled={!canSend || isSubmitting}
                     className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-40"
                   >
                     <SendHorizonalIcon className="h-4 w-4" />
