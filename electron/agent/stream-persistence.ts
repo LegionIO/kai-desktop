@@ -474,35 +474,41 @@ export function persistCooperativeInjectedUserTurn(
 ): PersistedInjectedUserTurn | null {
   if (!conversationId || !userText) return null;
   const partialAssistantHead = finalizeInterruptedTurn(appHome, conversationId);
-  // R229: finalizeInterruptedTurn returns null in TWO distinct situations: (a) genuinely nothing to persist
+  // R229/R230: finalizeInterruptedTurn returns null in TWO distinct situations: (a) genuinely nothing to persist
   // (no prefix), and (b) there WAS a partial prefix but its persist FAILED and R168 RETAINED the accumulator.
-  // Treating (b) as "no prefix" would pin the injected user on the current head and leave the continuation
-  // parented BEFORE the inject — eventually making the accepted answer/follow-up an off-branch sibling (the exact
-  // corruption the boundary split exists to prevent). Distinguish them: if content is still held, the prefix
-  // persist failed — DEFER the inject entirely (return null) rather than commit it to a wrong parent. The
-  // retained accumulator will be finalized by a later finalize/`done`, and the inject can be re-attempted then.
-  if (partialAssistantHead === null && persistenceAccumulatorHasContent(conversationId)) {
-    treeDebugLog(
-      `[INJECT-BOUNDARY-DEFER] conv=${conversationId} prefix persist FAILED but content retained — ` +
-        `deferring inject to avoid mis-parenting the continuation`,
-    );
-    return null;
-  }
+  // Treating (b) as "no prefix" would pin the injected user on the live head, leaving the continuation parented
+  // BEFORE the inject (off-branch sibling). R229 tried DEFERRING (return null) but callers have already drained
+  // the inject and a later supersession discards the retained accumulator — so a transient write failure lost the
+  // inject entirely. R230: instead PERSIST the inject pinned on the accumulator's OWN parent (the pre-inject head)
+  // — the prefix, when a later finalize recovers it, and the inject are then both children of the pre-inject head
+  // in the right chronological order, and the inject is never lost. Falls through to normal resolution if the
+  // accumulator's parent is unknown.
+  const retainedPrefixParent =
+    partialAssistantHead === null && persistenceAccumulatorHasContent(conversationId)
+      ? getPersistenceAccumulatorParentId(conversationId)
+      : undefined;
   const current = readConversation(appHome, conversationId);
   if (!current) return null;
   // Resolve the parent to pin the inject on:
   //   • a finalized partial prefix → pin on it (the normal cooperative-inject case);
+  //   • else (R230) the retained-prefix's OWN parent when the prefix persist FAILED but held content — the
+  //     pre-inject head, still-on-disk-validated — so the inject is chronologically correct and never lost;
   //   • else the caller-supplied superseded branch point (noPrefixParentId), when it
   //     still names a real node on disk — chronologically correct vs. the live head;
   //   • else the store's current head (first-turn / no-supersession fallback).
+  const nodeExistsOnDisk = (id: string): boolean =>
+    Array.isArray(current.messageTree) && (current.messageTree as Array<{ id?: unknown }>).some((m) => m?.id === id);
+  const retainedPrefixParentValid =
+    typeof retainedPrefixParent === 'string' && retainedPrefixParent && nodeExistsOnDisk(retainedPrefixParent)
+      ? retainedPrefixParent
+      : null;
   const noPrefixParent =
     opts && 'noPrefixParentId' in opts && typeof opts.noPrefixParentId === 'string' && opts.noPrefixParentId
-      ? Array.isArray(current.messageTree) &&
-        (current.messageTree as Array<{ id?: unknown }>).some((m) => m?.id === opts.noPrefixParentId)
+      ? nodeExistsOnDisk(opts.noPrefixParentId)
         ? opts.noPrefixParentId
         : null
       : null;
-  const explicitParent = partialAssistantHead ?? noPrefixParent ?? null;
+  const explicitParent = partialAssistantHead ?? retainedPrefixParentValid ?? noPrefixParent ?? null;
   const parentId = explicitParent ?? current.headId ?? null;
   treeDebugLog(
     `[INJECT-BOUNDARY] conv=${conversationId} partialAssistantHead=${JSON.stringify(partialAssistantHead)} ` +
@@ -566,19 +572,14 @@ export function finalizeGuiFallbackPrefixAtInject(
         restoreParentFromAcc: true,
       })
     : null;
-  // R229: if there WAS prefix content but the persist FAILED (R168 retained the accumulator, prefixHead === null),
-  // do NOT overwrite the accumulator with a fresh continuation seed below — that would permanently DESTROY the
-  // retained prefix content that hasn't made it to disk. Leave the retained accumulator intact so a later
-  // finalize/`done` can recover it, and signal the caller (null) to defer the boundary rather than reparent onto
-  // a lost prefix. Only re-seed the continuation accumulator when the prefix genuinely persisted (or there was
-  // none to begin with).
-  if (hasPrefix && prefixHead === null) {
-    treeDebugLog(
-      `[INJECT-GUI-DEFER] conv=${conversationId} GUI prefix persist FAILED but content retained — ` +
-        `not overwriting the accumulator; deferring`,
-    );
-    return null;
-  }
+  // R229/R230: we ALWAYS re-seed the continuation accumulator below, even when the prefix persist returned null
+  // (had content but the write failed, R168-retained). Earlier (R229) this path returned WITHOUT re-seeding to
+  // avoid clobbering the retained prefix, but that broke the GUI multi-inject batch loop (agent.ts) which
+  // depends on the continuation being re-seeded under en.id — a null return was read as "no prefix, proceed" and
+  // the next entry's continuation then accumulated under the wrong parent. Here the MAIN-side accumulator is a
+  // FALLBACK: the GUI renderer runs its own authoritative debounced persist under the same responseMessageId, so
+  // even if this main-side prefix copy is lost on re-seed, the renderer's copy (or its crash-fallback upsert)
+  // carries it. So re-seed unconditionally to keep the live turn's continuation correctly parented.
   // Re-seed a fresh continuation accumulator parented on the injected user, with
   // a DETERMINISTIC responseMessageId derived from the injected user id
   // (`${injectedUserId}-cont`). The RENDERER derives the identical id for its
@@ -805,6 +806,15 @@ export function discardPersistenceAccumulator(conversationId: string): void {
  *  full copy to disk. */
 export function hasPersistenceAccumulator(conversationId: string): boolean {
   return accumulators.has(conversationId);
+}
+
+/** The pre-inject parent the held accumulator is streaming under (its `parentId`), or undefined if there
+ *  is no accumulator. R230: on a prefix-persist FAILURE the inject boundary pins the injected user on THIS
+ *  (the pre-inject head) instead of the live head, so the inject is preserved AND chronologically correct
+ *  even though the prefix hasn't reached disk — no data-loss "defer", no mis-parent. */
+export function getPersistenceAccumulatorParentId(conversationId: string): string | null | undefined {
+  const acc = accumulators.get(conversationId);
+  return acc ? (acc.parentId ?? null) : undefined;
 }
 
 /** Whether the held accumulator (if any) has non-empty content to persist. Lets an on-demand

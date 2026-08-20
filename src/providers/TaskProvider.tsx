@@ -266,23 +266,15 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     if (!window.app?.tasks?.onChanged) return;
     const unsub = app.tasks.onChanged((tasks) => {
-      // R222/R225: a task deleted in ANOTHER window (or by a plugin) arrives here only as a replaced list.
-      // Reconcile orphaned recovery entries: any parked recovery whose id is no longer in the incoming list is
-      // unreachable (its TaskDetailPanel will never mount) so remove it AND release its byte charge (parked
-      // recovery stays accounted, R225). We iterate recoveryBytesRef — a ref mutated SYNCHRONOUSLY by
-      // parkRecovery/clearFailedSubmission — NOT a passive state-mirror — so a recovery entry
-      // parked microseconds before this broadcast is still seen (fixes the stale-mirror miss, R225). We
-      // intentionally do NOT touch submittedPayloadRef here — an in-flight entry is THIS window's live
-      // creation/refine and the broadcast list may simply not include it yet.
-      const liveIds = new Set(tasks.map((t) => t.id));
-      for (const id of Array.from(recoveryBytesRef.current.keys())) {
-        if (!liveIds.has(id)) {
-          const bytes = recoveryBytesRef.current.get(id) ?? 0;
-          recoveryBytesRef.current.delete(id);
-          if (bytes > 0) onAttachmentsReleased(bytes);
-          dispatch({ type: 'SET_FAILED_SUBMISSION', taskId: id, failed: null });
-        }
-      }
+      // R230: do NOT purge parked recovery entries based on a task's ABSENCE from this broadcast. A
+      // `tasks:changed` payload is NOT a reliable "these are the only live tasks" signal — listTasks() returns an
+      // EMPTY or PARTIAL array when the tasks directory or an individual file read transiently fails, so treating
+      // every omitted id as a confirmed deletion (R222/R225 did) could destroy the only parked prompt/images for
+      // a task that still exists on disk. Parked recovery is already bounded (48 MiB cap + oldest-eviction, R225)
+      // and released on RELIABLE per-task signals: the restore effect, local delete/archive purgeTaskPayload, and
+      // the main-emitted delete/archive terminal done{reason:'deleted'} (R223/R227). An orphaned recovery for a
+      // task deleted in another window with no active stream is bounded and harmless; a destroyed live draft is
+      // not. So we only refresh the task list here.
       dispatch({ type: 'SET_TASKS', tasks: tasks });
     });
     return unsub;
