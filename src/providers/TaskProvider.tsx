@@ -544,9 +544,33 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   const submittedPayloadRef = useRef<
     Map<
       string,
-      { text: string; attachments?: Array<{ image: string; mimeType?: string }>; producedText: boolean; bytes: number }
+      {
+        text: string;
+        attachments?: Array<{ image: string; mimeType?: string }>;
+        producedText: boolean;
+        bytes: number;
+        // R223: the stream INSTANCE id this window owns for the task, recorded once streamPlan resolves. The
+        // listener only lets an event resolve/feed this payload when the event's streamId matches (or is absent —
+        // pre-streamId early terminal events). Prevents a replacement stream started by ANOTHER window from
+        // resolving this window's in-flight payload.
+        streamId?: string;
+      }
     >
   >(new Map());
+  // Record the owned stream instance id for a task once streamPlan resolves (R223).
+  const setOwnedStreamId = useCallback((taskId: string, streamId: string | undefined) => {
+    if (!streamId) return;
+    const p = submittedPayloadRef.current.get(taskId);
+    if (p) p.streamId = streamId;
+  }, []);
+  // True when an event may act on the task's in-flight payload: either the payload has no streamId yet (early),
+  // or the event carries no streamId (pre-assignment terminal event), or the two match. A MISMATCH means the
+  // event belongs to a different stream instance (e.g. another window's replacement) and must be ignored here.
+  const streamMatchesOwned = useCallback((taskId: string, eventStreamId: string | undefined): boolean => {
+    const owned = submittedPayloadRef.current.get(taskId)?.streamId;
+    if (!owned || !eventStreamId) return true;
+    return owned === eventStreamId;
+  }, []);
   // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
   const rememberSubmission = useCallback(
     (taskId: string, text: string, attachments?: Array<{ image: string; mimeType?: string }>) => {
@@ -629,6 +653,13 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   useEffect(() => {
     if (!window.app?.tasks?.onStreamEvent) return;
     const unsub = app.tasks.onStreamEvent((evt) => {
+      // ---- Stream-instance ownership gate (R223) ----
+      // Ignore an event whose streamId doesn't match the instance THIS window owns for the task. A task's
+      // stream can be replaced (another window issues a new streamPlan for the same taskId); without this gate
+      // the replacement's events would resolve/clear or feed this window's in-flight payload and UI. Absent
+      // streamIds (on either side) fall through as a match for backward-compat with pre-assignment events.
+      if (!streamMatchesOwned(evt.taskId, evt.streamId)) return;
+
       // ---- Recovery/persistence bookkeeping: PER TASK, never gated by which task the UI shows (R220). ----
       // Any task with a tracked submitted payload must have its produced-text flag and terminal outcome
       // resolved, whether or not it is the displayed task and whether or not its START_AI_CREATE has run.
@@ -639,6 +670,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         if (evt.type === 'text-delta' && evt.text) {
           const p = submittedPayloadRef.current.get(evt.taskId);
           if (p) p.producedText = true; // R219: buffered/live text counts as produced so an empty-done isn't misjudged
+        } else if (evt.type === 'done' && evt.reason === 'deleted') {
+          // R223: the task was deleted while its stream was in flight — drop the payload WITHOUT recovery
+          // (a deliberate delete is not a failure, and the task no longer exists to restore into).
+          dropSubmission(evt.taskId);
+          clearFailedSubmission(evt.taskId);
         } else if (evt.type === 'done') {
           resolveTerminalOutcome(evt.taskId, false);
         } else if (evt.type === 'error') {
@@ -682,7 +718,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       }
     });
     return unsub;
-  }, [resolveTerminalOutcome]);
+  }, [resolveTerminalOutcome, streamMatchesOwned, dropSubmission, clearFailedSubmission]);
 
   const startAITaskCreation = useCallback(
     async (
@@ -728,9 +764,26 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           // data-URL recovery entry (R222). Exactly one of the two holds the payload.
           dropSubmission(task.id);
           clearFailedSubmission(task.id);
-          void app.tasks.delete?.(task.id).catch(() => {});
+          // R223: tasks:delete resolves {error}/{ok:false} rather than rejecting, so a fire-and-forget
+          // .catch() would leave a durable orphaned "New Task" on a filesystem delete failure. Await the
+          // result and re-sync the list if it didn't succeed so the orphan doesn't linger in the UI.
+          try {
+            const del = await app.tasks.delete?.(task.id);
+            if (del && !del.ok) {
+              const tasks = await app.tasks.list();
+              dispatch({ type: 'SET_TASKS', tasks });
+            }
+          } catch (delErr) {
+            console.error('[TaskProvider] Failed to clean up placeholder task after admission failure:', delErr);
+            const tasks = await app.tasks.list();
+            dispatch({ type: 'SET_TASKS', tasks });
+          }
           return { ok: false };
         }
+
+        // R223: record the stream instance id we own so the event listener ignores a replacement stream
+        // (e.g. started by another window) that would otherwise resolve/feed this window's payload.
+        setOwnedStreamId(task.id, (res as { streamId?: string })?.streamId);
 
         dispatch({ type: 'START_AI_CREATE', taskId: task.id });
         flushStreamBuffer(task.id); // flush events buffered before this dispatch (R215)
@@ -760,7 +813,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission],
+    [activeWorkspaceId, flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission, setOwnedStreamId],
   );
 
   const refineTaskPlan = useCallback(
@@ -791,6 +844,9 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
           dispatch({ type: 'STREAM_DONE' });
           return { ok: false };
         }
+        // R223: record the stream instance id we own so a replacement stream (another window) can't resolve
+        // this refine's in-flight payload.
+        setOwnedStreamId(taskId, (res as { streamId?: string })?.streamId);
         return { ok: true, droppedImages: (res as { droppedImages?: number })?.droppedImages };
       } catch (err) {
         console.error('[TaskProvider] Failed to refine task plan:', err);
@@ -799,7 +855,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         return { ok: false };
       }
     },
-    [flushStreamBuffer, rememberSubmission, resolveTerminalOutcome],
+    [flushStreamBuffer, rememberSubmission, resolveTerminalOutcome, setOwnedStreamId],
   );
 
   const cancelAIStream = useCallback(() => {

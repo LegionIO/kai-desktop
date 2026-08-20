@@ -139,4 +139,18 @@ export type TaskStreamEvent = {
   type: 'text-delta' | 'done' | 'error';
   text?: string;
   error?: string;
+  /**
+   * Identifies the specific plan-stream INSTANCE that emitted this event (R223). A task can have its stream
+   * replaced (e.g. another window starts a new stream for the same taskId); without this, a replacement
+   * stream's events would resolve/clear a different window's in-flight payload. The renderer records the
+   * streamId it started and ignores events whose streamId doesn't match. Optional for backward compatibility
+   * with early terminal events emitted before a stream id is assigned (those carry no recovery consequence).
+   */
+  streamId?: string;
+  /**
+   * Set on a terminal `done` emitted because the task was DELETED while its plan stream was in flight (R223).
+   * The renderer drops the in-flight payload WITHOUT triggering draft recovery — a deliberate deletion is not
+   * a failure to recover from, and the task no longer exists to restore into.
+   */
+  reason?: 'deleted';
 };

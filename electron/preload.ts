@@ -754,6 +754,9 @@ const appAPI = {
     ) =>
       ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history, attachments) as Promise<{
         taskId: string;
+        error?: boolean;
+        droppedImages?: number;
+        streamId?: string;
       }>,
     cancelPlanStream: (taskId: string) => ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
     generateTitle: (userMessage: string) =>

@@ -220,7 +220,7 @@ const conversationMessageSchema = z.object({
 });
 
 /** Active plan generation streams, keyed by taskId. */
-const activeTaskStreams = new Map<string, { token: symbol; abort: () => void }>();
+const activeTaskStreams = new Map<string, { token: symbol; streamId: string; abort: () => void }>();
 
 // ── Async Mutex ─────────────────────────────────────────────────────────
 
@@ -636,14 +636,18 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
   ipcMain.handle('tasks:delete', (_e, id: string) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
     try {
-      // R222: abort any in-flight plan-generation stream for this task BEFORE removing it. Deletion already
+      // R222/R223: abort any in-flight plan-generation stream for this task BEFORE removing it. Deletion already
       // stops the assigned running agent (onTaskDeleted below), but a background plan stream lives in
       // activeTaskStreams and would otherwise keep consuming the provider connection and broadcasting deltas
-      // for a task that no longer exists. Idempotent: no-op when there is no active stream.
+      // for a task that no longer exists. Aborting suppresses the stream's own terminal events, so emit a
+      // dedicated terminal `done` stamped with the stream's id + reason:'deleted' so ANY window owning that
+      // in-flight payload drops it WITHOUT triggering draft recovery (a deliberate delete is not a failure).
+      // Idempotent: no-op when there is no active stream.
       const activeStream = activeTaskStreams.get(id);
       if (activeStream) {
         activeStream.abort();
         activeTaskStreams.delete(id);
+        broadcastTaskStreamEvent({ taskId: id, type: 'done', streamId: activeStream.streamId, reason: 'deleted' });
       }
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       // Clear the terminal output buffers (memory + disk) for this task's
@@ -808,19 +812,27 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       // same taskId isn't torn down by this one's finally (which would make the
       // new stream uncancellable and race plan writes).
       const streamToken = Symbol(taskId);
-      activeTaskStreams.set(taskId, { token: streamToken, abort: () => controller.abort() });
+      // R223: a STRING instance id stamped on every broadcast event so a renderer can tell which stream
+      // instance emitted it. A task's stream can be replaced (another window issues a new streamPlan for the
+      // same taskId); without this, the replacement's events would resolve/clear the first window's in-flight
+      // payload. Returned in the resolved result so the caller records the id it owns.
+      const streamId = `${taskId}:${randomUUID()}`;
+      activeTaskStreams.set(taskId, { token: streamToken, streamId, abort: () => controller.abort() });
       const isCurrent = () => activeTaskStreams.get(taskId)?.token === streamToken;
       const clearIfCurrent = () => {
         if (isCurrent()) {
           activeTaskStreams.delete(taskId);
         }
       };
+      // Every event this stream emits carries its streamId. `emit` is the streamId-stamped broadcaster.
+      const emit = (event: Parameters<typeof broadcastTaskStreamEvent>[0]) =>
+        broadcastTaskStreamEvent({ ...event, streamId });
       // Broadcast a terminal event ONLY if THIS stream still owns the task (R190): after the first
       // `await` below, a newer stream-plan request for the same taskId may have replaced this one. A
       // stale run's error/done must not delete the replacement's entry (clearIfCurrent handles the map)
       // nor emit a terminal event the UI would attribute to the live stream.
       const emitTerminalIfCurrent = (event: Parameters<typeof broadcastTaskStreamEvent>[0]) => {
-        if (isCurrent()) broadcastTaskStreamEvent(event);
+        if (isCurrent()) emit(event);
       };
 
       // Resolve config and model
@@ -940,7 +952,9 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           for await (const textPart of (await result).textStream) {
             if (controller.signal.aborted) break;
             fullText += textPart;
-            broadcastTaskStreamEvent({ taskId, type: 'text-delta', text: textPart });
+            // Stamp the streamId (R223) and only emit while THIS stream still owns the task, so a stale run's
+            // deltas can't feed a replacement stream's UI/recovery.
+            if (isCurrent()) emit({ taskId, type: 'text-delta', text: textPart });
           }
 
           // Persist final description to task file
@@ -984,9 +998,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         }
       })();
 
-      // Return droppedImages in the RESOLVED result (R209) so the composer can warn deterministically —
-      // a stream-event warning would race the renderer's post-await ownership registration and be dropped.
-      return droppedImages > 0 ? { taskId, droppedImages } : { taskId };
+      // Return droppedImages AND the streamId in the RESOLVED result (R209/R223) so the composer can warn
+      // deterministically and record which stream instance it owns — a stream-event warning would race the
+      // renderer's post-await ownership registration and be dropped.
+      return { taskId, streamId, ...(droppedImages > 0 ? { droppedImages } : {}) };
     },
   );
 

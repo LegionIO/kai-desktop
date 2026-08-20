@@ -548,7 +548,7 @@ type AppAPI = {
       userMessage: string,
       history?: TaskConversationMessage[],
       attachments?: Array<{ image: string; mimeType?: string }>,
-    ) => Promise<{ taskId: string; error?: boolean; droppedImages?: number }>;
+    ) => Promise<{ taskId: string; error?: boolean; droppedImages?: number; streamId?: string }>;
     cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
