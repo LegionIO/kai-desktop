@@ -218,11 +218,11 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   // prompt+images. Repopulate THIS task's composer with them so the user can retry, then clear the payload.
   // Only restore into an empty composer so we don't clobber something the user has since typed.
   useEffect(() => {
-    const failed = state.failedSubmission;
-    if (!failed || failed.taskId !== task.id) return;
-    // Only clear the payload after a COMPLETE successful restore (R218): if the composer is busy (a newer
-    // draft) or addAttachments rejects some images (over the cap), leave failedSubmission set so the prompt
-    // isn't permanently discarded — a later empty-composer render (or freed budget) can retry the restore.
+    const failed = state.failedSubmissions[task.id];
+    if (!failed) return;
+    // Only clear the entry after a COMPLETE successful restore (R218): if the composer is busy (a newer
+    // draft) or addAttachments rejects some images (over the cap), leave the entry set so the prompt isn't
+    // permanently discarded — a later empty-composer render (or freed budget) can retry the restore.
     const composerBusy = (textareaRef.current?.value ?? '').trim().length > 0 || getResidentBytes() > 0;
     if (composerBusy) return;
     if (failed.text) setInput(failed.text);
@@ -241,9 +241,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       if (skipped.length > 0) allAttachmentsRestored = false;
     }
     showAttachMessage('The plan failed to generate — your message was restored. Try again.');
-    // Keep the payload if some attachments couldn't be re-staged (budget) so they aren't lost; retry later.
-    if (allAttachmentsRestored) clearFailedSubmission();
-  }, [state.failedSubmission, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
+    // Keep the entry if some attachments couldn't be re-staged (budget) so they aren't lost; retry later.
+    if (allAttachmentsRestored) clearFailedSubmission(task.id);
+  }, [state.failedSubmissions, task.id, getResidentBytes, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
