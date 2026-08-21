@@ -1814,6 +1814,33 @@ function recoveryTombstoneConversation(answerKey: string): string | undefined {
   return t.conversationId;
 }
 
+/** R251: recover the run nonce for a `${convId}::<nonce>::${toolCallId}` key by scanning the run-scoped
+ *  raced-answer RECOVERY state (handoff answerKeys + tombstone keys). This is the ONLY server-side place the
+ *  nonce reliably survives a post-abort settle of an ORDINARY `any-renderer` approval (no durable authority
+ *  record exists for those — R251 finding). Returns the nonce ONLY on an UNAMBIGUOUS single match so a
+ *  reject/dismiss/answer can purge/stash under the SAME run-scoped key the handoff/tombstone holds; undefined
+ *  otherwise (caller falls back to the conversation-only key). */
+function recoverRunNonceFromRecoveryState(convId: string | undefined, toolCallId: string): string | undefined {
+  if (!convId) return undefined;
+  const prefix = `${convId}::`;
+  const suffix = `::${toolCallId}`;
+  const seen = new Set<string>();
+  const consider = (key: string): void => {
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) return;
+    const middle = key.slice(prefix.length, key.length - suffix.length);
+    if (middle.length === 0 || middle.includes('::')) return;
+    seen.add(middle);
+  };
+  const state = racedAnswerHandoffs.get(convId);
+  if (state) {
+    for (const k of state.answerKeys) consider(k);
+  }
+  for (const [k, t] of recoveryTombstones) {
+    if (t.conversationId === convId) consider(k);
+  }
+  return seen.size === 1 ? [...seen][0] : undefined;
+}
+
 /** Route any ALREADY-STASHED answers for these keys through the durable
  *  recovered-answer path (re-inject into the ORIGIN conversation as a labeled turn,
  *  or persist as an Alert) instead of leaving them orphaned in the bounded stash
@@ -2658,8 +2685,11 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
   // persistence-owning renderer without its user node (→ discards the later
   // inject-consumed id, persists the continuation on the wrong branch) and could
   // leave agent:submit stuck 'running' before stream launch (R106 finding-1).
-  // Browser-owned approvals are restricted to authorized windows (main's authority routing).
-  const authorizedApprovalWindowIds = resolveApprovalBroadcastWindowIds(event);
+  // Browser-owned approvals are restricted to authorized windows (main's authority routing). R251: use the
+  // STAMPED copy (eventToBroadcast) — it carries runGeneration (the run nonce), so lookupPendingByEvent can
+  // resolve the RUN-SCOPED pending entry and recognize a browser-owned generic approval as restricted. The raw
+  // `event` may not have runGeneration yet (stamped just above), which would miss the entry and over-broadcast.
+  const authorizedApprovalWindowIds = resolveApprovalBroadcastWindowIds(eventToBroadcast);
   for (const win of BrowserWindow.getAllWindows()) {
     if (authorizedApprovalWindowIds && !authorizedApprovalWindowIds.has(win.webContents.id)) continue;
     try {
@@ -10529,10 +10559,18 @@ export function registerAgentHandlers(
     // If the turn already aborted + registered a raced-answer handoff for this
     // question, an explicit reject must purge it so a delayed answer from another
     // surface can't still be delivered to the successor. The handoff/tombstone keys are
-    // run-scoped (R192/R249), so purge under the run-scoped key (with a
-    // conversation-only fallback for a client that threaded no run nonce).
-    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId, runNonce));
-    if (runNonce) purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
+    // run-scoped (R192/R249). R251: recover the run nonce even when the caller didn't thread it AND the pending
+    // entry is already gone — from the pending key, else the durable authority record, else the run-scoped
+    // recovery state itself (the only place it survives for an ordinary any-renderer approval post-abort). Purge
+    // under the run-scoped key, with a conversation-only fallback for a truly nonce-less legacy path.
+    const rejConv = sanitizeAnswerConversationId(conversationId);
+    const rejNonce =
+      runNonce ??
+      extractRunNonceFromApprovalKey(resolved?.key, rejConv, toolCallId) ??
+      findRunNonceForAuthorityRecord(rejConv, toolCallId) ??
+      recoverRunNonceFromRecoveryState(rejConv, toolCallId);
+    purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId, rejNonce));
+    if (rejNonce) purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
@@ -10552,8 +10590,16 @@ export function registerAgentHandlers(
       pending.resolve('dismiss');
       pendingToolApprovals.delete(resolved.key);
     }
-    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId, runNonce));
-    if (runNonce) purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
+    // R251: same run-nonce recovery as reject — purge the run-scoped handoff/tombstone even when the caller
+    // didn't thread the nonce and the pending entry is already gone (post-abort).
+    const disConv = sanitizeAnswerConversationId(conversationId);
+    const disNonce =
+      runNonce ??
+      extractRunNonceFromApprovalKey(resolved?.key, disConv, toolCallId) ??
+      findRunNonceForAuthorityRecord(disConv, toolCallId) ??
+      recoverRunNonceFromRecoveryState(disConv, toolCallId);
+    purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId, disNonce));
+    if (disNonce) purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
@@ -10603,7 +10649,8 @@ export function registerAgentHandlers(
       const effectiveNonce =
         runNonce ??
         extractRunNonceFromApprovalKey(pendingResolved?.key, convId, toolCallId) ??
-        findRunNonceForAuthorityRecord(convId, toolCallId);
+        findRunNonceForAuthorityRecord(convId, toolCallId) ??
+        recoverRunNonceFromRecoveryState(convId, toolCallId);
       const answerKey = makeAnswerKey(convId, toolCallId, effectiveNonce);
       const approvalMapKey = approvalKey(convId, toolCallId, effectiveNonce);
       // A Browser-authorized approval may only be answered by the authorized surface (main's authority
