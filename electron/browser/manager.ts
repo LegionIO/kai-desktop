@@ -7856,6 +7856,80 @@ export class BrowserManager {
       if (remaining <= 0) throw new BrowserRendererDeadlineError(operation, timeoutMs);
       return remaining;
     };
+    const awaitSharedLoadWithoutView = async (
+      sharedLoadPromise: Promise<WebContentsView>,
+    ): Promise<WebContentsView> => {
+      if (deadlineAt === null && !abortSignal) return sharedLoadPromise;
+      let cancellation: 'timeout' | 'abort' | null = null;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let abortListener: (() => void) | undefined;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        const remaining = deadlineAt === null ? 0 : remainingRendererTimeout('Browser page load');
+        if (remaining > 0) {
+          timer = setTimeout(() => {
+            cancellation = 'timeout';
+            reject(new BrowserRendererDeadlineError('Browser page load', timeoutMs));
+          }, remaining);
+          timer.unref?.();
+        }
+        if (abortSignal) {
+          abortListener = () => {
+            cancellation = 'abort';
+            reject(new Error('Browser page load was cancelled.'));
+          };
+          abortSignal.addEventListener('abort', abortListener, { once: true });
+          if (abortSignal.aborted) abortListener();
+        }
+      });
+      try {
+        return await Promise.race([sharedLoadPromise, cancelled]);
+      } catch (error) {
+        // A shared restoration can still be in scripted-origin cleanup before
+        // it owns a WebContents. Once it does own one, preserve the same
+        // cancellation semantics as runRendererOperationWithDeadline without
+        // ever reclaiming a replacement created by unrelated user work.
+        const loadingView = tab.view;
+        if (
+          cancellation &&
+          !preserveExistingLoadingViewOnTimeout &&
+          tab.viewLoadPromise === sharedLoadPromise &&
+          loadingView &&
+          !loadingView.webContents.isDestroyed()
+        ) {
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.error =
+            cancellation === 'timeout' ? 'Browser page load timed out.' : 'Browser page load was cancelled.';
+          this.emitTabs(tab.shell.conversationId);
+        }
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (abortSignal && abortListener) abortSignal.removeEventListener('abort', abortListener);
+      }
+    };
+    const joinSharedLoad = async (
+      sharedLoadPromise: Promise<WebContentsView>,
+      sharedLoadState: BrowserViewLoadState | undefined,
+    ): Promise<WebContentsView> => {
+      const loadingView = tab.view && !tab.view.webContents.isDestroyed() ? tab.view : null;
+      const restoredView = loadingView
+        ? await this.runRendererOperationWithDeadline(
+            tab,
+            loadingView.webContents,
+            'Browser page load',
+            remainingRendererTimeout('Browser page load'),
+            () => sharedLoadPromise,
+            abortSignal,
+            undefined,
+            !preserveExistingLoadingViewOnTimeout,
+          )
+        : await awaitSharedLoadWithoutView(sharedLoadPromise);
+      if (sharedLoadState?.expectedInitialLoadGeneration !== undefined) {
+        recordExpectedInitialLoadGeneration?.(sharedLoadState.expectedInitialLoadGeneration);
+      }
+      return restoredView;
+    };
     this.assertHostRendererOperationCurrent();
     if (this.disposed) throw new Error('The in-app browser has been disposed.');
     if (!this.config().enabled) throw new Error('The in-app browser is disabled in Settings.');
@@ -7876,8 +7950,7 @@ export class BrowserManager {
         if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
       }
     }
-    if (tab.view && !tab.view.webContents.isDestroyed()) {
-      if (!tab.viewLoadPromise) return tab.view;
+    if (tab.viewLoadPromise) {
       // A user may have started this restoration without a deadline. An
       // assistant joining that shared load still needs its own abort/deadline.
       // Most operations reclaim a wedged target; bounded network observation
@@ -7885,72 +7958,74 @@ export class BrowserManager {
       // content-free timeout result.
       const sharedLoadPromise = tab.viewLoadPromise;
       const sharedLoadState = tab.viewLoadState?.promise === sharedLoadPromise ? tab.viewLoadState : undefined;
-      const restoredView = await this.runRendererOperationWithDeadline(
-        tab,
-        tab.view.webContents,
-        'Browser page load',
-        remainingRendererTimeout('Browser page load'),
-        () => sharedLoadPromise,
-        abortSignal,
-        undefined,
-        !preserveExistingLoadingViewOnTimeout,
-      );
-      if (sharedLoadState?.expectedInitialLoadGeneration !== undefined) {
-        recordExpectedInitialLoadGeneration?.(sharedLoadState.expectedInitialLoadGeneration);
-      }
-      return restoredView;
+      return joinSharedLoad(sharedLoadPromise, sharedLoadState);
     }
+    if (tab.view && !tab.view.webContents.isDestroyed()) return tab.view;
     throwIfBrowserAborted(abortSignal);
-    const pendingScriptCleanup = this.clearPendingScriptedOriginsBeforeRenderer(tab);
-    if (pendingScriptCleanup) {
-      await pendingScriptCleanup;
-      throwIfBrowserAborted(abortSignal);
-      this.assertScopeAvailable(tab.scopeKey);
-      if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
-    }
-    if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
-    // A hidden renderer bootstrap navigates through about:blank and therefore
-    // updates shell metadata before the requested navigation begins. Preserve
-    // the caller's target independently of those intermediate events.
-    const requestedInitialUrl = tab.shell.url || 'about:blank';
-    if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = true;
-    let view: WebContentsView;
-    try {
-      view = this.createView(tab);
-    } catch (error) {
-      if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = false;
-      throw error;
-    }
-    if (this.validatingProxy) {
-      const scopedSession = session.fromPartition(tab.partition);
-      try {
-        await this.validatingProxy.configureSession(scopedSession);
-      } catch (error) {
-        if (this.tabs.get(tab.shell.id) === tab && tab.view === view) {
-          this.destroyView(tab);
-          tab.shell.discarded = true;
-        }
-        throw new Error('The Browser connection-validation proxy could not start.', { cause: error });
-      }
-      throwIfBrowserAborted(abortSignal);
-      this.assertScopeAvailable(tab.scopeKey);
-      if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
-      if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
-    }
-    // createView installs the native surface synchronously. Attach an active
-    // restored tab before waiting for a slow or auth-blocked load so the user
-    // can see and stop it instead of staring at an empty Browser viewport.
-    this.attachActiveView(tab.shell.conversationId);
-    const guardInitialLoad =
-      tab.aiNetworkRestricted && !tab.trustedUserNavigation && this.aiAllowPrivateNetwork === false;
-    let initialGuardReady = !guardInitialLoad;
     // Only manager-issued loadURL calls may advance an approved discarded-tab
     // restoration lease. A page/user navigation interleaved with those calls
     // produces an extra generation and is rejected after ensureView returns.
     let expectedInitialLoadGeneration = tab.generation;
     const loadState: BrowserViewLoadState = { promise: null };
-    const loadPromise = (async () => {
+    // Publish the per-tab barrier before scripted-origin cleanup, proxy setup,
+    // or native view creation can yield. Every concurrent caller therefore
+    // joins this exact restoration instead of observing a blank renderer as
+    // ready or creating a competing WebContentsView.
+    const restoreView = async (): Promise<WebContentsView> => {
+      const pendingScriptCleanup = this.clearPendingScriptedOriginsBeforeRenderer(tab);
+      if (pendingScriptCleanup) {
+        await pendingScriptCleanup;
+      }
+      throwIfBrowserAborted(abortSignal);
+      this.assertScopeAvailable(tab.scopeKey);
+      if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
+      if (tab.viewLoadState !== loadState) {
+        throw new Error('The browser page changed while its renderer was being restored.');
+      }
+      if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
+      // A hidden renderer bootstrap navigates through about:blank and therefore
+      // updates shell metadata before the requested navigation begins. Preserve
+      // the caller's target independently of those intermediate events.
+      const requestedInitialUrl = tab.shell.url || 'about:blank';
+      if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = true;
+      let view: WebContentsView;
       try {
+        view = this.createView(tab);
+      } catch (error) {
+        if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = false;
+        throw error;
+      }
+      try {
+        if (this.validatingProxy) {
+          const scopedSession = session.fromPartition(tab.partition);
+          try {
+            await this.validatingProxy.configureSession(scopedSession);
+          } catch (error) {
+            if (this.tabs.get(tab.shell.id) === tab && tab.view === view) {
+              this.destroyView(tab);
+              tab.shell.discarded = true;
+            }
+            throw new Error('The Browser connection-validation proxy could not start.', { cause: error });
+          }
+          throwIfBrowserAborted(abortSignal);
+          this.assertScopeAvailable(tab.scopeKey);
+          if (
+            this.tabs.get(tab.shell.id) !== tab ||
+            tab.view !== view ||
+            view.webContents.isDestroyed() ||
+            tab.viewLoadState !== loadState
+          ) {
+            throw new Error('The browser page was closed while it was loading.');
+          }
+          if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
+        }
+        // createView installs the native surface synchronously. Attach an
+        // active restored tab before waiting for a slow or auth-blocked load so
+        // the user can see and stop it instead of staring at an empty viewport.
+        this.attachActiveView(tab.shell.conversationId);
+        const guardInitialLoad =
+          tab.aiNetworkRestricted && !tab.trustedUserNavigation && this.aiAllowPrivateNetwork === false;
+        let initialGuardReady = !guardInitialLoad;
         try {
           const initialUrl = typeof view.webContents.getURL === 'function' ? view.webContents.getURL() : undefined;
           const activeDialogGuard =
@@ -8058,10 +8133,20 @@ export class BrowserManager {
       loadState.expectedInitialLoadGeneration = expectedInitialLoadGeneration;
       recordExpectedInitialLoadGeneration?.(expectedInitialLoadGeneration);
       return view;
-    })();
+    };
+    let resolveLoad!: (view: WebContentsView) => void;
+    let rejectLoad!: (error: unknown) => void;
+    const loadPromise = new Promise<WebContentsView>((resolve, reject) => {
+      resolveLoad = resolve;
+      rejectLoad = reject;
+    });
     loadState.promise = loadPromise;
     tab.viewLoadPromise = loadPromise;
     tab.viewLoadState = loadState;
+    // Start only after the shared state is visible. restoreView still runs
+    // synchronously through native creation until its first real await, which
+    // keeps active-tab attachment responsive while closing the publication gap.
+    void restoreView().then(resolveLoad, rejectLoad);
     try {
       return await loadPromise;
     } finally {

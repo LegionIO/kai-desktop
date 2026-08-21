@@ -17186,6 +17186,194 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
   });
 
+  it('publishes one shared restoration before validating-proxy setup settles', async () => {
+    const proxySetup = deferred<void>();
+    const pageLoad = deferred<void>();
+    let currentUrl = '';
+    const view = {
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL: vi.fn(async (url: string) => {
+          currentUrl = url;
+          tab.generation++;
+          await pageLoad.promise;
+        }),
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://proxy.example/account',
+        discarded: true,
+      },
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+      generation: 8,
+      trustedUserNavigation: false,
+      trustedUserNavigationLease: 3,
+      aiNetworkRestricted: false,
+      aiControlOwnerId: null,
+    };
+    const fakeSession = {};
+    electronMocks.fromPartition.mockReturnValue(fakeSession);
+    const configureSession = vi.fn(() => proxySetup.promise);
+    const createView = vi.fn(() => {
+      tab.view = view;
+      return view;
+    });
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: true,
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView,
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validatingProxy: { configureSession },
+    });
+    const firstGeneration = vi.fn();
+    const secondGeneration = vi.fn();
+
+    const first = invokePrivate(
+      manager,
+      'ensureView',
+      tab,
+      undefined,
+      30_000,
+      false,
+      false,
+      firstGeneration,
+    ) as Promise<unknown>;
+    const sharedLoadPromise = tab.viewLoadPromise;
+    let secondSettled = false;
+    const second = (
+      invokePrivate(manager, 'ensureView', tab, undefined, 30_000, false, false, secondGeneration) as Promise<unknown>
+    ).finally(() => {
+      secondSettled = true;
+    });
+
+    expect(createView).toHaveBeenCalledOnce();
+    expect(configureSession).toHaveBeenCalledWith(fakeSession);
+    expect(tab.viewLoadPromise).toBe(sharedLoadPromise);
+    expect(view.webContents.loadURL).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(secondSettled).toBe(false);
+
+    proxySetup.resolve();
+    await vi.waitFor(() => expect(view.webContents.loadURL).toHaveBeenCalledOnce());
+    pageLoad.resolve();
+    await expect(Promise.all([first, second])).resolves.toEqual([view, view]);
+
+    expect(createView).toHaveBeenCalledOnce();
+    expect(firstGeneration).toHaveBeenCalledWith(9);
+    expect(secondGeneration).toHaveBeenCalledWith(9);
+    expect(tab.viewLoadPromise).toBeNull();
+    expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
+  });
+
+  it('shares scripted-origin cleanup and restoration provenance across concurrent callers', async () => {
+    const scriptedCleanup = deferred<void>();
+    let currentUrl = '';
+    const view = {
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL: vi.fn(async (url: string) => {
+          currentUrl = url;
+          tab.generation++;
+        }),
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://scripted.example/dashboard',
+        discarded: true,
+      },
+      scopeKey: 'global',
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+      generation: 12,
+      trustedUserNavigation: false,
+      trustedUserNavigationLease: 4,
+      aiNetworkRestricted: false,
+      aiControlOwnerId: null,
+    };
+    const clearPendingScriptedOriginsBeforeRenderer = vi.fn(() => scriptedCleanup.promise);
+    const createView = vi.fn(() => {
+      tab.view = view;
+      return view;
+    });
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: true,
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer,
+      createView,
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const firstGeneration = vi.fn();
+    const secondGeneration = vi.fn();
+
+    const first = invokePrivate(
+      manager,
+      'ensureView',
+      tab,
+      undefined,
+      30_000,
+      false,
+      false,
+      firstGeneration,
+    ) as Promise<unknown>;
+    const sharedLoadPromise = tab.viewLoadPromise;
+    const second = invokePrivate(
+      manager,
+      'ensureView',
+      tab,
+      undefined,
+      30_000,
+      false,
+      false,
+      secondGeneration,
+    ) as Promise<unknown>;
+
+    expect(clearPendingScriptedOriginsBeforeRenderer).toHaveBeenCalledOnce();
+    expect(createView).not.toHaveBeenCalled();
+    expect(tab.viewLoadPromise).toBe(sharedLoadPromise);
+
+    scriptedCleanup.resolve();
+    await expect(Promise.all([first, second])).resolves.toEqual([view, view]);
+
+    expect(createView).toHaveBeenCalledOnce();
+    expect(view.webContents.loadURL).toHaveBeenCalledOnce();
+    expect(firstGeneration).toHaveBeenCalledWith(13);
+    expect(secondGeneration).toHaveBeenCalledWith(13);
+    expect(tab.viewLoadPromise).toBeNull();
+    expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
+  });
+
   it('preserves the requested URL across a hidden assistant renderer bootstrap', async () => {
     let currentUrl = '';
     const loadURL = vi.fn(async (url: string) => {
