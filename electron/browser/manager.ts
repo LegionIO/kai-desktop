@@ -904,6 +904,12 @@ type BrowserDebuggerOwnership = {
   detachWhenIdle: boolean;
 };
 
+type BrowserDebuggerLease = {
+  release: () => void;
+  /** Detach only the debugger generation acquired by this lease. */
+  cancel: () => void;
+};
+
 type BrowserLocatedTarget = {
   x: number;
   y: number;
@@ -4865,7 +4871,7 @@ export class BrowserManager {
    * one-shot release is called. All manager CDP users share this counter so a
    * panel mount may restore viewport metrics concurrently without detaching an
    * assistant action, screenshot, sensitivity scan, or document guard. */
-  private acquireBrowserDebugger(contents: WebContents): () => void {
+  private acquireBrowserDebuggerLease(contents: WebContents): BrowserDebuggerLease {
     // Unit fixtures construct BrowserManager without its constructor. Lazily
     // initialize this field as well as declaring it above so those focused
     // tests exercise the same ownership behavior.
@@ -4885,24 +4891,41 @@ export class BrowserManager {
     }
     ownership.references++;
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
       released = true;
       ownership!.references = Math.max(0, ownership!.references - 1);
       if (ownership!.references !== 0) return;
+      // Cancellation detaches the shared transport and removes this ownership
+      // object so a successor can attach immediately. The cancelled command's
+      // release closure may run one microtask later; never let that stale
+      // closure delete or detach the successor's independently-owned session.
+      if (this.debuggerOwnership.get(contents) !== ownership) return;
       this.debuggerOwnership.delete(contents);
       if (ownership!.detachWhenIdle && !contents.isDestroyed() && contents.debugger.isAttached()) {
         contents.debugger.detach();
       }
     };
+    return {
+      release,
+      cancel: () => this.cancelManagerOwnedDebugger(contents, ownership),
+    };
+  }
+
+  private acquireBrowserDebugger(contents: WebContents): () => void {
+    return this.acquireBrowserDebuggerLease(contents).release;
   }
 
   /** Cancel a bounded presentation-only CDP operation without touching a
    * debugger attachment that predates BrowserManager ownership (for example a
    * developer-tools session). Detaching rejects outstanding manager commands. */
-  private cancelManagerOwnedDebugger(contents: WebContents): void {
+  private cancelManagerOwnedDebugger(contents: WebContents, expected?: BrowserDebuggerOwnership): void {
     const ownership = this.debuggerOwnership?.get(contents);
-    if (!ownership?.detachWhenIdle) return;
+    if (!ownership?.detachWhenIdle || (expected && ownership !== expected)) return;
+    // Electron exposes one debugger transport per WebContents. Detaching it to
+    // cancel one command would also reject every concurrently leased command;
+    // let the cancelled wrapper unwind and the final shared release detach.
+    if (ownership.references > 1) return;
     this.debuggerOwnership.delete(contents);
     try {
       if (!contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
@@ -7968,6 +7991,7 @@ export class BrowserManager {
     const joinSharedLoad = async (
       sharedLoadPromise: Promise<WebContentsView>,
       sharedLoadState: BrowserViewLoadState | undefined,
+      preservePreexistingLoadOnCancellation: boolean,
     ): Promise<WebContentsView> => {
       let cancellation: 'timeout' | 'abort' | null = null;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -8004,7 +8028,7 @@ export class BrowserManager {
         }
         return restoredView;
       } catch (error) {
-        if (cancellation && !preserveExistingLoadingViewOnTimeout) {
+        if (cancellation && !preservePreexistingLoadOnCancellation) {
           releaseWaiter();
           const mayReclaimSharedRestoration =
             !sharedLoadState ||
@@ -8060,7 +8084,7 @@ export class BrowserManager {
       // content-free timeout result.
       const sharedLoadPromise = tab.viewLoadPromise;
       const sharedLoadState = tab.viewLoadState?.promise === sharedLoadPromise ? tab.viewLoadState : undefined;
-      return joinSharedLoad(sharedLoadPromise, sharedLoadState);
+      return joinSharedLoad(sharedLoadPromise, sharedLoadState, preserveExistingLoadingViewOnTimeout);
     }
     if (tab.view && !tab.view.webContents.isDestroyed()) return tab.view;
     throwIfBrowserAborted(abortSignal);
@@ -8251,7 +8275,10 @@ export class BrowserManager {
     loadState.reject = rejectLoad;
     tab.viewLoadPromise = loadPromise;
     tab.viewLoadState = loadState;
-    const joinedLoad = joinSharedLoad(loadPromise, loadState);
+    // `preserveExistingLoadingViewOnTimeout` protects a restoration that this
+    // observer merely joined. This call published the restoration itself, so a
+    // timeout must reclaim it when no other waiter has since joined.
+    const joinedLoad = joinSharedLoad(loadPromise, loadState, false);
     // Start only after the shared state is visible. restoreView still runs
     // synchronously through native creation until its first real await, which
     // keeps active-tab attachment responsive while closing the publication gap.
@@ -13600,11 +13627,12 @@ export class BrowserManager {
     contents: WebContents,
     abortSignal: AbortSignal,
   ): Promise<NativeImage> {
-    const onCancelled = () => this.cancelManagerOwnedDebugger(contents);
+    let debuggerLease: BrowserDebuggerLease | undefined;
+    const onCancelled = () => debuggerLease?.cancel();
     abortSignal.addEventListener('abort', onCancelled, { once: true });
     try {
       throwIfBrowserAborted(abortSignal);
-      const releaseDebugger = this.acquireBrowserDebugger(contents);
+      debuggerLease = this.acquireBrowserDebuggerLease(contents);
       let encoded: string;
       try {
         const metrics = (await this.waitForMenuPreviewCancellation(
@@ -13629,7 +13657,7 @@ export class BrowserManager {
         if (typeof capture.data !== 'string') throw new Error('Browser menu preview did not produce an image.');
         encoded = capture.data;
       } finally {
-        releaseDebugger();
+        debuggerLease.release();
       }
       throwIfBrowserAborted(abortSignal);
       const capturedPng = Buffer.from(encoded, 'base64');
@@ -13638,7 +13666,7 @@ export class BrowserManager {
       if (image.isEmpty()) throw new Error('Browser menu preview did not produce a valid image.');
       return image;
     } catch (error) {
-      if (abortSignal.aborted) this.cancelManagerOwnedDebugger(contents);
+      if (abortSignal.aborted) debuggerLease?.cancel();
       throw error;
     } finally {
       abortSignal.removeEventListener('abort', onCancelled);

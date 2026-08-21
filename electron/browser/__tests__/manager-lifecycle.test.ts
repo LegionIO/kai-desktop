@@ -17409,6 +17409,59 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.viewLoadPromise).toBeNull();
   });
 
+  it('reclaims an observation-published restoration when its only waiter times out', async () => {
+    vi.useFakeTimers();
+    try {
+      const scriptedCleanup = deferred<void>();
+      const view = { webContents: { isDestroyed: () => false, loadURL: vi.fn(async () => undefined) } };
+      const tab = {
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          url: 'https://observation.example',
+          discarded: true,
+        },
+        scopeKey: 'global',
+        view: null as typeof view | null,
+        viewLoadPromise: null as Promise<typeof view> | null,
+        aiControlOwnerId: null,
+        assistantOwnerId: null,
+      };
+      const createView = vi.fn(() => {
+        tab.view = view;
+        return view;
+      });
+      const manager = managerWithoutConstructor({
+        assertScopeAvailable: vi.fn(),
+        clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => scriptedCleanup.promise),
+        createView,
+        destroyView: vi.fn(),
+        emitTabs: vi.fn(),
+        getConfig: () => ({ browser: { enabled: true } }),
+        requireLiveWindow: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      const observing = invokePrivate(manager, 'ensureView', tab, undefined, 25, true) as Promise<unknown>;
+      const rejected = expect(observing).rejects.toThrow('Browser page load exceeded 0.025 seconds');
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+      await Promise.resolve();
+
+      expect(tab.viewLoadPromise).toBeNull();
+      expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
+      expect(createView).not.toHaveBeenCalled();
+
+      scriptedCleanup.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(createView).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('abandons a caller-neutral restoration before native creation when its last waiter cancels', async () => {
     const scriptedCleanup = deferred<void>();
     const view = { webContents: { isDestroyed: () => false, loadURL: vi.fn(async () => undefined) } };
@@ -18019,6 +18072,25 @@ describe('browser manager renderer lifecycle', () => {
     await dispatching;
     expect(debuggerApi.attach).toHaveBeenCalledOnce();
     expect(debuggerApi.detach).toHaveBeenCalledOnce();
+  });
+
+  it('does not detach the debugger when cancellation overlaps another manager lease', () => {
+    const debuggerApi = browserDebuggerMock();
+    const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+    const manager = managerWithoutConstructor({});
+
+    const releaseCancelled = invokePrivate(manager, 'acquireBrowserDebugger', contents) as () => void;
+    const releaseConcurrent = invokePrivate(manager, 'acquireBrowserDebugger', contents) as () => void;
+    invokePrivate(manager, 'cancelManagerOwnedDebugger', contents);
+
+    expect(debuggerApi.detach).not.toHaveBeenCalled();
+    expect(debuggerApi.isAttached()).toBe(true);
+    releaseCancelled();
+    expect(debuggerApi.detach).not.toHaveBeenCalled();
+
+    releaseConcurrent();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    expect(debuggerApi.isAttached()).toBe(false);
   });
 
   it('installs the private-network document guard before a restricted tab first loads', async () => {
@@ -21114,7 +21186,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(debuggerApi.detach).toHaveBeenCalledOnce();
   });
 
-  it('detaches a manager-owned CDP menu capture promptly when cancellation wedges its command', async () => {
+  it('detaches a cancelled CDP menu capture without detaching a successor debugger lease', async () => {
     const captureStarted = deferred<void>();
     const wedgedCapture = deferred<{ data: string }>();
     const debuggerApi = browserDebuggerMock();
@@ -21148,9 +21220,15 @@ describe('browser manager renderer lifecycle', () => {
     ) as Promise<unknown>;
     await captureStarted.promise;
     controller.abort();
+    const releaseSuccessor = invokePrivate(manager, 'acquireBrowserDebugger', contents) as () => void;
 
     await expect(capture).rejects.toThrow(/cancelled/i);
     expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    expect(debuggerApi.attach).toHaveBeenCalledTimes(2);
+    expect(debuggerApi.isAttached()).toBe(true);
+
+    releaseSuccessor();
+    expect(debuggerApi.detach).toHaveBeenCalledTimes(2);
     expect(debuggerApi.isAttached()).toBe(false);
 
     wedgedCapture.resolve({ data: Buffer.from('late-menu-preview').toString('base64') });
