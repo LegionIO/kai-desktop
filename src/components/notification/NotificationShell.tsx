@@ -163,7 +163,7 @@ const NotificationChrome: FC<{ title: string; onClose: () => void; children: Rea
   );
 };
 
-export const NotificationShell: FC<{ id: string }> = ({ id }) => {
+export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({ id, conversationId }) => {
   const [item, setItem] = useState<NotificationItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -173,7 +173,9 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       if (it && it.id === id) setItem(it);
     });
     let cancelled = false;
-    void app.notification.get(id).then((raw) => {
+    // Resolve under the conversation-scoped key (R193): pass conversationId so a tool-approval pop-out
+    // pulls the right item when two conversations share a raw tool-call id.
+    void app.notification.get(id, conversationId).then((raw) => {
       const it = raw as NotificationItem | null;
       if (!cancelled && it && it.id === id) setItem(it);
     });
@@ -181,9 +183,9 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       cancelled = true;
       off();
     };
-  }, [id]);
+  }, [id, conversationId]);
 
-  const close = useCallback(() => app.notification.close(id), [id]);
+  const close = useCallback(() => app.notification.close(id, conversationId), [id, conversationId]);
 
   if (!item) {
     return (
@@ -218,7 +220,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
       if (submitting) return;
       setSubmitting(true);
       try {
-        await app.agent.answerToolQuestion(item.id, answers);
+        await app.agent.answerToolQuestion(item.id, answers, item.conversationId);
       } catch {
         /* main-side resolve is idempotent; close regardless */
       }
@@ -246,8 +248,8 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
     if (submitting) return;
     setSubmitting(true);
     try {
-      if (decision === 'approve') await app.agent.approveToolCall(item.id);
-      else await app.agent.rejectToolCall(item.id);
+      if (decision === 'approve') await app.agent.approveToolCall(item.id, item.conversationId);
+      else await app.agent.rejectToolCall(item.id, item.conversationId);
     } catch {
       /* idempotent */
     }
@@ -270,7 +272,7 @@ export const NotificationShell: FC<{ id: string }> = ({ id }) => {
             </pre>
           </section>
         )}
-        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} />
+        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} conversationId={item.conversationId} />
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"

@@ -24,6 +24,8 @@ import {
   getOrCreateAssistantInAcc,
   resolveLiveInjectedParentId,
   reconnectActiveBranchRoot,
+  reorderPrefixBeforeInjectedUser,
+  reorderPrefixBeforeInjectedUserChain,
   persistAdmissionRejectionMessage,
   streamAdmissionRejectionMessage,
 } from '../RuntimeProvider';
@@ -338,6 +340,119 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(msg.parentId).toBe('assistant-old');
   });
 
+  it('rotates to the DETERMINISTIC continuation id when the pendingAssistantId is a closed prefix', () => {
+    // After a mid-turn inject, the reply-so-far (msg-shared) is a CLOSED prefix.
+    // The continuation arrives under the SAME reused responseMessageId
+    // (pendingAssistantId) but must resolve to the per-boundary continuation id
+    // (`${injectedUser}-cont`, shared with main), parented on the injected user.
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        {
+          id: 'msg-shared',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-shared',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-inject',
+      pendingAssistantId: 'msg-shared',
+      closedPrefixIds: new Set(['msg-shared']),
+      injectContinuationId: 'user-inject-cont',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const first = getOrCreateAssistantInAcc(acc);
+    expect(first.msg.id).toBe('user-inject-cont'); // deterministic, cross-process
+    expect(first.msg.parentId).toBe('user-inject'); // parented on the injected user
+
+    // A second delta of the SAME reused id appends to the SAME continuation node.
+    const second = getOrCreateAssistantInAcc(acc);
+    expect(second.msg.id).toBe('user-inject-cont');
+  });
+
+  it('keeps the deterministic continuation id through a PRE-CONTENT model-fallback', () => {
+    // After the inject boundary, a model-fallback fires BEFORE any continuation
+    // content — rotating pendingAssistantId to the fallback model's FRESH id, which
+    // is NOT a closed prefix. Without the pending-continuation pin the renderer would
+    // create the continuation under that fresh id while main's fallback accumulator
+    // still uses `${injectedUser}-cont` → divergent ids → a duplicate sibling on a
+    // main finalize. The continuation node must still materialize under the
+    // deterministic injectContinuationId.
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        {
+          id: 'msg-shared',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-shared',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-inject',
+      // Pre-content fallback rotated the reused id to a FRESH fallback id (NOT closed).
+      pendingAssistantId: 'resp-fallback-2',
+      closedPrefixIds: new Set(['msg-shared']),
+      injectContinuationId: 'user-inject-cont',
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const first = getOrCreateAssistantInAcc(acc);
+    // Pinned to the deterministic id — NOT the fresh fallback id — so main can upsert.
+    expect(first.msg.id).toBe('user-inject-cont');
+    expect(first.msg.parentId).toBe('user-inject');
+  });
+
+  it('routes a prior-step remainder delta to the STILL-OPEN prefix, not under the injected user', () => {
+    // Mid-turn inject broadcast BEFORE the prior step finished: the user-message
+    // handler already advanced headId to the injected user, but the prefix
+    // (msg-prefix) is NOT yet closed (inject-consumed hasn't fired). A remaining
+    // old-step delta reuses the prefix's responseMessageId (pendingAssistantId).
+    // It must update the prefix IN PLACE (before the user), NOT create a new
+    // assistant under the user — otherwise ordering becomes `user → remainder`.
+    const acc = {
+      messages: [
+        { id: 'user-1', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }], createdAt: new Date() },
+        {
+          id: 'msg-prefix',
+          parentId: 'user-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prefix' }],
+          createdAt: new Date(),
+        },
+        {
+          id: 'user-inject',
+          parentId: 'msg-prefix',
+          role: 'user',
+          content: [{ type: 'text', text: 'answer' }],
+          createdAt: new Date(),
+        },
+      ],
+      headId: 'user-inject', // advanced by user-message before the remainder arrived
+      pendingAssistantId: 'msg-prefix', // prefix still open (not in closedPrefixIds)
+    } as unknown as Parameters<typeof getOrCreateAssistantInAcc>[0];
+
+    const { msg } = getOrCreateAssistantInAcc(acc);
+    expect(msg.id).toBe('msg-prefix'); // updated the prefix in place
+    expect(msg.parentId).toBe('user-1'); // still before the injected user
+    // No new assistant node was created under the injected user.
+    expect(acc.messages.filter((m) => m.role === 'assistant')).toHaveLength(1);
+  });
+
   it('creates the fallback retry as a sibling with its newly echoed id', () => {
     const acc = {
       messages: [
@@ -369,6 +484,117 @@ describe('shared Kai/Mastra assistant ids', () => {
     expect(acc.messages.filter((message: { parentId: string | null }) => message.parentId === 'user-1')).toHaveLength(
       2,
     );
+  });
+});
+
+describe('reorderPrefixBeforeInjectedUser — inject broadcast before the prefix existed', () => {
+  it('swaps a lone assistant mis-created under the injected user to sit BEFORE it', () => {
+    // user-1 → user-inject (head advanced early) → assistant (first delta arrived
+    // AFTER, so it was created UNDER the injected user). Repair → user-1 → prefix
+    // → user-inject, head follows the user.
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'prefix', 'user-inject');
+    expect(out.messages.find((m) => m.id === 'prefix')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
+    expect(out.headId).toBe('user-inject');
+  });
+
+  it('does NOT touch the legitimate continuation node (${id}-cont) under the user', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-1', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'prefix', role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject-cont', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'user-inject-cont', 'user-inject');
+    // Already correct — the only assistant under the user is the continuation, so no swap.
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
+    expect(out.headId).toBe('user-inject-cont');
+  });
+
+  it('is a no-op when the injected user is missing or has no assistant child', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'user-inject').headId).toBe('user-inject');
+    expect(reorderPrefixBeforeInjectedUser(messages, 'user-inject', 'missing').messages).toBe(messages);
+  });
+
+  it('selects the ACTIVE variant when a fallback left two assistants under the injected user', () => {
+    // failed partial + successful reply both under user-inject; head = the active one.
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'asst-failed', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'asst-ok', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUser>[0];
+    const out = reorderPrefixBeforeInjectedUser(messages, 'asst-ok', 'user-inject');
+    // The head-lineage variant (asst-ok) is threaded before the user; the failed
+    // sibling is ALSO moved back to the pre-inject head (a sibling of the active
+    // one), NOT left under the injected user where it'd group with the continuation.
+    expect(out.messages.find((m) => m.id === 'asst-ok')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('asst-ok');
+    expect(out.messages.find((m) => m.id === 'asst-failed')?.parentId).toBe('user-1');
+    expect(out.headId).toBe('user-inject');
+  });
+});
+
+describe('reorderPrefixBeforeInjectedUserChain — batched multi-inject before the prefix existed', () => {
+  it('moves the prefix BEFORE the whole user chain (pre → prefix → u1 → u2)', () => {
+    // Temporary tree: pre → u1 → u2 → prefix (prefix landed under the LAST user).
+    // Per-entry FIFO would leave `u1 → prefix → u2`; the chain repair must yield
+    // pre → prefix → u1 → u2.
+    const messages = [
+      { id: 'pre', parentId: null, role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u1', parentId: 'pre', role: 'user', content: [], createdAt: new Date() },
+      { id: 'u2', parentId: 'u1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'u2', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'prefix', ['u1', 'u2']);
+    const byId = Object.fromEntries(out.messages.map((m) => [m.id, m.parentId]));
+    expect(byId['prefix']).toBe('pre'); // prefix before the chain
+    expect(byId['u1']).toBe('prefix'); // first user after the prefix
+    expect(byId['u2']).toBe('u1'); // chain order preserved
+    expect(out.headId).toBe('u2'); // head advances to the chain tail
+  });
+
+  it('delegates to the single-entry repair for one inject', () => {
+    const messages = [
+      { id: 'user-1', parentId: null, role: 'user', content: [], createdAt: new Date() },
+      { id: 'user-inject', parentId: 'user-1', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'user-inject', role: 'assistant', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'prefix', ['user-inject']);
+    expect(out.messages.find((m) => m.id === 'prefix')?.parentId).toBe('user-1');
+    expect(out.messages.find((m) => m.id === 'user-inject')?.parentId).toBe('prefix');
+  });
+
+  it('rechains ALL injected users after the prefix for the INTERLEAVED shape pre → u1 → prefix → u2 (R99)', () => {
+    // The batch interleaved so the prefix landed under u1 and u2 under the prefix.
+    // The old per-first-user repair left `u2` parented on `prefix`, making u1 an
+    // inactive SIBLING of u2 → u1 (consumed by the model) dropped off-branch. The
+    // fix must yield the linear chain pre → prefix → u1 → u2.
+    const messages = [
+      { id: 'pre', parentId: null, role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u1', parentId: 'pre', role: 'user', content: [], createdAt: new Date() },
+      { id: 'prefix', parentId: 'u1', role: 'assistant', content: [], createdAt: new Date() },
+      { id: 'u2', parentId: 'prefix', role: 'user', content: [], createdAt: new Date() },
+    ] as unknown as Parameters<typeof reorderPrefixBeforeInjectedUserChain>[0];
+    const out = reorderPrefixBeforeInjectedUserChain(messages, 'u2', ['u1', 'u2']);
+    const byId = Object.fromEntries(out.messages.map((m) => [m.id, m.parentId]));
+    expect(byId['prefix']).toBe('pre'); // prefix before the chain
+    expect(byId['u1']).toBe('prefix'); // first user after the prefix
+    expect(byId['u2']).toBe('u1'); // u2 rechained onto u1 (NOT left under prefix)
+    // Both injected users are now on the active branch from the head.
+    const active = getActiveBranch(out.messages as never, out.headId);
+    const activeIds = active.map((m: { id: string }) => m.id);
+    expect(activeIds).toContain('u1');
+    expect(activeIds).toContain('u2');
   });
 });
 
@@ -640,5 +866,36 @@ describe('preserveErroredAssistantVariant — mid-stream fallback keeps the part
     const a = acc(messages, 'u1');
     expect(preserveErroredAssistantVariant(a, 'err')).toBe(false);
     expect(a.headId).toBe('u1'); // unchanged
+  });
+
+  it('closes the inject-continuation boundary when it seals the continuation node', () => {
+    // A POST-content transient fallback within a cooperative-inject continuation: the
+    // continuation node (user-inject-cont) has content, then errors. Sealing it must
+    // CLOSE the boundary (clear injectContinuationId, record it closed) so the retry
+    // is a fresh SIBLING — NOT another delta pinned onto the sealed errored node.
+    const messages = [
+      { id: 'user-inject', parentId: 'pre', role: 'user', content: [{ type: 'text', text: 'answer' }] },
+      {
+        id: 'user-inject-cont',
+        parentId: 'user-inject',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'partial' }],
+      },
+    ] as unknown as Msg[];
+    const a = {
+      messages,
+      headId: 'user-inject-cont',
+      injectContinuationId: 'user-inject-cont',
+      closedPrefixIds: new Set<string>(),
+    } as unknown as Parameters<typeof preserveErroredAssistantVariant>[0];
+    expect(preserveErroredAssistantVariant(a, 'boom')).toBe(true);
+    const acc2 = a as unknown as {
+      injectContinuationId: string | null;
+      closedPrefixIds: Set<string>;
+      headId: string | null;
+    };
+    expect(acc2.injectContinuationId).toBeNull(); // boundary closed
+    expect(acc2.closedPrefixIds.has('user-inject-cont')).toBe(true);
+    expect(acc2.headId).toBe('user-inject'); // rewound so the retry is a sibling
   });
 });

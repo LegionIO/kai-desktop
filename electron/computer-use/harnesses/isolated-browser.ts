@@ -9,7 +9,9 @@ import type {
 import { makeComputerUseId, nowIso } from '../../../shared/computer-use.js';
 import type { ComputerHarness, ComputerHarnessActionContext, ComputerHarnessActionResult } from './shared.js';
 import { applyBrandUserAgent } from '../../utils/user-agent.js';
-import { isUrlAllowed } from '../../utils/ssrf-guard.js';
+import { isUrlAllowed, urlResolvesToPrivate } from '../../utils/ssrf-guard.js';
+import { configureBrowserWebContents } from '../../browser/session.js';
+import { isIP } from 'net';
 import type { AppConfig } from '../../config/schema.js';
 
 const windows = new Map<string, BrowserWindow>();
@@ -34,7 +36,10 @@ export function checkIsolatedBrowserNavigation(
   const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   let host: string;
   try {
-    host = new URL(normalized).hostname.toLowerCase();
+    // Strip IPv6 brackets (R204): URL.hostname returns `[::1]` for IPv6 literals, and isIP('[::1]') is 0 —
+    // without stripping, a public IPv6 literal over http would be misclassified as a hostname and wrongly
+    // blocked by the HTTPS-for-hostnames rule below.
+    host = new URL(normalized).hostname.toLowerCase().replace(/^\[|\]$/g, '');
   } catch {
     return { ok: false, reason: `invalid URL ${normalized}` };
   }
@@ -43,6 +48,26 @@ export function checkIsolatedBrowserNavigation(
   }
   const verdict = isUrlAllowed(normalized, allowPrivate);
   if (!verdict.ok) return { ok: false, reason: verdict.reason };
+  // DNS-rebinding TOCTOU (R203): the Node preflight and Chromium resolve independently, so a hostname can
+  // answer public here then private to Chromium's own lookup. Requiring authenticated TLS (HTTPS) for
+  // HOSTNAME traffic (when private access is disabled) closes it: a rebound private peer can't present a
+  // valid cert for the hostname, so Chromium aborts before sending the request. IP LITERALS can't rebind,
+  // so public-IP HTTP stays allowed (isUrlAllowed already rejected private literals above). Mirrors the
+  // in-app Browser's assertAiNavigationAllowed rule.
+  if (!allowPrivate && isIP(host) === 0) {
+    let protocol: string;
+    try {
+      protocol = new URL(normalized).protocol;
+    } catch {
+      return { ok: false, reason: `invalid URL ${normalized}` };
+    }
+    if (protocol !== 'https:') {
+      return {
+        ok: false,
+        reason: `hostname HTTP is blocked while private-network access is disabled (rebind risk): ${host}`,
+      };
+    }
+  }
   return { ok: true, url: normalized };
 }
 
@@ -125,9 +150,51 @@ function clampCoordinate(value: number, max: number): number {
   return Math.max(0, Math.min(Math.round(value), max - 1));
 }
 
+// Module-level accessor for the isolatedBrowserAllowPrivateNetwork flag so the module-scope
+// ensureWindow's navigation guards (will-redirect / will-navigate) can consult live config even
+// though they aren't on the harness instance. Set by the harness constructor (R171).
+let isolatedBrowserAllowPrivateResolver: (() => boolean) | null = null;
+function resolveIsolatedBrowserAllowPrivate(): boolean {
+  try {
+    return isolatedBrowserAllowPrivateResolver?.() ?? false;
+  } catch {
+    return false; // fail closed
+  }
+}
+
+/**
+ * Reapply the WebRTC IP-handling policy to EVERY live isolated-browser window from current config (R206).
+ * Called when global config is (re)applied (main.ts registry reload) so toggling
+ * computerUse.safety.isolatedBrowserAllowPrivateNetwork OFF re-locks WebRTC on an already-open,
+ * paused/approval-waiting window immediately — otherwise its page could keep opening direct LAN UDP until
+ * the next ensureWindow() reuse (the sync request guards already pick the change up live). Never throws.
+ */
+export function reapplyIsolatedBrowserWebRtcPolicy(): void {
+  const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+  for (const win of windows.values()) {
+    if (win.isDestroyed()) continue;
+    try {
+      configureBrowserWebContents(win.webContents, allowPrivate);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 function ensureWindow(sessionId: string): BrowserWindow {
   const existing = windows.get(sessionId);
-  if (existing && !existing.isDestroyed()) return existing;
+  if (existing && !existing.isDestroyed()) {
+    // Reapply the WebRTC policy on a REUSED window (R204): a paused/approval-waiting session returns the
+    // existing window, but the private-network setting may have been toggled off since creation — leaving
+    // WebRTC on `default` would permit new direct LAN UDP despite the live request guards using the
+    // disabled setting. Re-derive it from current config each time the window is handed out.
+    try {
+      configureBrowserWebContents(existing.webContents, resolveIsolatedBrowserAllowPrivate());
+    } catch {
+      /* setWebRTCIPHandlingPolicy unavailable */
+    }
+    return existing;
+  }
 
   const win = new BrowserWindow({
     width: 1440,
@@ -148,6 +215,88 @@ function ensureWindow(sessionId: string): BrowserWindow {
   });
   applyBrandUserAgent(win.webContents);
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // WebRTC ICE/STUN/TURN traffic bypasses webRequest entirely, so an untrusted page could otherwise open
+  // direct UDP sockets to private/LAN addresses while private-network access is disabled (R203). Force
+  // WebRTC through the proxy-aware path (no direct non-proxied UDP) unless private access is allowed —
+  // mirroring the in-app Browser's policy (configureBrowserWebContents).
+  try {
+    configureBrowserWebContents(win.webContents, resolveIsolatedBrowserAllowPrivate());
+  } catch {
+    /* setWebRTCIPHandlingPolicy unavailable — the webRequest guard remains the primary defense */
+  }
+  // Re-validate EVERY redirect + top-level navigation against the SSRF guard (R171): the initial
+  // navigate() URL is checked, but a public URL can 3xx-redirect (or a page can navigate) to
+  // loopback / 169.254.169.254 (cloud metadata) / a private host — which the browser would otherwise
+  // follow, exposing internal services to computer-use capture. Veto any target that fails the guard.
+  const guardNavigation = (event: { preventDefault: () => void }, targetUrl: string): void => {
+    const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+    const decision = checkIsolatedBrowserNavigation(targetUrl, allowPrivate);
+    if (!decision.ok) {
+      event.preventDefault();
+      console.error(`[isolated-browser] blocked navigation/redirect to ${targetUrl}: ${decision.reason}`);
+    }
+  };
+  win.webContents.on('will-redirect', (event, targetUrl) => guardNavigation(event, targetUrl));
+  win.webContents.on('will-navigate', (event, targetUrl) => guardNavigation(event, targetUrl));
+  // Block private-network SUBRESOURCE requests too (R172): the navigation guards only cover the
+  // top-level frame, but an untrusted public page can embed http://127.0.0.1:PORT / 169.254.169.254
+  // in an <iframe>/<img>/fetch — probing internal services and, for an iframe, exposing rendered
+  // cross-origin pixels via capturePage(). A session-level webRequest filter vets EVERY request
+  // (all resource types) against the same SSRF guard and cancels private ones (unless allowPrivate).
+  try {
+    win.webContents.session.webRequest.onBeforeRequest((details, callback) => {
+      const allowPrivate = resolveIsolatedBrowserAllowPrivate();
+      if (allowPrivate) {
+        callback({});
+        return;
+      }
+      // Vet http(s) AND ws(s) subresources: WebSockets hit the network too, so an untrusted page could
+      // otherwise open ws://127.0.0.1 / ws://<LAN> and reach internal services, bypassing the SSRF guard
+      // (R201). data:/blob:/about: don't hit the network and would be spuriously rejected by the
+      // http-normalizing guard, so let them through. Normalize ws→http / wss→https for the host/port check.
+      const wsMatch = /^wss?:/i.test(details.url);
+      if (!/^https?:/i.test(details.url) && !wsMatch) {
+        callback({});
+        return;
+      }
+      const urlForGuard = wsMatch ? details.url.replace(/^ws(s?):/i, (_m, s) => (s ? 'https:' : 'http:')) : details.url;
+      // DNS-rebinding TOCTOU (R203): the Node preflight below and Chromium resolve independently. Require
+      // authenticated TLS (https/wss) for HOSTNAME subresources when private access is disabled — a rebound
+      // private peer can't present a valid cert, so the connection fails before data flows. IP literals
+      // can't rebind, so public-IP insecure requests still get the resolved-address check below.
+      let guardHost: string;
+      let guardSecure: boolean;
+      try {
+        const u = new URL(urlForGuard);
+        guardHost = u.hostname.replace(/^\[|\]$/g, '');
+        guardSecure = u.protocol === 'https:';
+      } catch {
+        callback({ cancel: true });
+        return;
+      }
+      if (isIP(guardHost) === 0 && !guardSecure) {
+        console.error(`[isolated-browser] blocked insecure hostname subresource (rebind risk): ${details.url}`);
+        callback({ cancel: true });
+        return;
+      }
+      // RESOLVE the hostname and reject if it lands on a private/local address (R202): a syntax-only
+      // check passes wildcard-DNS names like 127.0.0.1.nip.io, and BrowserWindow traffic never routes
+      // through the guarded DNS dispatcher safeFetch uses. Async is fine — onBeforeRequest's callback is
+      // deferred. Fails closed on a resolution error.
+      void urlResolvesToPrivate(urlForGuard)
+        .then((isPrivate) => {
+          if (isPrivate) {
+            console.error(`[isolated-browser] blocked private-network subresource: ${details.url}`);
+            callback({ cancel: true });
+          } else {
+            callback({});
+          }
+        })
+        .catch(() => callback({ cancel: true }));
+    });
+  } catch {
+    /* webRequest unavailable — navigation guards above are the primary defense */
+  }
   windows.set(sessionId, win);
   return win;
 }
@@ -751,7 +900,11 @@ async function dispatchChromiumDrag(
 export class IsolatedBrowserHarness implements ComputerHarness {
   readonly target = 'isolated-browser' as const;
 
-  constructor(private readonly getConfig?: () => AppConfig) {}
+  constructor(private readonly getConfig?: () => AppConfig) {
+    // Expose the allow-private flag to the module-scope navigation guards (R171).
+    isolatedBrowserAllowPrivateResolver = () =>
+      this.getConfig?.().computerUse.safety.isolatedBrowserAllowPrivateNetwork ?? false;
+  }
 
   async initialize(session: ComputerSession): Promise<void> {
     const win = ensureWindow(session.id);

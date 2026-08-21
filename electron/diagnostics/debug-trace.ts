@@ -106,6 +106,14 @@ const CATEGORICAL_REASONS = new Set([
   'two-failed-health-probes',
   'window-destroyed-during-probe',
   'window-not-presented',
+  // ask_user / tool-approval settle reasons (see tool-approval.ts, agent.ts).
+  // Categorical so they survive metadata-only tracing (no content leak).
+  'answered',
+  'approve',
+  'reject',
+  'dismiss',
+  'abort',
+  'duplicate-evict',
 ]);
 const MAX_STRING = 4000;
 
@@ -325,15 +333,14 @@ export function traceDiagnostic(event: DiagnosticTraceEvent): void {
     // truncation marker carrying the correlation/scope/event for triage.
     const perRecordCap = Math.max(64 * 1024, Math.min(1024 * 1024, Math.floor(cfg.maxFileBytes / 2)));
     if (Buffer.byteLength(line, 'utf8') > perRecordCap) {
-      line =
-        `${JSON.stringify({
-          ts: record.ts,
-          scope: (record as { scope?: unknown }).scope,
-          event: (record as { event?: unknown }).event,
-          correlationId: (record as { correlationId?: unknown }).correlationId,
-          truncated: true,
-          bytes: Buffer.byteLength(line, 'utf8'),
-        })}\n`;
+      line = `${JSON.stringify({
+        ts: record.ts,
+        scope: (record as { scope?: unknown }).scope,
+        event: (record as { event?: unknown }).event,
+        correlationId: (record as { correlationId?: unknown }).correlationId,
+        truncated: true,
+        bytes: Buffer.byteLength(line, 'utf8'),
+      })}\n`;
     }
     // Rotate based on CURRENT size + this record's bytes so a single append can't
     // push the active file substantially over the budget.

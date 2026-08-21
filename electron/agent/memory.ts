@@ -290,7 +290,14 @@ export function getSharedMemory(config: AppConfig, dbPath: string): Memory | nul
     sharedMemory = new Memory(memoryConfig as MemoryConfig);
   } catch (error) {
     console.error('[Memory] Failed to initialize:', error);
-    sharedMemory = null;
+    // A build THROW (transient EMFILE / permission / db-open failure) must NOT be cached under the
+    // key (R171): doing so returned the cached null on every later call with the same config, leaving
+    // memory disabled for the whole process even after the underlying condition cleared. Clear the
+    // key so the NEXT getSharedMemory RETRIES the build. (A config-DISABLED memory below still caches
+    // null under the key — that's a real, stable state, not a failure.)
+    sharedMemory = undefined;
+    sharedMemoryKey = undefined;
+    return null;
   }
 
   return sharedMemory;

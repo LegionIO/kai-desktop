@@ -1,6 +1,7 @@
 import type { IpcMain, IpcMainInvokeEvent } from 'electron';
 import { BrowserWindow, dialog } from 'electron';
 import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { stripRemoteMediaDeep, newRemoteBudget } from '../agent/remote-frame-cap.js';
 import { isAbsolute, resolve, extname } from 'path';
 import { existsSync } from 'fs';
@@ -31,7 +32,12 @@ import {
   WORKSPACE_TOOL_SCHEMA_TOKENS_ALLOWANCE,
   serializeToolSchemasForStatic,
 } from '../agent/static-tokens.js';
-import { getRegisteredTools, whenToolsReady, cancelConversationStream } from './agent.js';
+import {
+  getRegisteredTools,
+  whenToolsReady,
+  cancelConversationStream,
+  invalidateConversationRecovery,
+} from './agent.js';
 import { resolveHeaderTemplates } from '../agent/header-templates.js';
 import { stripDisplayOnlyParts } from '../agent/message-sanitizer.js';
 import { markCompacting, clearCompacting, isCompacting } from '../agent/compaction-lock.js';
@@ -41,7 +47,7 @@ import { resolveConversationTokenization } from '../agent/tokenization.js';
 import { getComputerUseManager } from '../computer-use/service.js';
 import { removeBrowserConversationData, removeBrowserConversationsData } from '../browser/service.js';
 import { browserScopeKey } from '../browser/session.js';
-import { stopRealtimeSessionForConversation } from './realtime.js';
+import { stopRealtimeSessionForConversation, onRealtimeExecutionModeChanged } from './realtime.js';
 import type { ConversationRecord, ConversationIndexEntry } from './conversation-store.js';
 import {
   readIndex,
@@ -57,6 +63,9 @@ import {
   nextCompactionRevision,
   isRecentlyDeleted,
   isWriteTombstoned,
+  consumeWriteWasSuppressed,
+  conversationFileExists,
+  getIndexMayHaveGhosts,
 } from './conversation-store.js';
 
 export type { ConversationRecord } from './conversation-store.js';
@@ -125,10 +134,22 @@ function broadcastChange(change: ConversationChange): void {
   // cap but also re-fetch, so stripping uniformly is safe + simplest.)
   const outgoing: ConversationChange =
     change.kind === 'upsert' ? { ...change, conversation: stripBroadcastMedia(change.conversation) } : change;
+  // Per-recipient guarded fan-out: one window's send throwing (destroyed / navigating)
+  // must not abort delivery to the rest or propagate to the caller (R106 finding-1).
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('conversations:changed', outgoing);
+    try {
+      if (!win.isDestroyed?.() && !win.webContents?.isDestroyed?.()) {
+        win.webContents.send('conversations:changed', outgoing);
+      }
+    } catch {
+      /* window disappeared between check and send; keep fanning out */
+    }
   }
-  broadcastToWebClients('conversations:changed', outgoing);
+  try {
+    broadcastToWebClients('conversations:changed', outgoing);
+  } catch {
+    /* best-effort remote fan-out */
+  }
 }
 
 export function broadcastUpsert(appHome: string, conversation: ConversationRecord): void {
@@ -137,13 +158,29 @@ export function broadcastUpsert(appHome: string, conversation: ConversationRecor
   // deleted conversation absent from disk. Guard the single upsert chokepoint: if this id was
   // recently deleted AND is not in the index (the same condition that suppressed the write),
   // don't broadcast. A legitimate recreate re-adds the index entry, so this only drops phantoms.
-  if (isRecentlyDeleted(conversation.id) && !readIndex(appHome).conversations[conversation.id]) {
-    return;
+  //
+  // The whole body is throw-SAFE (R170 f-2): broadcastUpsert runs AFTER the conversation file has
+  // already committed (writeConversation returned), and callers on the persist path treat a throw
+  // here as a persist failure → retain + retry the accumulator → DOUBLE-PERSIST the committed reply
+  // under a collision id. A pre-fanout index read (readIndex / getActiveConversationId) can throw
+  // EMFILE/EACCES, so any failure here must be swallowed — a missed/late broadcast is harmless
+  // (clients re-fetch), a duplicated reply is not.
+  try {
+    if (isRecentlyDeleted(conversation.id) && !readIndex(appHome).conversations[conversation.id]) {
+      return;
+    }
+    broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
+  } catch (err) {
+    console.error('[conversations] broadcastUpsert failed (non-fatal; write already committed)', err);
   }
-  broadcastChange({ kind: 'upsert', conversation, activeConversationId: getActiveConversationId(appHome) });
 }
 function broadcastDelete(appHome: string, id: string): void {
-  broadcastChange({ kind: 'delete', id, activeConversationId: getActiveConversationId(appHome) });
+  // If the DURABLE index write during delete/clear FAILED, the on-disk index still lists this id as
+  // the active conversation (R163 f-1); getActiveConversationId would echo the just-deleted id and
+  // other windows would retain it as active despite the list filtering it out. A deleted conversation
+  // can never be active — override to null when the stale active id IS the id we're deleting.
+  const active = getActiveConversationId(appHome);
+  broadcastChange({ kind: 'delete', id, activeConversationId: active === id ? null : active });
 }
 
 // Standalone automations run their agent turns via a SEPARATE registry (automations/actions.ts
@@ -488,10 +525,222 @@ export function insertConversationMessageBefore(
   return written;
 }
 
+/**
+ * Repoint an EXISTING node's parent to `newParentId` (a sibling-level reparent).
+ * Used at the GUI cooperative-inject boundary: the injected user node was
+ * pre-persisted parented on the pre-inject head, and main then finalizes its
+ * fallback assistant PREFIX under that same head — leaving the two as siblings.
+ * Reparent the injected user ONTO the finalized prefix so a renderer-crash
+ * fallback finalize yields the correct chronology
+ *   … → prefix-assistant → injected-user → continuation.
+ * With `makeHead: true`, also advance the head to the reparented node — the
+ * injected user is the active tail until a continuation assistant appends onto
+ * it, so a crash before any continuation content still reloads WITH the injected
+ * user on the active branch (else the head would sit on the prefix and hide it).
+ * No-op if either id is absent, they're equal, already parented, or newParentId
+ * is a descendant of messageId (would create a cycle).
+ */
+export function reparentConversationMessage(
+  appHome: string,
+  conversationId: string,
+  messageId: string,
+  newParentId: string | null,
+  options: { makeHead?: boolean } = {},
+): ConversationRecord | null {
+  // newParentId === null makes `messageId` a ROOT (parentId null) — used when the
+  // node it's being spliced before is itself a root (e.g. an edit of the first user
+  // message). messageId must still be non-empty and not self-parent.
+  if (!messageId || messageId === newParentId) return null;
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const node = tree.find((m) => m.id === messageId);
+  const newParent = newParentId === null ? null : tree.find((m) => m.id === newParentId);
+  if (!node || (newParentId !== null && !newParent)) return null;
+  const alreadyParented = node.parentId === newParentId;
+  // Cycle guard: walk up from newParentId; if we reach messageId, reparenting
+  // would form a loop. Bounded by tree size. (A null parent — root — can't cycle.)
+  const byId = new Map(tree.map((m) => [m.id, m] as const));
+  let cursor: string | null = newParentId;
+  const seen = new Set<string>();
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === messageId) return conv; // would cycle — refuse (no-op)
+    seen.add(cursor);
+    cursor = byId.get(cursor)?.parentId ?? null;
+  }
+  const now = new Date().toISOString();
+  const nextTree = alreadyParented ? tree : tree.map((m) => (m.id === messageId ? { ...m, parentId: newParentId } : m));
+  const nextHead = options.makeHead ? messageId : headId;
+  if (alreadyParented && nextHead === headId) return conv; // nothing to change
+  const branch = getConversationBranch(nextTree, nextHead);
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    headId: nextHead,
+    updatedAt: now,
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+  };
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return written;
+}
+
 function timestampMs(value: string | null | undefined): number {
   if (!value) return 0;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * On-disk mirror of the renderer's reorderPrefixBeforeInjectedUserChain repair,
+ * for the GUI terminal-drain case: one or more cooperative injects arrived after
+ * the final prepareStep, so no `inject-consumed` fired and the renderer persisted
+ * the turn's assistant reply UNDER the LAST injected user, making that assistant
+ * the disk head. The model produced that assistant BEFORE seeing any inject, so it
+ * belongs BEFORE the whole injected-user chain. If exactly one assistant node is
+ * parented on any of `injectedUserIds`, move it to that user's parent and reparent
+ * the FIRST injected user onto it — yielding `pre → assistant → u1 → u2 …` — and
+ * make the LAST injected user the head. `injectedUserIds` is in FIFO (chain) order.
+ * Returns the id that is (now) the head (the last injected user when a repair or
+ * chain exists), else the current head. No-op when no injected user is present.
+ */
+export function reorderInjectPrefixOnDisk(
+  appHome: string,
+  conversationId: string,
+  injectedUserIds: string[],
+): string | null {
+  if (injectedUserIds.length === 0) return null;
+  const conv = readConversation(appHome, conversationId);
+  if (!conv) return null;
+  const { tree, headId } = ensureConversationTree(conv);
+  const present = injectedUserIds.filter((id) => tree.some((m) => m.id === id));
+  if (present.length === 0) return headId;
+  const lastInjected = present[present.length - 1];
+  const idSet = new Set(present);
+  // Assistant node(s) parented UNDER an injected user (mis-ordered prefix). A
+  // transient model-fallback can leave MULTIPLE variants under the same injected
+  // user (a failed partial + the successful reply); pick the ACTIVE one — the
+  // variant on the current head's ancestor lineage — so the successful reply (not
+  // a failed sibling) is the one threaded before the chain.
+  const allPrefixes = tree.filter(
+    (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId),
+  );
+  const byIdForLineage = new Map(tree.map((m) => [m.id, m] as const));
+  const onHeadLineage = (id: string): boolean => {
+    let cur: string | null = headId;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      if (cur === id) return true;
+      seen.add(cur);
+      cur = byIdForLineage.get(cur)?.parentId ?? null;
+    }
+    return false;
+  };
+  const prefixes = allPrefixes.length > 1 ? allPrefixes.filter((m) => onHeadLineage(m.id)) : allPrefixes;
+  if (prefixes.length !== 1) {
+    // No assistant is parented UNDER an injected user. Two sub-cases:
+    //   (a) main's crash-backstop fallback finalized the turn's assistant as a
+    //       SIBLING of the first injected user (a child of the pre-inject head P,
+    //       because the fallback accumulator was still parented on P). That reply
+    //       exists but sits OFF the injected-user branch — thread it in as
+    //       `P → assistant → u1 … uN` so the continuation launches WITH it.
+    //   (b) genuinely no assistant yet (not persisted) or already correctly
+    //       ordered — just make the last injected user the head.
+    const firstInjected = present[0];
+    const firstUser = tree.find((m) => m.id === firstInjected);
+    const preInjectHead = firstUser?.parentId ?? null;
+    // A sibling assistant under the pre-inject head is the fallback-finalized reply
+    // ONLY if it belongs to the JUST-FINISHED turn — i.e. it's on the current head's
+    // ancestor lineage. A regenerated/rewound user turn can leave a SHELVED
+    // historical assistant as a sibling too; reparenting the inject onto that would
+    // attach it to abandoned history. Require the head-lineage evidence.
+    const siblingAssistants =
+      preInjectHead !== null
+        ? tree.filter(
+            (m) => m.role === 'assistant' && m.parentId === preInjectHead && !idSet.has(m.id) && onHeadLineage(m.id),
+          )
+        : [];
+    if (firstUser && siblingAssistants.length === 1) {
+      // (a) Reparent: assistant keeps P as parent; first injected user reparents onto it.
+      const sib = siblingAssistants[0];
+      const nextTree = tree.map((m) => (m.id === firstInjected ? { ...m, parentId: sib.id } : m));
+      const branch = getConversationBranch(nextTree, lastInjected);
+      const next: ConversationRecord = {
+        ...conv,
+        messageTree: nextTree,
+        messages: branch,
+        headId: lastInjected,
+        updatedAt: new Date().toISOString(),
+        messageCount: branch.length,
+        userMessageCount: branch.filter((m) => m.role === 'user').length,
+      };
+      broadcastUpsert(appHome, writeConversation(appHome, next));
+      return lastInjected;
+    }
+    // (b) The last injected user should be the head so the continuation launches on
+    // the full chain; advance it only if it isn't already.
+    if (headId === lastInjected) return headId;
+    const branch = getConversationBranch(tree, lastInjected);
+    const next: ConversationRecord = {
+      ...conv,
+      messageTree: tree,
+      messages: branch,
+      headId: lastInjected,
+      updatedAt: new Date().toISOString(),
+      messageCount: branch.length,
+      userMessageCount: branch.filter((m) => m.role === 'user').length,
+    };
+    broadcastUpsert(appHome, writeConversation(appHome, next));
+    return lastInjected;
+  }
+  const prefix = prefixes[0];
+  const firstUser = tree.find((m) => m.id === present[0])!;
+  const chainParent = firstUser.parentId; // the pre-inject head
+  // ALL assistant variants that sit under the SAME injected user as the active
+  // prefix were produced BEFORE the model saw the inject (a transient fallback can
+  // leave a failed partial + the successful reply as siblings there). Move EVERY
+  // such pre-consumption variant back to the pre-inject head (chainParent) so they
+  // stay siblings of each other on the PRE-inject branch — attaching the FIRST
+  // injected user only to the ACTIVE variant (prefix). Moving just the active one
+  // would leave the failed sibling(s) under the injected user, where the eventual
+  // continuation also lands → variant selection would group a stale pre-inject reply
+  // with the post-inject continuation. (Keyed on prefix.parentId, which in a
+  // multi-inject batch is the LAST injected user the renderer parented the reply
+  // under — not necessarily firstInjected.)
+  const variantParent = prefix.parentId;
+  const preConsumptionVariantIds = new Set(
+    tree.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
+  );
+  // Rechain EVERY injected user in FIFO order after the prefix, not just the first.
+  // The batch can interleave as `pre → u1 → prefix → u2` (prefix under u1, u2 under
+  // prefix), not only the canonical `pre → u1 → u2 → … → prefix`. Reparenting only
+  // firstInjected would leave u2 under the prefix, making u1 an inactive sibling → u1
+  // (consumed by the model) drops off the active branch on disk. Force the linear
+  // chain prefix → u1 → u2 → … (mirrors the renderer repair, R99/R102 finding-2).
+  const rechainParentOf = new Map<string, string>();
+  rechainParentOf.set(present[0], prefix.id);
+  for (let i = 1; i < present.length; i++) rechainParentOf.set(present[i], present[i - 1]);
+  const nextTree = tree.map((m) => {
+    if (preConsumptionVariantIds.has(m.id)) return { ...m, parentId: chainParent };
+    const rechainTo = rechainParentOf.get(m.id);
+    if (rechainTo !== undefined) return { ...m, parentId: rechainTo };
+    return m;
+  });
+  const branch = getConversationBranch(nextTree, lastInjected);
+  const next: ConversationRecord = {
+    ...conv,
+    messageTree: nextTree,
+    messages: branch,
+    headId: lastInjected,
+    updatedAt: new Date().toISOString(),
+    messageCount: branch.length,
+    userMessageCount: branch.filter((m) => m.role === 'user').length,
+  };
+  const written = writeConversation(appHome, next);
+  broadcastUpsert(appHome, written);
+  return lastInjected;
 }
 
 type ConversationMessageLike = {
@@ -656,7 +905,17 @@ export function registerConversationHandlers(
   ipcMain.handle('conversations:list', () => {
     // Reads only the lightweight index — no message bodies loaded.
     const index = readIndex(appHome);
-    const entries: ConversationIndexEntry[] = Object.values(index.conversations);
+    const all = Object.values(index.conversations);
+    // Filter GHOST entries whose record file is gone (R162 f-2) ONLY when a durable index write is
+    // known to have failed (getIndexMayHaveGhosts) — a failed delete/clear can leave an index entry
+    // pointing at a removed file. Gating on the flag keeps the STEADY-STATE list path O(N) with NO
+    // per-entry statSync (R163 f-2): the O(N) missing-file filter runs only inside the rare
+    // failure window, bounding the earlier O(N²) refresh storm (N list refreshes × N stats). statSync
+    // fails OPEN (only a definite ENOENT drops an entry) so a transiently-unreadable real chat is
+    // never hidden.
+    const entries: ConversationIndexEntry[] = getIndexMayHaveGhosts()
+      ? all.filter((entry) => conversationFileExists(appHome, entry.id))
+      : all;
     entries.sort((a, b) => {
       const aAt = a.lastAssistantUpdateAt ?? a.lastMessageAt ?? a.updatedAt ?? a.createdAt;
       const bAt = b.lastAssistantUpdateAt ?? b.lastMessageAt ?? b.updatedAt ?? b.createdAt;
@@ -716,8 +975,18 @@ export function registerConversationHandlers(
     // still return a record, so broadcasting an upsert + returning ok here would make the renderer
     // launch an agent run against a deleted chat. Reject so the renderer rolls back instead
     // (matches the compacting-busy rejection contract). isWriteTombstoned covers BOTH the in-memory
-    // TTL tombstone AND the durable index ring (survives restart / TTL expiry).
-    if (!prev && isWriteTombstoned(appHome, conversation.id)) {
+    // TTL tombstone AND the durable index ring (survives restart / TTL expiry). Throw-safe
+    // (R147): a tombstone-lookup throw (index rebuild EMFILE) here defaults to NOT-deleted so a
+    // legitimate new chat isn't rejected on a transient blip — writeConversation itself re-checks
+    // + suppresses a genuinely-tombstoned write, and the post-write guard below (also throw-safe,
+    // defaulting to reject) backstops the phantom-broadcast case.
+    let admissionTombstoned = false;
+    try {
+      admissionTombstoned = !prev && isWriteTombstoned(appHome, conversation.id);
+    } catch {
+      admissionTombstoned = false;
+    }
+    if (admissionTombstoned) {
       return { rejected: 'conversation-deleted' as const };
     }
 
@@ -1022,12 +1291,33 @@ export function registerConversationHandlers(
       }
     }
 
+    // executionMode is MAIN-authoritative: it's persisted by the plan-mode tools /
+    // stream path (setExecutionModePersister, broadcastExecutionMode) as the source of
+    // truth. A conversations:put from the renderer carries whatever executionMode was on
+    // disk at its get-time — a DELAYED put can thus clobber a plan-mode transition MAIN
+    // just wrote with a stale `auto` (re-exposing mutating tools). Always keep the
+    // CURRENT disk value (prev) over the incoming record's, same as pendingDrafts
+    // (R122 finding-3 — CAS-free: MAIN never loses its authoritative mode to a stale put).
+    {
+      const prevMode = prev ? (prev as { executionMode?: unknown }).executionMode : undefined;
+      if (prevMode !== undefined) {
+        nextConversation = { ...nextConversation, executionMode: prevMode } as typeof nextConversation;
+      } else if ((nextConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        nextConversation = { ...nextConversation };
+        delete (nextConversation as { executionMode?: unknown }).executionMode;
+      }
+    }
+
     const written = writeConversation(appHome, nextConversation);
     // If the id is tombstoned (deleted), writeConversation SUPPRESSES the write (returns the record
     // unchanged, nothing hits disk). Do NOT broadcast a phantom upsert or emit ConversationStart or
-    // report success in that case — signal conversation-deleted so the client rolls back its
-    // optimistic state (matching the renderer's persistConversation deleted-rollback contract).
-    if (isWriteTombstoned(appHome, conversation.id)) {
+    // report success in that case — signal conversation-deleted so the client rolls back. Use the
+    // AUTHORITATIVE one-shot suppression flag writeConversation just set (R148), NOT a second
+    // isWriteTombstoned lookup: that re-lookup can THROW *after* the write already committed, and
+    // defaulting that to the PERMANENT conversation-deleted signal (R147) left a ghost running turn
+    // on disk with no stream (the renderer treats conversation-deleted as non-retryable). The flag
+    // never throws and reflects exactly whether THIS write hit disk.
+    if (consumeWriteWasSuppressed(conversation.id)) {
       return { rejected: 'conversation-deleted' as const };
     }
     broadcastUpsert(appHome, written);
@@ -1053,6 +1343,10 @@ export function registerConversationHandlers(
     // Abort any live stream/submit for the (now-deleted) conversation so its tools and
     // side effects don't keep running. No await between delete and cancel, so no tool runs.
     cancelConversationStream(id);
+    // Deletion removed the record before cancel, so cancelConversationStream's "real
+    // conversation" guard skips the cancel-gen bump — purge recovery state directly so a
+    // late stale answer can't raise a FYI alert for the deleted chat (R132 finding-3).
+    invalidateConversationRecovery(id);
     stopRealtimeSessionForConversation(id);
     abortAutomationForConversation(id); // standalone automations use a separate abort registry
     abortActiveCompact(id); // stop a running /compact summarizer (not in activeStreams)
@@ -1110,6 +1404,7 @@ export function registerConversationHandlers(
     // (deleteConversations preserves such a conversation) — a surviving chat with a dead run.
     for (const id of removed) {
       cancelConversationStream(id);
+      invalidateConversationRecovery(id); // purge recovery state for the deleted chat (R132 f-3)
       stopRealtimeSessionForConversation(id);
       abortAutomationForConversation(id);
       abortActiveCompact(id);
@@ -1164,6 +1459,7 @@ export function registerConversationHandlers(
     const { cleared, fullyCleared } = clearAllConversations(appHome, candidateIds);
     for (const conversationId of cleared) {
       cancelConversationStream(conversationId);
+      invalidateConversationRecovery(conversationId); // purge recovery state (R132 f-3)
       stopRealtimeSessionForConversation(conversationId);
       abortAutomationForConversation(conversationId);
       abortActiveCompact(conversationId);
@@ -1358,6 +1654,17 @@ export function registerConversationHandlers(
         if (!d || typeof d.id !== 'string' || d.id.length === 0 || typeof d.stashedAt !== 'number') return false;
         const hasText = typeof d.text === 'string' && d.text.trim().length > 0;
         const hasAttachments = Array.isArray(d.attachments) && d.attachments.length > 0;
+        // Reject a draft whose any attachment carries a non-finite / negative `size` (R195): the renderer
+        // sums these into the renderer-wide committed-bytes counter on hydration, and a NaN/string size
+        // makes that counter NaN — after which EVERY aggregate-cap comparison fails open. A forged 0 also
+        // bypasses accounting. Persisted drafts are trusted-origin, but a corrupt/truncated write must not
+        // poison the accounting; drop the malformed draft rather than store it.
+        if (hasAttachments) {
+          for (const a of d.attachments as unknown[]) {
+            const size = (a as { size?: unknown } | null)?.size;
+            if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) return false;
+          }
+        }
         return hasText || hasAttachments;
       };
       const existing = ((conv as { pendingDrafts?: unknown }).pendingDrafts ?? []) as Array<{
@@ -1393,6 +1700,43 @@ export function registerConversationHandlers(
       return { ok: true };
     },
   );
+
+  // Dedicated, AUTHORITATIVE writer for per-conversation executionMode (R125 finding-2).
+  // executionMode is MAIN-authoritative (the plan-mode tools / stream path persist it as the
+  // source of truth), so a GENERIC conversations:put must NEVER write it — a delayed put carries
+  // a STALE mode from its get-time snapshot and would clobber a plan-mode transition MAIN just
+  // wrote. But the composer's Plan-First/Auto toggle is a DELIBERATE user change that must land.
+  // This channel is the renderer's ONLY authoritative mode writer: a small read-modify-write on
+  // the current disk record (so it can't carry stale sibling fields), broadcast like the plan-mode
+  // path. The generic put keeps prev-disk-mode unconditionally; deliberate changes come HERE.
+  ipcMain.handle('conversations:set-execution-mode', (_event, conversationId: string, mode: unknown) => {
+    if (typeof conversationId !== 'string' || !conversationId) return { ok: false };
+    if (mode !== 'auto' && mode !== 'plan-first' && mode !== null) return { ok: false };
+    const conv = readConversation(appHome, conversationId);
+    if (!conv) return { ok: false };
+    const prevMode = (conv as { executionMode?: ExecutionMode | null }).executionMode ?? null;
+    // Normalize: 'auto' is the default and is stored as ABSENT (null), matching the composer's
+    // `executionMode === 'auto' ? null` convention — so a no-op toggle doesn't churn the record.
+    const nextMode = mode === 'auto' ? null : (mode as ExecutionMode | null);
+    if (prevMode === nextMode) return { ok: true }; // no-op: avoid a needless write/broadcast
+    const updated: ConversationRecord = { ...conv };
+    if (nextMode === null) delete (updated as { executionMode?: unknown }).executionMode;
+    else (updated as { executionMode?: ExecutionMode }).executionMode = nextMode;
+    // Metadata-only change (tree/head/runStatus untouched). Persist, then broadcast the same
+    // payload shape as broadcastExecutionMode so every window/web client reconciles its toggle.
+    writeConversation(appHome, updated);
+    broadcastToAllWindows('agent:execution-mode-changed', { conversationId, mode: nextMode ?? 'auto' });
+    // Re-gate a LIVE Realtime call for this conversation (R184): this is the authoritative user-toggle
+    // setter, so an Auto→Plan-First change here must re-resolve + re-apply the Realtime tool filter —
+    // otherwise the connected socket keeps mutating tools until the next reload (same fix as the
+    // broadcastExecutionMode plan-mode path in agent.ts, R183).
+    try {
+      onRealtimeExecutionModeChanged(conversationId);
+    } catch (err) {
+      console.warn('[conversations] onRealtimeExecutionModeChanged failed (non-fatal):', err);
+    }
+    return { ok: true };
+  });
 
   // Soft-RESERVE + return ONE pending draft on main (lease+ACK), so that when multiple clients have
   // hydrated the same durable pendingDrafts, only ONE restores it. Unlike a remove-and-return, the

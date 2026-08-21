@@ -2,6 +2,8 @@ import { useCallback, useEffect } from 'react';
 import { parseAppShotRef, type AppShotPayload } from '../../shared/app-shots';
 import { app } from '@/lib/ipc-client';
 import { useAttachments, type AttachedFile } from '@/providers/AttachmentContext';
+import { useMidTurnComposer } from '@/providers/RuntimeProvider';
+import { filterAttachmentsBySize, releaseAttachmentReservation } from '@/lib/attachment-limits';
 
 function toBase64(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -67,6 +69,7 @@ export function useAppShots(): void {
  */
 export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLElement>) => boolean {
   const { addAttachments } = useAttachments();
+  const { getActiveConversationId } = useMidTurnComposer();
 
   return useCallback(
     (event) => {
@@ -89,15 +92,49 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       }
 
       event.preventDefault();
+      // Bind to the originating conversation (R187): resolveRef + the fallback FileReaders are async and
+      // write to the app-global attachment store, so a chat switch mid-await would otherwise attach the
+      // screenshot + metadata to the wrong chat.
+      const originConversationId = getActiveConversationId();
       void app.appShots.resolveRef(refId).then((payload) => {
+        if (getActiveConversationId() !== originConversationId) return;
         if (payload) {
-          addAttachments(appShotPayloadToAttachments(payload));
+          // Surface a partial/failed attach near the aggregate cap (R188): appShotPayloadToAttachments
+          // returns the image + a metadata sidecar, either of which addAttachments may reject when the
+          // store is near the ceiling. The paste is reported as handled, so warn rather than fail silent.
+          const { skipped } = addAttachments(appShotPayloadToAttachments(payload));
+          if (skipped.length > 0) {
+            console.warn(`[appshot] Couldn't attach ${skipped.length} app-shot part(s) — attachment size cap reached.`);
+          }
           return;
         }
         if (imageFiles.length === 0) return;
-        for (const file of imageFiles) {
+        // Gate the WHOLE batch before reading (R186): a per-file-only cap lets several raw clipboard
+        // images materialize concurrently past the aggregate limit. filterAttachmentsBySize applies the
+        // per-file AND running aggregate caps up front.
+        const { accepted, reservedBytes } = filterAttachmentsBySize(imageFiles);
+        // Release each file's share of the reservation as its read settles (R191): holding the whole
+        // batch reservation until the last reader double-counts each committed file (reserved AND
+        // committed) against the addAttachments backstop. Per-file release transfers reserved→committed
+        // atomically; a remainder is swept when the last reader settles.
+        let outstanding = accepted.length;
+        let releasedReserved = 0;
+        const settleOne = (bytes: number) => {
+          releasedReserved += bytes;
+          releaseAttachmentReservation(bytes);
+          outstanding -= 1;
+          if (outstanding <= 0 && releasedReserved < reservedBytes) {
+            releaseAttachmentReservation(reservedBytes - releasedReserved);
+          }
+        };
+        if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
+        for (const file of accepted) {
           const reader = new FileReader();
+          reader.onerror = () => settleOne(file.size);
+          reader.onabort = () => settleOne(file.size);
           reader.onload = () => {
+            settleOne(file.size);
+            if (getActiveConversationId() !== originConversationId) return;
             addAttachments([
               {
                 name: file.name || `appshot-${refId}.png`,
@@ -113,6 +150,6 @@ export function useAppShotPasteHandler(): (event: React.ClipboardEvent<HTMLEleme
       });
       return true;
     },
-    [addAttachments],
+    [addAttachments, getActiveConversationId],
   );
 }

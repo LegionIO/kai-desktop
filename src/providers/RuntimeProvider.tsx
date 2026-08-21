@@ -14,6 +14,7 @@ import { app } from '@/lib/ipc-client';
 import { generateId } from '@/lib/utils';
 import { useAttachments } from './AttachmentContext';
 import type { AttachedFile } from './AttachmentContext';
+import { onAttachmentsCommitted, onAttachmentsReleased } from '@/lib/attachment-limits';
 import { useConfig } from './ConfigProvider';
 import {
   createUnifiedSpeechAdapter,
@@ -192,6 +193,23 @@ type MessageAccumulator = {
   /** Assistant id preallocated for the current inference response. Mastra uses
    * the same id for its persisted output row and echoes it on stream events. */
   pendingAssistantId?: string | null;
+  /** Cooperative-inject continuation override. Mastra reuses the SAME
+   *  responseMessageId across a run's steps, so after a mid-turn inject splits the
+   *  reply the CONTINUATION arrives under the reused id — which would otherwise
+   *  reuse the (already-rendered) PREFIX assistant node id and, on persist,
+   *  collapse the continuation into the prefix (dropping the injected user off the
+   *  active branch). At the inject boundary we set this to a DETERMINISTIC id
+   *  derived from the injected user node id (`${injectedUserId}-cont`) — which the
+   *  MAIN-process fallback accumulator derives identically, so a renderer-crash
+   *  fallback replace-by-id matches instead of appending a duplicate; and which is
+   *  UNIQUE PER BOUNDARY (each inject has a distinct user id), so a second inject
+   *  in the same run rotates to a new node rather than colliding. Consumed by
+   *  getOrCreateAssistantInAcc for the FIRST continuation node, then cleared. */
+  injectContinuationId?: string | null;
+  /** Assistant node ids that are CLOSED prefixes (a cooperative inject boundary
+   *  passed with this node as the reply-so-far). getOrCreateAssistantInAcc must
+   *  not reuse a closed id even if a later event re-sets pendingAssistantId to it. */
+  closedPrefixIds?: Set<string>;
   /** STABLE run generation (the server's streamToken) this accumulator is locked to —
    *  set from the first event bearing runGeneration; later events from a DIFFERENT
    *  generation are a superseded run's and dropped (except compaction). */
@@ -731,14 +749,27 @@ export function usePromptHistory(): PromptHistoryState {
 /**
  * Compose-while-running state for the composer: whether a turn is live, the
  * configured mid-turn-send mode, and a helper to enqueue a mid-turn follow-up.
- * `sendMidTurn` returns true if the message was cooperatively injected into the
- * running turn (the composer should then just clear its input); false means the
- * caller should fall back to the normal send (supersede / new turn).
+ * `sendMidTurn` resolves:
+ *   - 'injected' — cooperatively spliced into the running turn (clear the input).
+ *   - 'blocked'  — a policy hook rejected the message; it was HANDLED, so the
+ *                  caller must NOT fall back to a normal send (that would re-run
+ *                  the blocked text / supersede the active turn).
+ *   - 'fallback' — not injectable (CLI runtime / ownership changed); the caller
+ *                  should do the normal send (supersede / new turn).
  */
+type MidTurnSendResult = 'injected' | 'blocked' | 'fallback';
+type MidTurnSendOutcome = {
+  status: MidTurnSendResult;
+  reason?: string;
+  /** The conversation the send was routed to (active id at call time). A caller
+   *  whose composer belongs to a DIFFERENT conversation now (the user switched
+   *  chats during the async gate) must NOT resubmit/restore into the wrong chat. */
+  originConversationId?: string | null;
+};
 type MidTurnComposerState = {
   isRunning: boolean;
   midTurnSend: 'splice' | 'queue-editable';
-  sendMidTurn: (text: string) => Promise<boolean>;
+  sendMidTurn: (text: string) => Promise<MidTurnSendOutcome>;
   /** Pending (not-yet-spliced) injects for the active conversation — the
    *  queue-editable chip UI. Empty in 'splice' mode (chips are only shown when
    *  the setting opts in). */
@@ -746,14 +777,32 @@ type MidTurnComposerState = {
   /** Cancel a queued inject by id. Returns its text (for the "edit" affordance,
    *  which cancels then pre-fills the composer), or null if already gone. */
   cancelInject: (id: string) => Promise<string | null>;
+  /** The CURRENT active conversation id, read LIVE (not captured at render). A
+   *  composer's post-await fallback callback uses this to confirm the user hasn't
+   *  switched chats since the send — resubmitting/restoring only when it still
+   *  matches the send's originConversationId. */
+  getActiveConversationId: () => string | null;
+  /** Stash a draft for later restoration in a SPECIFIC conversation (FIFO), used
+   *  when a mid-turn send's async gate resolved after the user switched chats or
+   *  typed a new draft — so the old text isn't silently dropped but resurfaces when
+   *  the user returns to `convId`. */
+  stashRejectedDraft: (convId: string, text: string) => void;
+  /** Mark a conversation so its NEXT onNew bypasses cooperative injection and does a
+   *  normal superseding send. A composer's `fallback` branch calls this right before
+   *  composerRuntime.send() so the forced normal send doesn't re-enter injectMidTurn
+   *  (re-running hooks / splicing onto the old transcript). One-shot; onNew consumes it. */
+  markForceNormalSend: (convId: string) => void;
 };
 
 const MidTurnComposerContext = createCtx<MidTurnComposerState>({
   isRunning: false,
   midTurnSend: 'splice',
-  sendMidTurn: async () => false,
+  sendMidTurn: async () => ({ status: 'fallback' }),
   pendingInjects: [],
   cancelInject: async () => null,
+  getActiveConversationId: () => null,
+  stashRejectedDraft: () => {},
+  markForceNormalSend: () => {},
 });
 
 export function useMidTurnComposer(): MidTurnComposerState {
@@ -831,6 +880,47 @@ function tombstoneDeletedSubAgent(id: string): void {
     if (oldest === undefined) break;
     deletedSubAgentIds.delete(oldest);
   }
+}
+
+// Tombstone of DELETED conversation ids. A displaced-prompt injectMidTurn awaits a policy
+// gate; if the conversation is deleted during that await, the delete handler clears
+// rejectedDrafts — but the injection's later then/catch would re-enqueue a draft under the
+// dead id (never flushable → lost + retained, R133 f-2). The failure callbacks consult this
+// so they SKIP re-enqueuing for a conversation that was deleted while the inject was in flight.
+const deletedConversationIds = new Set<string>();
+const DELETED_CONVERSATION_IDS_MAX = 1000;
+function tombstoneDeletedConversation(id: string): void {
+  deletedConversationIds.add(id);
+  cancelInFlightDisplacedInjects(id); // flip any in-flight inject cancellation flag for this conv
+  while (deletedConversationIds.size > DELETED_CONVERSATION_IDS_MAX) {
+    const oldest = deletedConversationIds.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    deletedConversationIds.delete(oldest);
+  }
+}
+
+// In-flight displaced-prompt injections. Each is registered before its injectMidTurn await and
+// removed when the then/catch settles. A conversation DELETE (per-id) or a global RESET flips
+// the matching entries' `cancelled` flag; the settle callback consults its OWN token, so it
+// won't re-enqueue a draft for a conversation cleared while it was pending — closing the gaps a
+// per-id tombstone set alone can't: a `reset` carries no ids (R134 f-2), and a bulk delete could
+// evict a tombstone before a slow callback settles (R134 f-4). The registry is retained until
+// the producer finishes, so the signal always outlives the async producer.
+type DisplacedInjectToken = { conversationId: string; cancelled: boolean };
+const inFlightDisplacedInjects = new Set<DisplacedInjectToken>();
+function registerDisplacedInject(conversationId: string): DisplacedInjectToken {
+  const token: DisplacedInjectToken = { conversationId, cancelled: false };
+  inFlightDisplacedInjects.add(token);
+  return token;
+}
+function settleDisplacedInject(token: DisplacedInjectToken): void {
+  inFlightDisplacedInjects.delete(token);
+}
+function cancelInFlightDisplacedInjects(conversationId: string): void {
+  for (const t of inFlightDisplacedInjects) if (t.conversationId === conversationId) t.cancelled = true;
+}
+function cancelAllInFlightDisplacedInjects(): void {
+  for (const t of inFlightDisplacedInjects) t.cancelled = true;
 }
 let globalSubAgentVersion = 0; // bumped on every change to trigger re-renders
 
@@ -914,6 +1004,13 @@ const IS_WEB_BRIDGE = Boolean((window as unknown as { app?: { __isWebBridge?: bo
 const automationSeedInProgress = new Set<string>();
 /** Conversations where the next assistant message should be forced-new (after realtime call reconnect) */
 const forceNewAssistant = new Set<string>();
+/** Conversations whose NEXT onNew must BYPASS cooperative mid-turn injection and go
+ *  straight to a normal (superseding) send. Set by a composer's `fallback` path
+ *  (sendMidTurn reported the branch changed / the run isn't injectable) right before
+ *  it calls composerRuntime.send(): without this, onNew sees the run still running
+ *  and re-enters injectMidTurn — re-running policy hooks and splicing onto the OLD
+ *  transcript, defeating the branch-safety fallback. Consumed (deleted) by onNew. */
+const forceNormalSendConvs = new Set<string>();
 /** Per-conversation persist version counter — incremented before each persist, checked before writing.
  *  Prevents stale async persists from overwriting newer data. */
 const persistVersions = new Map<string, number>();
@@ -1011,6 +1108,81 @@ function clearLateCompactionHandoffTimer(convId: string): void {
 // only). Cleared per-entry on restore, or wholesale when the conversation is deleted. Bounded.
 type RejectedDraft = { id: string; text: string; attachments: AttachedFile[]; stashedAt: number };
 const rejectedDrafts = new Map<string, RejectedDraft[]>();
+// Renderer-wide attachment accounting for PARKED rejected-draft attachments (R195). When a draft is
+// stashed, consumeAttachments() already released its bytes from the live store's committed total — but
+// the attachment data (base64 dataUrls) is still RESIDENT in the queue (and on disk). So re-commit those
+// bytes to the global counter while parked, and release them the instant the draft LEAVES the queue
+// (dequeued for restore — where the store re-commits — dropped, evicted, or purged on delete). This keeps
+// the 256 MiB renderer-wide ceiling honest: parked drafts count against new live attachments, and the
+// counter can't drift as long as every enqueue is matched by exactly one leave. Idempotency is enforced
+// by a per-entry-id "counted" set so a re-enqueue of an already-counted entry (front-requeue) never
+// double-commits, and a drop of an uncounted entry never over-releases.
+const draftBytesCounted = new Set<string>();
+// Normalize an attachment's byte size (R196/R197): a corrupt persisted size (negative / NaN / string /
+// forged 0 on a large payload) must not flow into the accounting or the store's arithmetic. Derive from
+// the dataUrl when the recorded size is unusable. Shared by hydrate AND the cross-client claim path so
+// BOTH reconstruction sites (which both feed addAttachments + the byte counters) get a sane size.
+function attachmentSafeSize(a: AttachedFile): number {
+  const recorded = typeof a.size === 'number' && Number.isFinite(a.size) && a.size > 0 ? a.size : 0;
+  const fromDataUrl = typeof a.dataUrl === 'string' ? Math.floor((a.dataUrl.length * 3) / 4) : 0;
+  return Math.max(recorded, fromDataUrl);
+}
+function normalizeAttachmentSizes(attachments: AttachedFile[]): AttachedFile[] {
+  return attachments.map((a) => {
+    const size = attachmentSafeSize(a);
+    return size === a.size ? a : { ...a, size };
+  });
+}
+function draftAttachmentBytes(entry: RejectedDraft): number {
+  return entry.attachments.reduce((sum, a) => sum + attachmentSafeSize(a), 0);
+}
+// Deterministic id for a LEGACY id-less persisted draft (R197): two viewers hydrating the same on-disk
+// entry concurrently must mint the SAME id, or main keeps both (after dropping the id-less original) and
+// the draft restores twice. Derive it from the draft's stable content (text + attachment dataUrls +
+// stashedAt) with a cheap stable string hash — identical content ⇒ identical id, so main dedups by key.
+function deterministicLegacyDraftId(text: string, attachments: AttachedFile[], stashedAt: number): string {
+  const material = `${stashedAt} ${text} ${attachments.map((a) => a.dataUrl ?? '').join(' ')}`;
+  let h1 = 0x811c9dc5;
+  let h2 = 0xc2b2ae35;
+  for (let i = 0; i < material.length; i++) {
+    const c = material.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  return `legacy-${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+function retainDraftAttachmentBytes(entry: RejectedDraft): void {
+  if (draftBytesCounted.has(entry.id)) return;
+  const bytes = draftAttachmentBytes(entry);
+  if (bytes > 0) onAttachmentsCommitted(bytes);
+  draftBytesCounted.add(entry.id);
+}
+function releaseDraftAttachmentBytes(entry: RejectedDraft): void {
+  if (!draftBytesCounted.has(entry.id)) return;
+  const bytes = draftAttachmentBytes(entry);
+  if (bytes > 0) onAttachmentsReleased(bytes);
+  draftBytesCounted.delete(entry.id);
+}
+// Unload the in-memory draft mirror for every conversation EXCEPT `keepConvId` (R196): the durable
+// pendingDrafts on disk survive, so an inactive conversation's mirror is redundant and its parked
+// attachment bytes stay counted against the renderer-wide ceiling — visiting many chats with drafts
+// would otherwise accumulate unbounded resident memory and could exceed the cap / OOM. Restore only
+// ever targets the ACTIVE conversation, so dropping inactive mirrors is safe; they re-hydrate on return.
+// A conversation with a claim in flight is left intact so we don't race its lease. A conversation whose
+// durable add-delta is still buffered/flushing is ALSO left intact (R197): unloading its memory mirror
+// before the disk write lands would lose the draft entirely if that write ultimately fails, and would
+// release its byte accounting while the retry buffer still holds the attachment data.
+function unloadInactiveDraftMirrors(keepConvId: string): void {
+  for (const [convId, q] of [...rejectedDrafts]) {
+    if (convId === keepConvId || draftClaimInFlight.has(convId)) continue;
+    if (pendingDraftDeltas.has(convId) || draftDeltaFlushing.has(convId)) continue; // durable write in flight
+    // Pin the mirror if ANY of this conversation's drafts had its durable add permanently fail (R199):
+    // the in-memory copy is then the only surviving one, so unloading would lose the unsent input.
+    if (q.some((d) => draftDurableWriteFailedIds.has(d.id))) continue;
+    for (const d of q) releaseDraftAttachmentBytes(d);
+    rejectedDrafts.delete(convId);
+  }
+}
 // Conversations with a draft claim currently in flight on THIS client — serializes the load-restore
 // and the composer-empty poll so they can't both claim (and double-restore) the same draft.
 const draftClaimInFlight = new Set<string>();
@@ -1027,12 +1199,22 @@ const draftClaimInFlight = new Set<string>();
 const MAX_REJECTED_DRAFTS_PER_CONV = 200; // pathological safety valve only
 function enqueueRejectedDraft(convId: string, draft: { text: string; attachments: AttachedFile[] }): void {
   if (draft.text.trim().length === 0 && draft.attachments.length === 0) return;
+  // Skip a conversation that was DELETED while an async producer (e.g. a displaced-prompt
+  // injectMidTurn awaiting a policy gate) was in flight: re-enqueuing under the dead id would
+  // leave an unflushable draft retained forever (its durable persist returns ok:false and the
+  // flusher ignores it), R133 f-2. The delete handler already cleared any existing drafts.
+  if (deletedConversationIds.has(convId)) return;
   const q = rejectedDrafts.get(convId) ?? [];
   const entry: RejectedDraft = { id: msgId(), ...draft, stashedAt: Date.now() };
   q.push(entry);
+  retainDraftAttachmentBytes(entry); // count parked bytes against the renderer-wide ceiling (R195)
   // Pathological safety valve only. If ever hit, drop the OLDEST (least likely still wanted) —
   // and remove it from the durable store by id so the delta stays consistent.
   const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.shift() : undefined;
+  if (evicted) {
+    releaseDraftAttachmentBytes(evicted); // parked bytes leave with the evicted entry (R195)
+    draftDurableWriteFailedIds.delete(evicted.id); // R199
+  }
   rejectedDrafts.set(convId, q);
   // DURABLE copy: the in-memory queue is the fast-restore mirror, but a reload/close/crash before
   // restore would silently lose this unsent input. ADD this draft to the conversation record's
@@ -1045,9 +1227,15 @@ function enqueueRejectedDraft(convId: string, draft: { text: string; attachments
 // it's the next one restored, and re-ADD it durably so it survives across reload.
 function enqueueRejectedDraftEntry(convId: string, entry: RejectedDraft): void {
   if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  if (deletedConversationIds.has(convId)) return; // deleted mid-flight → don't resurrect (R133 f-2)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  retainDraftAttachmentBytes(entry); // idempotent: no-op if this entry's bytes are already counted (R195)
   const evicted = q.length > MAX_REJECTED_DRAFTS_PER_CONV ? q.pop() : undefined; // drop NEWEST on overflow (keep this requeued one)
+  if (evicted) {
+    releaseDraftAttachmentBytes(evicted);
+    draftDurableWriteFailedIds.delete(evicted.id); // R199
+  }
   rejectedDrafts.set(convId, q);
   applyPendingDraftsDelta(convId, [entry], evicted ? [evicted.id] : []);
 }
@@ -1057,7 +1245,11 @@ function dequeueRejectedDraft(convId: string): RejectedDraft | undefined {
   if (!q || q.length === 0) return undefined;
   const next = q.shift();
   if (q.length === 0) rejectedDrafts.delete(convId);
-  if (next) applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
+  if (next) {
+    releaseDraftAttachmentBytes(next); // leaving the queue; the restore path re-commits via the store (R195)
+    draftDurableWriteFailedIds.delete(next.id); // being restored → no longer needs the unload pin (R199)
+    applyPendingDraftsDelta(convId, [], [next.id]); // remove the consumed draft by id (delta)
+  }
   return next;
 }
 // Peek the OLDEST rejected draft's id without removing it (used to name the atomic claim below).
@@ -1070,6 +1262,11 @@ function peekOldestRejectedDraftId(convId: string): string | undefined {
 function dropRejectedDraftLocal(convId: string, id: string): void {
   const q = rejectedDrafts.get(convId);
   if (!q) return;
+  const removed = q.find((d) => d.id === id);
+  if (removed) {
+    releaseDraftAttachmentBytes(removed); // leaving the queue (R195) — restore path re-commits via the store
+    draftDurableWriteFailedIds.delete(id); // no longer parked here → drop any unload pin (R199)
+  }
   const next = q.filter((d) => d.id !== id);
   if (next.length === 0) rejectedDrafts.delete(convId);
   else rejectedDrafts.set(convId, next);
@@ -1079,8 +1276,10 @@ function dropRejectedDraftLocal(convId: string, id: string): void {
 // durable re-add would duplicate the on-disk copy; we only need it back in this session's queue.
 function requeueRejectedDraftLocalOnly(convId: string, entry: RejectedDraft): void {
   if (entry.text.trim().length === 0 && entry.attachments.length === 0) return;
+  if (deletedConversationIds.has(convId)) return; // deleted after the claim → don't recreate the queue (R134 f-3)
   const q = rejectedDrafts.get(convId) ?? [];
   if (!q.some((d) => d.id === entry.id)) q.unshift(entry);
+  retainDraftAttachmentBytes(entry); // back in the queue → re-count its parked bytes (R195)
   rejectedDrafts.set(convId, q);
 }
 // ATOMICALLY reserve the oldest pending draft on MAIN and restore it into the composer — but only
@@ -1111,7 +1310,9 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
       const d: RejectedDraft = {
         id: res.draft.id || id,
         text: res.draft.text,
-        attachments: (res.draft.attachments as RejectedDraft['attachments']) ?? [],
+        // Normalize sizes (R197): the claim reconstructs from RAW persisted attachments, so a corrupt
+        // size would otherwise reach addAttachments + bypass the aggregate counter.
+        attachments: normalizeAttachmentSizes((res.draft.attachments as RejectedDraft['attachments']) ?? []),
         stashedAt: res.draft.stashedAt,
       };
       dropRejectedDraftLocal(convId, d.id);
@@ -1132,9 +1333,14 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
       // reclaim it on a later poll tick. Keeping the marker means the poll keeps retrying; the
       // draft is never orphaned. (No composer clobber — we didn't restore anything.)
       // (leave rejectedDrafts[convId] as-is)
-    } else {
-      // Genuinely gone (no live reservation, not returned) — reconcile our local mirror.
+    } else if (res.ok) {
+      // ok:true but neither returned nor reserved → main CONFIRMED the draft is genuinely gone (already
+      // restored/removed elsewhere): reconcile our local mirror.
       dropRejectedDraftLocal(convId, id);
+    } else {
+      // ok:false → main could NOT read the record (a transient EMFILE/read blip, or a claim racing an
+      // uncommitted add). This is NOT a confirmed deletion, so do NOT drop the only in-memory copy (R200):
+      // leave it in place (and its durability pin intact) for a later retry tick.
     }
   } catch {
     // Claim failed — leave the draft in place (both disk and local) for a later retry tick.
@@ -1158,6 +1364,20 @@ async function claimAndRestoreDraft(convId: string, restore: (d: RejectedDraft) 
 // collapses the common stash-then-immediately-restore case into a no-op write.
 type PendingDraftDelta = { adds: Map<string, RejectedDraft>; removes: Set<string> };
 const pendingDraftDeltas = new Map<string, PendingDraftDelta>();
+// Consecutive durable-write failures per conversation. A non-deleted conversation whose
+// setPendingDrafts keeps returning {ok:false} (a persistently-unreadable record) would otherwise
+// loop the flusher forever via the re-fold + finally-relaunch (R154 f-2). After a bounded number
+// of failed batches we DROP the durable write (the in-memory queue still holds the draft for the
+// session; durability is best-effort). Reset on any success.
+const draftFlushFailStreak = new Map<string, number>();
+const MAX_DRAFT_FLUSH_FAIL_STREAK = 8;
+// DRAFT IDS whose durable add permanently failed this session (retry budget exhausted on a still-live,
+// unreadable record). Keyed by draft id — NOT conversation (R199): a later successful delta for a
+// DIFFERENT draft in the same conversation must not un-pin an earlier draft whose add never persisted.
+// The conversation's in-memory mirror is pinned against unload while ANY of its drafts is in this set.
+// An id is cleared when that specific draft is successfully persisted, restored, dropped, or its
+// conversation is deleted/cleared.
+const draftDurableWriteFailedIds = new Set<string>();
 const draftDeltaFlushing = new Map<string, Promise<void>>();
 function applyPendingDraftsDelta(convId: string, add: RejectedDraft[], removeIds: string[]): void {
   let buf = pendingDraftDeltas.get(convId);
@@ -1201,21 +1421,68 @@ async function flushPendingDraftDeltas(convId: string): Promise<void> {
       let ok = false;
       for (let attempt = 0; attempt < 4 && !ok; attempt++) {
         try {
-          await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
-          ok = true;
+          // Honor the main-side result (R153 f-2): set-pending-drafts returns {ok:false} when it
+          // can't read the conversation (a transient EMFILE/read failure — or a genuine delete).
+          // Treating the resolved promise as success discarded the ONLY durable-write delta on a
+          // transient blip → the displaced prompt is lost if the user switched away + Kai exits
+          // before local restore. Retry on {ok:false}; the bounded budget + re-fold below give up
+          // (a genuinely-deleted conversation has no draft to preserve anyway).
+          const res = await app.conversations.setPendingDrafts?.(convId, { add: addPayload, removeIds });
+          ok = res ? res.ok !== false : true; // older bridge (undefined) → treat resolve as success
+          if (!ok && attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
         } catch {
           if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
         }
       }
       if (!ok) {
-        // Exhausted this batch. Re-fold it into the buffer so a later delta's flush retries it —
-        // but only ops not already superseded by a newer op (a fresh remove wins over our add).
+        // Exhausted this batch. A conversation DELETED/cleared this session returns {ok:false}
+        // PERMANENTLY (main can't read the record) — re-folding it would loop forever via the
+        // finally-relaunch below (R154 f-2). Its drafts are moot anyway (a deleted chat), so DROP
+        // the batch instead of re-folding. Only re-fold for a still-live conversation (a transient
+        // failure a later delta's flush should retry) — and cap consecutive failures so a
+        // persistently-unreadable (non-deleted) record can't loop the flusher forever either.
+        const streak = (draftFlushFailStreak.get(convId) ?? 0) + 1;
+        if (deletedConversationIds.has(convId)) {
+          // Deleted/cleared conversation: its drafts are moot — drop the whole buffer.
+          pendingDraftDeltas.delete(convId);
+          draftFlushFailStreak.delete(convId);
+          return;
+        }
+        if (streak >= MAX_DRAFT_FLUSH_FAIL_STREAK) {
+          // Persistently-unreadable but NOT-deleted conversation: give up on THIS batch's ops so the
+          // flusher can't loop forever — but do NOT blanket-delete the buffer (R167 f-2): a NEWER
+          // displaced draft may have been folded into pendingDraftDeltas by a concurrent
+          // applyPendingDraftsDelta while this batch was awaiting its retries, and deleting the whole
+          // buffer would discard that fresh, never-flushed prompt. Remove only THIS batch's ops from
+          // the current buffer, preserving anything newer; clear the streak so the newer op gets its
+          // own fresh retry budget.
+          const cur = pendingDraftDeltas.get(convId);
+          if (cur) {
+            for (const id of buf.adds.keys()) cur.adds.delete(id);
+            for (const id of buf.removes) cur.removes.delete(id);
+            if (cur.adds.size === 0 && cur.removes.size === 0) pendingDraftDeltas.delete(convId);
+          }
+          draftFlushFailStreak.delete(convId);
+          // These specific ADD ids had their durable write permanently fail — the in-memory queue is now
+          // their ONLY copy, so pin the mirror against unload-on-switch (R198/R199). Keyed by DRAFT ID (not
+          // conversation) so a later successful delta for a DIFFERENT draft can't un-pin these. (A pure-remove
+          // batch failing is harmless: the on-disk draft simply lingers and is reconciled later.)
+          for (const id of buf.adds.keys()) draftDurableWriteFailedIds.add(id);
+          return;
+        }
+        draftFlushFailStreak.set(convId, streak);
+        // Re-fold it into the buffer so a later delta's flush retries it — but only ops not
+        // already superseded by a newer op (a fresh remove wins over our add).
         const next = pendingDraftDeltas.get(convId) ?? { adds: new Map(), removes: new Set() };
         for (const d of buf.adds.values()) if (!next.removes.has(d.id) && !next.adds.has(d.id)) next.adds.set(d.id, d);
         for (const id of buf.removes) if (!next.adds.has(id)) next.removes.add(id);
         pendingDraftDeltas.set(convId, next);
         return; // stop laps; the next applyPendingDraftsDelta call restarts the flusher
       }
+      draftFlushFailStreak.delete(convId); // a successful batch resets the failure streak
+      // This batch's ADD ids are now durably persisted — un-pin them (R199). Keyed per draft id so only
+      // the drafts THIS batch persisted are cleared; any still-unpersisted failed draft stays pinned.
+      for (const id of buf.adds.keys()) draftDurableWriteFailedIds.delete(id);
     }
   })();
   draftDeltaFlushing.set(convId, run);
@@ -1237,15 +1504,32 @@ function hydrateRejectedDraftsFromDisk(convId: string, conv: { pendingDrafts?: u
   const raw = conv.pendingDrafts;
   if (!Array.isArray(raw) || raw.length === 0) return false;
   const restored: RejectedDraft[] = [];
+  const migratedLegacyIds: RejectedDraft[] = []; // id-less legacy entries we minted an id for
   for (const d of raw as Array<{ id?: unknown; text?: unknown; attachments?: unknown; stashedAt?: unknown }>) {
     const text = typeof d?.text === 'string' ? d.text : '';
-    const attachments = Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [];
+    // Normalize each attachment's size on hydrate (R196/R197): corrupt persisted sizes must not flow
+    // into accounting or the store. Shared with the claim path via normalizeAttachmentSizes.
+    const attachments = normalizeAttachmentSizes(
+      Array.isArray(d?.attachments) ? (d.attachments as AttachedFile[]) : [],
+    );
     const stashedAt = typeof d?.stashedAt === 'number' ? d.stashedAt : Date.now();
-    const id = typeof d?.id === 'string' && d.id.length > 0 ? d.id : msgId();
+    const hadId = typeof d?.id === 'string' && d.id.length > 0;
+    // Legacy id-less entry: use a DETERMINISTIC content-derived id (R197) so concurrent viewers agree
+    // and main dedups instead of restoring the draft twice.
+    const id = hadId ? (d.id as string) : deterministicLegacyDraftId(text, attachments, stashedAt);
     if (text.trim().length === 0 && attachments.length === 0) continue;
-    restored.push({ id, text, attachments, stashedAt });
+    const entry = { id, text, attachments, stashedAt };
+    restored.push(entry);
+    if (!hadId) migratedLegacyIds.push(entry);
   }
   if (restored.length === 0) return false;
+  // A legacy/pre-id persisted draft got a freshly-minted id above; that id lives only in this renderer
+  // mirror, so main's id-specific claim can't match it (the draft would never restore, and a later
+  // remove-delta would drop it as invalid). Persist the minted id back to disk so both sides agree (R196).
+  if (migratedLegacyIds.length > 0) void applyPendingDraftsDelta(convId, migratedLegacyIds, []);
+  // Count each hydrated draft's parked attachment bytes (R195): after a reload the live counter is 0
+  // but these dataUrls are resident again. Idempotent per id, so a double-hydrate can't double-count.
+  for (const entry of restored) retainDraftAttachmentBytes(entry);
   rejectedDrafts.set(convId, restored);
   return true;
 }
@@ -1363,8 +1647,200 @@ function finalizeAssistantResponse(acc: MessageAccumulator, finishedAt = nowIso(
   acc.pendingAssistantId = null;
 }
 
+/**
+ * Reorder a mid-turn-inject boundary when the injected user was inserted BEFORE
+ * the prior step's assistant prefix existed. If exactly one assistant node is
+ * parented on `injectedUserId` and it is NOT the per-boundary continuation node
+ * (`${injectedUserId}-cont`, which legitimately follows the user), that assistant
+ * is the prior step's output mis-created under the user — swap them so ordering is
+ * `prefix → injectedUser` (the model produced the prefix before it saw the
+ * inject). Advances headId from the prefix to the user when needed. Pure: returns
+ * new messages/headId (no mutation). No-op otherwise.
+ */
+export function reorderPrefixBeforeInjectedUser(
+  messages: StoredMessage[],
+  headId: string | null,
+  injectedUserId: string,
+): { messages: StoredMessage[]; headId: string | null } {
+  const user = messages.find((m) => m.id === injectedUserId);
+  if (!user) return { messages, headId };
+  const contId = `${injectedUserId}-cont`;
+  const childAssistants = messages.filter(
+    (m) => m.parentId === injectedUserId && m.role === 'assistant' && m.id !== contId,
+  );
+  // A transient model-fallback can leave MULTIPLE assistant variants under the
+  // injected user (a failed partial + the successful reply). Pick the ACTIVE one —
+  // the variant on the current head's ancestor lineage — so the successful reply
+  // (not a failed sibling) is threaded before the user (matches the disk-side
+  // reorderInjectPrefixOnDisk). If none is on the head lineage, don't guess.
+  let prefix: StoredMessage | undefined;
+  if (childAssistants.length === 1) {
+    prefix = childAssistants[0];
+  } else if (childAssistants.length > 1) {
+    const byId = new Map(messages.map((m) => [m.id, m] as const));
+    const onHeadLineage = (id: string): boolean => {
+      let cur: string | null = headId;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur)) {
+        if (cur === id) return true;
+        seen.add(cur);
+        cur = byId.get(cur)?.parentId ?? null;
+      }
+      return false;
+    };
+    prefix = childAssistants.find((m) => onHeadLineage(m.id));
+  }
+  if (!prefix) return { messages, headId };
+  const userParent = user.parentId;
+  const prefixId = prefix.id;
+  // Move EVERY assistant variant under the injected user (not just the active one):
+  // a transient fallback can leave a failed partial + the successful reply as
+  // siblings there, both produced BEFORE the model saw the inject. Leaving the
+  // failed sibling under the injected user would group it with the eventual
+  // continuation in branch selection (and a renderer persist could undo the
+  // disk-side repair). Reparent all to the pre-inject head; attach the injected user
+  // only to the ACTIVE variant (prefix).
+  const variantIds = new Set(
+    messages.filter((m) => m.role === 'assistant' && m.parentId === injectedUserId).map((m) => m.id),
+  );
+  const nextMessages = messages.map((m) => {
+    if (variantIds.has(m.id)) return { ...m, parentId: userParent };
+    if (m.id === injectedUserId) return { ...m, parentId: prefixId };
+    return m;
+  });
+  const nextHead = headId === prefixId ? injectedUserId : headId;
+  return { messages: nextMessages, headId: nextHead };
+}
+
+/**
+ * Batch-aware variant of reorderPrefixBeforeInjectedUser for a multi-inject
+ * boundary consumed together. When several injects were broadcast before the
+ * prior step's first assistant delta, the temporary tree is
+ * `pre → u1 → u2 → … → prefix` (the prefix landed under the LAST user). The prefix
+ * was produced BEFORE any of them, so it belongs BEFORE the whole chain:
+ * `pre → prefix → u1 → u2 → …`. Find the single non-continuation assistant parented
+ * on ANY injected user in the batch, move it to the FIRST injected user's parent,
+ * and reparent that first user onto it — leaving the rest of the user chain intact
+ * after it. Pure. No-op when there's no such misplaced prefix. `injectedIds` is in
+ * FIFO (chain) order.
+ */
+export function reorderPrefixBeforeInjectedUserChain(
+  messages: StoredMessage[],
+  headId: string | null,
+  injectedIds: string[],
+): { messages: StoredMessage[]; headId: string | null } {
+  if (injectedIds.length === 0) return { messages, headId };
+  if (injectedIds.length === 1) return reorderPrefixBeforeInjectedUser(messages, headId, injectedIds[0]);
+  const idSet = new Set(injectedIds);
+  const contIds = new Set(injectedIds.map((id) => `${id}-cont`));
+  // The misplaced prefix: a non-continuation assistant whose parent is one of the
+  // batch's injected users. A transient model-fallback can leave MULTIPLE variants
+  // (a failed partial + the successful reply) — select the ACTIVE one on the
+  // current head's ancestor lineage (matches the single-entry + disk repairs).
+  const allPrefixes = messages.filter(
+    (m) => m.role === 'assistant' && typeof m.parentId === 'string' && idSet.has(m.parentId) && !contIds.has(m.id),
+  );
+  let prefix: StoredMessage | undefined;
+  if (allPrefixes.length === 1) {
+    prefix = allPrefixes[0];
+  } else if (allPrefixes.length > 1) {
+    const byId = new Map(messages.map((m) => [m.id, m] as const));
+    const onHeadLineage = (id: string): boolean => {
+      let cur: string | null = headId;
+      const seen = new Set<string>();
+      while (cur && !seen.has(cur)) {
+        if (cur === id) return true;
+        seen.add(cur);
+        cur = byId.get(cur)?.parentId ?? null;
+      }
+      return false;
+    };
+    prefix = allPrefixes.find((m) => onHeadLineage(m.id));
+  }
+  if (!prefix) return { messages, headId };
+  const firstUser = messages.find((m) => m.id === injectedIds[0]);
+  if (!firstUser) return { messages, headId };
+  const prefixId = prefix.id;
+  const chainParent = firstUser.parentId; // the pre-inject head
+  // Move EVERY assistant variant that sits under the SAME injected user as the
+  // active prefix (a transient fallback can leave a failed partial + the successful
+  // reply as siblings there, both produced before the inject was consumed) back to
+  // the pre-inject head — attaching the first injected user only to the ACTIVE one.
+  // Leaving a failed sibling under the injected user would group it with the
+  // continuation in branch selection.
+  const variantParent = prefix.parentId;
+  const variantIds = new Set(
+    messages.filter((m) => m.role === 'assistant' && m.parentId === variantParent).map((m) => m.id),
+  );
+  // Rechain EVERY injected user in FIFO order after the prefix, not just the first.
+  // The batch can interleave as `pre → u1 → prefix → u2` (prefix landed under u1,
+  // u2 under prefix) — not only the documented `pre → u1 → u2 → … → prefix`. Simply
+  // reparenting u1 onto prefix would then leave u2 still parented on prefix, making
+  // u1 an inactive SIBLING of u2 → u1 (a turn the model actually consumed) drops off
+  // the active branch and disappears from persisted history. Force the linear chain
+  // prefix → u1 → u2 → … so every consumed inject stays on-branch (R99 finding-3).
+  const chainParentOf = new Map<string, string>();
+  chainParentOf.set(injectedIds[0], prefixId);
+  for (let i = 1; i < injectedIds.length; i++) {
+    chainParentOf.set(injectedIds[i], injectedIds[i - 1]);
+  }
+  const nextMessages = messages.map((m) => {
+    if (variantIds.has(m.id)) return { ...m, parentId: chainParent };
+    const rechainTo = chainParentOf.get(m.id);
+    if (rechainTo !== undefined) return { ...m, parentId: rechainTo };
+    return m;
+  });
+  // If the head was the misplaced prefix, advance it to the tail of the user chain.
+  const nextHead = headId === prefixId ? injectedIds[injectedIds.length - 1] : headId;
+  return { messages: nextMessages, headId: nextHead };
+}
+
 export function getOrCreateAssistantInAcc(acc: MessageAccumulator): { msg: StoredMessage; idx: number } {
-  const desiredId = acc.pendingAssistantId ?? undefined;
+  let desiredId = acc.pendingAssistantId ?? undefined;
+  // Cooperative-inject continuation: if the reused responseMessageId (desiredId)
+  // is a CLOSED prefix, do NOT reuse the prefix node id (that collapses the
+  // continuation into the prefix on persist, dropping the injected user
+  // off-branch). Use the DETERMINISTIC per-boundary continuation id
+  // (`${injectedUserId}-cont`, set at the boundary) — which the main-process
+  // fallback derives identically (so a crash-time replace-by-id matches, no
+  // duplicate) and which differs per inject (so a 2nd inject rotates again).
+  if (desiredId && acc.closedPrefixIds?.has(desiredId)) {
+    desiredId = acc.injectContinuationId ?? `${desiredId}-cont`;
+  }
+  // A cooperative-inject continuation boundary is OPEN (injectContinuationId is the
+  // CURRENT boundary's deterministic id; a new boundary rotates it and moves the old
+  // one into closedPrefixIds). ALL continuation content for this boundary must land on
+  // that id. A PRE-CONTENT model-fallback rotates acc.pendingAssistantId to the fallback
+  // model's FRESH id — which is NOT a closed prefix, so the branch above wouldn't
+  // redirect it; without this pin the renderer would create the continuation under the
+  // fresh id while main's fallback accumulator uses `${injectedUser}-cont` → divergent
+  // ids → a duplicate sibling on a main finalize. Pin the WHOLE boundary (not just until
+  // the node first materializes — else a fallback's SECOND delta, arriving after the
+  // deterministic node exists, would revert to the fresh id and fork a duplicate node):
+  // the reuse-in-place check below then reuses the materialized node, or creates it.
+  if (acc.injectContinuationId && desiredId !== acc.injectContinuationId) {
+    desiredId = acc.injectContinuationId;
+  }
+  // Cooperative-inject ordering guard: when an inject was broadcast mid-step, the
+  // `user-message` handler advanced acc.headId to the injected user BEFORE the
+  // prior step's remaining deltas arrived (the ordered `inject-consumed` marker
+  // that closes the prefix comes AFTER them). Those remainder deltas still belong
+  // to the STILL-OPEN node (desiredId not yet closed), but the branch tail is now
+  // the user — so the tail check below would create a NEW assistant UNDER the user
+  // (`user → remainder`), corrupting order. If a message with the RESOLVED desiredId
+  // already exists AND that id is NOT a closed prefix, update THAT node in place so
+  // the remainder stays with the still-open node, before the user. Keyed on
+  // desiredId (the resolved target), NOT pendingAssistantId — after a 2nd inject the
+  // reused pendingAssistantId is closed while desiredId is the OPEN 2nd continuation,
+  // which must still be reused in place rather than duplicated.
+  if (desiredId && !acc.closedPrefixIds?.has(desiredId)) {
+    const existingIdx = acc.messages.findIndex((m) => m.id === desiredId && m.role === 'assistant');
+    if (existingIdx >= 0) {
+      const timed = withPendingAssistantTiming(acc.messages[existingIdx], acc);
+      if (timed !== acc.messages[existingIdx]) acc.messages[existingIdx] = timed;
+      return { msg: acc.messages[existingIdx], idx: existingIdx };
+    }
+  }
   const branch = getActiveBranch(acc.messages, acc.headId);
   const last = branch[branch.length - 1];
   if (last?.role === 'assistant' && (!desiredId || last.id === desiredId)) {
@@ -1980,6 +2456,16 @@ export function preserveErroredAssistantVariant(acc: MessageAccumulator, errorTe
   acc.messages[idx] = { ...last, content: toStoredContent(content) };
   // Rewind head to the errored variant's parent so the retry is a sibling.
   acc.headId = last.parentId ?? null;
+  // If the sealed variant IS this run's open inject-continuation node, the boundary
+  // is now closed for it: the retry must be a fresh SIBLING, not another delta on
+  // this (errored) continuation. Close it out (record it as a closed prefix and clear
+  // injectContinuationId) so getOrCreateAssistantInAcc no longer pins the retry's
+  // fresh response id onto the sealed node. A subsequent inject re-opens a boundary.
+  if (acc.injectContinuationId && last.id === acc.injectContinuationId) {
+    acc.closedPrefixIds ??= new Set();
+    acc.closedPrefixIds.add(acc.injectContinuationId);
+    acc.injectContinuationId = null;
+  }
   return true;
 }
 
@@ -2420,7 +2906,7 @@ export function RuntimeProvider({
   onModelFallbackRef.current = onModelFallback;
   const onConversationSettingsLoadedRef = useRef(onConversationSettingsLoaded);
   onConversationSettingsLoadedRef.current = onConversationSettingsLoaded;
-  const { consumeAttachments, addAttachments, attachments } = useAttachments();
+  const { consumeAttachments, addAttachments, clearAttachments, attachments } = useAttachments();
   // Live mirror of the composer's current attachments, for reads inside async rollback
   // closures (state would be stale). Used to avoid clobbering a NEW draft's attachments
   // when restoring a rolled-back turn's consumed attachments.
@@ -2655,6 +3141,9 @@ export function RuntimeProvider({
     // First HYDRATE the in-memory queue from the durable copy on disk (survives a reload/crash
     // that dropped the volatile mirror) — only fills an empty slot, so a live in-session queue
     // is untouched.
+    // Unload other conversations' in-memory draft mirrors (R196) so parked attachment bytes don't
+    // accumulate unbounded across visited chats — the durable disk copy re-hydrates on return.
+    unloadInactiveDraftMirrors(id);
     hydrateRejectedDraftsFromDisk(id, conv as { pendingDrafts?: unknown });
     if (rejectedDrafts.has(id)) {
       setTimeout(() => {
@@ -2667,7 +3156,18 @@ export function RuntimeProvider({
           if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
           const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
           if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
-          if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+          // Commit attachments FIRST and only ACK the draft if they ALL committed (R194): the global
+          // reservation cap can reject some/all, and ACKing then would permanently delete the durable
+          // draft, silently losing the recovered attachments. On any skip, ROLL BACK the partial commit
+          // (the store was verified empty above) and requeue (return false) so a later attempt retries
+          // once budget frees — avoiding both loss and double-add. Text-only drafts always commit.
+          if (rejected.attachments.length > 0) {
+            const { skipped } = addAttachments(rejected.attachments);
+            if (skipped.length > 0) {
+              clearAttachments(); // undo the partial commit; keep the durable draft intact for retry
+              return false;
+            }
+          }
           restoreComposerDraft(rejected.text);
           return true;
         });
@@ -2777,7 +3277,18 @@ export function RuntimeProvider({
   useEffect(() => {
     (async () => {
       try {
+        // Capture the load sequence BEFORE awaiting getActiveId() (R169): if the user selects a
+        // different conversation while this IPC is pending, that selection runs its own
+        // loadConversationState and bumps loadSeqRef. Without this guard, resolving getActiveId here
+        // would then call loadConversationState for the STALE active id, which bumps the token AGAIN
+        // (becoming newest) and overwrites the user's selection — and a send in that window would
+        // target the old conversation. If the token advanced during the await, a newer load owns the
+        // state; skip the mount load entirely.
+        const seqBeforeResolve = loadSeqRef.current;
         const id = conversationId ?? (await app.conversations.getActiveId());
+        if (loadSeqRef.current !== seqBeforeResolve) {
+          return; // a newer selection-driven load started while we awaited getActiveId — defer to it
+        }
         if (id && (await loadConversationState(id))) {
           return;
         }
@@ -2848,13 +3359,22 @@ export function RuntimeProvider({
         if (activeIdRef.current !== id) return false; // switched during the async claim — requeue
         const t = runtimeRef.current?.thread?.composer?.getState?.().text ?? '';
         if (t.trim().length > 0 || attachmentsRef.current.length > 0) return false; // busy — requeue
-        if (rejected.attachments.length > 0) addAttachments(rejected.attachments);
+        // Same all-or-nothing attachment commit as the load-time restore (R194/R195): if the global
+        // reservation cap rejects any recovered attachment, roll back the partial commit and requeue so
+        // the durable draft isn't ACKed + deleted with its attachments lost.
+        if (rejected.attachments.length > 0) {
+          const { skipped } = addAttachments(rejected.attachments);
+          if (skipped.length > 0) {
+            clearAttachments();
+            return false;
+          }
+        }
         restoreComposerDraft(rejected.text);
         return true;
       });
     }, 1500);
     return () => clearInterval(timer);
-  }, [addAttachments]);
+  }, [addAttachments, clearAttachments]);
 
   // Reload the active conversation when the main process appends to it (e.g. an
   // automation targeting this thread). Our own persists never grow the tree past
@@ -2883,7 +3403,14 @@ export function RuntimeProvider({
           supersededResponseIds.delete(deletedId);
           pendingCompactionHandoff.delete(deletedId);
           clearLateCompactionHandoffTimer(deletedId);
+          // Release the parked attachment bytes of every rejected draft for this deleted conversation
+          // before dropping the queue (R195) — otherwise the global counter would leak them forever.
+          for (const d of rejectedDrafts.get(deletedId) ?? []) {
+            releaseDraftAttachmentBytes(d);
+            draftDurableWriteFailedIds.delete(d.id); // deleted chat: drop each draft's unload pin (R199)
+          }
           rejectedDrafts.delete(deletedId);
+          tombstoneDeletedConversation(deletedId); // so an in-flight inject's callback won't re-enqueue (R133 f-2)
           persistVersions.delete(deletedId);
           lastRetitleCount.delete(deletedId);
           clearFinalizedBranch(deletedId);
@@ -2905,7 +3432,11 @@ export function RuntimeProvider({
         pendingCompactionHandoff.clear();
         for (const t of lateCompactionHandoffTimers.values()) clearTimeout(t);
         lateCompactionHandoffTimers.clear();
+        // Release parked draft attachment bytes across ALL conversations before the bulk clear (R195).
+        for (const q of rejectedDrafts.values()) for (const d of q) releaseDraftAttachmentBytes(d);
         rejectedDrafts.clear();
+        draftDurableWriteFailedIds.clear(); // R199
+        cancelAllInFlightDisplacedInjects(); // a global clear cancels every in-flight displaced inject (R134 f-2)
         persistVersions.clear();
         lastRetitleCount.clear();
         for (const id of [...lastFinalizedBranch.keys()]) clearFinalizedBranch(id);
@@ -3589,20 +4120,130 @@ export function RuntimeProvider({
         // seeded by an untagged external user-message.
         lastLiveGeneration.set(convId, evGen);
         if (acc.runGeneration == null) {
-          // Lock to the first REAL-run event — BUT if this accumulator already knows its run
-          // (pendingAssistantId set by a local onNew/onEdit/onReload) and this event belongs to
-          // a DIFFERENT run (its responseMessageId doesn't match), do NOT let it lock. That
-          // guards the window where a superseded CLI/mirror run (whose responseMessageId was
-          // never blacklisted — its old accumulator had no pendingAssistantId to record) has a
-          // queued event arriving after a GUI turn replaced the accumulator; locking to the CLI
-          // generation would then drop the GUI run's own events (GUI response stranded).
-          const evRidForLock = (e as { responseMessageId?: string }).responseMessageId;
-          const foreignRun =
-            acc.pendingAssistantId != null && evRidForLock != null && evRidForLock !== acc.pendingAssistantId;
-          if (e.type !== 'compaction' && foreignRun) {
-            return; // event from a different (superseded) run — don't lock, don't mutate
+          // EXPLICIT TAKEOVER before this accumulator ever locked a generation: a
+          // token-tagged serverPersisted `user-message` is main-owned (an automation /
+          // recovery / CLI restart that already persisted the turn). A GUI submit that
+          // installed a locally-originated accumulator and is still awaiting persistence
+          // (no generation yet) must RELINQUISH ownership here — otherwise its delayed
+          // launch still passes ownsNew() and aborts the accepted server-owned run
+          // (R110 finding-1). Clear local ownership + the pending launch id + run-scoped
+          // state (mirrors the already-locked takeover path below), then lock to the
+          // new generation and fall through to render the mirrored turn.
+          const isServerPersistTakeover =
+            e.type === 'user-message' &&
+            (e as { serverPersisted?: boolean }).serverPersisted === true &&
+            evGen != null &&
+            acc.locallyOriginated === true &&
+            !supersededGenerations.get(convId)?.has(evGen);
+          if (isServerPersistTakeover) {
+            // The GUI submission this accumulator optimistically showed is being
+            // DISPLACED by the accepted server-owned run. Capture the user's consumed
+            // prompt (text AND whether it had attachments) + its node id, so it's
+            // injected into that run (user decision) or preserved as a durable draft —
+            // never lost off-branch (R111 f-1 / R112 f-1,2,3 / R113 f-1,2,3).
+            const takeoverId = (e as { data?: { messageId?: string } }).data?.messageId;
+            let displacedText = '';
+            let displacedHasAttachment = false;
+            let displacedNodeId: string | undefined;
+            for (let i = acc.messages.length - 1; i >= 0; i--) {
+              const m = acc.messages[i];
+              if (m.role !== 'user') continue;
+              displacedNodeId = typeof m.id === 'string' ? m.id : undefined;
+              if (Array.isArray(m.content)) {
+                const parts = m.content as ContentPart[];
+                displacedText = parts
+                  .filter((p) => (p as { type?: string }).type === 'text')
+                  .map((p) => (p as { text?: string }).text ?? '')
+                  .join('')
+                  .trim();
+                displacedHasAttachment = parts.some((p) => {
+                  const t = (p as { type?: string }).type;
+                  return t === 'image' || t === 'file';
+                });
+              } else if (typeof m.content === 'string') {
+                displacedText = m.content.trim();
+              }
+              break;
+            }
+            const displacedGeneration = evGen;
+            acc.runGeneration = evGen;
+            acc.locallyOriginated = false;
+            acc.pendingAssistantId = (e as { data?: { messageId?: string } }).data?.messageId ?? acc.pendingAssistantId;
+            acc.runConfig = undefined;
+            acc.pendingCompaction = undefined;
+            acc.seededBackground = undefined;
+            acc.seededDiskHeadId = undefined;
+            acc.awaitingApproval = undefined;
+            acc.deferredApprovals = undefined;
+            acc.pendingAssistantTiming = undefined;
+            acc.injectContinuationId = null;
+            acc.closedPrefixIds = undefined;
+            // A displaced prompt is meaningful only if it's a DIFFERENT turn than the
+            // takeover's own. Compare NODE IDS, not text: two distinct concurrent
+            // submissions with identical text are still distinct turns (R113 f-1). When
+            // the displaced node has no id, fall back to "has content" (still displaced).
+            const isSameTurn = displacedNodeId != null && takeoverId != null && displacedNodeId === takeoverId;
+            const hasDisplaced = (Boolean(displacedText) || displacedHasAttachment) && !isSameTurn;
+            if (hasDisplaced) {
+              // injectMidTurn is text-only and can't carry attachments. For an
+              // attachment-bearing displaced prompt, preserve the draft durably (the
+              // user re-sends with its files) rather than inject a text-only fragment
+              // (R112 f-2). Text-only → inject into the accepted run.
+              if (displacedHasAttachment) {
+                // enqueueRejectedDraft rejects an empty draft. ALWAYS include the
+                // re-attach notice when there were attachments — appended to the text
+                // if any (so a text+attachment prompt isn't silently restored as
+                // text-only, R114 f-1), or used alone when text is empty (R113 f-2).
+                const reattachNotice =
+                  '[Attachment(s) from a message interrupted by another turn were not delivered — please re-attach and resend.]';
+                const noticeText = displacedText ? `${displacedText}\n\n${reattachNotice}` : reattachNotice;
+                enqueueRejectedDraft(convId, { text: noticeText, attachments: [] });
+              } else if (displacedText) {
+                // Register the in-flight inject so a delete/reset during the await cancels it;
+                // the settle callbacks consult the token before re-enqueuing (R134 f-2/f-4).
+                const injectToken = registerDisplacedInject(convId);
+                void app.agent
+                  .injectMidTurn(convId, displacedText, displacedGeneration)
+                  .then((res) => {
+                    // Delivered ONLY if it spliced cooperatively into the generation we
+                    // pinned (expectedGeneration guards a wrong-run splice — R113 f-3).
+                    // Any other outcome (ok:false, non-cooperative, expected-generation-
+                    // superseded, reject) preserves the user's input (R112 f-1) — UNLESS the
+                    // conversation was deleted/cleared while the inject was in flight, in which
+                    // case re-enqueuing would leave an unflushable draft (R133 f-2 / R134).
+                    if ((!res?.ok || !res.cooperative) && !injectToken.cancelled) {
+                      enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+                    }
+                  })
+                  .catch(() => {
+                    if (!injectToken.cancelled) {
+                      enqueueRejectedDraft(convId, { text: displacedText, attachments: [] });
+                    }
+                  })
+                  .finally(() => settleDisplacedInject(injectToken));
+              }
+            }
+            traceRuntime('stream.supersede-adopt-mirror-prelock', convId, {
+              newGeneration: evGen,
+              displacedInjected: hasDisplaced && !displacedHasAttachment && Boolean(displacedText),
+            });
+            // fall through — render the takeover turn as a passive mirror.
+          } else {
+            // Lock to the first REAL-run event — BUT if this accumulator already knows its run
+            // (pendingAssistantId set by a local onNew/onEdit/onReload) and this event belongs to
+            // a DIFFERENT run (its responseMessageId doesn't match), do NOT let it lock. That
+            // guards the window where a superseded CLI/mirror run (whose responseMessageId was
+            // never blacklisted — its old accumulator had no pendingAssistantId to record) has a
+            // queued event arriving after a GUI turn replaced the accumulator; locking to the CLI
+            // generation would then drop the GUI run's own events (GUI response stranded).
+            const evRidForLock = (e as { responseMessageId?: string }).responseMessageId;
+            const foreignRun =
+              acc.pendingAssistantId != null && evRidForLock != null && evRidForLock !== acc.pendingAssistantId;
+            if (e.type !== 'compaction' && foreignRun) {
+              return; // event from a different (superseded) run — don't lock, don't mutate
+            }
+            if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
           }
-          if (e.type !== 'compaction') acc.runGeneration = evGen; // lock to the first REAL-run event
         } else if (acc.runGeneration !== evGen && e.type !== 'compaction') {
           // Event from a DIFFERENT generation than this accumulator is locked to. Normally this is
           // a superseded (older) run's late event → drop it. BUT a `user-message` under a different
@@ -3632,6 +4273,13 @@ export function RuntimeProvider({
             // for the new run (not from the old run's clock). Timing re-seeds on the next event.
             acc.deferredApprovals = undefined;
             acc.pendingAssistantTiming = undefined;
+            // Clear the PRIOR run's cooperative-inject boundary state too: these are
+            // run-scoped. Left set, the new generation's first assistant delta would be
+            // pinned onto the OLD run's continuation id (getOrCreateAssistantInAcc),
+            // updating a stale node off the new user's active branch and hiding the new
+            // turn's streamed response. A new inject in this generation re-opens them.
+            acc.injectContinuationId = null;
+            acc.closedPrefixIds = undefined;
             traceRuntime('stream.supersede-adopt-mirror', convId, { newGeneration: evGen });
             // fall through — render the new turn's user-message + subsequent events as a mirror
           } else {
@@ -3679,7 +4327,18 @@ export function RuntimeProvider({
         const msgText = e.text ?? '';
         if (msgText) {
           const branch = getActiveBranch(acc.messages, acc.headId);
-          const isDuplicate = isDuplicateLastUserMessage(branch, msgText);
+          // Dedup: prefer the AUTHORITATIVE messageId when main supplied one. Two
+          // distinct mid-turn injects with IDENTICAL text carry DIFFERENT persisted
+          // ids — text-only dedup would collapse the second, dropping an accepted
+          // user turn from the branch (main persists + sends both to the model, so
+          // the renderer must keep both). Dedup by id when present: skip only if a
+          // node with THIS id already exists. Fall back to text dedup for events
+          // WITHOUT an authoritative id (a peer GUI/CLI echo of our own submit).
+          const persistedForDedup = e.data as { messageId?: unknown } | undefined;
+          const authoritativeId = typeof persistedForDedup?.messageId === 'string' ? persistedForDedup.messageId : null;
+          const isDuplicate = authoritativeId
+            ? acc.messages.some((m) => m.id === authoritativeId)
+            : isDuplicateLastUserMessage(branch, msgText);
           if (!isDuplicate) {
             // `acc.headId` already points at the live assistant message during
             // streaming, so an incoming user turn (a follow-up injected mid-turn
@@ -3732,6 +4391,15 @@ export function RuntimeProvider({
             };
             acc.messages.push(userMsg);
             acc.headId = userMsg.id;
+            // NB: the cooperative-inject prefix/continuation boundary is NOT
+            // closed here. `user-message` is broadcast IMMEDIATELY at enqueue,
+            // BEFORE prepareStep has consumed the inject — if we rotated the
+            // continuation now, any text the CURRENT step is still emitting would
+            // be mis-attributed as the injected user's continuation even though
+            // the model has not yet seen that message. Main's fallback correctly
+            // waits for the ORDERED `inject-consumed` marker; the renderer now
+            // does the same (see the `inject-consumed` case below), so both agree
+            // on the split point.
             traceRuntime('stream.user-message', convId, {
               messageId: userMsg.id,
               parentId: userMsg.parentId,
@@ -3745,6 +4413,56 @@ export function RuntimeProvider({
         // handler, so the inserted user turn renders immediately for the active
         // conversation. Not persisted here — the main process owns the
         // server-persisted tree for a CLI/agent:submit turn.
+      } else if (e.type === 'inject-consumed') {
+        // ORDERED cooperative-inject boundary — emitted AFTER the prior step's
+        // chunks and BEFORE the next step's, so it marks the exact point at which
+        // the model actually consumed the injected user turn(s). Close the
+        // reply-so-far as a prefix and rotate the continuation to a DETERMINISTIC
+        // per-boundary node id (`${injectedUser}-cont`) that main's fallback
+        // derives identically. Doing this HERE (not on the immediate
+        // `user-message` broadcast) keeps prior-step deltas attributed to the
+        // prefix, not to the injected user's continuation. Close BOTH the reused
+        // responseMessageId (pendingAssistantId) AND any prior boundary's
+        // continuation id, so a SECOND inject in the same run rotates to the new id
+        // instead of reusing the first continuation node.
+        const acc2 = streamAccumulators.get(convId);
+        if (acc2) {
+          const rawEntries = ((e as { data?: { entries?: Array<{ id?: unknown }> } }).data?.entries ?? []).filter(
+            (en): en is { id: string } => typeof en?.id === 'string',
+          );
+          // Filter to ids that actually MATERIALIZED as a node in this accumulator.
+          // With id-based dedup of authoritative injects (above), two identical-text
+          // injects now BOTH materialize (distinct persisted ids), so this no longer
+          // drops a legitimate second turn. It remains a safety net: an id that never
+          // produced a node (e.g. a non-authoritative echo collapsed by text dedup, or
+          // a race) must not become the head — advancing headId to an absent id would
+          // parent later output on a missing node (branch diverges from disk).
+          const presentIds = new Set(acc2.messages.map((m) => m.id));
+          const entries = rawEntries.filter((en) => presentIds.has(en.id));
+          // ORDERING REPAIR (batch-aware) for the "inject(s) broadcast before the
+          // prefix existed" case: if the prior step's first assistant delta arrived
+          // AFTER the user-message handler advanced the head to the injected user(s),
+          // the prefix got created under the LAST injected user. Move it BEFORE the
+          // whole user chain (`pre → prefix → u1 → … `). Done ONCE over the batch —
+          // per-entry FIFO would leave `u1 → prefix → u2`.
+          const repaired = reorderPrefixBeforeInjectedUserChain(
+            acc2.messages,
+            acc2.headId,
+            entries.map((en) => en.id),
+          );
+          acc2.messages = repaired.messages;
+          acc2.headId = repaired.headId;
+          for (const en of entries) {
+            acc2.closedPrefixIds ??= new Set();
+            if (acc2.pendingAssistantId) acc2.closedPrefixIds.add(acc2.pendingAssistantId);
+            if (acc2.injectContinuationId) acc2.closedPrefixIds.add(acc2.injectContinuationId);
+            acc2.injectContinuationId = `${en.id}-cont`;
+          }
+          traceRuntime('stream.inject-consumed', convId, {
+            entryCount: entries.length,
+            injectContinuationId: acc2.injectContinuationId ?? null,
+          });
+        }
       } else if (e.type === 'tool-call' || e.type === 'tool-result' || e.type === 'tool-compaction') {
         logRuntimeToolDebug('stream-event', {
           conversationId: convId,
@@ -5394,7 +6112,12 @@ export function RuntimeProvider({
       // the active run isn't cooperatively injectable (a CLI runtime), also fall
       // through to the normal supersede path.
       const wasRunningAtEntry = isRunningRef.current;
-      if (isRunningRef.current) {
+      // A composer fallback (sendMidTurn reported the branch changed / not injectable)
+      // marks this conversation to FORCE a normal superseding send — do NOT re-enter
+      // cooperative injection (which would re-run policy hooks + splice onto the old
+      // transcript). Consume the one-shot flag; the block below is skipped when set.
+      const forceNormalSend = forceNormalSendConvs.delete(convId);
+      if (isRunningRef.current && !forceNormalSend) {
         const onlyText = userContent.length > 0 && userContent.every((p) => p.type === 'text');
         if (onlyText) {
           const text = userContent
@@ -5405,6 +6128,34 @@ export function RuntimeProvider({
           if (text) {
             const res = await app.agent.injectMidTurn(convId, text);
             if (res.ok && res.cooperative) return; // spliced into the running turn
+            // A policy hook BLOCKED the send — it was HANDLED (rejected), not a
+            // "couldn't inject" case. Do NOT fall through to a normal turn (that
+            // would re-run the blocked text + supersede the active run, and a
+            // plugin pre-send abort may already have persisted the raw node). Stop
+            // here; the draft stays in the composer (onNew already consumed it, so
+            // surface the reason for the user).
+            if (res.blocked) {
+              if (res.error) console.warn(`[mid-turn-inject] blocked: ${res.error}`);
+              // The composer already cleared the submitted text on send. A policy
+              // block is terminal (no resend), but the draft must NOT be silently
+              // lost — restore it the same way the conversation-busy rejection does:
+              // put it straight back if this chat is active with an empty composer,
+              // else stash it (FIFO) for restoration when the user returns here.
+              if (submittedText.trim().length > 0 || pendingAttachments.length > 0) {
+                const composerHasNewDraft =
+                  activeIdRef.current === convId &&
+                  (runtimeRef.current?.thread?.composer?.getState?.().text ?? '').trim().length > 0;
+                const canRestoreNow =
+                  activeIdRef.current === convId && attachmentsRef.current.length === 0 && !composerHasNewDraft;
+                if (canRestoreNow) {
+                  if (pendingAttachments.length > 0) addAttachments(pendingAttachments);
+                  restoreComposerDraft(submittedText);
+                } else {
+                  enqueueRejectedDraft(convId, { text: submittedText, attachments: pendingAttachments });
+                }
+              }
+              return;
+            }
             // Not cooperatively injectable (CLI runtime / race) — fall through to a
             // normal new turn, which supersedes the running one. NOTE: everything below
             // must use the LIVE accumulator / activeIdRef, not the closure tree/headId
@@ -5424,7 +6175,79 @@ export function RuntimeProvider({
       const liveAcc = streamAccumulators.get(convId);
       let baseTree: StoredMessage[] = liveAcc ? liveAcc.messages : tree;
       let baseHead: string | null = liveAcc ? liveAcc.headId : headId;
-      if (!liveAcc && wasRunningAtEntry) {
+      // A FORCE-NORMAL-SEND fallback (the composer's sendMidTurn reported the run
+      // wasn't cooperatively injectable — a CLI runtime, a run that ended during the
+      // policy gate, OR a genuine branch switch) must NOT blindly re-anchor on disk:
+      // renderer persistence is debounced, so disk can LAG the live/finalized
+      // accumulator. Reload disk, but only ADOPT the disk branch when it genuinely
+      // DIVERGES from the freshest in-memory branch (a real branch switch — the user
+      // selected a different lineage during the async gate). When disk is merely an
+      // older snapshot of the SAME branch (the live head descends from / is the disk
+      // head, or the disk head is still on the live branch), keep the fresher
+      // live/finalized tree so recent assistant output stays on-branch + in context.
+      if (forceNormalSend) {
+        // First, prefer the FINALIZED snapshot over a bare live/closure tree when the
+        // run finalized during the await (same rationale as the non-force path below).
+        if (!liveAcc && wasRunningAtEntry) {
+          const finalized = lastFinalizedBranch.get(convId);
+          if (finalized && finalized.messages.length >= baseTree.length) {
+            baseTree = finalized.messages;
+            baseHead = finalized.headId;
+          }
+        }
+        try {
+          const fresh = (await app.conversations.get(convId)) as ConversationRecord | null;
+          if (fresh) {
+            const { tree: ft, headId: fh } = ensureTree(fresh);
+            // Compare ACTIVE ANCESTOR LINEAGES, not whole-tree membership. Inactive
+            // variants stay in the tree, so `ft` still contains the live head even
+            // after the user selected a SIBLING branch — a whole-tree membership test
+            // would miss that switch and append onto the abandoned lineage. The disk's
+            // active branch (walked from `fh`) is the user's CURRENTLY-selected
+            // lineage; the live branch (from `baseHead`) is where the aborted run was.
+            const diskActiveIds = new Set(getActiveBranch(ft, fh).map((m) => m.id));
+            const liveActiveBranch = getActiveBranch(baseTree, baseHead);
+            const liveActiveIds = new Set(liveActiveBranch.map((m) => m.id));
+            // The live head is on the disk's ACTIVE branch → same selected lineage
+            // (disk may just be debounced-older). The disk head is on the live ACTIVE
+            // branch → live is ahead of disk on the same lineage.
+            const liveHeadOnDiskActive = baseHead != null && diskActiveIds.has(baseHead);
+            const diskHeadOnLiveActive = fh != null && liveActiveIds.has(fh);
+            // Distinguish an INTENTIONAL ancestor move (another client rewound /
+            // regenerated to an ancestor of baseHead during the gate) from mere
+            // debounced-persist lag. Both leave the disk head an ancestor of baseHead
+            // (diskHeadOnLiveActive true, fh !== baseHead). The tell: a rewind PERSISTS
+            // the tail nodes (they stay in the tree as an inactive branch) and moves the
+            // HEAD back, so baseHead still EXISTS in the disk tree `ft`. Debounced lag
+            // means the live tail simply hasn't been written yet, so baseHead is ABSENT
+            // from `ft`. When baseHead is present on disk but off disk's ACTIVE branch,
+            // the head was deliberately moved — adopt disk.
+            const diskHasLiveHeadNode = baseHead != null && ft.some((m) => m.id === baseHead);
+            const intentionalAncestorMove =
+              diskHeadOnLiveActive && fh !== baseHead && diskHasLiveHeadNode && !liveHeadOnDiskActive;
+            // Genuine branch switch: the live head is NOT on disk's active lineage AND
+            // the disk head is NOT on the live active lineage — different selected
+            // branches. Adopt disk (where the user is now). Otherwise keep the fresher
+            // in-memory tree.
+            const branchDiverged = baseHead != null && !liveHeadOnDiskActive && !diskHeadOnLiveActive;
+            // Adopt disk if the live tree is empty/degenerate (nothing to preserve).
+            const liveDegenerate = baseTree.length === 0;
+            if (branchDiverged || intentionalAncestorMove || liveDegenerate) {
+              baseTree = ft;
+              baseHead = fh;
+            } else if (liveHeadOnDiskActive && diskActiveIds.size > liveActiveIds.size) {
+              // Same selected lineage, but disk's active branch is LONGER than the live
+              // snapshot (a concurrent writer appended) — take disk so nothing is lost.
+              baseTree = ft;
+              baseHead = fh;
+            }
+            // else: keep the fresher live/finalized baseTree/baseHead.
+          }
+        } catch {
+          /* disk read failed — fall back to the (fresher) accumulator/closure tree */
+        }
+      }
+      if (!forceNormalSend && !liveAcc && wasRunningAtEntry) {
         const finalized = lastFinalizedBranch.get(convId);
         if (finalized && finalized.messages.length >= baseTree.length) {
           baseTree = finalized.messages;
@@ -6211,19 +7034,24 @@ export function RuntimeProvider({
   }, [midTurnMode]);
 
   const sendMidTurn = useCallback(
-    async (text: string): Promise<boolean> => {
+    async (text: string): Promise<MidTurnSendOutcome> => {
       const convId = activeIdRef.current;
       const trimmed = text.trim();
-      if (!convId || !trimmed || !isRunningRef.current) return false;
+      if (!convId || !trimmed || !isRunningRef.current) return { status: 'fallback', originConversationId: convId };
       try {
         const res = await app.agent.injectMidTurn(convId, trimmed);
         if (res.ok && res.cooperative) {
           void refreshPendingInjects();
-          return true;
+          return { status: 'injected', originConversationId: convId };
         }
-        return false;
+        // A policy hook BLOCKED the message — it was handled (rejected), NOT a
+        // "couldn't inject" case. The caller must NOT fall back to a normal send
+        // that would re-run the blocked text; it restores the draft + surfaces
+        // the reason instead.
+        if (res.blocked) return { status: 'blocked', reason: res.error, originConversationId: convId };
+        return { status: 'fallback', originConversationId: convId };
       } catch {
-        return false;
+        return { status: 'fallback', originConversationId: convId };
       }
     },
     [refreshPendingInjects],
@@ -6255,9 +7083,36 @@ export function RuntimeProvider({
     return () => clearInterval(iv);
   }, [isRunning, midTurnMode, refreshPendingInjects]);
 
+  const getActiveConversationId = useCallback(() => activeIdRef.current, []);
+  const stashRejectedDraft = useCallback((convId: string, text: string) => {
+    if (!convId || !text.trim()) return;
+    enqueueRejectedDraft(convId, { text, attachments: [] });
+  }, []);
+  const markForceNormalSend = useCallback((convId: string) => {
+    if (convId) forceNormalSendConvs.add(convId);
+  }, []);
+
   const midTurnComposerState = useMemo<MidTurnComposerState>(
-    () => ({ isRunning, midTurnSend: midTurnMode, sendMidTurn, pendingInjects, cancelInject }),
-    [isRunning, midTurnMode, sendMidTurn, pendingInjects, cancelInject],
+    () => ({
+      isRunning,
+      midTurnSend: midTurnMode,
+      sendMidTurn,
+      pendingInjects,
+      cancelInject,
+      getActiveConversationId,
+      stashRejectedDraft,
+      markForceNormalSend,
+    }),
+    [
+      isRunning,
+      midTurnMode,
+      sendMidTurn,
+      pendingInjects,
+      cancelInject,
+      getActiveConversationId,
+      stashRejectedDraft,
+      markForceNormalSend,
+    ],
   );
   const currentWorkingDirectoryState = useMemo<CurrentWorkingDirectoryState>(
     () => ({

@@ -90,6 +90,21 @@ export class OpencodeRuntime implements AgentRuntime {
       yield { conversationId, type: 'done' };
       return;
     }
+    // PLAN-FIRST: REFUSE (fail closed, R144 f-1). opencode loads OPENCODE_CONFIG BEFORE the
+    // repository config, so a repo's `permission.write/edit/bash = allow` can OVERRIDE our
+    // deny-permission temp config — Kai can't authoritatively force opencode read-only. Since
+    // plan mode is a safety boundary (no workspace mutation), don't run opencode in plan-first
+    // at all rather than run it possibly-writable. (The Mastra/SDK runtimes enforce plan mode
+    // properly; the user can switch runtime for planning.)
+    if (options.config.tools?.executionMode === 'plan-first') {
+      yield {
+        conversationId,
+        type: 'text-delta',
+        text: 'Plan mode is not supported with the opencode runtime (its read-only enforcement is not guaranteed). Switch to the default runtime for planning, or turn off plan mode.',
+      };
+      yield { conversationId, type: 'done' };
+      return;
+    }
     // On a cross-runtime switch, opencode has no prior session: prepend context.
     if (options.switchContext) promptText = `${options.switchContext}\n\n${promptText}`;
 
@@ -204,21 +219,73 @@ export class OpencodeRuntime implements AgentRuntime {
 
       const onAbort = (): void => killProcessGroup(child);
       abortSignal?.addEventListener('abort', onAbort, { once: true });
+      // If the signal was ALREADY aborted before we attached the listener (a Stop that landed during
+      // spawn), addEventListener never fires — kill the freshly-spawned child NOW and do not send the
+      // prompt, or OpenCode would still receive it and execute tools after Stop (R164 f-1).
+      if (abortSignal?.aborted) {
+        killProcessGroup(child);
+      }
 
       const exited = new Promise<void>((resolve) => {
         child.on('close', () => resolve());
       });
 
+      // If the LEADER exits but a TERM-resistant descendant keeps the stdout pipe open, the
+      // `for await (child.stdout)` loop below (and `exited`, which waits on 'close') would hang
+      // forever (R166 f-3) — the leader-alive SIGKILL gate deliberately does NOT group-kill after
+      // leader exit (recycled-pid safety). Break the hang: once the leader has exited, if 'close'
+      // hasn't followed, force-destroy stdout so the stream read completes and the runtime finalizes.
+      // But destroy ONLY when the stream is genuinely IDLE — nothing buffered AND nothing consumed
+      // recently (R167 f-1): destroying mid-drain would drop the final buffered event of a COMPLETED
+      // response (slow consumer) and raise ERR_STREAM_PREMATURE_CLOSE, turning success into an error.
+      // `lastReadAt` is bumped by the streaming loop below (no competing 'data' listener, which would
+      // steal chunks from the async iterator). Re-arm while data is pending/flowing.
+      let lastReadAt = Date.now();
+      child.on('exit', () => {
+        const IDLE_MS = 2000;
+        // Absolute post-exit deadline (R168): a stuck orphan descendant dribbling a byte every <IDLE_MS
+        // would re-arm the idle check forever and never let the stream finalize. Cap total wait after
+        // leader exit at 30s — past that, destroy regardless of trickle so the runtime always completes.
+        const HARD_DEADLINE = Date.now() + 30_000;
+        // `exited` resolves on 'close', which needs EVERY stdio stream closed. A TERM-resistant descendant
+        // can hold stderr open even after stdout ends/destroys — so whenever stdout is DONE we must also
+        // force stderr closed, or 'close' never fires and `await exited` hangs (R197/R198). Covers BOTH
+        // orderings: stdout ends first (early-return path) and stdout still open-but-idle.
+        const forceStderrClosed = (): void => {
+          if (!child.stderr.destroyed) child.stderr.destroy();
+        };
+        const tick = (): void => {
+          if (child.stdout.destroyed || child.stdout.readableEnded) {
+            forceStderrClosed();
+            return;
+          }
+          const idle = Date.now() - lastReadAt >= IDLE_MS && child.stdout.readableLength === 0;
+          if (idle || Date.now() >= HARD_DEADLINE) {
+            child.stdout.destroy();
+            forceStderrClosed();
+            return;
+          }
+          const t = setTimeout(tick, IDLE_MS);
+          if (typeof t.unref === 'function') t.unref();
+        };
+        const t0 = setTimeout(tick, IDLE_MS);
+        if (typeof t0.unref === 'function') t0.unref();
+      });
+
       try {
-        // Send the prompt on stdin.
-        child.stdin.write(promptText);
-        child.stdin.end();
+        // Send the prompt on stdin — unless a Stop already aborted (the child was killed above);
+        // writing would race the kill and could still deliver the prompt to a not-yet-dead child.
+        if (!abortSignal?.aborted) {
+          child.stdin.write(promptText);
+          child.stdin.end();
+        }
 
         let buf = '';
         let sessionIdEmitted = false;
         const MAX_LINE = 4 * 1024 * 1024;
         for await (const chunk of child.stdout) {
           if (abortSignal?.aborted) break;
+          lastReadAt = Date.now(); // R167 f-1: mark progress so the idle-destroy timer never fires mid-drain
           buf += (chunk as Buffer).toString('utf8');
           let nl: number;
           while ((nl = buf.indexOf('\n')) !== -1) {
@@ -501,18 +568,40 @@ function extractLastUserText(messages: unknown[]): string | null {
 
 /** Kill the child's whole process group (reaps grandchildren spawned by tools). */
 function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
-  try {
-    if (child.exitCode !== null || child.signalCode) return;
-    if (process.platform !== 'win32' && typeof child.pid === 'number') {
-      try {
-        process.kill(-child.pid, 'SIGTERM');
-        return;
-      } catch {
-        /* fall through to direct kill */
+  // Escalate TERM → KILL and target the process GROUP even after the leader exits (R164 f-1): a
+  // TERM-resistant or backgrounded child in the group would otherwise keep running and mutating
+  // after Stop. On POSIX the child is spawned `detached`, so -pid addresses the whole group; send
+  // SIGTERM first for a clean shutdown, then SIGKILL after a short grace period to guarantee death.
+  const pid = child.pid;
+  const groupKill = (signal: NodeJS.Signals): boolean => {
+    try {
+      if (process.platform !== 'win32' && typeof pid === 'number') {
+        process.kill(-pid, signal); // negative pid → the whole process group
+        return true;
       }
+    } catch {
+      /* group gone or not a group leader — fall through to direct child kill */
     }
-    child.kill('SIGTERM');
-  } catch {
-    /* already gone */
-  }
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false; // already gone
+    }
+  };
+  // First TERM. Do NOT early-return on child.exitCode — the LEADER may have exited while backgrounded
+  // group members live on; the group-directed signal still reaches them.
+  groupKill('SIGTERM');
+  // Escalate to SIGKILL after a grace period — but ONLY if the LEADER is still alive at fire time
+  // (R165 f-3): once the leader has exited, its numeric pid can be RECYCLED by the OS, so a
+  // `-pid` group SIGKILL could hit an unrelated process group. While the leader is alive its pid is
+  // held (not recyclable), so the group signal is safe. If the leader already exited, its own
+  // children are reparented/reaped by the OS; we forgo the (rare) backgrounded-survivor kill rather
+  // than risk killing a recycled pid. unref so the timer never keeps the event loop / process alive.
+  const killTimer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      groupKill('SIGKILL');
+    }
+  }, 2000);
+  if (typeof killTimer.unref === 'function') killTimer.unref();
 }

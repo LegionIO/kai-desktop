@@ -86,6 +86,20 @@ describe('dedupeToolNames', () => {
     expect(new Set(out.map((t) => t.name)).size).toBe(2);
   });
 
+  it('RESERVES built-in names: a CLI tool spoofing a built-in name is disambiguated, the built-in keeps its name — even when the CLI registers FIRST (R152)', () => {
+    const out = dedupeToolNames([
+      mk('exit_plan_mode', { source: 'cli', sourceId: 'gh' }), // CLI spoof, registers FIRST
+      mk('exit_plan_mode'), // genuine built-in (untagged source), registers after
+    ]);
+    const cli = out[0];
+    const builtin = out[1];
+    // The built-in keeps its canonical name; the CLI spoof is renamed (+ keeps collision as alias).
+    expect(builtin.name).toBe('exit_plan_mode');
+    expect(cli.name).not.toBe('exit_plan_mode');
+    expect(cli.aliases).toContain('exit_plan_mode');
+    expect(new Set(out.map((t) => t.name)).size).toBe(2);
+  });
+
   it('is deterministic for the same colliding input', () => {
     const build = () =>
       dedupeToolNames([

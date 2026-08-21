@@ -154,6 +154,9 @@ function AppRoot() {
   const approvalId = isApprovalWindow ? (search?.get('approvalId') ?? null) : null;
   const isNotifWindow = search?.get('notif') === '1';
   const notifId = isNotifWindow ? (search?.get('notifId') ?? null) : null;
+  // Conversation-scoped pop-out key (R193): tool-approval pop-outs carry notifConv so the shell can
+  // resolve/close its item under the conversationId::id key (alerts omit it — their id is unique).
+  const notifConv = isNotifWindow ? (search?.get('notifConv') ?? null) : null;
   if (typeof window !== 'undefined' && (isApprovalWindow || isNotifWindow)) {
     // TEMP debug: is the pop-out window rendering the standalone shell?
     console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId} notifId=${notifId}`);
@@ -169,7 +172,7 @@ function AppRoot() {
 
   // Unified dedicated pop-out window (approvals · questions · alerts).
   if (notifId) {
-    return <NotificationShell id={notifId} />;
+    return <NotificationShell id={notifId} conversationId={notifConv ?? undefined} />;
   }
 
   // Back-compat: legacy approval-only route.
@@ -1443,7 +1446,12 @@ function AppShell() {
   // Listen for AI-initiated execution mode changes (enter/exit plan mode)
   useEffect(() => {
     if (!window.app?.onExecutionModeChanged) return;
-    const cleanup = window.app.onExecutionModeChanged((mode) => {
+    const cleanup = window.app.onExecutionModeChanged(({ conversationId: evConvId, mode }) => {
+      // Apply ONLY when the event targets the DISPLAYED conversation (or is
+      // unscoped/legacy) — a BACKGROUND conversation exiting plan mode must not flip
+      // the viewed conversation's mode (which would enable mutating tools there). Main
+      // has already persisted the authoritative per-conversation mode (R121 finding-1).
+      if (evConvId != null && evConvId !== activeConversationIdRef.current) return;
       if (mode === 'plan-first' || mode === 'auto') {
         setExecutionMode(mode as ExecutionMode);
       }
@@ -1539,6 +1547,27 @@ function AppShell() {
     [],
   );
 
+  // USER-originated executionMode change (the composer Plan-First/Auto toggle + the settings
+  // modal). This is the ONLY path that WRITES the mode: it updates local state for immediate UI
+  // feedback AND calls the dedicated authoritative main-side setter. Reconciliation paths
+  // (loadConversationState hydration, the onExecutionModeChanged broadcast, new-chat reset) set
+  // state ONLY via plain setExecutionMode and never write back — so a stale hydration can't
+  // clobber a newer MAIN plan-mode transition (R127). Rapid toggles are last-write-wins: the
+  // main setter is a fresh read-modify-write and ipcMain handlers don't interleave.
+  const persistExecutionMode = useCallback(
+    (mode: ExecutionMode) => {
+      setExecutionMode(mode);
+      // Target activeConversationId STATE (not the ref): the ref is updated by a passive
+      // effect and can lag a switch to B (B renders + the user toggles before the ref
+      // replaces A → the write would land on A, or nothing when the ref is still null).
+      // The state is what drove this render, so a callback closing over it targets the
+      // conversation the toggle actually belongs to (R128 finding-4).
+      if (!activeConversationId) return;
+      void app.conversations.setExecutionMode?.(activeConversationId, mode === 'auto' ? null : mode).catch(() => {});
+    },
+    [activeConversationId],
+  );
+
   // Persist per-conversation settings whenever they change
   useEffect(() => {
     if (!activeConversationId) return;
@@ -1547,21 +1576,28 @@ function AppShell() {
     // the loaded model/profile/overrides are applied; writing here would clobber
     // the saved values with the previous conversation's stale state.
     if (hydratedSettingsConvIdRef.current !== activeConversationId) return;
+    // NOTE: executionMode is deliberately NOT written here. It is MAIN-authoritative and is
+    // persisted ONLY on a genuine USER action (persistExecutionMode — the composer toggle /
+    // settings modal), never from this effect. Driving it from here off the live `executionMode`
+    // state would write back a value that ORIGINATED from a stale reconciliation: e.g.
+    // loadConversationState snapshots 'auto', awaits its probes, MAIN enters plan mode +
+    // persists 'plan-first', then the stale hydration sets state to 'auto' → this effect would
+    // authoritatively clobber the newer plan transition (R127). The generic put below also
+    // excludes executionMode, and the main-side put keeps prev-disk mode unconditionally.
     const persistSeq = ++settingsPersistSeqRef.current;
     app.conversations
       .get(activeConversationId)
       .then(async (conv: unknown) => {
         const record = conv as ConversationRecord | null;
         if (!record) return;
-        // Skip if values haven't actually changed to avoid unnecessary writes
-        // that could race with concurrent stream persistence.
+        // Skip the generic put if the OTHER (put-owned) values haven't changed — executionMode
+        // is handled by persistExecutionMode and intentionally excluded from this comparison + payload.
         if (
           record.selectedModelKey === selectedModelKey &&
           record.selectedProfileKey === selectedProfileKey &&
           record.fallbackEnabled === fallbackEnabled &&
           record.profilePrimaryModelKey === profilePrimaryModelKey &&
           (record.reasoningEffort ?? null) === (reasoningEffort === 'medium' ? null : reasoningEffort) &&
-          (record.executionMode ?? null) === (executionMode === 'auto' ? null : executionMode) &&
           (record.temperature ?? null) === (threadOverrides?.temperature ?? null) &&
           (record.systemPromptOverride ?? null) === (threadOverrides?.systemPromptOverride ?? null) &&
           (record.maxSteps ?? null) === (threadOverrides?.maxSteps ?? null) &&
@@ -1576,7 +1612,6 @@ function AppShell() {
           fallbackEnabled,
           profilePrimaryModelKey,
           reasoningEffort: reasoningEffort === 'medium' ? null : reasoningEffort,
-          executionMode: executionMode === 'auto' ? null : executionMode,
           temperature: threadOverrides?.temperature ?? null,
           systemPromptOverride: threadOverrides?.systemPromptOverride ?? null,
           maxSteps: threadOverrides?.maxSteps ?? null,
@@ -1612,7 +1647,6 @@ function AppShell() {
     fallbackEnabled,
     profilePrimaryModelKey,
     reasoningEffort,
-    executionMode,
     threadOverrides,
   ]);
 
@@ -2192,7 +2226,10 @@ function AppShell() {
   return (
     <AttachmentProvider>
       <AppShotsBridge />
-      <DropZone>
+      <DropZone
+        enabled={activeView === CHAT_VIEW || activeView === activeConversationId}
+        activeConversationId={activeConversationId}
+      >
         <RuntimeProvider
           conversationId={activeConversationId}
           selectedModelKey={selectedModelKey}
@@ -3213,7 +3250,7 @@ function AppShell() {
                                 reasoningEffort={reasoningEffort}
                                 onChangeReasoningEffort={setReasoningEffort}
                                 executionMode={executionMode}
-                                onChangeExecutionMode={setExecutionMode}
+                                onChangeExecutionMode={persistExecutionMode}
                                 selectedProfileKey={selectedProfileKey}
                                 onSelectProfile={handleSelectProfile}
                                 fallbackEnabled={fallbackEnabled}

@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { URL } from 'url';
 import { z } from 'zod';
 import { generateForPlugin, streamForPlugin } from '../agent/plugin-generate.js';
+import { withoutMidStreamPlanTools } from '../agent/plan-mode-tools.js';
 import { getRegisteredTools } from '../ipc/agent.js';
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -74,6 +75,8 @@ import {
   readConversation,
   readAllConversations,
   writeConversation,
+  isWriteTombstoned,
+  conversationExistenceState,
   getActiveConversationId,
   setActiveConversationId,
 } from '../ipc/conversation-store.js';
@@ -563,9 +566,16 @@ function listPermission(instance: PluginInstance): string {
   return instance.manifest.permissions.join(', ') || 'none';
 }
 
+/** Per-API set of in-flight agent-generation abort controllers, so cleanupPluginAPI can abort them
+ *  on plugin unload (R172 f-4). WeakMap keyed by the api object → auto-drops when the api is GC'd. */
+const apiAgentControllers = new WeakMap<PluginAPI, Set<AbortController>>();
+
 export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICallbacks): PluginAPI {
   const { manifest } = instance;
   let httpServer: Server | null = null;
+  // In-flight host abort controllers for agent.generate/stream (R172 f-4): cleanupPluginAPI aborts
+  // them on unload so an orphaned generation + tool execution can't outlive the plugin.
+  const inFlightAgentControllers = new Set<AbortController>();
 
   // Reject calls from a stale activation generation — e.g. a timer/promise that
   // survived a disable (and possible re-enable) and would otherwise act for an
@@ -1573,41 +1583,80 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
       generate: async (options) => {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? getRegisteredTools().filter((tool) => tool.source !== 'browser') : [];
-        return generateForPlugin({
-          messages: options.messages,
-          config,
-          appHome: callbacks.appHome,
-          modelKey: options.modelKey,
-          profileKey: options.profileKey,
-          reasoningEffort: options.reasoningEffort,
-          fallbackEnabled: options.fallbackEnabled,
-          systemPrompt: options.systemPrompt,
-          tools: allTools,
-          abortSignal: options.abortSignal,
-        });
+        const allTools = options.tools
+          ? withoutMidStreamPlanTools(getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+          : [];
+        // Host-owned abort controller (R172 f-4): if the plugin omits abortSignal, an orphaned
+        // main-process generation (and any tool execution it drives) would keep running after the
+        // plugin is disabled/crashes/unloads. Link the plugin's signal (if any) into a host controller
+        // that cleanupPluginAPI aborts on unload, so teardown always cancels in-flight generation.
+        const hostController = new AbortController();
+        inFlightAgentControllers.add(hostController);
+        // Link the plugin's (possibly long-lived) signal into the host controller with a REMOVABLE
+        // listener, and remove it in finally (R201): a bare {once:true} listener that never fires (the
+        // common case — generation completes without an abort) lingers on the plugin's signal forever,
+        // leaking one listener + host controller per call.
+        const onPluginAbort = () => hostController.abort();
+        if (options.abortSignal) {
+          if (options.abortSignal.aborted) hostController.abort();
+          else options.abortSignal.addEventListener('abort', onPluginAbort, { once: true });
+        }
+        try {
+          return await generateForPlugin({
+            messages: options.messages,
+            config,
+            appHome: callbacks.appHome,
+            modelKey: options.modelKey,
+            profileKey: options.profileKey,
+            reasoningEffort: options.reasoningEffort,
+            fallbackEnabled: options.fallbackEnabled,
+            systemPrompt: options.systemPrompt,
+            tools: allTools,
+            abortSignal: hostController.signal,
+          });
+        } finally {
+          options.abortSignal?.removeEventListener('abort', onPluginAbort);
+          inFlightAgentControllers.delete(hostController);
+        }
       },
 
       stream: async function* (options) {
         requirePermission('agent:generate');
         const config = callbacks.getConfig();
-        const allTools = options.tools ? getRegisteredTools().filter((tool) => tool.source !== 'browser') : [];
-        for await (const ev of streamForPlugin({
-          messages: options.messages,
-          config,
-          appHome: callbacks.appHome,
-          modelKey: options.modelKey,
-          profileKey: options.profileKey,
-          reasoningEffort: options.reasoningEffort,
-          fallbackEnabled: options.fallbackEnabled,
-          systemPrompt: options.systemPrompt,
-          tools: allTools,
-          abortSignal: options.abortSignal,
-        })) {
-          // `inject-consumed` is an internal branch-split marker for automation
-          // persistence; plugins never need it. Filter it out of the plugin API.
-          if ((ev as { type?: string }).type === 'inject-consumed') continue;
-          yield ev as unknown as PluginAgentStreamEvent;
+        const allTools = options.tools
+          ? withoutMidStreamPlanTools(getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+          : [];
+        // Host-owned controller so unload aborts an in-flight stream + its tool execution (R172 f-4).
+        const hostController = new AbortController();
+        inFlightAgentControllers.add(hostController);
+        // Removable linked listener + finally removal (R201) — see generate() above: a never-firing
+        // {once:true} listener would otherwise leak on the plugin's long-lived signal per stream call.
+        const onPluginAbort = () => hostController.abort();
+        if (options.abortSignal) {
+          if (options.abortSignal.aborted) hostController.abort();
+          else options.abortSignal.addEventListener('abort', onPluginAbort, { once: true });
+        }
+        try {
+          for await (const ev of streamForPlugin({
+            messages: options.messages,
+            config,
+            appHome: callbacks.appHome,
+            modelKey: options.modelKey,
+            profileKey: options.profileKey,
+            reasoningEffort: options.reasoningEffort,
+            fallbackEnabled: options.fallbackEnabled,
+            systemPrompt: options.systemPrompt,
+            tools: allTools,
+            abortSignal: hostController.signal,
+          })) {
+            // `inject-consumed` is an internal branch-split marker for automation
+            // persistence; plugins never need it. Filter it out of the plugin API.
+            if ((ev as { type?: string }).type === 'inject-consumed') continue;
+            yield ev as unknown as PluginAgentStreamEvent;
+          }
+        } finally {
+          options.abortSignal?.removeEventListener('abort', onPluginAbort);
+          inFlightAgentControllers.delete(hostController);
         }
       },
 
@@ -1821,7 +1870,61 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
   api.conversations.upsert = (conversation: PluginConversationRecord) => {
     requirePermission('conversations:write');
     const normalizedConversation = normalizeConversationRecord(conversation);
+    // executionMode is MAIN-authoritative (persisted by the plan-mode tools / stream path). A
+    // plugin upsert carries whatever mode was on disk at the plugin's get-time (and
+    // PluginConversationRecord doesn't even model executionMode), so a DELAYED upsert can clobber
+    // a plan-mode transition MAIN just wrote — re-exposing mutating tools on the next trust-disk
+    // turn. Keep the CURRENT disk value over the incoming record's, like conversations:put (R158 f-2).
+    // readConversation returns NULL for BOTH a genuinely-absent record AND an existing-but-unreadable
+    // one (EMFILE / parse failure) — treating null as "absent → auto" would let a mode-less upsert
+    // clobber a plan-first record we merely failed to read (R159 f-3). Use the tri-state existence
+    // probe: 'exists' → merge prev's mode; 'absent' → new record, strip any incoming mode; 'unknown'
+    // → INDETERMINATE, FAIL CLOSED by aborting the whole upsert (never risk clobbering plan-first).
+    const existence = conversationExistenceState(callbacks.appHome, normalizedConversation.id);
+    if (existence === 'unknown') {
+      // Can't rule out an existing plan-first record; refuse rather than write a mode-less clobber.
+      return;
+    }
+    if (existence === 'exists') {
+      let prevMode: unknown = undefined;
+      try {
+        const prev = readConversation(callbacks.appHome, normalizedConversation.id) as {
+          executionMode?: unknown;
+        } | null;
+        if (!prev) {
+          // Raced from 'exists' to unreadable between the probe and this read — fail closed.
+          return;
+        }
+        prevMode = prev.executionMode;
+      } catch {
+        return; // fail closed
+      }
+      if (prevMode !== undefined) {
+        (normalizedConversation as { executionMode?: unknown }).executionMode = prevMode;
+      } else if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        delete (normalizedConversation as { executionMode?: unknown }).executionMode;
+      }
+    } else {
+      // 'absent' — a genuinely new record. Strip any incoming mode so a plugin can't seed a mode the
+      // authoritative path didn't set (MAIN broadcasts the real mode on its first transition).
+      if ((normalizedConversation as { executionMode?: unknown }).executionMode !== undefined) {
+        delete (normalizedConversation as { executionMode?: unknown }).executionMode;
+      }
+    }
     const written = writeConversation(callbacks.appHome, normalizedConversation as never);
+    // writeConversation SUPPRESSES a write for a tombstoned (deleted) id — it returns the record
+    // unchanged but nothing hits disk. Do NOT broadcast a phantom upsert for a deleted chat
+    // (R144 f-2): a durable-ring tombstone (survives restart / in-mem TTL expiry) would otherwise
+    // rebroadcast a nonexistent conversation to every client. Throw-safe (R147): a lookup throw
+    // defaults to SKIP the broadcast (safer direction — a phantom deleted-chat broadcast is the
+    // bug; a missed live-chat broadcast is harmless, clients re-fetch on demand).
+    let tombstoned = true;
+    try {
+      tombstoned = isWriteTombstoned(callbacks.appHome, normalizedConversation.id);
+    } catch {
+      tombstoned = true;
+    }
+    if (tombstoned) return;
     broadcastUpsert(callbacks.appHome, written);
   };
 
@@ -1892,11 +1995,25 @@ export function createPluginAPI(instance: PluginInstance, callbacks: PluginAPICa
     });
   };
 
+  apiAgentControllers.set(api, inFlightAgentControllers);
   return api;
 }
 
 /** Cleanup HTTP server when plugin is deactivated */
 export async function cleanupPluginAPI(api: PluginAPI): Promise<void> {
+  // Abort any in-flight agent generations/streams so they (and their tool execution) don't outlive
+  // the plugin's unload (R172 f-4).
+  const controllers = apiAgentControllers.get(api);
+  if (controllers) {
+    for (const c of controllers) {
+      try {
+        c.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    controllers.clear();
+  }
   try {
     await api.http.close();
   } catch {

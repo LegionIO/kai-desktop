@@ -129,6 +129,7 @@ const {
   mayBroadcastApprovalToWebClients,
   pendingToolApprovals,
   registerPendingApproval,
+  approvalKey,
   setToolApprovalOwnerResolver,
 } = await import('../tool-approval.js');
 
@@ -844,13 +845,16 @@ describe('realtime IPC — start/end lifecycle + usage', () => {
       conversationId: 'conv-realtime-approval',
       browserOwnerId: session.browserOwnerId,
     });
-    const genericOwner = pendingToolApprovals.get('realtime-generic-approval')?.streamOwner;
+    const genericOwner = pendingToolApprovals.get(
+      approvalKey('conv-realtime-approval', 'realtime-generic-approval', session.browserOwnerId),
+    )?.streamOwner;
     expect(genericOwner?.isCurrent?.()).toBe(true);
     expect(
       mayBroadcastApprovalToWebClients({
         type: 'tool-approval-required',
         conversationId: 'conv-realtime-approval',
         toolCallId: 'realtime-generic-approval',
+        runGeneration: session.browserOwnerId,
         toolName: 'mcp_servers',
       } as never),
     ).toBe(false);
@@ -864,10 +868,20 @@ describe('realtime IPC — start/end lifecycle + usage', () => {
         browserOwnerId: session.browserOwnerId,
       }),
     ).toThrow(/no longer authorized/);
-    expect(pendingToolApprovals.has('realtime-browser-approval-late')).toBe(false);
-    expect(pendingToolApprovals.has('realtime-generic-approval')).toBe(true);
+    expect(
+      pendingToolApprovals.has(
+        approvalKey('conv-realtime-approval', 'realtime-browser-approval-late', session.browserOwnerId),
+      ),
+    ).toBe(false);
+    expect(
+      pendingToolApprovals.has(
+        approvalKey('conv-realtime-approval', 'realtime-generic-approval', session.browserOwnerId),
+      ),
+    ).toBe(true);
     expect(genericOwner?.isCurrent?.()).toBe(true);
-    pendingToolApprovals.get('realtime-generic-approval')!.resolve(false);
+    pendingToolApprovals
+      .get(approvalKey('conv-realtime-approval', 'realtime-generic-approval', session.browserOwnerId))!
+      .resolve(false);
     await expect(genericDecision).resolves.toBe(false);
     await harness.invoke('realtime:end-session', primaryEvent);
     expect(genericOwner?.isCurrent?.()).toBe(false);

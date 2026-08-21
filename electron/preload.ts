@@ -85,8 +85,8 @@ const appAPI = {
       }>,
     /** Cooperative mid-turn injection (Mastra): enqueue a follow-up into the
      *  running turn (spliced at its next step boundary) instead of a new turn. */
-    injectMidTurn: (conversationId: string, userText: string) =>
-      ipcRenderer.invoke('agent:inject-mid-turn', conversationId, userText) as Promise<{
+    injectMidTurn: (conversationId: string, userText: string, expectedGeneration?: string) =>
+      ipcRenderer.invoke('agent:inject-mid-turn', conversationId, userText, expectedGeneration) as Promise<{
         ok: boolean;
         cooperative?: boolean;
         id?: string;
@@ -98,16 +98,19 @@ const appAPI = {
       >,
     cancelInject: (conversationId: string, id: string) =>
       ipcRenderer.invoke('agent:cancel-inject', conversationId, id) as Promise<{ ok: boolean; text?: string }>,
-    getToolApprovalPrivateDetails: (toolCallId: string) =>
-      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId) as Promise<{
+    getToolApprovalPrivateDetails: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId, conversationId) as Promise<{
         browserInput: unknown;
         browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
       } | null>,
-    approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
-    rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
-    dismissToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:dismiss-tool', toolCallId),
-    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) =>
-      ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers),
+    approveToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:approve-tool', toolCallId, conversationId),
+    rejectToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:reject-tool', toolCallId, conversationId),
+    dismissToolCall: (toolCallId: string, conversationId?: string) =>
+      ipcRenderer.invoke('agent:dismiss-tool', toolCallId, conversationId),
+    answerToolQuestion: (toolCallId: string, answers: Record<string, string>, conversationId?: string) =>
+      ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers, conversationId),
     generateTitle: (messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) =>
       ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint, conversationId),
     onStreamEvent: (callback: (event: unknown) => void) => {
@@ -133,7 +136,8 @@ const appAPI = {
       ipcRenderer.on('approval:request', handler);
       return () => ipcRenderer.removeListener('approval:request', handler);
     },
-    close: (approvalId: string) => ipcRenderer.send('approval:close', approvalId),
+    close: (approvalId: string, conversationId?: string) =>
+      ipcRenderer.send('approval:close', approvalId, conversationId),
   },
 
   // Dedicated notification pop-out window (approvals · questions · alerts).
@@ -143,8 +147,8 @@ const appAPI = {
       ipcRenderer.on('notif:request', handler);
       return () => ipcRenderer.removeListener('notif:request', handler);
     },
-    get: (id: string) => ipcRenderer.invoke('notif:get', id),
-    close: (id: string) => ipcRenderer.send('notif:close', id),
+    get: (id: string, conversationId?: string) => ipcRenderer.invoke('notif:get', id, conversationId),
+    close: (id: string, conversationId?: string) => ipcRenderer.send('notif:close', id, conversationId),
     reportSize: (height: number) => ipcRenderer.send('notif:resize', height),
   },
 
@@ -204,6 +208,13 @@ const appAPI = {
       },
     ) =>
       ipcRenderer.invoke('conversations:set-pending-drafts', conversationId, delta) as Promise<{
+        ok: boolean;
+      }>,
+    // Authoritative writer for per-conversation executionMode (the composer Plan-First/Auto
+    // toggle). The generic put never writes executionMode (MAIN-authoritative); deliberate
+    // changes go through here so a delayed generic put can't clobber a plan-mode transition.
+    setExecutionMode: (conversationId: string, mode: 'auto' | 'plan-first' | null) =>
+      ipcRenderer.invoke('conversations:set-execution-mode', conversationId, mode) as Promise<{
         ok: boolean;
       }>,
     // Soft-reserve + return one draft (lease+ACK): the draft is RETAINED (marked reserved), so a
@@ -736,9 +747,21 @@ const appAPI = {
       return () => ipcRenderer.removeListener('tasks:terminal-exit', handler);
     },
     // AI plan generation
-    streamPlan: (taskId: string, userMessage: string, history?: unknown[]) =>
-      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history) as Promise<{ taskId: string }>,
-    cancelPlanStream: (taskId: string) => ipcRenderer.invoke('tasks:cancel-stream', taskId) as Promise<{ ok: boolean }>,
+    streamPlan: (
+      taskId: string,
+      userMessage: string,
+      history?: unknown[],
+      attachments?: Array<{ image: string; mimeType?: string }>,
+      streamId?: string,
+    ) =>
+      ipcRenderer.invoke('tasks:stream-plan', taskId, userMessage, history, attachments, streamId) as Promise<{
+        taskId: string;
+        error?: boolean;
+        droppedImages?: number;
+        streamId?: string;
+      }>,
+    cancelPlanStream: (taskId: string, streamId?: string) =>
+      ipcRenderer.invoke('tasks:cancel-stream', taskId, streamId) as Promise<{ ok: boolean }>,
     generateTitle: (userMessage: string) =>
       ipcRenderer.invoke('tasks:generate-title', userMessage) as Promise<{ title: string | null }>,
     onStreamEvent: (callback: (event: unknown) => void) => {
@@ -986,8 +1009,15 @@ const appAPI = {
     return () => ipcRenderer.removeListener('agent:model-switched', handler);
   },
 
-  onExecutionModeChanged: (callback: (mode: string) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, mode: string) => callback(mode);
+  onExecutionModeChanged: (callback: (payload: { conversationId: string | null; mode: string }) => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      payload: { conversationId: string | null; mode: string } | string,
+    ) => {
+      // Back-compat: tolerate a bare mode string, though emitters now send {conversationId, mode}.
+      if (typeof payload === 'string') callback({ conversationId: null, mode: payload });
+      else callback(payload);
+    };
     ipcRenderer.on('agent:execution-mode-changed', handler);
     return () => ipcRenderer.removeListener('agent:execution-mode-changed', handler);
   },

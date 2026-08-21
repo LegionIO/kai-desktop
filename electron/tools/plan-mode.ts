@@ -1,9 +1,8 @@
 import { z } from 'zod';
-import { BrowserWindow } from 'electron';
 import { mkdirSync, openSync, writeSync, closeSync, constants as fsConstants } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import type { ToolDefinition } from './types.js';
 
 const ADJECTIVES = [
@@ -95,11 +94,56 @@ function slugifyPlanTitle(planTitle: string | undefined): string {
   return slug || generatePlanName();
 }
 
-function broadcastModeChange(mode: string): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('agent:execution-mode-changed', mode);
+/** Persist the authoritative per-conversation executionMode in the MAIN process
+ *  BEFORE broadcasting, wired from the IPC layer (setExecutionModePersister). The
+ *  broadcast is fire-and-forget and the renderer normally persists the mode via its
+ *  next submit — but if the window is reloading when the (guarded) broadcast skips
+ *  it, the renderer never learns the change and the next turn runs under the stale
+ *  mode's tool policy. Persisting in main makes the broadcast a notification/reconcile
+ *  rather than the source of truth (R108 finding-4). No-op until wired. */
+type ExecutionModePersister = (conversationId: string, mode: 'auto' | 'plan-first') => boolean;
+let executionModePersister: ExecutionModePersister | null = null;
+export function setExecutionModePersister(fn: ExecutionModePersister | null): void {
+  executionModePersister = fn;
+}
+
+/** Apply a mode change: persist (authoritative) then broadcast. Returns whether the persist
+ *  SUCCEEDED — a plan-first ENTER must fail closed if it didn't (R136 f-1), so the renderer
+ *  doesn't restart into a plan-first the trust-disk reconcile can't see. `auto` exits and the
+ *  unwired case return true (best-effort is fine when leaving plan mode / no persister). */
+function applyModeChange(conversationId: string | undefined, mode: 'auto' | 'plan-first'): boolean {
+  // A plan-first ENTER with NO conversationId (e.g. a direct `tool` automation action) can't be
+  // persisted anywhere — treat it as a FAILED entry (R139 f-2), not a silent success, so it can't
+  // broadcast an unscoped Plan-First that shows in the UI while disk stays 'auto' (next turn then
+  // runs mutating tools). enter_plan_mode is meaningless without a conversation to scope it to.
+  if (mode === 'plan-first' && (!conversationId || !executionModePersister)) {
+    return false;
   }
-  broadcastToWebClients('agent:execution-mode-changed', mode);
+  let persisted = true;
+  if (conversationId && executionModePersister) {
+    try {
+      persisted = executionModePersister(conversationId, mode);
+    } catch {
+      persisted = false;
+    }
+  }
+  // Only broadcast when the authoritative disk state MATCHES what we'd announce. Broadcasting
+  // plan-first after a FAILED persist would make the UI show Plan-First while disk stays 'auto',
+  // and the next submit (trust-disk) would run mutating tools despite the displayed mode (R137
+  // f-3). On a failed plan-first persist, suppress the broadcast (the tool also returns
+  // success:false). A failed 'auto' persist is less critical but treat it the same for symmetry.
+  if (persisted) broadcastModeChange(mode, conversationId);
+  return persisted;
+}
+
+function broadcastModeChange(mode: string, conversationId?: string): void {
+  // Guarded, non-throwing fan-out (mirrors agent.ts broadcastExecutionMode): a
+  // navigating window's send throwing must not interrupt the plan-mode transition
+  // sequence around it (R107 finding-4 class). Carry conversationId so the renderer
+  // applies the mode ONLY when it matches the DISPLAYED conversation — a background
+  // conversation exiting plan mode must not flip the viewed conversation to `auto`
+  // and expose mutating tools there (R121 finding-1).
+  broadcastToAllWindows('agent:execution-mode-changed', { conversationId: conversationId ?? null, mode });
 }
 
 export function createEnterPlanModeTool(): ToolDefinition {
@@ -116,7 +160,30 @@ export function createEnterPlanModeTool(): ToolDefinition {
     }),
     execute: async (input, context) => {
       const { reason } = input as { reason?: string };
-      broadcastModeChange('plan-first');
+      // SELF-GUARD (R141): only run in a context that can actually enforce plan mode — an
+      // interactive/SDK run whose driver intercepts this tool to restart read-only. Every other
+      // executor (Pi/Codex/OpenCode bridges, task agents, sub-agents, observer, plugin inference,
+      // realtime, direct automation tool actions) calls execute DIRECTLY with planModeGateable
+      // ABSENT — there, entering plan mode would flip the mode but the run keeps its MUTATING
+      // tool set (no restart), so refuse instead.
+      if (!context.planModeGateable) {
+        return {
+          success: false,
+          error: 'Plan mode is not available in this run. Continue normally; do not treat this turn as plan mode.',
+        };
+      }
+      // FAIL CLOSED (R136 f-1): if plan-first can't be persisted (disk write failed / no record),
+      // do NOT report success — a GUI/CLI restart into plan-first would then trust the stale
+      // disk 'auto' at reconcile and run mutating tools during "planning". Tell the model the
+      // transition failed so it stays in the current (safe) mode rather than assuming read-only.
+      const entered = applyModeChange(context.conversationId, 'plan-first');
+      if (!entered) {
+        return {
+          success: false,
+          error:
+            'Could not enter plan mode (failed to persist the mode). Continue WITHOUT assuming read-only planning; do not treat this turn as plan mode.',
+        };
+      }
       const cwd = context.cwd;
       return {
         success: true,
@@ -160,12 +227,25 @@ export function createExitPlanModeTool(): ToolDefinition {
         .describe('Short title for the plan file (e.g. "add-dark-mode"). If omitted, a random name is generated.'),
       summary: z.string().optional().describe('Brief summary of the plan that was produced'),
     }),
-    execute: async (input) => {
+    execute: async (input, context) => {
       const { planContent, planTitle, summary } = input as {
         planContent: string;
         planTitle?: string;
         summary?: string;
       };
+
+      // SELF-GUARD (R141): exit_plan_mode WRITES the plan file + flips mode to auto. That must
+      // only happen AFTER user approval, which only the gateable runtimes perform (the Mastra
+      // streamHandler approval hook; the SDK createExitPlanModeHandler). An ungated executor
+      // (Pi/Codex/OpenCode bridge, task/sub-agent, observer, plugin inference, realtime,
+      // automation tool action) calls execute DIRECTLY with planModeGateable ABSENT — saving the
+      // plan + leaving plan mode with NO approval. Refuse there.
+      if (!context.planModeGateable) {
+        return {
+          success: false,
+          error: 'exit_plan_mode requires an interactive approval flow not available in this run.',
+        };
+      }
 
       // Bound the plan size: model-generated content is normally small, but a
       // runaway plan shouldn't be able to write an unbounded file / block the
@@ -191,7 +271,20 @@ export function createExitPlanModeTool(): ToolDefinition {
           0o644,
         );
         try {
-          writeSync(fd, planContent, null, 'utf-8');
+          // writeSync can return a SHORT byte count (quota / disk-full) WITHOUT throwing (R167 f-3);
+          // ignoring it would persist a TRUNCATED plan and then report success + flip to auto. Write
+          // the full buffer, looping over any partial writes, and fail if a write makes no progress.
+          const planBuf = Buffer.from(planContent, 'utf-8');
+          let written = 0;
+          while (written < planBuf.length) {
+            const n = writeSync(fd, planBuf, written, planBuf.length - written);
+            if (n <= 0) {
+              throw new Error(
+                `short write persisting plan (${written}/${planBuf.length} bytes) — disk full or over quota`,
+              );
+            }
+            written += n;
+          }
         } finally {
           closeSync(fd);
         }
@@ -201,7 +294,21 @@ export function createExitPlanModeTool(): ToolDefinition {
         return { success: false, error: `Failed to save plan: ${err instanceof Error ? err.message : String(err)}` };
       }
 
-      broadcastModeChange('auto');
+      // Flip to auto (implementation mode). If the auto persist FAILS (conversation record
+      // temporarily unwritable), do NOT report mode:auto — disk + UI stay plan-first and the
+      // next trust-disk turn would remain read-only, so a success:true/mode:auto here is FALSE
+      // (R142 f-2). The plan file DID save, so surface that but report the mode is unchanged.
+      const switchedToAuto = applyModeChange(context.conversationId, 'auto');
+      if (!switchedToAuto) {
+        return {
+          success: false,
+          mode: 'plan-first',
+          planFilePath,
+          planName: `${planName}.md`,
+          error:
+            'Plan saved, but could not switch to implementation mode (failed to persist). The conversation is still in plan mode; retry exit_plan_mode.',
+        };
+      }
       return {
         success: true,
         mode: 'auto',

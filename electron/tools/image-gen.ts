@@ -3,7 +3,7 @@ import type { ToolDefinition } from './types.js';
 import type { AppConfig } from '../config/schema.js';
 import { resolveMediaGenEndpoint, saveMediaToFile, filePathToUrl, MAX_MEDIA_BYTES } from './media-gen-utils.js';
 import { withBrandUserAgent } from '../utils/user-agent.js';
-import { safeFetch, readCappedArrayBuffer } from '../utils/ssrf-guard.js';
+import { safeFetch, readCappedArrayBuffer, readCappedText } from '../utils/ssrf-guard.js';
 import { recordUsageEvent } from '../ipc/usage.js';
 
 export function createImageGenTool(getConfig: () => AppConfig, appHome: string): ToolDefinition {
@@ -57,16 +57,28 @@ export function createImageGenTool(getConfig: () => AppConfig, appHome: string):
         });
 
         if (!response.ok) {
-          const errorText = await response.text().catch(() => 'Unknown error');
+          // Bounded error-body read (R172): a compromised/misbehaving provider could stream an
+          // unbounded error body and OOM main. 64KiB is ample for a diagnostic message.
+          const errorText = await readCappedText(response, 64 * 1024).catch(() => 'Unknown error');
           return {
             error: `Image generation failed: HTTP ${response.status} ${response.statusText}`,
             details: errorText,
           };
         }
 
-        const result = (await response.json()) as {
-          data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
-        };
+        // Bounded success-body read BEFORE JSON.parse (R172): the response embeds base64 image data,
+        // so an unbounded response.json() would materialize an attacker-controlled blob in memory
+        // first (the per-image cap below is then too late). Cap the raw body at a generous multiple of
+        // MAX_MEDIA_BYTES to cover the base64 (~4/3×) + JSON envelope for the returned image(s).
+        const rawJson = await readCappedText(response, MAX_MEDIA_BYTES * 8 + 1024 * 1024);
+        let result: { data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> };
+        try {
+          result = JSON.parse(rawJson) as {
+            data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+          };
+        } catch {
+          return { error: 'Image generation returned an unparseable or oversized response.' };
+        }
 
         if (!result.data || result.data.length === 0) {
           return { error: 'No images returned from the API.', rawResponse: result };

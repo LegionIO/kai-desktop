@@ -1,19 +1,56 @@
-import { useState, useCallback, type FC, type ReactNode, type DragEvent } from 'react';
+import { useState, useCallback, useRef, type FC, type ReactNode, type DragEvent } from 'react';
 import { UploadIcon } from 'lucide-react';
 import { useAttachments } from '@/providers/AttachmentContext';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 
-export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
+/**
+ * Full-window drag/drop target that stages files into the SHARED chat attachment store.
+ *
+ * DropZone is mounted ABOVE RuntimeProvider and wraps every view, so it must be told (a) whether the
+ * chat surface is currently active — otherwise a drop over Tasks/Plugins/Settings would silently add a
+ * hidden chat attachment (R187) — and (b) the active conversation id, so a chat switch during the async
+ * reads discards the result instead of attaching to the wrong chat (R186). It cannot read these from a
+ * runtime context because it sits outside RuntimeProvider.
+ */
+export const DropZone: FC<{
+  children: ReactNode;
+  /** True only while the chat surface is active; drops are ignored otherwise. */
+  enabled: boolean;
+  /** The conversation a drop targets; reads resolving after a switch are discarded. */
+  activeConversationId: string | null;
+}> = ({ children, enabled, activeConversationId }) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const { addAttachments } = useAttachments();
+  // Track the latest active conversation id in a ref so async read callbacks compare against the
+  // CURRENT value, not the one captured at drop time by a stale render closure.
+  const activeConversationIdRef = useRef<string | null>(activeConversationId);
+  activeConversationIdRef.current = activeConversationId;
   const dragCountRef = { current: 0 };
-
-  const handleDragEnter = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    dragCountRef.current++;
-    if (e.dataTransfer.types.includes('Files')) {
-      setIsDragOver(true);
-    }
+  // Transient notice for dropped files SKIPPED by the size gate (R183).
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showNotice = useCallback((message: string) => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    setNotice(message);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), 6000);
   }, []);
+
+  const handleDragEnter = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      dragCountRef.current++;
+      // Don't show the chat drop overlay when the chat surface isn't active (R187) — a drop there is
+      // ignored, so a "drop to attach" hint would be misleading.
+      if (enabled && e.dataTransfer.types.includes('Files')) {
+        setIsDragOver(true);
+      }
+    },
+    [enabled],
+  );
 
   const handleDragLeave = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -29,56 +66,102 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
     e.dataTransfer.dropEffect = 'copy';
   }, []);
 
-  const handleDrop = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    dragCountRef.current = 0;
-    setIsDragOver(false);
+  const handleDrop = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      dragCountRef.current = 0;
+      setIsDragOver(false);
 
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
+      // Ignore drops when the chat surface isn't active (R187): DropZone wraps every view, but its files
+      // go into the chat attachment store — a drop over Tasks/Plugins/Settings would otherwise create a
+      // hidden chat attachment with no visible chip.
+      if (!enabled) return;
 
-    const pending: Promise<void>[] = [];
-    for (const file of files) {
-      const filePath = (file as File & { path?: string }).path || undefined;
-      pending.push(
-        new Promise<void>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const dataUrl = reader.result as string;
-            const isText = file.type.startsWith('text/') || file.type === 'application/json';
-            if (isText) {
-              // Also read as text
-              const textReader = new FileReader();
-              textReader.onload = () => {
-                addAttachments([{
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+
+      // Capture the conversation the drop targeted (R186): the attachment store is app-global, so a
+      // chat switch during the async reads would otherwise attach these files to the wrong chat.
+      const originConversationId = activeConversationIdRef.current;
+
+      // Gate by size BEFORE reading (R183): each FileReader materializes the whole file, so an oversized
+      // or bulk drop would OOM the renderer if read first. Reject over-cap files up front and report them.
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(files);
+      if (skipped.length > 0) showNotice(skippedAttachmentsNotice(skipped) ?? '');
+      if (accepted.length === 0) {
+        releaseAttachmentReservation(reservedBytes);
+        return;
+      }
+
+      type Attachable = {
+        name: string;
+        mime: string;
+        isImage: boolean;
+        size: number;
+        dataUrl: string;
+        text?: string;
+        filePath?: string;
+      };
+      const pending: Promise<Attachable | null>[] = [];
+      for (const file of accepted) {
+        const filePath = (file as File & { path?: string }).path || undefined;
+        pending.push(
+          new Promise<Attachable | null>((resolve) => {
+            const reader = new FileReader();
+            // Resolve null on read error/abort (R185) so one unreadable dropped file can't leak an
+            // unresolved promise or block the batch.
+            reader.onerror = () => resolve(null);
+            reader.onabort = () => resolve(null);
+            reader.onload = () => {
+              const dataUrl = reader.result as string;
+              const isText = file.type.startsWith('text/') || file.type === 'application/json';
+              if (isText) {
+                const textReader = new FileReader();
+                textReader.onerror = () => resolve(null);
+                textReader.onabort = () => resolve(null);
+                textReader.onload = () => {
+                  resolve({
+                    name: file.name,
+                    mime: file.type,
+                    isImage: file.type.startsWith('image/'),
+                    size: file.size,
+                    dataUrl,
+                    text: textReader.result as string,
+                    filePath,
+                  });
+                };
+                textReader.readAsText(file);
+              } else {
+                resolve({
                   name: file.name,
                   mime: file.type,
                   isImage: file.type.startsWith('image/'),
                   size: file.size,
                   dataUrl,
-                  text: textReader.result as string,
                   filePath,
-                }]);
-                resolve();
-              };
-              textReader.readAsText(file);
-            } else {
-              addAttachments([{
-                name: file.name,
-                mime: file.type,
-                isImage: file.type.startsWith('image/'),
-                size: file.size,
-                dataUrl,
-                filePath,
-              }]);
-              resolve();
-            }
-          };
-          reader.readAsDataURL(file);
-        }),
-      );
-    }
-  }, [addAttachments]);
+                });
+              }
+            };
+            reader.readAsDataURL(file);
+          }),
+        );
+      }
+      void Promise.all(pending).then((results) => {
+        releaseAttachmentReservation(reservedBytes);
+        // Discard if the user switched conversations while the reads were in flight (R186).
+        if (activeConversationIdRef.current !== originConversationId) return;
+        const attachable = results.filter((r): r is Attachable => r !== null);
+        const unreadable = accepted.length - attachable.length;
+        if (attachable.length > 0) {
+          // Add in one call so the aggregate backstop applies across the whole drop, not per file.
+          const { skipped: overCap } = addAttachments(attachable);
+          if (overCap.length > 0) showNotice(skippedAttachmentsNotice(overCap) ?? '');
+        }
+        if (unreadable > 0) showNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+      });
+    },
+    [addAttachments, showNotice, enabled],
+  );
 
   return (
     <div
@@ -89,6 +172,17 @@ export const DropZone: FC<{ children: ReactNode }> = ({ children }) => {
       onDrop={handleDrop}
     >
       {children}
+
+      {/* Transient skipped-attachment notice */}
+      {notice && (
+        <div
+          className="absolute bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-amber-500/40 bg-background/95 px-3 py-2 text-xs text-amber-600 shadow-md dark:text-amber-400"
+          role="status"
+          aria-live="polite"
+        >
+          {notice}
+        </div>
+      )}
 
       {/* Full-window drop overlay */}
       {isDragOver && (

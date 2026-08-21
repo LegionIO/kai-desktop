@@ -16,10 +16,12 @@ import {
   deleteConversations,
   clearAllConversations,
   reindexIfStale,
+  reconcileGhostIndexEntries,
   writeIndex,
   toIndexEntry,
   migrateMonolithIfNeeded,
   __resetMigrationGuardForTests,
+  __resetDeleteTombstonesForTests,
   sanitizeMessageTree,
   sanitizeConversationTree,
   mergeSnapshotContent,
@@ -59,6 +61,7 @@ beforeEach(() => {
   appHome = join(tempRoot, 'app-home');
   mkdirSync(join(appHome, 'data'), { recursive: true });
   __resetMigrationGuardForTests();
+  __resetDeleteTombstonesForTests();
 });
 
 afterEach(() => {
@@ -106,7 +109,9 @@ describe('per-file read/write', () => {
 
   it('derives hasComputerUse from computer_use* tool calls', () => {
     const autopilot = makeConv('cu1', {
-      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] },
+      ],
     });
     const plainTool = makeConv('cu2', {
       messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'read_file' }] }],
@@ -145,6 +150,17 @@ describe('per-file read/write', () => {
     expect(Object.keys(readIndex(appHome).conversations)).toEqual(['b2']);
   });
 
+  it('delete rejects a malformed / abusively-long id without polluting the durable deletedIds ring (R178)', () => {
+    const hugeId = 'x'.repeat(5_000_000); // ~5 MiB
+    expect(deleteConversation(appHome, hugeId)).toBe(false);
+    expect(deleteConversations(appHome, [hugeId, '', 'y'.repeat(500)])).toEqual([]);
+    // The durable deletedIds ring must not contain the oversized ids.
+    const idx = readIndex(appHome);
+    const deletedIds = Array.isArray(idx.deletedIds) ? idx.deletedIds : [];
+    expect(deletedIds).not.toContain(hugeId);
+    expect(deletedIds.some((d) => d.length > 256)).toBe(false);
+  });
+
   it('deleteConversations returns an ORPHAN record (file present, no index entry) so the caller tears it down', () => {
     // Simulate an orphan: a data file on disk with NO index entry (a rebuilt/corrupt index).
     writeConversation(appHome, makeConv('orphan'));
@@ -168,7 +184,9 @@ describe('per-file read/write', () => {
   it('reindexIfStale backfills new precomputed flags once, then no-ops', () => {
     // Seed a chat and hand-write a stale index missing the new flags + version.
     const conv = makeConv('r1', {
-      messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] }],
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 't1', toolName: 'computer_use_session' }] },
+      ],
     });
     writeConversation(appHome, conv);
     const stale = readIndex(appHome);
@@ -187,6 +205,33 @@ describe('per-file read/write', () => {
     expect(reindexIfStale(appHome)).toBe(0);
   });
 
+  it('reconcileGhostIndexEntries drops entries whose file is gone and durably tombstones them', () => {
+    // Two real chats, then remove ONE file out-of-band leaving its index entry — the exact ghost
+    // state a delete whose durable index write failed leaves across a restart.
+    writeConversation(appHome, makeConv('keep'));
+    writeConversation(appHome, makeConv('ghost'));
+    rmSync(join(appHome, 'data', 'conversations', 'ghost.json'), { force: true });
+    expect(readIndex(appHome).conversations.ghost).toBeDefined(); // ghost still indexed
+
+    const reconciled = reconcileGhostIndexEntries(appHome);
+    expect(reconciled).toBe(1);
+
+    const after = readIndex(appHome);
+    expect(after.conversations.ghost).toBeUndefined(); // dropped
+    expect(after.conversations.keep).toBeDefined(); // live chat retained
+    expect(Array.isArray(after.deletedIds) ? after.deletedIds : []).toContain('ghost'); // durable tombstone
+
+    // A stale writer can no longer resurrect the ghost: the durable ring suppresses the write.
+    // (Clear the in-memory tombstone first so ONLY the durable ring is under test.)
+    __resetDeleteTombstonesForTests();
+    writeConversation(appHome, makeConv('ghost', { title: 'resurrect attempt' }));
+    expect(readConversation(appHome, 'ghost')).toBeNull();
+    expect(readIndex(appHome).conversations.ghost).toBeUndefined();
+
+    // No-op when the index is already consistent.
+    expect(reconcileGhostIndexEntries(appHome)).toBe(0);
+  });
+
   it('deleteConversation removes the file and index entry', () => {
     writeConversation(appHome, makeConv('c1'));
     deleteConversation(appHome, 'c1');
@@ -200,6 +245,83 @@ describe('per-file read/write', () => {
     // The durable ring persisted to the index carries the deleted id — this is the tombstone
     // that survives a process restart / the in-memory TTL expiry, blocking later resurrection.
     expect(readIndex(appHome).deletedIds).toContain('d1');
+  });
+
+  it('consumeWriteWasSuppressed reports whether the LAST write hit disk, one-shot + throw-free (R148)', async () => {
+    const { consumeWriteWasSuppressed } = await import('../conversation-store.js');
+    // A normal write is NOT suppressed.
+    writeConversation(appHome, makeConv('live-w'));
+    expect(consumeWriteWasSuppressed('live-w')).toBe(false);
+    // Delete it, then a stale re-put is SUPPRESSED (tombstoned) → flag true, and one-shot.
+    deleteConversation(appHome, 'live-w');
+    writeConversation(appHome, makeConv('live-w'));
+    expect(consumeWriteWasSuppressed('live-w')).toBe(true);
+    expect(consumeWriteWasSuppressed('live-w')).toBe(false); // consumed (one-shot)
+  });
+
+  it('the suppression flag set stays bounded even when writes are NEVER consumed (R149)', async () => {
+    const { consumeWriteWasSuppressed } = await import('../conversation-store.js');
+    // Simulate a bulk clear + a flood of stale re-puts that are all suppressed and NEVER consumed
+    // (the plugin-upsert path reads via isWriteTombstoned, not consumeWriteWasSuppressed).
+    // Pre-seed ALL the tombstone ids in ONE index write (avoid per-iteration read/write I/O so the
+    // loop stays fast under parallel full-suite load), then flood suppressed writes.
+    const N = 560; // just past the 500 cap
+    const ids = Array.from({ length: N }, (_, i) => `flood-${i}`);
+    writeIndex(appHome, { conversations: {}, activeConversationId: null, settings: {}, deletedIds: ids });
+    for (const id of ids) writeConversation(appHome, makeConv(id)); // each suppressed (tombstoned)
+    // The newest id is still tracked (add-time eviction keeps the most-recent). And an id from
+    // the very START of the flood — well past the 500 cap — was evicted. (We avoid asserting an
+    // exact boundary id: eviction is recency-ordered and other tests in this file share the
+    // module-level set, so only "newest kept, ancient evicted" is a stable invariant.)
+    expect(consumeWriteWasSuppressed(`flood-${N - 1}`)).toBe(true);
+    expect(consumeWriteWasSuppressed('flood-0')).toBe(false);
+  });
+
+  it('SALVAGES durable deletion tombstones from a CORRUPT/truncated index (R135 f-4 / R136 f-3)', () => {
+    // A confirmed delete records the durable ring; then the index file is corrupted (e.g. a
+    // truncated write on crash). readIndex must rebuild from live files BUT preserve deletedIds
+    // (lost otherwise → a stale put could recreate the deleted chat).
+    writeConversation(appHome, makeConv('live1'));
+    const idxPath = join(appHome, 'data', 'index.json');
+    // (a) Truncation AFTER the deletedIds array closes — recover the whole array.
+    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["gone1","gone2"],"settings":{"trunc', 'utf-8');
+    let recovered = readIndex(appHome);
+    expect(recovered.conversations.live1).toBeDefined();
+    expect(recovered.deletedIds).toContain('gone1');
+    expect(recovered.deletedIds).toContain('gone2');
+    // (b) Truncation INSIDE the array (no closing `]`) — recover the complete ids before the cut.
+    writeFileSync(idxPath, '{"conversations":{},"deletedIds":["keptA","keptB","partia', 'utf-8');
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds).toContain('keptA');
+    expect(recovered.deletedIds).toContain('keptB');
+    expect(recovered.deletedIds).not.toContain('partia'); // incomplete trailing id dropped
+    // (c) A nested conversation field named deletedIds must NOT shadow the top-level ring.
+    writeFileSync(
+      idxPath,
+      '{"conversations":{"c":{"deletedIds":["nestedDecoy"]}},"deletedIds":["realGone"],"settings":{"x',
+      'utf-8',
+    );
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds).toContain('realGone');
+    // (d) A non-array deletedIds value must NOT grab a later unrelated array (R137 f-6).
+    writeFileSync(
+      idxPath,
+      '{"deletedIds":null,"settings":{"pendingConversationIds":["fresh-id"]},"conversations":{"trunc',
+      'utf-8',
+    );
+    recovered = readIndex(appHome);
+    expect(recovered.deletedIds ?? []).not.toContain('fresh-id');
+  });
+
+  it('conversationExistenceState is a fail-closed tri-state (R136 f-2)', async () => {
+    const { conversationExistenceState } = await import('../conversation-store.js');
+    writeConversation(appHome, makeConv('here1'));
+    expect(conversationExistenceState(appHome, 'here1')).toBe('exists');
+    expect(conversationExistenceState(appHome, 'never-created')).toBe('absent');
+    // A present-but-unreadable record file → 'unknown' (caller fails closed to plan-first).
+    const badPath = join(appHome, 'data', 'conversations', 'corrupt1.json');
+    writeFileSync(badPath, '{not valid json', 'utf-8');
+    expect(conversationExistenceState(appHome, 'corrupt1')).toBe('unknown');
   });
 
   it('records the durable tombstone even when the file exists but the index entry is absent (rebuilt index)', () => {

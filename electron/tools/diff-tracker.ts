@@ -114,6 +114,12 @@ const MAX_TRACKED_BYTES = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_PRECONTENT_BYTES = 32 * 1024 * 1024;
 const OP_SNAPSHOT_MAX_BYTES = 256 * 1024;
 const OP_SNAPSHOT_MAX_COUNT = 50;
+// Aggregate cap per conversation (R172): the per-file MAX_TRACKED_BYTES bounds ONE file, but a single
+// shell command touching thousands of medium files would otherwise retain each one's original +
+// current bodies (+ op snapshots) — hundreds of MiB. Cap the number of tracked files per
+// conversation; once reached, a NEW file's mutation is not retained (already-tracked files keep
+// updating). A few thousand entries is generous for a real edit session but bounds the abuse case.
+const MAX_TRACKED_FILES_PER_CONV = 2000;
 
 function safeRead(absPath: string): { exists: boolean; content: string; captured: boolean } {
   try {
@@ -203,6 +209,12 @@ function recordMutation(
   let entry = conv.get(absPath);
 
   if (!entry) {
+    // Aggregate cap (R172): don't start tracking a NEW file once the per-conversation store is full —
+    // a bulk command changing thousands of files would otherwise retain each one's bodies + snapshots
+    // and consume hundreds of MiB. Already-tracked files continue to update.
+    if (conv.size >= MAX_TRACKED_FILES_PER_CONV) {
+      return null;
+    }
     const before = preRead ?? { exists: false, content: '', captured: true };
     entry = {
       original: before.content,

@@ -39,6 +39,15 @@ export type ToolExecutionContext = {
   /** The active model key of the parent turn — the inherit fallback when the
    *  parent had no profile (single-model turn). */
   parentModelKey?: string | null;
+  /** True ONLY when this tool runs in a context that can properly GATE/enforce a plan-mode
+   *  transition — i.e. an interactive run whose driver intercepts enter/exit_plan_mode for
+   *  user approval + a plan-first restart (the Mastra streamHandler hook, or the Claude SDK
+   *  exit_plan_mode handler). Every OTHER executor (Pi/Codex/OpenCode bridges, task agents,
+   *  sub-agents, observer launches, plugin inference, realtime, direct automation tool actions)
+   *  calls tool.execute DIRECTLY with this ABSENT — so enter_plan_mode/exit_plan_mode SELF-GUARD
+   *  on it and refuse there (they'd otherwise save the plan + flip mode with no approval/restart,
+   *  R141). A single chokepoint covering every ungated executor by construction. */
+  planModeGateable?: boolean;
 };
 
 export type ToolDefinition = {

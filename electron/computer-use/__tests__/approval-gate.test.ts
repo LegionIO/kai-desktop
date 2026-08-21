@@ -66,10 +66,22 @@ describe('approvalRequired — configured modes on non-experimental platform (da
     expect(approvalRequired('goal', action({ risk: 'high' }), config, 'local-macos')).toBe(true);
   });
 
-  it('step → follows the action.requiresApproval flag', () => {
+  it('step → approves EVERY action regardless of the model requiresApproval flag (R171)', () => {
     setPlatform('darwin');
+    // "Step — Approve every action": a low-risk click must STILL require approval in step mode; the
+    // model can only raise the bar, never lower it below "always ask".
     expect(approvalRequired('step', action({ requiresApproval: true }), config, 'local-macos')).toBe(true);
-    expect(approvalRequired('step', action({ requiresApproval: false }), config, 'local-macos')).toBe(false);
+    expect(
+      approvalRequired('step', action({ kind: 'click', risk: 'low', requiresApproval: false }), config, 'local-macos'),
+    ).toBe(true);
+    expect(
+      approvalRequired(
+        'step',
+        action({ kind: 'navigate', risk: 'low', requiresApproval: false }),
+        config,
+        'isolated-browser',
+      ),
+    ).toBe(true);
   });
 
   it('pauseOnTerminal forces approval for a Terminal app action', () => {

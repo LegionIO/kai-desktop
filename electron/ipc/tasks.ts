@@ -14,6 +14,7 @@ import type {
 } from '../../shared/task-types.js';
 import { isValidTransition } from '../../shared/task-state-machine.js';
 import type { AppConfig } from '../config/schema.js';
+import type { ModelMessage } from 'ai';
 import { TASK_PLAN_SYSTEM_PROMPT } from '../agent/prompts.js';
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { warnOnDeprecatedField } from '../utils/field-validation.js';
@@ -219,7 +220,24 @@ const conversationMessageSchema = z.object({
 });
 
 /** Active plan generation streams, keyed by taskId. */
-const activeTaskStreams = new Map<string, { token: symbol; abort: () => void }>();
+const activeTaskStreams = new Map<string, { token: symbol; streamId: string; abort: () => void }>();
+
+/**
+ * R227: abort a task's in-flight plan-generation stream when the task is REMOVED FROM THE ACTIVE LIST
+ * (deleted or archived). Archiving, like deleting, drops the task from every window's active view via the
+ * `tasks:changed` broadcast, but the background stream in activeTaskStreams would keep running — and a later
+ * error/empty-done would park recovery in the owning window AFTER the removal broadcast already passed,
+ * stranding an inaccessible payload + byte charge. Aborting suppresses the stream's own terminal, so we emit a
+ * dedicated terminal `done{reason:'deleted'}` stamped with the stream's id so the owner drops its in-flight
+ * payload WITHOUT recovery (the task is no longer reachable in the active list). Idempotent: no-op with no stream.
+ */
+function abortActiveTaskStream(id: string): void {
+  const activeStream = activeTaskStreams.get(id);
+  if (!activeStream) return;
+  activeStream.abort();
+  activeTaskStreams.delete(id);
+  broadcastTaskStreamEvent({ taskId: id, type: 'done', streamId: activeStream.streamId, reason: 'deleted' });
+}
 
 // ── Async Mutex ─────────────────────────────────────────────────────────
 
@@ -399,6 +417,13 @@ function updateTaskWith(
         ...(isMeaningful && { updatedAt: new Date().toISOString() }),
       };
       atomicWriteFileSync(filePath, JSON.stringify(updated, null, 2));
+      // R227: if this update newly ARCHIVES the task (drops it from the active list), abort its in-flight plan
+      // stream and emit a stamped terminal — the same treatment tasks:delete gives — so the owning window drops
+      // its in-flight recovery payload instead of stranding it after the removal broadcast. Only on the
+      // transition into archived (not a re-write of an already-archived task).
+      if (cleanUpdates.archivedAt && !existing.archivedAt) {
+        abortActiveTaskStream(id);
+      }
       broadcastTaskChange(appHome, origin);
       return updated;
     } catch {
@@ -634,6 +659,33 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle('tasks:delete', (_e, id: string) => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+    // R222/R223/R224: abort any in-flight plan-generation stream for this task. Deletion stops the assigned
+    // running agent (onTaskDeleted below), but a background plan stream lives in activeTaskStreams and would
+    // otherwise keep consuming the provider connection and broadcasting deltas for a task that no longer exists.
+    // Aborting suppresses the stream's own terminal events, so we emit a dedicated terminal to release the
+    // owning window's in-flight payload — but ONLY after we know whether the task actually went away:
+    //   - unlink succeeded  → done{reason:'deleted'}: owner drops the payload WITHOUT recovery (task is gone).
+    //   - unlink FAILED      → error: the task survives, so the owner should recover its draft (R224).
+    // Idempotent: no-op when there is no active stream. Capture the stream up front (abort now to stop the
+    // provider work) but defer the terminal broadcast until the filesystem outcome is known.
+    const activeStream = activeTaskStreams.get(id);
+    if (activeStream) {
+      activeStream.abort();
+      activeTaskStreams.delete(id);
+    }
+    const emitStreamTerminal = (ok: boolean) => {
+      if (!activeStream) return;
+      if (ok) {
+        broadcastTaskStreamEvent({ taskId: id, type: 'done', streamId: activeStream.streamId, reason: 'deleted' });
+      } else {
+        broadcastTaskStreamEvent({
+          taskId: id,
+          type: 'error',
+          streamId: activeStream.streamId,
+          error: 'Task deletion failed',
+        });
+      }
+    };
     try {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       // Clear the terminal output buffers (memory + disk) for this task's
@@ -663,9 +715,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         unlinkSync(filePath);
       }
       broadcastTaskChange(appHome);
+      emitStreamTerminal(true); // task is gone → owner drops payload without recovery
       return { ok: true };
     } catch (err) {
       console.error(`[tasks] Failed to delete task ${id}:`, err);
+      emitStreamTerminal(false); // task survives → owner recovers its draft
       return { error: String(err) };
     }
   });
@@ -674,6 +728,11 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle('tasks:kick-back', (_e, id: string, reason: string, source: 'ai' | 'human') => {
     if (!isValidTaskId(id)) return { error: 'Invalid task ID' };
+    // Validate reason/source at the wire boundary (R181): the note is persisted and later read by
+    // TaskDetailPanel via `content.includes(...)`, so a non-string reason would crash the renderer,
+    // and an oversized reason would bypass the review-note schema's 20000-char cap.
+    if (typeof reason !== 'string' || reason.length > 20000) return { error: 'Invalid reason' };
+    if (source !== 'ai' && source !== 'human') return { error: 'Invalid source' };
     return withTaskLock(id, () => {
       const filePath = join(getTasksDir(appHome), `${id}.json`);
       if (!existsSync(filePath)) return { error: `Task ${id} not found` };
@@ -745,43 +804,118 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
 
   ipcMain.handle(
     'tasks:stream-plan',
-    async (_e, taskId: string, userMessage: string, existingHistory?: TaskConversationMessage[]) => {
+    async (
+      _e,
+      taskId: string,
+      userMessage: string,
+      existingHistory?: TaskConversationMessage[],
+      attachments?: Array<{ image: string; mimeType?: string }>,
+      clientStreamId?: string,
+    ) => {
+      // R224/R226: the stream INSTANCE id stamps EVERY event this request emits (incl. pre-stream validation
+      // errors) so a renderer can attribute each event to a specific request. R226: prefer the CLIENT-minted id
+      // when provided — the renderer records it synchronously before awaiting this call, eliminating the
+      // pending-admission window where the renderer owned a payload but didn't yet know its id. Fall back to a
+      // main-minted id for older callers. Validate it's a well-formed non-empty string to avoid a caller
+      // injecting a colliding/empty id.
+      const streamId =
+        typeof clientStreamId === 'string' && clientStreamId.length > 0 && clientStreamId.length <= 128
+          ? clientStreamId
+          : `${typeof taskId === 'string' ? taskId : 'invalid'}:${randomUUID()}`;
       // Validate taskId to prevent path traversal
       if (!isValidTaskId(taskId)) {
-        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', error: 'Invalid task ID' });
-        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done' });
-        return { taskId };
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'error', streamId, error: 'Invalid task ID' });
+        broadcastTaskStreamEvent({ taskId: taskId ?? '', type: 'done', streamId });
+        return { taskId, streamId, error: true };
       }
 
-      if (!userMessage || typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'User message too long or invalid' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        return { taskId };
+      // userMessage must be a string within the length cap. Empty text is allowed ONLY when at least
+      // one image attachment is present (R188): the composers permit an image-only send, so rejecting
+      // empty text here would drop those. A non-string / oversized message is always invalid.
+      const hasImageAttachment =
+        Array.isArray(attachments) && attachments.some((a) => typeof a?.image === 'string' && a.image.length > 0);
+      if (typeof userMessage !== 'string' || userMessage.length > MAX_USER_MESSAGE_LENGTH) {
+        broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+        return { taskId, streamId, error: true };
+      }
+      if (userMessage.length === 0 && !hasImageAttachment) {
+        broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'User message too long or invalid' });
+        broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+        return { taskId, streamId, error: true };
       }
 
       if (existingHistory) {
         const historyCheck = z.array(conversationMessageSchema).max(100).safeParse(existingHistory);
         if (!historyCheck.success) {
-          broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Invalid conversation history' });
-          broadcastTaskStreamEvent({ taskId, type: 'done' });
-          return { taskId };
+          broadcastTaskStreamEvent({ taskId, type: 'error', streamId, error: 'Invalid conversation history' });
+          broadcastTaskStreamEvent({ taskId, type: 'done', streamId });
+          return { taskId, streamId, error: true };
         }
       }
 
-      // Cancel any existing stream for this task
+      // R228: the task must still EXIST and be UNARCHIVED before we register/start a stream. A delete or archive
+      // that completed after the renderer initiated this call (but before we get here) leaves R227's abort with
+      // nothing to abort; without this guard we'd start an unreachable stream that either strands recovery on a
+      // later error (its removal broadcast already passed) or, worse, modifies an archived task on success. Emit a
+      // stamped terminal so the owner drops its in-flight payload WITHOUT recovery (the task is gone/archived).
+      {
+        const filePath = join(getTasksDir(appHome), `${taskId}.json`);
+        let taskExists = false;
+        if (existsSync(filePath)) {
+          try {
+            const t = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+            taskExists = !t.archivedAt;
+          } catch {
+            taskExists = false;
+          }
+        }
+        if (!taskExists) {
+          broadcastTaskStreamEvent({ taskId, type: 'done', streamId, reason: 'deleted' });
+          return { taskId, streamId, error: true };
+        }
+      }
+
+      // Cancel any existing stream for this task. R224: notify the OLD stream's owner with a terminal error
+      // stamped with the OLD streamId, so the window that started it resolves its in-flight payload (recovering
+      // its draft) and releases its attachment charge — otherwise, since the replaced stream's own terminals are
+      // suppressed (isCurrent() is now false for it) AND this new stream's events are rejected by the old owner's
+      // streamId gate (R223), the original window would stream forever and leak its charge.
       const existing = activeTaskStreams.get(taskId);
-      if (existing) existing.abort();
+      if (existing) {
+        existing.abort();
+        broadcastTaskStreamEvent({
+          taskId,
+          type: 'error',
+          streamId: existing.streamId,
+          error: 'Plan generation was superseded by a newer request',
+        });
+      }
 
       const controller = new AbortController();
       // Token identifies THIS stream so a later stream replacing it under the
       // same taskId isn't torn down by this one's finally (which would make the
       // new stream uncancellable and race plan writes).
       const streamToken = Symbol(taskId);
-      activeTaskStreams.set(taskId, { token: streamToken, abort: () => controller.abort() });
+      // R223/R224: streamId (the per-request instance id) was assigned at handler entry so validation errors
+      // could be stamped too. Reuse it here as the active stream's id — every broadcast for this run carries it,
+      // and a renderer records the id it owns to reject a replacement stream's events.
+      activeTaskStreams.set(taskId, { token: streamToken, streamId, abort: () => controller.abort() });
+      const isCurrent = () => activeTaskStreams.get(taskId)?.token === streamToken;
       const clearIfCurrent = () => {
-        if (activeTaskStreams.get(taskId)?.token === streamToken) {
+        if (isCurrent()) {
           activeTaskStreams.delete(taskId);
         }
+      };
+      // Every event this stream emits carries its streamId. `emit` is the streamId-stamped broadcaster.
+      const emit = (event: Parameters<typeof broadcastTaskStreamEvent>[0]) =>
+        broadcastTaskStreamEvent({ ...event, streamId });
+      // Broadcast a terminal event ONLY if THIS stream still owns the task (R190): after the first
+      // `await` below, a newer stream-plan request for the same taskId may have replaced this one. A
+      // stale run's error/done must not delete the replacement's entry (clearIfCurrent handles the map)
+      // nor emit a terminal event the UI would attribute to the live stream.
+      const emitTerminalIfCurrent = (event: Parameters<typeof broadcastTaskStreamEvent>[0]) => {
+        if (isCurrent()) emit(event);
       };
 
       // Resolve config and model
@@ -790,10 +924,10 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
         const { readEffectiveConfig } = await import('./config.js');
         config = readEffectiveConfig(appHome);
       } catch {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'Failed to load config' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        activeTaskStreams.delete(taskId);
-        return { taskId };
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'Failed to load config' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
+        clearIfCurrent();
+        return { taskId, error: true };
       }
 
       const { resolveModelCatalog } = await import('../agent/model-catalog.js');
@@ -802,22 +936,88 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
       const haikuModel = catalog.entries.find((e) => e.modelConfig.modelName.toLowerCase().includes('haiku'));
       const modelEntry = haikuModel ?? catalog.defaultEntry;
       if (!modelEntry) {
-        broadcastTaskStreamEvent({ taskId, type: 'error', error: 'No model configured' });
-        broadcastTaskStreamEvent({ taskId, type: 'done' });
-        activeTaskStreams.delete(taskId);
-        return { taskId };
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'No model configured' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
+        clearIfCurrent();
+        return { taskId, error: true };
       }
 
-      // Build conversation messages
-      const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      // Build conversation messages. The final user turn may carry image attachments (R187): the task
+      // composer now forwards them, so build a multimodal content array for that turn. History turns and
+      // the persisted description stay text-only. Caps mirror the chat submit path so a bulk/huge image
+      // set can't blow the model request or the persisted task file.
+      const messages: ModelMessage[] = [];
       if (existingHistory) {
         for (const msg of existingHistory) {
           messages.push({ role: msg.role, content: msg.content });
         }
       }
-      messages.push({ role: 'user', content: userMessage });
+      const MAX_PLAN_ATTACHMENTS = 8;
+      const MAX_PLAN_ATTACHMENT_BYTES = 6 * 1024 * 1024; // per image (data-URL length)
+      const MAX_PLAN_ATTACHMENTS_TOTAL_BYTES = 12 * 1024 * 1024; // across all images
+      const ALLOWED_PLAN_IMAGE_MIME = new Set([
+        'image/png',
+        'image/jpeg',
+        'image/gif',
+        'image/webp',
+        'image/bmp',
+        'image/svg+xml',
+        'image/heic',
+        'image/heif',
+      ]);
+      const imageParts: Array<{ type: 'image'; image: string; mimeType?: string }> = [];
+      // Count images the caller SUPPLIED (non-empty string) so we can warn when the plan-side caps
+      // (6 MiB/image · 8 images · 12 MiB total) drop some — the renderer accepts up to 64 MiB, so a
+      // valid-to-the-composer image can be silently dropped here (R195). Text-bearing sends still
+      // proceed, but the user must be told their image wasn't included.
+      let suppliedImages = 0;
+      if (Array.isArray(attachments)) {
+        let count = 0;
+        let totalBytes = 0;
+        for (const att of attachments) {
+          const image = att?.image;
+          if (typeof image !== 'string' || image.length === 0) continue;
+          suppliedImages += 1;
+          if (count >= MAX_PLAN_ATTACHMENTS) continue;
+          // Require a bounded inline data: URL (R205). The task composers always produce base64 data URLs,
+          // so a non-data image is either malformed or a remote http(s) URL — and for a provider without
+          // URL support (e.g. Bedrock) the AI SDK would fetch a remote URL locally with a ~2 GiB default
+          // limit (× up to 8 images), OOMing main. A data: URL's bytes ARE the string, so the caps below
+          // measure the real payload; a URL's short string would slip past them.
+          if (!/^data:/i.test(image)) continue;
+          const imageBytes = Buffer.byteLength(image, 'utf8');
+          if (imageBytes > MAX_PLAN_ATTACHMENT_BYTES) continue;
+          if (totalBytes + imageBytes > MAX_PLAN_ATTACHMENTS_TOTAL_BYTES) continue;
+          totalBytes += imageBytes;
+          count += 1;
+          const mimeType =
+            typeof att.mimeType === 'string' && ALLOWED_PLAN_IMAGE_MIME.has(att.mimeType) ? att.mimeType : undefined;
+          imageParts.push(mimeType ? { type: 'image', image, mimeType } : { type: 'image', image });
+        }
+      }
+      const droppedImages = suppliedImages - imageParts.length;
+      if (imageParts.length > 0) {
+        // Omit an empty text part (image-only send) — some providers reject a zero-length text part.
+        const parts =
+          userMessage.length > 0 ? [{ type: 'text' as const, text: userMessage }, ...imageParts] : imageParts;
+        messages.push({ role: 'user', content: parts });
+      } else if (userMessage.length > 0) {
+        messages.push({ role: 'user', content: userMessage });
+      } else {
+        // Image-only send whose every image was rejected by the per-image / total / MIME filter above
+        // (R189): the early hasImageAttachment gate saw raw attachments, but none survived. Sending
+        // { role:'user', content:'' } would run the model on an empty turn after the UI already cleared
+        // the files. Fail explicitly instead.
+        emitTerminalIfCurrent({ taskId, type: 'error', error: 'No usable image attachments' });
+        emitTerminalIfCurrent({ taskId, type: 'done' });
+        clearIfCurrent();
+        return { taskId, error: true };
+      }
 
-      // Stream in background (handler returns immediately)
+      // Stream in background (handler returns immediately). NOTE: the dropped-image warning is NOT emitted
+      // as a stream event here (R209) — it would be broadcast before the renderer registers stream
+      // ownership (START_AI_CREATE now fires only after this handler returns), so the listener would
+      // discard it. Instead droppedImages is returned in the resolved result below and the composer warns.
       void (async () => {
         try {
           const { streamText } = await import('ai');
@@ -835,7 +1035,9 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
           for await (const textPart of (await result).textStream) {
             if (controller.signal.aborted) break;
             fullText += textPart;
-            broadcastTaskStreamEvent({ taskId, type: 'text-delta', text: textPart });
+            // Stamp the streamId (R223) and only emit while THIS stream still owns the task, so a stale run's
+            // deltas can't feed a replacement stream's UI/recovery.
+            if (isCurrent()) emit({ taskId, type: 'text-delta', text: textPart });
           }
 
           // Persist final description to task file
@@ -843,9 +1045,14 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
             const filePath = join(getTasksDir(appHome), `${taskId}.json`);
             if (existsSync(filePath)) {
               const task = JSON.parse(readFileSync(filePath, 'utf-8')) as TaskFile;
+              // For an image-only turn userMessage is '' — persisting content:'' would replay as a
+              // zero-length text block on refinement, which some providers reject (R204). Store a
+              // non-empty placeholder so the history turn always has usable text. (The images themselves
+              // aren't persisted into history — the plan text below captures the outcome.)
+              const historyUserContent = userMessage.length > 0 ? userMessage : '[image attached]';
               const newHistory: TaskConversationMessage[] = [
                 ...(existingHistory ?? []),
-                { role: 'user', content: userMessage, timestamp: new Date().toISOString() },
+                { role: 'user', content: historyUserContent, timestamp: new Date().toISOString() },
                 { role: 'assistant', content: fullText, timestamp: new Date().toISOString() },
               ];
               const updated: TaskFile = {
@@ -859,30 +1066,43 @@ export function registerTaskHandlers(ipcMain: IpcMain, appHome: string, options?
             }
           }
 
-          broadcastTaskStreamEvent({ taskId, type: 'done' });
+          emitTerminalIfCurrent({ taskId, type: 'done' });
         } catch (error) {
           if (!controller.signal.aborted) {
-            broadcastTaskStreamEvent({
+            emitTerminalIfCurrent({
               taskId,
               type: 'error',
               error: error instanceof Error ? error.message : String(error),
             });
-            broadcastTaskStreamEvent({ taskId, type: 'done' });
+            emitTerminalIfCurrent({ taskId, type: 'done' });
           }
         } finally {
           clearIfCurrent();
         }
       })();
 
-      return { taskId };
+      // Return droppedImages AND the streamId in the RESOLVED result (R209/R223) so the composer can warn
+      // deterministically and record which stream instance it owns — a stream-event warning would race the
+      // renderer's post-await ownership registration and be dropped.
+      return { taskId, streamId, ...(droppedImages > 0 ? { droppedImages } : {}) };
     },
   );
 
-  ipcMain.handle('tasks:cancel-stream', (_e, taskId: string) => {
+  ipcMain.handle('tasks:cancel-stream', (_e, taskId: string, streamId?: string) => {
     const stream = activeTaskStreams.get(taskId);
     if (stream) {
+      // R232: when the caller names a streamId, only cancel if it matches the ACTIVE stream — a superseded
+      // window must not abort a NEWER window's stream for the same task (which would leave the newer stream with
+      // no terminal event, stuck streaming with its recovery bytes retained). A legacy caller (no streamId)
+      // keeps the prior unconditional behavior.
+      if (typeof streamId === 'string' && streamId.length > 0 && stream.streamId !== streamId) {
+        return { ok: false };
+      }
       stream.abort();
       activeTaskStreams.delete(taskId);
+      // Emit a stamped terminal so the owning window resolves its in-flight payload (drops it — a deliberate
+      // cancel is not a failure needing draft recovery, matching the renderer's cancel semantics).
+      broadcastTaskStreamEvent({ taskId, type: 'done', streamId: stream.streamId, reason: 'deleted' });
     }
     return { ok: true };
   });

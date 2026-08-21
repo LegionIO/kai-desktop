@@ -3,7 +3,20 @@ import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 import { broadcastToAllWindows } from '../utils/window-send.js';
 import { writeUpdateReady } from '../local-bridge/update-signal.js';
-import { existsSync, writeFileSync, readFileSync, unlinkSync, rmSync, appendFileSync, mkdirSync } from 'fs';
+import {
+  existsSync,
+  writeFileSync,
+  readFileSync,
+  unlinkSync,
+  rmSync,
+  appendFileSync,
+  mkdirSync,
+  openSync,
+  closeSync,
+  fstatSync,
+  readSync,
+  constants as fsConstants,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -306,8 +319,46 @@ function writePostUpdateMarker(version: string): boolean {
  */
 export function consumePostUpdateMarker(): { version: string; fromVersion: string } | null {
   try {
-    if (!existsSync(POST_UPDATE_MARKER)) return null;
-    const data = JSON.parse(readFileSync(POST_UPDATE_MARKER, 'utf-8'));
+    // Use lstatSync + O_NOFOLLOW and a byte cap (R181): the marker lives in
+    // userData, but a symlink or device/FIFO planted at that path would
+    // otherwise make readFileSync follow the link (leaking/blocking) or read an
+    // unbounded stream. The marker is a tiny JSON blob — reject anything that
+    // isn't a small regular file and never follow a link.
+    // Single-descriptor validation (R181/R204): a pre-open lstat cap is a TOCTOU — a symlink/FIFO/device
+    // or a grown/replaced regular file between the lstat and the read could bypass the cap or block. Open
+    // FIRST with O_NOFOLLOW|O_NONBLOCK (nonblocking so a FIFO can't hang startup), then fstat the SAME
+    // descriptor to confirm a small regular file, and read exactly the fstat'd size. The marker is a tiny
+    // JSON blob.
+    const MARKER_MAX_BYTES = 1024 * 1024;
+    let fd: number;
+    try {
+      fd = openSync(POST_UPDATE_MARKER, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    } catch {
+      return null; // absent, symlink (O_NOFOLLOW → ELOOP), or unopenable — nothing to consume
+    }
+    let raw: string;
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > MARKER_MAX_BYTES) {
+        try {
+          unlinkSync(POST_UPDATE_MARKER);
+        } catch {
+          /* */
+        }
+        return null;
+      }
+      const buf = Buffer.allocUnsafe(st.size);
+      let off = 0;
+      while (off < st.size) {
+        const n = readSync(fd, buf, off, st.size - off, off);
+        if (n === 0) break;
+        off += n;
+      }
+      raw = buf.subarray(0, off).toString('utf-8');
+    } finally {
+      closeSync(fd);
+    }
+    const data = JSON.parse(raw);
     unlinkSync(POST_UPDATE_MARKER);
     return data;
   } catch {

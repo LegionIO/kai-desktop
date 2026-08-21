@@ -35,9 +35,17 @@ function nextInjectId(): string {
 
 /** Append a message to a conversation's pending-inject queue (FIFO). Returns the
  *  new entry's id (for later cancel/edit), or null if nothing was enqueued. */
-export function enqueueInject(conversationId: string, text: string): string | null {
+export function enqueueInject(conversationId: string, text: string, desiredId?: string): string | null {
   if (!conversationId || !text) return null;
-  const entry: QueuedInject = { id: nextInjectId(), text, at: Date.now() };
+  // A caller (alert resume) may pin a STABLE id so a post-failure commit check can
+  // find the persisted turn by exact id even if a policy hook rewrote its content
+  // (R104). The id becomes the persisted user node's id via
+  // persistCooperativeInjectedUserTurn. Falls back to a minted id otherwise.
+  const entry: QueuedInject = {
+    id: desiredId && desiredId.length > 0 ? desiredId : nextInjectId(),
+    text,
+    at: Date.now(),
+  };
   const q = queues.get(conversationId);
   if (q) q.push(entry);
   else queues.set(conversationId, [entry]);

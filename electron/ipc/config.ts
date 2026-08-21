@@ -1333,6 +1333,21 @@ export function registerConfigHandlers(
     onBrowserChanged?.(structuredClone(currentConfig.browser));
   };
 
+  const applyReload = (): boolean => {
+    try {
+      currentConfig = readWatchedConfig();
+      publishBrowserConfig(false);
+      // External edit to desktop.json (enabled/content/scopes/retention) must
+      // take effect without an internal write or restart.
+      invalidateDiagnosticTraceConfig();
+      scheduleConfigBroadcast();
+      return true;
+    } catch {
+      // Ignore read errors during write
+      return false;
+    }
+  };
+
   const reloadConfig = () => {
     // Do not put Browser lifecycle changes behind the general file-watch
     // debounce. Atomic external edits normally emit more than one fs event;
@@ -1349,17 +1364,35 @@ export function registerConfigHandlers(
     }
     if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
     reloadDebounceTimer = setTimeout(() => {
-      try {
-        currentConfig = readWatchedConfig();
-        publishBrowserConfig(false);
-        // External edit to desktop.json (enabled/content/scopes/retention) must
-        // take effect without an internal write or restart.
-        invalidateDiagnosticTraceConfig();
-        scheduleConfigBroadcast();
-      } catch {
-        // Ignore read errors during write
-      }
+      reloadDebounceTimer = null;
+      applyReload();
     }, 200);
+  };
+
+  // Flush a PENDING external reload synchronously (R169): an external edit to desktop.json/llm.json
+  // is reloaded on a 200ms debounce; an internal config:set landing inside that window mutates the
+  // STALE cached currentConfig and rewrites the WHOLE desktop payload, silently clobbering the
+  // external edit. Before any internal mutation, if a reload is pending, cancel the timer and reload
+  // NOW so currentConfig reflects the external change, and the internal mutation layers on top of it.
+  const flushPendingReload = (): boolean => {
+    if (reloadDebounceTimer) {
+      clearTimeout(reloadDebounceTimer);
+      reloadDebounceTimer = null;
+      // If the synchronous flush read FAILS (partial external write mid-flush), do NOT leave the pending
+      // reload cancelled (R199): currentConfig is still stale and the caller's internal config:set would
+      // then rewrite the whole payload from stale state, clobbering the external edit. Re-arm the debounce
+      // so the external change is still picked up shortly after the writer finishes, and REPORT the failure
+      // so the caller can avoid a stale full-file rewrite (R200).
+      const ok = applyReload();
+      if (!ok && !reloadDebounceTimer) {
+        reloadDebounceTimer = setTimeout(() => {
+          reloadDebounceTimer = null;
+          applyReload();
+        }, 200);
+      }
+      return ok;
+    }
+    return true; // nothing pending → currentConfig already reflects the latest observed state
   };
 
   // Watch each settings file for external edits. `fs.watch` on the file itself
@@ -1413,6 +1446,21 @@ export function registerConfigHandlers(
   const llmProviderKeys = new Set(['anthropic', 'openai', 'gemini', 'bedrock', 'ollama']);
 
   const setConfigImpl = (path: string, value: unknown): void => {
+    // Fold in any pending external edit BEFORE mutating (R169) so this internal write can't clobber
+    // an external change that arrived within the reload debounce window.
+    const flushed = flushPendingReload();
+    if (!flushed) {
+      // The pending external reload's synchronous read failed (a partial write mid-flush), so currentConfig
+      // may be stale and the full-file rewrite below could clobber the external edit — the re-armed retry
+      // can't recover an already-overwritten file (R200). Make a best-effort fresh read here so the delta
+      // layers on the latest on-disk state; if it ALSO fails, proceed on the last-known config (unavoidable,
+      // and no worse than before), since silently dropping the user's config:set is a worse outcome.
+      try {
+        currentConfig = readWatchedConfig();
+      } catch {
+        /* still unreadable — proceed with the last-known currentConfig */
+      }
+    }
     if (path === 'models') {
       currentConfig = readEffectiveConfig(appHome);
       publishBrowserConfig(false);

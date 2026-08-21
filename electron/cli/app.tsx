@@ -48,6 +48,9 @@ type StreamEvent = {
   error?: string;
   durationMs?: number;
   data?: unknown;
+  /** The emitting run's nonce (streamToken), echoed on approval/tool events so a CLI responder can send it
+   *  back for run-scoped approval/answer resolution (R250). */
+  runGeneration?: string;
   // Sub-agent events are scoped to the SUB-agent's conversationId, but carry the
   // parent so a client viewing the parent can surface their progress.
   subAgentConversationId?: string;
@@ -251,7 +254,14 @@ export function App({
   // the conversation frees. A single slot would be OVERWRITTEN when a SECOND submission is
   // busy-rejected before the first drained — silently losing the first / reordering. Each entry
   // preserves the FULL submission (expanded text + attachments). Drained oldest-first.
-  const pendingBusyResendRef = useRef<Array<{ convId: string | null; trimmed: string; submitText?: string; attachments?: Array<{ image: string; mimeType?: string }> }>>([]);
+  const pendingBusyResendRef = useRef<
+    Array<{
+      convId: string | null;
+      trimmed: string;
+      submitText?: string;
+      attachments?: Array<{ image: string; mimeType?: string }>;
+    }>
+  >([]);
   // Keep the shared runtime ref current so startRepl's quit cleanup can cancel
   // an in-flight turn on the right conversation.
   if (runtimeRef) {
@@ -413,11 +423,13 @@ export function App({
   // collected answers back via agent:answer-tool-question (keyed by question
   // text, matching the GUI's contract). Falls back to approve on empty.
   const promptAskUser = useCallback(
-    (toolCallId: string, questions: AskUserQuestion[]) => {
+    (toolCallId: string, questions: AskUserQuestion[], convId?: string, runNonce?: string) => {
       const answers: Record<string, string> = {};
       const askNext = (i: number): void => {
         if (i >= questions.length) {
-          void client.invoke('agent:answer-tool-question', toolCallId, answers).catch(() => {});
+          // R250: pass conversationId + run nonce so the answer stashes under the SAME run-scoped key the
+          // SDK/gate reads (conversationId::runNonce::toolCallId); without them the answer is orphaned.
+          void client.invoke('agent:answer-tool-question', toolCallId, answers, convId, runNonce).catch(() => {});
           setStatus('running');
           return;
         }
@@ -443,7 +455,7 @@ export function App({
           // Esc mid-questionnaire → reject so the ask_user tool doesn't hang.
           onCancel: () => {
             setStatus('running');
-            void client.invoke('agent:reject-tool', toolCallId).catch(() => {});
+            void client.invoke('agent:reject-tool', toolCallId, convId, runNonce).catch(() => {});
           },
         });
       };
@@ -667,11 +679,17 @@ export function App({
           if (e.toolCallId) {
             setTools((prev) => prev.map((t) => (t.id === e.toolCallId ? { ...t, status: 'awaiting' } : t)));
             const id = e.toolCallId;
+            // R250: thread the conversationId + the emitting run's nonce (runGeneration) back on every
+            // resolve, so main composes the SAME run-scoped key the approval was registered under
+            // (conversationId::runNonce::toolCallId). Without them a run-scoped approval never resolves and
+            // the backend hangs. Both are optional on the wire; main falls back when absent.
+            const convId = e.conversationId ?? convIdRef.current ?? undefined;
+            const runNonce = e.runGeneration;
             // ask_user isn't a yes/no approval — it's a question set. Render the
             // questions as pickers and send the chosen answers back.
             const askArgs = e.args as { questions?: AskUserQuestion[] } | undefined;
             if (e.toolName === 'ask_user' && Array.isArray(askArgs?.questions) && askArgs.questions.length > 0) {
-              promptAskUser(id, askArgs.questions);
+              promptAskUser(id, askArgs.questions, convId, runNonce);
               break;
             }
             setPicker({
@@ -683,13 +701,15 @@ export function App({
               onSelect: (v) => {
                 setPicker(null);
                 setStatus('running');
-                void client.invoke(v === 'approve' ? 'agent:approve-tool' : 'agent:reject-tool', id).catch(() => {});
+                void client
+                  .invoke(v === 'approve' ? 'agent:approve-tool' : 'agent:reject-tool', id, convId, runNonce)
+                  .catch(() => {});
               },
               // Esc → dismiss the tool so the backend's pending approval resolves
               // (otherwise the stream hangs forever waiting on it).
               onCancel: () => {
                 setStatus('running');
-                void client.invoke('agent:dismiss-tool', id).catch(() => {});
+                void client.invoke('agent:dismiss-tool', id, convId, runNonce).catch(() => {});
               },
             });
           }
@@ -1653,7 +1673,10 @@ export function App({
               statusRef.current = 'running';
               setTurns((prev) => [
                 ...prev,
-                { kind: 'error', text: 'Conversation is busy — your message is queued and will send when it frees up.' },
+                {
+                  kind: 'error',
+                  text: 'Conversation is busy — your message is queued and will send when it frees up.',
+                },
               ]);
               if (submitRes.busyKind === 'compaction') {
                 compactBusyWaitRef.current = true;
@@ -1674,7 +1697,10 @@ export function App({
                       if (resend) {
                         setStatus('running');
                         statusRef.current = 'running';
-                        setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+                        setTimeout(
+                          () => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments),
+                          0,
+                        );
                       }
                     }
                   })
@@ -1758,7 +1784,10 @@ export function App({
                     if (resend) {
                       setStatus('running');
                       statusRef.current = 'running';
-                      setTimeout(() => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments), 0);
+                      setTimeout(
+                        () => sendMessageRef.current(resend.trimmed, resend.submitText, resend.attachments),
+                        0,
+                      );
                     }
                   })
                   .catch(() => {});

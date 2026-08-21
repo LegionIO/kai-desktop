@@ -478,3 +478,23 @@ describe('redactSecretsFromText (stderr leak guard, #65 review)', () => {
     expect(redactSecretsFromText('')).toBe('');
   });
 });
+
+describe('buildToolScopingArgs — plan-first scoping (R142 f-1)', () => {
+  it('scopes pi built-ins to read-only under plan-first, overriding approval', async () => {
+    const { buildToolScopingArgs } = await import('../pi-runtime.js');
+    // full-auto normally means "all tools on" (no flag); plan-first forces read-only.
+    const args = buildToolScopingArgs({ approval: 'full-auto' }, ['kai_x'], true);
+    expect(args[0]).toBe('--tools');
+    const allowed = args[1].split(',');
+    expect(allowed).toContain('read');
+    expect(allowed).not.toContain('write');
+    expect(allowed).not.toContain('edit');
+    expect(allowed).not.toContain('bash');
+    expect(allowed).toContain('kai_x'); // bridged Kai tools stay enabled
+  });
+
+  it('leaves normal (non-plan) scoping unchanged', async () => {
+    const { buildToolScopingArgs } = await import('../pi-runtime.js');
+    expect(buildToolScopingArgs({ approval: 'full-auto' }, [], false)).toEqual([]);
+  });
+});

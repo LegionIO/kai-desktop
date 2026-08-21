@@ -57,6 +57,8 @@ import {
   ensureConversationTree,
   getConversationBranch,
   registerConversationHandlers,
+  reparentConversationMessage,
+  reorderInjectPrefixOnDisk,
   summarizablePrefixMatchesDisk,
 } from '../conversations.js';
 import { sumBranchTokenCounts } from '../../agent/tokenization.js';
@@ -68,6 +70,9 @@ import {
   writeIndex,
   setActiveConversationId,
   __resetMigrationGuardForTests,
+  __resetDeleteTombstonesForTests,
+  markIndexMayHaveGhosts,
+  clearIndexGhostFlag,
   type ConversationRecord,
 } from '../conversation-store.js';
 
@@ -155,6 +160,8 @@ beforeEach(() => {
   // The per-file store guards migration with a module-level flag; reset it so
   // each fresh temp appHome is evaluated independently.
   __resetMigrationGuardForTests();
+  __resetDeleteTombstonesForTests();
+  clearIndexGhostFlag();
 });
 
 afterEach(() => {
@@ -176,6 +183,30 @@ describe('conversations IPC: list / get / put round-trip', () => {
     const list = await harness.invoke<unknown[]>('conversations:list', FAKE_EVENT);
     expect(Array.isArray(list)).toBe(true);
     expect(list).toHaveLength(0);
+  });
+
+  it('conversations:list filters a ghost (index entry, missing file) ONLY when the ghost flag is set', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    // Persist a real conversation, then remove its FILE out-of-band while leaving the index entry —
+    // exactly the "ghost" state a failed durable index write during delete/clear leaves behind.
+    writeConversation(appHome, makeConversation('ghost-1', { title: 'Ghost' }) as ConversationRecord);
+    expect(readIndex(appHome).conversations['ghost-1']).toBeDefined();
+    rmSync(join(appHome, 'data', 'conversations', 'ghost-1.json'), { force: true });
+
+    // Flag OFF (steady state): the list does NOT pay the per-entry stat filter, so the stale index
+    // entry is still returned (cheap hot path). This is the O(N) steady-state guarantee (R163 f-2).
+    clearIndexGhostFlag();
+    const beforeFlag = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
+    expect(beforeFlag.map((e) => e.id)).toContain('ghost-1');
+
+    // Flag ON (a durable write failed): the list filters out the ghost whose file is gone.
+    markIndexMayHaveGhosts();
+    const afterFlag = await harness.invoke<Array<{ id: string }>>('conversations:list', FAKE_EVENT);
+    expect(afterFlag.map((e) => e.id)).not.toContain('ghost-1');
   });
 
   it('persists a conversations:put and reflects it in conversations:get and conversations:list', async () => {
@@ -400,6 +431,53 @@ describe('conversations IPC: list / get / put round-trip', () => {
     expect(ids).toEqual(expect.arrayContaining(['u', 'autoU', 'autoA', 'streamA']));
     // Incoming write had a novel message (streamA) → concurrent, not stale → incoming head wins
     expect(merged.headId).toBe('streamA');
+  });
+
+  it('conversations:put keeps MAIN-authoritative executionMode against a stale incoming record (R122)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    // MAIN persisted plan-first directly (a plan-mode transition writes the record).
+    writeConversation(appHome, makeConversation('c', { executionMode: 'plan-first' }) as never);
+    // A DELAYED renderer put (snapshotted before the transition) carries stale 'auto'.
+    await harness.invoke('conversations:put', FAKE_EVENT, makeConversation('c', { executionMode: 'auto' } as never));
+
+    const after = readConversation(appHome, 'c') as { executionMode?: string } | null;
+    // MAIN's plan-first must NOT be clobbered by the stale put (would re-expose mutating tools).
+    expect(after?.executionMode).toBe('plan-first');
+  });
+
+  it('conversations:set-execution-mode is the authoritative writer for a deliberate toggle (R125)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    writeConversation(appHome, makeConversation('c', {}) as never);
+    // Deliberate Plan-First toggle lands (unlike a generic put, which keeps prev).
+    const r1 = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'plan-first');
+    expect((r1 as { ok?: boolean }).ok).toBe(true);
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBe('plan-first');
+    // Selecting Auto reverts to the default, stored as ABSENT (not the literal 'auto').
+    await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'auto');
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBeUndefined();
+  });
+
+  it('conversations:set-execution-mode rejects an invalid mode and a missing conversation (R125)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerConversationHandlers(ipc as Parameters<typeof registerConversationHandlers>[0], appHome);
+      },
+    });
+    writeConversation(appHome, makeConversation('c', { executionMode: 'plan-first' }) as never);
+    const bad = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'c', 'garbage');
+    expect((bad as { ok?: boolean }).ok).toBe(false);
+    // The invalid write must not have altered the persisted mode.
+    expect((readConversation(appHome, 'c') as { executionMode?: string })?.executionMode).toBe('plan-first');
+    const missing = await harness.invoke('conversations:set-execution-mode', FAKE_EVENT, 'nope', 'auto');
+    expect((missing as { ok?: boolean }).ok).toBe(false);
   });
 
   it('conversations:put preserves a redactedByHook user turn against a raw same-id rewrite', async () => {
@@ -1170,6 +1248,243 @@ describe('appendConversationMessages', () => {
       appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }], { skipIfBusy: true }),
     ).toBeNull();
     expect(appendConversationMessages(appHome, 'c1', [{ role: 'user', content: 'x' }])).not.toBeNull();
+  });
+});
+
+describe('reparentConversationMessage', () => {
+  const seed = (tree: Array<{ id: string; parentId: string | null; role: string; content: string }>, headId: string) =>
+    writeConversationStore(appHome, {
+      conversations: { c1: makeConversation('c1', { messageTree: tree as never, headId }) as never },
+      activeConversationId: null,
+      settings: {},
+    });
+
+  it('repoints an existing node onto a new parent (sibling reparent), head unchanged', () => {
+    // u1 → a1(prefix) ; u2(injected) also under u1 (sibling of a1). Reparent u2 onto a1.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'a1', parentId: 'u1', role: 'assistant', content: 'prefix' },
+        { id: 'u2', parentId: 'u1', role: 'user', content: 'injected answer' },
+      ],
+      'a1',
+    );
+    const res = reparentConversationMessage(appHome, 'c1', 'u2', 'a1');
+    expect(res).not.toBeNull();
+    const tree = (
+      readConversationStore(appHome).conversations.c1 as { messageTree: Array<{ id: string; parentId: string | null }> }
+    ).messageTree;
+    expect(tree.find((m) => m.id === 'u2')?.parentId).toBe('a1');
+    expect((readConversationStore(appHome).conversations.c1 as { headId: string }).headId).toBe('a1');
+  });
+
+  it('is a no-op when the new parent would create a cycle (newParent descends from node)', () => {
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'u2', parentId: 'u1', role: 'user', content: 'injected' },
+        { id: 'a1', parentId: 'u2', role: 'assistant', content: 'reply' },
+      ],
+      'a1',
+    );
+    reparentConversationMessage(appHome, 'c1', 'u2', 'a1');
+    const tree = (
+      readConversationStore(appHome).conversations.c1 as { messageTree: Array<{ id: string; parentId: string | null }> }
+    ).messageTree;
+    expect(tree.find((m) => m.id === 'u2')?.parentId).toBe('u1'); // unchanged
+  });
+
+  it('returns null for a missing node, missing new parent, or self-parent', () => {
+    seed([{ id: 'u1', parentId: null, role: 'user', content: 'q' }], 'u1');
+    expect(reparentConversationMessage(appHome, 'c1', 'nope', 'u1')).toBeNull();
+    expect(reparentConversationMessage(appHome, 'c1', 'u1', 'nope')).toBeNull();
+    expect(reparentConversationMessage(appHome, 'c1', 'u1', 'u1')).toBeNull();
+  });
+
+  it('chains a multi-inject batch forward so ALL injected users stay on the active branch', () => {
+    // Regression for the batched-inject head bug: prepareStep drained THREE
+    // injects in one step. Only the first has prefix content; the loop must still
+    // thread inj2 under inj1 and inj3 under inj2, advancing the head each time, or
+    // inj2/inj3 dangle off the branch on a reload before continuation output.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'a1', parentId: 'u1', role: 'assistant', content: 'prefix' },
+        // All three injects landed as siblings under the prior head (a1) at enqueue.
+        { id: 'inj1', parentId: 'a1', role: 'user', content: 'first' },
+        { id: 'inj2', parentId: 'a1', role: 'user', content: 'second' },
+        { id: 'inj3', parentId: 'a1', role: 'user', content: 'third' },
+      ],
+      'a1',
+    );
+    // Simulate the broadcastStreamEvent loop's chain: prefixHead = a1 for inj1,
+    // then no intervening content so chainParent walks to the prior injected id.
+    let chainParent: string | null = 'a1';
+    for (const id of ['inj1', 'inj2', 'inj3']) {
+      reparentConversationMessage(appHome, 'c1', id, chainParent, { makeHead: true });
+      chainParent = id;
+    }
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'inj1')?.parentId).toBe('a1');
+    expect(conv.messageTree.find((m) => m.id === 'inj2')?.parentId).toBe('inj1');
+    expect(conv.messageTree.find((m) => m.id === 'inj3')?.parentId).toBe('inj2');
+    expect(conv.headId).toBe('inj3');
+    // The active branch must contain all three injects in order.
+    const ids = conv.messages.map((m) => m.id);
+    expect(ids).toEqual(['u1', 'a1', 'inj1', 'inj2', 'inj3']);
+  });
+});
+
+describe('reorderInjectPrefixOnDisk — GUI terminal-drain prefix-before-user repair', () => {
+  const seed = (tree: Array<{ id: string; parentId: string | null; role: string; content: string }>, headId: string) =>
+    writeConversationStore(appHome, {
+      conversations: { c1: makeConversation('c1', { messageTree: tree as never, headId }) as never },
+      activeConversationId: null,
+      settings: {},
+    });
+
+  it('swaps an assistant mis-parented under the injected user and makes the user the head', () => {
+    // The inject arrived after the final prepareStep; the renderer parented the
+    // turn's assistant UNDER the injected user (u1 → inject → assistant, head=assistant).
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+        { id: 'asst', parentId: 'inject', role: 'assistant', content: 'reply' },
+      ],
+      'asst',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['inject']);
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'asst')?.parentId).toBe('u1');
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst');
+    expect(conv.headId).toBe('inject');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst', 'inject']);
+  });
+
+  it('is a no-op (returns current head) when the injected user has no assistant child', () => {
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+      ],
+      'inject',
+    );
+    expect(reorderInjectPrefixOnDisk(appHome, 'c1', ['inject'])).toBe('inject');
+  });
+
+  it('threads a SIBLING fallback assistant onto the branch (main crash-backstop finalize)', () => {
+    // main's fallback finalized the assistant as a SIBLING of the injected user
+    // (both children of the pre-inject head u1): u1 → {asst, inject}, head=asst.
+    // Repair must thread it as u1 → asst → inject so the reply stays on the branch.
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'asst', parentId: 'u1', role: 'assistant', content: 'reply' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+      ],
+      'asst',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['inject']);
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst', 'inject']);
+  });
+
+  it('selects the ACTIVE variant when a fallback left two assistants under the injected user', () => {
+    // A transient model-fallback left both a failed partial (asst-failed) and the
+    // successful reply (asst-ok) under the injected user; head = asst-ok (active).
+    // BOTH were produced BEFORE the model saw the inject, so BOTH move back onto the
+    // pre-inject head (u1) as siblings; only the ACTIVE one gets the injected user
+    // attached: u1 → {asst-failed, asst-ok}, asst-ok → inject. (Leaving asst-failed
+    // under inject would group a stale pre-inject reply with the post-inject
+    // continuation in variant selection.)
+    seed(
+      [
+        { id: 'u1', parentId: null, role: 'user', content: 'q' },
+        { id: 'inject', parentId: 'u1', role: 'user', content: 'follow-up' },
+        { id: 'asst-failed', parentId: 'inject', role: 'assistant', content: 'partial' },
+        { id: 'asst-ok', parentId: 'inject', role: 'assistant', content: 'reply' },
+      ],
+      'asst-ok',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['inject']);
+    expect(head).toBe('inject');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'asst-ok')?.parentId).toBe('u1');
+    // The failed variant is ALSO moved back to the pre-inject head (a sibling of the
+    // active one), NOT left dangling under the injected user.
+    expect(conv.messageTree.find((m) => m.id === 'asst-failed')?.parentId).toBe('u1');
+    expect(conv.messageTree.find((m) => m.id === 'inject')?.parentId).toBe('asst-ok');
+    expect(conv.messages.map((m) => m.id)).toEqual(['u1', 'asst-ok', 'inject']);
+  });
+
+  it('moves the prefix before the whole chain for a MULTI-inject batch', () => {
+    // Renderer parented the assistant under the LAST injected user (u2):
+    // pre → u1 → u2 → asst (head=asst). Repair → pre → asst → u1 → u2 (head=u2).
+    seed(
+      [
+        { id: 'pre', parentId: null, role: 'user', content: 'q' },
+        { id: 'u1', parentId: 'pre', role: 'user', content: 'first' },
+        { id: 'u2', parentId: 'u1', role: 'user', content: 'second' },
+        { id: 'asst', parentId: 'u2', role: 'assistant', content: 'reply' },
+      ],
+      'asst',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['u1', 'u2']);
+    expect(head).toBe('u2');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'asst')?.parentId).toBe('pre');
+    expect(conv.messageTree.find((m) => m.id === 'u1')?.parentId).toBe('asst');
+    expect(conv.messageTree.find((m) => m.id === 'u2')?.parentId).toBe('u1');
+    expect(conv.messages.map((m) => m.id)).toEqual(['pre', 'asst', 'u1', 'u2']);
+  });
+
+  it('rechains ALL injected users for the INTERLEAVED batch shape pre → u1 → prefix → u2 (R102)', () => {
+    // The prefix landed under u1 and u2 under the prefix. Reparenting only the FIRST
+    // injected user would leave u2 under the prefix → u1 becomes an inactive sibling
+    // and drops off the active branch on disk. Repair → pre → prefix → u1 → u2.
+    seed(
+      [
+        { id: 'pre', parentId: null, role: 'user', content: 'q' },
+        { id: 'u1', parentId: 'pre', role: 'user', content: 'first' },
+        { id: 'prefix', parentId: 'u1', role: 'assistant', content: 'reply' },
+        { id: 'u2', parentId: 'prefix', role: 'user', content: 'second' },
+      ],
+      'u2',
+    );
+    const head = reorderInjectPrefixOnDisk(appHome, 'c1', ['u1', 'u2']);
+    expect(head).toBe('u2');
+    const conv = readConversationStore(appHome).conversations.c1 as {
+      messageTree: Array<{ id: string; parentId: string | null }>;
+      headId: string;
+      messages: Array<{ id: string }>;
+    };
+    expect(conv.messageTree.find((m) => m.id === 'prefix')?.parentId).toBe('pre');
+    expect(conv.messageTree.find((m) => m.id === 'u1')?.parentId).toBe('prefix');
+    expect(conv.messageTree.find((m) => m.id === 'u2')?.parentId).toBe('u1');
+    // Both injected users are on the active branch from the head.
+    expect(conv.messages.map((m) => m.id)).toEqual(['pre', 'prefix', 'u1', 'u2']);
   });
 });
 

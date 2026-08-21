@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import {
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+  constants as fsConstants,
+} from 'node:fs';
 import { join } from 'node:path';
 import { clipboard, safeStorage, systemPreferences } from 'electron';
 import type { BrowserCredentialSummary } from '../../shared/browser.js';
@@ -29,6 +37,40 @@ function safeScopeKey(value: string): string {
 
 function isMissingFile(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
+/**
+ * Read a credential-vault file's bytes via a SINGLE descriptor, closing the TOCTOU window (R183):
+ * a plain lstat-then-read(path) can be defeated by swapping the path for a symlink/FIFO — or enlarging
+ * the file — between the check and the open. Open O_NOFOLLOW (no link-follow) + O_NONBLOCK (a FIFO can't
+ * hang openSync), then fstat the actual fd for type (regular file) and size before reading from that same
+ * fd. Throws on ENOENT (mapped to 0 by callers), non-regular file, or over-cap size. Shared by every
+ * vault reader so the sync and async paths cannot diverge.
+ */
+function readCredentialVaultBytes(filePath: string): Buffer {
+  const fd = openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new Error('Credential vault is not a regular file.');
+    }
+    if (!Number.isSafeInteger(st.size) || st.size < 0 || st.size > MAX_CREDENTIAL_VAULT_BYTES) {
+      throw new Error('Credential vault exceeds its size limit.');
+    }
+    // Read at most the VALIDATED size (R184): readFileSync(fd) would read the file's CURRENT length, so
+    // a file enlarged between fstat and read could allocate past the cap before the post-read check.
+    // Allocate a buffer of the fstat'd size and read exactly that many bytes.
+    const contents = Buffer.allocUnsafe(st.size);
+    let off = 0;
+    while (off < st.size) {
+      const n = readSync(fd, contents, off, st.size - off, off);
+      if (n === 0) break; // truncated after fstat
+      off += n;
+    }
+    return off === st.size ? contents : contents.subarray(0, off);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Electron reports encryption as "available" on Linux even when it falls back
@@ -129,11 +171,10 @@ export class BrowserCredentialVault {
 
   private load(): StoredCredential[] {
     try {
-      const fileSize = statSync(this.filePath).size;
-      if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
-        throw new Error('Credential vault exceeds its size limit.');
-      }
-      return storedCredentialsFromJson(readFileSync(this.filePath, 'utf8'), this.scopeKey);
+      // Read via a single descriptor (R180/R183): open O_NOFOLLOW + O_NONBLOCK, then fstat the fd for
+      // type + size before reading — a symlink/FIFO/device is rejected without following or blocking,
+      // and the check/read share one fd so the path can't be swapped or enlarged between them.
+      return storedCredentialsFromJson(readCredentialVaultBytes(this.filePath).toString('utf8'), this.scopeKey);
     } catch (error) {
       if (isMissingFile(error)) return [];
       // Never turn an unreadable/corrupt vault into an apparently empty,
@@ -382,15 +423,9 @@ export function readStoredCredentialCount(appHome: string, scopeKey: string): nu
   scopeKey = safeScopeKey(scopeKey);
   const filePath = join(appHome, 'browser', 'credentials', `${scopeKey}.json`);
   try {
-    const fileSize = statSync(filePath).size;
-    if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
-      throw new Error('Credential vault exceeds its size limit.');
-    }
-    const contents = readFileSync(filePath);
-    if (contents.byteLength > MAX_CREDENTIAL_VAULT_BYTES) {
-      throw new Error('Credential vault exceeds its size limit.');
-    }
-    return storedCredentialsFromJson(contents.toString('utf8'), scopeKey).length;
+    // Single-descriptor read (R180/R183): open+fstat+read share one fd — reject a symlink/FIFO/device
+    // and enforce the size cap on the actual descriptor, with no lstat→read TOCTOU window.
+    return storedCredentialsFromJson(readCredentialVaultBytes(filePath).toString('utf8'), scopeKey).length;
   } catch (error) {
     if (isMissingFile(error)) return 0;
     throw error;
@@ -404,15 +439,11 @@ export async function readStoredCredentialCountAsync(appHome: string, scopeKey: 
   scopeKey = safeScopeKey(scopeKey);
   const filePath = join(appHome, 'browser', 'credentials', `${scopeKey}.json`);
   try {
-    const fileSize = (await stat(filePath)).size;
-    if (!Number.isSafeInteger(fileSize) || fileSize < 0 || fileSize > MAX_CREDENTIAL_VAULT_BYTES) {
-      throw new Error('Credential vault exceeds its size limit.');
-    }
-    const contents = await readFile(filePath);
-    if (contents.byteLength > MAX_CREDENTIAL_VAULT_BYTES) {
-      throw new Error('Credential vault exceeds its size limit.');
-    }
-    return storedCredentialsFromJson(contents.toString('utf8'), scopeKey).length;
+    // Single-descriptor read (R181/R183): the async lstat→readFile(path) had a TOCTOU window (swap to a
+    // FIFO/symlink or enlarge the file between check and read → hang / oversized alloc). Bind validation
+    // and read to ONE fd via the shared helper. The open is O_NONBLOCK + fstat-gated, so it neither
+    // follows a link nor blocks main on a FIFO — safe to run on the main thread despite being sync I/O.
+    return storedCredentialsFromJson(readCredentialVaultBytes(filePath).toString('utf8'), scopeKey).length;
   } catch (error) {
     if (isMissingFile(error)) return 0;
     throw error;

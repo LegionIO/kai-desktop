@@ -2222,8 +2222,33 @@ export class BrowserManager {
     }
   }
 
+  /** True ONLY when the conversation is DEFINITIVELY absent (deleted) — NOT on a transient read
+   *  failure (R178/R179). Callers that would permanently FENCE a conversation must use this instead
+   *  of `!isConversationAvailable`, or a transient EMFILE/EACCES would fence a still-live conversation
+   *  until restart. `conversationExists` returns false only on 'absent' and THROWS on 'unknown'. */
+  private isConversationDefinitivelyAbsent(conversationId: string): boolean {
+    try {
+      return !this.conversationExists(conversationId);
+    } catch {
+      return false; // transient/unknown → NOT definitively absent; don't fence
+    }
+  }
+
   private assertConversationAvailable(conversationId: string): void {
-    if (this.isConversationAvailable(conversationId)) return;
+    if (this.removedConversations.has(conversationId)) {
+      throw new Error('Browser data is unavailable because this conversation was deleted or no longer exists.');
+    }
+    let exists: boolean;
+    try {
+      exists = this.conversationExists(conversationId);
+    } catch {
+      // TRANSIENT read failure (EMFILE/EACCES / existence unknown): deny access THIS time but do NOT
+      // fence — fencing permanently blocks a still-live conversation's Browser access until restart
+      // (R178). A later successful check re-enables it.
+      throw new Error('Browser data is temporarily unavailable (conversation record could not be read).');
+    }
+    if (exists) return;
+    // Definitively absent → the conversation was deleted; fence it permanently.
     this.fenceRemovedConversation(conversationId);
     throw new Error('Browser data is unavailable because this conversation was deleted or no longer exists.');
   }
@@ -7376,7 +7401,11 @@ export class BrowserManager {
     // A tabs-changed(empty) event emitted during conversation deletion can
     // re-run the BrowserPanel mount effect before React switches chats. Keep a
     // durable in-process fence so that stale effect cannot auto-create a tab.
-    if (!this.isConversationAvailable(conversationId)) {
+    // Fence ONLY on a DEFINITIVE absence (R179): a transient read failure must not permanently fence
+    // a still-live conversation. A not-yet-fenced, present-or-unknown conversation falls through and
+    // its actual availability is enforced downstream (assertConversationAvailable) where a transient
+    // failure yields a temporary error rather than a permanent fence.
+    if (this.removedConversations.has(conversationId) || this.isConversationDefinitivelyAbsent(conversationId)) {
       this.fenceRemovedConversation(conversationId);
       if (this.mountedConversationId === conversationId) {
         this.mountedConversationId = null;
@@ -14963,6 +14992,14 @@ export class BrowserManager {
       // readable again. Do not leave every profile process-wide quarantined
       // merely because an earlier Settings refresh observed a transient error.
       this.pendingCleanupQuarantineUnreadable = false;
+      // Re-quarantine the discovered pending-cleanup scopes (R179): clearing the process-wide
+      // unreadable flag WITHOUT re-adding the specific pending scopes to the restricted/quarantined
+      // sets would expose residual history/bookmarks/credential metadata from a not-yet-completed
+      // clear until cleanup succeeds. Mirror refreshPendingCleanupQuarantine.
+      for (const pendingScopeKey of pendingCleanupScopeKeys) {
+        this.restrictedBackgroundScopes.add(pendingScopeKey);
+        this.clearQuarantinedScopes.add(pendingScopeKey);
+      }
     } catch {
       pendingCleanupRecoveryRequired = true;
       this.pendingCleanupQuarantineUnreadable = true;

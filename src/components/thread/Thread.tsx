@@ -50,6 +50,11 @@ import {
 import { app } from '@/lib/ipc-client';
 import { cn, refocusComposer } from '@/lib/utils';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 import { useAttachments } from '@/providers/AttachmentContext';
 import {
   useBranchNav,
@@ -1810,14 +1815,48 @@ const Composer: FC<{
   onToggleFallback,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments, removeAttachment } = useAttachments();
+  const { attachments, addAttachments, removeAttachment, getAttachmentCount } = useAttachments();
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
   const { sessionsByConversation, startSession, continueSession, sendGuidance } = useComputerUse();
   const activeConversationId = useActiveConversationId();
-  const { sendMidTurn } = useMidTurnComposer();
+  const { sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } = useMidTurnComposer();
   const [composerText, setComposerText] = useState(() => composerRuntime.getState().text ?? '');
+  // Transient composer status notice (packaged users have no DevTools, so a console.warn is
+  // invisible and an action can look like a no-op). Used for a mid-turn send BLOCKED by a policy
+  // hook, and for attachment files the main process SKIPPED (too large / not a regular file) (R182).
+  const [midTurnBlockNotice, setMidTurnBlockNotice] = useState<string | null>(null);
+  const midTurnBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showComposerNotice = useCallback((message: string) => {
+    if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
+    setMidTurnBlockNotice(message);
+    midTurnBlockTimerRef.current = setTimeout(() => setMidTurnBlockNotice(null), 6000);
+  }, []);
+  const showMidTurnBlock = useCallback(
+    (reason?: string) => {
+      showComposerNotice(reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.');
+    },
+    [showComposerNotice],
+  );
+  useEffect(() => {
+    return () => {
+      if (midTurnBlockTimerRef.current) clearTimeout(midTurnBlockTimerRef.current);
+    };
+  }, []);
+  // Clear a lingering mid-turn block notice when the user switches conversations:
+  // Thread stays mounted across a chat switch, and the notice is scoped to the
+  // chat it was raised in — showing the originating chat's policy error in a
+  // newly-selected chat would misattribute it (a pending gate can also resolve
+  // AFTER the switch). Reset the notice + its timer on every activeConversationId
+  // change so it only ever displays in the chat that produced it.
+  useEffect(() => {
+    if (midTurnBlockTimerRef.current) {
+      clearTimeout(midTurnBlockTimerRef.current);
+      midTurnBlockTimerRef.current = null;
+    }
+    setMidTurnBlockNotice(null);
+  }, [activeConversationId]);
 
   // Compose-while-running: send the current composer text into the live turn (the
   // Send button rendered while running). Cooperatively spliced on Mastra; falls
@@ -1831,14 +1870,50 @@ const Composer: FC<{
     }
     composerRuntime.setText('');
     setComposerText('');
-    void sendMidTurn(t).then((injected) => {
-      if (!injected) {
+    void sendMidTurn(t).then(({ status, reason, originConversationId }) => {
+      if (status === 'injected') return;
+      // If the user switched chats or typed a new draft during the async gate,
+      // STASH the text for the ORIGINATING conversation rather than dropping it.
+      const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
+      const current = composerRuntime.getState().text ?? '';
+      // A LIVE attachment added during the async gate also blocks the resubmit:
+      // composerRuntime.send() consumes ALL current attachments, so a fallback
+      // resend of the OLD text would ship a file added for a different message.
+      const hasLiveAttachment = getAttachmentCount() > 0;
+      if (!stillHere || current.trim().length > 0 || hasLiveAttachment) {
+        if (originConversationId) stashRejectedDraft(originConversationId, t);
+        // Only surface the block notice when we're STILL in the originating chat —
+        // showing it after a switch would misattribute the origin chat's policy
+        // error to the newly-selected chat (the notice state is Thread-scoped).
+        if (status === 'blocked' && stillHere) showMidTurnBlock(reason);
+        return;
+      }
+      if (status === 'fallback') {
+        // Force a NORMAL superseding send — mark the origin conv so onNew does NOT
+        // re-enter cooperative injection (re-running hooks / splicing onto the stale
+        // transcript after a branch change).
+        const target = originConversationId ?? getActiveConversationId();
+        if (target) markForceNormalSend(target);
         composerRuntime.setText(t);
         composerRuntime.send();
         composerRuntime.setText('');
+      } else if (status === 'blocked') {
+        composerRuntime.setText(t);
+        setComposerText(t);
+        showMidTurnBlock(reason);
       }
     });
-  }, [attachments.length, composerRuntime, composerText, sendMidTurn]);
+  }, [
+    attachments.length,
+    composerRuntime,
+    composerText,
+    sendMidTurn,
+    getActiveConversationId,
+    getAttachmentCount,
+    stashRejectedDraft,
+    showMidTurnBlock,
+    markForceNormalSend,
+  ]);
 
   // Computer-use inline toggle state
   const computerUseEnabled = (config as Record<string, unknown> | null)?.computerUse
@@ -1927,19 +2002,49 @@ const Composer: FC<{
       return;
     }
     try {
+      const originConversationId = getActiveConversationId();
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
         files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+        skipped?: string[];
       };
-      if (!result.canceled && result.files) addAttachments(result.files);
+      if (result.canceled) return;
+      // Discard if the user switched conversations while the native dialog was open (R186) — the
+      // attachment store is app-global, so adding here would attach to the wrong chat.
+      if (getActiveConversationId() !== originConversationId) return;
+      // Merge files skipped by MAIN (too large / not a regular file) with any rejected by the renderer
+      // aggregate backstop, and surface the combined list so the action is never a silent no-op.
+      const skippedNames = [...(result.skipped ?? [])];
+      if (result.files && result.files.length > 0) {
+        const { skipped: overCap } = addAttachments(result.files);
+        skippedNames.push(...overCap);
+      }
+      if (skippedNames.length > 0) {
+        showComposerNotice(skippedAttachmentsNotice(skippedNames) ?? '');
+      }
     } catch (err) {
       console.error('Attach failed:', err);
     }
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
+    const fileList = event.target.files;
+    if (!fileList || fileList.length === 0) return;
+    // Capture the conversation the read was initiated for (R186): the attachment store is app-global,
+    // so if the user switches chats before these async reads resolve, adding the files would attach
+    // Chat A's files to the now-displayed Chat B (unintended disclosure). Drop the result if the active
+    // conversation has changed by the time it resolves.
+    const originConversationId = getActiveConversationId();
+    // Gate by size BEFORE reading (R183): FileReader materializes each file fully, concurrently, so an
+    // oversized or bulk selection would OOM the renderer if we read first. Reject over-cap files up front.
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(Array.from(fileList));
+    if (skipped.length > 0) showComposerNotice(skippedAttachmentsNotice(skipped) ?? '');
+    // Reset early so the same file can be re-selected even if nothing is accepted.
+    event.target.value = '';
+    if (accepted.length === 0) {
+      releaseAttachmentReservation(reservedBytes);
+      return;
+    }
     const readers: Promise<{
       name: string;
       mime: string;
@@ -1947,18 +2052,23 @@ const Composer: FC<{
       size: number;
       dataUrl: string;
       text?: string;
-    }>[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    } | null>[] = [];
+    for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
+          // Resolve null on read error/abort (R185) so one unreadable file can't leave Promise.all
+          // pending forever and swallow the successfully-read files.
+          reader.onerror = () => resolve(null);
+          reader.onabort = () => resolve(null);
           reader.onload = () => {
             const dataUrl = reader.result as string;
             const isImage = file.type.startsWith('image/');
             const isText = file.type.startsWith('text/') || file.type === 'application/json';
             if (isText) {
               const textReader = new FileReader();
+              textReader.onerror = () => resolve(null);
+              textReader.onabort = () => resolve(null);
               textReader.onload = () =>
                 resolve({
                   name: file.name,
@@ -1983,9 +2093,18 @@ const Composer: FC<{
         }),
       );
     }
-    void Promise.all(readers).then((results) => addAttachments(results));
-    // Reset so the same file can be re-selected
-    event.target.value = '';
+    void Promise.all(readers).then((results) => {
+      releaseAttachmentReservation(reservedBytes);
+      // Discard if the user switched conversations while the reads were in flight (R186).
+      if (getActiveConversationId() !== originConversationId) return;
+      const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+      const unreadable = accepted.length - attachable.length;
+      if (attachable.length > 0) {
+        const { skipped: overCap } = addAttachments(attachable);
+        if (overCap.length > 0) showComposerNotice(skippedAttachmentsNotice(overCap) ?? '');
+      }
+      if (unreadable > 0) showComposerNotice(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+    });
   };
 
   const handleAttachDirectory = async () => {
@@ -2170,6 +2289,11 @@ const Composer: FC<{
           ) : null
         ) : (
           <ComposerPrimitive.Root className="flex flex-col gap-0 rounded-2xl border border-border/70 app-composer-glass px-3 py-3 app-composer-shadow">
+            {midTurnBlockNotice && (
+              <div className="px-1 pb-2 text-xs text-amber-600 dark:text-amber-400" role="status" aria-live="polite">
+                {midTurnBlockNotice}
+              </div>
+            )}
             {mode === 'computer' ? (
               <>
                 <ComputerSetupPanel

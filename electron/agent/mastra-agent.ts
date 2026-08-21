@@ -16,6 +16,7 @@ import { homedir } from 'os';
 import { isAbsolute, resolve as resolvePath } from 'path';
 import type { AppConfig } from '../config/schema.js';
 import type { LLMModelConfig, ResolvedStreamConfig, ModelCatalogEntry, ReasoningEffort } from './model-catalog.js';
+import { toolsForExecutionMode } from './plan-mode-tools.js';
 import { createLanguageModelFromConfig, shouldUseOpenAIResponsesApi } from './language-model.js';
 import { getSharedMemory, getResourceId } from './memory.js';
 import type { ToolDefinition, ToolExecutionContext, ToolProgressEvent } from '../tools/types.js';
@@ -279,7 +280,7 @@ function toMastraTools(
   } & ToolLifecycleHooks,
   executionContext?: Pick<
     ToolExecutionContext,
-    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'browserOwnerId'
+    'cwd' | 'isHeadless' | 'parentProfileKey' | 'parentModelKey' | 'planModeGateable' | 'browserOwnerId'
   >,
 ): Record<string, ReturnType<typeof createTool>> {
   // Null-prototype map: tool names can originate from skills / MCP servers, so a
@@ -336,6 +337,12 @@ function toMastraTools(
             isHeadless: executionContext?.isHeadless,
             parentProfileKey: executionContext?.parentProfileKey,
             parentModelKey: executionContext?.parentModelKey,
+            // Plan-mode is gateable only for the INTERACTIVE streamHandler run (threaded
+            // explicitly via executionContext.planModeGateable). NOT keyed on the presence of
+            // onToolExecutionStart — a sub-agent/observer/task also passes that hook (for
+            // arg-charging/PreToolUse) but can't gate/restart plan mode, so the plan tools must
+            // still self-guard-refuse there (R141 fix).
+            planModeGateable: executionContext?.planModeGateable,
             abortSignal: mergedAbortSignal,
             onProgress: (progress: ToolProgressEvent) => {
               hooks?.emitEvent?.({
@@ -658,8 +665,15 @@ function buildProviderDefinedTools(modelConfig: LLMModelConfig): Record<string, 
  * Tool names that execute inside the provider (server-side web_search etc.) and
  * therefore never flow through our onToolExecutionStart wrapper. Callers use
  * this to skip UI arg-suppression for these tools (they'd never un-suppress).
+ *
+ * PLAN-FIRST returns EMPTY (R154 f-1): provider-defined tools are DROPPED from the tool set in
+ * plan-first, so their names must NOT be reported as provider-defined — otherwise a surviving
+ * KAI built-in of the same name (e.g. the built-in `web_search` when a provider `web_search` was
+ * configured) would be mis-classified as provider-defined and SKIP arg-suppression, broadcasting
+ * raw args before the enforcing PreToolUse hook redacts/blocks them.
  */
-export function getProviderDefinedToolNames(modelConfig: LLMModelConfig): Set<string> {
+export function getProviderDefinedToolNames(modelConfig: LLMModelConfig, executionMode?: string): Set<string> {
+  if (executionMode === 'plan-first') return new Set();
   return new Set(Object.keys(buildProviderDefinedTools(modelConfig)));
 }
 
@@ -1225,6 +1239,12 @@ export async function* streamAgentResponse(
     browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
+    /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
+     *  onToolExecutionStart approves exit_plan_mode + it restarts on enter_plan_mode). Threaded
+     *  to the tool ctx as planModeGateable so the plan tools self-guard everywhere else — a
+     *  sub-agent / observer / task also passes onToolExecutionStart (for arg-charging/PreToolUse)
+     *  but is NOT plan-gateable, so the hook's mere presence is NOT a valid proxy (R141 fix). */
+    planModeGateable?: boolean;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const msgArray = messages as Array<{ role?: string; content?: unknown }>;
@@ -1271,10 +1291,16 @@ export async function* streamAgentResponse(
     },
   );
 
-  // Wrap custom (non-workspace) tools through the bridge
+  // Wrap custom (non-workspace) tools through the bridge. FIRST filter them by executionMode
+  // (R141 finding-2): the workspace-tool filter above only drops mutating WORKSPACE tools, but
+  // under plan-first the CALLER's registered tools (MCP/skill/plugin/custom) must be read-only
+  // too — otherwise a task agent / sub-agent / observer / automation running under a
+  // (globally) plan-first config could invoke a mutating MCP/plugin tool. This is the single
+  // shared chokepoint every Mastra caller passes through, so it covers them all by construction.
+  const planFilteredTools = executionMode === 'plan-first' ? toolsForExecutionMode(tools, 'plan-first') : tools;
   const mastraCustomTools = toMastraTools(
     conversationId,
-    tools,
+    planFilteredTools,
     {
       emitEvent: options?.emitEvent,
       onToolExecutionStart: options?.onToolExecutionStart,
@@ -1286,10 +1312,17 @@ export async function* streamAgentResponse(
       isHeadless: options?.isHeadless,
       parentProfileKey: options?.parentProfileKey,
       parentModelKey: options?.parentModelKey,
+      planModeGateable: options?.planModeGateable,
       browserOwnerId: options?.browserOwnerId,
     },
   );
-  const providerDefinedTools = buildProviderDefinedTools(modelConfig);
+  // Provider-DEFINED tools (server-side web_search / code_interpreter / bash / computer, from
+  // modelConfig.providerTools) execute INSIDE the provider — they never flow through Kai's tool
+  // wrapper, can't be gated, and a config-controlled name could even collide with a built-in.
+  // In PLAN-FIRST they must be dropped entirely (R153 f-3): Kai can't guarantee a provider tool
+  // is read-only (code_interpreter/bash mutate), and it bypasses the allowlist/provenance filter
+  // applied to custom tools above. A plan-first turn keeps only Kai's own read-only tools.
+  const providerDefinedTools = executionMode === 'plan-first' ? {} : buildProviderDefinedTools(modelConfig);
 
   // Merge: workspace tools (native Mastra) + custom tools (bridged)
   const allTools = { ...mastraCustomTools, ...providerDefinedTools, ...workspaceTools };
@@ -2099,6 +2132,12 @@ export async function* streamWithFallback(
     browserOwnerId?: string;
     responseMessageId?: string;
     emitEvent?: (event: StreamEvent) => void;
+    /** True ONLY for the interactive streamHandler run that can gate/enforce plan mode (its
+     *  onToolExecutionStart approves exit_plan_mode + it restarts on enter_plan_mode). Threaded
+     *  to the tool ctx as planModeGateable so the plan tools self-guard everywhere else — a
+     *  sub-agent / observer / task also passes onToolExecutionStart (for arg-charging/PreToolUse)
+     *  but is NOT plan-gateable, so the hook's mere presence is NOT a valid proxy (R141 fix). */
+    planModeGateable?: boolean;
   } & ToolLifecycleHooks,
 ): AsyncGenerator<StreamEvent> {
   const modelChain: ModelCatalogEntry[] = [

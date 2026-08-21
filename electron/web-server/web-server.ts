@@ -284,6 +284,19 @@ const MIME_TYPES: Record<string, string> = {
 /** Base directory where generated media files are stored. */
 const MEDIA_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'media');
 
+/** decodeURIComponent that returns null instead of THROWING on a malformed percent-escape (R170 f-7):
+ *  a bare `%` or `%zz` in a request path throws URIError, which — if uncaught in the request handler —
+ *  escapes to the global exception handler (log only) and STRANDS the response socket, so repeated
+ *  `/media/%` / `/plugin-renderer/%` requests exhaust file descriptors (unauthenticated DoS in
+ *  anonymous mode). Callers return 400 on null. */
+function safeDecodeURIComponent(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
+}
+
 /** Base directory where compiled plugin renderer bundles are cached. */
 const PLUGINS_DIR = join(homedir(), '.' + __BRAND_APP_SLUG, 'plugins');
 
@@ -402,13 +415,13 @@ export function getBridgeScript(): string {
       inFlight: function(cId) { return invoke('agent:in-flight', cId); },
       authorizeContinuation: function(cId, clientId, turnToken) { return invoke('agent:authorize-continuation', cId, clientId, turnToken); },
       finalizeGuiFallback: function(cId, turnToken) { return invoke('agent:finalize-gui-fallback', cId, turnToken); },
-      injectMidTurn: function(cId, text) { return invoke('agent:inject-mid-turn', cId, text); },
+      injectMidTurn: function(cId, text, expectedGeneration) { return invoke('agent:inject-mid-turn', cId, text, expectedGeneration); },
       listInjects: function(cId) { return invoke('agent:list-injects', cId); },
       cancelInject: function(cId, id) { return invoke('agent:cancel-inject', cId, id); },
-      approveToolCall: function(id) { return invoke('agent:approve-tool', id); },
-      rejectToolCall: function(id) { return invoke('agent:reject-tool', id); },
-      dismissToolCall: function(id) { return invoke('agent:dismiss-tool', id); },
-      answerToolQuestion: function(id, answers) { return invoke('agent:answer-tool-question', id, answers); },
+      approveToolCall: function(id, conversationId) { return invoke('agent:approve-tool', id, conversationId); },
+      rejectToolCall: function(id, conversationId) { return invoke('agent:reject-tool', id, conversationId); },
+      dismissToolCall: function(id, conversationId) { return invoke('agent:dismiss-tool', id, conversationId); },
+      answerToolQuestion: function(id, answers, conversationId) { return invoke('agent:answer-tool-question', id, answers, conversationId); },
       generateTitle: function(msgs, mk, hint) { return invoke('agent:generate-title', msgs, mk, hint); },
       onStreamEvent: function(cb) { return on('agent:stream-event', cb); },
       sendSubAgentMessage: function(cId, msg) { return invoke('agent:sub-agent-message', cId, msg); },
@@ -431,6 +444,7 @@ export function getBridgeScript(): string {
       export: function(id, fmt) { return invoke('conversations:export', id, fmt); },
       compact: function(id) { return invoke('conversations:compact', id, { __timeoutMs: 300000 }); },
       setPendingDrafts: function(id, delta) { return invoke('conversations:set-pending-drafts', id, delta); },
+      setExecutionMode: function(id, mode) { return invoke('conversations:set-execution-mode', id, mode); },
       claimPendingDraft: function(id, draftId, clientId) { return invoke('conversations:claim-pending-draft', id, draftId, clientId); },
       ackPendingDraft: function(id, draftId, restored, clientId) { return invoke('conversations:ack-pending-draft', id, draftId, restored, clientId); },
       compactingIds: function() { return invoke('conversations:compacting-ids'); },
@@ -671,8 +685,8 @@ export function getBridgeScript(): string {
       terminalGetBuffer: function(sessionId) { return invoke('tasks:terminal-get-buffer', sessionId); },
       onTerminalData: function(cb) { return on('tasks:terminal-data', cb); },
       onTerminalExit: function(cb) { return on('tasks:terminal-exit', cb); },
-      streamPlan: function(taskId, userMessage, history) { return invoke('tasks:stream-plan', taskId, userMessage, history); },
-      cancelPlanStream: function(taskId) { return invoke('tasks:cancel-stream', taskId); },
+      streamPlan: function(taskId, userMessage, history, attachments, streamId) { return invoke('tasks:stream-plan', taskId, userMessage, history, attachments, streamId); },
+      cancelPlanStream: function(taskId, streamId) { return invoke('tasks:cancel-stream', taskId, streamId); },
       generateTitle: function(userMessage) { return invoke('tasks:generate-title', userMessage); },
       onStreamEvent: function(cb) { return on('tasks:stream-event', cb); }
     },
@@ -1051,7 +1065,12 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
 
     // --- Serve generated media files (images, videos, audio) ---
     if (urlPath.startsWith('/media/')) {
-      const relativePath = decodeURIComponent(urlPath.slice('/media/'.length));
+      const relativePath = safeDecodeURIComponent(urlPath.slice('/media/'.length));
+      if (relativePath === null) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+        return;
+      }
       const filePath = join(MEDIA_DIR, relativePath);
 
       // Security: ensure the resolved path is under the media directory
@@ -1139,7 +1158,19 @@ export async function startWebServer(config: WebServerConfig): Promise<void> {
     // --- Serve plugin frontend files directly from plugin directory ---
     if (urlPath.startsWith('/plugin-renderer/')) {
       // URL format: /plugin-renderer/<pluginName>/<assetPath>
-      const segments = urlPath.slice('/plugin-renderer/'.length).split('/').map(decodeURIComponent);
+      const rawSegments = urlPath.slice('/plugin-renderer/'.length).split('/');
+      const decodedSegments: string[] = [];
+      for (const seg of rawSegments) {
+        const dec = safeDecodeURIComponent(seg);
+        if (dec === null) {
+          // Malformed percent-escape — return 400 rather than throwing + stranding the socket (R170 f-7).
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Bad Request');
+          return;
+        }
+        decodedSegments.push(dec);
+      }
+      const segments = decodedSegments;
       const [pluginName, ...assetParts] = segments;
       const assetPath = assetParts.join('/');
 

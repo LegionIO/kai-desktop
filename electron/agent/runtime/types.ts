@@ -257,5 +257,22 @@ export const RUNTIME_LABELS: Record<RuntimeId, string> = {
  * external runtime can call the same tools the native Mastra agent can.
  *
  * `sub_agent`: both SDKs have a native sub-agent/Agent primitive.
+ *
+ * `enter_plan_mode` / `exit_plan_mode`: the interactive plan-mode flow (approval gate +
+ * plan-first restart) is only enforceable by the native Mastra streamHandler / the Claude SDK
+ * handler. The Pi/Codex/OpenCode bridges call tool.execute directly with no gate, so don't even
+ * offer them (the tools also self-guard on planModeGateable as a backstop — R141 f-1).
+ *
+ * `ask_user`: same reason (R179). Its interactive flow — register a pending approval, BROADCAST the
+ * question UI, await the user's answer, stash it for execute() — is driven ONLY by the Mastra
+ * streamHandler gate / the Claude SDK handler. A Pi/Codex bridge calls tool.execute directly with no
+ * gate, so execute finds no stashed answer and returns ASK_USER_NO_ANSWER_ERROR with NO question UI
+ * ever shown. Skipping it here means those runtimes simply don't offer ask_user (matching how they
+ * lack the plan-mode tools), rather than offering a broken one that always fails.
  */
-export const RUNTIME_BRIDGE_SKIP_TOOLS = new Set<string>(['sub_agent']);
+export const RUNTIME_BRIDGE_SKIP_TOOLS = new Set<string>([
+  'sub_agent',
+  'enter_plan_mode',
+  'exit_plan_mode',
+  'ask_user',
+]);

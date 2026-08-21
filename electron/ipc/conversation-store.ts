@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
@@ -155,6 +155,15 @@ function conversationsDir(appHome: string): string {
 function conversationPath(appHome: string, id: string): string {
   return join(conversationsDir(appHome), `${sanitizeId(id)}.json`);
 }
+// A conversation id is a UUID (~36 chars); anything wildly longer is malformed/abusive. The
+// delete/tombstone/index-ring structures are keyed by id, and delete is reachable from the web
+// bridge — a near-4-MiB "id" would otherwise be stored in the durable deletedIds ring + index.json
+// and forced through synchronous rewrites (memory/disk DoS, R178). Reject a non-string or over-long
+// id at the delete chokepoint.
+const MAX_CONVERSATION_ID_LENGTH = 256;
+function isPlausibleConversationId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_CONVERSATION_ID_LENGTH;
+}
 function indexPath(appHome: string): string {
   return join(appHome, 'data', 'index.json');
 }
@@ -301,9 +310,88 @@ export function readIndex(appHome: string): ConversationIndex {
     // Corrupt/truncated index — the per-file conversation records are the source
     // of truth, so rebuild the summaries from them instead of returning empty
     // (which would make every chat vanish from the list). activeConversationId +
-    // settings are best-effort lost, but no message data is.
+    // settings are best-effort lost, but no message data is. PRESERVE the durable
+    // deletedIds ring (R135 f-4): it can't be reconstructed from live files (the deleted
+    // records are gone), so losing it would let a stale put RECREATE a deleted conversation.
+    // Recover it leniently from the corrupt text (a trailing truncation usually leaves the
+    // earlier deletedIds array intact) before rebuilding.
+    const salvagedDeletedIds = salvageDeletedIdsFromCorruptIndex(p);
     const rebuilt = rebuildIndexFromConversationFiles(appHome);
-    return rebuilt ?? { conversations: {}, activeConversationId: null, settings: {} };
+    if (rebuilt) {
+      if (salvagedDeletedIds.length > 0) rebuilt.deletedIds = salvagedDeletedIds;
+      return rebuilt;
+    }
+    return {
+      conversations: {},
+      activeConversationId: null,
+      settings: {},
+      ...(salvagedDeletedIds.length > 0 ? { deletedIds: salvagedDeletedIds } : {}),
+    };
+  }
+}
+
+/** Best-effort recover the `deletedIds` array from a CORRUPT index file's raw text. A
+ *  full JSON.parse already failed (truncation/corruption), but the deletedIds array — a
+ *  flat list of string ids — usually sits intact earlier in the file. Extract it TOLERANTLY
+ *  (R135 f-4 / R136 f-3): do NOT require a closing `]` (truncation INSIDE the array must still
+ *  recover every complete id before the cut), and anchor on the TOP-LEVEL `deletedIds` key
+ *  (`{"deletedIds"` or `,"deletedIds"` at the object root) so a nested conversation field named
+ *  deletedIds can't shadow it. Returns [] when nothing recoverable. */
+function salvageDeletedIdsFromCorruptIndex(indexFilePath: string): string[] {
+  try {
+    const raw = readFileSync(indexFilePath, 'utf-8');
+    // Locate the TOP-LEVEL (object depth 1) "deletedIds" key by a string-aware brace-depth
+    // walk, so a NESTED conversation field of the same name can't shadow it (R136 f-3). Track
+    // depth outside of JSON strings; record the index of a `"deletedIds"` seen at depth 1.
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let keyStart = -1;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') {
+        // A key/string starts here. At depth 1, record it ONLY if it is exactly "deletedIds"
+        // AND is used as a KEY (followed by `:`), so a depth-1 VALUE string "deletedIds" (e.g.
+        // "activeConversationId":"deletedIds") can't overwrite the real key location (R137 f-6).
+        if (depth === 1 && raw.startsWith('"deletedIds"', i)) {
+          let k = i + '"deletedIds"'.length;
+          while (k < raw.length && /\s/.test(raw[k])) k++;
+          if (raw[k] === ':') keyStart = i;
+        }
+        inStr = true;
+        continue;
+      }
+      if (ch === '{' || ch === '[') depth++;
+      else if (ch === '}' || ch === ']') depth--;
+    }
+    if (keyStart === -1) return [];
+    // Verify the value is actually an ARRAY: after the key + `:` + whitespace the next char must
+    // be `[`. Otherwise (`"deletedIds":null`, a number, a truncation right after the key) do NOT
+    // grab a later unrelated `[` (e.g. settings.pendingConversationIds) and mis-salvage its ids
+    // as deleted (R137 f-6). The key literal is 12 chars ("deletedIds" + the 2 quotes).
+    let j = keyStart + '"deletedIds"'.length;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (raw[j] !== ':') return [];
+    j++;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (raw[j] !== '[') return []; // value isn't an array → nothing to salvage from this key
+    const openBracket = j;
+    // Slice to the array's close `]` if present, else to EOF — a truncation mid-array still
+    // yields the complete quoted ids that precede the cut (no closing `]` required).
+    const closeBracket = raw.indexOf(']', openBracket);
+    const end = closeBracket === -1 ? raw.length : closeBracket;
+    const segment = raw.slice(openBracket + 1, end);
+    const ids = segment.match(/"((?:[^"\\]|\\.)*)"/g);
+    if (!ids) return [];
+    return ids.map((s) => s.slice(1, -1)).filter((s) => s.length > 0);
+  } catch {
+    return [];
   }
 }
 
@@ -369,6 +457,88 @@ export function reindexIfStale(appHome: string): number {
 export function writeIndex(appHome: string, index: ConversationIndex): void {
   ensureDirs(appHome);
   atomicWriteFileSync(indexPath(appHome), JSON.stringify(index, null, 2));
+}
+
+/** Startup reconciliation for the delete/clear durable-write-failure gap (R165 f-2). A best-effort
+ *  index write that FAILED after a conversation's file was already removed leaves a GHOST index
+ *  entry (file gone) with NO durable deleted-id — the in-memory tombstone + ghost flag that guarded
+ *  it are process-local and vanish on restart, so the deleted chat would REAPPEAR in the list AND be
+ *  resurrectable by a stale writer. Run ONCE at backend startup: scan every indexed id, and for each
+ *  whose record FILE is definitively gone (ENOENT), drop the entry AND push its id into the DURABLE
+ *  deletedIds ring so it survives as a tombstone. Fail-OPEN per entry (only a definite ENOENT drops
+ *  it — a transient stat error keeps it) so a readable chat is never lost. Returns the number
+ *  reconciled. Cheap enough for startup (one O(N) statSync pass; startup already does a full sweep). */
+export function reconcileGhostIndexEntries(appHome: string): number {
+  if (monolithMigrationPending(appHome)) return 0;
+  let index: ConversationIndex;
+  try {
+    index = readIndex(appHome);
+  } catch {
+    return 0; // a corrupt index is handled by readIndex's own rebuild path
+  }
+  const ghostIds: string[] = [];
+  for (const id of Object.keys(index.conversations)) {
+    let missing = false;
+    try {
+      statSync(conversationPath(appHome, id));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') missing = true;
+      // any other stat error → keep the entry (fail open)
+    }
+    if (missing) ghostIds.push(id);
+  }
+  // FORWARD reconcile (R170 f-8): a writeConversation whose index maintenance failed AFTER the file
+  // committed (R169 f-2) leaves a record FILE on disk with NO index entry — it's broadcast live but
+  // vanishes from the list after restart (readIndex only rebuilds a CORRUPT/missing index, not a
+  // parseable-but-incomplete one). Scan the conversations dir and re-add any present file whose id is
+  // absent from the index — UNLESS it's durably deleted (a tombstoned record whose file rm failed
+  // must NOT be resurrected into the catalog).
+  const orphanFileIds: string[] = [];
+  try {
+    const dir = conversationsDir(appHome);
+    if (existsSync(dir)) {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.json')) continue;
+        const id = name.slice(0, -'.json'.length);
+        if (!index.conversations[id] && !isDurablyDeleted(index, id) && !isRecentlyDeleted(id)) {
+          orphanFileIds.push(id);
+        }
+      }
+    }
+  } catch {
+    /* dir scan best-effort */
+  }
+  if (ghostIds.length === 0 && orphanFileIds.length === 0) return 0;
+  for (const id of ghostIds) {
+    delete index.conversations[id];
+    if (index.activeConversationId === id) index.activeConversationId = null;
+    pushDurableDeletedId(index, id); // durable tombstone so a stale writer can't resurrect it
+  }
+  for (const id of orphanFileIds) {
+    try {
+      const rec = readConversation(appHome, id);
+      if (rec) index.conversations[id] = toIndexEntry(rec);
+    } catch {
+      /* unreadable — skip (a later read handles it) */
+    }
+  }
+  try {
+    writeIndex(appHome, index);
+  } catch (err) {
+    // If even this reconcile write fails, set an IN-MEMORY tombstone for each ghost (R166 f-2) so the
+    // tombstone-authoritative writeConversation guard still BLOCKS a stale client from resurrecting it
+    // THIS session (the disk index still contains the ghost, so the flag alone — which only gates the
+    // list-filter — is not enough). Also keep the ghost flag set so the list-filter hides them. A
+    // later successful write reconciles durably.
+    for (const id of ghostIds) tombstoneConversation(id);
+    console.error('[conversation-store] reconcileGhostIndexEntries: index write failed', err);
+    markIndexMayHaveGhosts();
+    return 0;
+  }
+  console.info(
+    `[conversation-store] reconciled ${ghostIds.length} ghost + ${orphanFileIds.length} orphan-file index entr(y|ies) at startup`,
+  );
+  return ghostIds.length + orphanFileIds.length;
 }
 
 // ── conversation read/write ───────────────────────────────────────────────────
@@ -1043,6 +1213,22 @@ export function sanitizeConversationTree(conv: ConversationRecord, priorTree?: u
  * NEW conversation is never tombstoned.
  */
 const recentlyDeletedConversations = new Map<string, number>();
+// Set true when a durable index write FAILS after files were already removed (delete/clear), which
+// can leave GHOST index entries whose record file is gone (R163 f-2). conversations:list consults
+// this to decide whether to pay the per-entry missing-file statSync filter — so the steady-state
+// (no failure) list path stays O(N) with NO per-entry stat, and the O(N) filter only runs while a
+// known ghost window is open. Cleared by the next SUCCESSFUL index write (writeConversation or a
+// delete/clear whose write landed), which reconciles the on-disk index.
+let indexMayHaveGhosts = false;
+export function markIndexMayHaveGhosts(): void {
+  indexMayHaveGhosts = true;
+}
+export function clearIndexGhostFlag(): void {
+  indexMayHaveGhosts = false;
+}
+export function getIndexMayHaveGhosts(): boolean {
+  return indexMayHaveGhosts;
+}
 // 10 minutes: comfortably outlasts any single in-flight persist/turn (a stream that was mid
 // -flight at delete time, or a slow write) so a late persist can't resurrect a deleted
 // conversation after the tombstone expired.
@@ -1104,16 +1290,61 @@ function pushDurableDeletedId(index: ConversationIndex, id: string): void {
 function isDurablyDeleted(index: ConversationIndex, id: string): boolean {
   return Array.isArray(index.deletedIds) && index.deletedIds.includes(id);
 }
+// True iff the conversation has an INDEX entry (exists on disk per the index), independent of
+// whether its record file can currently be READ. Lets a caller distinguish "genuinely absent /
+// first turn" from "exists but readConversation failed transiently (EMFILE/truncated JSON)" —
+// the latter must NOT be treated as recordless for a fail-closed security decision (R135 f-3).
+export function conversationExistsInIndex(appHome: string, id: string): boolean {
+  return Boolean(readIndex(appHome).conversations[id]);
+}
+// Lightweight "is the record FILE on disk" probe for LIST filtering (R162 f-2). A failed durable
+// index write during delete/clear can leave a GHOST index entry whose file is already gone;
+// conversations:list would otherwise surface it. statSync (NOT the heavier conversationExistenceState,
+// which also reads the file) with fail-OPEN semantics: only a definite ENOENT drops the entry; any
+// other stat error (EACCES/EMFILE) keeps it, so a transiently-unreadable real chat is never hidden.
+export function conversationFileExists(appHome: string, id: string): boolean {
+  try {
+    statSync(conversationPath(appHome, id));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    return true; // fail open: don't hide a real chat on a non-ENOENT stat error
+  }
+}
+// TRI-STATE existence for a fail-closed decision (R136 f-2 / R137 f-2): 'exists' | 'absent' |
+// 'unknown'. A plain boolean fails OPEN when the record can't be read (EMFILE/EACCES/truncated
+// JSON) — the caller would treat an existing plan-first chat as recordless and run mutating
+// tools. Probe the record FILE with statSync (NOT existsSync, which returns false for EACCES
+// instead of throwing → would mis-classify an unsearchable dir as 'absent', R137 f-2): ENOENT →
+// 'absent'; any other stat error → 'unknown'; file present + reads OK → 'exists'; present but
+// UNREADABLE → 'unknown' (caller fails closed to plan-first).
+export function conversationExistenceState(appHome: string, id: string): 'exists' | 'absent' | 'unknown' {
+  try {
+    statSync(conversationPath(appHome, id));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return 'absent';
+    return 'unknown'; // EACCES / EMFILE / any other stat failure → can't rule out an existing record
+  }
+  try {
+    return readConversation(appHome, id) != null ? 'exists' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+// (was: an index-only existence probe that could fail open on an index read failure)
 // Public tombstone check: is this id currently blocked from a create-shaped write (recently
 // deleted in-memory, OR durably deleted and absent from the index)? Callers that BROADCAST a write
 // (conversations:put) use this to avoid emitting a phantom upsert / false success for a write that
 // writeConversation will silently suppress. Returns false for an id still present in the index (a
 // normal update, or a legitimate recreate before the tombstone was set).
 export function isWriteTombstoned(appHome: string, id: string): boolean {
-  if (isRecentlyDeleted(id)) {
-    const idx = readIndex(appHome);
-    return !idx.conversations[id];
-  }
+  // The in-memory tombstone is AUTHORITATIVE on its own (R162 f-1): a recently-deleted id is
+  // tombstoned even if the index still LISTS it. The delete removes the file + sets the in-memory
+  // tombstone BEFORE the durable index update, and that index update is best-effort (can fail after
+  // the file is gone — R161 f-1); requiring the index entry to be ABSENT would let a failed
+  // index-write re-expose a just-deleted id to resurrection. A legitimate recreate uses a fresh id,
+  // so an in-memory-tombstoned id being written is always a stale in-flight persist.
+  if (isRecentlyDeleted(id)) return true;
   const idx = readIndex(appHome);
   return !idx.conversations[id] && isDurablyDeleted(idx, id);
 }
@@ -1143,25 +1374,68 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
     /* best-effort — fall back to fresh backfill */
   }
   const sanitized = sanitizeConversationTree(conv, priorTree);
-  // Resurrection guard: if this id was DELETED and is not currently in the index, a stale
-  // in-flight persist is trying to recreate it. SKIP the write (return the record to the caller
-  // unchanged) rather than resurrect a deleted conversation with stale messages + run state. Two
-  // tombstone sources: the in-memory TTL map (fast path, covers the common mid-flight delete) AND
-  // the DURABLE index ring (survives process restart / TTL expiry, so a client reconnecting long
-  // after the delete still can't resurrect it). A conversation still present in the index (a
-  // normal update, or a legitimate recreate before the tombstone was set) writes normally.
+  // Resurrection guard: if this id was DELETED, a stale in-flight persist is trying to recreate it.
+  // SKIP the write (return the record unchanged) rather than resurrect a deleted conversation with
+  // stale messages + run state. Two tombstone sources: the in-memory TTL map (fast path, covers the
+  // common mid-flight delete) AND the DURABLE index ring (survives process restart / TTL expiry).
+  // The in-memory tombstone is AUTHORITATIVE ON ITS OWN — suppress even if the index still LISTS the
+  // id (R162 f-1): the delete sets the in-memory tombstone BEFORE its (best-effort, can-fail) index
+  // update, so requiring the index entry to be absent would let a failed delete index-write
+  // resurrect the just-deleted conversation. A legitimate recreate uses a fresh id, so an
+  // in-memory-tombstoned id being written is always stale. The durable-ring branch keeps requiring
+  // index-absence (a durably-deleted id that IS back in the index was legitimately recreated later).
   if (isRecentlyDeleted(sanitized.id)) {
+    markWriteSuppressed(sanitized.id);
+    return sanitized;
+  }
+  {
     const idx = readIndex(appHome);
-    if (!idx.conversations[sanitized.id]) return sanitized;
-  } else {
-    const idx = readIndex(appHome);
-    if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) return sanitized;
+    if (!idx.conversations[sanitized.id] && isDurablyDeleted(idx, sanitized.id)) {
+      markWriteSuppressed(sanitized.id);
+      return sanitized;
+    }
   }
   atomicWriteFileSync(conversationPath(appHome, sanitized.id), JSON.stringify(sanitized, null, 2));
-  const index = readIndex(appHome);
-  index.conversations[sanitized.id] = toIndexEntry(sanitized);
-  writeIndex(appHome, index);
+  // The conversation FILE is now committed — the write SUCCEEDED from the caller's perspective. The
+  // index is a DERIVED, rebuildable cache (rebuildIndexFromConversationFiles scans the files), so a
+  // throw during index maintenance must NOT propagate out of writeConversation (R169 f-2): letting it
+  // throw made the stream-persistence caller treat a COMMITTED response as failed, retain its
+  // accumulator, and DOUBLE-PERSIST it under a collision id on the next finalize. Swallow + log; the
+  // index self-heals on the next corrupt/missing read or the startup ghost reconcile.
+  try {
+    const index = readIndex(appHome);
+    index.conversations[sanitized.id] = toIndexEntry(sanitized);
+    writeIndex(appHome, index);
+  } catch (err) {
+    console.error('[conversation-store] writeConversation: index maintenance failed after file commit', err);
+  }
+  lastWriteSuppressed.delete(sanitized.id);
   return sanitized;
+}
+
+// Records whether the MOST RECENT writeConversation for an id SUPPRESSED the write (tombstoned).
+// Lets a caller learn suppression WITHOUT a second (throwable) isWriteTombstoned lookup after the
+// write — the R147-f-1 fix's post-write re-lookup could throw AFTER the write already committed,
+// and defaulting that to the PERMANENT conversation-deleted signal left a ghost running turn
+// (R148). Bounded at ADD time (not only on consume) so a non-consuming caller — e.g. the plugin
+// upsert, which reads suppression via isWriteTombstoned, not consumeWriteWasSuppressed — can't
+// grow it without bound via repeated stale writes after a clear (R149).
+const lastWriteSuppressed = new Set<string>();
+const MAX_WRITE_SUPPRESSED = 500;
+function markWriteSuppressed(id: string): void {
+  // Re-insert at the back (delete → add) so recency reflects usefulness, then evict oldest.
+  lastWriteSuppressed.delete(id);
+  lastWriteSuppressed.add(id);
+  while (lastWriteSuppressed.size > MAX_WRITE_SUPPRESSED) {
+    const oldest = lastWriteSuppressed.values().next().value;
+    if (oldest === undefined) break;
+    lastWriteSuppressed.delete(oldest);
+  }
+}
+/** True iff the most recent {@link writeConversation} for `id` suppressed the write (tombstoned).
+ *  Consumes the flag (one-shot) so a stale later read can't misreport. Never throws. */
+export function consumeWriteWasSuppressed(id: string): boolean {
+  return lastWriteSuppressed.delete(id);
 }
 
 /** Delete a single conversation. Returns true iff the data file is GONE (removed now, or
@@ -1169,6 +1443,9 @@ export function writeConversation(appHome: string, conv: ConversationRecord): Co
  *  preserve-on-rm-failure semantics so a failed rm keeps the conversation intact (and the
  *  caller can avoid cancelling/broadcasting for a delete that didn't happen). */
 export function deleteConversation(appHome: string, id: string): boolean {
+  // Reject a malformed / abusively-long id before it enters the tombstone + durable deletedId ring
+  // + index (R178): treat it as a benign no-op (nothing to delete).
+  if (!isPlausibleConversationId(id)) return false;
   // Migrate first (and refuse if migration is pending) so a subsequent
   // readIndex() can't recreate the file we delete or strand old chats.
   assertMigratedBeforeWrite(appHome);
@@ -1184,17 +1461,39 @@ export function deleteConversation(appHome: string, id: string): boolean {
   // Tombstone only once the file is actually gone, so a stale in-flight persist can't
   // resurrect the just-deleted conversation (writeConversation checks isRecentlyDeleted).
   // (Deleting an already-absent id is a benign idempotent success — returns true.)
+  // The in-memory tombstone is set BEFORE the index read/write below so that even if the durable
+  // index update THROWS (readIndex/writeIndex EMFILE/EACCES), this session is still protected from
+  // resurrection AND the caller still learns the file is GONE (R161 f-1): the index update is a
+  // best-effort DURABILITY step, not a precondition for the delete having happened. Letting an
+  // index-write throw propagate here would (a) skip the caller's stream/tool teardown + broadcast
+  // and (b) leave the stale index entry able to resurrect the conversation on the NEXT persist —
+  // strictly worse than swallowing and returning the truth: the record file is gone.
   tombstoneConversation(id);
-  const index = readIndex(appHome);
-  if (index.conversations[id]) {
-    delete index.conversations[id];
-    if (index.activeConversationId === id) index.activeConversationId = null;
+  try {
+    const index = readIndex(appHome);
+    if (index.conversations[id]) {
+      delete index.conversations[id];
+      if (index.activeConversationId === id) index.activeConversationId = null;
+    }
+    // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was
+    // already absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone
+    // and a stale client could resurrect the just-deleted conversation.
+    pushDurableDeletedId(index, id);
+    writeIndex(appHome, index);
+    // NOTE: do NOT clearIndexGhostFlag() here (R164 f-3). A single delete's writeIndex persists the
+    // index it just read MINUS this one id — it does NOT reconcile UNRELATED ghosts left by a prior
+    // failed bulk clear, so clearing the flag would stop the list-filter while those ghosts remain.
+    // Only clearAllConversations (which rebuilds the index from `preserved`) reconciles fully. An
+    // over-set flag is safe (just an O(N) list filter); an under-set one re-exposes ghosts.
+  } catch (err) {
+    // Durable index update failed AFTER the file was removed. The in-memory tombstone (above) still
+    // guards this session (the write-path resurrection guard is tombstone-authoritative — R162 f-1);
+    // the caller must still tear down streams + broadcast the delete. A later successful index write
+    // (or the salvage-on-corrupt-index path) re-drops the durable id. Log so a systematic durable
+    // failure is visible rather than silently swallowed (R162).
+    console.error('[conversation-store] deleteConversation: durable index write failed', err);
+    markIndexMayHaveGhosts();
   }
-  // ALWAYS record the DURABLE tombstone once the file is gone — even if the index entry was already
-  // absent (a rebuilt/corrupt index). Otherwise a restart drops the in-memory tombstone and a
-  // stale client could resurrect the just-deleted conversation.
-  pushDurableDeletedId(index, id);
-  writeIndex(appHome, index);
   return true;
 }
 
@@ -1207,6 +1506,8 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
   const index = readIndex(appHome);
   const removed: string[] = [];
   for (const id of ids) {
+    // Skip a malformed / abusively-long id before it touches the tombstone/index structures (R178).
+    if (!isPlausibleConversationId(id)) continue;
     // Only drop the index entry once the data file is GONE (removed now, or already
     // absent). If rmSync FAILS, the file remains on disk; dropping the index entry anyway
     // would orphan that data AND make the conversation invisible — so keep the entry and
@@ -1242,7 +1543,25 @@ export function deleteConversations(appHome: string, ids: string[]): string[] {
     // effects and must get the same teardown.
     removed.push(id);
   }
-  if (removed.length > 0) writeIndex(appHome, index);
+  if (removed.length > 0) {
+    // Durable index write is best-effort: every removed id ALREADY has its file gone + an in-memory
+    // tombstone (set in the loop), so a writeIndex throw here must NOT prevent the caller from
+    // tearing down streams/tools + broadcasting the deletes for ids we've committed to (R161 f-1).
+    // Swallow and return `removed`; the stale index entries are re-dropped by a later successful
+    // write or the salvage-on-corrupt-index path, and this session is resurrection-guarded.
+    try {
+      writeIndex(appHome, index);
+      // NOTE: do NOT clearIndexGhostFlag() here (R164 f-3) — a batch delete's writeIndex removes only
+      // THIS batch's entries, not unrelated ghosts from a prior failed clear. Only clearAllConversations
+      // reconciles fully. Over-set is safe; under-set re-exposes ghosts.
+    } catch (err) {
+      // durable persist failed after removal — in-memory tombstones (set per id in the loop) still
+      // guard this session via the tombstone-authoritative write-path guard (R162 f-1). Log so a
+      // systematic durable failure is visible rather than silently swallowed (R162).
+      console.error('[conversation-store] deleteConversations: durable index write failed', err);
+      markIndexMayHaveGhosts();
+    }
+  }
   return removed;
 }
 
@@ -1313,8 +1632,25 @@ export function clearAllConversations(
     deletedIds: Array.isArray(priorIndex.deletedIds) ? [...priorIndex.deletedIds] : [],
   };
   for (const id of cleared) pushDurableDeletedId(nextIndex, id);
-  writeIndex(appHome, nextIndex);
-  return { cleared, fullyCleared: !anySurvived };
+  // Durable index write is best-effort for RESURRECTION (every cleared id has its file gone + an
+  // in-memory tombstone, and the write path's guard is tombstone-authoritative — R161 f-1 / R162
+  // f-1), so a writeIndex throw must NOT block the caller's teardown/broadcast. BUT a failed write
+  // leaves the OLD index (all entries) on disk while the files are gone: after reload those become
+  // GHOST entries (conversations:list reads the index), and reporting fullyCleared:true would have
+  // the caller broadcast a full reset it can't actually back with disk state (R162 f-2). So on a
+  // write failure, report fullyCleared:false (the durable catalog was NOT fully cleared) and log it —
+  // a systematic durability failure must be visible, not silently swallowed. conversations:list also
+  // filters missing-file entries as defense-in-depth so any surviving ghost never reaches a client.
+  let durablyPersisted = true;
+  try {
+    writeIndex(appHome, nextIndex);
+    clearIndexGhostFlag(); // full index rewrite (only surviving entries) reconciles any ghosts
+  } catch (err) {
+    durablyPersisted = false;
+    console.error('[conversation-store] clearAllConversations: durable index write failed', err);
+    markIndexMayHaveGhosts();
+  }
+  return { cleared, fullyCleared: !anySurvived && durablyPersisted };
 }
 
 // ── active id + settings ───────────────────────────────────────────────────────
@@ -1456,4 +1792,15 @@ export function migrateMonolithIfNeeded(appHome: string): void {
 /** Test-only: reset the in-process migration guard. */
 export function __resetMigrationGuardForTests(): void {
   migrationChecked = false;
+}
+
+// Test-only: clear the module-level in-memory delete tombstone map + suppression flags so a fixed
+// conversation id deleted in one test can't leak a tombstone into the next (production never reuses
+// ids — they're UUIDs — so this is purely a test-isolation concern). Without this, the
+// tombstone-authoritative resurrection guard (R162 f-1) would suppress a later legitimate write to a
+// reused id.
+export function __resetDeleteTombstonesForTests(): void {
+  recentlyDeletedConversations.clear();
+  lastWriteSuppressed.clear();
+  lastTombstoneSweep = 0;
 }

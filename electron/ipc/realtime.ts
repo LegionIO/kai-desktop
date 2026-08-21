@@ -9,6 +9,8 @@ import { RealtimeSession } from '../realtime/realtime-session.js';
 import { buildRealtimeMemoryContext } from '../realtime/realtime-context.js';
 import type { AppConfig } from '../config/schema.js';
 import type { ToolDefinition } from '../tools/types.js';
+import { toolsForExecutionMode } from '../agent/plan-mode-tools.js';
+import { readConversation, conversationExistenceState } from './conversation-store.js';
 import { getExistingBrowserManager } from '../browser/service.js';
 import { recordUsageEvent } from './usage.js';
 import { dismissPendingNativeBrowserApprovalsForOwner, type ToolApprovalAuthority } from './tool-approval.js';
@@ -18,6 +20,9 @@ let sessionStartTime: string | null = null;
 let sessionConversationId: string | null = null;
 let activeSessionBrowserInitiated = false;
 let activeSessionAllowsBrowserTools = false;
+// Whether the ACTIVE realtime call runs plan-first (read-only). A mid-call tool hot-reload must
+// re-apply the plan-first filter so it can't re-introduce mutating tools into a plan-first call (R175).
+let activeSessionPlanFirst = false;
 let pendingStart: {
   generation: number;
   conversationId: string;
@@ -25,6 +30,9 @@ let pendingStart: {
   browserInitiated: boolean;
   allowsBrowserTools: boolean;
   browserToolsRevoked: boolean;
+  /** Plan-first (read-only) gating for this start, resolved at admission — known BEFORE the session
+   *  is installed so tool-replacement paths that run against a pending start still gate correctly. */
+  planFirst: boolean;
 } | null = null;
 /**
  * Monotonic start generation. Bumped at the top of BOTH start-session and
@@ -37,6 +45,12 @@ let pendingStart: {
  */
 let startGeneration = 0;
 const assistantTabCleanupTails = new Map<string, Promise<void>>();
+
+// Registration-time refs so exported helpers invoked OUTSIDE a start handler (e.g. an executionMode
+// change broadcast) can re-resolve plan-first + re-gate the live session's tools (R183).
+let registeredGetTools: (() => ToolDefinition[]) | null = null;
+let registeredGetConfig: (() => AppConfig) | null = null;
+let registeredAppHome: string | null = null;
 
 function scheduleAssistantTabCleanup(conversationId: string, browserOwnerId: string): Promise<void> {
   const previous = assistantTabCleanupTails.get(conversationId) ?? Promise.resolve();
@@ -127,10 +141,89 @@ function isCurrentPrimaryMainFrame(event: IpcMainInvokeEvent, getPrimaryWindow: 
   );
 }
 
+/** Apply Browser-source + plan-first read-only gating to a tool set before it is advertised to a
+ *  realtime session (R176). EVERY session.updateTools(...) must route through this so a mid-call
+ *  browser-config change / renderer reload / hot reload / authority revalidation can never
+ *  re-introduce mutating (or Browser) tools into a plan-first call. `planFirst` is passed per-target
+ *  (the active session vs a not-yet-installed pending start, which has its own resolved flag). */
+function gateRealtimeTools(base: ToolDefinition[], allowBrowser: boolean, planFirst: boolean): ToolDefinition[] {
+  const browserFiltered = allowBrowser ? base : base.filter((tool) => tool.source !== 'browser');
+  return planFirst ? toolsForExecutionMode(browserFiltered, 'plan-first') : browserFiltered;
+}
+
+/**
+ * Resolve whether a Realtime call must run plan-first (read-only) for a conversation.
+ * Realtime never traverses the Mastra plan-mode chokepoint, so this decides tool gating directly.
+ *
+ * Priority (mirrors the text submit path in plugin-generate.ts):
+ *   - a present conversation record is MAIN-authoritative: its executionMode (or 'auto' when the
+ *     field is missing) wins — TRUST DISK (R129 f-3);
+ *   - a definitively ABSENT conversation (recordless voice/web/test session) falls back to the
+ *     GLOBAL config.tools.executionMode (R182) — a globally plan-first config must gate a recordless
+ *     call too, exactly like a recordless plugin generate;
+ *   - a present-but-UNREADABLE record, or any throw, fails CLOSED to plan-first.
+ */
+function resolveRealtimePlanFirst(appHome: string, conversationId: string, config: AppConfig): boolean {
+  try {
+    const persistedConv = readConversation(appHome, conversationId) as { executionMode?: string } | null;
+    if (persistedConv != null) {
+      return persistedConv.executionMode === 'plan-first';
+    }
+    if (conversationExistenceState(appHome, conversationId) === 'absent') {
+      return (config.tools as { executionMode?: string } | undefined)?.executionMode === 'plan-first';
+    }
+    // Present-but-unreadable (transient/unknown) → fail closed.
+    return true;
+  } catch {
+    return true; // fail closed
+  }
+}
+
 export function updateActiveRealtimeSessionTools(tools: ToolDefinition[]): void {
-  const withoutBrowserTools = tools.filter((tool) => tool.source !== 'browser');
-  activeSession?.updateTools(activeSessionAllowsBrowserTools ? tools : withoutBrowserTools);
-  pendingStart?.session?.updateTools(pendingStart.allowsBrowserTools ? tools : withoutBrowserTools);
+  // Re-resolve plan-first from CURRENT config before re-gating (R206): this runs on every registry reload
+  // (main.ts), which is when a GLOBAL config.tools.executionMode change takes effect. A RECORDLESS session
+  // (voice/web/test, no conversation record) never receives a per-conversation execution-mode event, so
+  // onRealtimeExecutionModeChanged never fires for it — without re-resolving here, a global Auto→Plan-First
+  // switch would leave its frozen activeSessionPlanFirst=false and mutating tools active. resolveRealtimePlanFirst
+  // still honors a present conversation record's own mode (recorded sessions unaffected) and fails closed.
+  if (registeredGetConfig && registeredAppHome) {
+    const config = registeredGetConfig();
+    if (activeSession && sessionConversationId) {
+      activeSessionPlanFirst = resolveRealtimePlanFirst(registeredAppHome, sessionConversationId, config);
+    }
+    if (pendingStart) {
+      pendingStart.planFirst = resolveRealtimePlanFirst(registeredAppHome, pendingStart.conversationId, config);
+    }
+  }
+  activeSession?.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
+  if (pendingStart?.session) {
+    pendingStart.session.updateTools(gateRealtimeTools(tools, pendingStart.allowsBrowserTools, pendingStart.planFirst));
+  }
+}
+
+/**
+ * Re-gate a LIVE Realtime call after its conversation's execution mode changes (R183). The install-time
+ * plan-first resolution froze `activeSessionPlanFirst`; a later Auto→Plan-First toggle (via
+ * broadcastExecutionMode) persists + updates the UI but would otherwise leave the connected session with
+ * mutating tools until the next registry reload — and that reload would itself reuse the stale flag.
+ * Re-resolve from disk/global config and re-apply the tool filter. Only ever TIGHTENS via re-resolution
+ * (resolveRealtimePlanFirst is itself fail-closed); an explicit relax to Auto is honored because the
+ * conversation record now says so. Scoped to the exact conversation that changed.
+ */
+export function onRealtimeExecutionModeChanged(conversationId: string): void {
+  if (!registeredGetTools || !registeredGetConfig || !registeredAppHome) return;
+  const tools = registeredGetTools();
+  const config = registeredGetConfig();
+  if (activeSession && sessionConversationId === conversationId) {
+    activeSessionPlanFirst = resolveRealtimePlanFirst(registeredAppHome, conversationId, config);
+    activeSession.updateTools(gateRealtimeTools(tools, activeSessionAllowsBrowserTools, activeSessionPlanFirst));
+  }
+  if (pendingStart && pendingStart.conversationId === conversationId) {
+    pendingStart.planFirst = resolveRealtimePlanFirst(registeredAppHome, conversationId, config);
+    pendingStart.session?.updateTools(
+      gateRealtimeTools(tools, pendingStart.allowsBrowserTools, pendingStart.planFirst),
+    );
+  }
 }
 
 /** Permanently remove native Browser authority from the current call/start.
@@ -147,9 +240,9 @@ export function revokeRealtimeBrowserTools(tools: ToolDefinition[]): void {
     pendingStart.allowsBrowserTools = false;
     pendingStart.browserToolsRevoked = true;
   }
-  const withoutBrowserTools = tools.filter((tool) => tool.source !== 'browser');
-  activeSession?.updateTools(withoutBrowserTools);
-  pendingStart?.session?.updateTools(withoutBrowserTools);
+  // Browser is force-disabled here, but plan-first gating must STILL apply to the remaining tools.
+  activeSession?.updateTools(gateRealtimeTools(tools, false, activeSessionPlanFirst));
+  pendingStart?.session?.updateTools(gateRealtimeTools(tools, false, pendingStart?.planFirst ?? false));
 }
 
 /**
@@ -170,6 +263,7 @@ function recordAndCloseActiveSession(closeSession = true): Promise<void> {
   sessionConversationId = null;
   activeSessionBrowserInitiated = false;
   activeSessionAllowsBrowserTools = false;
+  activeSessionPlanFirst = false;
 
   if (!session) return Promise.resolve();
 
@@ -229,6 +323,9 @@ export function registerRealtimeHandlers(
   isTextTurnActive: (conversationId: string) => boolean = () => false,
 ): void {
   const dbPath = join(appHome, 'data', 'memory.db');
+  registeredGetTools = getTools;
+  registeredGetConfig = getConfig;
+  registeredAppHome = appHome;
 
   ipcMain.handle('realtime:start-session', async (event, conversationId: string) => {
     const browserManagerAtAuthorization = getExistingBrowserManager();
@@ -276,6 +373,7 @@ export function registerRealtimeHandlers(
       browserInitiated,
       allowsBrowserTools: false,
       browserToolsRevoked: false,
+      planFirst: false,
     };
     try {
       previousPendingSession?.close();
@@ -360,7 +458,18 @@ export function registerRealtimeHandlers(
         event.senderFrame === primaryWindow.webContents.mainFrame &&
         browserAuthorityCurrent();
       if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = allowBrowserTools;
-      const tools = allowBrowserTools ? availableTools : availableTools.filter((tool) => tool.source !== 'browser');
+      // Plan-first read-only gating (R175/R182): a plan-first conversation's voice call must NOT
+      // expose mutating tools (incl. Browser click/type/evaluate/tab-management) — Realtime does NOT
+      // traverse the Mastra plan-mode chokepoint, so filter here too. Recordless calls fall back to
+      // the GLOBAL executionMode; present-but-unreadable fails CLOSED.
+      let realtimePlanFirst = resolveRealtimePlanFirst(appHome, conversationId, config);
+      // The gate actually baked into the session's INITIAL tools below. Install compares against THIS
+      // (not a mutated local) to decide whether a reload is needed — so it reapplies exactly when the
+      // authoritative resolution has diverged from what's installed, and stays a no-op otherwise.
+      const initialPlanFirst = realtimePlanFirst;
+      // Record on the pending start so tool-replacement paths that run BEFORE install gate correctly.
+      if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
+      const tools = gateRealtimeTools(availableTools, allowBrowserTools, realtimePlanFirst);
       let createdSession: RealtimeSession;
       createdSession = new RealtimeSession(getConfig, tools, () => handleRealtimeSessionTerminal(createdSession));
       session = createdSession;
@@ -385,7 +494,7 @@ export function registerRealtimeHandlers(
         if (allowBrowserTools) {
           if (!browserAuthorityCurrent() || pendingStart?.browserToolsRevoked) {
             if (pendingStart?.generation === myGeneration) pendingStart.allowsBrowserTools = false;
-            session.updateTools(getTools().filter((tool) => tool.source !== 'browser'));
+            session.updateTools(gateRealtimeTools(getTools(), false, realtimePlanFirst));
           } else {
             // Browser runs from the text and Realtime runtimes must not coexist:
             // each runtime maintains independent page assumptions and would
@@ -428,11 +537,23 @@ export function registerRealtimeHandlers(
         void scheduleAssistantTabCleanup(conversationId, session.browserOwnerId);
         browserRunRegistered = false;
       }
-      if (browserToolsStillAuthorized !== allowBrowserTools) {
-        session.updateTools(
-          browserToolsStillAuthorized ? getTools() : getTools().filter((tool) => tool.source !== 'browser'),
-        );
+      // Re-resolve plan-first at INSTALL time (R182/R185): the mode was frozen before the async
+      // connect, so a Plan-First toggle (or a conversation record written) while connecting would
+      // otherwise leave the wrong tool set on the freshly-installed session. resolveRealtimePlanFirst
+      // is itself fail-CLOSED (present-but-unreadable / throw → plan-first), so its result is the
+      // authoritative gate — use it directly rather than OR-ing in the stale captured value, which
+      // could DIVERGE tools from the flag (a start relaxed to Auto mid-connect by
+      // onRealtimeExecutionModeChanged would keep those Auto tools while a `stale || fresh` set the flag
+      // back to plan-first, and an equality guard against the stale value would then skip the reload).
+      // Reapply the gate iff the authoritative (browser-authority, plan-first) pair differs from what
+      // was actually installed — correct AND still a no-op when nothing changed.
+      realtimePlanFirst = resolveRealtimePlanFirst(appHome, conversationId, getConfig());
+      if (browserToolsStillAuthorized !== allowBrowserTools || realtimePlanFirst !== initialPlanFirst) {
+        session.updateTools(gateRealtimeTools(getTools(), browserToolsStillAuthorized, realtimePlanFirst));
       }
+      // Keep the pending-start flag in sync with the re-resolved mode so a tool-reload racing this
+      // install gates against the authoritative value, not the pre-connect one.
+      if (pendingStart?.generation === myGeneration) pendingStart.planFirst = realtimePlanFirst;
       activeSession = session;
       // Set timing/attribution at INSTALL time so a superseded start can't leave
       // stale globals, and so the recorded duration reflects connected time
@@ -441,6 +562,7 @@ export function registerRealtimeHandlers(
       sessionConversationId = conversationId;
       activeSessionBrowserInitiated = browserInitiated;
       activeSessionAllowsBrowserTools = browserToolsStillAuthorized;
+      activeSessionPlanFirst = realtimePlanFirst;
       return { ok: true };
     } catch (err) {
       const msg = isStale() ? 'Session start superseded' : err instanceof Error ? err.message : String(err);
@@ -503,6 +625,11 @@ export function registerRealtimeHandlers(
   // an event handler with no catch) and never let sendAudio's failure propagate.
   ipcMain.on('realtime:send-audio', (event, pcmBase64: string) => {
     if (typeof pcmBase64 !== 'string' || pcmBase64.length === 0) return;
+    // Cap the frame (R179): this fire-and-forget channel is web-bridge-reachable and bypasses the
+    // invoke concurrency limit; each frame is synchronously decoded/resampled/re-encoded/serialized
+    // and queued to the provider socket. An unbounded near-4-MiB frame stream would stall the main
+    // process and grow outbound buffers unboundedly. A real audio chunk is well under this bound.
+    if (pcmBase64.length > 1_048_576) return;
     if (activeSessionBrowserInitiated) {
       const primaryWindow = getPrimaryWindow();
       if (

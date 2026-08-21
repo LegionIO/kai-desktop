@@ -14,7 +14,7 @@ import {
   reenqueueFreshAtFront,
 } from '../agent/inject-queue.js';
 import { isCompacting } from '../agent/compaction-lock.js';
-import type { AppConfig, AutomationAction, AutomationRule } from '../config/schema.js';
+import type { AppConfig, AutomationAction, AutomationRule, ExecutionMode } from '../config/schema.js';
 import {
   appendConversationMessages,
   broadcastUpsert,
@@ -28,6 +28,7 @@ import { readIndex, readConversation, writeConversation } from '../ipc/conversat
 import type { ConversationRecord } from '../ipc/conversation-store.js';
 import type { PluginActionPayload } from '../plugins/types.js';
 import type { ToolDefinition } from '../tools/types.js';
+import { withoutMidStreamPlanTools } from '../agent/plan-mode-tools.js';
 import { getPath } from './conditions.js';
 import type { AutomationEventBus } from './event-bus.js';
 import type { AutomationActionResult, AutomationEvent, AutomationRunRecord } from './types.js';
@@ -49,8 +50,43 @@ export type ActionDeps = {
   injectUserTurnAndRestart?: (
     conversationId: string,
     userText: string,
-    opts?: { modelKey?: string; reasoningEffort?: string; profileKey?: string; cwd?: string },
+    opts?: {
+      modelKey?: string;
+      reasoningEffort?: string;
+      profileKey?: string;
+      cwd?: string;
+      executionMode?: ExecutionMode;
+      threadOverrides?: {
+        temperature?: number | null;
+        systemPromptOverride?: string | null;
+        maxSteps?: number | null;
+        maxRetries?: number | null;
+        runtimeOverride?: string | null;
+      };
+      /** Stable id for the persisted/spliced user turn (alert resume) so a commit
+       *  check can find it by exact id even if a hook rewrote the content (R104). */
+      userTurnId?: string;
+      /** Resolved fallback-enabled for this dispatch so the inject fingerprint/restart
+       *  match the fresh-execution semantics, not the conversation's toggle (R107). */
+      fallbackEnabled?: boolean;
+    },
   ) => Promise<{ ok: boolean; error?: string; injectedCooperatively?: boolean }>;
+  /**
+   * Resolve the EFFECTIVE runtime id for a turn (accounting for global
+   * agent.runtime, any thread runtimeOverride, and the selected model), e.g.
+   * 'mastra' | 'claude-agent-sdk' | 'codex-sdk' | a plugin runtime id. Injected
+   * from main.ts (which owns the runtime graph) so the automations layer doesn't
+   * import it directly. When absent (tests / early init) a resume falls back to
+   * the ordinary Mastra streamForPlugin path. Used ONLY to decide whether an
+   * alert/recovered-answer resume must be dispatched through the runtime-resolving
+   * injectUserTurnAndRestart path instead of the Mastra-only streamForPlugin path
+   * (R94).
+   */
+  resolveEffectiveRuntimeId?: (opts: {
+    modelKey?: string;
+    profileKey?: string;
+    runtimeOverride?: string | null;
+  }) => Promise<string> | string;
 };
 
 type InterpolationCtx = { payload: unknown; result: unknown[]; source?: string; event?: string };
@@ -135,7 +171,30 @@ export async function resumeConversationWithMessage(
   conversationId: string,
   promptText: string,
   deps: ActionDeps,
-  opts?: { modelKey?: string; profileKey?: string; tools?: boolean; correlationId?: string },
+  opts?: {
+    modelKey?: string;
+    profileKey?: string;
+    tools?: boolean;
+    correlationId?: string;
+    /** The conversation's own cwd / execution mode / fallback, so the resumed turn
+     *  runs in its context (not the global config default) — R90. */
+    cwd?: string;
+    executionMode?: ExecutionMode;
+    fallbackEnabled?: boolean;
+    /** Reasoning effort + per-thread overrides so a resume honors the conversation's
+     *  persisted instructions/runtime (R92). */
+    reasoningEffort?: string;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
+    /** Caller-allocated STABLE id for the persisted user turn, so a post-failure
+     *  commit check can look for THIS exact turn (R103 finding-2). */
+    userTurnId?: string;
+  },
 ): Promise<unknown> {
   const action: Extract<AutomationAction, { type: 'agent' }> = {
     type: 'agent',
@@ -172,9 +231,21 @@ export async function resumeConversationWithMessage(
     literalPrompt: true,
     strictExistingTarget: true,
     forceFreshTurn: true,
+    // Marks this as an alert/recovered-answer resume so the runtime-aware dispatch
+    // fires even after the ordered barrier re-enters with forceFreshTurn:false —
+    // it must run on the SERIALIZED slot, not the pre-barrier call (R94).
+    isAlertResume: true,
     // Thread the alert's stable correlation id so the resumed agent turn's traces
     // share the alert's `alert-<id>` id (creation → answer → resume all correlate).
     ...(opts?.correlationId ? { correlationId: opts.correlationId } : {}),
+    // Run in the CONVERSATION's own context (cwd / execution mode / fallback) so a
+    // resume doesn't stream at the home dir / global mode (R90).
+    ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+    ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+    ...(opts?.fallbackEnabled !== undefined ? { fallbackEnabled: opts.fallbackEnabled } : {}),
+    ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+    ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+    ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
   });
 }
 
@@ -340,13 +411,41 @@ async function runAgentAction(
     /** Internal: this invocation already owns its slot in orderedConversationTails. */
     orderedExecution?: boolean;
     correlationId?: string;
+    /** Working directory + execution mode for the streamed turn, so a resume
+     *  (alert answer / recovered raced answer) runs in the CONVERSATION's context
+     *  rather than the global config default (R90). Forwarded to streamForPlugin. */
+    cwd?: string;
+    executionMode?: ExecutionMode;
+    /** Explicit fallback toggle; overrides the default `Boolean(profileKey)`. */
+    fallbackEnabled?: boolean;
+    /** Reasoning effort + per-thread overrides (temperature / systemPromptOverride /
+     *  maxSteps / maxRetries / runtimeOverride) for a resumed turn, so it honors the
+     *  conversation's persisted settings (R92). Forwarded to streamForPlugin. */
+    reasoningEffort?: string;
+    threadOverrides?: {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    };
+    /** Set by resumeConversationWithMessage: this is an alert/recovered-answer
+     *  resume. Survives the ordered-barrier re-entry (unlike forceFreshTurn, which
+     *  is reset to false), so the runtime-aware dispatch fires on the serialized
+     *  slot (R94). */
+    isAlertResume?: boolean;
+    /** Caller-allocated stable id for the persisted user turn (alert resume) so a
+     *  post-failure commit check can find THIS exact turn (R103 finding-2). */
+    userTurnId?: string;
   },
 ): Promise<unknown> {
   const config = deps.getConfig();
   const correlationId =
     opts?.correlationId ?? newDiagnosticCorrelationId(opts?.forceFreshTurn ? 'alert-resume' : 'automation');
   const prompt = opts?.literalPrompt ? action.prompt : interpolateString(action.prompt, ctx);
-  const tools = action.tools ? deps.getRegisteredTools().filter((tool) => tool.source !== 'browser') : [];
+  const tools = action.tools
+    ? withoutMidStreamPlanTools(deps.getRegisteredTools()).filter((tool) => tool.source !== 'browser')
+    : [];
   const title = action.conversationTitle ? interpolateString(action.conversationTitle, ctx) : rule.name;
 
   // Background mode has no conversation to stream into — keep the simple
@@ -513,6 +612,14 @@ async function runAgentAction(
     const res = await deps.injectUserTurnAndRestart!(targetConvId, prompt, {
       modelKey: action.modelKey,
       profileKey: action.profileKey,
+      ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+      ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+      ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+      ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
+      // Match the fresh-execution fallback resolution so the inject fingerprint/restart
+      // don't diverge from what a fresh turn would use (R107 finding-5).
+      fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
     });
     // Surface a failed injection as a failed action (don't record ok:false as
     // success) so e.g. an alert answer that couldn't be delivered isn't lost.
@@ -537,6 +644,74 @@ async function runAgentAction(
   const target = resolved && 'targetId' in resolved ? resolved : null;
   let conversationId = target?.targetId ?? createAutomationConversation(deps.appHome, rule, action, title, false);
   let created = target ? (target.created ?? false) : true;
+
+  // Runtime-aware resume dispatch (R94): the streamForPlugin path below always
+  // drives the Mastra runtime — it never dispatches to the resolved AgentRuntime.
+  // So an alert/recovered-answer resume of a conversation whose EFFECTIVE runtime
+  // is a CLI/plugin runtime (claude-agent-sdk / codex-sdk / plugin id — whether
+  // pinned via runtimeOverride OR selected by global agent.runtime='auto' + model)
+  // would run under Mastra, losing that runtime's session semantics. Delegate to
+  // injectUserTurnAndRestart, which routes through streamHandler → resolveRuntimeForStream
+  // (the single authoritative resolver) and honors the runtime for both an idle
+  // conversation (no active stream → straight to streamHandler) and a busy one
+  // (abort+restart). This runs INSIDE the ordered fresh-turn barrier + after
+  // waitForAutomationRunToSettle (a forceFreshTurn resume only reaches here on its
+  // serialized slot), so it can NOT race a concurrent automation run on the same
+  // conversation the way a pre-barrier fast path could. Scoped to isAlertResume
+  // (alert/recovered resumes only — it survives the barrier re-entry) + an
+  // EXISTING (not newly-created) target.
+  if (
+    opts?.isAlertResume &&
+    !created &&
+    target &&
+    typeof deps.injectUserTurnAndRestart === 'function' &&
+    typeof deps.resolveEffectiveRuntimeId === 'function'
+  ) {
+    let effectiveRuntime: string | undefined;
+    try {
+      effectiveRuntime = await deps.resolveEffectiveRuntimeId({
+        modelKey: action.modelKey,
+        profileKey: action.profileKey,
+        runtimeOverride: opts?.threadOverrides?.runtimeOverride ?? undefined,
+      });
+    } catch {
+      effectiveRuntime = undefined; // resolver failure → fall back to the Mastra path
+    }
+    // Delegate to injectUserTurnAndRestart when EITHER the effective runtime is
+    // non-Mastra (must run on its own runtime), OR a turn became ACTIVE on this
+    // conversation DURING the awaited resolveEffectiveRuntimeId (a GUI/CLI turn
+    // started after our pre-await idle check). Falling through to the streamForPlugin
+    // path in the now-busy case would append + stream CONCURRENTLY with that turn —
+    // forking history and duplicating tool side effects. injectUserTurnAndRestart
+    // handles the busy conversation correctly (cooperative splice or abort+restart)
+    // and honors runtime for the idle case (R94/R100 finding-3).
+    const becameBusy = isConversationTurnActive(conversationId) || isAutomationRunInFlight(conversationId);
+    if ((effectiveRuntime && effectiveRuntime !== 'mastra') || becameBusy) {
+      traceDiagnostic({
+        scope: 'automation',
+        event: 'turn.resume-runtime-dispatch',
+        correlationId,
+        conversationId,
+        ruleId: rule.id,
+        fields: { runtime: effectiveRuntime ?? 'mastra', becameBusy },
+      });
+      const res = await deps.injectUserTurnAndRestart(conversationId, prompt, {
+        ...(action.modelKey ? { modelKey: action.modelKey } : {}),
+        ...(action.profileKey ? { profileKey: action.profileKey } : {}),
+        ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+        ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
+        ...(opts?.userTurnId ? { userTurnId: opts.userTurnId } : {}),
+        fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
+      });
+      if (!res.ok) {
+        throw new Error(`runtime-aware resume into ${conversationId} failed: ${res.error ?? 'unknown error'}`);
+      }
+      return { resumedInto: conversationId, ok: true };
+    }
+  }
+
   inFlightAutomationTargets.add(conversationId);
   traceDiagnostic({
     scope: 'automation',
@@ -614,7 +789,17 @@ async function runAgentAction(
       const promptWrite = appendConversationMessages(
         deps.appHome,
         conversationId,
-        [{ role: 'user', content: [{ type: 'text', text: prompt }], createdAt: new Date().toISOString() }],
+        [
+          {
+            // Caller-supplied STABLE id (alert resume) so a post-failure commit check
+            // can look for THIS exact turn — durable against a content-rewriting hook
+            // and immune to a concurrent unrelated user turn (R103 finding-2).
+            ...(opts?.userTurnId ? { id: opts.userTurnId } : {}),
+            role: 'user',
+            content: [{ type: 'text', text: prompt }],
+            createdAt: new Date().toISOString(),
+          },
+        ],
         // A resume (strictExistingTarget) MUST land in the alert's own
         // conversation — never skip-if-busy (which would then divert to a NEW
         // chat, so the answer vanishes from the thread the user is watching).
@@ -998,9 +1183,13 @@ async function runAgentAction(
         conversationId,
         modelKey: action.modelKey,
         profileKey: action.profileKey,
-        fallbackEnabled: Boolean(action.profileKey),
+        fallbackEnabled: opts?.fallbackEnabled ?? Boolean(action.profileKey),
         tools,
         abortSignal: abortController.signal,
+        ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
+        ...(opts?.reasoningEffort ? { reasoningEffort: opts.reasoningEffort as never } : {}),
+        ...(opts?.threadOverrides ? { threadOverrides: opts.threadOverrides } : {}),
         // prepareStep may fire this BEFORE the prior step's events reach this
         // loop; buffer, don't persist synchronously. Flushed at the top of each
         // iteration (below) once those events have been consumed.
@@ -1224,7 +1413,7 @@ async function runAgentAction(
     }
     turnSucceeded = true;
     const resultText = committedText && text ? `${committedText}\n\n${text}` : committedText || text;
-    turnResult = { text: resultText, modelKey, toolCalls, conversationId };
+    turnResult = { text: resultText, modelKey, toolCalls, conversationId, userTurnId: userTurnHeadId ?? undefined };
   } finally {
     inFlightAutomationTargets.delete(conversationId);
     automationRunAborts.delete(conversationId);

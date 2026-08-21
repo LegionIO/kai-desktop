@@ -546,7 +546,7 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
     // un-suppress them → stuck {pending}).
     // Recomputed on model-fallback (a cross-provider fallback changes which
     // tools are provider-defined vs wrapped-local).
-    let subProviderToolNames = getProviderDefinedToolNames(modelConfig);
+    let subProviderToolNames = getProviderDefinedToolNames(modelConfig, subAgentConfig.tools?.executionMode);
     const subHookRewrittenArgs = new Map<string, unknown>();
     // Sub-agent runtime has no exec/stream id pairing map. To reconcile a
     // possible id mismatch, the stream loop records suppressed stream ids per
@@ -656,11 +656,26 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       if (abortSignal?.aborted) break;
       turnCount++;
       controlSignal.current = null; // reset for this turn
+      // Reset the provider-tool exemption set to THIS turn's starting (primary) model each turn
+      // (R156 f-1): the set is recomputed within a turn on model-fallback, so if turn N ended on
+      // a fallback model whose provider had a native web_search, turn N+1 (which restarts on the
+      // primary) would otherwise keep that stale exemption and skip DLP arg-suppression for a
+      // LOCAL primary web_search. A turn that itself falls back re-recomputes it (line ~909).
+      subProviderToolNames = getProviderDefinedToolNames(modelConfig, subAgentConfig.tools?.executionMode);
 
       // The initial prompt was gated up front; each follow-up is gated inside
       // addFollowUpMessage before it's added/broadcast. So no per-turn gate here.
 
       let turnText = '';
+      // Accumulate this turn's TOOL calls + results so a `continue` (multi-turn) sub-agent carries
+      // the tool evidence + side effects it just observed into the next turn's context (R170 f-9):
+      // pushing only turnText dropped tool-only turns entirely, making the next turn repeat work or
+      // decide without the results. Parts are ordered assistant tool-call parts; toolResults become a
+      // following `tool` message. On model-fallback (turn restart) these reset alongside turnText.
+      type SubToolPart = { type: 'tool-call'; toolCallId: string; toolName: string; args?: unknown };
+      let turnToolParts: SubToolPart[] = [];
+      const turnToolIndex = new Map<string, number>();
+      let turnToolResults: Array<{ type: 'tool-result'; toolCallId: string; toolName: string; result: unknown }> = [];
       // Set if the model stream emits an `error` event this turn — a terminal
       // failure that must NOT fall through to a `completed` classification.
       let turnError: string | null = null;
@@ -932,6 +947,35 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
       for await (const event of stream) {
         if (event.type === 'text-delta' && event.text) {
           turnText += event.text;
+        } else if (event.type === 'tool-call' && event.toolCallId) {
+          // Record the tool call for next-turn context (R170 f-9). Update-in-place on a repeat id.
+          const existing = turnToolIndex.get(event.toolCallId);
+          if (existing === undefined) {
+            turnToolIndex.set(event.toolCallId, turnToolParts.length);
+            turnToolParts.push({
+              type: 'tool-call',
+              toolCallId: event.toolCallId,
+              toolName: event.toolName ?? 'tool',
+              args: event.args,
+            });
+          } else {
+            turnToolParts[existing] = {
+              type: 'tool-call',
+              toolCallId: event.toolCallId,
+              toolName: event.toolName ?? turnToolParts[existing].toolName,
+              args: event.args ?? turnToolParts[existing].args,
+            };
+          }
+        } else if ((event.type === 'tool-result' || event.type === 'tool-error') && event.toolCallId) {
+          turnToolResults.push({
+            type: 'tool-result',
+            toolCallId: event.toolCallId,
+            toolName: event.toolName ?? 'tool',
+            result:
+              event.type === 'tool-error'
+                ? { isError: true, error: event.error ?? 'Tool execution failed' }
+                : event.result,
+          });
         } else if (event.type === 'error') {
           // Model/stream error this turn — terminal failure. Capture the reason;
           // handled after the loop so it can't be classified as `completed`.
@@ -943,12 +987,21 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
           // concatenation. Only the LOCAL accumulation is reset — the event is
           // still enriched, broadcast, and yielded below like any other.
           turnText = '';
+          // Reset the tool accumulators too (R170 f-9) — the discarded attempt's tool calls/results
+          // must not carry into the successful retry's next-turn context.
+          turnToolParts = [];
+          turnToolIndex.clear();
+          turnToolResults = [];
           const toKey = (event.data as { toModelKey?: string } | undefined)?.toModelKey;
           const nextEntry = toKey
             ? (streamConfig?.fallbackModels.find((m) => m.key === toKey) ??
               (streamConfig?.primaryModel.key === toKey ? streamConfig.primaryModel : undefined))
             : undefined;
-          if (nextEntry) subProviderToolNames = getProviderDefinedToolNames(nextEntry.modelConfig);
+          if (nextEntry)
+            subProviderToolNames = getProviderDefinedToolNames(
+              nextEntry.modelConfig,
+              subAgentConfig.tools?.executionMode,
+            );
           // streamWithFallback restarts the next model from the original messages —
           // reset the same-turn media budget so the discarded attempt's committed
           // args/text/media don't phantom-charge the fallback's budget, and recompute
@@ -1006,7 +1059,40 @@ export async function* runSubAgent(opts: SubAgentRunOptions): AsyncGenerator<Sub
 
       if (turnText) {
         fullResponseText += (fullResponseText ? '\n\n' : '') + turnText;
-        messages.push({ role: 'assistant', content: turnText });
+      }
+      // Push a structured assistant turn carrying BOTH text and tool calls into the next-turn context
+      // (R170 f-9). Previously only turnText was pushed, so a tool-only turn contributed nothing and a
+      // `continue` re-ran without the tool evidence/side effects. Build assistant content = [text?, …
+      // tool-call parts]; follow with a `tool` message holding the results so the model sees outcomes.
+      // CRITICAL (R171): every tool-call part MUST have a matching tool-result, or strict providers
+      // (Anthropic) reject the request with an orphaned tool_use. A stream error/abort after a
+      // tool-call but before its result leaves an orphan — SYNTHESIZE an error result for any
+      // unmatched call so the pairing is complete AND the evidence that the call happened is kept.
+      if (turnText || turnToolParts.length > 0) {
+        const resultIds = new Set(turnToolResults.map((r) => r.toolCallId));
+        const completeResults = [...turnToolResults];
+        for (const p of turnToolParts) {
+          if (!resultIds.has(p.toolCallId)) {
+            completeResults.push({
+              type: 'tool-result',
+              toolCallId: p.toolCallId,
+              toolName: p.toolName,
+              result: { isError: true, error: 'Tool call did not complete (turn ended before a result).' },
+            });
+          }
+        }
+        const assistantContent: Array<Record<string, unknown>> = [];
+        if (turnText) assistantContent.push({ type: 'text', text: turnText });
+        for (const p of turnToolParts) assistantContent.push({ ...p });
+        // If there are no tool parts, keep the legacy plain-string content shape for text-only turns.
+        messages.push(
+          turnToolParts.length > 0
+            ? { role: 'assistant', content: assistantContent }
+            : { role: 'assistant', content: turnText },
+        );
+        if (completeResults.length > 0) {
+          messages.push({ role: 'tool', content: completeResults.map((r) => ({ ...r })) });
+        }
       }
 
       if (abortSignal?.aborted) break;

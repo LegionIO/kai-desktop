@@ -240,17 +240,34 @@ export class PiRuntime implements AgentRuntime {
       }
     }
 
-    let spawnedChild: ChildProcessWithoutNullStreams | null = null;
-    let removeAbortListener: (() => void) | null = null;
-    try {
-      // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
-      // Passed the bridged tool names so a restrictive --tools allowlist keeps the
-      // Kai tools enabled (pi's allowlist covers extension tools too).
-      args.push(...buildToolScopingArgs(piConfig, piBridge ? bridgeableTools.map((t) => t.name) : []));
+    // Tool scoping from the Kai approval mode (pi has no mid-stream gating).
+    // Passed the bridged tool names so a restrictive --tools allowlist keeps the
+    // Kai tools enabled (pi's allowlist covers extension tools too).
+    args.push(
+      ...buildToolScopingArgs(
+        piConfig,
+        piBridge ? bridgeableTools.map((t) => t.name) : [],
+        options.config.tools?.executionMode === 'plan-first',
+      ),
+    );
 
-      // -----------------------------------------------------------------------
-      // 5. Spawn + stream
-      // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // 5. Spawn + stream
+    // -----------------------------------------------------------------------
+    // The bridge (loopback server + temp extension dir) is already started above; from here on it
+    // MUST be stopped on every exit path, so the try/finally opens BEFORE the unmappable-model
+    // warning yield and BEFORE spawn (R164 f-4): if the consumer closes the iterator AT that yield,
+    // or spawn() throws synchronously, a try that only began after spawn would skip the finally and
+    // leak the bridge. `child`/`onAbort` are nullable so the finally can null-guard the child cleanup
+    // for the spawn-threw / closed-at-yield cases (no child yet).
+    let child: ChildProcessWithoutNullStreams | null = null;
+    let onAbort: (() => void) | null = null;
+    // Declared OUTSIDE the try so the catch/finally can read them (the try body assigns them).
+    let spawnError: NodeJS.ErrnoException | undefined;
+    let stderrBuf = '';
+    let exitCode: number | null = null;
+    let errorYielded = false;
+    try {
       if (mapping.unmappableReason) {
         yield {
           conversationId,
@@ -265,28 +282,23 @@ export class PiRuntime implements AgentRuntime {
         };
       }
 
-      const child = spawn(piPath, args, {
+      const spawned = spawn(piPath, args, {
         cwd: options.confinedCwd || cwd || process.cwd(),
         env,
         shell: false,
         detached: process.platform !== 'win32', // own process group → reap bash grandchildren
         stdio: ['pipe', 'pipe', 'pipe'],
       }) as ChildProcessWithoutNullStreams;
-      spawnedChild = child;
+      child = spawned;
 
-      let spawnError: NodeJS.ErrnoException | undefined;
-      let stderrBuf = '';
-      let exitCode: number | null = null;
-      let errorYielded = false;
-
-      child.on('error', (err) => {
+      spawned.on('error', (err) => {
         spawnError = err as NodeJS.ErrnoException;
       });
       // Writing the prompt to a child that has already exited (e.g. an abort
       // landed during spawn) emits an async EPIPE 'error' on stdin that a
       // synchronous try/catch can't catch — swallow it to avoid an unhandled error.
-      child.stdin.on('error', () => {});
-      child.stderr.on('data', (d: Buffer) => {
+      spawned.stdin.on('error', () => {});
+      spawned.stderr.on('data', (d: Buffer) => {
         if (stderrBuf.length < STDERR_CAP) {
           // Hard-cap on append: a single large stderr chunk must not push the
           // buffer well past STDERR_CAP.
@@ -294,141 +306,181 @@ export class PiRuntime implements AgentRuntime {
         }
       });
       const exited = new Promise<void>((resolve) => {
-        child.on('close', (code) => {
+        spawned.on('close', (code) => {
           exitCode = code;
           resolve();
         });
       });
 
-      const onAbort = () => {
-        killProcessGroup(child);
+      // If the LEADER (pi) exits but a TERM-resistant bash grandchild keeps the stdout pipe open, the
+      // `for await (spawned.stdout)` loop and `exited` (waits on 'close') would hang forever (R166
+      // f-3) — killProcessGroup's leader-alive SIGKILL gate deliberately does NOT group-kill after
+      // leader exit (recycled-pid safety). Break the hang: once the leader exits, if 'close' hasn't
+      // followed, force-destroy stdout so the stream read completes and the runtime finalizes. But
+      // destroy ONLY when the stream is genuinely IDLE — nothing buffered AND nothing consumed
+      // recently (R167 f-1): destroying mid-drain would drop the final buffered event of a COMPLETED
+      // response (slow consumer) and raise ERR_STREAM_PREMATURE_CLOSE, turning success into an error.
+      // `lastReadAt` is bumped by the streaming loop below (no competing 'data' listener, which would
+      // steal chunks from the async iterator). Re-arm while data is pending/flowing.
+      let lastReadAt = Date.now();
+      spawned.on('exit', () => {
+        const IDLE_MS = 2000;
+        // Absolute post-exit deadline (R168): a stuck orphan grandchild dribbling a byte every <IDLE_MS
+        // would re-arm the idle check forever. Cap total wait after leader exit at 30s.
+        const HARD_DEADLINE = Date.now() + 30_000;
+        // `exited` resolves on 'close', which needs EVERY stdio stream closed. A TERM-resistant descendant
+        // can hold stderr open even after stdout ends/destroys — so whenever stdout is DONE we must also
+        // force stderr closed, or 'close' never fires and `await exited` hangs (R197/R198). This covers
+        // BOTH orderings: stdout ends first (early-return path) and stdout still open-but-idle.
+        const forceStderrClosed = (): void => {
+          if (!spawned.stderr.destroyed) spawned.stderr.destroy();
+        };
+        const tick = (): void => {
+          if (spawned.stdout.destroyed || spawned.stdout.readableEnded) {
+            forceStderrClosed(); // stdout already done — ensure stderr is too so 'close' can fire
+            return;
+          }
+          const idle = Date.now() - lastReadAt >= IDLE_MS && spawned.stdout.readableLength === 0;
+          if (idle || Date.now() >= HARD_DEADLINE) {
+            spawned.stdout.destroy();
+            forceStderrClosed();
+            return;
+          }
+          const t = setTimeout(tick, IDLE_MS);
+          if (typeof t.unref === 'function') t.unref();
+        };
+        const t0 = setTimeout(tick, IDLE_MS);
+        if (typeof t0.unref === 'function') t0.unref();
+      });
+
+      onAbort = () => {
+        killProcessGroup(spawned);
         // Unblock the `for await (… of child.stdout)` loop even when the child has
         // emitted nothing yet — otherwise an abort against a hung, silent child
         // would never reach the `finally` that reaps it.
-        child.stdout.destroy();
+        spawned.stdout.destroy();
       };
       abortSignal?.addEventListener('abort', onAbort, { once: true });
-      removeAbortListener = () => abortSignal?.removeEventListener('abort', onAbort);
       // If the signal was already aborted before we attached (abort landed during
       // spawn), `{ once: true }` won't fire — reap immediately.
       if (abortSignal?.aborted) onAbort();
 
-      // Send the prompt via stdin, then close it so pi runs single-shot.
-      try {
-        child.stdin.write(promptText);
-        child.stdin.end();
-      } catch {
-        /* if the process already failed to spawn, the error path below handles it */
+      // Send the prompt via stdin, then close it so pi runs single-shot — UNLESS a Stop already
+      // aborted (onAbort above killed the child): writing would still deliver the prompt to a
+      // not-yet-dead / SIGTERM-ignoring pi and let it execute tools after Stop (R165 f-1).
+      if (!abortSignal?.aborted) {
+        try {
+          spawned.stdin.write(promptText);
+          spawned.stdin.end();
+        } catch {
+          /* if the process already failed to spawn, the error path below handles it */
+        }
       }
 
-      try {
-        let buf = '';
-        let totalBytes = 0;
-        for await (const chunk of child.stdout) {
-          if (abortSignal?.aborted) break;
-          const bytes = chunk as Buffer;
-          totalBytes += bytes.length;
-          if (totalBytes > MAX_TOTAL_BYTES) {
-            errorYielded = true;
-            killProcessGroup(child);
-            yield {
-              conversationId,
-              type: 'error',
-              error: 'pi produced an excessive amount of output; the stream was stopped.',
-            };
-            break;
+      let buf = '';
+      let totalBytes = 0;
+      for await (const chunk of spawned.stdout) {
+        if (abortSignal?.aborted) break;
+        lastReadAt = Date.now(); // R167 f-1: mark progress so the idle-destroy timer never fires mid-drain
+        const bytes = chunk as Buffer;
+        totalBytes += bytes.length;
+        if (totalBytes > MAX_TOTAL_BYTES) {
+          errorYielded = true;
+          killProcessGroup(spawned);
+          yield {
+            conversationId,
+            type: 'error',
+            error: 'pi produced an excessive amount of output; the stream was stopped.',
+          };
+          break;
+        }
+        buf += bytes.toString('utf8');
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.length > MAX_LINE_BYTES) continue;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(trimmed);
+          } catch {
+            continue; // skip non-JSON / partial garbage
           }
-          buf += bytes.toString('utf8');
-          let nl: number;
-          while ((nl = buf.indexOf('\n')) >= 0) {
-            const line = buf.slice(0, nl);
-            buf = buf.slice(nl + 1);
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.length > MAX_LINE_BYTES) continue;
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(trimmed);
-            } catch {
-              continue; // skip non-JSON / partial garbage
+          // A pi event is always a JSON object; a bare primitive (null, number,
+          // string) from a hostile/buggy stream would crash translatePiEvent on
+          // `event.type`. Skip it.
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          // Capture pi's session id on the FIRST turn so the next turn can resume
+          // it via --session. pi emits {type:'session',id,...} at stream start.
+          if (!existingPiSessionId) {
+            const p = parsed as { type?: unknown; id?: unknown };
+            if (p.type === 'session' && typeof p.id === 'string' && p.id) {
+              yield { conversationId, type: 'enrichment', data: { piSessionId: p.id } };
             }
-            // A pi event is always a JSON object; a bare primitive (null, number,
-            // string) from a hostile/buggy stream would crash translatePiEvent on
-            // `event.type`. Skip it.
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-            // Capture pi's session id on the FIRST turn so the next turn can resume
-            // it via --session. pi emits {type:'session',id,...} at stream start.
-            if (!existingPiSessionId) {
-              const p = parsed as { type?: unknown; id?: unknown };
-              if (p.type === 'session' && typeof p.id === 'string' && p.id) {
-                yield { conversationId, type: 'enrichment', data: { piSessionId: p.id } };
-              }
-            }
-            for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) {
+          }
+          for (const evt of translatePiEvent(conversationId, parsed as PiEvent)) {
+            if (evt.type === 'error') errorYielded = true;
+            yield evt;
+          }
+        }
+        // Enforce the per-line cap DURING buffering too: a newline-free hostile
+        // line must not grow `buf` up to the whole-turn ceiling. Once the pending
+        // (unterminated) buffer exceeds the line cap it can't become a valid line,
+        // so drop it.
+        if (buf.length > MAX_LINE_BYTES) buf = '';
+      }
+      // Flush any trailing line without a newline.
+      const tail = buf.trim();
+      if (!abortSignal?.aborted && tail && tail.length <= MAX_LINE_BYTES) {
+        try {
+          const parsedTail: unknown = JSON.parse(tail);
+          if (parsedTail && typeof parsedTail === 'object' && !Array.isArray(parsedTail)) {
+            for (const evt of translatePiEvent(conversationId, parsedTail as PiEvent)) {
               if (evt.type === 'error') errorYielded = true;
               yield evt;
             }
           }
-          // Enforce the per-line cap DURING buffering too: a newline-free hostile
-          // line must not grow `buf` up to the whole-turn ceiling. Once the pending
-          // (unterminated) buffer exceeds the line cap it can't become a valid line,
-          // so drop it.
-          if (buf.length > MAX_LINE_BYTES) buf = '';
+        } catch {
+          /* ignore */
         }
-        // Flush any trailing line without a newline.
-        const tail = buf.trim();
-        if (!abortSignal?.aborted && tail && tail.length <= MAX_LINE_BYTES) {
-          try {
-            const parsedTail: unknown = JSON.parse(tail);
-            if (parsedTail && typeof parsedTail === 'object' && !Array.isArray(parsedTail)) {
-              for (const evt of translatePiEvent(conversationId, parsedTail as PiEvent)) {
-                if (evt.type === 'error') errorYielded = true;
-                yield evt;
-              }
-            }
-          } catch {
-            /* ignore */
-          }
-        }
+      }
 
-        await exited;
+      await exited;
 
-        if (spawnError) {
-          errorYielded = true;
-          yield {
-            conversationId,
-            type: 'error',
-            error:
-              spawnError.code === 'ENOENT'
-                ? `pi CLI could not be launched (not found at ${piPath}). Reinstall with \`npm i -g @earendil-works/pi-coding-agent\`.`
-                : `pi CLI failed to start: ${spawnError.message}`,
-          };
-        } else if (!abortSignal?.aborted && !errorYielded && exitCode && exitCode !== 0) {
-          errorYielded = true;
-          yield {
-            conversationId,
-            type: 'error',
-            error: redactSecretsFromText(stderrBuf.trim()) || `pi exited with code ${exitCode}`,
-          };
-        }
-      } catch (err) {
-        if (!abortSignal?.aborted && !errorYielded) {
-          const msg =
-            spawnError?.code === 'ENOENT'
-              ? `pi CLI could not be launched (not found at ${piPath}).`
-              : err instanceof Error
-                ? err.message
-                : String(err);
-          yield { conversationId, type: 'error', error: msg };
-        }
+      if (spawnError) {
+        errorYielded = true;
+        yield {
+          conversationId,
+          type: 'error',
+          error:
+            spawnError.code === 'ENOENT'
+              ? `pi CLI could not be launched (not found at ${piPath}). Reinstall with \`npm i -g @earendil-works/pi-coding-agent\`.`
+              : `pi CLI failed to start: ${spawnError.message}`,
+        };
+      } else if (!abortSignal?.aborted && !errorYielded && exitCode && exitCode !== 0) {
+        errorYielded = true;
+        yield {
+          conversationId,
+          type: 'error',
+          error: redactSecretsFromText(stderrBuf.trim()) || `pi exited with code ${exitCode}`,
+        };
       }
     } catch (err) {
-      if (!abortSignal?.aborted) {
-        const message = err instanceof Error ? err.message : String(err);
-        yield { conversationId, type: 'error', error: `pi CLI failed to start: ${redactSecretsFromText(message)}` };
+      if (!abortSignal?.aborted && !errorYielded) {
+        const msg =
+          spawnError?.code === 'ENOENT'
+            ? `pi CLI could not be launched (not found at ${piPath}).`
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        yield { conversationId, type: 'error', error: msg };
       }
     } finally {
-      removeAbortListener?.();
-      if (spawnedChild) killProcessGroup(spawnedChild); // ensure no orphan pi/bash processes survive
+      // Null-guarded: on a closed-at-yield or spawn-threw exit there is no child/listener yet, but
+      // the bridge (started before this try) still MUST be stopped (R164 f-4).
+      if (onAbort) abortSignal?.removeEventListener('abort', onAbort);
+      if (child) killProcessGroup(child); // ensure no orphan pi/bash processes survive
       if (piBridge) await piBridge.stop().catch(() => {});
       yield { conversationId, type: 'done' };
     }
@@ -454,10 +506,16 @@ function killProcessGroup(child: ChildProcessWithoutNullStreams): void {
       process.kill(-child.pid, 'SIGTERM');
       const pid = child.pid;
       const timer = setTimeout(() => {
-        try {
-          process.kill(-pid, 'SIGKILL');
-        } catch {
-          /* group already gone (ESRCH) */
+        // Only escalate to a GROUP SIGKILL while the LEADER is still alive (R165 f-3): once it has
+        // exited, its numeric pid can be RECYCLED by the OS and a `-pid` SIGKILL could hit an
+        // unrelated process group. A live leader holds its pid (not recyclable), so the group kill
+        // is safe; if it already exited, forgo the (rare) backgrounded-survivor kill.
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            /* group already gone (ESRCH) */
+          }
         }
       }, 2000);
       timer.unref?.();
@@ -501,7 +559,11 @@ function extractLastUserText(messages: unknown[]): string | null {
 // Helper: Kai approval mode → pi spawn-time tool scoping
 // ---------------------------------------------------------------------------
 
-function buildToolScopingArgs(piConfig: Record<string, unknown>, bridgedToolNames: string[] = []): string[] {
+export function buildToolScopingArgs(
+  piConfig: Record<string, unknown>,
+  bridgedToolNames: string[] = [],
+  planFirst = false,
+): string[] {
   // pi has NO --exclude-tools; it only supports an ALLOWLIST via --tools, or
   // --no-tools / --no-builtin-tools. pi's built-in tools are: read, write, edit,
   // bash. Map Kai's approval mode to the allowed built-in set. Default full-auto
@@ -516,6 +578,14 @@ function buildToolScopingArgs(piConfig: Record<string, unknown>, bridgedToolName
   const approval = (piConfig.approval as string) ?? 'full-auto';
   const BUILTINS = ['read', 'write', 'edit', 'bash'];
   const withBridged = (allowed: string[]): string[] => ['--tools', [...allowed, ...bridgedToolNames].join(',')];
+
+  // PLAN-FIRST (R142 f-1): pi has no mid-stream gating and its NATIVE write/edit/bash tools
+  // aren't Kai tools, so Kai can't self-guard them — scope pi to READ-ONLY at spawn (read +
+  // bridged Kai tools only). This overrides approval/excludeTools: a plan-first turn must never
+  // let pi's built-ins mutate the workspace.
+  if (planFirst) {
+    return withBridged(['read']);
+  }
 
   // An explicit excludeTools list (Kai config semantics: "deny these") is
   // translated to pi's allowlist = the built-ins NOT excluded.

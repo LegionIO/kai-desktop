@@ -336,6 +336,9 @@ describe('ClaudeAgentRuntime', () => {
       const tr = toolResults[0];
       if (tr.type === 'tool-result') {
         expect(tr.toolCallId).toBe('toolu_2');
+        // The tool NAME recorded at the tool-CALL block is stamped onto the result event so
+        // MAIN's mid-stream enter_plan_mode/exit_plan_mode interception fires for SDK runs (R138 f-4).
+        expect(tr.toolName).toBe('read_file');
         // Result content should reach the renderer verbatim.
         const resultStr = typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result);
         expect(resultStr).toContain('Hello world');
@@ -581,8 +584,11 @@ describe('ClaudeAgentRuntime', () => {
 
         const response = sdkState.toolHandlers.get('ask_user')?.({ prompt: 'private prompt' }, {});
         await vi.waitFor(() => expect(pendingToolApprovals.size).toBe(1));
-        const [toolCallId, pending] = [...pendingToolApprovals.entries()][0]!;
-        pendingQuestionAnswers.set(toolCallId, { answer: 'private answer' });
+        const [approvalMapKey, pending] = [...pendingToolApprovals.entries()][0]!;
+        // The pending-approval map + the answer stash are both conversation-scoped under the SAME
+        // composite key (approvalKey === makeAnswerKey scheme, R191/R192), so the map key IS the stash
+        // key the SDK handler reads. Seed the stash under it directly.
+        pendingQuestionAnswers.set(approvalMapKey, { answer: 'private answer' });
         pending.resolve(true);
         const result = (await response) as { content?: Array<{ text?: string }>; isError?: boolean };
 

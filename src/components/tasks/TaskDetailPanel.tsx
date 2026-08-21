@@ -29,10 +29,16 @@ import { cn } from '@/lib/utils';
 import { refocusComposer } from '@/lib/utils';
 import { useTasks } from '@/providers/TaskProvider';
 import { useAgents } from '@/providers/AgentProvider';
-import { useAttachments } from '@/providers/AttachmentContext';
+import { useLocalAttachments } from '@/hooks/useLocalAttachments';
 import { useCurrentWorkingDirectory } from '@/providers/RuntimeProvider';
 import { useConfig } from '@/providers/ConfigProvider';
 import { app } from '@/lib/ipc-client';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+  attachmentsToImagePayload,
+} from '@/lib/attachment-limits';
 import { MarkdownText } from '@/components/thread/MarkdownText';
 import { RecordingButton } from '@/components/thread/RecordingButton';
 import { useVoiceRecording } from '@/hooks/useVoiceRecording';
@@ -59,9 +65,20 @@ interface TaskDetailPanelProps {
 }
 
 export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => {
-  const { state, updateTask, updateTaskStatus, refineTaskPlan } = useTasks();
+  const { state, updateTask, updateTaskStatus, refineTaskPlan, clearDroppedImageNotice, clearFailedSubmission } =
+    useTasks();
   const { state: agentState, startAgent, stopAgent, unassignTask } = useAgents();
-  const { attachments, addAttachments, removeAttachment } = useAttachments();
+  // Task-local attachment store (R186): isolated from the shared chat attachment store so task files
+  // don't leak into chat and leaving the panel doesn't clear unsent chat attachments.
+  const { attachments, addAttachments, removeAttachment, clearAttachments, getAttachmentSignature } =
+    useLocalAttachments();
+  // Synchronous single-submission latch for refine (R212): isActivelyStreaming stays false until
+  // refineTaskPlan finishes its tasks.get, so rapid submits could start competing plan streams.
+  const refineSubmittingRef = useRef(false);
+  // R232: count in-flight FileReader batches (web-bridge <input type=file>) so a submit fired before the reads
+  // settle can't send text-only and drop the still-loading image (mirrors TaskCreationView's pendingReadsRef,
+  // R216). Incremented when a read batch starts, decremented when it settles.
+  const pendingReadsRef = useRef(0);
   const { currentWorkingDirectory, setCurrentWorkingDirectory } = useCurrentWorkingDirectory();
   const { config } = useConfig();
   const fullWidth = useFullWidthContent();
@@ -108,6 +125,17 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
     }
   });
 
+  // Clear staged attachments when the panel is reused for a DIFFERENT task (R188): TaskQueue reuses this
+  // component instance across task.id changes, so without this an image staged for task A could be
+  // submitted to task B. Keyed on task.id so switching tasks resets the (task-local) attachment store.
+  // The ref fences in-flight async reads (dialog await + FileReader) so a read STARTED for task A that
+  // resolves AFTER a switch to task B is discarded rather than attached to B (R189).
+  const activeTaskIdRef = useRef(task.id);
+  useEffect(() => {
+    activeTaskIdRef.current = task.id;
+    clearAttachments();
+  }, [task.id, clearAttachments]);
+
   // ── Reviewer terminal tab state ───────────────────────────────────────
   // null = show executor terminal, string = show reviewer terminal by sessionId
   const [activeTerminalTab, setActiveTerminalTab] = useState<string | null>(null);
@@ -148,7 +176,9 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const cwdName = currentWorkingDirectory?.split('/').pop() ?? currentWorkingDirectory;
   const hasFileAttachments = attachments.length > 0;
-  const canSend = input.trim().length > 0 || attachments.length > 0;
+  // Text OR image attachments can refine the plan (R187): image attachments are forwarded to the plan
+  // model. Text is still required unless at least one image is staged.
+  const canSend = input.trim().length > 0 || attachments.some((a) => a.isImage);
 
   // File attach handlers
   const isWebBridge = Boolean(
@@ -156,6 +186,77 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFileAccept, setPendingFileAccept] = useState<string>('*/*');
+  // Transient notice for attachment files the main process SKIPPED (too large / not a regular file)
+  // (R183) — otherwise picking such a file is a silent no-op.
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const attachNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showAttachMessage = useCallback((message: string) => {
+    if (!message) return;
+    if (attachNoticeTimerRef.current) clearTimeout(attachNoticeTimerRef.current);
+    setAttachNotice(message);
+    attachNoticeTimerRef.current = setTimeout(() => setAttachNotice(null), 6000);
+  }, []);
+  const showAttachNotice = useCallback(
+    (skipped: string[]) => {
+      showAttachMessage(skippedAttachmentsNotice(skipped) ?? '');
+    },
+    [showAttachMessage],
+  );
+
+  // Surface a dropped-image notice raised during task CREATION (R210): the create composer unmounts on the
+  // transition into this detail view, so the provider stashes it in state; show it here once (the surviving
+  // UI) and clear it. Consume ONLY the notice for THIS task (R211) — the notice is keyed by taskId, so a
+  // different task's detail panel must not display it. Refine-path drops are shown inline by handleComposerSubmit.
+  useEffect(() => {
+    const notice = state.droppedImageNotice;
+    if (notice && notice.taskId === task.id && notice.count > 0) {
+      showAttachMessage(
+        `${notice.count} image${notice.count === 1 ? '' : 's'} not included (exceeds the task-plan limit).`,
+      );
+      clearDroppedImageNotice();
+    }
+  }, [state.droppedImageNotice, task.id, showAttachMessage, clearDroppedImageNotice]);
+
+  // Restore a submission whose background plan stream failed AFTER admission with no text produced (R217):
+  // the create composer already unmounted (or a refine cleared) at admission, so the provider stashed the
+  // prompt+images. Repopulate THIS task's composer with them so the user can retry, then clear the payload.
+  // Only restore into an empty composer so we don't clobber something the user has since typed.
+  useEffect(() => {
+    const failed = state.failedSubmissions[task.id];
+    if (!failed) return;
+    // Only restore into an EMPTY composer (a newer draft in progress takes precedence). R221: the busy check
+    // reads REACTIVE state (`input`, `attachments`) — not the non-reactive textarea ref — and both are in the
+    // dependency array, so when the user clears their draft this effect re-runs and the deferred restore fires.
+    const composerBusy = input.trim().length > 0 || attachments.length > 0;
+    if (composerBusy) return;
+    // R225: clear the recovery entry FIRST — this releases the parked byte charge (kept accounted while parked,
+    // R225) and removes the entry BEFORE addAttachments re-charges, so there is no transient double-count of the
+    // same images against the renderer-wide ceiling. Capture the payload into a local before clearing. Restore is
+    // ALL-AT-ONCE and TERMINAL; over-budget images are dropped with a notice rather than stranding recovery state.
+    const restoreText = failed.text;
+    const restoreAttachments = failed.attachments;
+    clearFailedSubmission(task.id);
+    if (restoreText) setInput(restoreText);
+    let skippedCount = 0;
+    if (restoreAttachments && restoreAttachments.length > 0) {
+      // Reconstruct AttachedFile[] from the image payload (dataUrl + mime); size from the dataUrl length.
+      const { skipped } = addAttachments(
+        restoreAttachments.map((a, i) => ({
+          name: `image-${i + 1}.${(a.mimeType?.split('/')[1] ?? 'png').split('+')[0]}`,
+          mime: a.mimeType ?? 'image/png',
+          isImage: true,
+          size: Math.floor((a.image.length * 3) / 4),
+          dataUrl: a.image,
+        })),
+      );
+      skippedCount = skipped.length;
+    }
+    showAttachMessage(
+      skippedCount > 0
+        ? `The plan failed to generate — your message was restored (${skippedCount} image${skippedCount === 1 ? '' : 's'} exceeded the limit). Try again.`
+        : 'The plan failed to generate — your message was restored. Try again.',
+    );
+  }, [state.failedSubmissions, task.id, input, attachments, addAttachments, showAttachMessage, clearFailedSubmission]);
 
   const handleAttachFiles = async (filters?: Array<{ name: string; extensions: string[] }>) => {
     if (isWebBridge) {
@@ -164,20 +265,53 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       setTimeout(() => fileInputRef.current?.click(), 0);
       return;
     }
+    const originTaskId = task.id;
     try {
       const result = (await app.dialog.openFile({ filters })) as {
         canceled: boolean;
         files?: Array<{ name: string; mime: string; isImage: boolean; size: number; dataUrl: string; text?: string }>;
+        skipped?: string[];
       };
-      if (!result.canceled && result.files) addAttachments(result.files);
+      if (result.canceled) return;
+      // Discard if the panel switched to a different task while the native dialog was open (R189) —
+      // otherwise task A's picked images attach to task B.
+      if (activeTaskIdRef.current !== originTaskId) return;
+      // Task plans can only submit IMAGES (R188) — only stage images; drop non-images with a notice.
+      const images = (result.files ?? []).filter((f) => f.isImage);
+      const nonImages = (result.files ?? []).filter((f) => !f.isImage).map((f) => f.name);
+      // Surface budget-rejected images (R202) — addAttachments returns {skipped} when the renderer-wide
+      // cap is exhausted; without this they'd disappear with no chip or notice.
+      const overCap = images.length > 0 ? addAttachments(images).skipped : [];
+      if (nonImages.length > 0) {
+        showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImages.join(', ')}`);
+      } else if (result.skipped && result.skipped.length > 0) {
+        showAttachNotice(result.skipped);
+      }
+      if (overCap.length > 0) showAttachNotice(overCap);
     } catch (err) {
       console.error('Attach failed:', err);
     }
   };
 
   const handleWebFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
+    const fileList = event.target.files;
+    if (!fileList || fileList.length === 0) return;
+    const originTaskId = task.id;
+    // Task plans can only submit IMAGES (R188) — keep only image files. Gate by size BEFORE reading (R184).
+    const allFiles = Array.from(fileList);
+    const imageFiles = allFiles.filter((f) => f.type.startsWith('image/'));
+    const nonImageNames = allFiles.filter((f) => !f.type.startsWith('image/')).map((f) => f.name);
+    const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(imageFiles);
+    if (nonImageNames.length > 0) {
+      showAttachMessage(`Only images can be attached to a task. Skipped: ${nonImageNames.join(', ')}`);
+    } else if (skipped.length > 0) {
+      showAttachNotice(skipped);
+    }
+    event.target.value = '';
+    if (accepted.length === 0) {
+      releaseAttachmentReservation(reservedBytes);
+      return;
+    }
     const readers: Promise<{
       name: string;
       mime: string;
@@ -185,12 +319,14 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
       size: number;
       dataUrl: string;
       text?: string;
-    }>[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    } | null>[] = [];
+    for (const file of accepted) {
       readers.push(
         new Promise((resolve) => {
           const reader = new FileReader();
+          // Resolve null on error/abort (R185) so one unreadable file can't hang Promise.all.
+          reader.onerror = () => resolve(null);
+          reader.onabort = () => resolve(null);
           reader.onload = () => {
             const dataUrl = reader.result as string;
             const isImage = file.type.startsWith('image/');
@@ -200,8 +336,23 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
         }),
       );
     }
-    void Promise.all(readers).then((results) => addAttachments(results));
-    event.target.value = '';
+    pendingReadsRef.current += 1; // R232: block submit until this read batch settles
+    void Promise.all(readers)
+      .then((results) => {
+        releaseAttachmentReservation(reservedBytes);
+        // Discard reads that resolved after a switch to a different task (R189).
+        if (activeTaskIdRef.current !== originTaskId) return;
+        const attachable = results.filter((r): r is NonNullable<typeof r> => r !== null);
+        const unreadable = accepted.length - attachable.length;
+        if (attachable.length > 0) {
+          const { skipped: overCap } = addAttachments(attachable);
+          if (overCap.length > 0) showAttachNotice(overCap);
+        }
+        if (unreadable > 0) showAttachMessage(`Couldn't read ${unreadable} file${unreadable === 1 ? '' : 's'}.`);
+      })
+      .finally(() => {
+        pendingReadsRef.current = Math.max(0, pendingReadsRef.current - 1);
+      });
   };
 
   const handleAttachDirectory = async () => {
@@ -334,14 +485,68 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
 
   const handleComposerSubmit = useCallback(() => {
     const text = input.trim();
-    if (!text || isActivelyStreaming) return;
+    if (isActivelyStreaming) return;
+    if (refineSubmittingRef.current) return; // single-submission latch (R212) — block competing streams
+    // R232: block while a web FileReader batch is still in flight — otherwise a quick send after selecting an
+    // image submits text-only and the image lands afterward for a LATER turn. Warn and bail; the user retries
+    // once the read settles (it clears pendingReadsRef and re-enables the composer's next submit).
+    if (pendingReadsRef.current > 0) {
+      showAttachMessage('Still attaching your image — try again in a moment.');
+      return;
+    }
+    const { images, dropped } = attachmentsToImagePayload(attachments);
+    if (!text && images.length === 0) {
+      // All staged images dropped by the renderer plan caps + no text → nothing to submit; warn + bail (R214).
+      if (dropped > 0) {
+        showAttachMessage(
+          `${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit); add text or a smaller image.`,
+        );
+      }
+      return;
+    }
+    refineSubmittingRef.current = true;
+    // Warn immediately for a renderer-side drop (deterministic, before any async) — the composer survives
+    // here, so show it inline (R214). Main receives only what the renderer sent, so its droppedImages is 0.
+    if (dropped > 0) {
+      showAttachMessage(`${dropped} image${dropped === 1 ? '' : 's'} not included (exceeds the task-plan limit).`);
+    }
 
-    setInput('');
-    void refineTaskPlan(task.id, text);
+    // Do NOT clear optimistically (R210): a cleared-then-snapshot-rollback retained the data URLs in a
+    // snapshot while clearAttachments() released their bytes from the global counter. Submit with the
+    // composer intact; on SUCCESS clear it (fenced to the originating task, unchanged live text, AND an
+    // IDENTITY-unchanged attachment set), else leave the input untouched.
+    const originTaskId = task.id;
+    // Capture the exact attachment set (identity signature, not byte total — a same-sized replacement must
+    // NOT pass, R212) so we don't wipe an attachment added/replaced/finished-loading during admission.
+    const submittedSignature = getAttachmentSignature();
+    void refineTaskPlan(task.id, text, images.length > 0 ? images : undefined)
+      .then((res) => {
+        if (!res.ok) return; // composer keeps the user's input/attachments; nothing to restore
+        const stillOriginTask = activeTaskIdRef.current === originTaskId;
+        const liveText = textareaRef.current?.value ?? '';
+        if (stillOriginTask && liveText.trim() === text && getAttachmentSignature() === submittedSignature) {
+          setInput('');
+          clearAttachments();
+        }
+        // (No main-side dropped-image warning here: the renderer caps the payload before IPC — R213/R214 —
+        // so main's droppedImages is always 0. The renderer-side warning above covers all drops.)
+      })
+      .finally(() => {
+        refineSubmittingRef.current = false;
+      });
 
     // Request focus on next render (survives streaming state updates)
     pendingFocusRef.current = true;
-  }, [input, task.id, refineTaskPlan, isActivelyStreaming]);
+  }, [
+    input,
+    attachments,
+    clearAttachments,
+    getAttachmentSignature,
+    task.id,
+    refineTaskPlan,
+    isActivelyStreaming,
+    showAttachMessage,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -598,6 +803,15 @@ export const TaskDetailPanel: FC<TaskDetailPanelProps> = ({ task, onClose }) => 
                     />
                   )}
                   {/* File attachment chips */}
+                  {attachNotice && (
+                    <div
+                      className="mb-2 px-1 text-xs text-amber-600 dark:text-amber-400"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {attachNotice}
+                    </div>
+                  )}
                   {hasFileAttachments && (
                     <div className="mb-3 flex flex-wrap gap-2">
                       {attachments.map((file, i) => (

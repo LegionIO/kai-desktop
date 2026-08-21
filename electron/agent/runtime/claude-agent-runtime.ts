@@ -34,7 +34,13 @@ import { MAX_TOOL_NAME_LENGTH } from '../../tools/naming.js';
 import { resolveStreamConfig } from '../model-catalog.js';
 import { withWorkingDirectoryPrompt } from '../instructions.js';
 import { registerPendingApproval, broadcastStreamEventRaw } from '../../ipc/tool-approval.js';
-import { pendingQuestionAnswers } from '../../tools/ask-user.js';
+import type { ApprovalSettleSource } from '../../ipc/tool-approval.js';
+import {
+  pendingQuestionAnswers,
+  getAskUserRecoveryRouter,
+  getActiveStreamTokenForConversation,
+  makeAnswerKey,
+} from '../../tools/ask-user.js';
 import { appendFileSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
@@ -764,6 +770,21 @@ function rewriteSdkError(text: string): string {
     .replace(/Run `claude login`[^.]*/gi, 'Check your API key in Settings → Model Providers.');
 }
 
+// enter_plan_mode interception (agent.ts) matches on toolName. Record tool_use_id → name at the
+// tool-CALL block so the result event can be stamped with the real name (R138 f-4) — otherwise
+// an SDK enter_plan_mode never triggers the plan-first restart and the query keeps its mutating
+// tools. Bounded: tool_use_ids are unique + short-lived (one turn); evict oldest.
+const sdkToolNameById = new Map<string, string>();
+const SDK_TOOL_NAME_MAP_MAX = 500;
+function recordSdkToolName(toolUseId: string, name: string): void {
+  sdkToolNameById.set(toolUseId, name);
+  while (sdkToolNameById.size > SDK_TOOL_NAME_MAP_MAX) {
+    const oldest = sdkToolNameById.keys().next().value;
+    if (oldest === undefined) break;
+    sdkToolNameById.delete(oldest);
+  }
+}
+
 function translateSdkMessage(conversationId: string, msg: SdkMessageAny): StreamEvent[] {
   const events: StreamEvent[] = [];
 
@@ -804,11 +825,16 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
       // content_block_start with tool_use — signal start of tool call
       if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
         const block = event.content_block;
+        const toolCallId = (block.id as string) ?? `tool-${Date.now()}`;
+        const toolName = normalizeToolName((block.name as string) ?? 'unknown');
+        // Record id → name so the later `user`-message tool_result block (which carries no name)
+        // can be stamped with the real tool name (R138 f-4).
+        if (block.id) recordSdkToolName(block.id as string, toolName);
         events.push({
           conversationId,
           type: 'tool-call',
-          toolCallId: (block.id as string) ?? `tool-${Date.now()}`,
-          toolName: normalizeToolName((block.name as string) ?? 'unknown'),
+          toolCallId,
+          toolName,
           args: block.input ?? {},
           startedAt: new Date().toISOString(),
         });
@@ -854,11 +880,13 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
       for (const block of betaMessage.content) {
         if (block.type === 'tool_use') {
           // Complete tool call from assistant message
+          const toolName = normalizeToolName(block.name ?? 'unknown');
+          if (block.id) recordSdkToolName(block.id, toolName);
           events.push({
             conversationId,
             type: 'tool-call',
             toolCallId: block.id ?? `tool-${Date.now()}`,
-            toolName: normalizeToolName(block.name ?? 'unknown'),
+            toolName,
             args: block.input ?? {},
             startedAt: new Date().toISOString(),
           });
@@ -1050,7 +1078,7 @@ function translateSdkMessage(conversationId: string, msg: SdkMessageAny): Stream
             conversationId,
             type: 'tool-result',
             toolCallId: block.tool_use_id,
-            toolName: '', // SDK doesn't include tool name in result; UI can match by toolCallId
+            toolName: sdkToolNameById.get(block.tool_use_id) ?? '', // stamped from the tool-CALL block (R138 f-4)
             result: isError ? { isError: true, error: resultText } : resultText,
             finishedAt,
           });
@@ -1122,7 +1150,13 @@ type CallToolResult = {
   isError?: boolean;
 };
 
-type ClaudeToolExecutionContext = ToolExecutionContext & { conversationId: string };
+type ClaudeToolExecutionContext = ToolExecutionContext & {
+  conversationId: string;
+  /** The OWNING run's stream token, captured at handler creation (bound to THIS run). Lets the
+   *  ask_user path classify an abort-driven recovery as terminal (Stop/dismiss) vs recoverable
+   *  supersession (R95/R100 f-6) without re-reading activeStreams (which may be torn down). */
+  owningStreamToken?: string;
+};
 
 /**
  * Create an MCP tool handler for a Kai tool definition.
@@ -1137,9 +1171,22 @@ function createToolHandler(
   abortSignal: AbortSignal | undefined,
   browserOwnerId: string | undefined,
 ): (args: unknown, extra: unknown) => Promise<CallToolResult> {
+  // Bind the owning run's stream token at creation (NOT re-read later): a post-Stop queued callback
+  // must still classify correctly even after activeStreams is torn down (R100 f-6).
+  const owningStreamToken = getActiveStreamTokenForConversation(conversationId);
   // Approval-backed special tools stay inside this wrapper so lifecycle hooks
   // can deny or rewrite their input and sanitize their result.
   return async (args: unknown): Promise<CallToolResult> => {
+    // If THIS run was already aborted (superseded / Stopped) before a queued callback fires, do NOT
+    // execute enter_plan_mode (R144 f-1): it would persist plan-first but never emit the result
+    // MAIN's mid-stream interception needs to restart, so the SUCCESSOR run continues with its
+    // mutating tool set while disk/UI show Plan-First. The turn is over — refuse.
+    if (toolDef.name === 'enter_plan_mode' && abortSignal?.aborted) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'The turn was stopped.' }) }],
+        isError: true,
+      };
+    }
     const toolCallPrefix =
       toolDef.name === 'ask_user' ? 'sdk-ask' : toolDef.name === 'exit_plan_mode' ? 'sdk-plan' : 'sdk-bridge';
     const toolCallId = `${toolCallPrefix}-${randomUUID()}`;
@@ -1149,6 +1196,11 @@ function createToolHandler(
       browserOwnerId,
       cwd,
       abortSignal,
+      owningStreamToken,
+      // The SDK runtime IS a gateable plan-mode context: enter_plan_mode restarts via MAIN's
+      // name-stamped mid-stream interception (R139) and exit_plan_mode is gated below. So the plan
+      // tools may execute here (R141).
+      planModeGateable: true,
     };
 
     try {
@@ -1206,16 +1258,37 @@ function createToolHandler(
  * events and sends answers via `agent:answer-tool-question` IPC.
  */
 async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionContext): Promise<unknown> {
-  const { toolCallId, conversationId, abortSignal, browserOwnerId } = context;
+  const { toolCallId, conversationId, abortSignal, browserOwnerId, owningStreamToken } = context;
+
+  // Reject a callback that fires AFTER this run was already aborted/stopped (R100 f-6): the SDK may
+  // invoke a queued tool callback post-abort, which would broadcast a stale question card and record
+  // a post-Stop recovery tombstone a later answer could use to resurrect the stopped conversation.
+  // Bail before any broadcast/stash.
+  if (abortSignal?.aborted) {
+    return { error: 'The turn was stopped before this question ran.' };
+  }
 
   debugLog(`[ASK_USER] Broadcasting question toolCallIdLength=${toolCallId.length}`);
 
+  // Capture the CATEGORICAL settle source (R94): abort resolves with the same 'dismiss' VALUE as a
+  // real user dismiss, so only onSettle can tell a recoverable abort (turn torn down mid-answer)
+  // apart from a deliberate reject/dismiss (user said no — must NOT be resurrected).
+  let settleSource: ApprovalSettleSource | undefined;
   // Register before broadcasting so a synchronous response cannot beat the
   // waiter, and so a dedicated pop-out can be bound to this exact request.
-  const approvalDecision = registerPendingApproval(toolCallId, abortSignal ?? undefined, 'any-renderer', {
-    conversationId,
-    browserOwnerId,
-  });
+  const approvalDecision = registerPendingApproval(
+    toolCallId,
+    abortSignal ?? undefined,
+    'any-renderer',
+    { conversationId, browserOwnerId },
+    {
+      conversationId,
+      toolName: 'ask_user',
+      onSettle: (source) => {
+        settleSource = source;
+      },
+    },
+  );
 
   // 1. Broadcast to renderer — shows question UI
   broadcastStreamEventRaw({
@@ -1232,13 +1305,35 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
   const approved = await approvalDecision;
 
   if (approved !== true) {
-    debugLog(`[ASK_USER] User dismissed/rejected question`);
+    // Route the durable recovered-answer path ONLY for a genuine ABORT (turn superseded / torn down
+    // while an answer raced in). A deliberate reject/dismiss means the user declined THIS question —
+    // resurrecting a late answer would override that, and on explicit Stop the cancel-generation
+    // bump could let a stale surface's answer restart a stopped turn. (R93 routing; R94 abort-scope.)
+    debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
+    if (settleSource === 'abort') {
+      try {
+        // Recovery is keyed by the run-scoped answerKey (R191 conversation + R249 run), matching how
+        // agent:answer-tool-question stashes the answer (R250: include this run's browserOwnerId nonce).
+        getAskUserRecoveryRouter()?.(
+          conversationId,
+          makeAnswerKey(conversationId, toolCallId, browserOwnerId),
+          owningStreamToken,
+        );
+      } catch {
+        /* best-effort — the bounded stash copy remains as the last resort */
+      }
+    }
     return { error: 'User dismissed the question.' };
   }
 
-  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler)
-  const answers = pendingQuestionAnswers.get(toolCallId);
-  pendingQuestionAnswers.delete(toolCallId);
+  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler under the run-scoped answerKey —
+  //    R191 conversation + R249 run). The run nonce is this run's browserOwnerId (the SAME value passed to
+  //    registerPendingApproval above), so the handler's stash key and this read key agree (R250).
+  const answerKey = makeAnswerKey(conversationId, toolCallId, browserOwnerId);
+  const answers =
+    pendingQuestionAnswers.get(answerKey) ?? pendingQuestionAnswers.get(makeAnswerKey(conversationId, toolCallId));
+  pendingQuestionAnswers.delete(answerKey);
+  pendingQuestionAnswers.delete(makeAnswerKey(conversationId, toolCallId));
 
   debugLog(`[ASK_USER] Got answers answerCount=${answers ? Object.keys(answers).length : 0}`);
 
@@ -1267,12 +1362,23 @@ async function executeExitPlanModeTool(
 ): Promise<unknown> {
   const { toolCallId, conversationId, abortSignal, browserOwnerId } = context;
 
+  // If THIS run was already aborted (a superseding GUI/CLI run replaced it) before the queued
+  // exit_plan_mode callback fires, do NOT broadcast an approval request (R128 f-3). The broadcast is
+  // UNTAGGED (no owning stream token), so the renderer would apply it to the SUCCESSOR run — wedging
+  // it at 'awaiting-approval' with no pending approval to resolve. Bail before broadcasting.
+  if (abortSignal?.aborted) {
+    return { error: 'The turn was stopped before the plan could be reviewed.' };
+  }
+
   debugLog(`[EXIT_PLAN_MODE] Broadcasting plan approval request toolCallIdLength=${toolCallId.length}`);
 
-  const approvalDecision = registerPendingApproval(toolCallId, abortSignal ?? undefined, 'any-renderer', {
-    conversationId,
-    browserOwnerId,
-  });
+  const approvalDecision = registerPendingApproval(
+    toolCallId,
+    abortSignal ?? undefined,
+    'any-renderer',
+    { conversationId, browserOwnerId },
+    { conversationId, toolName: 'exit_plan_mode' },
+  );
 
   // 1. Broadcast to renderer — shows plan review UI with approve/reject
   broadcastStreamEventRaw({

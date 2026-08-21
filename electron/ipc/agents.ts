@@ -164,6 +164,60 @@ function isValidAgentRuntime(runtime: unknown): runtime is AgentFile['runtime'] 
   return typeof runtime === 'string' && ALLOWED_AGENT_RUNTIMES.has(runtime);
 }
 
+const ALLOWED_AGENT_STATUSES = new Set<string>(['idle', 'running', 'error']);
+const ALLOWED_AGENT_ROLES = new Set<string>(['general', 'engineer', 'reviewer', 'researcher']);
+function isValidAgentStatus(v: unknown): v is AgentFile['status'] {
+  return typeof v === 'string' && ALLOWED_AGENT_STATUSES.has(v);
+}
+function isValidAgentRole(v: unknown): v is AgentFile['role'] {
+  return typeof v === 'string' && ALLOWED_AGENT_ROLES.has(v);
+}
+/** A plain (Object/null-prototype) non-array, non-null object — for nested config/stats fields that
+ *  the reconciler + renderer later dereference. Rejects null / arrays / primitives. */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Validate the NESTED shape of an AgentStats partial (R182): a container-only check accepts
+ *  `{tasksCompleted:{}}`, which persists and then crashes the agent-detail renderer when React tries
+ *  to render an object as a child. Every present field must match AgentStats' declared type. */
+function isValidAgentStatsShape(v: unknown): boolean {
+  if (!isPlainObject(v)) return false;
+  const numberFields = ['tasksCompleted', 'totalRuntime', 'crashCount'] as const;
+  for (const f of numberFields) {
+    if (v[f] !== undefined && (typeof v[f] !== 'number' || !Number.isFinite(v[f]))) return false;
+  }
+  const stringFields = ['lastRunAt', 'lastCrashAt'] as const;
+  for (const f of stringFields) {
+    if (v[f] !== undefined && typeof v[f] !== 'string') return false;
+  }
+  return true;
+}
+
+/** Validate the NESTED shape of an AgentRuntimeConfig partial (R182): same reasoning as stats —
+ *  a poisoned nested field (e.g. `{cwd:{}}`, `{env:[]}`) would persist and later crash a renderer
+ *  view or a runtime spawn that treats these as strings/records. */
+function isValidAgentConfigShape(v: unknown): boolean {
+  if (!isPlainObject(v)) return false;
+  const stringFields = ['cwd', 'modelKey', 'profileKey'] as const;
+  for (const f of stringFields) {
+    if (v[f] !== undefined && typeof v[f] !== 'string') return false;
+  }
+  const numberFields = ['maxSessionSeconds', 'maxCrashesPerDay'] as const;
+  for (const f of numberFields) {
+    if (v[f] !== undefined && (typeof v[f] !== 'number' || !Number.isFinite(v[f]))) return false;
+  }
+  if (v.customArgs !== undefined) {
+    if (!Array.isArray(v.customArgs) || v.customArgs.some((a) => typeof a !== 'string')) return false;
+  }
+  if (v.env !== undefined) {
+    if (!isPlainObject(v.env) || Object.values(v.env).some((e) => typeof e !== 'string')) return false;
+  }
+  return true;
+}
+
 /**
  * Match a value against a simple glob pattern supporting `*` as a prefix
  * and/or suffix wildcard only (no mid-string globs, no regex).
@@ -1639,9 +1693,22 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
 
   ipcMain.handle('agents:create', (_e, payload: CreateAgentPayload) => {
     try {
+      // Validate the untyped web-bridge payload (R181): a non-string name / bad role / non-object
+      // config would persist + broadcast and crash a renderer agent view (survives restart).
+      if (!isPlainObject(payload)) return { error: 'Invalid agent payload' };
       const runtime = payload.runtime ?? 'auto';
       if (!isValidAgentRuntime(runtime)) {
         return { error: `Unknown runtime: ${String(payload.runtime)}` };
+      }
+      if (!isValidAgentRole(payload.role)) {
+        return { error: `Invalid role: ${String(payload.role)}` };
+      }
+      for (const f of ['name', 'icon', 'description', 'instructions', 'workspaceId'] as const) {
+        const v = (payload as Record<string, unknown>)[f];
+        if (v !== undefined && typeof v !== 'string') return { error: `Invalid ${f}: expected string` };
+      }
+      if (payload.config !== undefined && !isValidAgentConfigShape(payload.config)) {
+        return { error: 'Invalid config' };
       }
       const id = randomUUID();
       const now = new Date().toISOString();
@@ -1691,6 +1758,45 @@ export function registerAgentHandlers(ipcMain: IpcMain, appHome: string, termina
     }
     if (updates.runtime !== undefined && !isValidAgentRuntime(updates.runtime)) {
       return { error: `Unknown runtime: ${String(updates.runtime)}` };
+    }
+    // The web bridge is UNTYPED — reject a non-string value for any STRING-typed field (R180): a
+    // poisoned `{terminalSessionId:{}}` would persist and later crash the reconciler when it calls
+    // .startsWith()/path ops on the object (an uncaught main-process exception, and the bad record
+    // survives restart). Validate every string field present in `updates`.
+    const stringFields = [
+      'name',
+      'icon',
+      'description',
+      'instructions',
+      'matchedRoleId',
+      'terminalSessionId',
+      'workspaceId',
+    ] as const;
+    for (const f of stringFields) {
+      const v = (updates as Record<string, unknown>)[f];
+      if (v !== undefined && typeof v !== 'string') {
+        return { error: `Invalid ${f}: expected string` };
+      }
+    }
+    if (updates.capabilities !== undefined) {
+      if (!Array.isArray(updates.capabilities) || updates.capabilities.some((c) => typeof c !== 'string')) {
+        return { error: 'Invalid capabilities: expected string[]' };
+      }
+    }
+    // Enum + nested-object fields (R181/R182): a poisoned {status:"x"} / {stats:null} / {config:[]}
+    // would shallow-merge and later crash the reconciler (dereferences stats) or a renderer view.
+    // Validate the NESTED shape too — a container-only check still admits {stats:{tasksCompleted:{}}}.
+    if (updates.status !== undefined && !isValidAgentStatus(updates.status)) {
+      return { error: `Invalid status: ${String(updates.status)}` };
+    }
+    if (updates.role !== undefined && !isValidAgentRole(updates.role)) {
+      return { error: `Invalid role: ${String(updates.role)}` };
+    }
+    if (updates.stats !== undefined && !isValidAgentStatsShape(updates.stats)) {
+      return { error: 'Invalid stats' };
+    }
+    if (updates.config !== undefined && !isValidAgentConfigShape(updates.config)) {
+      return { error: 'Invalid config' };
     }
     const existing = readAgent(appHome, id);
     if (!existing) return { error: `Agent ${id} not found` };

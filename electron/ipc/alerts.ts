@@ -24,12 +24,13 @@ import {
   type Alert,
   type CreateAlertInput,
 } from './alert-store.js';
-import { readConversation } from './conversation-store.js';
+import { readConversation, isWriteTombstoned } from './conversation-store.js';
 import { resumeConversationWithMessage, type ActionDeps } from '../automations/actions.js';
 import { setAlertCreatedHandler } from './alert-notify.js';
+import { setRecoveredAnswerDeliverer } from '../tools/ask-user.js';
 import { isGuiFocused } from '../agent/kai-presence.js';
 import { traceDiagnostic } from '../diagnostics/debug-trace.js';
-import { broadcastToWebClients } from '../web-server/web-clients.js';
+import { broadcastToAllWindows } from '../utils/window-send.js';
 import { openNotificationWindow, closeNotificationWindow } from '../notification-window.js';
 
 /** Deps the alerts layer needs: where alerts live + how to resume a conversation. */
@@ -39,6 +40,13 @@ export interface AlertsDeps {
   getActionDeps: () => ActionDeps;
   /** Effective alert surface (mutually exclusive): 'off' | 'modal' | 'window'. */
   alertSurface: () => 'off' | 'modal' | 'window';
+  /** Whether a stream/run is still active for a conversation. Injected (not a direct
+   *  agent.js import) so the alerts layer stays out of agent.ts's heavy module graph.
+   *  Used to reconcile the recovered-answer durability alert against the run lifecycle
+   *  (dismiss on commit; keep once the run ends uncommitted) rather than a fixed poll
+   *  timeout that a long tool step would outlive (R119). Optional: absent → the poll
+   *  falls back to its bounded ceiling. */
+  isConversationTurnActive?: (conversationId: string) => boolean;
 }
 
 let deps: AlertsDeps | null = null;
@@ -49,6 +57,419 @@ export function initializeAlerts(d: AlertsDeps): void {
   // Let the tools layer (request_review / ask_user fallback) trigger OS
   // notifications + UI broadcasts after it writes the alert store directly.
   setAlertCreatedHandler(notifyNewAlert);
+  // Let the ask_user raced-answer machinery deliver an answer whose run finished
+  // before consuming it (ordinary completion + in-flight delivery + no genuine
+  // successor) — into the ORIGIN conversation as a labeled turn, with a persistent
+  // Alert as the durable fallback (see deliverRecoveredAnswer). Wired here (not a
+  // direct import in agent.ts) so the tools/agent layers stay free of the
+  // automations/alerts graph — mirrors setAlertCreatedHandler.
+  setRecoveredAnswerDeliverer(deliverRecoveredAnswer);
+}
+
+/** Allocate a stable user-turn id GUARANTEED not to collide with an existing node in
+ *  the conversation tree. A colliding id would be reminted by appendConversationMessages,
+ *  so the persisted node's id would differ from the requested one and the commit-check
+ *  by-id would false-negative (→ reopen → duplicate). Random ids make a collision
+ *  astronomically unlikely, but verify against the current tree and regenerate to be
+ *  safe (R105 finding-1). */
+function allocateFreshTurnId(appHome: string, conversationId: string, prefix: string): string {
+  let existing: Set<string>;
+  try {
+    const conv = readConversation(appHome, conversationId) as { messageTree?: Array<{ id?: unknown }> } | null;
+    existing = new Set((conv?.messageTree ?? []).map((m) => (typeof m?.id === 'string' ? m.id : '')).filter(Boolean));
+  } catch {
+    existing = new Set();
+  }
+  for (let i = 0; i < 8; i++) {
+    const id = `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    if (!existing.has(id)) return id;
+  }
+  // Astronomically unreachable; fall back to a highly-entropic id.
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Collect the conversation's persisted per-thread overrides into the shape
+ *  `resumeConversationWithMessage` forwards to the stream. Returns `undefined`
+ *  when none are set so callers can omit the field entirely (R92). */
+function buildThreadOverrides(conv: {
+  temperature?: number | null;
+  systemPromptOverride?: string | null;
+  maxSteps?: number | null;
+  maxRetries?: number | null;
+  runtimeOverride?: string | null;
+}):
+  | {
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    }
+  | undefined {
+  const overrides: {
+    temperature?: number | null;
+    systemPromptOverride?: string | null;
+    maxSteps?: number | null;
+    maxRetries?: number | null;
+    runtimeOverride?: string | null;
+  } = {};
+  if (typeof conv.temperature === 'number') overrides.temperature = conv.temperature;
+  if (typeof conv.systemPromptOverride === 'string') overrides.systemPromptOverride = conv.systemPromptOverride;
+  if (typeof conv.maxSteps === 'number') overrides.maxSteps = conv.maxSteps;
+  if (typeof conv.maxRetries === 'number') overrides.maxRetries = conv.maxRetries;
+  if (typeof conv.runtimeOverride === 'string') overrides.runtimeOverride = conv.runtimeOverride;
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
+}
+
+/**
+ * Deliver an ALREADY-COLLECTED raced answer whose run finished before it could be
+ * consumed (the ordinary-completion / in-flight-delivery orphan case — see the
+ * ask_user raced-answer machinery in agent.ts). We already have the user's answer,
+ * so this does NOT re-ask: it re-injects the answer into the ORIGINATING
+ * conversation as a clearly-labeled `[Answering your earlier question …]` user turn
+ * (idle conv → fresh turn; busy conv → a follow-up in the SAME chat — a legitimate
+ * late user message, NOT a cross-turn splice). This is why it can't misdeliver the
+ * way the raced-answer HANDOFF could: the answer only ever reaches the origin
+ * conversation, never an unrelated turn's tool loop.
+ *
+ * If inline delivery isn't possible (conversation gone, or the resume throws /
+ * rejects busy), fall back to a persistent `question` Alert carrying the answer so
+ * it survives an app restart and the user can re-surface it — nothing is silently
+ * lost. Returns `{ delivered:true }` only when the inline re-inject was launched.
+ */
+export async function deliverRecoveredAnswer(
+  conversationId: string,
+  questionTitle: string,
+  answers: Record<string, string>,
+): Promise<{ delivered: boolean }> {
+  if (!deps) return { delivered: false };
+  // Recovery normalizer — NOT the strict alerts:answer sanitizeAnswer: ask_user
+  // permits question text > 200 chars and free-text ("Other") answers with no
+  // 2000-char cap, and this answer was ALREADY collected + accepted. Rejecting a
+  // valid long answer here would drop it to the evictable in-memory stash (lost on
+  // restart). So keep every string entry, truncating only pathological outliers to
+  // a generous bound (defensive against an unbounded value inflating the prompt).
+  const MAX_RECOVERY_VALUE = 16 * 1024;
+  const clean: Record<string, string> = {};
+  if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+    for (const [k, v] of Object.entries(answers)) {
+      if (typeof k !== 'string' || typeof v !== 'string') continue;
+      clean[k] = v.length > MAX_RECOVERY_VALUE ? `${v.slice(0, MAX_RECOVERY_VALUE)}…` : v;
+    }
+  }
+  if (Object.keys(clean).length === 0) return { delivered: false };
+  const title = questionTitle.trim() || 'your earlier question';
+  const lines = Object.entries(clean).map(([header, choice]) => `- ${header} → ${choice}`);
+  const body = lines.length ? lines.join('\n') : '(no answer provided)';
+  // Unique per-delivery id embedded in the labeled turn. The post-failure
+  // committed-check matches THIS exact id, so two concurrent recoveries into the
+  // same conversation can't be confused — even when one's answer text is a prefix
+  // of the other's, or when both carry identical answers (R94). Rendered as a
+  // trailing HTML comment so it doesn't clutter the visible turn but survives the
+  // JSON round-trip on disk.
+  const deliveryId = `rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const text = `[Answering your earlier question "${title}"]\n${body}\n<!-- ${deliveryId} -->`;
+  // Stable id for the persisted user turn so the post-failure commit-check finds it
+  // by EXACT id even if a policy hook strips the in-content marker (R104). Collision-
+  // free vs the current tree so appendConversationMessages won't remint it (R105 f-1).
+  const userTurnId = allocateFreshTurnId(deps.appHome, conversationId, `rcv-turn-${deliveryId}`);
+  const correlationId = `recovered-answer-${conversationId}`;
+  // Function-scoped so the durable pending-delivery alert (created before the resume
+  // await, below) can be dismissed from BOTH the inline-resume paths and the final
+  // fallback path (which is outside the `if (conv)` block) (R117).
+  let pendingAlertId: string | null = null;
+  const alertsAppHome = deps.appHome;
+  const dismissPendingAlert = () => {
+    if (pendingAlertId) {
+      try {
+        dismissAlert(alertsAppHome, pendingAlertId);
+      } catch {
+        /* best-effort cleanup */
+      }
+      pendingAlertId = null;
+    }
+  };
+  // Inline re-inject into the ORIGIN conversation when it still exists on disk.
+  const conv = readConversation(deps.appHome, conversationId);
+  if (conv) {
+    const convBefore = conv as {
+      selectedModelKey?: string | null;
+      selectedProfileKey?: string | null;
+      currentWorkingDirectory?: string | null;
+      fallbackEnabled?: boolean;
+      executionMode?: 'auto' | 'plan-first' | null;
+      reasoningEffort?: string | null;
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+      messages?: unknown[];
+    };
+    const threadOverrides = buildThreadOverrides(convBefore);
+    // DURABILITY BEFORE THE AWAIT (R117): the resume can wait up to ~60s behind an
+    // automation turn in the ordered barrier. The recovered answer lives only in the
+    // in-memory stash (and its tombstone was cleared), so if Kai EXITS during that wait
+    // the answer is lost with no user-visible trace. Record a durable pending-delivery
+    // Alert NOW; it survives a restart so the user can re-surface the answer. Dismiss it
+    // once we CONFIRM the turn committed (delivered / committed-in-catch); KEEP it only
+    // on a genuine pre-commit failure (replaced by the accurate "not delivered" record).
+    try {
+      const pendingAlert = createAlert(deps.appHome, {
+        kind: 'fyi',
+        title: `Delivering your answer: ${title}`,
+        body: `Recording your answer to continue the conversation:\n${body}`,
+        conversationId,
+      });
+      pendingAlertId = pendingAlert.id;
+      // Do NOT notifyNewAlert here — this is a transient durability record dismissed on
+      // success; surfacing it would flash a notification for the normal (fast) path.
+    } catch {
+      /* alert persistence failed — handled below (fall to the durable fallback) */
+    }
+    // If the durable pending-delivery record could NOT be created, the whole "durable before
+    // the await" guarantee is void — a Kai exit during the resume wait would lose the answer
+    // with no trace (R150 f-1, not covered by settled item 5 which assumes the record exists).
+    // So do NOT enter the fragile fire-and-forget resume; fall through to the durable fallback
+    // Alert below (which records the answer as a persistent, restart-surviving entry).
+    if (pendingAlertId) {
+      try {
+        // Preserve the conversation's OWN model/profile/cwd/fallback/executionMode so
+        // the recovered answer runs under the same context the question was asked in —
+        // not the global default (R89/R90/R91). executionMode especially: a plan-first
+        // conversation must NOT resume in auto and expose mutating workspace tools.
+        // reasoningEffort + per-thread overrides (temperature/systemPrompt/maxSteps/…)
+        // are threaded too so the resume honors the conversation's own runtime (R92).
+        await resumeConversationWithMessage(conversationId, text, deps.getActionDeps(), {
+          correlationId,
+          ...(convBefore.selectedModelKey ? { modelKey: convBefore.selectedModelKey } : {}),
+          ...(convBefore.selectedProfileKey ? { profileKey: convBefore.selectedProfileKey } : {}),
+          ...(convBefore.currentWorkingDirectory ? { cwd: convBefore.currentWorkingDirectory } : {}),
+          ...(typeof convBefore.fallbackEnabled === 'boolean' ? { fallbackEnabled: convBefore.fallbackEnabled } : {}),
+          ...(convBefore.executionMode ? { executionMode: convBefore.executionMode } : {}),
+          ...(convBefore.reasoningEffort ? { reasoningEffort: convBefore.reasoningEffort } : {}),
+          ...(threadOverrides ? { threadOverrides } : {}),
+          userTurnId,
+        });
+        traceDiagnostic({
+          scope: 'alert',
+          event: 'recovered-answer.delivered',
+          correlationId,
+          conversationId,
+          fields: { answerCount: Object.keys(clean).length },
+        });
+        // "resume succeeded" does NOT mean the user turn is on disk: a SERVER-OWNED
+        // COOPERATIVE splice (CLI/headless Mastra) defers persistence to the next
+        // prepareStep, which lands only AFTER the current (possibly long-running) tool
+        // step. Reconcile against the RUN LIFECYCLE, not a fixed timeout: dismiss the
+        // durable pending alert the moment the userTurnId commits; keep polling WHILE the
+        // run is still active (a long tool step must not orphan the alert — R119); and
+        // stop (KEEPING the alert as the recoverable record) once the run is no longer
+        // active without having committed (a Kai exit before drain, or an aborted/stuck
+        // run). A non-cooperative abort+restart persists synchronously → first check
+        // passes. Bounded ceiling backstops a run whose active-state signal never clears.
+        const isCommittedOnDisk = () => {
+          try {
+            const after = readConversation(alertsAppHome, conversationId) as {
+              messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+              messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+            } | null;
+            const nodes = [
+              ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+              ...(Array.isArray(after?.messages) ? after!.messages : []),
+            ];
+            return nodes.some(
+              (m) =>
+                m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
+            );
+          } catch {
+            return false;
+          }
+        };
+        let committedOnDisk = isCommittedOnDisk();
+        // Reconcile against the run lifecycle with NO fixed time ceiling when lifecycle
+        // tracking is available: a server-owned Mastra run can hold a single tool step
+        // (e.g. a long shell timeout) for far longer than any fixed budget, and the
+        // recovered answer only commits at the NEXT prepareStep after it. So loop until
+        // the answer commits OR the run actually terminates (then a short grace for the
+        // terminal persist) — a fixed ceiling would abandon the alert mid-run and leave
+        // it stale (R119→R120). Back off the poll interval so a multi-minute tool step
+        // isn't polled tightly. Without a lifecycle signal, keep the bounded ~3s fallback.
+        const runActive = deps?.isConversationTurnActive;
+        let inactiveGrace = 3;
+        // If the conversation is DELETED during the resume wait (another client/window),
+        // abandon the delivery: dismiss the durable pending alert (a FYI record referencing a
+        // deleted chat is worse than nothing) and stop reconciling. Use the DURABLE tombstone
+        // (isWriteTombstoned = in-memory isRecentlyDeleted OR the index's persisted deleted-id
+        // ring), NOT a null read — a null read can be a transient EMFILE/JSON error (would drop a
+        // live answer), and a purely in-memory tombstone can EXPIRE (10min) / EVICT (5000) before
+        // a long resume observes it (R134 f-1). The durable ring survives restart + TTL + eviction.
+        // Throw-safe (R146 f-2): the tombstone check reads the index, which can throw (EMFILE during
+        // a rebuild) — a throw must NOT abandon a LIVE delivery, so treat a lookup failure as "not
+        // gone" and keep reconciling.
+        const conversationGone = () => {
+          try {
+            return isWriteTombstoned(alertsAppHome, conversationId);
+          } catch {
+            return false;
+          }
+        };
+        // Absolute backstop so a pathologically-stuck (never-terminating) active run can't
+        // leak this loop forever — far above any real tool timeout. Reaching it keeps the
+        // alert (uncommitted), which is the safe outcome.
+        const MAX_RECONCILE_MS = 6 * 60 * 60 * 1000; // 6h
+        const startedAt = Date.now();
+        for (let i = 0; !committedOnDisk; i++) {
+          if (Date.now() - startedAt > MAX_RECONCILE_MS) break;
+          // Deleted mid-wait → abandon: drop the durable alert (no FYI for a deleted chat).
+          if (conversationGone()) {
+            dismissPendingAlert();
+            return { delivered: false };
+          }
+          if (runActive) {
+            // Stop once the run is no longer streaming AND a short grace has elapsed —
+            // whatever was going to commit has; keep the alert if it still hasn't.
+            if (!runActive(conversationId) && inactiveGrace-- <= 0) break;
+          } else if (i >= 20) {
+            break; // no lifecycle signal → bounded ~3s fallback (R118 behavior)
+          }
+          // 150ms while the commit is imminent (first ~3s / after the run goes inactive),
+          // then back off to 1s so a long-running tool step doesn't tight-loop for minutes.
+          const stillRunning = runActive ? runActive(conversationId) : false;
+          await new Promise((r) => setTimeout(r, i < 20 || !stillRunning ? 150 : 1000));
+          committedOnDisk = isCommittedOnDisk();
+        }
+        if (committedOnDisk) dismissPendingAlert();
+        return { delivered: true };
+      } catch {
+        // fall through to the durable Alert fallback — but first determine whether the
+        // failure was BEFORE or AFTER the user turn was committed to the branch.
+        // resumeConversationWithMessage persists the labeled user turn EARLY, then
+        // streams; a throw AFTER commit (generation/finalization failure) means the
+        // answer is ALREADY on-branch, so telling the user to re-send would DUPLICATE
+        // it (and repeat tool side effects). Detect the committed turn on disk and word
+        // the fallback accordingly (R90).
+        try {
+          const after = readConversation(deps.appHome, conversationId) as {
+            messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+            messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+          } | null;
+          // Conversation DELETED during the (failed) resume → abandon: dismiss the durable
+          // pending alert and surface nothing (a FYI for a deleted chat is noise / stale data,
+          // R133 f-1). Use the DURABLE tombstone (isWriteTombstoned), NOT `after == null` — a
+          // null read can be a transient I/O error, and an in-memory-only tombstone can expire/
+          // evict before a long resume's failure lands (R134 f-1). THROW-SAFE (R147 f-2):
+          // isWriteTombstoned can throw (index rebuild EMFILE) — a throw here must NOT skip the
+          // committed-turn scan below (which would misclassify a COMMITTED turn as undelivered →
+          // invite a duplicate resend). A failed lookup → treat as not-deleted, fall through.
+          let targetDeleted = false;
+          try {
+            targetDeleted = isWriteTombstoned(deps.appHome, conversationId);
+          } catch {
+            targetDeleted = false;
+          }
+          if (targetDeleted) {
+            dismissPendingAlert();
+            return { delivered: false };
+          }
+          // The record could NOT be read (transient EMFILE/EACCES/parse) but the conversation is
+          // NOT deleted — we CANNOT confirm the turn didn't commit (R154 f-4). Do NOT invite a
+          // re-send (a committed turn + a resend would DUPLICATE it + repeat tool effects). Surface
+          // the CAUTIOUS "verify before resending" alert instead of "not delivered, re-send".
+          if (after == null) {
+            dismissPendingAlert();
+            try {
+              const alert = createAlert(deps.appHome, {
+                kind: 'fyi',
+                title: `Answer may be incomplete: ${title}`,
+                body: `Your answer was being applied but the conversation couldn't be read to confirm. CHECK the conversation before re-sending — if your answer is already there, re-sending would duplicate it:\n${body}`,
+                conversationId,
+              });
+              notifyNewAlert(alert);
+            } catch {
+              /* best-effort — the caller retains its bounded-stash copy */
+            }
+            return { delivered: false };
+          }
+          // The CURRENT resume committed its user turn iff a message carrying THIS
+          // resume's UNIQUE deliveryId is on disk. Search the WHOLE message set (tree +
+          // active branch), NOT a count-based suffix: a count-relative slice breaks if
+          // the branch was rewound to a shorter one while the resume was queued (the
+          // committed turn then sits outside `slice(beforeMessageCount)` and is missed,
+          // wrongly reporting delivered:false → duplicate resend). The deliveryId is
+          // globally unique and appears ONLY in this recovery's turn, so a full-set scan
+          // can't false-positive on a concurrent/earlier recovery either (R94/R96).
+          const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
+            ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+            ...(Array.isArray(after?.messages) ? after!.messages : []),
+          ];
+          // Committed iff a user node carries THIS resume's exact userTurnId (durable
+          // against a content-rewriting policy hook, R104) OR the in-content marker
+          // survived (fast path / cooperative-inject where the id may differ).
+          const committed = nodes.some(
+            (m) => m?.role === 'user' && (m.id === userTurnId || JSON.stringify(m.content ?? '').includes(deliveryId)),
+          );
+          if (committed) {
+            // The answer IS on-branch; only the response generation failed. Do NOT invite
+            // a resend (it would duplicate). Surface an informational alert instead.
+            dismissPendingAlert(); // replaced by the accurate "response incomplete" alert
+            try {
+              const alert = createAlert(deps.appHome, {
+                kind: 'fyi',
+                title: `Answer applied, response incomplete: ${title}`,
+                body: `Your answer was recorded on the conversation, but generating the response failed. Continue in the conversation — do NOT re-send (that would duplicate it):\n${body}`,
+                conversationId,
+              });
+              notifyNewAlert(alert);
+              traceDiagnostic({
+                scope: 'alert',
+                event: 'recovered-answer.committed-response-failed',
+                correlationId,
+                conversationId,
+                alertId: alert.id,
+                fields: { answerCount: Object.keys(clean).length },
+              });
+            } catch {
+              /* best-effort */
+            }
+            // Committed = the answer reached the branch; report delivered so the caller
+            // consumes the stash and doesn't ALSO route it elsewhere.
+            return { delivered: true };
+          }
+        } catch {
+          /* fall through to the pre-commit "re-send" fallback below */
+        }
+      }
+    }
+  }
+  // Durable fallback: raise a persistent `fyi` Alert that RECORDS the answer the
+  // user gave (in the body) so it's neither silently lost nor misdelivered — it
+  // survives an app restart and the user can re-send it manually from the
+  // conversation if still relevant. NOT a `question` alert: we already have the
+  // answer, so re-asking would be confusing, and an answerable synthetic question
+  // (`alerts:answer`) would re-inject the SYNTHETIC choice ("Resend"/"Discard"),
+  // not the saved answer — the wrong payload.
+  dismissPendingAlert(); // replaced by the accurate "not delivered" record below
+  try {
+    const alert = createAlert(deps.appHome, {
+      kind: 'fyi',
+      title: `Answer not delivered: ${title}`,
+      body: `Your answer arrived after the turn ended, so it wasn't applied:\n${body}\n\nIf it's still relevant, re-send it in the conversation.`,
+      conversationId,
+    });
+    notifyNewAlert(alert);
+    traceDiagnostic({
+      scope: 'alert',
+      event: 'recovered-answer.alerted',
+      correlationId,
+      conversationId,
+      alertId: alert.id,
+      fields: { answerCount: Object.keys(clean).length },
+    });
+  } catch {
+    /* best-effort — the caller retains its bounded-stash copy as the last resort */
+  }
+  return { delivered: false };
 }
 
 /** Push an `alerts:changed` event to every window + web client (tab badge / modal host). */
@@ -65,10 +486,11 @@ function broadcastAlertsChanged(payload: {
   if ((payload.reason === 'resolved' || payload.reason === 'dismissed') && payload.alert) {
     closeNotificationWindow(payload.alert.id);
   }
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('alerts:changed', payload);
-  }
-  broadcastToWebClients('alerts:changed', payload);
+  // Guarded, non-throwing fan-out: a navigating window's send throwing here must not
+  // propagate — the alerts:answer/decide handler broadcasts BEFORE resume(), so a
+  // throw would leave the alert persisted-as-answered but never resumed (its answer
+  // never injected, and non-retryable) (R107 finding-2).
+  broadcastToAllWindows('alerts:changed', payload);
 }
 
 /** Bring the main window front-most + focused (used when surfaceAlertsAsModal is on). */
@@ -146,10 +568,7 @@ export function notifyNewAlert(alert: Alert): void {
         const n = new Notification({ title: `${verb}: ${alert.title}`, body: alert.body.slice(0, 240) });
         n.on('click', () => {
           focusMainWindowForModal();
-          for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send('alerts:navigate', { alertId: alert.id });
-          }
-          broadcastToWebClients('alerts:navigate', { alertId: alert.id });
+          broadcastToAllWindows('alerts:navigate', { alertId: alert.id });
         });
         n.show();
       }
@@ -198,13 +617,105 @@ function formatDecision(alert: Alert, decision: 'approve' | 'deny', note?: strin
  *  user's answer isn't silently lost and they can retry. */
 async function resume(alert: Alert, userText: string): Promise<void> {
   if (!deps) throw new Error('alerts not initialized');
+  // Unique per-delivery marker (trailing HTML comment) so a post-failure check can
+  // tell whether THIS answer's user turn was committed to the branch. A resume can
+  // persist the user turn EARLY, run tools, then throw during finalization — blindly
+  // reopening the alert on ANY failure then lets the user re-answer, appending the
+  // turn again and repeating tool side effects. Search the full tree for the marker;
+  // reopen ONLY when the turn was not committed (R101 finding-4). Mirrors
+  // deliverRecoveredAnswer's committed-check.
+  const deliveryId = `alert-rcv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const markedText = `${userText}\n<!-- ${deliveryId} -->`;
+  // Allocate a STABLE id for the resumed user turn and thread it through so the
+  // idle-resume append persists the turn under EXACTLY this id. A post-failure commit
+  // check then looks for THIS id (durable against a content-rewriting hook, and immune
+  // to a CONCURRENT unrelated GUI/CLI user turn — the ordered barrier serializes only
+  // automation turns, so "any new user id = committed" would false-positive and leave
+  // the alert wrongly resolved with its answer never delivered, R103 finding-2). The
+  // in-content marker stays as a fallback for the cooperative-inject path (which mints
+  // its own id): if BOTH are absent we conservatively reopen (re-answerable) rather
+  // than silently drop.
+  const userTurnId = allocateFreshTurnId(deps.appHome, alert.conversationId, `alert-turn-${alert.id}`);
   try {
-    await resumeConversationWithMessage(alert.conversationId, userText, deps.getActionDeps(), {
+    // Run the resumed turn in the conversation's OWN context (model/profile/cwd/
+    // fallback/executionMode) rather than the global default (R90/R91) — a plan-first
+    // conversation must resume in plan-first, not auto (which would expose mutating
+    // tools).
+    const conv = readConversation(deps.appHome, alert.conversationId) as {
+      selectedModelKey?: string | null;
+      selectedProfileKey?: string | null;
+      currentWorkingDirectory?: string | null;
+      fallbackEnabled?: boolean;
+      executionMode?: 'auto' | 'plan-first' | null;
+      reasoningEffort?: string | null;
+      temperature?: number | null;
+      systemPromptOverride?: string | null;
+      maxSteps?: number | null;
+      maxRetries?: number | null;
+      runtimeOverride?: string | null;
+    } | null;
+    const threadOverrides = conv ? buildThreadOverrides(conv) : undefined;
+    await resumeConversationWithMessage(alert.conversationId, markedText, deps.getActionDeps(), {
       correlationId: `alert-${alert.id}`,
+      ...(conv?.selectedModelKey ? { modelKey: conv.selectedModelKey } : {}),
+      ...(conv?.selectedProfileKey ? { profileKey: conv.selectedProfileKey } : {}),
+      ...(conv?.currentWorkingDirectory ? { cwd: conv.currentWorkingDirectory } : {}),
+      ...(typeof conv?.fallbackEnabled === 'boolean' ? { fallbackEnabled: conv.fallbackEnabled } : {}),
+      ...(conv?.executionMode ? { executionMode: conv.executionMode } : {}),
+      ...(conv?.reasoningEffort ? { reasoningEffort: conv.reasoningEffort } : {}),
+      ...(threadOverrides ? { threadOverrides } : {}),
+      userTurnId,
     });
   } catch (err) {
-    const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
-    if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
+    // Only reopen (invite a re-answer) when the answer's user turn is NOT already on
+    // the branch — otherwise re-answering would duplicate it + repeat tool effects.
+    let committed = false;
+    let readFailed = false;
+    try {
+      const after = readConversation(deps.appHome, alert.conversationId) as {
+        messages?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+        messageTree?: Array<{ id?: unknown; role?: unknown; content?: unknown }>;
+      } | null;
+      // A null read is a transient I/O failure (EMFILE/EACCES/parse) — NOT proof of non-commit
+      // (R154 f-4). Track it: on a failed read we must NOT reopen (a committed turn + a reopened
+      // re-answer would DUPLICATE it), unless the conversation is confirmed deleted.
+      if (after == null) readFailed = true;
+      const nodes: Array<{ id?: unknown; role?: unknown; content?: unknown }> = [
+        ...(Array.isArray(after?.messageTree) ? after!.messageTree : []),
+        ...(Array.isArray(after?.messages) ? after!.messages : []),
+      ];
+      // Committed iff a user node carrying THIS resume's exact stable userTurnId is
+      // on the tree (durable, hook-proof, and can't match a concurrent unrelated turn)
+      // OR — for the cooperative-inject path, which mints its own id — the in-content
+      // marker survived (fast path). NOT "any new user id": a concurrent GUI/CLI turn
+      // would false-positive and leave the alert wrongly resolved (R103 finding-2).
+      committed = nodes.some((m) => {
+        if (m?.role !== 'user') return false;
+        if (m.id === userTurnId) return true;
+        return JSON.stringify(m.content ?? '').includes(deliveryId);
+      });
+    } catch {
+      readFailed = true; // couldn't read → can't confirm non-commit; don't reopen (may duplicate)
+    }
+    if (!committed && !readFailed) {
+      // Do NOT reopen for a conversation that was DELETED during/before the resume (R144 f-3):
+      // reopening clears the recorded answer and re-surfaces an alert that can NEVER be answered
+      // (its conversation is gone), stranding it. A confirmed-deleted target → leave it dismissed.
+      // But the tombstone check reads the index, which can THROW (EMFILE/permission during a
+      // rebuild) — a throw must NOT bypass reopen for a LIVE conversation (R146 f-2), so treat a
+      // lookup failure as "not tombstoned" and fall through to reopen (safer: let the user retry).
+      let targetDeleted = false;
+      try {
+        targetDeleted = Boolean(deps && isWriteTombstoned(deps.appHome, alert.conversationId));
+      } catch {
+        targetDeleted = false;
+      }
+      if (targetDeleted) {
+        throw err;
+      }
+      const reopened = deps ? reopenAlert(deps.appHome, alert.id) : null;
+      if (reopened) broadcastAlertsChanged({ reason: 'created', alert: reopened });
+    }
     throw err;
   }
 }

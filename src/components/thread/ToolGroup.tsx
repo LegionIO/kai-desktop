@@ -39,6 +39,7 @@ import {
 import ShikiHighlighter from 'react-shiki';
 import { app } from '@/lib/ipc-client';
 import { useConfig } from '@/providers/ConfigProvider';
+import { useRuntimeConversationId } from '@/providers/RuntimeProvider';
 import { EditDiffSummary } from './EditDiffSummary';
 import { copyTextToClipboard, logClipboardError } from '@/lib/clipboard';
 import { Tooltip } from '@/components/ui/Tooltip';
@@ -129,6 +130,9 @@ export const ToolCallDisplay: FC<{
   const [feedbackText, setFeedbackText] = useState('');
   const [createdTaskIdLocal, setCreatedTaskIdLocal] = useState<string | null>(null);
   const tasksCtx = useTasksOptional();
+  // Conversation-scoped answer key (R192): reject/dismiss must purge the raced-answer handoff/tombstone
+  // under conversationId::toolCallId, matching how the answer path stashes.
+  const conversationId = useRuntimeConversationId();
   // Derive createdTaskId from the tasks list (survives remount) or fall back to local state
   const createdTaskId = useMemo(() => {
     if (createdTaskIdLocal) return createdTaskIdLocal;
@@ -225,7 +229,7 @@ export const ToolCallDisplay: FC<{
     // so we never send two approve/reject IPC calls for one approval.
     if (localApproval) return;
     setLocalApproval('approved');
-    void app.agent.approveToolCall(part.approvalId ?? part.toolCallId);
+    void app.agent.approveToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
     // Bridge: create a task queue entry from approved plan
     if (isPlanApproval && planContent) {
       const task = await onPlanApproved?.({
@@ -248,29 +252,30 @@ export const ToolCallDisplay: FC<{
     planArgs?.planTitle,
     planFileName,
     onPlanApproved,
+    conversationId,
   ]);
 
   const handleReject = useCallback(() => {
     if (localApproval) return;
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
     refocusComposer();
-  }, [localApproval, part.toolCallId, part.approvalId]);
+  }, [localApproval, part.toolCallId, part.approvalId, conversationId]);
 
   const handleDismiss = useCallback(() => {
     setLocalApproval('dismissed');
-    void app.agent.dismissToolCall(part.approvalId ?? part.toolCallId);
+    void app.agent.dismissToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
     refocusComposer();
-  }, [part.toolCallId, part.approvalId]);
+  }, [part.toolCallId, part.approvalId, conversationId]);
 
   const handleFeedbackSubmit = useCallback(() => {
     if (!feedbackText.trim()) return;
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId);
+    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
     onSendFeedback?.(feedbackText.trim());
     setFeedbackText('');
     refocusComposer();
-  }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback]);
+  }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback, conversationId]);
 
   const summary = getToolSummary(part);
   const subtitle = getToolSubtitle(part);
@@ -437,6 +442,7 @@ export const ToolCallDisplay: FC<{
             approvalId={part.approvalId ?? part.toolCallId}
             args={part.args}
             active={isPendingApproval}
+            conversationId={conversationId ?? undefined}
           />
         </div>
       )}
@@ -931,6 +937,9 @@ const QuestionnaireView: FC<{
   const [activeTab, setActiveTab] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [otherTexts, setOtherTexts] = useState<Record<number, string>>({});
+  // Conversation-scoped answer key (R191): pass the active conversation id so main keys the answer by
+  // conversationId::toolCallId and a provider that reuses `call_1` across conversations can't cross-route.
+  const conversationId = useRuntimeConversationId();
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -977,10 +986,10 @@ const QuestionnaireView: FC<{
         result[q.question] = answer;
       }
     });
-    void app.agent.answerToolQuestion(toolCallId, result);
+    void app.agent.answerToolQuestion(toolCallId, result, conversationId ?? undefined);
     onSubmit();
     refocusComposer();
-  }, [toolCallId, questions, answers, otherTexts, onSubmit]);
+  }, [toolCallId, questions, answers, otherTexts, onSubmit, conversationId]);
 
   if (questions.length === 0) return null;
 

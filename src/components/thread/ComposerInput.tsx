@@ -5,12 +5,13 @@ import { useAttachments } from '@/providers/AttachmentContext';
 import { useAppShotPasteHandler } from '@/hooks/useAppShots';
 import { usePromptHistory, useMidTurnComposer } from '@/providers/RuntimeProvider';
 import { isCompactCommand } from '@/lib/slash-commands';
-import {
-  useCompactingIds,
-  markConversationCompacting,
-  clearConversationCompacting,
-} from '@/lib/compaction-ui-store';
+import { useCompactingIds, markConversationCompacting, clearConversationCompacting } from '@/lib/compaction-ui-store';
 import { cn } from '@/lib/utils';
+import {
+  filterAttachmentsBySize,
+  skippedAttachmentsNotice,
+  releaseAttachmentReservation,
+} from '@/lib/attachment-limits';
 
 export const ComposerInput: FC<{ placeholder?: string; className?: string; autoFocus?: boolean }> = ({
   placeholder = 'Discuss your thoughts and ideas...',
@@ -18,10 +19,11 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   autoFocus,
 }) => {
   const composerRuntime = useComposerRuntime();
-  const { attachments, addAttachments } = useAttachments();
+  const { attachments, addAttachments, getAttachmentCount } = useAttachments();
   const handleAppShotPaste = useAppShotPasteHandler();
   const { conversationId, prompts: promptHistory } = usePromptHistory();
-  const { isRunning, sendMidTurn } = useMidTurnComposer();
+  const { isRunning, sendMidTurn, getActiveConversationId, stashRejectedDraft, markForceNormalSend } =
+    useMidTurnComposer();
   const [text, setText] = useState(() => composerRuntime.getState().text ?? '');
   // /compact status is SCOPED to the conversation it belongs to. In-flight compactions
   // live in a MODULE-LEVEL store (compaction-ui-store) keyed by conversation id — NOT
@@ -33,6 +35,21 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
   const compactingIds = useCompactingIds();
   const compactStatus = compactStatusFor && compactStatusFor.id === conversationId ? compactStatusFor.msg : null;
   const compactInFlight = conversationId ? compactingIds.has(conversationId) : false;
+  // Transient, conversation-scoped status for a mid-turn send that was BLOCKED by a
+  // pre-send / UserPromptSubmit policy hook. Packaged users have no DevTools, so a
+  // console.warn is invisible and Send appears to do nothing — surface the reason
+  // inline (mirrors the compactStatus affordance). Auto-clears after a few seconds.
+  const [sendBlockFor, setSendBlockFor] = useState<{ id: string | null; msg: string } | null>(null);
+  const sendBlockStatus = sendBlockFor && sendBlockFor.id === conversationId ? sendBlockFor.msg : null;
+  const sendBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showSendBlock = useCallback((id: string | null, reason?: string) => {
+    if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+    setSendBlockFor({
+      id,
+      msg: reason?.trim() ? `Message blocked: ${reason.trim()}` : 'Message blocked by a policy hook.',
+    });
+    sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+  }, []);
   const historyIndexRef = useRef(-1);
   const draftBeforeHistoryRef = useRef('');
   const historyConversationRef = useRef<string | null>(conversationId);
@@ -159,13 +176,21 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     return () => clearTimeout(t);
   }, [compactStatusFor, compactingIds]);
 
+  // Clear the send-block timer on unmount so it can't fire into a gone component.
+  useEffect(() => {
+    return () => {
+      if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+    };
+  }, []);
+
   const handleSubmit = useCallback(() => {
     if (!text.trim() && attachments.length === 0) return;
     // Don't start a normal turn while an on-demand /compact summary is in flight —
     // it would race the paid summarizer (which the backend then discards). A repeat
     // /compact is harmless (runCompact self-guards), so only block non-compact sends.
     if (compactInFlight && !(attachments.length === 0 && isCompactCommand(text))) {
-      if (conversationId) setCompactStatusFor({ id: conversationId, msg: 'Compacting… wait for it to finish before sending.' });
+      if (conversationId)
+        setCompactStatusFor({ id: conversationId, msg: 'Compacting… wait for it to finish before sending.' });
       return;
     }
     // Slash command: `/compact` summarizes older messages instead of sending a
@@ -188,13 +213,42 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       setText('');
       composerRuntime.setText('');
       resetHistoryNavigation('');
-      void sendMidTurn(toSend).then((injected) => {
-        if (!injected) {
-          // Not cooperatively injected — restore and use the normal send path
-          // (which supersedes the running turn).
+      void sendMidTurn(toSend).then(({ status, reason, originConversationId }) => {
+        if (status === 'injected') return; // spliced — nothing to restore
+        // Compare against the LIVE active conversation at resolution time (not a
+        // value captured at render). If the user switched chats during the async
+        // gate, don't resubmit/restore into the wrong chat — STASH the text for the
+        // ORIGINATING conversation so it resurfaces when the user returns there.
+        const stillHere = originConversationId != null && originConversationId === getActiveConversationId();
+        const current = composerRuntime.getState().text ?? '';
+        // A LIVE attachment added during the async gate must also block the
+        // resubmit: composerRuntime.send() → RuntimeProvider.onNew consumes ALL
+        // current attachments, so a fallback resend of the OLD text would ship a
+        // file the user added for a DIFFERENT (not-yet-sent) message. Read the
+        // ref-backed live count, not the stale render-time `attachments`.
+        const hasLiveAttachment = getAttachmentCount() > 0;
+        if (!stillHere || current.trim().length > 0 || hasLiveAttachment) {
+          // Switched away, a new draft is present, OR a new attachment was added —
+          // don't clobber/mis-send; stash the text for the origin chat (dropped only
+          // if there's no origin id, which can't happen for a real send).
+          if (originConversationId) stashRejectedDraft(originConversationId, toSend);
+          if (status === 'blocked') showSendBlock(originConversationId ?? null, reason);
+          return;
+        }
+        if (status === 'fallback') {
+          // Force a NORMAL superseding send — the run wasn't cooperatively
+          // injectable (branch changed / not Mastra). Mark the origin conv so onNew
+          // does NOT re-enter cooperative injection (re-running hooks / splicing onto
+          // the stale transcript); then send.
+          const target = originConversationId ?? getActiveConversationId();
+          if (target) markForceNormalSend(target);
           composerRuntime.setText(toSend);
           composerRuntime.send();
           composerRuntime.setText('');
+        } else if (status === 'blocked') {
+          composerRuntime.setText(toSend);
+          setText(toSend);
+          showSendBlock(originConversationId ?? conversationId ?? null, reason);
         }
       });
       return;
@@ -203,7 +257,22 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
     setText('');
     composerRuntime.setText('');
     resetHistoryNavigation('');
-  }, [attachments.length, composerRuntime, compactInFlight, conversationId, isRunning, resetHistoryNavigation, runCompact, sendMidTurn, text]);
+  }, [
+    attachments.length,
+    composerRuntime,
+    compactInFlight,
+    conversationId,
+    isRunning,
+    resetHistoryNavigation,
+    runCompact,
+    sendMidTurn,
+    getActiveConversationId,
+    stashRejectedDraft,
+    showSendBlock,
+    getAttachmentCount,
+    markForceNormalSend,
+    text,
+  ]);
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLElement>) => {
@@ -215,13 +284,43 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       if (imageItems.length === 0) return false;
 
       event.preventDefault();
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (!file) continue;
-
+      // Capture the conversation the paste targeted (R186): the attachment store is app-global, so a
+      // chat switch before a reader resolves would otherwise attach the image to the wrong chat.
+      const originConversationId = getActiveConversationId();
+      // Gate the WHOLE pasted batch before reading (R186): a per-file-only check lets several images
+      // materialize concurrently past the aggregate cap. filterAttachmentsBySize applies the per-file
+      // AND running aggregate limits up front; addAttachments' return then backstops the shared store.
+      const pastedFiles = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
+      const { accepted, skipped, reservedBytes } = filterAttachmentsBySize(pastedFiles);
+      const skippedPastes = skipped.slice();
+      // Release each file's share of the in-flight reservation as its read settles (R191): the whole
+      // batch is reserved up front, but a file's bytes are DOUBLE-counted (reserved AND committed) if we
+      // hold the reservation until commit — the addAttachments backstop counts committed + reserved, so a
+      // valid batch near the cap would be wrongly rejected. Releasing per file transfers reserved→committed
+      // atomically (net outstanding unchanged), whether the file committed or was discarded on a chat switch.
+      // A rounding remainder (accepted sizes vs the reserved sum are identical, so none in practice) is
+      // swept when the last reader settles.
+      let outstanding = accepted.length;
+      let releasedReserved = 0;
+      const settleOne = (bytes: number) => {
+        releasedReserved += bytes;
+        releaseAttachmentReservation(bytes);
+        outstanding -= 1;
+        if (outstanding <= 0 && releasedReserved < reservedBytes) {
+          releaseAttachmentReservation(reservedBytes - releasedReserved);
+        }
+      };
+      if (accepted.length === 0) releaseAttachmentReservation(reservedBytes);
+      for (const file of accepted) {
         const reader = new FileReader();
+        reader.onerror = () => settleOne(file.size);
+        reader.onabort = () => settleOne(file.size);
         reader.onload = () => {
-          addAttachments([
+          // Release this file's reservation BEFORE committing so the backstop doesn't see it twice.
+          settleOne(file.size);
+          // Discard if the user switched conversations while this read was in flight (R186).
+          if (getActiveConversationId() !== originConversationId) return;
+          const { skipped: overCap } = addAttachments([
             {
               name: file.name || `pasted-image-${Date.now()}.${file.type.split('/')[1] || 'png'}`,
               mime: file.type,
@@ -230,8 +329,24 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
               dataUrl: reader.result as string,
             },
           ]);
+          if (overCap.length > 0) {
+            const notice = skippedAttachmentsNotice(overCap);
+            if (notice) {
+              if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+              setSendBlockFor({ id: conversationId, msg: notice });
+              sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+            }
+          }
         };
         reader.readAsDataURL(file);
+      }
+      if (skippedPastes.length > 0) {
+        const notice = skippedAttachmentsNotice(skippedPastes);
+        if (notice) {
+          if (sendBlockTimerRef.current) clearTimeout(sendBlockTimerRef.current);
+          setSendBlockFor({ id: conversationId, msg: notice });
+          sendBlockTimerRef.current = setTimeout(() => setSendBlockFor(null), 6000);
+        }
       }
 
       const pastedText = event.clipboardData.getData('text/plain');
@@ -241,7 +356,7 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
 
       return true;
     },
-    [addAttachments, handleAppShotPaste],
+    [addAttachments, handleAppShotPaste, conversationId, getActiveConversationId],
   );
 
   const isMultiline = text.includes('\n');
@@ -251,6 +366,11 @@ export const ComposerInput: FC<{ placeholder?: string; className?: string; autoF
       {compactStatus && (
         <div className="px-3 pb-1 text-xs text-muted-foreground" role="status" aria-live="polite">
           {compactStatus}
+        </div>
+      )}
+      {sendBlockStatus && (
+        <div className="px-3 pb-1 text-xs text-amber-600 dark:text-amber-400" role="status" aria-live="polite">
+          {sendBlockStatus}
         </div>
       )}
       <RichChatInput

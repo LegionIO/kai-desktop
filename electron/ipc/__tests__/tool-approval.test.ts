@@ -43,6 +43,8 @@ import {
   setPrimaryApprovalWindowResolver,
   authorizePendingApprovalWindow,
   broadcastStreamEventRaw,
+  getRecordedApprovalAuthority,
+  approvalKey,
 } from '../tool-approval.js';
 
 beforeEach(() => {
@@ -59,6 +61,56 @@ beforeEach(() => {
 });
 
 describe('registerPendingApproval', () => {
+  it('never FIFO-evicts a LIVE-pending browser authority record (R177)', async () => {
+    setToolApprovalOwnerResolver((conversationId, browserOwnerId) => ({ conversationId, streamToken: browserOwnerId }));
+    // A live (still-pending) browser-owned approval.
+    const live = registerPendingApproval('browser-live', undefined, 'native-browser', {
+      conversationId: 'chat-1',
+      browserOwnerId: 'run-1',
+    });
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live', 'run-1'))).toBeDefined();
+    // Flood with 600 later browser-owned records (each also records authority), all settled so they
+    // are evictable. The live-pending record must survive despite exceeding the 500 FIFO cap.
+    for (let i = 0; i < 600; i++) {
+      const p = registerPendingApproval(`flood-${i}`, undefined, 'native-browser', {
+        conversationId: 'chat-2',
+        browserOwnerId: `r-${i}`,
+      });
+      pendingToolApprovals.get(approvalKey('chat-2', `flood-${i}`, `r-${i}`))!.resolve(false);
+      await p;
+    }
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live', 'run-1'))).toMatchObject({
+      authority: 'native-browser',
+    });
+    pendingToolApprovals.get(approvalKey('chat-1', 'browser-live', 'run-1'))!.resolve(false);
+    await live;
+    setToolApprovalOwnerResolver(null);
+  });
+
+  it('durably records a browser-owned approval authority that OUTLIVES abort deletion (R174)', async () => {
+    setToolApprovalOwnerResolver((conversationId, browserOwnerId) => ({ conversationId, streamToken: browserOwnerId }));
+    const ctrl = new AbortController();
+    const p = registerPendingApproval('browser-ask', ctrl.signal, 'native-browser', {
+      conversationId: 'chat-1',
+      browserOwnerId: 'run-1',
+    });
+    // Abort deletes the pending entry, but the durable authority record must remain so the
+    // pendingless raced-answer recovery path can still enforce browser authority.
+    ctrl.abort();
+    await p;
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'browser-ask', 'run-1'))).toBe(false);
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-ask', 'run-1'))).toMatchObject({
+      authority: 'native-browser',
+      streamOwner: { conversationId: 'chat-1', streamToken: 'run-1' },
+    });
+    // A plain any-renderer approval with no owner records NOTHING (nothing to enforce post-deletion).
+    const p2 = registerPendingApproval('plain-ask');
+    pendingToolApprovals.get('plain-ask')!.resolve(true);
+    await p2;
+    expect(getRecordedApprovalAuthority('plain-ask')).toBeUndefined();
+    setToolApprovalOwnerResolver(null);
+  });
+
   it('resolves with the value the map entry is resolved with (approve)', async () => {
     const p = registerPendingApproval('call-1');
     expect(pendingToolApprovals.has('call-1')).toBe(true);
@@ -101,11 +153,11 @@ describe('registerPendingApproval', () => {
       }),
     ).toThrow(/no longer authorized/);
 
-    expect(pendingToolApprovals.get('owned')?.streamOwner).toEqual({
+    expect(pendingToolApprovals.get(approvalKey('chat-1', 'owned', 'run-1'))?.streamOwner).toEqual({
       conversationId: 'chat-1',
       streamToken: 'run-1',
     });
-    expect(pendingToolApprovals.has('realtime')).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'realtime', 'realtime-owner'))).toBe(false);
   });
 
   it.each(['text', 'Realtime'])('rejects a late %s Browser approval after its owner is revoked', async (modality) => {
@@ -123,7 +175,7 @@ describe('registerPendingApproval', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    pendingToolApprovals.get(`${modality}-live`)!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', `${modality}-live`, 'run-1'))!.resolve(false);
     await expect(live).resolves.toBe(false);
 
     authorized = false;
@@ -133,7 +185,7 @@ describe('registerPendingApproval', () => {
         browserOwnerId: 'run-1',
       }),
     ).toThrow(/no longer authorized/);
-    expect(pendingToolApprovals.has(`${modality}-late`)).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', `${modality}-late`, 'run-1'))).toBe(false);
   });
 
   it('grants a one-shot dedicated-window capability only after registration', () => {
@@ -180,7 +232,7 @@ describe('registerPendingApproval', () => {
     ctrl.abort();
     await expect(p).resolves.toBe('dismiss');
     expect(pendingToolApprovals.has('c-laterabort')).toBe(false);
-    expect(closeWindow).toHaveBeenCalledWith('c-laterabort');
+    expect(closeWindow).toHaveBeenCalledWith('c-laterabort', undefined);
   });
 
   it('closes a raw approval pop-out on duplicate eviction', async () => {
@@ -192,7 +244,7 @@ describe('registerPendingApproval', () => {
     const second = registerPendingApproval('window-duplicate');
 
     await expect(first).resolves.toBe(false);
-    expect(closeWindow).toHaveBeenCalledWith('window-duplicate');
+    expect(closeWindow).toHaveBeenCalledWith('window-duplicate', undefined);
     pendingToolApprovals.get('window-duplicate')!.resolve(false);
     await expect(second).resolves.toBe(false);
   });
@@ -200,6 +252,61 @@ describe('registerPendingApproval', () => {
   it('with no abort signal, the entry stays pending until resolved', () => {
     registerPendingApproval('c-pending');
     expect(pendingToolApprovals.has('c-pending')).toBe(true);
+  });
+
+  it('onSettle delivers the CATEGORICAL source: abort distinct from reject/dismiss/answered (R94)', async () => {
+    // The SDK ask_user handler routes recovery ONLY on a genuine abort — it must be
+    // able to tell abort ('dismiss' VALUE) apart from a real user reject/dismiss.
+    const abortCtrl = new AbortController();
+    let abortSource: string | undefined;
+    const pAbort = registerPendingApproval('c-src-abort', abortCtrl.signal, undefined, undefined, {
+      onSettle: (s) => {
+        abortSource = s;
+      },
+    });
+    abortCtrl.abort();
+    await pAbort;
+    expect(abortSource).toBe('abort');
+
+    let rejectSource: string | undefined;
+    const pReject = registerPendingApproval('c-src-reject', undefined, undefined, undefined, {
+      onSettle: (s) => {
+        rejectSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-reject')!.resolve(false, 'reject');
+    await pReject;
+    expect(rejectSource).toBe('reject');
+
+    let dismissSource: string | undefined;
+    const pDismiss = registerPendingApproval('c-src-dismiss', undefined, undefined, undefined, {
+      onSettle: (s) => {
+        dismissSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-dismiss')!.resolve('dismiss', 'dismiss');
+    await pDismiss;
+    expect(dismissSource).toBe('dismiss');
+
+    let answeredSource: string | undefined;
+    const pAns = registerPendingApproval('c-src-answered', undefined, undefined, undefined, {
+      onSettle: (s) => {
+        answeredSource = s;
+      },
+    });
+    pendingToolApprovals.get('c-src-answered')!.resolve(true, 'answered');
+    await pAns;
+    expect(answeredSource).toBe('answered');
+  });
+
+  it('onSettle that throws does not break the settle path (R94)', async () => {
+    const p = registerPendingApproval('c-src-throw', undefined, undefined, undefined, {
+      onSettle: () => {
+        throw new Error('observer boom');
+      },
+    });
+    pendingToolApprovals.get('c-src-throw')!.resolve(true, 'answered');
+    await expect(p).resolves.toBe(true);
   });
 
   it('dismisses only native Browser approvals owned by the revoked assistant run', async () => {
@@ -223,10 +330,10 @@ describe('registerPendingApproval', () => {
     dismissPendingNativeBrowserApprovalsForOwner('chat-1', 'run-1');
 
     await expect(native).resolves.toBe('dismiss');
-    expect(pendingToolApprovals.has('generic-owned')).toBe(true);
-    expect(pendingToolApprovals.has('native-other')).toBe(true);
-    pendingToolApprovals.get('generic-owned')!.resolve(false);
-    pendingToolApprovals.get('native-other')!.resolve(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'generic-owned', 'run-1'))).toBe(true);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'native-other', 'run-2'))).toBe(true);
+    pendingToolApprovals.get(approvalKey('chat-1', 'generic-owned', 'run-1'))!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'native-other', 'run-2'))!.resolve(false);
     await expect(generic).resolves.toBe(false);
     await expect(other).resolves.toBe(false);
   });
@@ -271,6 +378,30 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
     broadcastStreamEventRaw(event);
     expect(sent[0].event).toMatchObject({ type: 'text', serverPersisted: true });
     expect(webSent[0].event).toMatchObject({ serverPersisted: true });
+  });
+
+  it('continues fan-out to healthy windows + web clients when one window send throws (R106)', () => {
+    // Insert a throwing window BEFORE the healthy one; a raw loop would abort here and
+    // the healthy window + web clients would miss the event.
+    const throwingWindow = {
+      isDestroyed: () => false,
+      webContents: {
+        id: 999,
+        isDestroyed: () => false,
+        send: () => {
+          throw new Error('window navigating');
+        },
+      },
+    };
+    browserWindows.unshift(throwingWindow as never);
+    try {
+      broadcastStreamEventRaw(event);
+      // The healthy window still received it, and web-client fan-out still ran.
+      expect(sent).toEqual([{ channel: 'agent:stream-event', event }]);
+      expect(webSent).toEqual([{ channel: 'agent:stream-event', event }]);
+    } finally {
+      browserWindows.shift(); // restore the single-window default for later tests
+    }
   });
 
   it('keeps native Browser approval cards off unsupported web clients', () => {
@@ -323,15 +454,21 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    const opener = vi.fn((event: { toolCallId?: string }) => {
-      expect(pendingToolApprovals.has(event.toolCallId ?? '')).toBe(true);
-      authorizePendingApprovalWindow(event.toolCallId ?? '', 91);
+    const opener = vi.fn((event: { toolCallId?: string; conversationId?: string; runGeneration?: string }) => {
+      // The pending entry is run-scoped (R192 conversation + R249 run); look it up under the composite
+      // key (the event's runGeneration IS the run nonce) and authorize the window with the same
+      // conversationId + run nonce maybeOpenDedicatedApprovalWindow uses.
+      expect(
+        pendingToolApprovals.has(approvalKey(event.conversationId, event.toolCallId ?? '', event.runGeneration)),
+      ).toBe(true);
+      authorizePendingApprovalWindow(event.toolCallId ?? '', 91, event.conversationId, event.runGeneration);
     });
     setRawApprovalWindowOpener(opener as never);
     const approval = {
       type: 'tool-approval-required',
       conversationId: 'chat-1',
       toolCallId: 'owned-question',
+      runGeneration: 'run-1',
       toolName: 'ask_user',
       args: { questions: [] },
     } as never;
@@ -339,7 +476,9 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
     broadcastStreamEventRaw(approval);
 
     expect(opener).toHaveBeenCalledWith(approval);
-    expect(pendingToolApprovals.get('owned-question')?.approvalWindowWebContentsId).toBe(91);
+    expect(
+      pendingToolApprovals.get(approvalKey('chat-1', 'owned-question', 'run-1'))?.approvalWindowWebContentsId,
+    ).toBe(91);
     expect(sentWindowIds).toEqual([primaryWindow.webContents.id, approvalWindow.webContents.id]);
     expect(sentWindowIds).not.toContain(unrelatedWindow.webContents.id);
     expect(webSent).toEqual([]);

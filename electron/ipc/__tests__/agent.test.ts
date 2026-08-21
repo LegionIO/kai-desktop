@@ -172,7 +172,9 @@ vi.mock('../conversations.js', () => ({
 vi.mock('../conversation-store.js', () => ({
   readConversation: vi.fn(() => null),
   writeConversation: vi.fn(),
+  isWriteTombstoned: vi.fn(() => false),
   isRecentlyDeleted: vi.fn(() => false),
+  conversationExistenceState: vi.fn(() => 'absent'),
 }));
 
 // ---------------------------------------------------------------------------
@@ -197,6 +199,7 @@ import {
   registerPendingApproval,
   setPrimaryApprovalWindowResolver,
   setToolApprovalOwnerResolver,
+  approvalKey,
 } from '../tool-approval.js';
 import { pendingQuestionAnswers } from '../../tools/ask-user.js';
 import { closeApprovalWindow } from '../../approval-window.js';
@@ -322,16 +325,18 @@ describe('startup tool registration', () => {
         browserOwnerId: 'run-1',
       }),
     ).toThrow(/no longer authorized/);
-    expect(pendingToolApprovals.has('late-text-browser-approval')).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'late-text-browser-approval'))).toBe(false);
     const genericAfterRevocation = registerPendingApproval('late-text-generic-approval', undefined, 'any-renderer', {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    expect(pendingToolApprovals.get('late-text-generic-approval')?.streamOwner).toMatchObject({
+    expect(
+      pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval', 'run-1'))?.streamOwner,
+    ).toMatchObject({
       conversationId: 'chat-1',
       streamToken: 'run-1',
     });
-    pendingToolApprovals.get('late-text-generic-approval')!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval', 'run-1'))!.resolve(false);
     void genericAfterRevocation;
     setToolApprovalOwnerResolver(null);
   });
@@ -663,7 +668,7 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
     expect(pendingToolApprovals.has('tc-approve')).toBe(false);
     // Answering inline must also close the dedicated approval window (sync dismissal).
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve', undefined);
   });
 
   it('resolves the pending approval promise with false on agent:reject-tool', async () => {
@@ -687,7 +692,7 @@ describe('agent IPC: tool approval channels', () => {
     await pending;
     expect(decisions).toEqual([false]);
     expect(pendingToolApprovals.has('tc-reject')).toBe(false);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject', undefined);
   });
 
   it('resolves with the sentinel "dismiss" string on agent:dismiss-tool', async () => {
@@ -708,7 +713,7 @@ describe('agent IPC: tool approval channels', () => {
     await harness.invoke('agent:dismiss-tool', FAKE_EVENT, 'tc-dismiss');
     await pending;
     expect(decisions).toEqual(['dismiss']);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss');
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss', undefined);
   });
 
   it('stores answers and approves the call on agent:answer-tool-question', async () => {
@@ -734,22 +739,65 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
   });
 
-  it('does NOT stash answers on agent:answer-tool-question when the toolCallId has no pending approval', async () => {
+  it('STASHES answers on agent:answer-tool-question even when the toolCallId has no live pending approval (raced abort)', async () => {
     const harness = await createIpcHarness({
       registerHandlers: (ipc) => {
         registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
       },
     });
 
-    // No pendingToolApprovals entry for this id (already dismissed/aborted).
-    const result = await harness.invoke<{ ok: boolean }>('agent:answer-tool-question', FAKE_EVENT, 'tc-stale', {
-      q1: 'ignored',
+    // No pendingToolApprovals entry: the turn's controller already aborted
+    // (superseded / plan-restart) and settled+removed the approval a beat before
+    // the user's fully-submitted answer landed. The OLD behavior dropped the
+    // answer here, and the tool then emitted "No user response received" even
+    // though the user answered. The answer must now be preserved so the gate /
+    // re-invoked execute can recover it (bounded FIFO prevents a leak).
+    const result = await harness.invoke<{ ok: boolean }>('agent:answer-tool-question', FAKE_EVENT, 'tc-raced', {
+      q1: 'The answer I submitted',
     });
 
     expect(result).toEqual({ ok: true });
-    // Guard: a stale id must not leave an orphaned answers entry the terminated
-    // tool will never read.
-    expect(pendingQuestionAnswers.has('tc-stale')).toBe(false);
+    expect(pendingQuestionAnswers.get('tc-raced')).toEqual({ q1: 'The answer I submitted' });
+  });
+
+  it('rejects a malformed answer frame from the untyped web boundary and stashes nothing (R132)', async () => {
+    const harness = await createIpcHarness({
+      registerHandlers: (ipc) => {
+        registerAgentHandlers(ipc as Parameters<typeof registerAgentHandlers>[0], '/tmp/app-home');
+      },
+    });
+    // A non-string toolCallId (e.g. a huge object used as the Map key) is rejected.
+    const objId = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      { big: 'x'.repeat(10) } as unknown as string,
+      { q: 'a' },
+    );
+    expect(objId.ok).toBe(false);
+    expect(objId.error).toBe('invalid-tool-call-id');
+    // Non-string answer values are rejected (not silently counted as 0 bytes downstream).
+    const badVal = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      'tc-badval',
+      { q: { nested: 'y' } } as unknown as Record<string, string>,
+    );
+    expect(badVal.ok).toBe(false);
+    expect(badVal.error).toBe('invalid-answers');
+    expect(pendingQuestionAnswers.has('tc-badval')).toBe(false);
+
+    // A non-plain object (Map/ArrayBuffer/class instance) whose Object.values() is empty must be
+    // rejected — else byte-accounting measures it as {} while structured-clone retains its
+    // payload in MAIN (R137 f-7).
+    const mapFrame = await harness.invoke<{ ok: boolean; error?: string }>(
+      'agent:answer-tool-question',
+      FAKE_EVENT,
+      'tc-map',
+      new Map([['q', 'a']]) as unknown as Record<string, string>,
+    );
+    expect(mapFrame.ok).toBe(false);
+    expect(mapFrame.error).toBe('invalid-answers');
+    expect(pendingQuestionAnswers.has('tc-map')).toBe(false);
   });
 
   it('returns ok=true on agent:approve-tool when no pending entry exists', async () => {
@@ -2162,6 +2210,134 @@ describe('observer workspace tool registry', () => {
   });
 });
 
+describe('cancel-generation ABA-safety (evicted-after-Stop must count as changed — R132)', () => {
+  const { bumpExplicitCancelGeneration, captureCancelGeneration, cancelGenerationChanged } = __internal;
+
+  it('a Stop after capture is detected as changed', () => {
+    const captured = captureCancelGeneration('aba-conv-1'); // never Stopped → undefined
+    expect(captured).toBeUndefined();
+    bumpExplicitCancelGeneration('aba-conv-1'); // Stop
+    expect(cancelGenerationChanged('aba-conv-1', captured)).toBe(true);
+  });
+
+  it('no Stop since capture is NOT changed', () => {
+    bumpExplicitCancelGeneration('aba-conv-2');
+    const captured = captureCancelGeneration('aba-conv-2'); // a positive sequence
+    expect(captured).toBeGreaterThan(0);
+    expect(cancelGenerationChanged('aba-conv-2', captured)).toBe(false);
+  });
+
+  it('an evicted-after-Stop entry re-reads as undefined and counts as CHANGED (no ABA to 0)', () => {
+    bumpExplicitCancelGeneration('aba-conv-3'); // Stop → positive sequence
+    const captured = captureCancelGeneration('aba-conv-3');
+    expect(captured).toBeGreaterThan(0);
+    // Simulate eviction under memory pressure: flood distinct ids past the 500 cap so the
+    // oldest (aba-conv-3) is evicted. Its re-read is now undefined — which must NOT collide
+    // with the captured positive sequence (the pre-R132 `?? 0` bug matched 0).
+    for (let i = 0; i < 600; i++) bumpExplicitCancelGeneration(`flood-${i}`);
+    expect(captureCancelGeneration('aba-conv-3')).toBeUndefined();
+    expect(cancelGenerationChanged('aba-conv-3', captured)).toBe(true);
+  });
+});
+
+describe('cancel-gen PUSH token (eviction-proof for run-starting deferred ops — R135)', () => {
+  const { bumpExplicitCancelGeneration, registerCancelGenToken, releaseCancelGenToken } = __internal;
+
+  it('a Stop flips a registered token even when the capture was undefined (never Stopped) AND the map entry is evicted', () => {
+    // The R134 f-2 hole: capture undefined → Stop → evict → numeric re-read is undefined again.
+    // The PUSH token catches it because the Stop flipped it directly.
+    const token = registerCancelGenToken('push-conv-1'); // never Stopped at registration
+    expect(token.cancelled).toBe(false);
+    bumpExplicitCancelGeneration('push-conv-1'); // Stop → flips the token
+    expect(token.cancelled).toBe(true);
+    // Even after eviction of push-conv-1's map entry, the token stays cancelled.
+    for (let i = 0; i < 600; i++) bumpExplicitCancelGeneration(`push-flood-${i}`);
+    expect(token.cancelled).toBe(true);
+    releaseCancelGenToken(token);
+  });
+
+  it('a token for a DIFFERENT conversation is not flipped by an unrelated Stop', () => {
+    const token = registerCancelGenToken('push-conv-2');
+    bumpExplicitCancelGeneration('push-conv-other');
+    expect(token.cancelled).toBe(false);
+    releaseCancelGenToken(token);
+  });
+
+  it('release removes the token so a later Stop no longer flips it', () => {
+    const token = registerCancelGenToken('push-conv-3');
+    releaseCancelGenToken(token);
+    bumpExplicitCancelGeneration('push-conv-3');
+    // The token object is detached from the registry; a Stop can't reach it.
+    expect(token.cancelled).toBe(false);
+  });
+});
+
+describe('planEnterResultFailed (skip plan-restart on a non-entry result — R146)', () => {
+  const { planEnterResultFailed } = __internal;
+
+  it('does NOT flag a successful entry (restart proceeds)', () => {
+    expect(planEnterResultFailed({ success: true, mode: 'plan-first' })).toBe(false);
+    expect(planEnterResultFailed('entered plan mode')).toBe(false);
+    expect(planEnterResultFailed(null)).toBe(false);
+  });
+
+  it('flags a Mastra object success:false', () => {
+    expect(planEnterResultFailed({ success: false, error: 'no persist' })).toBe(true);
+  });
+
+  it('flags a Pi stringified success:false', () => {
+    expect(planEnterResultFailed('{"success":false,"error":"x"}')).toBe(true);
+  });
+
+  it('flags an SDK error wrap {isError:true, error:"{...success:false...}"} (R146 f-1)', () => {
+    expect(planEnterResultFailed({ isError: true, error: '{"success":false,"error":"stopped"}' })).toBe(true);
+    // Even a bare isError:true (no nested success) → did NOT enter → no restart.
+    expect(planEnterResultFailed({ isError: true, error: 'boom' })).toBe(true);
+  });
+});
+
+describe('isConversationDeletedSafe (throw-safe tombstone lookup — R147)', () => {
+  const { isConversationDeletedSafe } = __internal;
+
+  it('returns the tombstone result when the lookup succeeds', async () => {
+    const store = await import('../conversation-store.js');
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(true);
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(false);
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(false);
+  });
+
+  it('returns FALSE (not-deleted) when the lookup THROWS — never abandons a possibly-live chat', async () => {
+    const store = await import('../conversation-store.js');
+    (store.isWriteTombstoned as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      throw new Error('EMFILE');
+    });
+    expect(isConversationDeletedSafe('/tmp/app', 'c1')).toBe(false);
+  });
+});
+
+describe('reconcileExecutionMode (GUI submit vs MAIN-authoritative disk mode — R128/R129)', () => {
+  const { reconcileExecutionMode } = __internal;
+
+  it('trusts disk plan-first over a stale auto submit (never expose mutating tools)', () => {
+    expect(reconcileExecutionMode('auto', 'plan-first', true)).toBe('plan-first');
+    expect(reconcileExecutionMode(undefined, 'plan-first', true)).toBe('plan-first');
+  });
+
+  it('trusts disk auto over a stale plan-first submit (no latched plan-first — R129 f-3)', () => {
+    // A stale plan-first renderer state must NOT pin the conversation plan-first forever
+    // after a genuine plan→auto toggle already wrote disk 'auto'.
+    expect(reconcileExecutionMode('plan-first', 'auto', true)).toBe('auto');
+    expect(reconcileExecutionMode('plan-first', undefined, true)).toBe('auto');
+  });
+
+  it('falls back to the submit ONLY when there is no persisted record (recordless first turn)', () => {
+    expect(reconcileExecutionMode('plan-first', undefined, false)).toBe('plan-first');
+    expect(reconcileExecutionMode('auto', undefined, false)).toBe('auto');
+    expect(reconcileExecutionMode(undefined, undefined, false)).toBe('auto');
+  });
+});
+
 describe("isSupersededRunEvent (mid-turn inject: drop the aborted run's stale events)", () => {
   it('suppresses a token-stamped event whose token no longer matches the active run', () => {
     // The prior run (token A) was superseded by a new run (token B); A's trailing
@@ -2180,5 +2356,159 @@ describe("isSupersededRunEvent (mid-turn inject: drop the aborted run's stale ev
   it('does not treat events as stale when no run is active', () => {
     expect(isSupersededRunEvent('A', undefined)).toBe(false);
     expect(isSupersededRunEvent(undefined, undefined)).toBe(false);
+  });
+});
+
+describe('resolveInjectedTextFromGatedPayload (mid-turn inject enforcement)', () => {
+  const { resolveInjectedTextFromGatedPayload } = __internal;
+
+  it('returns the surviving user turn text (string content)', () => {
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: 'redacted answer' }]);
+    expect(res).toEqual({ allowed: true, text: 'redacted answer' });
+  });
+
+  it('extracts text from a single content-part user message (redacting hook rewrote parts)', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      { role: 'user', content: [{ type: 'text', text: '[redacted]' }] },
+    ]);
+    expect(res).toEqual({ allowed: true, text: '[redacted]' });
+  });
+
+  it('denies when a hook REMOVED the user turn (payload is not a single user message)', () => {
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'assistant', content: 'only assistant left' }]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
+
+  it('denies when a hook ADDED extra messages (can’t splice added context as one inject)', () => {
+    // A modify hook returned a system safety message + the rewritten user turn.
+    // We can’t represent that as a single user-text inject → fail closed.
+    const res = resolveInjectedTextFromGatedPayload([
+      { role: 'system', content: 'SAFETY: redacted per policy' },
+      { role: 'user', content: [{ type: 'text', text: 'answer' }] },
+    ]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
+
+  it('denies when a hook redacts the message to EMPTY text (string or parts)', () => {
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: '' }])).toEqual({ allowed: false, text: '' });
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: '   ' }])).toEqual({
+      allowed: false,
+      text: '',
+    });
+    expect(resolveInjectedTextFromGatedPayload([{ role: 'user', content: [{ type: 'text', text: '' }] }])).toEqual({
+      allowed: false,
+      text: '',
+    });
+  });
+
+  it('denies on an empty payload', () => {
+    expect(resolveInjectedTextFromGatedPayload([])).toEqual({ allowed: false, text: '' });
+  });
+
+  it('preserves multiline / spacing-sensitive text VERBATIM (no whitespace collapse)', () => {
+    const code = 'def f():\n    x = 1\n\n    return  x   # two spaces';
+    const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: [{ type: 'text', text: code }] }]);
+    expect(res).toEqual({ allowed: true, text: code });
+  });
+
+  it('concatenates multiple text parts verbatim', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'line1\n' },
+          { type: 'text', text: 'line2' },
+        ],
+      },
+    ]);
+    expect(res).toEqual({ allowed: true, text: 'line1\nline2' });
+  });
+
+  it('denies when the surviving turn has a non-text part (hook rewrote to media/file)', () => {
+    const res = resolveInjectedTextFromGatedPayload([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hi' },
+          { type: 'image', image: 'data:...' },
+        ],
+      },
+    ]);
+    expect(res).toEqual({ allowed: false, text: '' });
+  });
+
+  describe('with history context (historyLen > 0)', () => {
+    it('extracts ONLY the injected turn (last message) after N history messages', () => {
+      // The gate ran hooks over [history…, injectedUser]; extract the last turn.
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'assistant', content: 'a reply' },
+          { role: 'user', content: [{ type: 'text', text: 'the injected answer' }] },
+        ],
+        2,
+      );
+      expect(res).toEqual({ allowed: true, text: 'the injected answer' });
+    });
+
+    it('denies when a hook ADDED a message AFTER the injected turn (payload too long)', () => {
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'user', content: [{ type: 'text', text: 'answer' }] },
+          { role: 'system', content: 'SAFETY appended' },
+        ],
+        1,
+      );
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+
+    it('denies when a hook REMOVED the injected turn (payload too short)', () => {
+      const res = resolveInjectedTextFromGatedPayload([{ role: 'user', content: 'first prompt' }], 1);
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+
+    it('denies when the message at the injected index is not a user turn', () => {
+      const res = resolveInjectedTextFromGatedPayload(
+        [
+          { role: 'user', content: 'first prompt' },
+          { role: 'assistant', content: 'hook replaced the inject with an assistant turn' },
+        ],
+        1,
+      );
+      expect(res).toEqual({ allowed: false, text: '' });
+    });
+  });
+});
+
+describe('isSupersessionDescendant (raced-answer handoff lineage guard — R81/R115)', () => {
+  const { recordSupersession, isSupersessionDescendant } = __internal;
+
+  it('follows a recorded supersession chain (A→B→C) but rejects unrelated tokens', () => {
+    recordSupersession('A', 'B');
+    recordSupersession('B', 'C');
+    // C genuinely superseded A through the chain.
+    expect(isSupersessionDescendant('A', 'C')).toBe(true);
+    expect(isSupersessionDescendant('A', 'B')).toBe(true);
+    // D never entered A's chain — an unrelated later turn must NOT inherit A's answer.
+    expect(isSupersessionDescendant('A', 'D')).toBe(false);
+    // Reverse direction is not a descendant.
+    expect(isSupersessionDescendant('C', 'A')).toBe(false);
+  });
+
+  it('returns false when there is no recorded edge (a successor that died before admission)', () => {
+    // 'X' was issued as latest but its supersession edge was never recorded (config
+    // threw before stream admission), so a predecessor teardown must NOT treat it as a
+    // live replacement — the R115 guard falls through to durable recovery.
+    expect(isSupersessionDescendant('pred-no-edge', 'X')).toBe(false);
+  });
+
+  it('does not infinite-loop on a supersession cycle (corrupt lineage)', () => {
+    recordSupersession('cyc1', 'cyc2');
+    recordSupersession('cyc2', 'cyc1');
+    // Cycle-guarded: terminates and does not match an unrelated token.
+    expect(isSupersessionDescendant('cyc1', 'nope')).toBe(false);
+    // Still finds a real descendant within the cycle.
+    expect(isSupersessionDescendant('cyc1', 'cyc2')).toBe(true);
   });
 });

@@ -16,7 +16,21 @@ import {
   webContents,
 } from 'electron';
 import { basename, join, sep } from 'path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync } from 'fs';
+import {
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  opendirSync,
+  statSync,
+  fstatSync,
+  openSync,
+  readSync,
+  closeSync,
+  renameSync,
+  constants as fsReadConstants,
+} from 'fs';
 import {
   appendBoundedLog,
   enterErrorHandler,
@@ -47,10 +61,18 @@ import {
   isTextConversationTurnActive,
   mayPersistConversationForBrowserAuthority,
   getInjectUserTurnAndRestart,
+  resolveEffectiveRuntimeId,
   revokeActiveTextBrowserTools,
 } from './ipc/agent.js';
 import { registerConversationHandlers } from './ipc/conversations.js';
-import { resetStaleRunStatus, reindexIfStale } from './ipc/conversation-store.js';
+import {
+  resetStaleRunStatus,
+  reindexIfStale,
+  reconcileGhostIndexEntries,
+  readConversation as readConversationRecord,
+  writeConversation as writeConversationRecord,
+} from './ipc/conversation-store.js';
+import { setExecutionModePersister } from './tools/plan-mode.js';
 import { getCliInstallStatus, installCliCommand, uninstallCliCommand } from './ipc/cli-install.js';
 import { buildToolRegistry } from './tools/registry.js';
 import { createBrowserTools } from './tools/browser.js';
@@ -59,7 +81,7 @@ import { retryPendingSubAgentResumes } from './tools/sub-agent.js';
 import { registerMcpHandlers } from './ipc/mcp.js';
 import { registerMemoryHandlers } from './ipc/memory.js';
 import { rebuildMcpTools, disconnectAllMcpServers } from './tools/mcp-client.js';
-import { loadSkillsAsTools, resolveSkillsDir } from './tools/skill-loader.js';
+import { loadSkillsAsTools, resolveSkillsDir, skillsDirectoryFingerprint } from './tools/skill-loader.js';
 import { registerSkillsHandlers } from './ipc/skills.js';
 import { registerPlatformHandlers } from './ipc/platform.js';
 import { registerAppshotHandlers } from './ipc/appshots.js';
@@ -83,6 +105,7 @@ import {
   revokeRealtimeBrowserTools,
   updateActiveRealtimeSessionTools,
 } from './ipc/realtime.js';
+import { reapplyIsolatedBrowserWebRtcPolicy } from './computer-use/harnesses/isolated-browser.js';
 import type { AppConfig } from './config/schema.js';
 import { resolveAlertSurface } from './config/schema.js';
 import { registerRuntime } from './agent/runtime/index.js';
@@ -160,7 +183,7 @@ import { checkAndHandleRollback, signalAppRunning, signalGracefulQuit } from './
 import { registerOtaHandlers, cleanupOta } from './ipc/ota.js';
 import { initializeSubagentCleanup } from './services/subagent-cleanup.js';
 import { isExternallyOpenableUrl } from './utils/safe-external-url.js';
-import { safeReadFileWithin } from './utils/safe-file-read.js';
+import { safeReadFileWithin, safeReadRangeWithin } from './utils/safe-file-read.js';
 import { overrideCommittedQuitUnloadVeto } from './quit-lifecycle.js';
 import {
   BROWSER_FORCE_EXIT_GRACE_MS,
@@ -1561,16 +1584,32 @@ if (gotSingleInstanceLock) {
       Object.fromEntries((Object.keys(cfg) as Array<keyof AppConfig>).map((k) => [k, JSON.stringify(cfg[k]) ?? '']));
     let lastConfigFingerprints = fingerprintConfig(getConfig());
     let lastMcpFingerprint = JSON.stringify(getConfig().mcpServers ?? []);
-    let lastSkillsFingerprint = JSON.stringify(getConfig().skills?.enabled ?? []);
+    let lastSkillsFingerprint = JSON.stringify({
+      enabled: getConfig().skills?.enabled ?? [],
+      directory: getConfig().skills?.directory ?? null,
+      contents: skillsDirectoryFingerprint(resolveSkillsDir(getConfig(), APP_HOME)),
+    });
     let lastCliToolsFingerprint = JSON.stringify(getConfig().cliTools ?? []);
     let lastDisplayFingerprint = JSON.stringify(getConfig().computerUse?.localMacos?.allowedDisplays ?? []);
     let lastWebServerFingerprint = JSON.stringify(getConfig().webServer ?? {});
     let lastLaunchAtLoginFp = JSON.stringify(getConfig().launchAtLogin ?? false);
     let lastAutopilotFingerprint = JSON.stringify(getConfig().autopilot ?? {});
     let lastSubAgentCapsFingerprint = JSON.stringify(getConfig().tools?.subAgents ?? {});
+    // Security re-gating fingerprints (R209): a pure executionMode or isolated-browser-allow-private change
+    // has no MCP/skills/CLI/browser fingerprint, so it never triggered syncRealtimeTools() — leaving a
+    // recordless Realtime session with mutating tools and a live isolated browser with direct UDP after a
+    // global plan-first / private-network toggle. Track them explicitly and re-gate on change.
+    let lastExecutionModeFp = JSON.stringify(getConfig().tools?.executionMode ?? 'auto');
+    let lastIsolatedBrowserPrivateFp = JSON.stringify(
+      getConfig().computerUse?.safety?.isolatedBrowserAllowPrivateNetwork ?? false,
+    );
     let webServerDebounce: ReturnType<typeof setTimeout> | null = null;
     const syncRealtimeTools = (): void => {
       updateActiveRealtimeSessionTools(getRegisteredTools());
+      // A config change may have toggled computerUse.safety.isolatedBrowserAllowPrivateNetwork — reapply
+      // the WebRTC policy to any LIVE isolated-browser window so disabling private access re-locks WebRTC
+      // immediately, not just on the next window reuse (R206).
+      reapplyIsolatedBrowserWebRtcPolicy();
     };
     const publishBrowserTools = (browserConfig: AppConfig['browser']): void => {
       updateBrowserTools(browserConfig.enabled && getExistingBrowserManager() ? createBrowserTools(getConfig) : []);
@@ -1603,7 +1642,22 @@ if (gotSingleInstanceLock) {
       browserConfigTransitions?.handle(browserConfig);
     };
 
+    // Gate config-driven hot-reloads until the INITIAL tool registry has been registered (R170 f-5):
+    // buildToolRegistry runs async; a config change (e.g. disable A + enable B) that lands during that
+    // build triggers a hot-reload rebuild, and if the (slower) initial build's registerTools completes
+    // AFTER the hot-reload's updateMcpTools, it CLOBBERS the reload's result with the stale set. So
+    // while the initial build is in flight we DEFER hot-reloads; once it registers we re-run
+    // handleConfigChanged(getConfig()) once so any drift that occurred during startup is applied ON TOP
+    // of the initial registration (the fingerprints stayed at their initial values, so the re-run
+    // detects and applies the real current config, winning deterministically).
+    let initialToolsRegistered = false;
+    let configChangedDuringStartup = false;
+
     const handleConfigChanged = (config: AppConfig) => {
+      if (!initialToolsRegistered) {
+        configChangedDuringStartup = true;
+        return;
+      }
       // MCP hot-reload
       const newMcpFp = JSON.stringify(config.mcpServers ?? []);
       if (newMcpFp !== lastMcpFingerprint) {
@@ -1620,12 +1674,22 @@ if (gotSingleInstanceLock) {
           });
       }
 
-      // Skills hot-reload
-      const newSkillsFp = JSON.stringify(config.skills?.enabled ?? []);
+      // Skills hot-reload. Fingerprint the skills DIRECTORY CONTENTS + directory path, not just
+      // skills.enabled (R170 f-6): with the default enabled=[] sentinel ("all enabled"), deleting a
+      // skill (or changing skills.directory) doesn't change the enabled array, so the reload was
+      // skipped and the removed skill's captured prompt/HTTP workflow stayed executable until restart.
+      const newSkillsFp = JSON.stringify({
+        enabled: config.skills?.enabled ?? [],
+        directory: config.skills?.directory ?? null,
+        contents: skillsDirectoryFingerprint(resolveSkillsDir(config, APP_HOME)),
+      });
       if (newSkillsFp !== lastSkillsFingerprint) {
         lastSkillsFingerprint = newSkillsFp;
         const skillsDir = resolveSkillsDir(config, APP_HOME);
-        const skillTools = loadSkillsAsTools(skillsDir, config.skills?.enabled ?? [], getConfig);
+        // Pass the CURRENT registered tool catalog (R170 f-10) so COMPOSITE skills can resolve the
+        // tools they orchestrate — omitting it made every composite skill capture an empty catalog
+        // after any reload and return "Tool not found" until restart.
+        const skillTools = loadSkillsAsTools(skillsDir, config.skills?.enabled ?? [], getConfig, getRegisteredTools());
         updateSkillTools(skillTools);
         syncRealtimeTools();
         console.info(`[${__BRAND_PRODUCT_NAME}] Skills hot-reload complete: ${skillTools.length} skill tools`);
@@ -1655,6 +1719,21 @@ if (gotSingleInstanceLock) {
       if (newSubAgentCapsFp !== lastSubAgentCapsFingerprint) {
         lastSubAgentCapsFingerprint = newSubAgentCapsFp;
         retryPendingSubAgentResumes();
+      }
+
+      // Security re-gating on a pure executionMode / isolated-browser-private toggle (R209): neither has an
+      // MCP/skills/CLI/browser fingerprint, so without this a global Auto->Plan-First switch would leave a
+      // recordless Realtime session with mutating tools, and disabling private access would leave a live
+      // isolated browser on WebRTC `default`. syncRealtimeTools() re-resolves realtime plan-first AND
+      // reapplies the isolated-browser WebRTC policy (R206).
+      const newExecutionModeFp = JSON.stringify(config.tools?.executionMode ?? 'auto');
+      const newIsolatedBrowserPrivateFp = JSON.stringify(
+        config.computerUse?.safety?.isolatedBrowserAllowPrivateNetwork ?? false,
+      );
+      if (newExecutionModeFp !== lastExecutionModeFp || newIsolatedBrowserPrivateFp !== lastIsolatedBrowserPrivateFp) {
+        lastExecutionModeFp = newExecutionModeFp;
+        lastIsolatedBrowserPrivateFp = newIsolatedBrowserPrivateFp;
+        syncRealtimeTools();
       }
 
       // Display list change detection — auto-update maxDimension when allowed displays change
@@ -2123,6 +2202,19 @@ if (gotSingleInstanceLock) {
       console.warn(`[${__BRAND_PRODUCT_NAME}] stale runStatus sweep failed (non-fatal):`, err);
     }
 
+    // Reconcile GHOST index entries left by a delete/clear whose durable index write failed before
+    // this process started (R165 f-2): drop entries whose record file is gone and durably tombstone
+    // their ids, so a deleted chat can't reappear or be resurrected after restart. Run this BEFORE
+    // reindexIfStale (R166 f-1): a stale-schema rebuild (rebuildIndexFromConversationFiles) would
+    // otherwise silently DROP the ghost entries (their files are gone) WITHOUT adding them to the
+    // durable deletedIds ring, so reconcile could no longer discover them and a stale put could
+    // recreate the deleted conversation.
+    try {
+      reconcileGhostIndexEntries(APP_HOME);
+    } catch (err) {
+      console.warn(`[${__BRAND_PRODUCT_NAME}] ghost-index reconcile failed (non-fatal):`, err);
+    }
+
     // One-time index backfill: older index.json files lack precomputed fields
     // (hasComputerUse/hasMedia) added for the chats-list advanced filters. Rebuild
     // the summaries once so those filters work on pre-existing conversations.
@@ -2320,6 +2412,11 @@ if (gotSingleInstanceLock) {
         if (!fn) return Promise.resolve({ ok: false, error: 'inject-unavailable' });
         return fn(conversationId, userText, o as never);
       },
+      // Effective-runtime resolver so an alert/recovered-answer resume of a
+      // non-Mastra-runtime conversation dispatches through the runtime-resolving
+      // inject path instead of the Mastra-only streamForPlugin path (R94).
+      resolveEffectiveRuntimeId: (o: { modelKey?: string; profileKey?: string; runtimeOverride?: string | null }) =>
+        resolveEffectiveRuntimeId(o),
     };
     const automationEngine = initializeAutomationEngine(automationDeps);
     registerAutomationsHandlers(ipcMain, automationEngine, eventBus);
@@ -2330,8 +2427,30 @@ if (gotSingleInstanceLock) {
       appHome: APP_HOME,
       getActionDeps: () => automationDeps,
       alertSurface: () => resolveAlertSurface(getConfig().automations ?? {}),
+      // Lets the recovered-answer durability alert reconcile against the run lifecycle
+      // (dismiss on deferred commit; keep once the run ends uncommitted) — R119.
+      isConversationTurnActive,
     });
     registerAlertsHandlers(ipcMain);
+
+    // Persist the authoritative per-conversation executionMode in MAIN when a
+    // plan-mode tool switches it, BEFORE its (fire-and-forget) renderer broadcast — so
+    // a window reloading during the transition doesn't leave the conversation on the
+    // stale mode for its next turn (R108 finding-4).
+    setExecutionModePersister((conversationId, mode) => {
+      // Return whether the authoritative disk write SUCCEEDED so a plan-first enter can FAIL
+      // CLOSED (R136 f-1): if plan-first can't be persisted, the tool must not let the renderer
+      // restart into a plan-first the trust-disk reconcile can't see (it would read stale 'auto'
+      // and run mutating tools).
+      try {
+        const conv = readConversationRecord(APP_HOME, conversationId);
+        if (!conv) return false;
+        writeConversationRecord(APP_HOME, { ...conv, executionMode: mode } as never);
+        return true;
+      } catch {
+        return false;
+      }
+    });
 
     // Register available agent runtimes
     registerRuntime(new MastraRuntime());
@@ -2400,9 +2519,59 @@ if (gotSingleInstanceLock) {
         });
         if (result.canceled) return { canceled: true, filePaths: [] };
 
-        // Read files and return as base64 data URLs
-        const files = result.filePaths.map((filePath) => {
-          const data = readFileSync(filePath);
+        // Read files and return as base64 data URLs. Enforce per-file + aggregate byte caps (R181),
+        // and open each file with O_NOFOLLOW + fstat the fd (R182): a plain statSync FOLLOWS a symlink
+        // and never checks the file TYPE, so a selected symlink to /dev/zero or a FIFO reports size 0,
+        // passes the cap, and then readFileSync either OOMs or blocks main forever. Open first (no
+        // link-follow), then fstat the real fd for both type (regular file) and size before reading.
+        const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024; // per file
+        const MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024; // across the selection
+        const skipped: string[] = [];
+        let aggregateBytes = 0;
+        const files: Array<Record<string, unknown>> = [];
+        for (const filePath of result.filePaths) {
+          let fd: number;
+          try {
+            // O_NONBLOCK (R183): opening a FIFO with a plain blocking O_RDONLY would hang main in the
+            // openSync call itself — before fstat could reject it. Open nonblocking; a regular file is
+            // unaffected, and a FIFO/device is rejected by the isFile() check below.
+            fd = openSync(filePath, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW | fsReadConstants.O_NONBLOCK);
+          } catch {
+            skipped.push(basename(filePath));
+            continue;
+          }
+          let data: Buffer;
+          try {
+            const st = fstatSync(fd);
+            // Reject non-regular files (FIFO/device/socket/dir): their reported size is meaningless and
+            // reading can block main indefinitely or stream unbounded bytes.
+            if (!st.isFile()) {
+              skipped.push(basename(filePath));
+              continue;
+            }
+            if (st.size > MAX_ATTACHMENT_BYTES || aggregateBytes + st.size > MAX_ATTACHMENT_TOTAL_BYTES) {
+              skipped.push(basename(filePath));
+              continue;
+            }
+            // Read at most the VALIDATED size (R184): readFileSync(fd) reads the file's CURRENT length,
+            // so a regular file grown between fstat and read could exceed the caps. Allocate a buffer of
+            // the fstat'd size and read exactly that many bytes — the allocation is bounded by the size
+            // we already checked, and any bytes appended after fstat are simply not read.
+            const buf = Buffer.allocUnsafe(st.size);
+            let off = 0;
+            while (off < st.size) {
+              const n = readSync(fd, buf, off, st.size - off, off);
+              if (n === 0) break; // truncated after fstat — use what we got
+              off += n;
+            }
+            data = off === st.size ? buf : buf.subarray(0, off);
+          } catch {
+            skipped.push(basename(filePath));
+            continue;
+          } finally {
+            closeSync(fd);
+          }
+          aggregateBytes += data.length;
           const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
           const mimeTypes: Record<string, string> = {
             png: 'image/png',
@@ -2419,7 +2588,7 @@ if (gotSingleInstanceLock) {
           };
           const mime = mimeTypes[ext] ?? 'application/octet-stream';
           const isImage = mime.startsWith('image/');
-          return {
+          files.push({
             path: filePath,
             name: basename(filePath),
             mime,
@@ -2428,9 +2597,9 @@ if (gotSingleInstanceLock) {
             dataUrl: `data:${mime};base64,${data.toString('base64')}`,
             // For text files, also include raw text
             ...(mime.startsWith('text/') || mime === 'application/json' ? { text: data.toString('utf-8') } : {}),
-          };
-        });
-        return { canceled: false, files };
+          });
+        }
+        return { canceled: false, files, ...(skipped.length > 0 ? { skipped } : {}) };
       },
     );
 
@@ -2510,14 +2679,37 @@ if (gotSingleInstanceLock) {
         if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
           return { error: 'Not a directory', entries: [] };
         }
-        const entries = readdirSync(resolved, { withFileTypes: true })
-          .filter((e) => !e.name.startsWith('.'))
-          .map((e) => ({ name: e.name, isDirectory: e.isDirectory() }))
-          .sort((a, b) => {
-            if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-            return a.name.localeCompare(b.name);
-          });
-        return { path: resolved, entries };
+        // Cap the enumeration (R180/R182/R183): this web-bridge-reachable handler synchronously reads
+        // + sorts entries of an arbitrary directory. A huge dir (e.g. /usr/bin, node_modules, or a dir
+        // of millions of DOTFILES) would freeze main and produce an enormous response. Iterate with
+        // opendirSync and STOP after scanning the cap — bound the SCAN (every Dirent examined), not just
+        // the collected non-hidden entries, so a flood of hidden files can't keep the loop running.
+        const MAX_DIR_ENTRIES = 5000;
+        const collected: Array<{ name: string; isDirectory: boolean }> = [];
+        let truncated = false;
+        let scanned = 0;
+        const dir = opendirSync(resolved);
+        try {
+          let dirent = dir.readSync();
+          while (dirent !== null) {
+            if (scanned >= MAX_DIR_ENTRIES) {
+              truncated = true;
+              break;
+            }
+            scanned++;
+            if (!dirent.name.startsWith('.')) {
+              collected.push({ name: dirent.name, isDirectory: dirent.isDirectory() });
+            }
+            dirent = dir.readSync();
+          }
+        } finally {
+          dir.closeSync();
+        }
+        const entries = collected.sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+        return { path: resolved, entries, ...(truncated ? { truncated: true } : {}) };
       } catch (err) {
         return { error: String(err), entries: [] };
       }
@@ -2530,10 +2722,40 @@ if (gotSingleInstanceLock) {
         // Security: strip directory components and only allow reading from the plans directory
         const safeName = String(filename).replace(/[/\\]/g, '');
         const resolved = join(plansDir, safeName);
-        if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+        // Use lstatSync (NOT statSync) so a SYMLINK at the target is detected and REJECTED rather
+        // than followed (R168): statSync follows the link, so `~/.kai/plans/x.md → ~/.ssh/id_ed25519`
+        // would leak the target's contents through this IPC channel. Plan files are ephemeral
+        // Byte cap (R180) + single-descriptor validation (R204): a pre-open lstat cap is a TOCTOU — a
+        // regular file grown/replaced between the lstat and the read could exceed the cap, and a FIFO swap
+        // could block a plain openSync. Open FIRST with O_NOFOLLOW|O_NONBLOCK (nonblocking so a FIFO can't
+        // hang the open), then fstat the SAME descriptor to confirm a regular file + enforce the cap, and
+        // read exactly the fstat'd size with a bounded loop (bytes appended after fstat are not read).
+        const MAX_PLAN_READ_BYTES = 4 * 1024 * 1024;
+        let fd: number;
+        try {
+          fd = openSync(resolved, fsReadConstants.O_RDONLY | fsReadConstants.O_NOFOLLOW | fsReadConstants.O_NONBLOCK);
+        } catch {
           return { error: 'File not found' };
         }
-        return { content: readFileSync(resolved, 'utf-8') };
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile()) {
+            return { error: 'File not found' };
+          }
+          if (st.size > MAX_PLAN_READ_BYTES) {
+            return { error: 'Plan file too large' };
+          }
+          const buf = Buffer.allocUnsafe(st.size);
+          let off = 0;
+          while (off < st.size) {
+            const n = readSync(fd, buf, off, st.size - off, off);
+            if (n === 0) break; // truncated after fstat — use what we got
+            off += n;
+          }
+          return { content: buf.subarray(0, off).toString('utf-8') };
+        } finally {
+          closeSync(fd);
+        }
       } catch (err) {
         return { error: String(err) };
       }
@@ -2664,11 +2886,6 @@ if (gotSingleInstanceLock) {
         return new Response('Forbidden', { status: 403 });
       }
 
-      const data = safeReadFileWithin(mediaDir, filePath);
-      if (!data) {
-        return new Response('Not Found', { status: 404 });
-      }
-
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
       const mimeTypes: Record<string, string> = {
         png: 'image/png',
@@ -2687,8 +2904,87 @@ if (gotSingleInstanceLock) {
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 
+      // Honor a Range request (R171) so a media element (esp. <video preload="metadata">) can fetch
+      // just the bytes it needs instead of making us buffer the WHOLE file (up to 512MiB) into memory.
+      // Parse a single `bytes=start-end` range; multi-range is uncommon for media and we fall back to
+      // a full read for it.
+      const rangeHeader = request.headers.get('Range') || request.headers.get('range');
+      const singleRange = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+      if (singleRange) {
+        // Need the size first; do a bounded ranged read starting at the requested offset.
+        const startStr = singleRange[1];
+        const endStr = singleRange[2];
+        // Suffix range (bytes=-N) → last N bytes; needs the size, so read once to learn it via a
+        // best-effort full-containment stat. We resolve start/end after a small probe read.
+        const MEDIA_CHUNK = 4 * 1024 * 1024; // serve at most 4MiB per range response
+        let start: number;
+        let end: number;
+        if (startStr === '' && endStr !== '') {
+          // suffix range — resolve against size from a 1-byte probe (cheap) to get total length
+          const probe = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+          if (!probe) return new Response('Not Found', { status: 404 });
+          const suffix = Math.min(parseInt(endStr, 10), probe.size);
+          start = Math.max(0, probe.size - suffix);
+          // Cap the served span to MEDIA_CHUNK (R172): an open-ended suffix like bytes=-536870912
+          // would otherwise buffer the whole (up to 512MiB) file. The client re-requests further
+          // bytes with follow-up ranges.
+          end = Math.min(probe.size - 1, start + MEDIA_CHUNK - 1);
+        } else {
+          start = startStr === '' ? 0 : parseInt(startStr, 10);
+          end = endStr === '' ? start + MEDIA_CHUNK - 1 : parseInt(endStr, 10);
+          // Cap the served span so a `bytes=0-` request doesn't buffer the whole file.
+          end = Math.min(end, start + MEDIA_CHUNK - 1);
+        }
+        const ranged = safeReadRangeWithin(mediaDir, filePath, start, end);
+        if (!ranged) {
+          // Unsatisfiable / not found — probe existence to choose 416 vs 404.
+          const exists = safeReadRangeWithin(mediaDir, filePath, 0, 0);
+          if (exists) {
+            return new Response('Range Not Satisfiable', {
+              status: 416,
+              headers: { 'Content-Range': `bytes */${exists.size}` },
+            });
+          }
+          return new Response('Not Found', { status: 404 });
+        }
+        return new Response(new Uint8Array(ranged.data), {
+          status: 206,
+          headers: {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${ranged.start}-${ranged.end}/${ranged.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(ranged.data.length),
+            'Cache-Control': 'no-cache',
+          },
+        });
+      }
+
+      // A Range header that is PRESENT but not a parseable single range (multi-range, or malformed)
+      // must NOT fall through to the unbounded full-file read (R172) — a `bytes=-BIG` or multi-range
+      // against a 512MiB video would allocate the whole file. Serve a bounded first chunk as 206.
+      if (rangeHeader) {
+        const ranged = safeReadRangeWithin(mediaDir, filePath, 0, 4 * 1024 * 1024 - 1);
+        if (ranged) {
+          return new Response(new Uint8Array(ranged.data), {
+            status: 206,
+            headers: {
+              'Content-Type': contentType,
+              'Content-Range': `bytes ${ranged.start}-${ranged.end}/${ranged.size}`,
+              'Accept-Ranges': 'bytes',
+              'Content-Length': String(ranged.data.length),
+              'Cache-Control': 'no-cache',
+            },
+          });
+        }
+        // fall through to full read only if the ranged read failed (e.g. empty file)
+      }
+
+      const data = safeReadFileWithin(mediaDir, filePath);
+      if (!data) {
+        return new Response('Not Found', { status: 404 });
+      }
       return new Response(new Uint8Array(data), {
-        headers: { 'Content-Type': contentType, 'Cache-Control': 'no-cache' },
+        headers: { 'Content-Type': contentType, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-cache' },
       });
     });
 
@@ -2804,6 +3100,17 @@ if (gotSingleInstanceLock) {
         // do not let this older registry snapshot overwrite the live setting.
         registerToolsPreservingBrowserState(allTools);
         console.info(`[${__BRAND_PRODUCT_NAME}] ${tools.length} tools + ${pluginTools.length} plugin tools registered`);
+        // The initial registry is now live. Enable hot-reloads and re-run once if any config change
+        // arrived DURING the build (R170 f-5), so it lands ON TOP of this registration.
+        initialToolsRegistered = true;
+        if (configChangedDuringStartup) {
+          configChangedDuringStartup = false;
+          try {
+            handleConfigChanged(getConfig());
+          } catch (err) {
+            console.error(`[${__BRAND_PRODUCT_NAME}] deferred config hot-reload failed:`, err);
+          }
+        }
 
         // Register realtime handlers (needs tool registry)
         registerRealtimeHandlers(
@@ -2840,6 +3147,18 @@ if (gotSingleInstanceLock) {
         // CLI agent:submit calls don't hang forever awaiting a registry that
         // will never arrive. registerTools() flips the ready latch.
         registerTools(getRegisteredTools());
+        // Enable hot-reloads even on build failure (R171): otherwise a single initial-build rejection
+        // would DEFER every config-driven MCP/skill/CLI reload forever (until restart). Re-run any
+        // change that arrived during the (failed) build so config still takes effect live.
+        initialToolsRegistered = true;
+        if (configChangedDuringStartup) {
+          configChangedDuringStartup = false;
+          try {
+            handleConfigChanged(getConfig());
+          } catch (e) {
+            console.error(`[${__BRAND_PRODUCT_NAME}] deferred config hot-reload failed:`, e);
+          }
+        }
       });
 
     void Promise.allSettled([pluginsReady, toolsReady, workspaceToolsReady]).then(() => {

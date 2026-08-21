@@ -9,7 +9,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const appendMock = vi.fn();
-const readMock = vi.fn((_appHome?: string, _conversationId?: string) => null as { headId?: string | null } | null);
+const readMock = vi.fn(
+  (_appHome?: string, _conversationId?: string) =>
+    null as {
+      headId?: string | null;
+      runStatus?: string;
+      messageTree?: Array<Record<string, unknown>>;
+      messages?: Array<Record<string, unknown>>;
+    } | null,
+);
 const writeMock = vi.fn((_appHome: string, conv: unknown) => conv);
 vi.mock('../../ipc/conversations.js', () => ({
   // Return a minimal record whose headId is the id of the appended assistant
@@ -31,14 +39,16 @@ import {
   discardPersistenceAccumulator,
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
+  finalizeInterruptedTurnUpsert,
   persistCooperativeInjectedUserTurn,
+  finalizeGuiFallbackPrefixAtInject,
   clearFinalizedResponseIds,
 } from '../stream-persistence.js';
 import type { StreamEvent } from '../mastra-agent.js';
 
 const APP_HOME = '/tmp/fake-home';
-const feed = (e: Partial<StreamEvent>): void => accumulateForPersistence(APP_HOME, e as StreamEvent);
-const feedWithParent = (e: Partial<StreamEvent>, parentId?: string): void =>
+const feed = (e: Partial<StreamEvent>) => accumulateForPersistence(APP_HOME, e as StreamEvent);
+const feedWithParent = (e: Partial<StreamEvent>, parentId?: string) =>
   accumulateForPersistence(APP_HOME, e as StreamEvent, parentId);
 
 describe('stream persistence accumulator', () => {
@@ -96,6 +106,37 @@ describe('stream persistence accumulator', () => {
     expect(secondMsg.id).toContain('resp-1'); // derived from it for traceability
     expect(secondHead).toBeTruthy();
     clearFinalizedResponseIds('cont');
+  });
+
+  it('finalizeGuiFallbackPrefixAtInject finalizes the prefix, returns its head, and reseeds the continuation under the injected user', () => {
+    clearFinalizedResponseIds('gui');
+    // Prefix content accumulated before the inject boundary.
+    feed({ conversationId: 'gui', type: 'text-delta', text: 'prefix reply', responseMessageId: 'resp-g' });
+    const prefixHead = finalizeGuiFallbackPrefixAtInject(APP_HOME, 'gui', 'injected-user-id');
+    // The prefix was finalized (one append) and its head returned.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    expect(prefixHead).toBeTruthy();
+    // A fresh continuation accumulator is now parented on the injected user, so a
+    // later continuation delta finalizes as a child of the injected user.
+    feed({ conversationId: 'gui', type: 'text-delta', text: 'continuation', responseMessageId: 'resp-g2' });
+    finalizeInterruptedTurn(APP_HOME, 'gui');
+    expect(appendMock).toHaveBeenCalledTimes(2);
+    const contCall = appendMock.mock.calls[1];
+    // appendConversationMessages(home, id, msgs, opts) — opts.parentId is the injected user.
+    expect((contCall[3] as { parentId?: string } | undefined)?.parentId).toBe('injected-user-id');
+    clearFinalizedResponseIds('gui');
+  });
+
+  it('finalizeGuiFallbackPrefixAtInject with NO prefix content just reseeds under the injected user (no append)', () => {
+    clearFinalizedResponseIds('gui2');
+    const prefixHead = finalizeGuiFallbackPrefixAtInject(APP_HOME, 'gui2', 'iu2');
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(prefixHead).toBeNull();
+    // Reseeded accumulator is parented on the injected user.
+    feed({ conversationId: 'gui2', type: 'text-delta', text: 'reply', responseMessageId: 'r' });
+    finalizeInterruptedTurn(APP_HOME, 'gui2');
+    expect((appendMock.mock.calls[0][3] as { parentId?: string } | undefined)?.parentId).toBe('iu2');
+    clearFinalizedResponseIds('gui2');
   });
 
   it('finalizeInterruptedTurnReplacing REPLACES an existing assistant node (web-origin) instead of appending a duplicate', () => {
@@ -163,6 +204,50 @@ describe('stream persistence accumulator', () => {
     expect(writtenConv.headId).toBe('newerUser');
     expect(writtenConv.runStatus).toBe('running');
     clearFinalizedResponseIds('web2');
+  });
+
+  it('finalizeInterruptedTurnUpsert REPLACES a local-origin node the renderer already persisted (no duplicate)', () => {
+    // Local originator: the renderer's ~300ms debounced stream-persist already wrote the
+    // assistant node under this run's responseMessageId, but disk is still 'running' (the
+    // originator hasn't reached its terminal persist). A passive client wins continuation and
+    // flushes main's fallback here. A plain append would collision-rename to a bogus
+    // `auto-msg-*` sibling; upsert must REPLACE the existing node in place.
+    clearFinalizedResponseIds('local');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    readMock.mockReturnValueOnce({
+      id: 'local',
+      headId: 'resp-local',
+      runStatus: 'running',
+      messageTree: [
+        { id: 'u', parentId: null, role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-local', parentId: 'u', role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+      ],
+      messages: [
+        { id: 'u', role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { id: 'resp-local', role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+      ],
+    } as unknown as { headId?: string | null });
+    feed({ conversationId: 'local', type: 'text-delta', text: 'FULL reply', responseMessageId: 'resp-local' });
+    const head = finalizeInterruptedTurnUpsert(APP_HOME, 'local');
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    expect(head).toBe('resp-local');
+    const writtenConv = writeMock.mock.calls[0][1] as { messageTree: Array<{ id: string; content: unknown }> };
+    const node = writtenConv.messageTree.find((m) => m.id === 'resp-local')!;
+    expect(JSON.stringify(node.content)).toContain('FULL reply');
+    clearFinalizedResponseIds('local');
+  });
+
+  it('finalizeInterruptedTurnUpsert APPENDS when no node with that id exists yet (local, renderer not-yet-persisted)', () => {
+    clearFinalizedResponseIds('local2');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    feed({ conversationId: 'local2', type: 'text-delta', text: 'reply', responseMessageId: 'resp-local2' });
+    finalizeInterruptedTurnUpsert(APP_HOME, 'local2');
+    // No pre-existing node under resp-local2 → falls through to a normal append.
+    expect(appendMock).toHaveBeenCalledTimes(1);
+    clearFinalizedResponseIds('local2');
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
@@ -563,5 +648,48 @@ describe('persistCooperativeInjectedUserTurn (CLI/server-persisted cooperative i
     expect(appendMock).toHaveBeenCalledTimes(1);
     const [, , , options] = appendMock.mock.calls[0];
     expect(options).toEqual({ runStatus: 'running' });
+  });
+
+  it('pins an empty-prefix inject to noPrefixParentId (superseded branch point), not the live head', () => {
+    // A newer prompt has already advanced the disk head. The superseded run had no
+    // accumulated assistant content, so there is no partial to finalize. The inject
+    // must pin on the superseded run's OWN branch point (`orig-user`) — where it
+    // chronologically belongs — NOT the store's current head (the newer prompt).
+    readMock.mockReturnValue({
+      headId: 'newer-prompt',
+      messageTree: [
+        { id: 'orig-user', parentId: null, role: 'user' },
+        { id: 'newer-prompt', parentId: 'orig-user', role: 'user' },
+      ],
+    });
+    appendMock.mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci3', 'raced answer', 'inj-e', {
+      noPrefixParentId: 'orig-user',
+    });
+
+    expect(result?.messageId).toBe('inj-e');
+    expect(result?.parentId).toBe('orig-user');
+    const [, , , options] = appendMock.mock.calls[0];
+    // Explicit parent pinned — NOT an omitted parentId (which would fall to the live head).
+    expect(options).toEqual({ runStatus: 'running', parentId: 'orig-user' });
+  });
+
+  it('falls back to the store head when noPrefixParentId names a node absent from disk', () => {
+    // A stale branch point that no longer exists on disk must NOT be pinned (would
+    // create a detached inject); fall back to the store's current head.
+    readMock.mockReturnValue({
+      headId: 'live-head',
+      messageTree: [{ id: 'live-head', parentId: null, role: 'user' }],
+    });
+    appendMock.mockReturnValueOnce({ headId: 'stored-injected-head' });
+
+    const result = persistCooperativeInjectedUserTurn(APP_HOME, 'ci4', 'answer', 'inj-f', {
+      noPrefixParentId: 'gone-node',
+    });
+
+    expect(result?.parentId).toBe('live-head');
+    const [, , , options] = appendMock.mock.calls[0];
+    expect(options).toEqual({ runStatus: 'running' }); // parentId omitted → append uses store head
   });
 });

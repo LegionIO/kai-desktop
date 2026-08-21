@@ -652,15 +652,27 @@ export function countMessageTokensCanonical(message: TokenBearingMessage): numbe
  * turn — reuses the result instead of re-encoding.
  *
  * The cache is keyed by `(encodingModelName, serialized length, message count,
- * last message id)`. Length + count + tail id change whenever the branch
- * content changes in any way that matters for token counting; a collision would
- * require identical length AND count AND tail id with different interior bytes,
- * which does not occur for an append-only/edited conversation branch. The cache
- * is bounded (LRU-ish via insertion-order eviction) so it can't grow unbounded
- * across many conversations.
+ * last message id, cheap content hash)`. Length + count + tail id change for
+ * most edits, but a SAME-LENGTH interior-message rewrite (an inline edit /
+ * regenerate that keeps the byte length and tail id) would otherwise collide and
+ * reuse a stale count (R168) — so a cheap non-cryptographic hash of the
+ * serialized bytes disambiguates it. The hash is O(n) string scan, orders of
+ * magnitude cheaper than a tiktoken encode, so it preserves the perf win. The
+ * cache is bounded (LRU-ish via insertion-order eviction) so it can't grow
+ * unbounded across many conversations.
  */
 const EXACT_TOKEN_CACHE_MAX = 256;
 const exactTokenCache = new Map<string, number>();
+
+/** Cheap 32-bit FNV-1a hash of a string — used only to disambiguate cache keys, not for security. */
+function cheapStringHash(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
 
 function branchSignature(
   serialized: string,
@@ -668,7 +680,7 @@ function branchSignature(
   lastMessageId: string | undefined,
   encodingModelName: string,
 ): string {
-  return `${encodingModelName}\0${serialized.length}\0${messageCount}\0${lastMessageId ?? ''}`;
+  return `${encodingModelName}\0${serialized.length}\0${messageCount}\0${lastMessageId ?? ''}\0${cheapStringHash(serialized)}`;
 }
 
 /**

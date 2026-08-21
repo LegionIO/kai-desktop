@@ -96,17 +96,25 @@ type AppAPI = {
     injectMidTurn: (
       conversationId: string,
       userText: string,
-    ) => Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }>;
+      expectedGeneration?: string,
+    ) => Promise<{ ok: boolean; cooperative?: boolean; blocked?: boolean; id?: string; error?: string }>;
     listInjects: (conversationId: string) => Promise<Array<{ id: string; text: string; at: number }>>;
     cancelInject: (conversationId: string, id: string) => Promise<{ ok: boolean; text?: string }>;
-    getToolApprovalPrivateDetails?: (toolCallId: string) => Promise<{
+    getToolApprovalPrivateDetails?: (
+      toolCallId: string,
+      conversationId?: string,
+    ) => Promise<{
       browserInput: unknown;
       browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
     } | null>;
-    approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
-    rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
-    dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
-    answerToolQuestion: (toolCallId: string, answers: Record<string, string>) => Promise<{ ok: boolean }>;
+    approveToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
+    rejectToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
+    dismissToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
+    answerToolQuestion: (
+      toolCallId: string,
+      answers: Record<string, string>,
+      conversationId?: string,
+    ) => Promise<{ ok: boolean }>;
     generateTitle: (
       messages: unknown[],
       modelKey?: string,
@@ -122,12 +130,12 @@ type AppAPI = {
   };
   approval: {
     onRequest: (callback: (request: unknown) => void) => () => void;
-    close: (approvalId: string) => void;
+    close: (approvalId: string, conversationId?: string) => void;
   };
   notification: {
     onRequest: (callback: (item: unknown) => void) => () => void;
-    get: (id: string) => Promise<unknown>;
-    close: (id: string) => void;
+    get: (id: string, conversationId?: string) => Promise<unknown>;
+    close: (id: string, conversationId?: string) => void;
     reportSize: (height: number) => void;
   };
   conversations: {
@@ -177,6 +185,7 @@ type AppAPI = {
         removeIds?: string[];
       },
     ) => Promise<{ ok: boolean }>;
+    setExecutionMode: (conversationId: string, mode: 'auto' | 'plan-first' | null) => Promise<{ ok: boolean }>;
     claimPendingDraft: (
       conversationId: string,
       id?: string,
@@ -541,8 +550,10 @@ type AppAPI = {
       taskId: string,
       userMessage: string,
       history?: TaskConversationMessage[],
-    ) => Promise<{ taskId: string }>;
-    cancelPlanStream: (taskId: string) => Promise<{ ok: boolean }>;
+      attachments?: Array<{ image: string; mimeType?: string }>,
+      streamId?: string,
+    ) => Promise<{ taskId: string; error?: boolean; droppedImages?: number; streamId?: string }>;
+    cancelPlanStream: (taskId: string, streamId?: string) => Promise<{ ok: boolean }>;
     generateTitle: (userMessage: string) => Promise<{ title: string | null }>;
     onStreamEvent: (callback: (event: TaskStreamEvent) => void) => () => void;
   };
@@ -699,7 +710,7 @@ type AppAPI = {
   onMenuOpenSettings: (callback: () => void) => () => void;
   onFind: (callback: () => void) => () => void;
   onModelSwitched: (callback: (modelKey: string) => void) => () => void;
-  onExecutionModeChanged: (callback: (mode: string) => void) => () => void;
+  onExecutionModeChanged: (callback: (payload: { conversationId: string | null; mode: string }) => void) => () => void;
   dictation: {
     toggle: () => Promise<DictationRuntimeState>;
     stop: () => Promise<DictationRuntimeState>;

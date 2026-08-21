@@ -490,6 +490,11 @@ export class HookDispatcher {
         continue;
       }
 
+      // block/modify are only meaningful for awaited (enforcing) events; for
+      // fire-and-forget events, downgrade to observe regardless of source so a
+      // plugin can't deny/short-circuit (and suppress the observe fan-out).
+      const effectiveMode = ENFORCING_HOOK_EVENTS.has(event) ? reg.mode : 'observe';
+
       // User shell hooks carry their rule's throttle. Decide ONCE per rule per
       // dispatch (memoized on dispatchId) so a rule with multiple actions
       // doesn't have the first action consume the budget and skip the rest.
@@ -503,20 +508,22 @@ export class HookDispatcher {
       // rate-limit and cause the real chat prompt to be throttled past the DLP
       // hook (raw prompt leaks). So we skip the throttle check (no bucket
       // advancement) for suppressObserve dispatches and let enforcement proceed.
+      //
+      // CRITICAL (R170 f-4): throttling only limits an OBSERVE action's side-effect frequency
+      // (notifications / shell). A throttled BLOCK or MODIFY rule must STILL ENFORCE — skipping it
+      // would FAIL OPEN: a second prompt inside a DLP rule's debounce window would bypass redaction,
+      // and a rate-limited PreToolUse block would allow the raw tool call. So the throttle-skip
+      // applies ONLY when the effective mode is observe; block/modify never get skipped for throttle.
       if (reg.source === 'user' && reg.ruleId) {
         if (reg.conditionGate && !reg.conditionGate(current)) continue;
         if (
+          effectiveMode === 'observe' &&
           !opts?.suppressObserve &&
           this.isRuleThrottled(reg.ruleId, reg.debounceMs ?? 0, reg.rateLimitPerMinute, dispatchId)
         ) {
           continue;
         }
       }
-
-      // block/modify are only meaningful for awaited (enforcing) events; for
-      // fire-and-forget events, downgrade to observe regardless of source so a
-      // plugin can't deny/short-circuit (and suppress the observe fan-out).
-      const effectiveMode = ENFORCING_HOOK_EVENTS.has(event) ? reg.mode : 'observe';
 
       if (effectiveMode === 'observe') {
         // suppressObserve → enforcement-only dispatch (e.g. title generation):

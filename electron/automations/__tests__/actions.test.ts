@@ -331,6 +331,32 @@ describe('agent conversationTarget', () => {
     );
   });
 
+  it('strips the interactive plan-mode tools from a headless automation tool set (R138 f-5)', async () => {
+    const t = (name: string) => ({ name, description: name, inputSchema: {}, execute: vi.fn() }) as never;
+    const planRule = rule([
+      {
+        type: 'agent',
+        mode: 'conversation',
+        prompt: 'do the thing',
+        tools: true,
+        conversationTarget: { type: 'per-invocation' },
+        includeHistory: true,
+        onBusyTarget: 'inject',
+      },
+    ]);
+    await executeActions(
+      planRule,
+      evt,
+      deps({ getRegisteredTools: () => [t('enter_plan_mode'), t('exit_plan_mode'), t('read_file')] }),
+    );
+    const forwardedTools = (vi.mocked(streamForPlugin).mock.calls.at(-1)![0] as { tools?: Array<{ name: string }> })
+      .tools;
+    const names = (forwardedTools ?? []).map((x) => x.name);
+    expect(names).toContain('read_file');
+    expect(names).not.toContain('enter_plan_mode');
+    expect(names).not.toContain('exit_plan_mode');
+  });
+
   it('busy target (existing or singleton) diverts before generation, skipping history', async () => {
     resetMockStore({
       convA: {
@@ -1263,5 +1289,106 @@ describe('agent conversationTarget', () => {
     await executeActions(agentAction({ type: 'existing', conversationId: 'convA' }, false), evt, deps());
     const call = vi.mocked(streamForPlugin).mock.calls.at(-1)![0];
     expect(call.messages).toEqual([{ role: 'user', content: 'do the thing' }]);
+  });
+});
+
+describe('resumeConversationWithMessage runtime-aware routing (R94)', () => {
+  beforeEach(() => {
+    vi.mocked(streamForPlugin).mockReset();
+    vi.mocked(streamForPlugin).mockImplementation(async function* () {
+      yield { type: 'done' } as never;
+    });
+    resetMockStore({
+      convA: {
+        id: 'convA',
+        messageTree: [{ id: 'm1', parentId: null, role: 'user', content: 'earlier', createdAt: 'x' }],
+        headId: 'm1',
+        metadata: {},
+      },
+    });
+  });
+
+  it('delegates to injectUserTurnAndRestart (NOT streamForPlugin) when the effective runtime is non-Mastra', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'codex-sdk');
+    const res = await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+      {
+        executionMode: 'plan-first',
+        reasoningEffort: 'high',
+        threadOverrides: { runtimeOverride: 'codex-sdk', temperature: 0.3 },
+      },
+    );
+    expect(resolveEffectiveRuntimeId).toHaveBeenCalled();
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    const [convId, text, opts] = injectUserTurnAndRestart.mock.calls.at(-1) as unknown as [
+      string,
+      string,
+      { executionMode?: string; reasoningEffort?: string; threadOverrides?: { runtimeOverride?: string } },
+    ];
+    expect(convId).toBe('convA');
+    expect(text).toBe('the answer');
+    expect(opts.executionMode).toBe('plan-first');
+    expect(opts.reasoningEffort).toBe('high');
+    expect(opts.threadOverrides?.runtimeOverride).toBe('codex-sdk');
+    // The recovered turn runs on its own (CLI) runtime, not the Mastra stream path.
+    expect(streamForPlugin).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ ok: true });
+  });
+
+  it('resolves the effective runtime even with NO runtimeOverride (auto → non-Mastra) and delegates', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    // Global agent.runtime='auto' + an Anthropic model resolves to claude-agent-sdk.
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'claude-agent-sdk');
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).toHaveBeenCalledTimes(1);
+    expect(streamForPlugin).not.toHaveBeenCalled();
+  });
+
+  it('uses the ordinary streamForPlugin path when the effective runtime is Mastra', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'mastra');
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
+  });
+
+  it('uses streamForPlugin when no runtime resolver is wired (tests / early init)', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    await resumeConversationWithMessage('convA', 'the answer', deps({ injectUserTurnAndRestart }));
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
+  });
+
+  it('throws when the runtime-aware delegation fails so the answer is not silently dropped', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: false, error: 'conversation-busy' }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => 'codex-sdk');
+    await expect(
+      resumeConversationWithMessage('convA', 'a', deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId })),
+    ).rejects.toThrow(/conversation-busy/);
+  });
+
+  it('falls back to streamForPlugin when the runtime resolver throws', async () => {
+    const injectUserTurnAndRestart = vi.fn(async () => ({ ok: true }));
+    const resolveEffectiveRuntimeId = vi.fn(async () => {
+      throw new Error('resolver boom');
+    });
+    await resumeConversationWithMessage(
+      'convA',
+      'the answer',
+      deps({ injectUserTurnAndRestart, resolveEffectiveRuntimeId }),
+    );
+    expect(injectUserTurnAndRestart).not.toHaveBeenCalled();
+    expect(streamForPlugin).toHaveBeenCalled();
   });
 });

@@ -62,9 +62,19 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
     // block always disconnects, killing any spawned process.
     const CONNECT_TEST_TIMEOUT_MS = 30_000;
     let timer: NodeJS.Timeout | undefined;
+    // Keep a handle to the connect promise so a TIMED-OUT test can still tear down the connection
+    // once it eventually settles (R169): Promise.race does NOT cancel connectMcpServer, so on a
+    // timeout the connect keeps running and later does connections.set(testName, …) — AFTER the
+    // finally's disconnect already ran — leaking a live __test__ connection (rebuilds skip __test__
+    // names, so it survives until exit). Disconnect again after the connect settles to reap it.
+    const connectPromise = connectMcpServer({ ...server, name: testName });
+    let settledBeforeCleanup = false;
     try {
       const conn = await Promise.race([
-        connectMcpServer({ ...server, name: testName }),
+        connectPromise.then((c) => {
+          settledBeforeCleanup = true;
+          return c;
+        }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new Error(`Connection test timed out after ${CONNECT_TEST_TIMEOUT_MS / 1000}s`)),
@@ -92,6 +102,15 @@ export function registerMcpHandlers(ipcMain: IpcMain): void {
         await disconnectMcpServer(testName);
       } catch {
         /* best-effort cleanup */
+      }
+      // If the connect had NOT settled by the time we cleaned up (a timeout), it may still be running
+      // and will insert a live connection when it completes — disconnect once more after it settles.
+      if (!settledBeforeCleanup) {
+        void connectPromise
+          .catch(() => undefined)
+          .finally(() => {
+            void disconnectMcpServer(testName).catch(() => undefined);
+          });
       }
     }
   });
