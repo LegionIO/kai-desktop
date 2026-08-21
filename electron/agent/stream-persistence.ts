@@ -809,8 +809,15 @@ function persistAccumulatedReturningHead(
           accumulators.delete(conversationId); // persisted — safe to clear (R168)
           return effectiveId;
         }
+        // Node did NOT exist on disk (read succeeded, nodeIdx < 0) → the renderer hasn't persisted it yet;
+        // fall through to the normal append (which uses effectiveId, no collision since it's absent).
       } catch {
-        // Fall through to the normal append on any read/write failure.
+        // R263: a read/write FAILURE in the replaceById path must NOT fall through to append — the renderer
+        // may already have persisted a node under effectiveId, so appending would collision-rename to a bogus
+        // `auto-msg-*` duplicate variant AND bypass R173's failed-write protection. RETAIN the accumulator and
+        // return null so a later finalize retries the replace (idempotent). (Distinct from the read-succeeded /
+        // node-absent case above, which correctly appends.)
+        return null;
       }
     }
     // Parent on the head captured at submit so a mid-run branch change

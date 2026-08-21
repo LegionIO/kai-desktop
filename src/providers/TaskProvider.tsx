@@ -593,55 +593,7 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     },
     [],
   );
-  // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
-  const rememberSubmission = useCallback(
-    (
-      taskId: string,
-      text: string,
-      attachments: Array<{ image: string; mimeType?: string }> | undefined,
-      streamId: string,
-    ) => {
-      const prev = submittedPayloadRef.current.get(taskId);
-      if (prev) onAttachmentsReleased(prev.bytes);
-      const bytes = computePayloadBytes(text, attachments);
-      if (bytes > 0) onAttachmentsCommitted(bytes);
-      // R226: streamId is minted by the caller and stored HERE, synchronously, before streamPlan is awaited —
-      // no pending-admission window (streamId is known before streamPlan is awaited).
-      submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes, streamId });
-      // R221/R226: a NEW submission for this task supersedes any stale recovery entry from a prior failed attempt —
-      // the user is actively retrying, so the earlier stashed draft is obsolete. Release the prior recovery entry's
-      // byte charge from recoveryBytesRef (R226: previously only the state was cleared, leaving a phantom charge
-      // that reduced the global budget after a successful retry) AND remove the state entry.
-      const staleRecovery = recoveryBytesRef.current.get(taskId);
-      if (staleRecovery !== undefined) {
-        recoveryBytesRef.current.delete(taskId);
-        if (staleRecovery > 0) onAttachmentsReleased(staleRecovery);
-      }
-      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
-    },
-    [computePayloadBytes],
-  );
-  const dropSubmission = useCallback((taskId: string) => {
-    const p = submittedPayloadRef.current.get(taskId);
-    if (p) {
-      onAttachmentsReleased(p.bytes); // release parked bytes (R219)
-      submittedPayloadRef.current.delete(taskId);
-    }
-  }, []);
-  const clearFailedSubmission = useCallback((taskId: string) => {
-    // R225: release the parked recovery payload's byte charge (kept accounted while parked so the renderer-wide
-    // ceiling reflects the strings actually resident in failedSubmissions state). Delete-then-release is
-    // idempotent — a second clear finds no ref entry and releases nothing.
-    const bytes = recoveryBytesRef.current.get(taskId);
-    if (bytes !== undefined) {
-      recoveryBytesRef.current.delete(taskId);
-      if (bytes > 0) onAttachmentsReleased(bytes);
-    }
-    dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
-  }, []);
-  // R225: park a recovery payload, keeping its bytes accounted and bounding the total. Evicts OLDEST parked
-  // entries (Map insertion order) until this new entry fits under RECOVERY_BYTES_CAP. Evicting drops the entry's
-  // strings + releases its charge so parked recovery can't grow the heap without limit.
+  // R225: park a recovery payload, accounting its bytes and bounding the total (evict oldest to a cap).
   const parkRecovery = useCallback(
     (
       taskId: string,
@@ -671,6 +623,68 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
     },
     [RECOVERY_BYTES_CAP],
   );
+  // Store (or replace) a task's recovery payload, accounting its bytes. A replace releases the prior bytes.
+  const rememberSubmission = useCallback(
+    (
+      taskId: string,
+      text: string,
+      attachments: Array<{ image: string; mimeType?: string }> | undefined,
+      streamId: string,
+    ) => {
+      const prev = submittedPayloadRef.current.get(taskId);
+      let parkedPrev = false;
+      if (prev) {
+        // R263: `prev` may be a STILL-LIVE in-flight submission for the SAME task (A1→B→A2: the user returned to
+        // task A and submitted A2 while A1 was still streaming — the composer's busy gate only tracks the
+        // displayed task B, so it doesn't block this). Overwriting A1's ownership means A1's later
+        // superseded-error terminal (stamped A1's streamId) no longer matches this entry (now A2's), so A1 would
+        // be neither persisted nor recovered. PARK A1's payload as recovery before overwriting so its draft
+        // isn't silently lost. (parkRecovery takes ownership of prev.bytes — already committed — rather than
+        // releasing then re-committing.)
+        parkRecovery(taskId, prev.text, prev.attachments, prev.bytes);
+        parkedPrev = true;
+      }
+      const bytes = computePayloadBytes(text, attachments);
+      if (bytes > 0) onAttachmentsCommitted(bytes);
+      // R226: streamId is minted by the caller and stored HERE, synchronously, before streamPlan is awaited —
+      // no pending-admission window (streamId is known before streamPlan is awaited).
+      submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes, streamId });
+      // R221: a fresh submission supersedes a STALE recovery entry from a prior FAILED attempt — clear it so a
+      // subsequent failure of THIS submission isn't confused with the old one AND its byte charge is released.
+      // BUT do NOT clear when we JUST parked a live prev above (that IS the recovery we want to keep, R263). When
+      // clearing, release the recoveryBytesRef charge (R226) too.
+      if (!parkedPrev) {
+        const staleRecovery = recoveryBytesRef.current.get(taskId);
+        if (staleRecovery !== undefined) {
+          recoveryBytesRef.current.delete(taskId);
+          if (staleRecovery > 0) onAttachmentsReleased(staleRecovery);
+        }
+        dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
+      }
+    },
+    [computePayloadBytes, parkRecovery],
+  );
+  const dropSubmission = useCallback((taskId: string) => {
+    const p = submittedPayloadRef.current.get(taskId);
+    if (p) {
+      onAttachmentsReleased(p.bytes); // release parked bytes (R219)
+      submittedPayloadRef.current.delete(taskId);
+    }
+  }, []);
+  const clearFailedSubmission = useCallback((taskId: string) => {
+    // R225: release the parked recovery payload's byte charge (kept accounted while parked so the renderer-wide
+    // ceiling reflects the strings actually resident in failedSubmissions state). Delete-then-release is
+    // idempotent — a second clear finds no ref entry and releases nothing.
+    const bytes = recoveryBytesRef.current.get(taskId);
+    if (bytes !== undefined) {
+      recoveryBytesRef.current.delete(taskId);
+      if (bytes > 0) onAttachmentsReleased(bytes);
+    }
+    dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
+  }, []);
+  // R225: park a recovery payload, keeping its bytes accounted and bounding the total. Evicts OLDEST parked
+  // entries (Map insertion order) until this new entry fits under RECOVERY_BYTES_CAP. Evicting drops the entry's
+  // strings + releases its charge so parked recovery can't grow the heap without limit.
   const resolveTerminalOutcome = useCallback(
     (taskId: string, isError: boolean) => {
       const payload = submittedPayloadRef.current.get(taskId);
