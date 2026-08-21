@@ -940,7 +940,15 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
           const nextTree = tree.map((m) =>
             m.id === orphan.responseMessageId ? { ...m, content: orphan.parts, parentId: orphan.parentId } : m,
           );
-          const written = writeConversation(appHome, { ...conv!, messageTree: nextTree });
+          // R239: ALSO refresh the LEGACY FLAT `messages` array — search, Markdown export, plugins, and media
+          // indexing read from `messages`, so leaving a frame-capped renderer copy there would permanently show
+          // the truncated prefix even though messageTree carries the full parts. (Mirrors the remote-replace path.)
+          const nextMessages = Array.isArray(conv!.messages)
+            ? (conv!.messages as Array<Record<string, unknown>>).map((m) =>
+                m && typeof m === 'object' && m.id === orphan.responseMessageId ? { ...m, content: orphan.parts } : m,
+              )
+            : conv!.messages;
+          const written = writeConversation(appHome, { ...conv!, messageTree: nextTree, messages: nextMessages });
           broadcastUpsert(appHome, written);
           prefixNodeId = orphan.responseMessageId!;
         } catch {
