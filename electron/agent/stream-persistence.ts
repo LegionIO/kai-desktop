@@ -949,12 +949,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       // the prefix must NOT leave the head on the prefix (which would hide the inject+continuation); the head is
       // restored to the continuation head below.
       const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
-      // R244: capture the authoritative continuation head BEFORE any write in this iteration overwrites headId.
-      // Record it on the orphan the FIRST time we observe a real head that is neither the prefix node nor the
-      // inject — on a retry the live head is the prefix, so without this the true continuation tip would be lost
-      // and the restore would collapse the head to the injected user, hiding the persisted continuation.
+      // R244/R245: capture the authoritative continuation head BEFORE any write in this iteration overwrites
+      // headId. Refresh it on EVERY attempt (not just the first, R245) to the LATEST pre-write non-prefix head —
+      // a retained orphan outlives branch changes, so between a failed flush and a successful retry the user may
+      // have selected a DIFFERENT branch; recording only the first head would restore a stale branch and discard
+      // the user's current selection. Skip when the live head is the prefix (a retry after a prior failed append)
+      // or the inject — those aren't a continuation tip to preserve; keep whatever we last recorded.
       if (
-        orphan.continuationHead === undefined &&
         typeof conv.headId === 'string' &&
         conv.headId !== orphan.responseMessageId &&
         conv.headId !== orphan.injectedUserId
