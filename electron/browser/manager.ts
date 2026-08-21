@@ -900,8 +900,13 @@ type BrowserSemanticTargetLease = {
 };
 
 type BrowserDebuggerOwnership = {
-  references: number;
+  leases: Set<BrowserDebuggerLeaseState>;
   detachWhenIdle: boolean;
+};
+
+type BrowserDebuggerLeaseState = {
+  cancelled: boolean;
+  released: boolean;
 };
 
 type BrowserDebuggerLease = {
@@ -4868,7 +4873,7 @@ export class BrowserManager {
   }
 
   /** Acquire manager ownership of the target debugger until the returned
-   * one-shot release is called. All manager CDP users share this counter so a
+   * one-shot release is called. All manager CDP users share this lease set so a
    * panel mount may restore viewport metrics concurrently without detaching an
    * assistant action, screenshot, sensitivity scan, or document guard. */
   private acquireBrowserDebuggerLease(contents: WebContents): BrowserDebuggerLease {
@@ -4877,38 +4882,34 @@ export class BrowserManager {
     // tests exercise the same ownership behavior.
     this.debuggerOwnership ??= new WeakMap<WebContents, BrowserDebuggerOwnership>();
     let ownership = this.debuggerOwnership.get(contents);
+    if (ownership && !contents.debugger.isAttached()) {
+      // The old transport was detached externally or by cancellation, so every
+      // command from that generation has already failed. Give new work an
+      // independent ownership object; stale releases must not affect it.
+      this.debuggerOwnership.delete(contents);
+      ownership = undefined;
+    }
     if (!ownership) {
       const detachWhenIdle = !contents.debugger.isAttached();
       if (detachWhenIdle) contents.debugger.attach('1.3');
-      ownership = { references: 0, detachWhenIdle };
+      ownership = { leases: new Set(), detachWhenIdle };
       this.debuggerOwnership.set(contents, ownership);
-    } else if (!contents.debugger.isAttached()) {
-      // A target replacement or an external DevTools detach invalidates every
-      // in-flight CDP command. Reattach for subsequent work and reclaim the
-      // manager-owned connection once the shared count reaches zero.
-      contents.debugger.attach('1.3');
-      ownership.detachWhenIdle = true;
     }
-    ownership.references++;
-    let released = false;
+    const state: BrowserDebuggerLeaseState = { cancelled: false, released: false };
+    ownership.leases.add(state);
     const release = () => {
-      if (released) return;
-      released = true;
-      ownership!.references = Math.max(0, ownership!.references - 1);
-      if (ownership!.references !== 0) return;
-      // Cancellation detaches the shared transport and removes this ownership
-      // object so a successor can attach immediately. The cancelled command's
-      // release closure may run one microtask later; never let that stale
-      // closure delete or detach the successor's independently-owned session.
-      if (this.debuggerOwnership.get(contents) !== ownership) return;
-      this.debuggerOwnership.delete(contents);
-      if (ownership!.detachWhenIdle && !contents.isDestroyed() && contents.debugger.isAttached()) {
-        contents.debugger.detach();
-      }
+      if (state.released) return;
+      state.released = true;
+      ownership!.leases.delete(state);
+      this.settleBrowserDebuggerOwnership(contents, ownership!);
     };
     return {
       release,
-      cancel: () => this.cancelManagerOwnedDebugger(contents, ownership),
+      cancel: () => {
+        if (state.released || this.debuggerOwnership.get(contents) !== ownership) return;
+        state.cancelled = true;
+        this.settleBrowserDebuggerOwnership(contents, ownership!);
+      },
     };
   }
 
@@ -4916,21 +4917,22 @@ export class BrowserManager {
     return this.acquireBrowserDebuggerLease(contents).release;
   }
 
-  /** Cancel a bounded presentation-only CDP operation without touching a
-   * debugger attachment that predates BrowserManager ownership (for example a
-   * developer-tools session). Detaching rejects outstanding manager commands. */
-  private cancelManagerOwnedDebugger(contents: WebContents, expected?: BrowserDebuggerOwnership): void {
-    const ownership = this.debuggerOwnership?.get(contents);
-    if (!ownership?.detachWhenIdle || (expected && ownership !== expected)) return;
-    // Electron exposes one debugger transport per WebContents. Detaching it to
-    // cancel one command would also reject every concurrently leased command;
-    // let the cancelled wrapper unwind and the final shared release detach.
-    if (ownership.references > 1) return;
+  /** Release an idle manager transport, or cancel it once every remaining lease
+   * belongs to bounded work that has requested cancellation. Electron exposes
+   * one debugger transport per WebContents, so a cancelled lease must remain
+   * pending while any unrelated command still owns the shared session. */
+  private settleBrowserDebuggerOwnership(contents: WebContents, ownership: BrowserDebuggerOwnership): void {
+    if (this.debuggerOwnership.get(contents) !== ownership) return;
+    const idle = ownership.leases.size === 0;
+    const onlyCancelledLeasesRemain =
+      ownership.detachWhenIdle && !idle && [...ownership.leases].every((lease) => lease.cancelled);
+    if (!idle && !onlyCancelledLeasesRemain) return;
     this.debuggerOwnership.delete(contents);
+    if (!ownership.detachWhenIdle) return;
     try {
       if (!contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
     } catch {
-      // The target may have closed concurrently with presentation cancellation.
+      // The target may have closed concurrently with debugger cleanup.
     }
   }
 
@@ -5452,6 +5454,7 @@ export class BrowserManager {
     documentLease?: AssistantDocumentLease,
     totalTimeoutMs?: number,
     reclaimTargetOnCancellation = true,
+    captureDebuggerLease?: (lease: BrowserDebuggerLease) => void,
   ): Promise<void> {
     if (tab.shell.sensitive) {
       throw new Error(`${operation} is blocked while this tab contains password data.`);
@@ -5471,6 +5474,7 @@ export class BrowserManager {
       documentLease,
       remainingTimeout(),
       reclaimTargetOnCancellation,
+      captureDebuggerLease,
     )) as boolean;
     if (!sensitive) {
       sensitive = await this.runRendererOperationWithDeadline(
@@ -5480,7 +5484,7 @@ export class BrowserManager {
         remainingTimeout(),
         async () =>
           (await this.hasPopulatedPasswordFieldInChildFrames(contents)) ||
-          (await this.hasPopulatedPasswordFieldViaCdp(contents)),
+          (await this.hasPopulatedPasswordFieldViaCdp(contents, captureDebuggerLease)),
         abortSignal,
         documentLease,
         reclaimTargetOnCancellation,
@@ -5532,14 +5536,18 @@ export class BrowserManager {
    * populated password fields and show-password controls. Values never cross
    * into main. Both document size and operation time are bounded; oversized or
    * malformed results fail closed. */
-  private async hasPopulatedPasswordFieldViaCdp(contents: WebContents): Promise<boolean> {
-    const releaseDebugger = this.acquireBrowserDebugger(contents);
+  private async hasPopulatedPasswordFieldViaCdp(
+    contents: WebContents,
+    captureDebuggerLease?: (lease: BrowserDebuggerLease) => void,
+  ): Promise<boolean> {
+    const debuggerLease = this.acquireBrowserDebuggerLease(contents);
     const budget: CdpSensitiveScanBudget = {
       elementsRemaining: MAX_DOM_ELEMENTS_FOR_CDP_SENSITIVE_SCAN,
       nodesRemaining: MAX_DOM_NODES_FOR_CDP_SENSITIVE_SCAN,
       inputsRemaining: MAX_INPUT_FIELDS_FOR_CDP_SCAN,
     };
     try {
+      captureDebuggerLease?.(debuggerLease);
       if (await this.scanSensitiveCdpSession(contents, budget)) return true;
 
       const oopifFrameTreeNodeIds = this.liveOopifFrameTreeNodeIds(contents);
@@ -5548,7 +5556,7 @@ export class BrowserManager {
       if (oopifFrameTreeNodeIds.size > MAX_CDP_SENSITIVE_SCAN_TARGETS) return true;
       return await this.hasSensitiveRelatedOopifTarget(contents, budget, oopifFrameTreeNodeIds);
     } finally {
-      releaseDebugger();
+      debuggerLease.release();
     }
   }
 
@@ -12626,6 +12634,7 @@ export class BrowserManager {
               const assertNotSensitiveWithinBudget = async (): Promise<boolean> => {
                 if (waitFor !== 'none' && Date.now() >= deadlineAt) return false;
                 const remaining = waitFor === 'none' ? undefined : Math.max(1, Math.ceil(deadlineAt - Date.now()));
+                let debuggerLease: BrowserDebuggerLease | undefined;
                 try {
                   await this.assertTabNotSensitive(
                     tab,
@@ -12635,13 +12644,16 @@ export class BrowserManager {
                     documentLease,
                     remaining,
                     false,
+                    (lease) => {
+                      debuggerLease = lease;
+                    },
                   );
                 } catch (error) {
                   if (waitFor === 'none' || !(error instanceof BrowserRendererDeadlineError)) throw error;
                   // A diagnostic timeout must not discard an authenticated user
                   // page. Detach only a debugger connection that BrowserManager
                   // itself owns so its late CDP command cannot block later work.
-                  this.cancelManagerOwnedDebugger(contents);
+                  debuggerLease?.cancel();
                   return false;
                 }
                 return waitFor === 'none' || Date.now() < deadlineAt;
@@ -12823,6 +12835,7 @@ export class BrowserManager {
     documentLease?: AssistantDocumentLease,
     timeoutMs = EVALUATE_TIMEOUT_MS,
     reclaimTargetOnCancellation = true,
+    captureDebuggerLease?: (lease: BrowserDebuggerLease) => void,
   ): Promise<unknown> {
     return this.runRendererOperationWithDeadline(
       tab,
@@ -12830,8 +12843,9 @@ export class BrowserManager {
       'Browser script evaluation',
       timeoutMs,
       async () => {
-        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        const debuggerLease = this.acquireBrowserDebuggerLease(contents);
         try {
+          captureDebuggerLease?.(debuggerLease);
           const frameTree = (await contents.debugger.sendCommand('Page.getFrameTree')) as {
             frameTree?: { frame?: { id?: string } };
           };
@@ -12872,7 +12886,7 @@ export class BrowserManager {
           }
           return response.result?.value;
         } finally {
-          releaseDebugger();
+          debuggerLease.release();
         }
       },
       abortSignal,
@@ -13600,12 +13614,16 @@ export class BrowserManager {
     contents: WebContents,
   ): Promise<boolean> {
     const signal = AbortSignal.any([active.controller.signal, active.teardownController.signal]);
+    let debuggerLease: BrowserDebuggerLease | undefined;
     return this.runRendererOperationWithDeadline(
       tab,
       contents,
       'Browser menu preview password-field scan',
       MENU_PREVIEW_CDP_SENSITIVITY_TIMEOUT_MS,
-      () => this.hasPopulatedPasswordFieldViaCdp(contents),
+      () =>
+        this.hasPopulatedPasswordFieldViaCdp(contents, (lease) => {
+          debuggerLease = lease;
+        }),
       signal,
       undefined,
       false,
@@ -13613,7 +13631,7 @@ export class BrowserManager {
       // The preview is admitted only when the tab queue is idle and refuses a
       // pre-existing external debugger. Detach our private target connection to
       // make the native command deadline real without discarding page state.
-      this.cancelManagerOwnedDebugger(contents);
+      debuggerLease?.cancel();
       throw error;
     });
   }

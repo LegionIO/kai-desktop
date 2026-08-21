@@ -13440,6 +13440,65 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('retains a timed-out network scan cancellation until a concurrent debugger lease drains', async () => {
+    vi.useFakeTimers();
+    try {
+      const wedgedScan = deferred<unknown>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+        if (args[0] === 'Page.getFrameTree') return wedgedScan.promise;
+        return {};
+      });
+      const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+      const tab = {
+        shell: {
+          id: 'tab-network-debugger-timeout',
+          conversationId: 'chat-1',
+          url: 'https://example.com/account',
+          loading: false,
+          sensitive: false,
+        },
+        scopeKey: 'global',
+        generation: 1,
+        trustedUserNavigationLease: 0,
+        networkNavigationSequence: 0,
+        networkRequests: new Map(),
+        queue: new BrowserActionQueue(),
+        view: { webContents: contents },
+      };
+      const manager = managerWithoutConstructor({
+        assistantRuns: { assertActive: () => 1 },
+        assertAssistantDocumentLease: vi.fn(),
+        assertAssistantRun: vi.fn(),
+        assertBrowserDocumentApproval: vi.fn(),
+        ensureAssistantView: vi.fn(async () => tab.view),
+        requireAssistantTab: () => tab,
+        tabs: new Map([[tab.shell.id, tab]]),
+        withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+          operation({}),
+        withVisibleAssistantOperation: async (...args: unknown[]) =>
+          (args[5] as (reveal: () => Promise<void>) => Promise<unknown>)(async () => undefined),
+      });
+      const concurrentLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+        release: () => void;
+      };
+
+      const diagnostics = manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100 }, { id: 'run-1' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.getFrameTree');
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(diagnostics).resolves.toMatchObject({ waitTimedOut: true, requests: [] });
+      expect(debuggerApi.detach).not.toHaveBeenCalled();
+
+      concurrentLease.release();
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+      expect(debuggerApi.isAttached()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('cancels a network wait without routing the main-process poll through a destructive renderer deadline', async () => {
     const controller = new AbortController();
     const tab = {
@@ -18079,18 +18138,47 @@ describe('browser manager renderer lifecycle', () => {
     const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
     const manager = managerWithoutConstructor({});
 
-    const releaseCancelled = invokePrivate(manager, 'acquireBrowserDebugger', contents) as () => void;
-    const releaseConcurrent = invokePrivate(manager, 'acquireBrowserDebugger', contents) as () => void;
-    invokePrivate(manager, 'cancelManagerOwnedDebugger', contents);
+    const cancelledLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      cancel: () => void;
+      release: () => void;
+    };
+    const concurrentLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      cancel: () => void;
+      release: () => void;
+    };
+    cancelledLease.cancel();
 
     expect(debuggerApi.detach).not.toHaveBeenCalled();
     expect(debuggerApi.isAttached()).toBe(true);
-    releaseCancelled();
+    cancelledLease.release();
     expect(debuggerApi.detach).not.toHaveBeenCalled();
 
-    releaseConcurrent();
+    concurrentLease.release();
     expect(debuggerApi.detach).toHaveBeenCalledOnce();
     expect(debuggerApi.isAttached()).toBe(false);
+  });
+
+  it('retains debugger cancellation until unrelated leases drain', () => {
+    const debuggerApi = browserDebuggerMock();
+    const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+    const manager = managerWithoutConstructor({});
+
+    const cancelledLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      cancel: () => void;
+      release: () => void;
+    };
+    const concurrentLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      cancel: () => void;
+      release: () => void;
+    };
+    cancelledLease.cancel();
+
+    concurrentLease.release();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    expect(debuggerApi.isAttached()).toBe(false);
+
+    cancelledLease.release();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
   });
 
   it('installs the private-network document guard before a restricted tab first loads', async () => {
@@ -21460,10 +21548,19 @@ describe('browser manager renderer lifecycle', () => {
         const destroyView = vi.fn((target: typeof tab) => {
           target.view = null;
         });
-        const hasPopulatedPasswordFieldViaCdp = vi.fn(async () => {
-          scan += 1;
-          return scan === blockedScan ? blocked.promise : false;
-        });
+        const cancelledDebuggerLeases: Array<ReturnType<typeof vi.fn>> = [];
+        const hasPopulatedPasswordFieldViaCdp = vi.fn(
+          async (
+            _contents: unknown,
+            captureDebuggerLease?: (lease: { cancel: () => void; release: () => void }) => void,
+          ) => {
+            const cancel = vi.fn();
+            cancelledDebuggerLeases.push(cancel);
+            captureDebuggerLease?.({ cancel, release: vi.fn() });
+            scan += 1;
+            return scan === blockedScan ? blocked.promise : false;
+          },
+        );
         const manager = managerWithoutConstructor({
           assertBrowserPageLease: vi.fn(),
           attachedView: null,
@@ -21483,6 +21580,7 @@ describe('browser manager renderer lifecycle', () => {
 
         await vi.advanceTimersByTimeAsync(5_000);
         await rejection;
+        expect(cancelledDebuggerLeases[blockedScan - 1]).toHaveBeenCalledOnce();
         expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
         await expect(manager.captureMenuPreview('chat-1', tab.shell.id, 'replacement-preview')).resolves.toMatchObject({
           tabId: tab.shell.id,
