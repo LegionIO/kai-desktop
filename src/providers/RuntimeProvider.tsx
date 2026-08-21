@@ -216,7 +216,7 @@ type MessageAccumulator = {
   runGeneration?: string;
   /** Deferred tool approvals keyed by toolName — handles race where
    *  tool-approval-required arrives before the stream-side tool-call event. */
-  deferredApprovals?: Map<string, { toolCallId: string; args?: unknown }>;
+  deferredApprovals?: Map<string, { toolCallId: string; args?: unknown; runGeneration?: string }>;
   /** True while a tool is awaiting user approval — suppresses the running indicator */
   awaitingApproval?: boolean;
   /** Compaction record captured from the `compaction` stream event this turn.
@@ -4626,6 +4626,8 @@ export function RuntimeProvider({
               ...existing,
               approvalStatus: 'pending',
               approvalId: deferred.toolCallId,
+              // R257: restore the deferred approval's run nonce so the inline card resolves run-scoped.
+              ...(deferred.runGeneration ? { approvalRunNonce: deferred.runGeneration } : {}),
               // Apply any rich approval args (e.g. dangerous-automation rule +
               // reason) captured when the approval arrived early.
               ...(deferred.args !== undefined ? { args: deferred.args, argsPending: false } : {}),
@@ -4679,7 +4681,16 @@ export function RuntimeProvider({
           // tool-call event hasn't arrived yet — defer the approval so it can
           // be applied when the matching tool-call stream event is processed.
           if (!acc.deferredApprovals) acc.deferredApprovals = new Map();
-          acc.deferredApprovals.set(e.toolName as string, { toolCallId: e.toolCallId as string, args: e.args });
+          acc.deferredApprovals.set(e.toolName as string, {
+            toolCallId: e.toolCallId as string,
+            args: e.args,
+            // R257: preserve the run nonce so the deferred card, once applied to its tool-call, resolves under
+            // the run-scoped key (matching the non-deferred path, R255).
+            runGeneration: (() => {
+              const rg = (e as unknown as { runGeneration?: unknown }).runGeneration;
+              return typeof rg === 'string' ? rg : undefined;
+            })(),
+          });
         }
       } else if (e.type === 'tool-result') {
         acc.awaitingApproval = false;
