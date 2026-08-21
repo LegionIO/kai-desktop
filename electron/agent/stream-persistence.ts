@@ -840,9 +840,13 @@ function persistAccumulatedReturningHead(
   }
 }
 
-/** Drop any partial accumulation for a conversation (e.g. on cancel). */
+/** Drop any partial accumulation for a conversation (e.g. on cancel, or when the renderer's authoritative
+ *  persist wins). R235: ALSO drop any orphaned inject-prefixes — if the renderer has persisted the turn (or the
+ *  turn is cancelled), a stale orphan would otherwise be flushed by a later finalizer, collision-rename to a
+ *  bogus `auto-msg-*` duplicate, and reparent the inject onto the duplicate, corrupting the durable branch. */
 export function discardPersistenceAccumulator(conversationId: string): void {
   accumulators.delete(conversationId);
+  orphanedPrefixes.delete(conversationId);
 }
 
 /** Whether main is currently holding a persistence accumulator for a conversation (a live GUI-turn
@@ -917,11 +921,15 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         remaining.push(orphan); // still failing — keep for next attempt
         continue;
       }
-      // R234: splice the flushed prefix INTO the chain — reparent the injected user (and thus its continuation
-      // subtree) onto the just-persisted prefix node, so the active branch is pre → prefix → inject → continuation
-      // instead of leaving prefix and inject as siblings under the pre-inject head (which omitted the prefix).
+      // R234/R235: splice the flushed prefix INTO the chain — reparent the injected user (and thus its
+      // continuation subtree) onto the just-persisted prefix node, so the active branch is
+      // pre → prefix → inject → continuation. makeHead:true (R235) so the INJECT becomes the head — appending the
+      // prefix above made the prefix the head, and if the stream ends before any continuation content the head
+      // would otherwise stay on the prefix, hiding the accepted injected user.
       try {
-        reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, updated.headId);
+        reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, updated.headId, {
+          makeHead: true,
+        });
       } catch {
         // Best-effort: the prefix is persisted either way; a reparent failure only affects branch ordering.
       }
