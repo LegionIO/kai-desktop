@@ -98,8 +98,8 @@ const appAPI = {
       >,
     cancelInject: (conversationId: string, id: string) =>
       ipcRenderer.invoke('agent:cancel-inject', conversationId, id) as Promise<{ ok: boolean; text?: string }>,
-    getToolApprovalPrivateDetails: (toolCallId: string, conversationId?: string) =>
-      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId, conversationId) as Promise<{
+    getToolApprovalPrivateDetails: (toolCallId: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId, conversationId, runNonce) as Promise<{
         browserInput: unknown;
         browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
       } | null>,

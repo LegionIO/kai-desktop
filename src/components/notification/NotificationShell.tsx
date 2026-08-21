@@ -276,7 +276,12 @@ export const NotificationShell: FC<{ id: string; conversationId?: string; runNon
             </pre>
           </section>
         )}
-        <BrowserApprovalPrivateInput approvalId={item.id} args={item.args} conversationId={item.conversationId} />
+        <BrowserApprovalPrivateInput
+          approvalId={item.id}
+          args={item.args}
+          conversationId={item.conversationId}
+          runNonce={runNonce}
+        />
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"

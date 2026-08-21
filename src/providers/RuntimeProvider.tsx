@@ -4659,6 +4659,13 @@ export function RuntimeProvider({
             ...existing,
             approvalStatus: 'pending',
             approvalId: e.toolCallId as string,
+            // R255: preserve the emitting run's nonce so the inline card's approve/answer/reject resolves under
+            // the RUN-scoped key — two overlapping same-conversation runs reusing call_1 otherwise make main's
+            // resolve ambiguous (finds two candidates, resolves neither) while the UI marks the card handled.
+            ...(() => {
+              const rg = (e as unknown as { runGeneration?: unknown }).runGeneration;
+              return typeof rg === 'string' ? { approvalRunNonce: rg } : {};
+            })(),
             // Some approvals carry richer args than the tool was originally
             // called with (e.g. the dangerous-automation gate sends the full
             // rule + reason so the user can see the shell command / hook rule

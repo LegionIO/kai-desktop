@@ -168,10 +168,19 @@ describe('preload bridge contract', () => {
   it('agent.getToolApprovalPrivateDetails(...) uses the private approval channel', async () => {
     invokeMock.mockClear();
     const agentNs = exposedAPI?.agent as {
-      getToolApprovalPrivateDetails: (toolCallId: string, conversationId?: string) => Promise<unknown>;
+      getToolApprovalPrivateDetails: (
+        toolCallId: string,
+        conversationId?: string,
+        runNonce?: string,
+      ) => Promise<unknown>;
     };
     await agentNs.getToolApprovalPrivateDetails('browser-approval-1');
-    expect(invokeMock).toHaveBeenCalledWith('agent:get-tool-approval-private-details', 'browser-approval-1', undefined);
+    expect(invokeMock).toHaveBeenCalledWith(
+      'agent:get-tool-approval-private-details',
+      'browser-approval-1',
+      undefined,
+      undefined,
+    );
   });
 
   it('config.onChanged subscribes via ipcRenderer.on and returns an unsubscribe', () => {

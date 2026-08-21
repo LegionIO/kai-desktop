@@ -101,7 +101,7 @@ describe('NotificationShell', () => {
     expect(details).not.toHaveTextContent('approvalKind');
     const exactInput = await screen.findByTestId('browser-private-approval-input');
     expect(exactInput).toHaveTextContent('document.querySelector("button").click()');
-    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('browser-1', 'c1');
+    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('browser-1', 'c1', undefined);
   });
 
   it('bounds cyclic and oversized Browser approval details in the notification renderer', () => {

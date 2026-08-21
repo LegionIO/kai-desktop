@@ -81,6 +81,9 @@ type ToolCallPart = {
   approvalStatus?: 'pending' | 'approved' | 'rejected';
   /** Backend-side approval ID — may differ from toolCallId due to ID mismatch */
   approvalId?: string;
+  /** R255: the emitting run's nonce (runGeneration), so the inline approve/answer/reject resolves under the
+   *  run-scoped key when two overlapping same-conversation runs reuse the same tool-call id. */
+  approvalRunNonce?: string;
 };
 
 export const ToolGroup: FC<{
@@ -229,7 +232,11 @@ export const ToolCallDisplay: FC<{
     // so we never send two approve/reject IPC calls for one approval.
     if (localApproval) return;
     setLocalApproval('approved');
-    void app.agent.approveToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
+    void app.agent.approveToolCall(
+      part.approvalId ?? part.toolCallId,
+      conversationId ?? undefined,
+      part.approvalRunNonce,
+    );
     // Bridge: create a task queue entry from approved plan
     if (isPlanApproval && planContent) {
       const task = await onPlanApproved?.({
@@ -247,6 +254,7 @@ export const ToolCallDisplay: FC<{
     localApproval,
     part.toolCallId,
     part.approvalId,
+    part.approvalRunNonce,
     isPlanApproval,
     planContent,
     planArgs?.planTitle,
@@ -258,24 +266,36 @@ export const ToolCallDisplay: FC<{
   const handleReject = useCallback(() => {
     if (localApproval) return;
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
+    void app.agent.rejectToolCall(
+      part.approvalId ?? part.toolCallId,
+      conversationId ?? undefined,
+      part.approvalRunNonce,
+    );
     refocusComposer();
-  }, [localApproval, part.toolCallId, part.approvalId, conversationId]);
+  }, [localApproval, part.toolCallId, part.approvalId, part.approvalRunNonce, conversationId]);
 
   const handleDismiss = useCallback(() => {
     setLocalApproval('dismissed');
-    void app.agent.dismissToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
+    void app.agent.dismissToolCall(
+      part.approvalId ?? part.toolCallId,
+      conversationId ?? undefined,
+      part.approvalRunNonce,
+    );
     refocusComposer();
-  }, [part.toolCallId, part.approvalId, conversationId]);
+  }, [part.toolCallId, part.approvalId, part.approvalRunNonce, conversationId]);
 
   const handleFeedbackSubmit = useCallback(() => {
     if (!feedbackText.trim()) return;
     setLocalApproval('rejected');
-    void app.agent.rejectToolCall(part.approvalId ?? part.toolCallId, conversationId ?? undefined);
+    void app.agent.rejectToolCall(
+      part.approvalId ?? part.toolCallId,
+      conversationId ?? undefined,
+      part.approvalRunNonce,
+    );
     onSendFeedback?.(feedbackText.trim());
     setFeedbackText('');
     refocusComposer();
-  }, [part.toolCallId, part.approvalId, feedbackText, onSendFeedback, conversationId]);
+  }, [part.toolCallId, part.approvalId, part.approvalRunNonce, feedbackText, onSendFeedback, conversationId]);
 
   const summary = getToolSummary(part);
   const subtitle = getToolSubtitle(part);
@@ -361,6 +381,7 @@ export const ToolCallDisplay: FC<{
       {expanded && isPendingApproval && isAskUser && (
         <QuestionnaireView
           toolCallId={part.approvalId ?? part.toolCallId}
+          runNonce={part.approvalRunNonce}
           args={part.args}
           onSubmit={() => setLocalApproval('approved')}
           onCancel={handleDismiss}
@@ -443,6 +464,7 @@ export const ToolCallDisplay: FC<{
             args={part.args}
             active={isPendingApproval}
             conversationId={conversationId ?? undefined}
+            runNonce={part.approvalRunNonce}
           />
         </div>
       )}
@@ -929,10 +951,11 @@ function parseQuestions(args: unknown): Question[] {
 
 const QuestionnaireView: FC<{
   toolCallId: string;
+  runNonce?: string;
   args: unknown;
   onSubmit: () => void;
   onCancel: () => void;
-}> = ({ toolCallId, args, onSubmit, onCancel }) => {
+}> = ({ toolCallId, runNonce, args, onSubmit, onCancel }) => {
   const questions = parseQuestions(args);
   const [activeTab, setActiveTab] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
@@ -986,10 +1009,10 @@ const QuestionnaireView: FC<{
         result[q.question] = answer;
       }
     });
-    void app.agent.answerToolQuestion(toolCallId, result, conversationId ?? undefined);
+    void app.agent.answerToolQuestion(toolCallId, result, conversationId ?? undefined, runNonce);
     onSubmit();
     refocusComposer();
-  }, [toolCallId, questions, answers, otherTexts, onSubmit, conversationId]);
+  }, [toolCallId, runNonce, questions, answers, otherTexts, onSubmit, conversationId]);
 
   if (questions.length === 0) return null;
 

@@ -27,7 +27,7 @@ describe('BrowserApprovalPrivateInput', () => {
     expect(await screen.findByTestId('browser-private-approval-input')).toHaveTextContent(
       'document.querySelector("#save").click()',
     );
-    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('approval-1', undefined);
+    expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('approval-1', undefined, undefined);
     expect(screen.getByTestId('browser-private-approval-target')).toHaveTextContent('secret-login.example');
   });
 

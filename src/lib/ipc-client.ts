@@ -103,6 +103,7 @@ type AppAPI = {
     getToolApprovalPrivateDetails?: (
       toolCallId: string,
       conversationId?: string,
+      runNonce?: string,
     ) => Promise<{
       browserInput: unknown;
       browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };

@@ -43,7 +43,11 @@ export const BrowserApprovalPrivateInput: FC<{
   /** Conversation the approval belongs to. Threaded so main resolves the private details under the
    *  conversation-scoped approval key (R192); omitted only where unavailable (main falls back to raw). */
   conversationId?: string;
-}> = ({ approvalId, args, active = true, conversationId }) => {
+  /** R255: the emitting run's nonce (runGeneration). Two OVERLAPPING Browser approvals in the same
+   *  conversation sharing a tool-call id make the conversation-only lookup ambiguous (returns null, buttons stay
+   *  enabled while the script/target stay redacted); the nonce resolves the exact run-scoped entry. */
+  runNonce?: string;
+}> = ({ approvalId, args, active = true, conversationId, runNonce }) => {
   const [input, setInput] = useState<unknown>(undefined);
   const [target, setTarget] = useState<{ tabId: string; origin: string; destinationOrigin?: string } | undefined>(
     undefined,
@@ -63,7 +67,7 @@ export const BrowserApprovalPrivateInput: FC<{
       return () => {
         current = false;
       };
-    void getPrivateDetails(approvalId, conversationId)
+    void getPrivateDetails(approvalId, conversationId, runNonce)
       .then((details) => {
         if (current && details && Object.prototype.hasOwnProperty.call(details, 'browserInput')) {
           setInput(details.browserInput);
@@ -74,7 +78,7 @@ export const BrowserApprovalPrivateInput: FC<{
     return () => {
       current = false;
     };
-  }, [active, approvalId, browserControl, conversationId]);
+  }, [active, approvalId, browserControl, conversationId, runNonce]);
 
   const display = useMemo(() => exactInputText(input), [input]);
   if (!active || (!display && !target)) return null;

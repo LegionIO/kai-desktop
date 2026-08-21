@@ -1000,6 +1000,7 @@ const ToolFallback: FC<{
   };
   approvalStatus?: 'pending' | 'approved' | 'rejected';
   approvalId?: string;
+  approvalRunNonce?: string;
 }> = (props) => {
   const hasResult = props.result !== undefined;
   const isPendingApproval = props.approvalStatus === 'pending' && !hasResult;
@@ -1095,6 +1096,7 @@ const ToolFallback: FC<{
           liveOutput: props.liveOutput,
           approvalStatus: props.approvalStatus,
           approvalId: props.approvalId,
+          approvalRunNonce: props.approvalRunNonce,
         }}
         onSendFeedback={handleSendFeedback}
         onPlanApproved={handlePlanApproved}
