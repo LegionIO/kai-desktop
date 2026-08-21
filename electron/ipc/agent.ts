@@ -50,6 +50,7 @@ import {
   finalizeInterruptedTurnReplacing,
   finalizeInterruptedTurnUpsert,
   snapshotSupersededAccumulatorForRetry,
+  flushSupersededSnapshots,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
   finalizeGuiFallbackPrefixAtInject,
@@ -1394,6 +1395,11 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       } else {
         pendingRemoteReplace.delete(conversationId);
         pendingLocalReplace.delete(conversationId);
+        // R270: the renderer owns the full local write, so its OWN accumulator is redundant — discard it. But a
+        // takeover on an EARLIER turn may have parked a superseded-turn snapshot (snapshotSupersededAccumulatorForRetry)
+        // that no finalizer runs on this renderer-persisted branch; retry flushing it here (no-op when there are none)
+        // so it isn't stranded until process exit. Recover BEFORE discarding this turn's own accumulator.
+        flushSupersededSnapshots(fbAppHome, conversationId);
         discardPersistenceAccumulator(conversationId); // local renderer owns the (full) write — no double-persist
         return;
       }

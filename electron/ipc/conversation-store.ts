@@ -564,9 +564,20 @@ function readConversationImpl(appHome: string, id: string, strict: boolean): Con
     if (strict) throw err;
     return null;
   }
-  if (!existsSync(p)) return null; // genuinely absent (both modes)
+  // R270: strict mode must NOT use existsSync as the absence test — existsSync returns false for BOTH a
+  // genuinely-missing file (ENOENT) AND a permission/I-O failure to stat it (EACCES/EIO/ELOOP/...), which would
+  // make a transient failure look like absence and drop the caller's sole recovery copy. So in strict mode read
+  // DIRECTLY and classify by the error's code: ENOENT → genuine absence (null); any other error → THROW (retain).
+  let raw: string;
   try {
-    const rec = JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
+    raw = readFileSync(p, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null; // genuinely absent (both modes)
+    if (strict) throw err; // R270: a stat/read failure that is NOT ENOENT is a transient error, not absence
+    return null; // non-strict: fail-open as before
+  }
+  try {
+    const rec = JSON.parse(raw) as ConversationRecord;
     // Advance the revision floor past any stored compaction revision so a clock rollback /
     // VM restore can't later issue a lower revision than what's already on disk.
     observeCompactionRevision(
@@ -574,7 +585,7 @@ function readConversationImpl(appHome: string, id: string, strict: boolean): Con
     );
     return rec;
   } catch (err) {
-    if (strict) throw err; // R269: a read/parse failure is NOT absence — let the caller retain+retry
+    if (strict) throw err; // R269: a parse failure is NOT absence — let the caller retain+retry
     return null;
   }
 }

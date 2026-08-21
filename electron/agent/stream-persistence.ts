@@ -977,17 +977,37 @@ export function flushSupersededSnapshots(appHome: string, conversationId: string
         const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
         broadcastUpsert(appHome, written);
       } else {
-        // No node on disk yet → append the snapshot as its own assistant node under its parent.
-        const updated = appendConversationMessages(appHome, conversationId, [
-          {
-            id: snap.responseMessageId,
-            role: 'assistant',
-            content: snap.parts,
-            parentId: snap.parentId,
-          } as unknown as Parameters<typeof appendConversationMessages>[2][number],
-        ]);
-        if (!updated) {
-          remaining.push(snap); // append failed → retain for a later finalize
+        // No node on disk yet → INSERT the snapshot as its own assistant node under its ORIGINAL parent, WITHOUT
+        // moving the conversation head. R270: appendConversationMessages reads parentId from its OPTIONS (not the
+        // message object) AND always advances headId to the appended node — using it here would (a) parent the
+        // recovered reply under the successor's CURRENT head (wrong branch) and (b) rewind the head onto the
+        // recovered node, hiding/corrupting the successor turn's ordering. So write the tree directly: parent the
+        // node on snap.parentId (the pre-supersession head it answered) when that node still exists — else attach
+        // it as a root (parentId null) rather than dangle it under a missing parent — and PRESERVE conv.headId.
+        const parentExists = snap.parentId != null && treeArr.some((m) => m.id === snap.parentId);
+        const effectiveParent = parentExists ? snap.parentId! : null;
+        const nodeId = snap.responseMessageId ?? `auto-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        // Guard against an id collision introduced by a concurrent write between the read and here.
+        if (treeArr.some((m) => m.id === nodeId)) {
+          remaining.push(snap); // will re-resolve to the replace branch on the next flush
+          continue;
+        }
+        const newNode = {
+          id: nodeId,
+          role: 'assistant' as const,
+          content: snap.parts,
+          parentId: effectiveParent,
+          createdAt: new Date().toISOString(),
+        } as unknown as StoredTreeMessage;
+        try {
+          const written = writeConversation(appHome, {
+            ...conv,
+            messageTree: [...treeArr, newNode],
+            // Head UNCHANGED — the recovered node is a superseded prior turn, not the live tip.
+          });
+          broadcastUpsert(appHome, written);
+        } catch {
+          remaining.push(snap); // write failed → retain for a later finalize
           continue;
         }
       }

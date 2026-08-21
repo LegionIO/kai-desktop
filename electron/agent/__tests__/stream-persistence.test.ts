@@ -46,6 +46,8 @@ import {
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
   finalizeInterruptedTurnUpsert,
+  snapshotSupersededAccumulatorForRetry,
+  flushSupersededSnapshots,
   persistCooperativeInjectedUserTurn,
   finalizeGuiFallbackPrefixAtInject,
   clearFinalizedResponseIds,
@@ -278,6 +280,77 @@ describe('stream persistence accumulator', () => {
     expect(appendMock).not.toHaveBeenCalled(); // NEVER append on a read failure
     expect(head).toBeNull(); // accumulator retained for a later renderer re-persist
     clearFinalizedResponseIds('local3');
+  });
+
+  it('flushSupersededSnapshots inserts a recovered turn under its ORIGINAL parent and PRESERVES the head (R270)', () => {
+    // R270: a takeover snapshotted a superseded turn (resp-A, answering user uA) whose flush failed. On a later
+    // finalize the snapshot must be inserted parented on uA (its original parent) WITHOUT rewinding the head off
+    // the successor turn (respB) — appendConversationMessages would do both wrong (parent under current head + move
+    // head), so flushSupersededSnapshots writes the tree directly. Assert placement + head preservation.
+    clearFinalizedResponseIds('sup1');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    // Seed a snapshot: feed content under resp-A parented on uA, then snapshot+clear the accumulator.
+    feedWithParent(
+      { conversationId: 'sup1', type: 'text-delta', text: 'superseded reply', responseMessageId: 'resp-A' },
+      'uA',
+    );
+    expect(snapshotSupersededAccumulatorForRetry('sup1')).toBe(true);
+    // Disk now carries only the successor branch: uA → respB (the head), resp-A is NOT present yet.
+    readStrictMock.mockReturnValueOnce({
+      id: 'sup1',
+      headId: 'respB',
+      runStatus: 'idle',
+      messageTree: [
+        { id: 'uA', parentId: null, role: 'user', content: [{ type: 'text', text: 'q' }] },
+        { id: 'respB', parentId: 'uA', role: 'assistant', content: [{ type: 'text', text: 'successor' }] },
+      ],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'sup1');
+    // Must NOT route through appendConversationMessages (which would mis-parent + move the head).
+    expect(appendMock).not.toHaveBeenCalled();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    const written = writeMock.mock.calls[0][1] as {
+      headId?: string | null;
+      messageTree: Array<{ id: string; parentId: string | null; content: unknown }>;
+    };
+    // Head preserved on the successor.
+    expect(written.headId).toBe('respB');
+    // Recovered node present, parented on its ORIGINAL parent uA (not under respB).
+    const recovered = written.messageTree.find((m) => m.id === 'resp-A')!;
+    expect(recovered).toBeTruthy();
+    expect(recovered.parentId).toBe('uA');
+    expect(JSON.stringify(recovered.content)).toContain('superseded reply');
+    clearFinalizedResponseIds('sup1');
+  });
+
+  it('flushSupersededSnapshots RETAINS a snapshot on a transient read FAILURE, drops it on genuine absence (R270)', () => {
+    clearFinalizedResponseIds('sup2');
+    writeMock.mockClear();
+    feedWithParent({ conversationId: 'sup2', type: 'text-delta', text: 'reply', responseMessageId: 'resp-S2' }, 'uS2');
+    snapshotSupersededAccumulatorForRetry('sup2');
+    // Transient read failure → strict read throws → retain (no write, snapshot kept).
+    readStrictMock.mockImplementationOnce(() => {
+      throw new Error('EIO: transient');
+    });
+    flushSupersededSnapshots(APP_HOME, 'sup2');
+    expect(writeMock).not.toHaveBeenCalled(); // retained, not written
+    // Now a genuine absence (conversation deleted) → strict read returns null → drop the snapshot (no write, no retain).
+    readStrictMock.mockReturnValueOnce(null);
+    flushSupersededSnapshots(APP_HOME, 'sup2');
+    expect(writeMock).not.toHaveBeenCalled();
+    // A third flush with a good read now finds nothing to do (snapshot already dropped) → still no write.
+    readStrictMock.mockReturnValueOnce({
+      id: 'sup2',
+      headId: 'uS2',
+      runStatus: 'idle',
+      messageTree: [{ id: 'uS2', parentId: null, role: 'user', content: [] }],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'sup2');
+    expect(writeMock).not.toHaveBeenCalled();
+    clearFinalizedResponseIds('sup2');
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
