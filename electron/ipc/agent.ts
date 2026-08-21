@@ -10530,7 +10530,14 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId, conversationId);
+        // R261: run-scope this stale-browser-stream close (resolve already closed THIS run's exact window) so
+        // the follow-up close can't nonce-lessly match + destroy an overlapping run's sole same-id pop-out.
+        closeApprovalWindow(
+          toolCallId,
+          conversationId,
+          runNonce ??
+            extractRunNonceFromApprovalKey(resolved?.key, sanitizeAnswerConversationId(conversationId), toolCallId),
+        );
       }
       return { ok: false, error: approvalError };
     }
@@ -10570,7 +10577,14 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId, conversationId);
+        // R261: run-scope this stale-browser-stream close (resolve already closed THIS run's exact window) so
+        // the follow-up close can't nonce-lessly match + destroy an overlapping run's sole same-id pop-out.
+        closeApprovalWindow(
+          toolCallId,
+          conversationId,
+          runNonce ??
+            extractRunNonceFromApprovalKey(resolved?.key, sanitizeAnswerConversationId(conversationId), toolCallId),
+        );
       }
       return { ok: false, error: approvalError };
     }
@@ -10604,7 +10618,14 @@ export function registerAgentHandlers(
     if (pending && approvalError) {
       if (approvalError === 'stale-browser-stream') {
         pending.resolve(false);
-        closeApprovalWindow(toolCallId, conversationId);
+        // R261: run-scope this stale-browser-stream close (resolve already closed THIS run's exact window) so
+        // the follow-up close can't nonce-lessly match + destroy an overlapping run's sole same-id pop-out.
+        closeApprovalWindow(
+          toolCallId,
+          conversationId,
+          runNonce ??
+            extractRunNonceFromApprovalKey(resolved?.key, sanitizeAnswerConversationId(conversationId), toolCallId),
+        );
       }
       return { ok: false, error: approvalError };
     }
@@ -10685,7 +10706,8 @@ export function registerAgentHandlers(
       if (pending && approvalError) {
         if (approvalError === 'stale-browser-stream') {
           pending.resolve(false);
-          closeApprovalWindow(toolCallId, conversationId);
+          // R261: run-scope this stale-browser-stream close so it can't destroy an overlapping run's pop-out.
+          closeApprovalWindow(toolCallId, conversationId, effectiveNonce);
         }
         return { ok: false, error: approvalError };
       }
