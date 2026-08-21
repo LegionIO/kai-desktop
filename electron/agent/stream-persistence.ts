@@ -100,6 +100,11 @@ type OrphanedPrefix = {
   parentId: string | null;
   responseMessageId?: string;
   injectedUserId: string;
+  /** R244: the authoritative continuation head captured on the FIRST flush attempt, BEFORE appending the prefix
+   *  overwrites headId. Persisted across retries so a retry (whose current head is now the prefix) can still
+   *  restore the head to the real continuation tip instead of collapsing it to the injected user. Undefined
+   *  until the first flush observes a continuation head distinct from the prefix. */
+  continuationHead?: string;
 };
 const orphanedPrefixes = new Map<string, OrphanedPrefix[]>();
 
@@ -942,8 +947,20 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       const tree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
       // R238: the injected user has a persisted continuation subtree iff some node parents on it. If so, splicing
       // the prefix must NOT leave the head on the prefix (which would hide the inject+continuation); the head is
-      // restored to the continuation tip below (computed fresh from the tree, R242).
+      // restored to the continuation head below.
       const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
+      // R244: capture the authoritative continuation head BEFORE any write in this iteration overwrites headId.
+      // Record it on the orphan the FIRST time we observe a real head that is neither the prefix node nor the
+      // inject — on a retry the live head is the prefix, so without this the true continuation tip would be lost
+      // and the restore would collapse the head to the injected user, hiding the persisted continuation.
+      if (
+        orphan.continuationHead === undefined &&
+        typeof conv.headId === 'string' &&
+        conv.headId !== orphan.responseMessageId &&
+        conv.headId !== orphan.injectedUserId
+      ) {
+        orphan.continuationHead = conv.headId;
+      }
       // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior flush
       // that persisted but failed to reparent)?
       const existingNode = orphan.responseMessageId ? tree.find((m) => m?.id === orphan.responseMessageId) : undefined;
@@ -1001,13 +1018,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         remaining.push(orphan);
         continue;
       }
-      // R238/R240/R242/R243: splicing the prefix can leave the head ON the prefix node, hiding the
-      // inject+continuation. R243: do NOT try to infer the "active continuation tip" by walking newest-createdAt
-      // children — continuation subtrees can hold sibling variants and headId is the authority, so guessing could
-      // silently switch the transcript to another variant. Instead, only correct the head when it is CURRENTLY on
-      // the just-spliced prefix node (the wrong place); move it to the injected user (which is on the active
-      // branch). Any other head value is a valid tip set by the normal continuation persist — leave it untouched.
-      // reparentConversationMessage rebuilds the flat `messages` + counts (R242). RETAIN the orphan on failure.
+      // R238/R242/R243/R244: splicing the prefix can leave the head ON the prefix node, hiding the
+      // inject+continuation. Correct it ONLY when the head is currently the just-spliced prefix (the wrong
+      // place) — a non-prefix head is a valid tip and is left untouched (no variant guessing, R243). The restore
+      // TARGET is the authoritative continuation head captured before the first write (orphan.continuationHead,
+      // R244) when it still exists on disk; otherwise the injected user (no continuation persisted yet). Using the
+      // captured head — not a fresh walk or the post-write head — avoids collapsing the branch to the inject and
+      // hiding a persisted continuation on retry. reparentConversationMessage rebuilds messages+counts (R242).
       if (injectHasContinuation) {
         try {
           const after = readConversation(appHome, conversationId);
@@ -1016,7 +1033,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
             continue;
           }
           if (after.headId === prefixNodeId) {
-            const restored = reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, prefixNodeId, {
+            const afterTree = Array.isArray(after.messageTree) ? (after.messageTree as StoredTreeMessage[]) : [];
+            const contHead =
+              orphan.continuationHead && afterTree.some((m) => m.id === orphan.continuationHead)
+                ? orphan.continuationHead
+                : orphan.injectedUserId;
+            const contNodeParent = afterTree.find((m) => m.id === contHead)?.parentId ?? null;
+            const restored = reparentConversationMessage(appHome, conversationId, contHead, contNodeParent, {
               makeHead: true,
             });
             if (!restored) {
