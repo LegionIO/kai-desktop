@@ -255,8 +255,12 @@ function resolvePendingApprovalKey(
   runNonce?: string,
 ): string | undefined {
   if (conversationId && runNonce) {
+    // R258: an EXPLICIT nonce FAILS CLOSED on a miss — try only the exact run-scoped key then the raw id; do
+    // NOT fall through to the conversation-scoped key or the suffix scan (which could bind a DIFFERENT run's
+    // same-id approval). The scan fallback below is for NONCE-LESS callers only.
     const k = approvalKey(conversationId, toolCallId, runNonce);
     if (pendingToolApprovals.has(k)) return k;
+    return pendingToolApprovals.has(toolCallId) ? toolCallId : undefined;
   }
   if (conversationId) {
     const k = approvalKey(conversationId, toolCallId);

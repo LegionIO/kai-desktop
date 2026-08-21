@@ -692,7 +692,7 @@ describe('agent IPC: tool approval channels', () => {
     await pending;
     expect(decisions).toEqual([false]);
     expect(pendingToolApprovals.has('tc-reject')).toBe(false);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject', undefined);
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-reject', undefined, undefined);
   });
 
   it('resolves with the sentinel "dismiss" string on agent:dismiss-tool', async () => {
@@ -713,7 +713,7 @@ describe('agent IPC: tool approval channels', () => {
     await harness.invoke('agent:dismiss-tool', FAKE_EVENT, 'tc-dismiss');
     await pending;
     expect(decisions).toEqual(['dismiss']);
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss', undefined);
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-dismiss', undefined, undefined);
   });
 
   it('stores answers and approves the call on agent:answer-tool-question', async () => {

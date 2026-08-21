@@ -10482,9 +10482,16 @@ export function registerAgentHandlers(
   ): { pending: PendingToolApproval; key: string } | undefined => {
     const convId = sanitizeAnswerConversationId(conversationId);
     if (convId && runNonce) {
+      // R258: an EXPLICIT nonce must FAIL CLOSED on a miss — do NOT fall through to the conversation-scoped
+      // key or the unambiguous scan. After run A settles, a delayed A response carrying A's nonce would
+      // otherwise "unambiguously" resolve run B's same-id approval and approve B's unrelated action. Try only
+      // the exact run-scoped key, then the raw id (a legacy/headless caller that happened to pass a nonce for a
+      // raw-keyed approval). The conversation-scoped + suffix-scan fallbacks below are for NONCE-LESS callers.
       const runScoped = approvalKey(convId, toolCallId, runNonce);
       const p = pendingToolApprovals.get(runScoped);
       if (p) return { pending: p, key: runScoped };
+      const raw = pendingToolApprovals.get(toolCallId);
+      return raw ? { pending: raw, key: toolCallId } : undefined;
     }
     if (convId) {
       const composite = approvalKey(convId, toolCallId);
@@ -10578,7 +10585,7 @@ export function registerAgentHandlers(
       findRunNonceForAuthorityRecord(rejConv, toolCallId);
     purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId, rejNonce));
     if (rejNonce) purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId));
-    closeApprovalWindow(toolCallId, conversationId);
+    closeApprovalWindow(toolCallId, conversationId, rejNonce); // R258: exact run-scoped close, don't hit a sibling
     return { ok: true };
   });
 
@@ -10607,7 +10614,7 @@ export function registerAgentHandlers(
       findRunNonceForAuthorityRecord(disConv, toolCallId);
     purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId, disNonce));
     if (disNonce) purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId));
-    closeApprovalWindow(toolCallId, conversationId);
+    closeApprovalWindow(toolCallId, conversationId, disNonce); // R258: exact run-scoped close, don't hit a sibling
     return { ok: true };
   });
 

@@ -317,8 +317,12 @@ function restorePriorFocus(id: string): void {
 function resolveNotifKey(id: string, conversationId?: string, runNonce?: string): string | undefined {
   if (!conversationId) return notificationWindows.has(id) ? id : undefined;
   if (runNonce) {
+    // R258: an EXPLICIT nonce FAILS CLOSED — resolve only the exact run-scoped key, never fall through to the
+    // conversation-scoped key or the suffix scan (which could close a DIFFERENT run's sibling pop-out). This
+    // also prevents the post-resolve close-sibling bug: after run A settles + closes its own window exactly, a
+    // nonce-carrying close for A won't then match B as the "sole" remaining candidate.
     const k = notifKeyFromParts(id, conversationId, runNonce);
-    if (notificationWindows.has(k)) return k;
+    return notificationWindows.has(k) ? k : undefined;
   }
   const conv = notifKeyFromParts(id, conversationId);
   if (notificationWindows.has(conv)) return conv;
