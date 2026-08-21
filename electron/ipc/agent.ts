@@ -4074,9 +4074,15 @@ export function registerAgentHandlers(
     // so its partial output can't merge into this fresh turn's assistant message.
     // (A stranded server-inject drain above already finalized+deleted it via
     // persistCooperativeInjectedUserTurn — this is then a no-op for that path.)
-    // R269: a FAILED takeover flush above already snapshotted + cleared the accumulator
-    // (snapshotSupersededAccumulatorForRetry) for a later flushSupersededSnapshots retry, so this
-    // discard is a safe no-op there — it never throws away the prior turn's only full copy.
+    // R269/R274: a FAILED takeover flush above already snapshotted + cleared the accumulator
+    // (snapshotSupersededAccumulatorForRetry). If an accumulator is somehow STILL present here (e.g. a marker-less
+    // path — an inject-restart finalize that returned null and left it retained), snapshot it too BEFORE discarding,
+    // so this fresh-turn discard can never throw away a prior turn's full copy. snapshotSupersededAccumulatorForRetry
+    // both preserves the content (bounded store, retried by later finalizes) AND clears the live accumulator, so the
+    // fresh turn still starts clean — making the discard below a guaranteed-safe no-op.
+    if (hasPersistenceAccumulator(conversationId)) {
+      snapshotSupersededAccumulatorForRetry(conversationId);
+    }
     discardPersistenceAccumulator(conversationId);
     // Fresh turn → clear any consumed-inject marker from a prior turn (the flag is
     // only meaningful within the turn that consumed the inject).
@@ -8886,17 +8892,20 @@ export function registerAgentHandlers(
           try {
             finalizeInterruptedTurn(serverPersistAppHome, conversationId); // persists the partial (if any) + deletes the accumulator
           } catch {
-            discardPersistenceAccumulator(conversationId); // fall back to release if finalize throws
+            /* fall through to the retained-accumulator handling below */
           }
           // finalizeInterruptedTurn RETAINS the accumulator on a (non-throwing) persist failure
           // (R168 f-2). This is the terminal give-up: we've dropped ownership (above) and will reset
-          // runStatus + emit `done` below, so the accumulator can NEVER be persisted later — discard
-          // it explicitly (R170 f-1) rather than leave it ownerless and leaking for the process life.
+          // runStatus + emit `done` below, so no later poll/finalize on THIS run will retry.
+          // R274: rather than DISCARD the retained accumulator (permanent loss), SNAPSHOT it into the bounded
+          // superseded-snapshot store — a LATER turn of the same conversation re-flushes it (the disk write may
+          // succeed once the transient failure clears). snapshotSupersededAccumulatorForRetry clears the live
+          // accumulator, so it can't leak or contaminate a fresh turn; the store is bounded (R271/R273).
           if (hasPersistenceAccumulator(conversationId)) {
             console.error(
-              `[agent] terminal finalize could not persist accumulated reply for ${conversationId}; discarding`,
+              `[agent] terminal finalize could not persist accumulated reply for ${conversationId}; snapshotting for retry`,
             );
-            discardPersistenceAccumulator(conversationId);
+            snapshotSupersededAccumulatorForRetry(conversationId);
           }
           try {
             const conv = readConversation(serverPersistAppHome, conversationId);
@@ -10289,11 +10298,21 @@ export function registerAgentHandlers(
         ? finalizeInterruptedTurnReplacing(serverPersistAppHome, conversationId)
         : finalizeInterruptedTurnUpsert(serverPersistAppHome, conversationId);
       if (head) return { confirmed: true, headId: head };
-      if (hadContent) return { confirmed: false, headId: null as string | null }; // write failed → not confirmed
+      if (hadContent) {
+        // R274 f-1: the markers were deleted above, so a null head (write FAILED, accumulator retained) would leave
+        // the accumulator OWNERLESS — the next submission's takeover discards it, losing the authoritative full
+        // reply. Snapshot it into the bounded superseded-snapshot store (retried by every later finalize/settle)
+        // before reporting not-confirmed. Mirrors R271's budget-expiry fix.
+        snapshotSupersededAccumulatorForRetry(conversationId);
+        return { confirmed: false, headId: null as string | null }; // write failed → not confirmed
+      }
       // Genuinely empty accumulator: the on-disk head is the confirmed branch.
       const conv = readConversation(serverPersistAppHome, conversationId);
       return { confirmed: true, headId: conv?.headId ?? null };
     } catch {
+      // R274 f-1: a throw here also leaves the retained accumulator ownerless (markers deleted) — snapshot it if it
+      // still holds content so a later finalize can recover it.
+      if (hasPersistenceAccumulator(conversationId)) snapshotSupersededAccumulatorForRetry(conversationId);
       return { confirmed: false, headId: null as string | null };
     }
   });
@@ -10448,10 +10467,18 @@ export function registerAgentHandlers(
           }
           if (persisted || remaining <= 0) {
             pendingRemoteReplace.delete(conversationId);
+            let head: string | null = null;
             try {
-              finalizeInterruptedTurnReplacing(appHome, conversationId);
+              head = finalizeInterruptedTurnReplacing(appHome, conversationId);
             } catch {
-              discardPersistenceAccumulator(conversationId);
+              head = null;
+            }
+            // R274 f-2: the marker was deleted, so a null head (write failed, accumulator retained) or a throw
+            // would leave the accumulator OWNERLESS — the next turn discards it, leaving only the web client's
+            // frame-capped copy (a remote-origin cancel has no local renderer to re-persist). Snapshot the retained
+            // accumulator so a later finalize/settle recovers main's full copy.
+            if (head === null && hasPersistenceAccumulator(conversationId)) {
+              snapshotSupersededAccumulatorForRetry(conversationId);
             }
             return;
           }
@@ -10485,15 +10512,21 @@ export function registerAgentHandlers(
           }
           if (remaining <= 0) {
             pendingLocalReplace.delete(conversationId);
+            let head: string | null = null;
             try {
               // Upsert-by-id: the renderer's debounced persist may have landed the
               // assistant node under this run's responseMessageId just before it
               // crashed/reloaded (disk still 'running'); a plain append would
               // id-collision-rename it to a bogus `auto-msg-*` sibling. replaceById
               // upserts in place (falls back to append when no such node exists).
-              finalizeInterruptedTurnUpsert(appHome, conversationId); // renderer never persisted → save main's partial
+              head = finalizeInterruptedTurnUpsert(appHome, conversationId); // renderer never persisted → save main's partial
             } catch {
-              discardPersistenceAccumulator(conversationId);
+              head = null;
+            }
+            // R274 f-2: marker deleted → a null head (write failed, accumulator retained) or a throw would strand
+            // the accumulator for the next turn to discard, losing the local partial. Snapshot it for retry.
+            if (head === null && hasPersistenceAccumulator(conversationId)) {
+              snapshotSupersededAccumulatorForRetry(conversationId);
             }
             return;
           }

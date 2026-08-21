@@ -926,7 +926,11 @@ export function purgeConversationPersistence(conversationId: string): void {
  *  here and discard the live accumulator, then re-attempt the upsert on the next finalize via
  *  flushSupersededSnapshots — recovering the prior turn's full reply without contaminating the fresh turn. */
 type SupersededSnapshot = {
-  parts: ContentPart[];
+  /** R274 f-3: store the JSON-SERIALIZED parts (a plain string), NOT the live object graph. A tool result with a
+   *  compact toJSON()/non-enumerable state can serialize small yet keep an arbitrarily large graph alive if we held
+   *  a reference to it — charging `bytes` while retaining that graph would bypass the cap. Storing the serialized
+   *  string makes retained memory EQUAL to the measured `bytes` and drops the reference to the original object. */
+  serialized: string;
   parentId: string | null;
   responseMessageId?: string;
   bytes: number;
@@ -943,20 +947,18 @@ const SUPERSEDED_SNAPSHOT_BYTES_CAP = 24 * 1024 * 1024; // 24 MiB — generous f
 let supersededSnapshotBytes = 0;
 let supersededSnapshotSeq = 0;
 
-/** Byte size of a snapshot's parts for the memory accountant, or null when the parts are NOT JSON-serializable
- *  (cyclic reference / BigInt tool result). R273: a serializability failure means the parts can never be written
- *  back to disk (writeConversation JSON-stringifies the whole tree — the same failure would abort that write), so
- *  the snapshot is unrecoverable AND unmeasurable. Returning null tells the caller to DISCARD it rather than retain
- *  an arbitrarily-large object graph charged as a tiny placeholder (which R272's per-part floor did — it bounded
- *  snapshot COUNT, not retained MEMORY, so a huge cyclic payload could still blow past the cap and OOM main). */
-function estimateSnapshotBytes(parts: ContentPart[]): number | null {
+/** R273/R274: serialize a snapshot's parts to a JSON string for retention, or null when they are NOT
+ *  JSON-serializable (cyclic reference / BigInt tool result). Returning the STRING (rather than measuring the live
+ *  graph and keeping a reference to it) means retained memory equals the string length exactly — a compact
+ *  toJSON()/non-enumerable-state object can't serialize small while a large graph stays alive (R274 f-3). A
+ *  serializability failure means the parts can never be written back to disk anyway (writeConversation
+ *  JSON-stringifies the whole tree — the same failure would abort that write), so the caller DISCARDS on null. */
+function serializeSnapshotParts(parts: ContentPart[]): string | null {
   try {
-    const n = JSON.stringify(parts)?.length;
-    if (typeof n === 'number' && n > 0) return n;
-    // A serializable-but-empty result (n === 0 / undefined) is genuinely tiny content; charge a small floor.
-    return Math.max(1, parts.length) * 64;
+    const s = JSON.stringify(parts);
+    return typeof s === 'string' ? s : null;
   } catch {
-    return null; // unserializable → cannot persist, cannot measure → discard
+    return null; // unserializable → cannot persist, cannot bound → discard
   }
 }
 
@@ -1005,15 +1007,16 @@ export function snapshotSupersededAccumulatorForRetry(conversationId: string): b
     accumulators.delete(conversationId);
     return true; // already recorded — idempotent
   }
-  const bytes = estimateSnapshotBytes(acc.parts);
-  if (bytes === null) {
+  const serialized = serializeSnapshotParts(acc.parts);
+  if (serialized === null) {
     // R273: parts are not JSON-serializable → they can never be written back to disk (writeConversation would
     // fail the same way) and their retained memory is unmeasurable/unbounded. DISCARD rather than retain.
     accumulators.delete(conversationId);
     return false;
   }
+  const bytes = serialized.length;
   list.push({
-    parts: acc.parts,
+    serialized,
     parentId: acc.parentId ?? null,
     responseMessageId: acc.responseMessageId,
     bytes,
@@ -1043,19 +1046,27 @@ export function flushSupersededSnapshots(appHome: string, conversationId: string
         // Conversation genuinely absent (deleted/never-persisted) → can't recover; drop it.
         continue;
       }
+      // R274 f-3: the snapshot retains the JSON-serialized parts; re-parse to the live parts for the write. A parse
+      // failure is impossible for our own serialized string, but guard anyway → drop (can't recover unparseable).
+      let snapParts: ContentPart[];
+      try {
+        snapParts = JSON.parse(snap.serialized) as ContentPart[];
+      } catch {
+        continue; // corrupt serialization (shouldn't happen) → drop
+      }
       const idx = snap.responseMessageId
         ? treeArr.findIndex((m) => m.id === snap.responseMessageId && m.role === 'assistant')
         : -1;
       if (idx >= 0) {
         // Node exists on disk (renderer/web wrote a possibly-capped copy) → replace its content with the full parts.
         const nextTree = treeArr.slice();
-        const replaced = { ...nextTree[idx], content: snap.parts };
+        const replaced = { ...nextTree[idx], content: snapParts };
         delete (replaced as { tokenCount?: unknown }).tokenCount;
         delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
         nextTree[idx] = replaced;
         const nextMessages = Array.isArray(conv.messages)
           ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
-              m && typeof m === 'object' && m.id === snap.responseMessageId ? { ...m, content: snap.parts } : m,
+              m && typeof m === 'object' && m.id === snap.responseMessageId ? { ...m, content: snapParts } : m,
             )
           : conv.messages;
         const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
@@ -1079,7 +1090,7 @@ export function flushSupersededSnapshots(appHome: string, conversationId: string
         const newNode = {
           id: nodeId,
           role: 'assistant' as const,
-          content: snap.parts,
+          content: snapParts,
           parentId: effectiveParent,
           createdAt: new Date().toISOString(),
         } as unknown as StoredTreeMessage;
