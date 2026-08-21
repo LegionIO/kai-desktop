@@ -49,6 +49,7 @@ import {
   finalizeInterruptedTurn,
   finalizeInterruptedTurnReplacing,
   finalizeInterruptedTurnUpsert,
+  snapshotSupersededAccumulatorForRetry,
   persistCooperativeInjectedUserTurn,
   clearFinalizedResponseIds,
   finalizeGuiFallbackPrefixAtInject,
@@ -3794,17 +3795,31 @@ export function registerAgentHandlers(
     //   - REMOTE origin (pendingRemoteReplace): replace the web client's capped node in place.
     //   - LOCAL origin: append main's copy, but ONLY if the renderer hasn't already persisted (disk
     //     still 'running'); if it persisted (runStatus flipped) main's fallback is redundant → drop.
-    const hadRemotePending = pendingRemoteReplace.delete(conversationId);
-    if (hadRemotePending) {
+    // R269: the takeover flush can FAIL. finalizeInterruptedTurn* returns null when every bounded persist
+    // retry failed (transient disk error) and RETAINS the live accumulator. The superseding turn is about to
+    // reuse the SAME per-conversation accumulator (a new turn feeds it — see ensureAcc), so leaving the prior
+    // turn's parts live would MERGE them into the fresh turn under the prior id, and the unconditional discard
+    // (line ~4030) would otherwise throw the prior turn's only full copy away. On a failed flush we therefore
+    // SNAPSHOT the retained accumulator (snapshotSupersededAccumulatorForRetry) — which stores the parts for a
+    // later finalize's flushSupersededSnapshots retry AND clears the live accumulator so the fresh turn starts
+    // clean — and RETAIN the pending marker so a subsequent supersession/poll can also re-attempt it.
+    if (pendingRemoteReplace.has(conversationId)) {
+      let replaced: string | null = null;
       try {
-        finalizeInterruptedTurnReplacing(appHome, conversationId);
+        replaced = finalizeInterruptedTurnReplacing(appHome, conversationId);
       } catch {
-        /* fall through to the discard below */
+        replaced = null; // treat a throw as a failed flush → snapshot + retain below
+      }
+      if (replaced !== null) {
+        pendingRemoteReplace.delete(conversationId); // landed → safe to drop the marker
+      } else {
+        // Failed flush: snapshot the prior turn's content for retry, then keep the marker.
+        snapshotSupersededAccumulatorForRetry(conversationId);
       }
     } else if (
       // LOCAL fallback either not-yet-polling (guiFallbackParents still set) OR mid-poll
       // (pendingLocalReplace set — guiFallbackParents already consumed by the poll).
-      (guiFallbackParents.delete(conversationId) || pendingLocalReplace.delete(conversationId)) &&
+      (guiFallbackParents.delete(conversationId) || pendingLocalReplace.has(conversationId)) &&
       hasPersistenceAccumulator(conversationId)
     ) {
       let rendererPersisted = false;
@@ -3816,7 +3831,10 @@ export function registerAgentHandlers(
       } catch {
         /* treat as not-persisted → flush main's full copy */
       }
-      if (!rendererPersisted) {
+      if (rendererPersisted) {
+        pendingLocalReplace.delete(conversationId); // renderer already persisted → fallback redundant, drop it
+      } else {
+        let upserted: string | null = null;
         try {
           // Upsert-by-id (NOT a plain append): the local originator's renderer runs a
           // ~300ms debounced stream-persist, so disk may ALREADY carry the assistant
@@ -3826,13 +3844,20 @@ export function registerAgentHandlers(
           // 'idle' over the just-admitted replacement turn (whose new prompt is already
           // the disk head) — leaving that prompt off-branch if it produced no assistant
           // node yet. replaceById upserts in place (falls back to append when absent).
-          finalizeInterruptedTurnUpsert(appHome, conversationId);
+          upserted = finalizeInterruptedTurnUpsert(appHome, conversationId);
         } catch {
-          /* fall through to the discard below */
+          upserted = null; // treat a throw as a failed flush → snapshot + retain below
+        }
+        if (upserted !== null) {
+          pendingLocalReplace.delete(conversationId); // landed → drop the marker
+        } else {
+          // Failed flush: snapshot the prior turn's content for retry, then keep the marker.
+          snapshotSupersededAccumulatorForRetry(conversationId);
         }
       }
+    } else {
+      pendingLocalReplace.delete(conversationId); // no live fallback for this conv → ensure marker cleared
     }
-    pendingLocalReplace.delete(conversationId); // ensure cleared even if the branch above didn't run
     guiFallbackRemoteOrigin.delete(conversationId);
     // Handle cooperative injects STRANDED by a just-superseded turn (queued but
     // not yet drained — e.g. a raced ask_user answer). They belonged to that turn;
@@ -4027,6 +4052,9 @@ export function registerAgentHandlers(
     // so its partial output can't merge into this fresh turn's assistant message.
     // (A stranded server-inject drain above already finalized+deleted it via
     // persistCooperativeInjectedUserTurn — this is then a no-op for that path.)
+    // R269: a FAILED takeover flush above already snapshotted + cleared the accumulator
+    // (snapshotSupersededAccumulatorForRetry) for a later flushSupersededSnapshots retry, so this
+    // discard is a safe no-op there — it never throws away the prior turn's only full copy.
     discardPersistenceAccumulator(conversationId);
     // Fresh turn → clear any consumed-inject marker from a prior turn (the flag is
     // only meaningful within the turn that consumed the inject).

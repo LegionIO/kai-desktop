@@ -19,6 +19,11 @@ const readMock = vi.fn(
     } | null,
 );
 const writeMock = vi.fn((_appHome: string, conv: unknown) => conv);
+// R269: readConversationStrict returns null ONLY for a genuinely-absent conversation and THROWS on a
+// read/parse failure. By default it delegates to readMock (so a null there means "absent" → append works,
+// matching the brand-new-conversation case). A test that needs to exercise the retain-on-read-failure path
+// overrides this mock to throw.
+const readStrictMock = vi.fn((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
 vi.mock('../../ipc/conversations.js', () => ({
   // Return a minimal record whose headId is the id of the appended assistant
   // message, so finalizeInterruptedTurn's "return the new head" contract can be
@@ -31,6 +36,7 @@ vi.mock('../../ipc/conversations.js', () => ({
 }));
 vi.mock('../../ipc/conversation-store.js', () => ({
   readConversation: (appHome: string, conversationId: string) => readMock(appHome, conversationId),
+  readConversationStrict: (appHome: string, conversationId: string) => readStrictMock(appHome, conversationId),
   writeConversation: (appHome: string, conv: unknown) => writeMock(appHome, conv),
 }));
 
@@ -248,6 +254,30 @@ describe('stream persistence accumulator', () => {
     // No pre-existing node under resp-local2 → falls through to a normal append.
     expect(appendMock).toHaveBeenCalledTimes(1);
     clearFinalizedResponseIds('local2');
+  });
+
+  it('finalizeInterruptedTurnUpsert RETAINS (no append) when every read is a transient FAILURE, not absence (R269)', () => {
+    // R269: a read/parse FAILURE is not the same as a genuinely-absent conversation. If we treated the
+    // failure as absence we'd append under resp-local3, collision-renaming an existing on-disk node into a
+    // bogus duplicate sibling. readConversationStrict THROWS on failure → the upsert loop retains (returns
+    // null) and lets the renderer's authoritative re-persist land the full content.
+    clearFinalizedResponseIds('local3');
+    writeMock.mockClear();
+    appendMock.mockClear();
+    readStrictMock.mockImplementationOnce(() => {
+      throw new Error('EIO: simulated transient read failure');
+    });
+    readStrictMock.mockImplementationOnce(() => {
+      throw new Error('EIO: simulated transient read failure');
+    });
+    readStrictMock.mockImplementationOnce(() => {
+      throw new Error('EIO: simulated transient read failure');
+    });
+    feed({ conversationId: 'local3', type: 'text-delta', text: 'reply', responseMessageId: 'resp-local3' });
+    const head = finalizeInterruptedTurnUpsert(APP_HOME, 'local3');
+    expect(appendMock).not.toHaveBeenCalled(); // NEVER append on a read failure
+    expect(head).toBeNull(); // accumulator retained for a later renderer re-persist
+    clearFinalizedResponseIds('local3');
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {

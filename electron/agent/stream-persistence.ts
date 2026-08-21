@@ -8,7 +8,12 @@ import {
   reparentConversationMessage,
 } from '../ipc/conversations.js';
 import type { StoredTreeMessage } from '../ipc/conversations.js';
-import { readConversation, writeConversation, nextCompactionRevision } from '../ipc/conversation-store.js';
+import {
+  readConversation,
+  readConversationStrict,
+  writeConversation,
+  nextCompactionRevision,
+} from '../ipc/conversation-store.js';
 import { getAppHome } from '../local-bridge/paths.js';
 import { isStrictPrefix, messageContentSignature } from './compaction.js';
 import type { StreamEvent } from './mastra-agent.js';
@@ -418,6 +423,7 @@ export function accumulateForPersistence(
 function finalizeTurn(appHome: string, conversationId: string): 'done' | 'failed' {
   // R233: on turn settle, retry persisting any orphaned prefixes left by a failed inject-boundary persist —
   // a write is more likely to succeed now, and they must land under their pre-inject parent before the turn ends.
+  flushSupersededSnapshots(appHome, conversationId); // R269: also retry any superseded-turn snapshot at settle
   flushOrphanedPrefixes(appHome, conversationId);
   const hadContent = Boolean(accumulators.get(conversationId)?.sawContent);
   persistAccumulated(appHome, conversationId);
@@ -447,6 +453,7 @@ function finalizeTurn(appHome: string, conversationId: string): 'done' | 'failed
  * there was nothing to persist.
  */
 export function finalizeInterruptedTurn(appHome: string, conversationId: string): string | null {
+  flushSupersededSnapshots(appHome, conversationId); // R269
   flushOrphanedPrefixes(appHome, conversationId); // R234: GUI terminal handling uses these finalizers, not finalizeTurn
   return persistAccumulatedReturningHead(appHome, conversationId);
 }
@@ -455,6 +462,7 @@ export function finalizeInterruptedTurn(appHome: string, conversationId: string)
 // frame-capped assistant node under the same responseMessageId, so REPLACE that node's content with
 // main's full copy (upsert by id) rather than appending a duplicate sibling variant.
 export function finalizeInterruptedTurnReplacing(appHome: string, conversationId: string): string | null {
+  flushSupersededSnapshots(appHome, conversationId); // R269
   flushOrphanedPrefixes(appHome, conversationId); // R234
   return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
 }
@@ -467,6 +475,7 @@ export function finalizeInterruptedTurnReplacing(appHome: string, conversationId
 // `auto-msg-*` duplicate sibling; replaceById upserts the existing node in place (and falls through
 // to a normal append when no such node exists yet).
 export function finalizeInterruptedTurnUpsert(appHome: string, conversationId: string): string | null {
+  flushSupersededSnapshots(appHome, conversationId); // R269
   flushOrphanedPrefixes(appHome, conversationId); // R234
   return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
 }
@@ -771,19 +780,14 @@ function persistAccumulatedReturningHead(
       for (let attempt = 0; attempt < 3; attempt++) {
         lastReplaceThrew = false;
         try {
-          const conv = readConversation(appHome, conversationId);
+          const conv = readConversationStrict(appHome, conversationId);
           const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
-          // R265: readConversation returns null on a read/PARSE FAILURE, not only for a genuinely-absent record.
-          // A null read on a NON-FINAL attempt is treated as TRANSIENT (retry) so we don't fall through to append
-          // and collision-rename an existing effectiveId to a bogus auto-msg-* duplicate. On the LAST attempt a
-          // still-null read is treated as "no record" and falls through to the normal append (the legitimate
-          // brand-new-conversation / renderer-not-yet-persisted case, where append with effectiveId can't collide).
+          // R269: readConversationStrict THROWS on a read/parse failure (→ caught below → retry/retain) and
+          // returns null ONLY for a genuinely-absent conversation. So a null here is CONFIRMED absence — falling
+          // through to append is safe (no existing node to collision-rename). This removes the R265 ambiguity
+          // where a transient null could be mistaken for absence on the last attempt.
           if (!conv || !treeArr) {
-            if (attempt < 2) {
-              lastReplaceThrew = true;
-              continue;
-            }
-            break; // last attempt, still no readable record → append (node is genuinely absent)
+            break; // conversation/tree genuinely absent → append (node can't collide)
           }
           const nodeIdx = treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant');
           if (nodeIdx >= 0) {
@@ -907,7 +911,92 @@ export function discardPersistenceAccumulator(conversationId: string): void {
 export function purgeConversationPersistence(conversationId: string): void {
   accumulators.delete(conversationId);
   orphanedPrefixes.delete(conversationId);
+  supersededSnapshots.delete(conversationId);
   finalizedResponseIds.delete(conversationId);
+}
+
+/** R269: content snapshots of a SUPERSEDED turn whose takeover fallback-flush FAILED (transient disk error). The
+ *  live accumulator can't be kept across the superseding turn (a new turn feeds the SAME per-conversation
+ *  accumulator and would merge the prior turn's parts under the prior id). Instead we snapshot the retained parts
+ *  here and discard the live accumulator, then re-attempt the upsert on the next finalize via
+ *  flushSupersededSnapshots — recovering the prior turn's full reply without contaminating the fresh turn. */
+type SupersededSnapshot = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string };
+const supersededSnapshots = new Map<string, SupersededSnapshot[]>();
+
+/** R269: snapshot the currently-held accumulator's content for a conversation whose superseding-turn fallback flush
+ *  FAILED, then clear the live accumulator so the fresh turn starts clean. No-op if there's no accumulator content.
+ *  Returns true if a snapshot was recorded. */
+export function snapshotSupersededAccumulatorForRetry(conversationId: string): boolean {
+  const acc = accumulators.get(conversationId);
+  if (!acc || !acc.sawContent || acc.parts.length === 0) {
+    accumulators.delete(conversationId); // nothing worth keeping — just clear so the fresh turn is clean
+    return false;
+  }
+  const list = supersededSnapshots.get(conversationId) ?? [];
+  // Don't double-record the same responseMessageId (idempotent across repeated failed takeovers).
+  if (!list.some((s) => s.responseMessageId === acc.responseMessageId)) {
+    list.push({ parts: acc.parts, parentId: acc.parentId ?? null, responseMessageId: acc.responseMessageId });
+    supersededSnapshots.set(conversationId, list);
+  }
+  accumulators.delete(conversationId);
+  return true;
+}
+
+/** R269: re-attempt persisting any superseded-turn snapshots for a conversation, upserting each by its
+ *  responseMessageId (replace-in-place if the node exists, else append). Drops a snapshot on success; RETAINS it on
+ *  a transient failure so a later finalize retries. Called at the top of each finalize entry point. */
+export function flushSupersededSnapshots(appHome: string, conversationId: string): void {
+  const list = supersededSnapshots.get(conversationId);
+  if (!list || list.length === 0) return;
+  const remaining: SupersededSnapshot[] = [];
+  for (const snap of list) {
+    try {
+      // readConversationStrict THROWS on a read/parse failure (→ caught → retain) and returns null only for a
+      // genuinely-absent conversation (→ nothing to recover into; drop the snapshot).
+      const conv = readConversationStrict(appHome, conversationId);
+      const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
+      if (!conv || !treeArr) {
+        // Conversation genuinely absent (deleted/never-persisted) → can't recover; drop it.
+        continue;
+      }
+      const idx = snap.responseMessageId
+        ? treeArr.findIndex((m) => m.id === snap.responseMessageId && m.role === 'assistant')
+        : -1;
+      if (idx >= 0) {
+        // Node exists on disk (renderer/web wrote a possibly-capped copy) → replace its content with the full parts.
+        const nextTree = treeArr.slice();
+        const replaced = { ...nextTree[idx], content: snap.parts };
+        delete (replaced as { tokenCount?: unknown }).tokenCount;
+        delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
+        nextTree[idx] = replaced;
+        const nextMessages = Array.isArray(conv.messages)
+          ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
+              m && typeof m === 'object' && m.id === snap.responseMessageId ? { ...m, content: snap.parts } : m,
+            )
+          : conv.messages;
+        const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
+        broadcastUpsert(appHome, written);
+      } else {
+        // No node on disk yet → append the snapshot as its own assistant node under its parent.
+        const updated = appendConversationMessages(appHome, conversationId, [
+          {
+            id: snap.responseMessageId,
+            role: 'assistant',
+            content: snap.parts,
+            parentId: snap.parentId,
+          } as unknown as Parameters<typeof appendConversationMessages>[2][number],
+        ]);
+        if (!updated) {
+          remaining.push(snap); // append failed → retain for a later finalize
+          continue;
+        }
+      }
+    } catch {
+      remaining.push(snap); // transient read/write failure → retain
+    }
+  }
+  if (remaining.length > 0) supersededSnapshots.set(conversationId, remaining);
+  else supersededSnapshots.delete(conversationId);
 }
 
 /** Whether main is currently holding a persistence accumulator for a conversation (a live GUI-turn

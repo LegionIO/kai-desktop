@@ -544,14 +544,27 @@ export function reconcileGhostIndexEntries(appHome: string): number {
 // ── conversation read/write ───────────────────────────────────────────────────
 
 export function readConversation(appHome: string, id: string): ConversationRecord | null {
+  return readConversationImpl(appHome, id, false);
+}
+
+/** R269: like readConversation but DISTINGUISHES a genuinely-absent conversation (returns null) from a
+ *  read/parse FAILURE (THROWS). readConversation collapses both to null, which is ambiguous for callers that
+ *  must not treat a transient failure as "absent" (e.g. the replaceById upsert deciding append-vs-retain — a
+ *  null-as-absent there collision-renames an existing node into a duplicate). Absent → null; failure → throw. */
+export function readConversationStrict(appHome: string, id: string): ConversationRecord | null {
+  return readConversationImpl(appHome, id, true);
+}
+
+function readConversationImpl(appHome: string, id: string, strict: boolean): ConversationRecord | null {
   migrateMonolithIfNeeded(appHome);
   let p: string;
   try {
     p = conversationPath(appHome, id);
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return null;
   }
-  if (!existsSync(p)) return null;
+  if (!existsSync(p)) return null; // genuinely absent (both modes)
   try {
     const rec = JSON.parse(readFileSync(p, 'utf-8')) as ConversationRecord;
     // Advance the revision floor past any stored compaction revision so a clock rollback /
@@ -560,7 +573,8 @@ export function readConversation(appHome: string, id: string): ConversationRecor
       (rec?.conversationCompaction as { compactionRevision?: number } | null)?.compactionRevision,
     );
     return rec;
-  } catch {
+  } catch (err) {
+    if (strict) throw err; // R269: a read/parse failure is NOT absence — let the caller retain+retry
     return null;
   }
 }
