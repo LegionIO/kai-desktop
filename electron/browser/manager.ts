@@ -2496,6 +2496,54 @@ export class BrowserManager {
     });
   }
 
+  /** Bound how long caller-facing work can wait to enter a busy tab queue.
+   * Once the admission deadline wins, the queued wrapper remains as a cheap
+   * ordering tombstone and must never start the renderer operation later. */
+  private runTabOperationBeforeDeadline<T>(
+    tab: InternalTab,
+    deadlineAt: number,
+    onDeadline: () => T | Promise<T>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    let deadlineReached = Date.now() >= deadlineAt;
+    let queueTurnStarted = false;
+    let deadlineResult: Promise<T> | undefined;
+    const resolveDeadline = (): Promise<T> => (deadlineResult ??= Promise.resolve().then(() => onDeadline()));
+    if (deadlineReached) return resolveDeadline();
+    if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+      return Promise.reject(new Error('This browser tab is being closed by another assistant operation.'));
+    }
+
+    const queued = tab.queue.run(() => {
+      queueTurnStarted = true;
+      if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+        throw new Error('This browser tab is being closed by another assistant operation.');
+      }
+      if (deadlineReached || Date.now() >= deadlineAt) {
+        deadlineReached = true;
+        return resolveDeadline();
+      }
+      return this.withScopeActivity(tab.scopeKey, operation);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const admissionDeadline = new Promise<T>((resolve, reject) => {
+      timer = setTimeout(
+        () => {
+          // Once admitted, the operation's own remaining-budget checks own the
+          // deadline. This timer exists only to bound a blocked queue entrance.
+          if (queueTurnStarted) return;
+          deadlineReached = true;
+          void resolveDeadline().then(resolve, reject);
+        },
+        Math.max(0, Math.ceil(deadlineAt - Date.now())),
+      );
+      timer.unref?.();
+    });
+    return Promise.race([queued, admissionDeadline]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
   private assistantDownloadOwner(tab: InternalTab): string | null {
     const activeOwner = (ownerId: string | null | undefined): string | null =>
       ownerId && this.assistantRuns.generationIfActive(tab.shell.conversationId, ownerId) !== null ? ownerId : null;
@@ -3440,6 +3488,7 @@ export class BrowserManager {
         if (contents.isDestroyed()) return;
         const targetWasCurrent = tab.view?.webContents === contents;
         let restored = false;
+        let debuggerLease: BrowserDebuggerLease | undefined;
         try {
           await this.runRendererOperationWithDeadline(
             tab,
@@ -3447,11 +3496,12 @@ export class BrowserManager {
             'Browser background viewport cleanup',
             timeoutMs,
             async () => {
-              const releaseDebugger = this.acquireBrowserDebugger(contents);
+              const lease = this.acquireBrowserDebuggerLease(contents);
+              debuggerLease = lease;
               try {
                 await contents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride');
               } finally {
-                releaseDebugger();
+                lease.release();
               }
             },
             undefined,
@@ -3465,6 +3515,11 @@ export class BrowserManager {
             this.emitTabs(tab.shell.conversationId);
           }
         } catch {
+          // Cleanup deliberately preserves the authenticated page, so detach
+          // only the exact manager-owned CDP generation whose native command
+          // exceeded the deadline. A concurrent lease keeps the shared
+          // transport alive until it drains.
+          debuggerLease?.cancel();
           // Presentation must never destroy or cancel an assistant target. Keep
           // the native-mount quarantine so the operation's own finally path can
           // retry after concurrent CDP work settles.
@@ -12577,48 +12632,56 @@ export class BrowserManager {
     // sidebar-independent work and count against the requested wait deadline.
     const startedAt = Date.now();
     const deadlineAt = waitFor === 'none' ? Number.POSITIVE_INFINITY : startedAt + timeoutMs;
+    const timedOutBeforeInspection = (documentLease?: AssistantDocumentLease): BrowserNetworkDiagnostics => {
+      throwIfBrowserAborted(abortSignal);
+      this.assertAssistantRun(conversationId, assistantRun);
+      this.assertBrowserDocumentApproval(tab, approvedDocument);
+      if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+      if (
+        this.removedConversations.has(conversationId) ||
+        tab.shell.conversationId !== conversationId ||
+        this.tabs.get(tab.shell.id) !== tab
+      ) {
+        throw new Error('The browser tab closed while network diagnostics were waiting.');
+      }
+      if (tab.shell.sensitive) {
+        throw new Error('Network diagnostics is blocked while this tab contains password data.');
+      }
+      const redactionKey = this.networkRedactionKeyForTab(tab);
+      const requestCount = Math.max(tab.networkRequests?.size ?? 0, tab.networkRequestSequence ?? 0);
+      const inFlight = this.currentDocumentActiveNetworkRequests(tab).length;
+      // No renderer inspection is allowed after the caller's budget expires.
+      // Return only manager-owned, content-free state; exact request metadata
+      // remains withheld until a later successful sensitivity scan.
+      return {
+        tabId: tab.shell.id,
+        url: browserNetworkPageIdentity(tab.shell.url, redactionKey),
+        loading: tab.shell.loading,
+        waitFor,
+        waitTimedOut: true,
+        inFlight,
+        requestCount,
+        requestsTruncated: requestCount > 0,
+        loadTiming: {},
+        requests: [],
+      };
+    };
     return this.withVisibleAssistantOperation(
       conversationId,
       tab,
       assistantRun,
       'network',
       waitFor === 'none' ? 'checking network activity' : `waiting for ${waitFor}`,
-      () =>
-        this.runTabOperation(tab, () =>
+      () => {
+        const operation = () =>
           this.withAssistantControl(
             tab,
             assistantRun,
             async (documentLease) => {
               throwIfBrowserAborted(abortSignal);
               this.assertBrowserDocumentApproval(tab, approvedDocument);
-              const timedOutBeforeInspection = (): BrowserNetworkDiagnostics => {
-                this.assertAssistantDocumentLease(tab, documentLease);
-                this.assertBrowserDocumentApproval(tab, approvedDocument);
-                if (tab.shell.sensitive) {
-                  throw new Error('Network diagnostics is blocked while this tab contains password data.');
-                }
-                const redactionKey = this.networkRedactionKeyForTab(tab);
-                const requestCount = Math.max(tab.networkRequests?.size ?? 0, tab.networkRequestSequence ?? 0);
-                const inFlight = this.currentDocumentActiveNetworkRequests(tab).length;
-                // No renderer inspection is allowed after the caller's budget
-                // expires. Return only manager-owned, content-free state; exact
-                // request metadata remains withheld until a later successful
-                // sensitivity scan.
-                return {
-                  tabId: tab.shell.id,
-                  url: browserNetworkPageIdentity(tab.shell.url, redactionKey),
-                  loading: tab.shell.loading,
-                  waitFor,
-                  waitTimedOut: true,
-                  inFlight,
-                  requestCount,
-                  requestsTruncated: requestCount > 0,
-                  loadTiming: {},
-                  requests: [],
-                };
-              };
               const remainingBeforeView = Math.ceil(deadlineAt - Date.now());
-              if (waitFor !== 'none' && remainingBeforeView <= 0) return timedOutBeforeInspection();
+              if (waitFor !== 'none' && remainingBeforeView <= 0) return timedOutBeforeInspection(documentLease);
               let contents: WebContents;
               try {
                 contents = (
@@ -12633,7 +12696,7 @@ export class BrowserManager {
                 ).webContents;
               } catch (error) {
                 if (waitFor !== 'none' && error instanceof BrowserRendererDeadlineError) {
-                  return timedOutBeforeInspection();
+                  return timedOutBeforeInspection(documentLease);
                 }
                 throw error;
               }
@@ -12739,9 +12802,9 @@ export class BrowserManager {
 
               assertTargetCurrent();
               if (waitFor !== 'none' && (waitTimedOut || Date.now() >= deadlineAt)) {
-                return timedOutBeforeInspection();
+                return timedOutBeforeInspection(documentLease);
               }
-              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection();
+              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection(documentLease);
               assertTargetCurrent();
               const trackedRequests = [...(tab.networkRequests?.values() ?? [])];
               const network = snapshotBrowserNetworkRequests(trackedRequests, limit, target.redactionKey);
@@ -12761,13 +12824,16 @@ export class BrowserManager {
                 loadTiming: browserLoadTimingFromNetworkRequests(trackedRequests),
                 requests: network.entries,
               } satisfies BrowserNetworkDiagnostics;
-              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection();
+              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection(documentLease);
               assertTargetCurrent();
               return result;
             },
             approvedDocument,
-          ),
-        ),
+          );
+        return waitFor === 'none'
+          ? this.runTabOperation(tab, operation)
+          : this.runTabOperationBeforeDeadline(tab, deadlineAt, timedOutBeforeInspection, operation);
+      },
     );
   }
 

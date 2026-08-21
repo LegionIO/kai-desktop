@@ -7786,6 +7786,51 @@ describe('browser manager renderer lifecycle', () => {
     invokePrivate(manager, 'clearAssistantBackgroundViewportRetry', tab, contents);
   });
 
+  it('cancels the exact debugger lease when background viewport cleanup reaches its deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const wedgedCleanup = deferred<unknown>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+        if (args[0] === 'Emulation.clearDeviceMetricsOverride') return wedgedCleanup.promise;
+        return {};
+      });
+      const contents = { debugger: debuggerApi, isDestroyed: () => false };
+      const tab = {
+        aiActionDepth: 0,
+        generation: 1,
+        trustedUserNavigationLease: 0,
+        queue: new BrowserActionQueue(),
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, error: undefined as string | undefined },
+        view: { webContents: contents },
+        assistantBackgroundViewportContents: new Set([contents]),
+      };
+      const manager = managerWithoutConstructor({
+        attachActiveView: vi.fn(),
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      const restore = invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab, contents, 100) as Promise<void>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(restore).resolves.toBeUndefined();
+
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+      expect(debuggerApi.isAttached()).toBe(false);
+      expect(tab.view.webContents).toBe(contents);
+      expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
+      expect(tab.shell.error).toBe('The background browser viewport could not be restored.');
+      invokePrivate(manager, 'clearAssistantBackgroundViewportRetry', tab, contents);
+      wedgedCleanup.resolve({});
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('autonomously retries failed background viewport cleanup without reclaiming the target', async () => {
     vi.useFakeTimers();
     const debuggerApi = browserDebuggerMock();
@@ -13335,6 +13380,66 @@ describe('browser manager renderer lifecycle', () => {
       expect(Reflect.get(manager, 'ensureAssistantView')).not.toHaveBeenCalled();
     } finally {
       now.mockRestore();
+    }
+  });
+
+  it('returns at the network wait deadline without starting inspection after a blocked queue drains', async () => {
+    vi.useFakeTimers();
+    try {
+      const queueBlocker = deferred<void>();
+      const tab = {
+        shell: {
+          id: 'tab-network-queue-deadline',
+          conversationId: 'chat-1',
+          url: 'https://example.com/loading',
+          loading: true,
+          sensitive: false,
+        },
+        scopeKey: 'global',
+        generation: 1,
+        trustedUserNavigationLease: 0,
+        queue: new BrowserActionQueue(),
+      };
+      const blocked = tab.queue.run(() => queueBlocker.promise);
+      const withAssistantControl = vi.fn(
+        async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => operation({}),
+      );
+      const ensureAssistantView = vi.fn();
+      const manager = managerWithoutConstructor({
+        assertBrowserDocumentApproval: vi.fn(),
+        ensureAssistantView,
+        requireAssistantTab: () => tab,
+        tabs: new Map([[tab.shell.id, tab]]),
+        withAssistantControl,
+        withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+      });
+
+      const diagnostics = manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100 }, { id: 'run-1' });
+      await vi.advanceTimersByTimeAsync(99);
+      let settled = false;
+      void diagnostics.finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(diagnostics).resolves.toMatchObject({
+        tabId: tab.shell.id,
+        waitFor: 'load',
+        waitTimedOut: true,
+        requests: [],
+      });
+      expect(withAssistantControl).not.toHaveBeenCalled();
+      expect(ensureAssistantView).not.toHaveBeenCalled();
+
+      queueBlocker.resolve();
+      await blocked;
+      await tab.queue.whenIdle();
+      expect(withAssistantControl).not.toHaveBeenCalled();
+      expect(ensureAssistantView).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
     }
   });
 
