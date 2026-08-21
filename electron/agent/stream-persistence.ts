@@ -85,6 +85,19 @@ type Accumulator = {
 const accumulators = new Map<string, Accumulator>();
 
 /**
+ * R233: orphaned assistant PREFIXES whose persist FAILED at an inject boundary. The prefix and continuation
+ * share one accumulator; if the prefix write fails we cannot leave it in the accumulator (the continuation
+ * would then persist merged with it AFTER the inject — placing an answer's pre-question content after the
+ * question) nor discard it (crash-backstop loss). So we SNAPSHOT the prefix parts here — parented on the
+ * PRE-INJECT head (where it chronologically belongs) — and re-seed a fresh EMPTY continuation accumulator under
+ * the injected user. A later finalize/`done` (flushOrphanedPrefixes) retries persisting these under their own
+ * parent, so both prefix (before inject) and continuation (after inject) end up correctly ordered. Keyed by
+ * conversationId → list (a run can cross multiple failed boundaries before one flush).
+ */
+type OrphanedPrefix = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string };
+const orphanedPrefixes = new Map<string, OrphanedPrefix[]>();
+
+/**
  * Response ids already persisted as an assistant node for a conversation, so a
  * second finalize of the SAME logical reply (the inject-consumed handler, the
  * stop/cancel path, and the terminal drain can all reach a finalize) does not
@@ -387,6 +400,9 @@ export function accumulateForPersistence(
  * genuinely nothing to persist (ownership is safe to clear either way).
  */
 function finalizeTurn(appHome: string, conversationId: string): 'done' | 'failed' {
+  // R233: on turn settle, retry persisting any orphaned prefixes left by a failed inject-boundary persist —
+  // a write is more likely to succeed now, and they must land under their pre-inject parent before the turn ends.
+  flushOrphanedPrefixes(appHome, conversationId);
   const hadContent = Boolean(accumulators.get(conversationId)?.sawContent);
   persistAccumulated(appHome, conversationId);
   // If content existed and the accumulator is STILL present, persist failed and retained it (R168 f-2).
@@ -532,14 +548,15 @@ export function persistCooperativeInjectedUserTurn(
     },
   );
   if (!updated?.headId) return null;
-  // R231: when the prefix persist FAILED and its content is still held in the retained accumulator, that same
-  // accumulator will keep accumulating the CONTINUATION — but its parentId is still the PRE-INJECT head, so the
-  // continuation would persist as a sibling of the inject and the head would move back OVER the inject (leaving
-  // the accepted user off-branch). Rebind the retained accumulator's parent onto the just-persisted injected user
-  // so continuation flows `…pre → inject → continuation`. (The retained prefix, if a later finalize recovers it,
-  // lands as a sibling under the pre-inject head — branch selection handles that; the ACTIVE chain is correct.)
+  // R233: when the prefix persist FAILED (retainedPrefixParent !== undefined), the retained accumulator still
+  // holds the PREFIX and will keep accumulating the CONTINUATION into the SAME buffer. R231 rebound its parent
+  // onto the inject, but that made the prefix persist AFTER the inject (merged with the continuation) — placing
+  // an answer's pre-question content after the question. Instead SPLIT: snapshot the prefix as an orphan parented
+  // on the pre-inject head (retainedPrefixParent, == parentId here) and re-seed a fresh EMPTY continuation
+  // accumulator under the injected user. Then prefix (before inject) and continuation (after inject) are ordered
+  // correctly, and the prefix is preserved for flushOrphanedPrefixes rather than discarded.
   if (retainedPrefixParent !== undefined) {
-    rebindPersistenceAccumulatorParent(conversationId, messageId);
+    splitFailedPrefixIntoOrphan(conversationId, messageId, parentId);
   }
   return { messageId, parentId, createdAt };
 }
@@ -565,6 +582,9 @@ export function finalizeGuiFallbackPrefixAtInject(
   if (!conversationId || !injectedUserId) return null;
   const acc = accumulators.get(conversationId);
   const hasPrefix = !!acc && acc.sawContent && acc.parts.length > 0;
+  // Capture the pre-inject parent BEFORE persisting: if the persist fails we snapshot the prefix as an orphan
+  // under this parent rather than losing it (R233).
+  const preInjectParent = acc?.parentId ?? null;
   // replaceById: the RENDERER (authoritative) may have already persisted this
   // prefix assistant under the same responseMessageId via its debounce. Appending
   // would id-collision-rename into a bogus duplicate variant that conversations:put
@@ -581,14 +601,20 @@ export function finalizeGuiFallbackPrefixAtInject(
         restoreParentFromAcc: true,
       })
     : null;
-  // R229/R230: we ALWAYS re-seed the continuation accumulator below, even when the prefix persist returned null
-  // (had content but the write failed, R168-retained). Earlier (R229) this path returned WITHOUT re-seeding to
-  // avoid clobbering the retained prefix, but that broke the GUI multi-inject batch loop (agent.ts) which
-  // depends on the continuation being re-seeded under en.id — a null return was read as "no prefix, proceed" and
-  // the next entry's continuation then accumulated under the wrong parent. Here the MAIN-side accumulator is a
-  // FALLBACK: the GUI renderer runs its own authoritative debounced persist under the same responseMessageId, so
-  // even if this main-side prefix copy is lost on re-seed, the renderer's copy (or its crash-fallback upsert)
-  // carries it. So re-seed unconditionally to keep the live turn's continuation correctly parented.
+  // R233: if the prefix had content but the persist FAILED (prefixHead === null, accumulator retained), SNAPSHOT
+  // it as an orphan parented on the pre-inject head BEFORE the unconditional re-seed below overwrites the
+  // accumulator — otherwise the main-side crash-backstop prefix is discarded (R233 f-2). splitFailedPrefixIntoOrphan
+  // both snapshots the prefix AND re-seeds the continuation under the injected user, so we skip the manual re-seed
+  // below in that case. (The GUI renderer also persists this prefix authoritatively; the orphan is main's backstop
+  // in case the renderer reloads/crashes before its debounced write.)
+  if (hasPrefix && prefixHead === null) {
+    splitFailedPrefixIntoOrphan(conversationId, injectedUserId, preInjectParent);
+    return null;
+  }
+  // R229/R230: we ALWAYS re-seed the continuation accumulator below when the prefix genuinely persisted (or there
+  // was none). Earlier (R229) this path returned WITHOUT re-seeding to avoid clobbering a retained prefix, but that
+  // broke the GUI multi-inject batch loop (agent.ts) which depends on the continuation being re-seeded under en.id.
+  // The failed-prefix case is now handled by splitFailedPrefixIntoOrphan above (which also re-seeds).
   // Re-seed a fresh continuation accumulator parented on the injected user, with
   // a DETERMINISTIC responseMessageId derived from the injected user id
   // (`${injectedUserId}-cont`). The RENDERER derives the identical id for its
@@ -826,12 +852,62 @@ export function getPersistenceAccumulatorParentId(conversationId: string): strin
   return acc ? (acc.parentId ?? null) : undefined;
 }
 
-/** R231: repoint the held accumulator's parent (used when a failed-prefix inject boundary must make the
- *  RETAINED accumulator's continuation flow under the newly-persisted injected user instead of the stale
- *  pre-inject head). No-op if there is no accumulator. */
-export function rebindPersistenceAccumulatorParent(conversationId: string, parentId: string | null): void {
+/** R233: on a prefix-persist FAILURE at an inject boundary, SPLIT the retained accumulator: snapshot its
+ *  current parts as an orphaned prefix (parented on the pre-inject head, where the prefix chronologically
+ *  belongs — NOT under the inject) and re-seed a FRESH EMPTY continuation accumulator parented on the injected
+ *  user. This avoids both failure modes of the shared accumulator: the continuation no longer persists MERGED
+ *  with the prefix after the inject (R233 f-1), and the prefix is not discarded (R233 f-2) — flushOrphanedPrefixes
+ *  retries it under its own parent on a later finalize/`done`. No-op if there is no accumulator with content.
+ *  `injectedUserId` becomes the continuation's parent; `preInjectParent` is the prefix's parent. */
+export function splitFailedPrefixIntoOrphan(
+  conversationId: string,
+  injectedUserId: string,
+  preInjectParent: string | null,
+): void {
   const acc = accumulators.get(conversationId);
-  if (acc) acc.parentId = parentId ?? undefined;
+  if (!acc || !acc.sawContent || acc.parts.length === 0) return;
+  const list = orphanedPrefixes.get(conversationId) ?? [];
+  list.push({ parts: acc.parts, parentId: preInjectParent, responseMessageId: acc.responseMessageId });
+  orphanedPrefixes.set(conversationId, list);
+  // Fresh continuation accumulator parented on the inject; a deterministic `-cont` id so a renderer-crash
+  // fallback finalize targets the same node (mirrors finalizeGuiFallbackPrefixAtInject's re-seed).
+  accumulators.set(conversationId, {
+    parts: [],
+    toolIndex: new Map(),
+    sawContent: false,
+    parentId: injectedUserId,
+    responseMessageId: `${injectedUserId}-cont`,
+  });
+}
+
+/** R233: attempt to persist any orphaned prefixes (from failed inject-boundary persists) as their own assistant
+ *  nodes under their recorded pre-inject parent. Called on a later finalize/`done` when a write is more likely to
+ *  succeed. Entries that persist are removed; entries that fail again are retained for the next attempt. */
+export function flushOrphanedPrefixes(appHome: string, conversationId: string): void {
+  const list = orphanedPrefixes.get(conversationId);
+  if (!list || list.length === 0) return;
+  const remaining: OrphanedPrefix[] = [];
+  for (const orphan of list) {
+    try {
+      const updated = appendConversationMessages(
+        appHome,
+        conversationId,
+        [
+          {
+            ...(orphan.responseMessageId ? { id: orphan.responseMessageId } : {}),
+            role: 'assistant',
+            content: orphan.parts,
+          },
+        ],
+        { runStatus: 'running', ...(orphan.parentId !== null ? { parentId: orphan.parentId } : {}) },
+      );
+      if (!updated?.headId) remaining.push(orphan); // still failing — keep for next attempt
+    } catch {
+      remaining.push(orphan);
+    }
+  }
+  if (remaining.length > 0) orphanedPrefixes.set(conversationId, remaining);
+  else orphanedPrefixes.delete(conversationId);
 }
 
 /** Whether the held accumulator (if any) has non-empty content to persist. Lets an on-demand
