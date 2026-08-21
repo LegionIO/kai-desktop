@@ -7440,6 +7440,7 @@ export function registerAgentHandlers(
                 conversationId,
                 type: 'tool-approval-required',
                 toolCallId: streamId,
+                runGeneration: streamToken, // R254: run-scope the pop-out registry / resolve (see mcp-manage)
                 toolName: state.toolName,
                 args: state.args,
               });
@@ -7541,6 +7542,7 @@ export function registerAgentHandlers(
                 conversationId,
                 type: 'tool-approval-required',
                 toolCallId: streamId,
+                runGeneration: streamToken, // R254: run-scope the pop-out registry / resolve (see mcp-manage)
                 toolName: state.toolName,
                 args: state.args,
               });

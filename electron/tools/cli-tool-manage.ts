@@ -33,6 +33,7 @@ async function approveRegistration(
     conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId,
+    runGeneration: context.browserOwnerId, // R254: run-scope the pop-out (see mcp-manage)
     toolName: 'cli_tools',
     args: {
       approvalKind: 'register-cli-tool',

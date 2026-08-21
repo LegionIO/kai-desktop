@@ -232,6 +232,7 @@ async function enforcePolicy<Approval = never>(
     conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId: context.toolCallId,
+    runGeneration: context.browserOwnerId, // R254: run-scope the pop-out (see mcp-manage)
     toolName,
     args: browserApprovalArgs(toolName, input, reason, approvalTarget),
   });

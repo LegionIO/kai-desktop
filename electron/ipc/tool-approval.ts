@@ -211,7 +211,7 @@ type ApprovalOwnerResolver = (
 
 let approvalOwnerResolver: ApprovalOwnerResolver | null = null;
 let rawApprovalWindowOpener: ((event: StreamEvent) => void) | null = null;
-let rawApprovalWindowCloser: ((toolCallId: string, conversationId?: string) => void) | null = null;
+let rawApprovalWindowCloser: ((toolCallId: string, conversationId?: string, runNonce?: string) => void) | null = null;
 let primaryApprovalWindowResolver: (() => BrowserWindow | null) | null = null;
 
 /** Bind approval ownership to agent.ts without importing it here (which would
@@ -230,7 +230,7 @@ export function setRawApprovalWindowOpener(opener: ((event: StreamEvent) => void
  * duplicate eviction, Realtime teardown, or authority revocation without
  * passing through agent.ts's renderer IPC handlers. */
 export function setRawApprovalWindowCloser(
-  closer: ((toolCallId: string, conversationId?: string) => void) | null,
+  closer: ((toolCallId: string, conversationId?: string, runNonce?: string) => void) | null,
 ): void {
   rawApprovalWindowCloser = closer;
 }
@@ -481,10 +481,10 @@ export function registerPendingApproval(
         /* observer must never break the settle path */
       }
       try {
-        // Close the pop-out under the SAME conversation-scoped key the registry uses (R193/R194): on a
-        // NON-IPC settle (abort / revocation / duplicate-evict) there's no renderer close call, so a
-        // raw-id-only close would leave a stale always-on-top window when the pop-out is composite-keyed.
-        rawApprovalWindowCloser?.(toolCallId, context?.conversationId);
+        // Close the pop-out under the SAME run-scoped key the registry uses (R193/R194/R254): on a NON-IPC
+        // settle (abort / revocation / duplicate-evict) there's no renderer close call, so a raw-id-only close
+        // would leave a stale always-on-top window when the pop-out is run-scoped-keyed. Pass the run nonce.
+        rawApprovalWindowCloser?.(toolCallId, context?.conversationId, runNonce);
       } catch {
         // Approval settlement must not depend on an optional window surface.
       }

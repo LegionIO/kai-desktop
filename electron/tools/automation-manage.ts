@@ -215,6 +215,7 @@ async function ensureApproved(
     conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId,
+    runGeneration: context.browserOwnerId, // R254: run-scope the pop-out (see mcp-manage)
     toolName: 'automations',
     args: {
       approvalKind: 'dangerous-automation',

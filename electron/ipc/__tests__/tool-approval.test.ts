@@ -232,7 +232,7 @@ describe('registerPendingApproval', () => {
     ctrl.abort();
     await expect(p).resolves.toBe('dismiss');
     expect(pendingToolApprovals.has('c-laterabort')).toBe(false);
-    expect(closeWindow).toHaveBeenCalledWith('c-laterabort', undefined);
+    expect(closeWindow).toHaveBeenCalledWith('c-laterabort', undefined, undefined);
   });
 
   it('closes a raw approval pop-out on duplicate eviction', async () => {
@@ -244,7 +244,7 @@ describe('registerPendingApproval', () => {
     const second = registerPendingApproval('window-duplicate');
 
     await expect(first).resolves.toBe(false);
-    expect(closeWindow).toHaveBeenCalledWith('window-duplicate', undefined);
+    expect(closeWindow).toHaveBeenCalledWith('window-duplicate', undefined, undefined);
     pendingToolApprovals.get('window-duplicate')!.resolve(false);
     await expect(second).resolves.toBe(false);
   });

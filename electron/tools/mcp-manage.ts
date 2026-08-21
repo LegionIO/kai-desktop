@@ -86,6 +86,9 @@ async function approveServerRegistration(
     conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId,
+    // R254: stamp the run nonce so the pop-out registry key (conversationId::runNonce::toolCallId) and the
+    // renderer resolve agree — raw producers otherwise omit runGeneration and two overlapping runs collide.
+    runGeneration: context.browserOwnerId,
     toolName: 'mcp_servers',
     args: {
       approvalKind: 'register-mcp-server',

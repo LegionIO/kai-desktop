@@ -1295,6 +1295,7 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
     conversationId,
     type: 'tool-approval-required',
     toolCallId,
+    runGeneration: browserOwnerId, // R254: run-scope the pop-out registry / resolve (see mcp-manage)
     toolName: 'ask_user',
     args,
   });
@@ -1385,6 +1386,7 @@ async function executeExitPlanModeTool(
     conversationId,
     type: 'tool-approval-required',
     toolCallId,
+    runGeneration: browserOwnerId, // R254: run-scope the pop-out registry / resolve (see mcp-manage)
     toolName: 'exit_plan_mode',
     args,
   });
