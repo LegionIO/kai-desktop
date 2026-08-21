@@ -914,6 +914,25 @@ export function splitFailedPrefixIntoOrphan(
   });
 }
 
+/** R246: record an orphan for a prefix that is ALREADY PERSISTED but whose inject SPLICE (reparent) failed — so
+ *  flushOrphanedPrefixes retries the reparent + head restore on the next finalize. Distinct from
+ *  splitFailedPrefixIntoOrphan (which handles an UNpersisted prefix). The prefix content is already on disk under
+ *  `prefixNodeId`, so flushOrphanedPrefixes' existing-node branch reuses it and only re-attempts the splice.
+ *  `parts` is passed so an existing-node content-restore is still a correct full copy. */
+export function recordSpliceOnlyOrphan(
+  conversationId: string,
+  injectedUserId: string,
+  prefixNodeId: string,
+  prefixParent: string | null,
+  parts: ContentPart[],
+): void {
+  const list = orphanedPrefixes.get(conversationId) ?? [];
+  // Don't double-record the same (prefix, inject) pair.
+  if (list.some((o) => o.responseMessageId === prefixNodeId && o.injectedUserId === injectedUserId)) return;
+  list.push({ parts, parentId: prefixParent, responseMessageId: prefixNodeId, injectedUserId });
+  orphanedPrefixes.set(conversationId, list);
+}
+
 /** R233/R234/R236/R237: persist orphaned prefixes (from failed inject-boundary persists) as their own assistant
  *  nodes under their pre-inject parent, THEN reparent the injected user onto the flushed prefix so the active
  *  chain is `pre → prefix → inject → continuation`. Robustness:
@@ -933,6 +952,12 @@ export function splitFailedPrefixIntoOrphan(
 export function flushOrphanedPrefixes(appHome: string, conversationId: string): void {
   const list = orphanedPrefixes.get(conversationId);
   if (!list || list.length === 0) return;
+  // R246: the set of ALL orphan prefix node ids in this batch. When recording a continuation head we must NOT
+  // record another orphan's (temporary, not-yet-spliced) prefix node — an earlier orphan whose splice failed
+  // leaves its prefix as the disk head, which is NOT a user-selected continuation and would hide the real one.
+  const orphanPrefixIds = new Set(
+    list.map((o) => o.responseMessageId).filter((id): id is string => typeof id === 'string'),
+  );
   const remaining: OrphanedPrefix[] = [];
   for (const orphan of list) {
     try {
@@ -954,11 +979,14 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       // a retained orphan outlives branch changes, so between a failed flush and a successful retry the user may
       // have selected a DIFFERENT branch; recording only the first head would restore a stale branch and discard
       // the user's current selection. Skip when the live head is the prefix (a retry after a prior failed append)
-      // or the inject — those aren't a continuation tip to preserve; keep whatever we last recorded.
+      // or the inject — those aren't a continuation tip to preserve; keep whatever we last recorded. R246: also
+      // skip when the head is ANOTHER orphan's prefix node (an earlier failed splice left it as the disk head) —
+      // that's an internal mutation from this loop, not a user-selected branch.
       if (
         typeof conv.headId === 'string' &&
         conv.headId !== orphan.responseMessageId &&
-        conv.headId !== orphan.injectedUserId
+        conv.headId !== orphan.injectedUserId &&
+        !orphanPrefixIds.has(conv.headId)
       ) {
         orphan.continuationHead = conv.headId;
       }

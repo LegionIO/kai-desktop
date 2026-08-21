@@ -43,6 +43,7 @@ import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
   purgeConversationPersistence,
+  recordSpliceOnlyOrphan,
   hasPersistenceAccumulator,
   persistenceAccumulatorHasContent,
   finalizeInterruptedTurn,
@@ -2538,9 +2539,39 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
           const prefixHead = finalizeGuiFallbackPrefixAtInject(serverPersistAppHome, event.conversationId, en.id);
           if (prefixHead) chainParent = prefixHead;
           if (chainParent) {
-            reparentConversationMessage(serverPersistAppHome, event.conversationId, en.id, chainParent, {
-              makeHead: true,
-            });
+            const spliced = reparentConversationMessage(
+              serverPersistAppHome,
+              event.conversationId,
+              en.id,
+              chainParent,
+              {
+                makeHead: true,
+              },
+            );
+            // R246: if the prefix persisted (prefixHead) but this SPLICE transiently failed, record a
+            // splice-only orphan so flushOrphanedPrefixes retries the reparent on the next finalize — otherwise
+            // the continuation persists under the inject's sibling branch and hides the prefix permanently.
+            if (!spliced && prefixHead && chainParent === prefixHead) {
+              try {
+                const c = readConversation(serverPersistAppHome, event.conversationId);
+                const node = Array.isArray(c?.messageTree)
+                  ? (c.messageTree as Array<{ id?: string; parentId?: string | null; content?: unknown }>).find(
+                      (m) => m.id === prefixHead,
+                    )
+                  : undefined;
+                if (node) {
+                  recordSpliceOnlyOrphan(
+                    event.conversationId,
+                    en.id,
+                    prefixHead,
+                    node.parentId ?? null,
+                    (node.content ?? []) as Parameters<typeof recordSpliceOnlyOrphan>[4],
+                  );
+                }
+              } catch {
+                /* best-effort orphan record */
+              }
+            }
           }
           // The next entry in the batch chains under THIS injected user (its
           // continuation accumulator was reseeded parented on en.id, so any prefix
