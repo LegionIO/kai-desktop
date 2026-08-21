@@ -152,6 +152,32 @@ describe('Browser validating proxy', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
+  it('uses a process-local realm to separate Kai credentials from upstream proxy authentication', async () => {
+    const first = new BrowserValidatingProxy();
+    const second = new BrowserValidatingProxy();
+    proxies.push(first, second);
+    await first.configureSession({
+      setProxy: vi.fn(async () => undefined),
+      closeAllConnections: vi.fn(async () => undefined),
+    } as never);
+    const realm = Reflect.get(first, 'authenticationRealm') as string;
+    const secondRealm = Reflect.get(second, 'authenticationRealm') as string;
+    const port = Reflect.get(first, 'port') as number;
+    const endpoint = {
+      isProxy: true,
+      host: '127.0.0.1',
+      port,
+      scheme: 'basic',
+    };
+
+    expect(realm).toMatch(/^Kai Browser Network Guard [0-9a-f]{32}$/);
+    expect(secondRealm).not.toBe(realm);
+    expect(first.isAuthenticationChallenge({ ...endpoint, realm } as never)).toBe(true);
+    expect(first.isUpstreamAuthenticationChallenge({ ...endpoint, realm } as never)).toBe(false);
+    expect(first.isAuthenticationChallenge({ ...endpoint, realm: 'Kai Browser Network Guard' } as never)).toBe(false);
+    expect(first.isUpstreamAuthenticationChallenge({ ...endpoint, realm: 'Enterprise Proxy' } as never)).toBe(true);
+  });
+
   it('shares a failing session setup and retries it instead of caching the rejection', async () => {
     const proxy = new BrowserValidatingProxy();
     proxies.push(proxy);
@@ -178,6 +204,37 @@ describe('Browser validating proxy', () => {
       proxyBypassRules: '<-loopback>',
     });
     expect(closeAllConnections).toHaveBeenCalledOnce();
+  });
+
+  it('invalidates configured sessions after a runtime listener error and safely starts a replacement', async () => {
+    const proxy = new BrowserValidatingProxy();
+    proxies.push(proxy);
+    const setProxy = vi.fn(async () => undefined);
+    const closeAllConnections = vi.fn(async () => undefined);
+    const targetSession = { setProxy, closeAllConnections } as never;
+
+    await proxy.configureSession(targetSession);
+    const failedServer = Reflect.get(proxy, 'server') as RunningServer;
+
+    expect(() => failedServer.emit('error', new Error('runtime listener failure'))).not.toThrow();
+    expect(Reflect.get(proxy, 'server')).toBeNull();
+    expect(Reflect.get(proxy, 'port')).toBeNull();
+    expect(Reflect.get(proxy, 'listenerGeneration')).toBe(1);
+    // The permanent listener must consume delayed errors from the retired
+    // server without invalidating a replacement or crashing the process.
+    expect(() => failedServer.emit('error', new Error('late retired-listener failure'))).not.toThrow();
+
+    await proxy.configureSession(targetSession);
+    const replacementServer = Reflect.get(proxy, 'server') as RunningServer;
+    const replacementPort = Reflect.get(proxy, 'port') as number;
+    expect(replacementServer).not.toBe(failedServer);
+    expect(replacementPort).toBeGreaterThan(0);
+    expect(setProxy).toHaveBeenCalledTimes(2);
+    expect(closeAllConnections).toHaveBeenCalledTimes(2);
+
+    expect(() => failedServer.emit('error', new Error('stale listener failure'))).not.toThrow();
+    expect(Reflect.get(proxy, 'server')).toBe(replacementServer);
+    expect(Reflect.get(proxy, 'port')).toBe(replacementPort);
   });
 
   it.each(['setProxy', 'closeAllConnections'] as const)(

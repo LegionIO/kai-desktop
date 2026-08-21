@@ -4011,6 +4011,72 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('keeps relayed enterprise-proxy authentication bounded and usable while the Browser panel is hidden', () => {
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-ai-upstream-proxy-auth-test',
+      () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    try {
+      const validatingProxy = Reflect.get(manager, 'validatingProxy') as {
+        isAuthenticationChallenge: (authInfo: Electron.AuthInfo) => boolean;
+        isUpstreamAuthenticationChallenge: (authInfo: Electron.AuthInfo) => boolean;
+      };
+      vi.spyOn(validatingProxy, 'isAuthenticationChallenge').mockReturnValue(false);
+      vi.spyOn(validatingProxy, 'isUpstreamAuthenticationChallenge').mockReturnValue(true);
+      const listener = electronMocks.appOn.mock.calls.find(([event]) => event === 'login')?.[1] as
+        | ((
+            event: { preventDefault: () => void },
+            contents: { id: number },
+            details: { url: string; pid: number },
+            authInfo: { isProxy: boolean; scheme: string; host: string; port: number; realm: string },
+            callback: (username?: string, password?: string) => void,
+          ) => void)
+        | undefined;
+      Reflect.get(manager, 'tabs').set('tab-1', {
+        shell: { id: 'tab-1', conversationId: 'chat-1' },
+        scopeKey: 'global',
+        generation: 5,
+        aiNetworkRestricted: true,
+      });
+      Reflect.get(manager, 'webContentsToTab').set(42, 'tab-1');
+      const event = { preventDefault: vi.fn() };
+      const callback = vi.fn();
+
+      listener?.(
+        event,
+        { id: 42 },
+        { url: 'https://secure.uhc.com/', pid: 1 },
+        {
+          isProxy: true,
+          scheme: 'basic',
+          host: '127.0.0.1',
+          port: 43123,
+          realm: 'Enterprise Proxy',
+        },
+        callback,
+      );
+
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(callback).not.toHaveBeenCalled();
+      const prompts = manager.getState('chat-1').authPrompts ?? [];
+      expect(prompts).toMatchObject([
+        {
+          tabId: 'tab-1',
+          realm: 'Enterprise Proxy',
+          isProxy: true,
+          assistantTriggered: true,
+        },
+      ]);
+      manager.respondAuthPrompt(prompts[0]!.id, 'enterprise-user', 'enterprise-secret');
+      expect(callback).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledWith('enterprise-user', 'enterprise-secret');
+    } finally {
+      manager.dispose();
+    }
+  });
+
   it('allows HTTP auth for the exact target of an explicit trusted user navigation', () => {
     const manager = new BrowserManager(
       '/tmp/kai-browser-trusted-http-auth-test',
@@ -11029,6 +11095,62 @@ describe('browser manager renderer lifecycle', () => {
     await Promise.all([cleanup, barrier]);
     expect(cleanupAssistantStateOwnedByRun).toHaveBeenCalledWith('chat-1', 'text-run');
     expect(barrierFinished).toBe(true);
+  });
+
+  it('retains and retries failed ordinary assistant tab and download cleanup without Browser presentation', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const cleanupAssistantStateOwnedByRun = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('download cancellation did not reach a terminal state'))
+        .mockResolvedValue(undefined);
+      const manager = managerWithoutConstructor({
+        assistantRuns: { end: vi.fn(async () => undefined) },
+        cleanupAssistantStateOwnedByRun,
+        emitTabs: vi.fn(),
+      });
+
+      await expect(manager.cleanupAssistantTabs('chat-1', 'run-1')).rejects.toThrow(/terminal state/i);
+      expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(1);
+      const retained = manager.waitForAssistantTabCleanup('chat-1');
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await retained;
+
+      expect(cleanupAssistantStateOwnedByRun).toHaveBeenCalledTimes(2);
+      expect((Reflect.get(manager, 'assistantTabCleanupRetries') as Map<unknown, unknown>).size).toBe(0);
+      expect((Reflect.get(manager, 'assistantTabCleanups') as Map<unknown, unknown>).size).toBe(0);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries terminal assistant download cancellation until it succeeds', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const cancelActiveAssistantDownloads = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('download still progressing'))
+        .mockResolvedValue(undefined);
+      const manager = managerWithoutConstructor({ cancelActiveAssistantDownloads });
+
+      invokePrivate(manager, 'scheduleAssistantDownloadCleanupRetry');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cancelActiveAssistantDownloads).toHaveBeenCalledOnce();
+      expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).not.toBeNull();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cancelActiveAssistantDownloads).toHaveBeenCalledTimes(2);
+      expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).toBeNull();
+      expect(warn).toHaveBeenCalledOnce();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('destroys a retained scripted renderer when its assistant run ends', async () => {

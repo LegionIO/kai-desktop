@@ -881,6 +881,14 @@ type PendingAssistantContinuation = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingAssistantTabCleanupRetry = {
+  conversationId: string;
+  runId: string;
+  completion: Promise<void>;
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
 type AssistantDocumentLease = {
   runId: string;
   runGeneration: number;
@@ -1372,6 +1380,11 @@ export class BrowserManager {
   private assistantTargetTabs = new Map<string, string>();
   private readonly pendingAssistantContinuations = new Map<string, PendingAssistantContinuation>();
   private assistantTabCleanups?: Map<string, Set<Promise<void>>>;
+  /** Failed ordinary turn cleanup stays owned here until a headless retry
+   * succeeds. This is separate from continuation handoffs: a failed completed
+   * run must never become adoptable by a future logical-turn continuation. */
+  private assistantTabCleanupRetries?: Map<string, PendingAssistantTabCleanupRetry>;
+  private assistantDownloadCleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /** Run ids whose temporary tabs are retained across the gap between a
    * completed stream and its authorized continuation. */
   private readonly assistantContinuationLeases = new Set<string>();
@@ -1940,6 +1953,7 @@ export class BrowserManager {
     // being present in the live tab map below.
     void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
       console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
+      this.scheduleAssistantDownloadCleanupRetry();
     });
     void this.cancelAssistantContinuations().catch((error: unknown) => {
       console.warn('[Browser] Assistant continuation revocation will be retried:', error);
@@ -11180,14 +11194,18 @@ export class BrowserManager {
       callback(credentials.username, credentials.password);
       return;
     }
+    const upstreamProxyAuthentication = this.validatingProxy?.isUpstreamAuthenticationChallenge(authInfo) === true;
     if (!tab) return;
     event.preventDefault();
     const trustedUserNavigationAuth = this.trustedUserNavigationAuthRequest(tab, details.url);
-    if (tab.aiNetworkRestricted && !trustedUserNavigationAuth) {
+    if (tab.aiNetworkRestricted && !trustedUserNavigationAuth && !upstreamProxyAuthentication) {
       // HTTP-auth callbacks block navigation itself. Assistant-controlled loads
       // must terminate without waiting for Browser chrome to mount; the user can
       // authenticate only when this challenge belongs to the exact main-frame
-      // target (or redirect) claimed by an explicit user navigation.
+      // target (or redirect) claimed by an explicit user navigation. Relayed
+      // enterprise-proxy challenges are different: the local validating proxy
+      // has already bound them to this request/connection, and the bounded
+      // prompt can remain pending while the Browser sidebar is hidden.
       callback();
       return;
     }
@@ -14771,6 +14789,19 @@ export class BrowserManager {
     return Promise.all(cancellations).then(() => undefined);
   }
 
+  private scheduleAssistantDownloadCleanupRetry(): void {
+    if (this.disposed || this.shuttingDown || this.assistantDownloadCleanupRetryTimer) return;
+    this.assistantDownloadCleanupRetryTimer = setTimeout(() => {
+      this.assistantDownloadCleanupRetryTimer = null;
+      if (this.disposed || this.shuttingDown) return;
+      void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
+        console.warn('[Browser] Assistant download cancellation will be retried:', error);
+        this.scheduleAssistantDownloadCleanupRetry();
+      });
+    }, ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS);
+    this.assistantDownloadCleanupRetryTimer.unref?.();
+  }
+
   private cancelActiveDownloadsForConversation(conversationId: string): Promise<void> {
     const cancellations = [...(this.activeDownloads?.values() ?? [])]
       .filter((download) => download.conversationId === conversationId)
@@ -15909,10 +15940,20 @@ export class BrowserManager {
   }
 
   cleanupAssistantTabs(conversationId: string, runId: string): Promise<void> {
+    const key = assistantContinuationKey(conversationId, runId);
+    const retainedRetry = this.assistantTabCleanupRetries?.get(key);
+    if (retainedRetry) return retainedRetry.completion;
     // cleanupAssistantTabsNow executes synchronously through assistantRuns.end,
     // revoking new work before this method returns. Track the resulting drain
     // without deferring that revocation behind a promise microtask.
-    const cleanup = this.cleanupAssistantTabsNow(conversationId, runId);
+    const cleanup = this.cleanupAssistantTabsNow(conversationId, runId).then(() => {
+      this.finishAssistantTabCleanupRetry(key);
+    });
+    void cleanup.catch(() => this.scheduleAssistantTabCleanupRetry(conversationId, runId));
+    return this.trackAssistantTabCleanup(conversationId, cleanup);
+  }
+
+  private trackAssistantTabCleanup(conversationId: string, cleanup: Promise<void>): Promise<void> {
     const cleanupsByConversation = (this.assistantTabCleanups ??= new Map());
     const pending = cleanupsByConversation.get(conversationId) ?? new Set<Promise<void>>();
     pending.add(cleanup);
@@ -15926,6 +15967,64 @@ export class BrowserManager {
       })
       .catch(() => undefined);
     return cleanup;
+  }
+
+  private scheduleAssistantTabCleanupRetry(conversationId: string, runId: string): void {
+    if (this.disposed || this.shuttingDown) return;
+    const key = assistantContinuationKey(conversationId, runId);
+    if (this.pendingAssistantContinuations?.has(key)) return;
+    if (this.assistantTabCleanupRetries?.has(key)) return;
+    let resolve!: () => void;
+    const completion = new Promise<void>((settled) => {
+      resolve = settled;
+    });
+    const pending: PendingAssistantTabCleanupRetry = {
+      conversationId,
+      runId,
+      completion,
+      resolve,
+      timer: null,
+    };
+    (this.assistantTabCleanupRetries ??= new Map()).set(key, pending);
+    this.trackAssistantTabCleanup(conversationId, completion);
+    this.armAssistantTabCleanupRetry(key, pending);
+  }
+
+  private armAssistantTabCleanupRetry(key: string, pending: PendingAssistantTabCleanupRetry): void {
+    if (this.disposed || this.shuttingDown || this.assistantTabCleanupRetries?.get(key) !== pending) {
+      this.finishAssistantTabCleanupRetry(key, pending);
+      return;
+    }
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      pending.timer = null;
+      void this.retryAssistantTabCleanup(key, pending);
+    }, ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS);
+    pending.timer.unref?.();
+  }
+
+  private async retryAssistantTabCleanup(key: string, pending: PendingAssistantTabCleanupRetry): Promise<void> {
+    if (this.assistantTabCleanupRetries?.get(key) !== pending) return;
+    if (this.disposed || this.shuttingDown) {
+      this.finishAssistantTabCleanupRetry(key, pending);
+      return;
+    }
+    try {
+      await this.cleanupAssistantTabsNow(pending.conversationId, pending.runId);
+      this.finishAssistantTabCleanupRetry(key, pending);
+    } catch (error) {
+      if (this.assistantTabCleanupRetries?.get(key) !== pending) return;
+      console.warn('[Browser] Assistant tab/download cleanup will be retried:', error);
+      this.armAssistantTabCleanupRetry(key, pending);
+    }
+  }
+
+  private finishAssistantTabCleanupRetry(key: string, expected?: PendingAssistantTabCleanupRetry): void {
+    const pending = this.assistantTabCleanupRetries?.get(key);
+    if (!pending || (expected && pending !== expected)) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.assistantTabCleanupRetries?.delete(key);
+    pending.resolve();
   }
 
   waitForAssistantTabCleanup(conversationId: string): Promise<void> {
@@ -16031,6 +16130,7 @@ export class BrowserManager {
     // is still intact, before clearing leases and destroying page renderers.
     void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
       console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
+      this.scheduleAssistantDownloadCleanupRetry();
     });
     this.assistantRuns.clear();
     this.assistantTargetTabs?.clear();
@@ -16122,6 +16222,13 @@ export class BrowserManager {
     for (const pending of this.pendingAssistantContinuations?.values() ?? []) clearTimeout(pending.timer);
     this.pendingAssistantContinuations?.clear();
     this.assistantContinuationLeases?.clear();
+    for (const [key, pending] of this.assistantTabCleanupRetries ?? []) {
+      this.finishAssistantTabCleanupRetry(key, pending);
+    }
+    if (this.assistantDownloadCleanupRetryTimer) {
+      clearTimeout(this.assistantDownloadCleanupRetryTimer);
+      this.assistantDownloadCleanupRetryTimer = null;
+    }
     ipcMain.off('browser-page:sensitive', this.handleSensitiveEvent);
     ipcMain.off('browser-page:login-submitted', this.handleLoginSubmitted);
     ipcMain.off('browser-page:activity', this.handlePageActivity);
@@ -16195,6 +16302,8 @@ export class BrowserManager {
     this.scopeGenerations.clear();
     this.scopeRuntimeReleaseTokens.clear();
     this.pendingAssistantTabClosures.clear();
+    this.assistantTabCleanups?.clear();
+    this.assistantTabCleanupRetries?.clear();
     this.clearingOrigins.clear();
     this.panelAuthorityGenerations.clear();
     this.panelLayoutGenerations.clear();

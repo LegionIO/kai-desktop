@@ -43,7 +43,6 @@ type ProxyRoute =
   | { kind: 'socks4'; hostname: string; port: number }
   | { kind: 'socks5'; hostname: string; port: number };
 
-const PROXY_AUTH_REALM = 'Kai Browser Network Guard';
 const MAX_PROXY_TARGET_CHARS = 16 * 1_024;
 const MAX_PROXY_ROUTE_LIST_CHARS = 16 * 1_024;
 const MAX_PROXY_AUTHORITY_TOKENS = 4_096;
@@ -354,7 +353,11 @@ function pinnedHttpAgent(route: ProxyRoute, socket: Socket): HttpAgent {
  */
 export class BrowserValidatingProxy {
   private readonly username = `kai-${randomBytes(12).toString('hex')}`;
-  private readonly configuredSessions = new WeakMap<Session, Promise<void>>();
+  /** The realm is a process-local capability marker. An enterprise proxy can
+   * choose any public realm string, so a fixed Kai realm would let it collide
+   * with the internal challenge and receive a one-shot guard credential. */
+  private readonly authenticationRealm = `Kai Browser Network Guard ${randomBytes(16).toString('hex')}`;
+  private readonly configuredSessions = new WeakMap<Session, { generation: number; promise: Promise<void> }>();
   private readonly restrictedRequests = new Map<string, string>();
   private readonly restrictedHostCounts = new Map<string, number>();
   private readonly authorities = new Map<string, ProxyAuthority>();
@@ -366,7 +369,12 @@ export class BrowserValidatingProxy {
   private readonly resolveHost: (hostname: string) => Promise<ResolvedEndpoint[]>;
   private server: Server | null = null;
   private startPromise: Promise<number> | null = null;
+  private readonly retiredServerClosures = new Set<Promise<void>>();
   private port: number | null = null;
+  /** Incremented whenever a listener that had successfully started faults.
+   * WeakMap entries carry this generation so every Browser profile lazily
+   * reapplies setProxy to the replacement listener on its next request. */
+  private listenerGeneration = 0;
   private closed = false;
 
   constructor(
@@ -388,10 +396,13 @@ export class BrowserValidatingProxy {
   }
 
   configureSession(session: Session): Promise<void> {
+    const generation = this.listenerGeneration;
     const existing = this.configuredSessions.get(session);
-    if (existing) return existing;
+    if (existing?.generation === generation) return existing.promise;
     const configured = this.start().then(async (port) => {
-      if (this.closed) throw new Error('The Browser validating proxy is closed.');
+      if (this.closed || this.listenerGeneration !== generation) {
+        throw new Error('The Browser validating proxy changed while the session was being configured.');
+      }
       await withOperationTimeout(
         session.setProxy({
           mode: 'fixed_servers',
@@ -403,18 +414,25 @@ export class BrowserValidatingProxy {
         this.operationTimeoutMs,
         'Browser session proxy configuration timed out.',
       );
+      if (this.closed || this.listenerGeneration !== generation) {
+        throw new Error('The Browser validating proxy changed while the session was being configured.');
+      }
       await withOperationTimeout(
         session.closeAllConnections(),
         this.operationTimeoutMs,
         'Browser session connection reset timed out.',
       );
+      if (this.closed || this.listenerGeneration !== generation) {
+        throw new Error('The Browser validating proxy changed while the session was being configured.');
+      }
     });
-    this.configuredSessions.set(session, configured);
+    const entry = { generation, promise: configured };
+    this.configuredSessions.set(session, entry);
     // Cache only a successful configuration (or its in-flight attempt). A
     // transient listener/session failure must not poison this profile forever;
     // later callers retry while concurrent callers still share one attempt.
     void configured.catch(() => {
-      if (this.configuredSessions.get(session) === configured) {
+      if (this.configuredSessions.get(session) === entry) {
         this.configuredSessions.delete(session);
       }
     });
@@ -427,7 +445,21 @@ export class BrowserValidatingProxy {
       normalizedHostname(authInfo.host) === '127.0.0.1' &&
       this.port !== null &&
       authInfo.port === this.port &&
-      authInfo.realm === PROXY_AUTH_REALM
+      authInfo.realm === this.authenticationRealm
+    );
+  }
+
+  /** True only for an upstream 407 that Kai relayed through its loopback
+   * listener. Keeping this separate from isAuthenticationChallenge() lets a
+   * background assistant load ask for bounded enterprise credentials without
+   * ever exposing Kai's internal one-shot credential to the upstream proxy. */
+  isUpstreamAuthenticationChallenge(authInfo: AuthInfo): boolean {
+    return (
+      authInfo.isProxy &&
+      normalizedHostname(authInfo.host) === '127.0.0.1' &&
+      this.port !== null &&
+      authInfo.port === this.port &&
+      authInfo.realm !== this.authenticationRealm
     );
   }
 
@@ -512,10 +544,54 @@ export class BrowserValidatingProxy {
     await this.startPromise?.catch(() => undefined);
     const server = this.server;
     this.server = null;
-    if (!server?.listening) return;
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    });
+    const closures = [...this.retiredServerClosures];
+    if (server?.listening) {
+      closures.push(
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        }),
+      );
+    }
+    await Promise.all(closures);
+  }
+
+  private handleRuntimeServerError(server: Server): void {
+    // A retired listener can report a delayed close/error after its replacement
+    // is already serving. Its permanent listener still consumes the event, but
+    // only the currently published server may invalidate session generations.
+    if (this.closed || this.server !== server) return;
+    this.server = null;
+    this.port = null;
+    this.startPromise = null;
+    this.listenerGeneration++;
+    this.authorities.clear();
+    for (const connections of this.connectionsByHost.values()) {
+      for (const connection of connections) {
+        connection.client.destroy();
+        connection.upstream.destroy();
+      }
+    }
+    this.connectionsByHost.clear();
+    for (const sockets of this.pendingSocketsByHost.values()) {
+      for (const socket of sockets) socket.destroy();
+    }
+    this.pendingSocketsByHost.clear();
+    for (const socket of this.clientSockets) socket.destroy();
+    this.clientSockets.clear();
+    // Runtime failures are recovered lazily by configureSession(). Do not let
+    // an asynchronous close error become an unhandled rejection or tear down a
+    // replacement listener that may already have started.
+    if (server.listening) {
+      let closure!: Promise<void>;
+      closure = new Promise<void>((resolve) => {
+        try {
+          server.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      }).finally(() => this.retiredServerClosures.delete(closure));
+      this.retiredServerClosures.add(closure);
+    }
   }
 
   private closeHostConnections(hostname: string): void {
@@ -626,12 +702,12 @@ export class BrowserValidatingProxy {
 
   private rejectAuthentication(socketOrResponse: Socket | ServerResponse): void {
     if ('writeHead' in socketOrResponse) {
-      socketOrResponse.writeHead(407, { 'Proxy-Authenticate': `Basic realm="${PROXY_AUTH_REALM}"` });
+      socketOrResponse.writeHead(407, { 'Proxy-Authenticate': `Basic realm="${this.authenticationRealm}"` });
       socketOrResponse.end();
       return;
     }
     socketOrResponse.end(
-      `HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="${PROXY_AUTH_REALM}"\r\nConnection: close\r\n\r\n`,
+      `HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="${this.authenticationRealm}"\r\nConnection: close\r\n\r\n`,
     );
   }
 
@@ -1395,6 +1471,7 @@ export class BrowserValidatingProxy {
     });
     this.server = server;
     const pending = new Promise<number>((resolve, reject) => {
+      let started = false;
       server.on('connection', (socket) => {
         this.clientSockets.add(socket);
         socket.once('close', () => this.clientSockets.delete(socket));
@@ -1405,7 +1482,14 @@ export class BrowserValidatingProxy {
       server.on('upgrade', (request, socket, head) => {
         void this.handleUpgrade(request, socket as Socket, head).catch(() => socket.destroy());
       });
-      server.once('error', reject);
+      // Keep this listener for the entire server lifetime. A once-only startup
+      // handler silently consumed the first runtime error, then left the next
+      // `error` event able to crash Electron while sessions stayed pinned to a
+      // dead port.
+      server.on('error', (error) => {
+        if (!started) reject(error);
+        else this.handleRuntimeServerError(server);
+      });
       server.listen(0, '127.0.0.1', () => {
         if (this.closed) {
           server.close(() => reject(new Error('The Browser validating proxy closed during startup.')));
@@ -1416,6 +1500,7 @@ export class BrowserValidatingProxy {
           reject(new Error('The Browser validating proxy did not bind a TCP port.'));
           return;
         }
+        started = true;
         this.port = address.port;
         resolve(address.port);
       });

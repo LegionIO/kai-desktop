@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -90,6 +91,31 @@ describe('assistant download quarantine', () => {
     expect(writes).toHaveLength(1);
     expect(writes[0]?.value).toBe(`0083;${Math.floor(1_700_000_000).toString(16)};Kai;${exportId}`);
     expect(existsSync(writes[0]!.path)).toBe(false);
+  });
+
+  it('rejects a substituted macOS staging path after quarantining the original inode', async () => {
+    const appHome = createAppHome();
+    const source = prepareAssistantDownloadQuarantine(appHome, 'global', downloadId(1));
+    writeFileSync(source, 'remote payload');
+    const exported = join(appHome, 'chosen-by-user.dmg');
+    const exportId = '66666666-6666-4666-8666-666666666666';
+    let displaced = '';
+
+    await expect(
+      exportAssistantDownloadFile(appHome, source, exported, {
+        platform: 'darwin',
+        exportId,
+        writeMacOsQuarantineAttribute: async (path, _value, handle) => {
+          expect((await handle.stat()).isFile()).toBe(true);
+          displaced = `${path}.displaced`;
+          renameSync(path, displaced);
+          writeFileSync(path, 'unquarantined substitute');
+        },
+      }),
+    ).rejects.toThrow(/staging file changed/i);
+
+    expect(existsSync(exported)).toBe(false);
+    expect(readFileSync(displaced, 'utf8')).toBe('remote payload');
   });
 
   it('uses a bounded staging name for valid destinations near NAME_MAX', async () => {

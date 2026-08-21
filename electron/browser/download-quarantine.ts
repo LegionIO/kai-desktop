@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -15,7 +15,6 @@ import {
 } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
 
 export const MAX_ASSISTANT_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_ASSISTANT_QUARANTINE_FILES_PER_SCOPE = 25;
@@ -30,13 +29,13 @@ const QUARANTINE_SCOPE_KEY = /^(global|conversation-[a-f0-9]{24})$/;
 const EXPORT_JOURNAL_FILENAME =
   /^Kai-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/i;
 const MAX_EXPORT_JOURNAL_BYTES = 16 * 1024;
-const execFileAsync = promisify(execFile);
+const MAX_XATTR_ERROR_BYTES = 8 * 1_024;
 
 type AssistantDownloadExportOptions = {
   platform?: NodeJS.Platform;
   now?: number;
   exportId?: string;
-  writeMacOsQuarantineAttribute?: (path: string, value: string) => Promise<void>;
+  writeMacOsQuarantineAttribute?: (path: string, value: string, handle: FileHandle) => Promise<void>;
   removeExportJournal?: (path: string) => Promise<void>;
 };
 
@@ -339,10 +338,10 @@ async function copyOpenedAssistantDownload(
   source: FileHandle,
   expectedSize: number,
   destination: string,
-): Promise<void> {
+): Promise<FileHandle> {
   const output = await fsPromises.open(
     destination,
-    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
     0o600,
   );
   const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -374,8 +373,10 @@ async function copyOpenedAssistantDownload(
     }
     await output.chmod(0o600);
     await output.sync();
-  } finally {
+    return output;
+  } catch (error) {
     await output.close();
+    throw error;
   }
 }
 
@@ -396,15 +397,6 @@ function assistantDownloadExportStagingPath(destination: string, exportId: strin
   return join(dirname(destination), `.kai-export-${safeDownloadId(exportId)}.tmp`);
 }
 
-async function syncFile(path: string): Promise<void> {
-  const handle = await fsPromises.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
 async function syncDirectory(path: string): Promise<void> {
   const handle = await fsPromises.open(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
   try {
@@ -414,11 +406,50 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-async function writeMacOsQuarantineAttribute(path: string, value: string): Promise<void> {
-  await execFileAsync('/usr/bin/xattr', ['-w', 'com.apple.quarantine', value, path], {
-    timeout: 5_000,
-    maxBuffer: 8 * 1_024,
+async function writeMacOsQuarantineAttribute(_path: string, value: string, handle?: FileHandle): Promise<void> {
+  if (!handle) throw new Error('The assistant download export descriptor is unavailable.');
+  await new Promise<void>((resolve, reject) => {
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    // Pass the already-open staging inode into xattr as fd 3. A page or another
+    // process replacing the staging pathname cannot redirect quarantine metadata
+    // to a different file while Kai still holds this descriptor.
+    const child = spawn('/usr/bin/xattr', ['-w', 'com.apple.quarantine', value, '/dev/fd/3'], {
+      stdio: ['ignore', 'ignore', 'pipe', handle.fd],
+      timeout: 5_000,
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (stderr.length >= MAX_XATTR_ERROR_BYTES) return;
+      stderr = Buffer.concat([stderr, chunk.subarray(0, MAX_XATTR_ERROR_BYTES - stderr.length)]);
+    });
+    child.once('error', (error) => finish(error));
+    child.once('close', (code, signal) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const detail = stderr.toString('utf8').trim();
+      finish(
+        new Error(
+          detail ||
+            `Could not apply macOS quarantine metadata (${signal ? `signal ${signal}` : `exit ${String(code)}`}).`,
+        ),
+      );
+    });
   });
+}
+
+async function assertOpenFileOwnsPath(handle: FileHandle, path: string, label: string): Promise<void> {
+  const [opened, named] = await Promise.all([handle.stat({ bigint: true }), fsPromises.lstat(path, { bigint: true })]);
+  if (!opened.isFile() || !named.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) {
+    throw new Error(`The assistant download ${label} changed while it was being exported.`);
+  }
 }
 
 export async function exportAssistantDownloadFile(
@@ -432,13 +463,17 @@ export async function exportAssistantDownloadFile(
   const staged = assistantDownloadExportStagingPath(destination, exportId);
   const platform = options.platform ?? process.platform;
   if (platform !== 'darwin') {
+    let stagedHandle: FileHandle | undefined;
     try {
-      await copyOpenedAssistantDownload(openedSource.handle, openedSource.size, staged);
+      stagedHandle = await copyOpenedAssistantDownload(openedSource.handle, openedSource.size, staged);
+      await assertOpenFileOwnsPath(stagedHandle, staged, 'staging file');
       await fsPromises.rename(staged, destination);
+      await assertOpenFileOwnsPath(stagedHandle, destination, 'destination');
     } catch (error) {
       await fsPromises.rm(staged, { force: true }).catch(() => undefined);
       throw error;
     } finally {
+      await stagedHandle?.close().catch(() => undefined);
       await openedSource.handle.close().catch(() => undefined);
     }
     return;
@@ -452,6 +487,7 @@ export async function exportAssistantDownloadFile(
   const journalPath = join(journalDirectory, `Kai-${safeDownloadId(exportId)}.json`);
   const journalRecord = JSON.stringify({ version: 1, exportId, destination, staged });
   let published = false;
+  let stagedHandle: FileHandle | undefined;
   try {
     ensureExportJournalHierarchy(appHome);
     const journal = await fsPromises.open(
@@ -466,20 +502,24 @@ export async function exportAssistantDownloadFile(
       await journal.close();
     }
     await syncDirectory(journalDirectory);
-    await copyOpenedAssistantDownload(openedSource.handle, openedSource.size, staged);
+    stagedHandle = await copyOpenedAssistantDownload(openedSource.handle, openedSource.size, staged);
     await (options.writeMacOsQuarantineAttribute ?? writeMacOsQuarantineAttribute)(
       staged,
       macOsQuarantineValue(options.now ?? Date.now(), exportId),
+      stagedHandle,
     );
-    // copyOpenedAssistantDownload syncs the payload before closing it. The
-    // quarantine xattr is applied afterwards, so sync the same staged inode a
-    // second time before publication to make that security metadata durable.
-    await syncFile(staged);
+    // The xattr is applied through the open descriptor. Sync that same inode and
+    // prove its pathname still names it immediately before and after rename.
+    // Together, those checks prevent a substituted unquarantined staging file
+    // from being reported as a successful export.
+    await stagedHandle.sync();
+    await assertOpenFileOwnsPath(stagedHandle, staged, 'staging file');
     await fsPromises.rename(staged, destination);
-    published = true;
+    await assertOpenFileOwnsPath(stagedHandle, destination, 'destination');
     // rename is atomic but is not crash-durable until the containing directory
     // has been synced.
     await syncDirectory(dirname(destination));
+    published = true;
   } catch (error) {
     if (!published) {
       await fsPromises.rm(staged, { force: true }).catch(() => undefined);
@@ -487,6 +527,7 @@ export async function exportAssistantDownloadFile(
     }
     throw error;
   } finally {
+    await stagedHandle?.close().catch(() => undefined);
     await openedSource.handle.close().catch(() => undefined);
   }
   // rename() is the publication commit point. A journal deletion failure after
