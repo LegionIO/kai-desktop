@@ -7757,6 +7757,8 @@ describe('browser manager renderer lifecycle', () => {
   it('keeps a target quarantined when background viewport cleanup reaches its deadline', async () => {
     const contents = { isDestroyed: () => false };
     const tab = {
+      aiActionDepth: 0,
+      queue: new BrowserActionQueue(),
       shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, error: undefined as string | undefined },
       view: { webContents: contents },
       assistantBackgroundViewportContents: new Set([contents]),
@@ -7781,6 +7783,55 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.view.webContents).toBe(contents);
     expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
     expect(tab.shell.error).toBe('The background browser viewport could not be restored.');
+    invokePrivate(manager, 'clearAssistantBackgroundViewportRetry', tab, contents);
+  });
+
+  it('autonomously retries failed background viewport cleanup without reclaiming the target', async () => {
+    vi.useFakeTimers();
+    const debuggerApi = browserDebuggerMock();
+    const contents = { debugger: debuggerApi, isDestroyed: () => false };
+    const tab = {
+      aiActionDepth: 0,
+      queue: new BrowserActionQueue(),
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, error: undefined as string | undefined },
+      view: { webContents: contents },
+      assistantBackgroundViewportContents: new Set([contents]),
+    };
+    const attachActiveView = vi.fn();
+    const destroyView = vi.fn();
+    let attempt = 0;
+    const runRendererOperationWithDeadline = vi.fn(async (...args: unknown[]) => {
+      attempt++;
+      if (attempt === 1) throw new Error('transient cleanup deadline');
+      return (args[4] as () => Promise<unknown>)();
+    });
+    const manager = managerWithoutConstructor({
+      attachActiveView,
+      destroyView,
+      disposed: false,
+      emitTabs: vi.fn(),
+      runRendererOperationWithDeadline,
+      shuttingDown: false,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    try {
+      await invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab, contents);
+      expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
+      expect(tab.shell.error).toBe('The background browser viewport could not be restored.');
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(runRendererOperationWithDeadline).toHaveBeenCalledTimes(2);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view.webContents).toBe(contents);
+      expect(tab.assistantBackgroundViewportContents).toBeUndefined();
+      expect(tab.shell.error).toBeUndefined();
+      expect(attachActiveView).toHaveBeenLastCalledWith('chat-1');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('quarantines a page from native mounting for the full background viewport transition', async () => {
@@ -9818,7 +9869,7 @@ describe('browser manager renderer lifecycle', () => {
 
     await expect(invokePrivate(manager, 'ensureAssistantView', tab, { id: 'run-1' }, lease)).resolves.toBe(view);
 
-    expect(ensureView).toHaveBeenCalledWith(tab, undefined, 30_000, true, false, expect.any(Function));
+    expect(ensureView).toHaveBeenCalledWith(tab, undefined, 30_000, false, expect.any(Function));
   });
 
   it('autofills a saved credential only in its matching top-level frame', async () => {
@@ -16845,7 +16896,6 @@ describe('browser manager renderer lifecycle', () => {
       expect.objectContaining({ shell: expect.objectContaining({ id: created.id }) }),
       undefined,
       0,
-      false,
     );
     expect(created.discarded).toBe(false);
     expect(manager.captureDocumentApproval('chat-1', created.id)).toMatchObject({ tabId: created.id });
@@ -16916,7 +16966,6 @@ describe('browser manager renderer lifecycle', () => {
       expect.objectContaining({ shell: expect.objectContaining({ id: created.id }) }),
       undefined,
       30_000,
-      true,
     );
     expect(created).toMatchObject({ discarded: false, owner: 'assistant' });
     expect(guardedBeforeInitialNavigation).toBe(true);
@@ -17129,6 +17178,7 @@ describe('browser manager renderer lifecycle', () => {
     }));
     const installAssistantNativeUiGuard = vi.fn(async () => undefined);
     const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
       aiAllowPrivateNetwork: true,
       assertScopeAvailable: vi.fn(),
       attachActiveView: vi.fn(),
@@ -17138,8 +17188,11 @@ describe('browser manager renderer lifecycle', () => {
         return view;
       }),
       getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () => visibleHostWindow(),
       guardAssistantTab,
       installAssistantNativeUiGuard,
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
       requireLiveWindow: vi.fn(),
       runRendererOperationWithDeadline: async (
         _tab: unknown,
@@ -17253,13 +17306,12 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
       30_000,
       false,
-      false,
       firstGeneration,
     ) as Promise<unknown>;
     const sharedLoadPromise = tab.viewLoadPromise;
     let secondSettled = false;
     const second = (
-      invokePrivate(manager, 'ensureView', tab, undefined, 30_000, false, false, secondGeneration) as Promise<unknown>
+      invokePrivate(manager, 'ensureView', tab, undefined, 30_000, false, secondGeneration) as Promise<unknown>
     ).finally(() => {
       secondSettled = true;
     });
@@ -17281,6 +17333,124 @@ describe('browser manager renderer lifecycle', () => {
     expect(secondGeneration).toHaveBeenCalledWith(9);
     expect(tab.viewLoadPromise).toBeNull();
     expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
+  });
+
+  it('keeps shared restoration alive for another caller when the publisher aborts', async () => {
+    const proxySetup = deferred<void>();
+    const pageLoad = deferred<void>();
+    const view = {
+      webContents: {
+        getURL: () => '',
+        isDestroyed: () => false,
+        loadURL: vi.fn(() => pageLoad.promise),
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        url: 'https://shared.example/account',
+        discarded: true,
+      },
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+      generation: 4,
+      trustedUserNavigation: false,
+      trustedUserNavigationLease: 1,
+      aiNetworkRestricted: false,
+      aiControlOwnerId: null,
+      assistantOwnerId: null,
+    };
+    const fakeSession = {};
+    electronMocks.fromPartition.mockReturnValue(fakeSession);
+    const destroyView = vi.fn();
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: true,
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      destroyView,
+      emitTabs: vi.fn(),
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validatingProxy: { configureSession: vi.fn(() => proxySetup.promise) },
+    });
+    const controller = new AbortController();
+
+    const publishingCaller = invokePrivate(manager, 'ensureView', tab, controller.signal, 30_000) as Promise<unknown>;
+    const sharedLoadPromise = tab.viewLoadPromise;
+    const userCaller = invokePrivate(manager, 'ensureView', tab) as Promise<unknown>;
+    controller.abort();
+
+    await expect(publishingCaller).rejects.toThrow('Browser page load was cancelled');
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view).toBe(view);
+    expect(tab.viewLoadPromise).toBe(sharedLoadPromise);
+
+    proxySetup.resolve();
+    await vi.waitFor(() => expect(view.webContents.loadURL).toHaveBeenCalledWith('https://shared.example/account'));
+    pageLoad.resolve();
+    await expect(userCaller).resolves.toBe(view);
+    expect(tab.viewLoadPromise).toBeNull();
+  });
+
+  it('abandons a caller-neutral restoration before native creation when its last waiter cancels', async () => {
+    const scriptedCleanup = deferred<void>();
+    const view = { webContents: { isDestroyed: () => false, loadURL: vi.fn(async () => undefined) } };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        url: 'https://cancelled.example',
+        discarded: true,
+      },
+      scopeKey: 'global',
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+      aiControlOwnerId: null,
+      assistantOwnerId: null,
+    };
+    const createView = vi.fn(() => {
+      tab.view = view;
+      return view;
+    });
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => scriptedCleanup.promise),
+      createView,
+      emitTabs: vi.fn(),
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const controller = new AbortController();
+
+    const restoring = invokePrivate(manager, 'ensureView', tab, controller.signal, 30_000) as Promise<unknown>;
+    controller.abort();
+    await expect(restoring).rejects.toThrow('Browser page load was cancelled');
+    expect(tab.viewLoadPromise).toBeNull();
+    expect(createView).not.toHaveBeenCalled();
+
+    scriptedCleanup.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(createView).not.toHaveBeenCalled();
   });
 
   it('shares scripted-origin cleanup and restoration provenance across concurrent callers', async () => {
@@ -17344,7 +17514,6 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
       30_000,
       false,
-      false,
       firstGeneration,
     ) as Promise<unknown>;
     const sharedLoadPromise = tab.viewLoadPromise;
@@ -17354,7 +17523,6 @@ describe('browser manager renderer lifecycle', () => {
       tab,
       undefined,
       30_000,
-      false,
       false,
       secondGeneration,
     ) as Promise<unknown>;
@@ -17394,6 +17562,7 @@ describe('browser manager renderer lifecycle', () => {
       shell: {
         id: 'tab-1',
         conversationId: 'chat-1',
+        owner: 'assistant' as const,
         url: 'https://assistant.example/requested',
       },
       scopeKey: 'global',
@@ -17435,7 +17604,6 @@ describe('browser manager renderer lifecycle', () => {
         tab,
         undefined,
         30_000,
-        true,
         false,
         recordExpectedInitialLoadGeneration,
       ) as Promise<unknown>,
@@ -17467,6 +17635,7 @@ describe('browser manager renderer lifecycle', () => {
       shell: {
         id: 'tab-1',
         conversationId: 'chat-1',
+        owner: 'assistant' as const,
         url: 'https://assistant.example/requested',
       },
       scopeKey: 'global',
@@ -17499,7 +17668,7 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([[tab.shell.id, tab]]),
     });
 
-    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>;
+    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000) as Promise<unknown>;
     await vi.waitFor(() => expect(loadURL).toHaveBeenCalledWith('about:blank'));
     expect(invokePrivate(manager, 'prepareTabForUserPresentation', tab)).toBeNull();
     expect(tab.assistantBackgroundInitialLoadPending).toBe(false);
@@ -17543,6 +17712,7 @@ describe('browser manager renderer lifecycle', () => {
       shell: {
         id: 'tab-1',
         conversationId: 'chat-1',
+        owner: 'assistant' as const,
         url: 'https://assistant.example/requested',
       },
       scopeKey: 'global',
@@ -17572,7 +17742,7 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([[tab.shell.id, tab]]),
     });
 
-    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>;
+    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000) as Promise<unknown>;
     await vi.waitFor(() =>
       expect(sendCommand).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride', {
         width: 1_280,
@@ -18454,7 +18624,7 @@ describe('browser manager renderer lifecycle', () => {
     });
 
     try {
-      const joined = invokePrivate(manager, 'ensureView', tab, undefined, 25, false, true) as Promise<unknown>;
+      const joined = invokePrivate(manager, 'ensureView', tab, undefined, 25, true) as Promise<unknown>;
       const rejected = expect(joined).rejects.toThrow('Browser page load exceeded 0.025 seconds');
       await vi.advanceTimersByTimeAsync(25);
       await rejected;

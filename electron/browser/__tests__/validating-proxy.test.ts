@@ -152,6 +152,34 @@ describe('Browser validating proxy', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
+  it('shares a failing session setup and retries it instead of caching the rejection', async () => {
+    const proxy = new BrowserValidatingProxy();
+    proxies.push(proxy);
+    const start = vi
+      .spyOn(proxy as unknown as { start(): Promise<number> }, 'start')
+      .mockRejectedValueOnce(new Error('transient listener failure'))
+      .mockResolvedValue(43123);
+    const setProxy = vi.fn(async () => undefined);
+    const closeAllConnections = vi.fn(async () => undefined);
+    const session = { setProxy, closeAllConnections } as never;
+
+    const first = proxy.configureSession(session);
+    const concurrent = proxy.configureSession(session);
+    expect(concurrent).toBe(first);
+    await expect(Promise.all([first, concurrent])).rejects.toThrow('transient listener failure');
+    expect(start).toHaveBeenCalledOnce();
+    expect(setProxy).not.toHaveBeenCalled();
+
+    await expect(proxy.configureSession(session)).resolves.toBeUndefined();
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(setProxy).toHaveBeenCalledWith({
+      mode: 'fixed_servers',
+      proxyRules: 'http://127.0.0.1:43123',
+      proxyBypassRules: '<-loopback>',
+    });
+    expect(closeAllConnections).toHaveBeenCalledOnce();
+  });
+
   it('closes a listener whose startup races proxy shutdown', async () => {
     const proxy = new BrowserValidatingProxy();
     proxies.push(proxy);

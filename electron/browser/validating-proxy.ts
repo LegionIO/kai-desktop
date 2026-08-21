@@ -401,6 +401,14 @@ export class BrowserValidatingProxy {
       await session.closeAllConnections();
     });
     this.configuredSessions.set(session, configured);
+    // Cache only a successful configuration (or its in-flight attempt). A
+    // transient listener/session failure must not poison this profile forever;
+    // later callers retry while concurrent callers still share one attempt.
+    void configured.catch(() => {
+      if (this.configuredSessions.get(session) === configured) {
+        this.configuredSessions.delete(session);
+      }
+    });
     return configured;
   }
 
@@ -1365,14 +1373,14 @@ export class BrowserValidatingProxy {
     if (this.closed) return Promise.reject(new Error('The Browser validating proxy is closed.'));
     if (this.port !== null) return Promise.resolve(this.port);
     if (this.startPromise) return this.startPromise;
-    this.startPromise = new Promise<number>((resolve, reject) => {
-      const server = createServer((request, response) => {
-        void this.handleHttp(request, response).catch(() => {
-          if (!response.headersSent) response.writeHead(502);
-          response.end();
-        });
+    const server = createServer((request, response) => {
+      void this.handleHttp(request, response).catch(() => {
+        if (!response.headersSent) response.writeHead(502);
+        response.end();
       });
-      this.server = server;
+    });
+    this.server = server;
+    const pending = new Promise<number>((resolve, reject) => {
       server.on('connection', (socket) => {
         this.clientSockets.add(socket);
         socket.once('close', () => this.clientSockets.delete(socket));
@@ -1398,6 +1406,21 @@ export class BrowserValidatingProxy {
         resolve(address.port);
       });
     });
-    return this.startPromise;
+    let starting!: Promise<number>;
+    starting = pending.catch(async (error: unknown) => {
+      if (this.startPromise === starting) {
+        this.port = null;
+        if (this.server === server) this.server = null;
+        // A malformed address or a shutdown race can reject after listen()
+        // acquired a port. Retract it before allowing the serialized retry.
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        if (this.startPromise === starting) this.startPromise = null;
+      }
+      throw error;
+    });
+    this.startPromise = starting;
+    return starting;
   }
 }

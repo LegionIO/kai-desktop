@@ -341,6 +341,7 @@ export const ASSISTANT_CONTINUATION_HANDOFF_TIMEOUT_MS = 6 * 60_000;
 const ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS = 1_000;
 const SCREENSHOT_TIMEOUT_MS = 60_000;
 const BACKGROUND_VIEWPORT_TIMEOUT_MS = 5_000;
+const BACKGROUND_VIEWPORT_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000, 4_000] as const;
 const PRIVATE_NETWORK_GUARD_TIMEOUT_MS = 15_000;
 const NATIVE_UI_GUARD_TIMEOUT_MS = 15_000;
 const DNS_RESOLUTION_TIMEOUT_MS = 10_000;
@@ -535,6 +536,16 @@ type BrowserBackgroundCaptureLease = {
 
 type BrowserViewLoadState = {
   promise: Promise<WebContentsView> | null;
+  /** Number of callers currently waiting for this shared restoration. Caller
+   * cancellation may reclaim the shared target only after the last waiter has
+   * left; one assistant deadline must never cancel a concurrent user mount. */
+  waiters: number;
+  /** Exact view created by this restoration, if native creation has started. */
+  view?: WebContentsView;
+  /** Reject the published barrier when every reclaiming caller has left. The
+   * underlying cleanup may still be unwinding, but its state-identity checks
+   * prevent it from creating or publishing a late renderer. */
+  reject?: (error: unknown) => void;
   /** Generation produced only by manager-issued loadURL calls for this exact
    * renderer restoration. Every caller joining the shared load uses the same
    * value, regardless of whether Browser chrome or an assistant created it. */
@@ -671,6 +682,13 @@ type InternalTab = {
   /** Coalesces a user-presentation clear with the assistant operation's own
    * finally cleanup so concurrent debugger attach/detach sequences cannot race. */
   assistantBackgroundViewportRestores?: Map<WebContents, Promise<void>>;
+  /** Bounded autonomous retries for a transient failed metrics clear. These
+   * never destroy the target; presentation remains quarantined until Chromium
+   * confirms the viewport is ordinary again. */
+  assistantBackgroundViewportRetries?: Map<
+    WebContents,
+    { timer: ReturnType<typeof setTimeout> | null; attempt: number }
+  >;
   /** Prevents a newly created assistant WebContents from being mounted before
    * its deterministic hidden initial-load viewport has been installed. */
   assistantBackgroundInitialLoadPending?: boolean;
@@ -3274,7 +3292,13 @@ export class BrowserManager {
     timeoutMs = BACKGROUND_VIEWPORT_TIMEOUT_MS,
   ): Promise<void> {
     const active = (tab.assistantBackgroundViewportContents ??= new Set());
-    if (active.has(contents)) return;
+    if (active.has(contents)) {
+      // A new assistant action owns this deterministic viewport again. Cancel
+      // any delayed cleanup from the previous action; the new outer finally
+      // will make a fresh bounded restoration attempt.
+      this.clearAssistantBackgroundViewportRetry(tab, contents);
+      return;
+    }
     // This set is also the native-mount quarantine. Publish membership before
     // the first asynchronous debugger step so a concurrent panel mount cannot
     // expose a view while its deterministic background viewport is only
@@ -3314,15 +3338,83 @@ export class BrowserManager {
     }
   }
 
+  private clearAssistantBackgroundViewportRetry(tab: InternalTab, contents: WebContents): void {
+    const retries = tab.assistantBackgroundViewportRetries;
+    const retry = retries?.get(contents);
+    if (retry?.timer) clearTimeout(retry.timer);
+    retries?.delete(contents);
+    if (retries?.size === 0) tab.assistantBackgroundViewportRetries = undefined;
+  }
+
+  private scheduleAssistantBackgroundViewportRetry(tab: InternalTab, contents: WebContents, immediately = false): void {
+    if (
+      this.disposed ||
+      this.shuttingDown ||
+      this.tabs.get(tab.shell.id) !== tab ||
+      tab.view?.webContents !== contents ||
+      contents.isDestroyed() ||
+      !tab.assistantBackgroundViewportContents?.has(contents)
+    ) {
+      this.clearAssistantBackgroundViewportRetry(tab, contents);
+      return;
+    }
+    const retries = (tab.assistantBackgroundViewportRetries ??= new Map());
+    const retry = retries.get(contents) ?? { timer: null, attempt: 0 };
+    retries.set(contents, retry);
+    if (retry.timer || retry.attempt >= BACKGROUND_VIEWPORT_RETRY_DELAYS_MS.length) return;
+    const delay = immediately ? 0 : BACKGROUND_VIEWPORT_RETRY_DELAYS_MS[retry.attempt];
+    retry.attempt++;
+    retry.timer = setTimeout(() => {
+      retry.timer = null;
+      if (
+        this.tabs.get(tab.shell.id) !== tab ||
+        tab.view?.webContents !== contents ||
+        contents.isDestroyed() ||
+        !tab.assistantBackgroundViewportContents?.has(contents)
+      ) {
+        this.clearAssistantBackgroundViewportRetry(tab, contents);
+        return;
+      }
+      const retryOperation = tab.queue.runIfIdle(async () => {
+        if (tab.assistantBackgroundViewportRetries?.get(contents) !== retry) return;
+        // Never clear the deterministic viewport out from under a successor AI
+        // action or an in-flight setup. Waiting here preserves the exact target
+        // without making retry depend on the sidebar being mounted.
+        if (
+          tab.aiActionDepth > 0 ||
+          tab.assistantBackgroundInitialLoadPending ||
+          tab.assistantBackgroundViewportSetups?.has(contents)
+        ) {
+          retry.attempt = Math.max(0, retry.attempt - 1);
+          this.scheduleAssistantBackgroundViewportRetry(tab, contents);
+          return;
+        }
+        await this.restoreAssistantBackgroundViewport(tab, contents, BACKGROUND_VIEWPORT_TIMEOUT_MS, true);
+      });
+      if (!retryOperation) {
+        retry.attempt = Math.max(0, retry.attempt - 1);
+        this.scheduleAssistantBackgroundViewportRetry(tab, contents);
+      }
+      void retryOperation?.catch(() => {
+        if (tab.assistantBackgroundViewportRetries?.get(contents) === retry) {
+          this.scheduleAssistantBackgroundViewportRetry(tab, contents);
+        }
+      });
+    }, delay);
+    retry.timer.unref?.();
+  }
+
   private async restoreAssistantBackgroundViewport(
     tab: InternalTab,
     only?: WebContents,
     timeoutMs = BACKGROUND_VIEWPORT_TIMEOUT_MS,
+    retryAttempt = false,
   ): Promise<void> {
     const active = tab.assistantBackgroundViewportContents;
     if (!active) return;
     for (const contents of [...active]) {
       if (only && contents !== only) continue;
+      if (!retryAttempt) this.clearAssistantBackgroundViewportRetry(tab, contents);
       const existingRestore = tab.assistantBackgroundViewportRestores?.get(contents);
       if (existingRestore) {
         await existingRestore;
@@ -3356,6 +3448,7 @@ export class BrowserManager {
             false,
           );
           restored = true;
+          this.clearAssistantBackgroundViewportRetry(tab, contents);
           if (tab.shell.error === 'The background browser viewport could not be restored.') {
             tab.shell.error = undefined;
             this.emitTabs(tab.shell.conversationId);
@@ -3373,6 +3466,13 @@ export class BrowserManager {
           // non-destructive: presentation state may never reclaim an AI target.
           if (targetWasCurrent && (!tab.view || tab.view.webContents !== contents || contents.isDestroyed())) {
             restored = true;
+            this.clearAssistantBackgroundViewportRetry(tab, contents);
+          } else if (
+            this.tabs.get(tab.shell.id) === tab &&
+            tab.view?.webContents === contents &&
+            !contents.isDestroyed()
+          ) {
+            this.scheduleAssistantBackgroundViewportRetry(tab, contents);
           }
         } finally {
           if (restored) active.delete(contents);
@@ -3423,6 +3523,19 @@ export class BrowserManager {
       tab.assistantBackgroundInitialLoadPending = false;
     }
     const backgroundViewportActive = !!contents && tab.assistantBackgroundViewportContents?.has(contents) === true;
+    if (
+      contents &&
+      backgroundViewportActive &&
+      tab.aiActionDepth === 0 &&
+      tab.shell.error === 'The background browser viewport could not be restored.'
+    ) {
+      // A later explicit presentation gets a fresh immediate retry budget even
+      // if the autonomous attempts were exhausted. This is non-destructive and
+      // uses the queue only when idle, so it never reclaims or interrupts the AI
+      // target and does not make Browser control depend on a mounted panel.
+      this.clearAssistantBackgroundViewportRetry(tab, contents);
+      this.scheduleAssistantBackgroundViewportRetry(tab, contents, true);
+    }
     if (
       contents &&
       !contents.isDestroyed() &&
@@ -3788,15 +3901,13 @@ export class BrowserManager {
   ): Promise<WebContentsView> {
     const hadReadyView = !!tab.view && !tab.view.webContents.isDestroyed() && !tab.viewLoadPromise;
     let expectedRestoreGeneration: number | undefined;
-    // A discarded assistant target must be recreated under the deterministic
-    // hidden viewport before its requested page begins loading. Presentation
-    // state may never determine responsive layout, document visibility, or
-    // script behavior for a background operation.
+    // The shared restoration itself derives detached/presented behavior from
+    // current tab ownership and presentation state. This caller contributes
+    // only its own cancellation policy and provenance callback.
     const view = await this.ensureView(
       tab,
       run.abortSignal,
       timeoutMs,
-      !hadReadyView,
       preserveExistingLoadingViewOnTimeout,
       (generation) => {
         expectedRestoreGeneration = generation;
@@ -6046,7 +6157,6 @@ export class BrowserManager {
             tab,
             assistantRun?.abortSignal,
             owner === 'assistant' ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
-            owner === 'assistant' && url !== 'about:blank',
           );
           this.emitTabs(request.conversationId);
           published = true;
@@ -7845,7 +7955,6 @@ export class BrowserManager {
     tab: InternalTab,
     abortSignal?: AbortSignal,
     timeoutMs = abortSignal ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
-    backgroundInitialLoad = false,
     preserveExistingLoadingViewOnTimeout = false,
     recordExpectedInitialLoadGeneration?: (generation: number) => void,
   ): Promise<WebContentsView> {
@@ -7856,13 +7965,20 @@ export class BrowserManager {
       if (remaining <= 0) throw new BrowserRendererDeadlineError(operation, timeoutMs);
       return remaining;
     };
-    const awaitSharedLoadWithoutView = async (
+    const joinSharedLoad = async (
       sharedLoadPromise: Promise<WebContentsView>,
+      sharedLoadState: BrowserViewLoadState | undefined,
     ): Promise<WebContentsView> => {
-      if (deadlineAt === null && !abortSignal) return sharedLoadPromise;
       let cancellation: 'timeout' | 'abort' | null = null;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let abortListener: (() => void) | undefined;
+      let waiterReleased = false;
+      if (sharedLoadState) sharedLoadState.waiters++;
+      const releaseWaiter = (): void => {
+        if (!sharedLoadState || waiterReleased) return;
+        waiterReleased = true;
+        sharedLoadState.waiters = Math.max(0, sharedLoadState.waiters - 1);
+      };
       const cancelled = new Promise<never>((_resolve, reject) => {
         const remaining = deadlineAt === null ? 0 : remainingRendererTimeout('Browser page load');
         if (remaining > 0) {
@@ -7882,53 +7998,39 @@ export class BrowserManager {
         }
       });
       try {
-        return await Promise.race([sharedLoadPromise, cancelled]);
+        const restoredView = await Promise.race([sharedLoadPromise, cancelled]);
+        if (sharedLoadState?.expectedInitialLoadGeneration !== undefined) {
+          recordExpectedInitialLoadGeneration?.(sharedLoadState.expectedInitialLoadGeneration);
+        }
+        return restoredView;
       } catch (error) {
-        // A shared restoration can still be in scripted-origin cleanup before
-        // it owns a WebContents. Once it does own one, preserve the same
-        // cancellation semantics as runRendererOperationWithDeadline without
-        // ever reclaiming a replacement created by unrelated user work.
-        const loadingView = tab.view;
-        if (
-          cancellation &&
-          !preserveExistingLoadingViewOnTimeout &&
-          tab.viewLoadPromise === sharedLoadPromise &&
-          loadingView &&
-          !loadingView.webContents.isDestroyed()
-        ) {
-          this.destroyView(tab);
-          tab.shell.discarded = true;
-          tab.shell.error =
-            cancellation === 'timeout' ? 'Browser page load timed out.' : 'Browser page load was cancelled.';
-          this.emitTabs(tab.shell.conversationId);
+        if (cancellation && !preserveExistingLoadingViewOnTimeout) {
+          releaseWaiter();
+          const mayReclaimSharedRestoration =
+            !sharedLoadState ||
+            (sharedLoadState.waiters === 0 &&
+              sharedLoadState.promise === sharedLoadPromise &&
+              tab.viewLoadState === sharedLoadState);
+          if (mayReclaimSharedRestoration && tab.viewLoadPromise === sharedLoadPromise) {
+            const loadingView = sharedLoadState?.view ?? tab.view;
+            if (loadingView && tab.view === loadingView && !loadingView.webContents.isDestroyed()) {
+              this.destroyView(tab);
+            }
+            tab.shell.discarded = true;
+            tab.shell.error =
+              cancellation === 'timeout' ? 'Browser page load timed out.' : 'Browser page load was cancelled.';
+            this.emitTabs(tab.shell.conversationId);
+            if (sharedLoadState) {
+              sharedLoadState.reject?.(error);
+            }
+          }
         }
         throw error;
       } finally {
+        releaseWaiter();
         if (timer) clearTimeout(timer);
         if (abortSignal && abortListener) abortSignal.removeEventListener('abort', abortListener);
       }
-    };
-    const joinSharedLoad = async (
-      sharedLoadPromise: Promise<WebContentsView>,
-      sharedLoadState: BrowserViewLoadState | undefined,
-    ): Promise<WebContentsView> => {
-      const loadingView = tab.view && !tab.view.webContents.isDestroyed() ? tab.view : null;
-      const restoredView = loadingView
-        ? await this.runRendererOperationWithDeadline(
-            tab,
-            loadingView.webContents,
-            'Browser page load',
-            remainingRendererTimeout('Browser page load'),
-            () => sharedLoadPromise,
-            abortSignal,
-            undefined,
-            !preserveExistingLoadingViewOnTimeout,
-          )
-        : await awaitSharedLoadWithoutView(sharedLoadPromise);
-      if (sharedLoadState?.expectedInitialLoadGeneration !== undefined) {
-        recordExpectedInitialLoadGeneration?.(sharedLoadState.expectedInitialLoadGeneration);
-      }
-      return restoredView;
     };
     this.assertHostRendererOperationCurrent();
     if (this.disposed) throw new Error('The in-app browser has been disposed.');
@@ -7966,7 +8068,7 @@ export class BrowserManager {
     // restoration lease. A page/user navigation interleaved with those calls
     // produces an extra generation and is rejected after ensureView returns.
     let expectedInitialLoadGeneration = tab.generation;
-    const loadState: BrowserViewLoadState = { promise: null };
+    const loadState: BrowserViewLoadState = { promise: null, waiters: 0 };
     // Publish the per-tab barrier before scripted-origin cleanup, proxy setup,
     // or native view creation can yield. Every concurrent caller therefore
     // joins this exact restoration instead of observing a blank renderer as
@@ -7976,21 +8078,30 @@ export class BrowserManager {
       if (pendingScriptCleanup) {
         await pendingScriptCleanup;
       }
-      throwIfBrowserAborted(abortSignal);
       this.assertScopeAvailable(tab.scopeKey);
       if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
       if (tab.viewLoadState !== loadState) {
         throw new Error('The browser page changed while its renderer was being restored.');
       }
-      if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
       // A hidden renderer bootstrap navigates through about:blank and therefore
       // updates shell metadata before the requested navigation begins. Preserve
       // the caller's target independently of those intermediate events.
       const requestedInitialUrl = tab.shell.url || 'about:blank';
+      // Initial-load presentation is shared tab state, not policy inherited
+      // from whichever caller happened to publish the restoration barrier.
+      // Assistant-owned/control renderers use a deterministic detached viewport
+      // only when the page is not actually presented to the user.
+      const backgroundInitialLoad =
+        requestedInitialUrl !== 'about:blank' &&
+        (tab.shell.owner === 'assistant' ||
+          typeof tab.assistantOwnerId === 'string' ||
+          typeof tab.aiControlOwnerId === 'string') &&
+        !this.isTabPresentedToUser(tab);
       if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = true;
       let view: WebContentsView;
       try {
         view = this.createView(tab);
+        loadState.view = view;
       } catch (error) {
         if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = false;
         throw error;
@@ -8007,7 +8118,6 @@ export class BrowserManager {
             }
             throw new Error('The Browser connection-validation proxy could not start.', { cause: error });
           }
-          throwIfBrowserAborted(abortSignal);
           this.assertScopeAvailable(tab.scopeKey);
           if (
             this.tabs.get(tab.shell.id) !== tab ||
@@ -8017,7 +8127,6 @@ export class BrowserManager {
           ) {
             throw new Error('The browser page was closed while it was loading.');
           }
-          if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
         }
         // createView installs the native surface synchronously. Attach an
         // active restored tab before waiting for a slow or auth-blocked load so
@@ -8041,12 +8150,11 @@ export class BrowserManager {
               tab,
               view.webContents,
               'Browser background renderer bootstrap',
-              remainingRendererTimeout('Browser background renderer bootstrap'),
+              BACKGROUND_VIEWPORT_TIMEOUT_MS,
               () => {
                 expectedInitialLoadGeneration += 1;
                 return view.webContents.loadURL('about:blank');
               },
-              abortSignal,
             );
           }
           const dialogGuard = activeDialogGuard;
@@ -8062,9 +8170,9 @@ export class BrowserManager {
               await this.enableAssistantBackgroundViewport(
                 tab,
                 view.webContents,
-                abortSignal,
                 undefined,
-                remainingRendererTimeout('Browser background viewport setup'),
+                undefined,
+                BACKGROUND_VIEWPORT_TIMEOUT_MS,
               );
             }
           }
@@ -8072,12 +8180,12 @@ export class BrowserManager {
             tab,
             view.webContents,
             'Browser page load',
-            remainingRendererTimeout('Browser page load'),
+            0,
             async () => {
               const initialUrl = typeof view.webContents.getURL === 'function' ? view.webContents.getURL() : undefined;
               const guardAfterInitialLoad = guardInitialLoad && initialUrl === '';
               if (guardInitialLoad && !guardAfterInitialLoad) {
-                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents, abortSignal);
+                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents);
                 initialGuardReady = true;
               }
               // A new restricted WebContents already owns an initial blank
@@ -8094,11 +8202,11 @@ export class BrowserManager {
                 await view.webContents.loadURL(requestedInitialUrl);
               }
               if (guardAfterInitialLoad) {
-                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents, abortSignal);
+                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents);
                 initialGuardReady = true;
               }
             },
-            abortSignal,
+            undefined,
           );
         } catch (error) {
           // A preload-restricted renderer is safe but unusable if main could not
@@ -8131,7 +8239,6 @@ export class BrowserManager {
       }
       this.assertHostRendererOperationCurrent();
       loadState.expectedInitialLoadGeneration = expectedInitialLoadGeneration;
-      recordExpectedInitialLoadGeneration?.(expectedInitialLoadGeneration);
       return view;
     };
     let resolveLoad!: (view: WebContentsView) => void;
@@ -8141,18 +8248,28 @@ export class BrowserManager {
       rejectLoad = reject;
     });
     loadState.promise = loadPromise;
+    loadState.reject = rejectLoad;
     tab.viewLoadPromise = loadPromise;
     tab.viewLoadState = loadState;
+    const joinedLoad = joinSharedLoad(loadPromise, loadState);
     // Start only after the shared state is visible. restoreView still runs
     // synchronously through native creation until its first real await, which
     // keeps active-tab attachment responsive while closing the publication gap.
-    void restoreView().then(resolveLoad, rejectLoad);
-    try {
-      return await loadPromise;
-    } finally {
+    const clearSharedLoad = (): void => {
       if (tab.viewLoadPromise === loadPromise) tab.viewLoadPromise = null;
       if (tab.viewLoadState === loadState) tab.viewLoadState = undefined;
-    }
+    };
+    void loadPromise.then(clearSharedLoad, clearSharedLoad);
+    // The shared restoration must not inherit the publishing renderer IPC's
+    // AsyncLocalStorage lease. Each caller—including the publisher—waits through
+    // its own wrapper above, while the core is governed only by tab/profile
+    // identity and fixed internal safety deadlines.
+    const startSharedRestore = (): void => {
+      void restoreView().then(resolveLoad, rejectLoad);
+    };
+    if (this.hostRendererOperationContext) this.hostRendererOperationContext.exit(startSharedRestore);
+    else startSharedRestore();
+    return joinedLoad;
   }
 
   private createView(tab: InternalTab, inheritedOptions?: Electron.BrowserWindowConstructorOptions): WebContentsView {
@@ -8524,6 +8641,7 @@ export class BrowserManager {
     tab.assistantGesture = null;
     if (view) this.restoreAssistantBackgroundRendering(tab, view.webContents);
     if (view) {
+      this.clearAssistantBackgroundViewportRetry(tab, view.webContents);
       tab.assistantBackgroundViewportContents?.delete(view.webContents);
       if (tab.assistantBackgroundViewportContents?.size === 0) {
         tab.assistantBackgroundViewportContents = undefined;
