@@ -7611,8 +7611,8 @@ export class BrowserManager {
     const targetSession = session.fromPartition(partition);
     await assertAiNavigationAllowed(url, allowPrivateNetwork, async (hostname) => {
       // Do not authorize from a stale host-cache entry. HTTPS authentication
-      // below protects the subsequent connection from a DNS rebind, while this
-      // fresh lookup still rejects destinations that are already private.
+      // keeps a split-DNS hostname meaningful even when this fresh lookup
+      // intentionally returns an enterprise-private destination.
       const resolved = await resolveHostWithDeadline(
         targetSession.resolveHost(hostname, { cacheUsage: 'disallowed' }),
         abortSignal,
@@ -9018,9 +9018,9 @@ export class BrowserManager {
       this.webContentsToTab.delete(contents.id);
       this.finishAssistantPopupBootstrap(tab, contents);
       // Electron can destroy a popup or crashed target without routing through
-      // destroyView(). A native capturePage() promise may never settle after
-      // that loss, so release the global preview slot from the destruction
-      // event instead of waiting forever on the orphaned promise.
+      // destroyView(). Native capture promises may never settle after that
+      // loss, so release both capture paths from the destruction event instead
+      // of waiting forever on an orphaned promise.
       this.rejectMenuPreviewForContents(
         contents.id,
         new Error('Browser menu preview was cancelled because the page closed.'),
@@ -9031,11 +9031,14 @@ export class BrowserManager {
       // sanitization must not erase diagnostics collected by the replacement.
       this.resetBrowserNetworkDiagnostics(tab);
       const destroyedView = tab.view;
+      if (!destroyedView) return;
+      this.releaseBackgroundCaptureHostedView(destroyedView);
+      this.detachedHostViews?.delete(destroyedView);
       this.dropPendingForTab(tab.shell.id);
       if (this.attachedView === tab.view) this.detachAttachedView();
       const win = this.getWindow();
       try {
-        if (destroyedView && win && !win.isDestroyed()) win.contentView.removeChildView(destroyedView);
+        if (win && !win.isDestroyed()) win.contentView.removeChildView(destroyedView);
       } catch {
         // Best-effort native child cleanup after an unexpected renderer loss.
       }
@@ -9763,16 +9766,16 @@ export class BrowserManager {
     if (this.wiredSessions.has(ses)) return;
     this.wiredSessions.add(ses);
     registerBrowserFramePreload(ses, this.pagePreloadPath);
-    const proxyReady =
+    const configureProxy = (): Promise<void> =>
       this.validatingProxy &&
       typeof (ses as Session & { setProxy?: unknown }).setProxy === 'function' &&
       typeof (ses as Session & { closeAllConnections?: unknown }).closeAllConnections === 'function'
         ? this.validatingProxy.configureSession(ses)
         : Promise.resolve();
-    // onBeforeRequest awaits this same promise before admitting any traffic.
-    // Observe an early rejection now so a startup failure cannot become an
-    // unhandled promise while no Browser tab is loading yet.
-    void proxyReady.catch(() => undefined);
+    // Start eagerly so the first navigation normally finds a ready session.
+    // BrowserValidatingProxy evicts a rejected attempt, so request admission
+    // below must call this helper again rather than retaining that rejection.
+    void configureProxy().catch(() => undefined);
     const handleServiceWorkerRegistration = (
       _event: Electron.Event,
       details: Electron.RegistrationCompletedDetails,
@@ -9833,7 +9836,7 @@ export class BrowserManager {
           publishResponse();
           return;
         }
-        void proxyReady.then(publishResponse, (error: unknown) => {
+        void configureProxy().then(publishResponse, (error: unknown) => {
           if (tab) {
             this.finishBrowserNetworkRequest(tab, {
               id: details.id,

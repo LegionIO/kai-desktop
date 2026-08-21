@@ -75,7 +75,8 @@ function normalizedHostname(value: string): string {
   return value
     .trim()
     .toLowerCase()
-    .replace(/^\[|\]$/g, '');
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
 }
 
 function requestKey(scopeKey: string, requestId: number): string {
@@ -646,15 +647,20 @@ export class BrowserValidatingProxy {
         );
     if (endpoints.length === 0) throw new Error('DNS resolution returned no destination.');
     const restricted = restrictPrivateNetwork || (this.restrictedHostCounts.get(normalizedHostname(hostname)) ?? 0) > 0;
-    if (restricted && endpoints.some((endpoint) => isPrivateResolvedAddress(endpoint.address))) {
+    // Restriction applies to the target the page named, not to the address an
+    // authenticated non-local hostname receives from enterprise split DNS.
+    // Hostname HTTP is rejected by the request preflight; HTTPS still validates
+    // the original hostname while this proxy pins the actual connection IP.
+    const directlyPrivateTarget =
+      normalized === 'localhost' ||
+      normalized.endsWith('.local') ||
+      (literalFamily !== 0 && isPrivateResolvedAddress(normalized));
+    if (restricted && directlyPrivateTarget) {
       throw new Error('Private-network destination blocked by the Browser validating proxy.');
     }
-    const permitted = restricted
-      ? endpoints.filter((endpoint) => !isPrivateResolvedAddress(endpoint.address))
-      : endpoints;
     const unique = [
       ...new Map(
-        permitted
+        endpoints
           .filter(
             (endpoint) =>
               (endpoint.family === 4 || endpoint.family === 6) && isIP(endpoint.address) === endpoint.family,

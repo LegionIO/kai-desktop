@@ -287,6 +287,30 @@ describe('Browser validating proxy', () => {
     });
   });
 
+  it('permits an authenticated split-DNS HTTPS hostname to use its pinned private endpoint', async () => {
+    const target = createNetServer((socket) => sockets.push(socket));
+    netServers.push(target);
+    const targetPort = await listen(target);
+    const resolveHost = vi.fn(async (hostname: string) => {
+      expect(hostname).toBe('secure.uhc.com');
+      return [{ address: '127.0.0.1', family: 4 as const }];
+    });
+    const proxy = new BrowserValidatingProxy(undefined, { resolveHost });
+    proxies.push(proxy);
+    const proxyPort = await configureProxy(proxy);
+    const client = await connectSocket(proxyPort);
+    sockets.push(client);
+    proxy.restrictRequest('global', 43, 'https://secure.uhc.com/account');
+
+    client.write(
+      `CONNECT secure.uhc.com:${targetPort} HTTP/1.1\r\nHost: secure.uhc.com:${targetPort}\r\nProxy-Authorization: ${authorization(proxy, true)}\r\n\r\n`,
+    );
+
+    await expect(readHeaderBlock(client)).resolves.toMatch(/^HTTP\/1\.1 200 Connection Established/);
+    expect(resolveHost).toHaveBeenCalledOnce();
+    proxy.releaseRequest('global', 43);
+  });
+
   it('keeps every same-host connection restricted until all assistant requests release', async () => {
     const target = createServer((_request, response) => response.end('trusted-user-page'));
     servers.push(target);

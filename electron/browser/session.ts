@@ -340,7 +340,10 @@ export function isPrivateNetworkUrl(rawUrl: string): boolean {
   } catch {
     return false;
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const host = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
   if (host === 'localhost' || host.endsWith('.local')) return true;
   if (isIP(host) === 4) return isPrivateIpv4(host);
   if (isIP(host) === 6) return isPrivateIpv6(host);
@@ -352,8 +355,9 @@ type BrowserHostResolver = (hostname: string) => Promise<BrowserHostResolution>;
 
 /**
  * Validate an AI-initiated top-level navigation before Chromium receives it.
- * Literal private addresses are rejected first, then hostnames are resolved so
- * a public-looking name cannot trivially bypass the private-network setting.
+ * Direct private/localhost targets are rejected first. Non-local hostnames may
+ * legitimately use split DNS, so their fresh resolution verifies availability
+ * but does not reclassify the authenticated HTTPS origin as a private target.
  */
 export async function assertAiNavigationAllowed(
   rawUrl: string,
@@ -380,9 +384,9 @@ export async function assertAiNavigationAllowed(
   if (isIP(hostname) !== 0) return;
   // This preflight provides an early, useful failure before Chromium starts a
   // navigation. BrowserValidatingProxy independently resolves and connects to
-  // the exact validated IP at dispatch time, closing the DNS-rebinding window.
-  // Hostname HTTP remains disallowed because it has no authenticated origin;
-  // literal public IPs cannot rebind.
+  // an exact IP at dispatch time. Hostname HTTP remains disallowed because it
+  // has no authenticated origin; an HTTPS certificate keeps a public hostname
+  // meaningful when enterprise split DNS intentionally resolves it privately.
   if (parsed.protocol !== 'https:') {
     throw new Error(
       'AI navigation to hostname-based HTTP pages is blocked while private-network access is disabled. Use HTTPS or enable private-network access in Browser Settings.',
@@ -392,12 +396,6 @@ export async function assertAiNavigationAllowed(
   const resolution = await resolveHost(hostname);
   if (resolution.errorCode !== 0 || resolution.addresses.length === 0) {
     throw new Error('AI navigation was blocked because DNS resolution did not return a verified destination.');
-  }
-  const addresses = resolution.addresses;
-  if (addresses.some(isPrivateResolvedAddress)) {
-    throw new Error(
-      'AI navigation resolved to a private-network address and was blocked. Enable “Allow AI navigation to private-network and localhost addresses” in Browser Settings for trusted internal sites.',
-    );
   }
 }
 

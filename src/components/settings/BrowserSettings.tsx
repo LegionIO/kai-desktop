@@ -146,7 +146,7 @@ export const BrowserSettings: FC<SettingsProps & { conversationId: string | null
         />
         <Toggle
           id="browser.aiAllowPrivateNetwork"
-          label="Allow AI navigation to private-network and localhost addresses"
+          label="Allow AI navigation to direct private-network IPs and localhost"
           checked={browser.aiAllowPrivateNetwork ?? false}
           onChange={(value) => void updateConfig('browser.aiAllowPrivateNetwork', value)}
         />

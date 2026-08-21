@@ -155,6 +155,8 @@ describe('browser session helpers', () => {
 
   it('identifies private network destinations', () => {
     expect(isPrivateNetworkUrl('http://127.0.0.1')).toBe(true);
+    expect(isPrivateNetworkUrl('http://localhost.:3000')).toBe(true);
+    expect(isPrivateNetworkUrl('http://service.local.')).toBe(true);
     expect(isPrivateNetworkUrl('https://192.168.4.2')).toBe(true);
     expect(isPrivateNetworkUrl('https://172.20.1.1')).toBe(true);
     expect(isPrivateNetworkUrl('https://100.64.0.1')).toBe(true);
@@ -176,23 +178,23 @@ describe('browser session helpers', () => {
     expect(isPrivateNetworkUrl('https://example.com')).toBe(false);
   });
 
-  it('blocks AI navigation to literal and DNS-resolved private addresses', async () => {
+  it('blocks direct private targets while allowing authenticated split-DNS hostnames', async () => {
     const publicResolver = async () => ({ addresses: ['93.184.216.34'], errorCode: 0 });
     await expect(assertAiNavigationAllowed('http://localhost:3000', false, publicResolver)).rejects.toThrow(
       /private-network/,
     );
     await expect(
-      assertAiNavigationAllowed('https://internal.example', false, async () => ({
+      assertAiNavigationAllowed('https://secure.uhc.com', false, async () => ({
         addresses: ['10.0.0.8'],
         errorCode: 0,
       })),
-    ).rejects.toThrow(/resolved to a private-network/);
+    ).resolves.toBeUndefined();
     await expect(
       assertAiNavigationAllowed('https://link-local.example', false, async () => ({
         addresses: ['fe80::1%en0'],
         errorCode: 0,
       })),
-    ).rejects.toThrow(/resolved to a private-network/);
+    ).resolves.toBeUndefined();
     await expect(assertAiNavigationAllowed('https://example.com', false, publicResolver)).resolves.toBeUndefined();
     await expect(assertAiNavigationAllowed('file:///tmp/secret', true, publicResolver)).rejects.toThrow(/HTTP\(S\)/);
   });

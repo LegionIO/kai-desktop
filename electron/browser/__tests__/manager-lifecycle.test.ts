@@ -3718,6 +3718,51 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.networkLastBlockingActivityAt).toBeTypeOf('number');
   });
 
+  it('releases a hidden capture host when its current renderer is unexpectedly destroyed', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      id: 43,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    const view = {
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const captureHost = {
+      contentView: { removeChildView: vi.fn() },
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+      view,
+      isPopup: false,
+    };
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      backgroundCaptureHost: captureHost,
+      captureHostedView: view,
+      captureHostedViewLease: { view, host: captureHost, returnedToMain: false },
+      detachedHostViews: new Set([view]),
+      emitTabs,
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[43, 'tab-1']]),
+    });
+
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+    listeners.get('destroyed')?.();
+
+    expect(captureHost.contentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+    expect(Reflect.get(manager, 'captureHostedViewLease')).toBeNull();
+    expect(Reflect.get(manager, 'detachedHostViews')).not.toContain(view);
+    expect(tab.view).toBeNull();
+    expect(tab.shell.discarded).toBe(true);
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
+  });
+
   it('uses the authenticated replacement path for accepted password-save prompts', async () => {
     const pending = {
       tabId: 'tab-1',
@@ -12383,7 +12428,7 @@ describe('browser manager renderer lifecycle', () => {
     rmSync(appHome, { recursive: true, force: true });
   });
 
-  it('does not attribute a worker request to an unrelated unrestricted tab', async () => {
+  it('validates split-DNS worker traffic independently of an unrelated unrestricted tab', async () => {
     let requestPolicy:
       | ((
           details: {
@@ -12443,7 +12488,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(callback).not.toHaveBeenCalled();
     expect(unrelatedTab.unrestrictedNetworkValidations.size).toBe(0);
     privateResolution.resolve({ endpoints: [{ address: '127.0.0.1' }] });
-    await vi.waitFor(() => expect(callback).toHaveBeenCalledWith({ cancel: true }));
+    await vi.waitFor(() => expect(callback).toHaveBeenCalledWith({}));
     expect(unrelatedTab.unrestrictedNetworkUnsafe).toBe(false);
   });
 
@@ -13201,6 +13246,60 @@ describe('browser manager renderer lifecycle', () => {
 
     completed?.({ id: 101, webContentsId: 42, resourceType: 'mainFrame' });
     expect(validatingProxy.releaseRequest).toHaveBeenCalledWith('global', 101);
+  });
+
+  it('admits later requests after a transient validating-proxy setup failure is retried', async () => {
+    let requestPolicy:
+      | ((
+          details: { id: number; resourceType: string; url: string },
+          callback: (result: { cancel?: boolean }) => void,
+        ) => void)
+      | undefined;
+    const initialSetup = deferred<void>();
+    const configureSession = vi
+      .fn()
+      .mockImplementationOnce(() => initialSetup.promise)
+      .mockImplementationOnce(() => initialSetup.promise)
+      .mockResolvedValue(undefined);
+    const validatingProxy = {
+      configureSession,
+      releaseRequest: vi.fn(),
+    };
+    const manager = managerWithoutConstructor({
+      scopeHasActiveAiNetworkRestriction: vi.fn(() => false),
+      storeForScope: vi.fn(() => ({ isBackgroundNetworkRestricted: () => false })),
+      trackUnrestrictedScopeRequest: vi.fn(() => true),
+      validatingProxy,
+    });
+    const fakeSession = {
+      closeAllConnections: vi.fn(async () => undefined),
+      getPreloadScripts: () => [],
+      on: vi.fn(),
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      setProxy: vi.fn(async () => undefined),
+      webRequest: {
+        onBeforeRequest: (_filter: unknown, listener: typeof requestPolicy) => {
+          requestPolicy = listener;
+        },
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    expect(configureSession).toHaveBeenCalledOnce();
+
+    const firstCallback = vi.fn();
+    requestPolicy?.({ id: 201, resourceType: 'xhr', url: 'https://example.com/first' }, firstCallback);
+    expect(configureSession).toHaveBeenCalledTimes(2);
+    initialSetup.reject(new Error('transient proxy setup failure'));
+    await vi.waitFor(() => expect(firstCallback).toHaveBeenCalledWith({ cancel: true }));
+
+    const retryCallback = vi.fn();
+    requestPolicy?.({ id: 202, resourceType: 'xhr', url: 'https://example.com/retry' }, retryCallback);
+    await vi.waitFor(() => expect(retryCallback).toHaveBeenCalledWith({}));
+    expect(configureSession).toHaveBeenCalledTimes(3);
   });
 
   it('returns bounded load timing and sanitized recent requests to assistant diagnostics', async () => {
