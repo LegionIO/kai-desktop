@@ -564,6 +564,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
   // both the charge and the heap) — a rare recovery draft is worth losing before the renderer OOMs.
   const recoveryBytesRef = useRef<Map<string, number>>(new Map());
   const RECOVERY_BYTES_CAP = 48 * 1024 * 1024; // 48 MiB total parked recovery payloads (≈4 max-size task submissions)
+  // R265: taskIds with a refine SYNCHRONOUSLY RESERVED (before the first await) but not yet recorded in
+  // submittedPayloadRef. The R264 in-flight guard checks submittedPayloadRef, which is only populated AFTER
+  // `await app.tasks.get()`; a second refine arriving during that await window would pass the guard and race.
+  // Reserving here, synchronously, closes that pre-registration window — released on every refine exit path.
+  const refineReservationsRef = useRef<Set<string>>(new Set());
   // R226: the client MINTS the stream instance id and records it SYNCHRONOUSLY at submission (rememberSubmission),
   // then passes it to streamPlan so main stamps every event with it. This eliminates the pending-admission window
   // that R223-R225 kept creating races around: there is no interval where we own an in-flight payload but don't
@@ -902,14 +907,16 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       userMessage: string,
       attachments?: Array<{ image: string; mimeType?: string }>,
     ): Promise<{ ok: boolean; droppedImages?: number }> => {
-      // R264: refuse a concurrent re-submit for a task whose PRIOR plan stream is still in flight (its
-      // submittedPayloadRef entry hasn't been resolved by a terminal). The composer busy-gate only tracks the
-      // DISPLAYED task, so A1→(switch away)→A2 on the same task A slips through; overwriting A1's ownership loses
-      // it (R263) and a second failure would evict A1's parked recovery before restore (R264). Blocking the
-      // concurrent same-task submit at the source is the terminal fix — the user retries once A1 settles.
-      if (submittedPayloadRef.current.has(taskId)) {
+      // R264/R265: refuse a concurrent re-submit for a task whose PRIOR plan stream is still in flight. The
+      // composer busy-gate only tracks the DISPLAYED task, so A1→(switch away)→A2 on task A slips through;
+      // overwriting A1's ownership loses it (R263). The guard must cover BOTH an already-registered submission
+      // (submittedPayloadRef) AND one merely RESERVED synchronously before its `await app.tasks.get()` recorded
+      // it (refineReservationsRef) — R265: without the reservation, a second A2 arriving during A1's get() await
+      // would pass a submittedPayloadRef-only check and race. Reserve synchronously here; release in `finally`.
+      if (submittedPayloadRef.current.has(taskId) || refineReservationsRef.current.has(taskId)) {
         return { ok: false };
       }
+      refineReservationsRef.current.add(taskId);
       try {
         // Fetch fresh task from IPC to avoid stale closure over state.tasks
         const task = await app.tasks.get(taskId);
@@ -946,6 +953,11 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
         clearFailedSubmission(taskId);
         dispatch({ type: 'STREAM_DONE' });
         return { ok: false };
+      } finally {
+        // R265: release the synchronous reservation. Once streamPlan admission succeeded, submittedPayloadRef
+        // holds the in-flight entry (the guard uses it), so dropping the reservation here doesn't reopen the race
+        // for a still-live stream; on any failure path the reservation must be freed so the user can retry.
+        refineReservationsRef.current.delete(taskId);
       }
     },
     [flushStreamBuffer, rememberSubmission, dropSubmission, clearFailedSubmission],

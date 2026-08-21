@@ -773,8 +773,20 @@ function persistAccumulatedReturningHead(
         try {
           const conv = readConversation(appHome, conversationId);
           const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
-          const nodeIdx = treeArr ? treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant') : -1;
-          if (conv && treeArr && nodeIdx >= 0) {
+          // R265: readConversation returns null on a read/PARSE FAILURE, not only for a genuinely-absent record.
+          // A null read on a NON-FINAL attempt is treated as TRANSIENT (retry) so we don't fall through to append
+          // and collision-rename an existing effectiveId to a bogus auto-msg-* duplicate. On the LAST attempt a
+          // still-null read is treated as "no record" and falls through to the normal append (the legitimate
+          // brand-new-conversation / renderer-not-yet-persisted case, where append with effectiveId can't collide).
+          if (!conv || !treeArr) {
+            if (attempt < 2) {
+              lastReplaceThrew = true;
+              continue;
+            }
+            break; // last attempt, still no readable record → append (node is genuinely absent)
+          }
+          const nodeIdx = treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant');
+          if (nodeIdx >= 0) {
             const nextTree = treeArr.slice();
             // Overwrite content; drop the cached token count/sig so writeConversation's backfill
             // recomputes them for the new (full) content.
