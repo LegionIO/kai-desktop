@@ -8,6 +8,8 @@ type StreamEvent = {
   text?: string;
   toolName?: string;
   toolCallId?: string;
+  /** Emitting run's nonce, echoed on approval events (R256) so the auto-deny resolves the run-scoped entry. */
+  runGeneration?: string;
   error?: string;
 };
 
@@ -289,7 +291,9 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
             `\n[auto-denied ${stripControl(e.toolName ?? 'tool')} — approval needs an interactive terminal]\n`,
           );
         }
-        void client.invoke('agent:reject-tool', e.toolCallId).catch(() => {});
+        // R256: pass conversationId + run nonce so main resolves the RUN-scoped pending approval
+        // (conversationId::runNonce::toolCallId) — a raw-id-only reject finds nothing and the run hangs.
+        void client.invoke('agent:reject-tool', e.toolCallId, e.conversationId, e.runGeneration).catch(() => {});
       } else if (e.type === 'model-fallback') {
         // A mid-stream fallback restarts the response on the next model. Drop the
         // failed attempt's accumulated text so the collected `--json` reply is the
@@ -359,7 +363,12 @@ export async function runHeadlessOnce(client: LocalBridgeClient, opts: HeadlessO
       })();
     });
     void client
-      .invoke<{ ok?: boolean; error?: string; busyKind?: string } | undefined>('agent:submit', id, prompt.trim(), submitOpts)
+      .invoke<{ ok?: boolean; error?: string; busyKind?: string } | undefined>(
+        'agent:submit',
+        id,
+        prompt.trim(),
+        submitOpts,
+      )
       .then((res) => {
         // A submit that RESOLVES { ok:false } (conversation busy from a cross-client compaction,
         // or the conversation was deleted) starts NO stream — so no `done` ever arrives and the
@@ -399,7 +408,9 @@ async function waitForPersistedReply(client: LocalBridgeClient, conversationId: 
   for (;;) {
     let running = false;
     try {
-      running = (await client.invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', conversationId))?.inFlight === true;
+      running =
+        (await client.invoke<{ inFlight: boolean; serverPersisted: boolean }>('agent:in-flight', conversationId))
+          ?.inFlight === true;
     } catch {
       // A drop while polling — the outer recover loop owns reconnection; treat as
       // not-running so we fall through to read whatever was persisted.
