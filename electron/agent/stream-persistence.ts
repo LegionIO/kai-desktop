@@ -985,10 +985,12 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         remaining.push(orphan);
         continue;
       }
-      // R238: appending/upserting the prefix moved the head ONTO the prefix. When the inject already has a
+      // R238/R240: appending/upserting the prefix moved the head ONTO the prefix. When the inject already has a
       // persisted continuation, that prefix-head hides the inject+continuation — restore the head to the tip it
-      // was at BEFORE this flush (the continuation). (When there's no continuation, the reparent's makeHead put
-      // the head on the inject, which is correct — nothing to restore.)
+      // was at BEFORE this flush (the continuation). This restoration is NOT best-effort: it is the operation
+      // that keeps the continuation on the active branch, so if it FAILS we RETAIN the orphan (don't remove it)
+      // so the next finalize retries — otherwise the head stays stuck on the prefix while the orphan is gone.
+      // (When there's no continuation, the reparent's makeHead already put the head on the inject — no restore.)
       if (injectHasContinuation && headBeforeFlush) {
         try {
           const after = readConversation(appHome, conversationId);
@@ -997,7 +999,8 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
             broadcastUpsert(appHome, withHead);
           }
         } catch {
-          // Best-effort head restore; the prefix + reparent already landed.
+          remaining.push(orphan); // head restore failed — retain the orphan and retry on the next finalize
+          continue;
         }
       }
     } catch {
