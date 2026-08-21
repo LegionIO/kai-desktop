@@ -929,11 +929,9 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         continue;
       }
       const tree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
-      const headBeforeFlush = conv.headId ?? null;
-      // R238: the injected user has a persisted continuation subtree iff some node parents on it (directly or
-      // transitively). If so, the ACTIVE tip is the pre-flush head — appending/upserting the prefix and any
-      // reparent below must NOT leave the head on the prefix (which would hide the inject+continuation). We
-      // restore the pre-flush head explicitly after splicing in that case.
+      // R238: the injected user has a persisted continuation subtree iff some node parents on it. If so, splicing
+      // the prefix must NOT leave the head on the prefix (which would hide the inject+continuation); the head is
+      // restored to the continuation tip below (computed fresh from the tree, R242).
       const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
       // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior flush
       // that persisted but failed to reparent)?
@@ -992,24 +990,46 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         remaining.push(orphan);
         continue;
       }
-      // R238/R240: appending/upserting the prefix moved the head ONTO the prefix. When the inject already has a
-      // persisted continuation, that prefix-head hides the inject+continuation — restore the head to the tip it
-      // was at BEFORE this flush (the continuation). This restoration is NOT best-effort: it is the operation
-      // that keeps the continuation on the active branch, so if it FAILS we RETAIN the orphan (don't remove it)
-      // so the next finalize retries — otherwise the head stays stuck on the prefix while the orphan is gone.
-      // (When there's no continuation, the reparent's makeHead already put the head on the inject — no restore.)
-      if (injectHasContinuation && headBeforeFlush) {
+      // R238/R240/R242: appending/upserting the prefix (or the makeHead:false reparent) leaves the head ON the
+      // prefix when the inject already has a persisted continuation, hiding the inject+continuation. Restore the
+      // head to the ACTIVE TIP of the inject's continuation subtree — computed FRESH from the tree (R242: not the
+      // stale headBeforeFlush, which on a retry is the prefix itself, so "restoring" to it would be a no-op that
+      // then removes the orphan and permanently hides the branch). Use reparentConversationMessage as the
+      // head-set primitive: it rebuilds the flat `messages` + counts from the branch (R242: a raw headId write
+      // left `messages` describing the prefix branch, so search/exports omitted the inject+continuation). RETAIN
+      // the orphan on any failure so the next finalize retries.
+      if (injectHasContinuation) {
         try {
           const after = readConversation(appHome, conversationId);
-          // R241: a null read is a transient FAILURE (readConversation fails open), NOT "nothing to restore" —
-          // skipping restoration here would leave the head on the prefix with the orphan gone. Retain + retry.
           if (!after) {
-            remaining.push(orphan);
+            remaining.push(orphan); // fail-open null read — transient; retain + retry (R241)
             continue;
           }
-          if (after.headId !== headBeforeFlush) {
-            const withHead = writeConversation(appHome, { ...after, headId: headBeforeFlush });
-            broadcastUpsert(appHome, withHead);
+          const afterTree = Array.isArray(after.messageTree) ? (after.messageTree as StoredTreeMessage[]) : [];
+          // Walk down from the inject following its (single active) child chain to the deepest descendant — that
+          // is the continuation tip that must be the head.
+          const childrenOf = (id: string) => afterTree.filter((m) => m?.parentId === id);
+          let tip = orphan.injectedUserId;
+          const guard = new Set<string>();
+          for (;;) {
+            if (guard.has(tip)) break; // cycle-guard
+            guard.add(tip);
+            const kids = childrenOf(tip);
+            if (kids.length === 0) break;
+            // Prefer the most-recently-created child as the active continuation.
+            const next = kids.reduce((a, b) => ((a.createdAt ?? '') >= (b.createdAt ?? '') ? a : b));
+            if (!next?.id) break;
+            tip = next.id;
+          }
+          if (after.headId !== tip) {
+            const tipNode = afterTree.find((m) => m.id === tip);
+            const restored = reparentConversationMessage(appHome, conversationId, tip, tipNode?.parentId ?? null, {
+              makeHead: true,
+            });
+            if (!restored) {
+              remaining.push(orphan);
+              continue;
+            }
           }
         } catch {
           remaining.push(orphan); // head restore failed — retain the orphan and retry on the next finalize
