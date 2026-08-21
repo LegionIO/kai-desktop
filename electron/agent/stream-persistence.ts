@@ -105,6 +105,11 @@ type OrphanedPrefix = {
    *  restore the head to the real continuation tip instead of collapsing it to the injected user. Undefined
    *  until the first flush observes a continuation head distinct from the prefix. */
   continuationHead?: string;
+  /** R248: true for a SPLICE-ONLY orphan — the prefix is already persisted on disk under responseMessageId and
+   *  only its reparent (splice) failed. flushOrphanedPrefixes must NOT overwrite the on-disk node's content/parent
+   *  from this record (which may be empty/unknown when the failed splice's reread also failed); it only re-attempts
+   *  the reparent + head restore. */
+  spliceOnly?: boolean;
 };
 const orphanedPrefixes = new Map<string, OrphanedPrefix[]>();
 
@@ -917,19 +922,13 @@ export function splitFailedPrefixIntoOrphan(
 /** R246: record an orphan for a prefix that is ALREADY PERSISTED but whose inject SPLICE (reparent) failed — so
  *  flushOrphanedPrefixes retries the reparent + head restore on the next finalize. Distinct from
  *  splitFailedPrefixIntoOrphan (which handles an UNpersisted prefix). The prefix content is already on disk under
- *  `prefixNodeId`, so flushOrphanedPrefixes' existing-node branch reuses it and only re-attempts the splice.
- *  `parts` is passed so an existing-node content-restore is still a correct full copy. */
-export function recordSpliceOnlyOrphan(
-  conversationId: string,
-  injectedUserId: string,
-  prefixNodeId: string,
-  prefixParent: string | null,
-  parts: ContentPart[],
-): void {
+ *  `prefixNodeId`; the orphan is marked spliceOnly so flushOrphanedPrefixes only re-attempts the reparent and does
+ *  NOT overwrite the on-disk node's content/parent (which may be empty/unknown when the caller's reread failed). */
+export function recordSpliceOnlyOrphan(conversationId: string, injectedUserId: string, prefixNodeId: string): void {
   const list = orphanedPrefixes.get(conversationId) ?? [];
   // Don't double-record the same (prefix, inject) pair.
   if (list.some((o) => o.responseMessageId === prefixNodeId && o.injectedUserId === injectedUserId)) return;
-  list.push({ parts, parentId: prefixParent, responseMessageId: prefixNodeId, injectedUserId });
+  list.push({ parts: [], parentId: null, responseMessageId: prefixNodeId, injectedUserId, spliceOnly: true });
   orphanedPrefixes.set(conversationId, list);
 }
 
@@ -965,9 +964,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
   // every orphan in this batch. Refreshed each flush call (a later finalize re-reads the current branch), so a
   // user branch change between finalizes is still honored.
   const preLoopConv = readConversation(appHome, conversationId);
+  // R248: readConversation FAILS OPEN (null on read/parse error). If the pre-loop read fails we CANNOT tell "no
+  // continuation" from "couldn't read it" — proceeding would let a per-orphan append move the head and then
+  // restore only to the inject, permanently hiding an already-persisted continuation. RETAIN the whole batch
+  // (leave orphanedPrefixes untouched) and bail so the next finalize retries with a good read.
+  if (!preLoopConv) return;
   const injectIds = new Set(list.map((o) => o.injectedUserId));
   const sharedContinuationHead =
-    preLoopConv &&
     typeof preLoopConv.headId === 'string' &&
     !orphanPrefixIds.has(preLoopConv.headId) &&
     !injectIds.has(preLoopConv.headId)
@@ -997,28 +1000,39 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       const existingNode = orphan.responseMessageId ? tree.find((m) => m?.id === orphan.responseMessageId) : undefined;
       let prefixNodeId: string | null = null;
       if (existingNode) {
-        // R237: REUSE but RESTORE — a renderer-written node may be frame-capped (truncated) or wrongly parented
-        // (e.g. temporarily under the inject via the debounce). Overwrite its content with the orphan's full copy
-        // and set its parent to the pre-inject parent, so consuming it can't leave a truncated or cyclic node.
-        try {
-          const nextTree = tree.map((m) =>
-            m.id === orphan.responseMessageId ? { ...m, content: orphan.parts, parentId: orphan.parentId } : m,
-          );
-          // R239: ALSO refresh the LEGACY FLAT `messages` array — search, Markdown export, plugins, and media
-          // indexing read from `messages`, so leaving a frame-capped renderer copy there would permanently show
-          // the truncated prefix even though messageTree carries the full parts. (Mirrors the remote-replace path.)
-          const nextMessages = Array.isArray(conv.messages)
-            ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
-                m && typeof m === 'object' && m.id === orphan.responseMessageId ? { ...m, content: orphan.parts } : m,
-              )
-            : conv.messages;
-          const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
-          broadcastUpsert(appHome, written);
+        if (orphan.spliceOnly) {
+          // R248: the prefix is already on disk and its content is authoritative; a splice-only orphan carries no
+          // content/parent to restore (its recording reread may have failed). Reuse the node AS-IS and only
+          // re-attempt the reparent below — do NOT overwrite content/parent from the (empty) orphan record.
           prefixNodeId = orphan.responseMessageId!;
-        } catch {
-          remaining.push(orphan);
-          continue;
+        } else {
+          // R237: REUSE but RESTORE — a renderer-written node may be frame-capped (truncated) or wrongly parented
+          // (e.g. temporarily under the inject via the debounce). Overwrite its content with the orphan's full copy
+          // and set its parent to the pre-inject parent, so consuming it can't leave a truncated or cyclic node.
+          try {
+            const nextTree = tree.map((m) =>
+              m.id === orphan.responseMessageId ? { ...m, content: orphan.parts, parentId: orphan.parentId } : m,
+            );
+            // R239: ALSO refresh the LEGACY FLAT `messages` array — search, Markdown export, plugins, and media
+            // indexing read from `messages`, so leaving a frame-capped renderer copy there would permanently show
+            // the truncated prefix even though messageTree carries the full parts. (Mirrors the remote-replace path.)
+            const nextMessages = Array.isArray(conv.messages)
+              ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
+                  m && typeof m === 'object' && m.id === orphan.responseMessageId ? { ...m, content: orphan.parts } : m,
+                )
+              : conv.messages;
+            const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
+            broadcastUpsert(appHome, written);
+            prefixNodeId = orphan.responseMessageId!;
+          } catch {
+            remaining.push(orphan);
+            continue;
+          }
         }
+      } else if (orphan.spliceOnly) {
+        // R248: a splice-only orphan whose supposedly-persisted prefix node is NOT on disk (deleted/branch-nav) —
+        // nothing to splice; drop it (do not re-append, we have no content).
+        continue;
       } else {
         const updated = appendConversationMessages(
           appHome,

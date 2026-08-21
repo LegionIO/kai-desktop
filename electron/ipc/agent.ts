@@ -2549,29 +2549,14 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
             } catch {
               spliced = null;
             }
-            // R246: if the prefix persisted (prefixHead) but this SPLICE failed (falsy OR threw), record a
+            // R246/R248: if the prefix persisted (prefixHead) but this SPLICE failed (falsy OR threw), record a
             // splice-only orphan so flushOrphanedPrefixes retries the reparent on the next finalize — otherwise
-            // the continuation persists under the inject's sibling branch and hides the prefix permanently.
+            // the continuation persists under the inject's sibling branch and hides the prefix permanently. R248:
+            // record unconditionally (no disk reread) — a reread here would also fail if the conversation was
+            // unreadable (the likely splice-failure cause), skipping the retry record. The prefix content is
+            // already on disk; flushOrphanedPrefixes reads it fresh when it retries.
             if (!spliced && prefixHead && chainParent === prefixHead) {
-              try {
-                const c = readConversation(serverPersistAppHome, event.conversationId);
-                const node = Array.isArray(c?.messageTree)
-                  ? (c.messageTree as Array<{ id?: string; parentId?: string | null; content?: unknown }>).find(
-                      (m) => m.id === prefixHead,
-                    )
-                  : undefined;
-                if (node) {
-                  recordSpliceOnlyOrphan(
-                    event.conversationId,
-                    en.id,
-                    prefixHead,
-                    node.parentId ?? null,
-                    (node.content ?? []) as Parameters<typeof recordSpliceOnlyOrphan>[4],
-                  );
-                }
-              } catch {
-                /* best-effort orphan record */
-              }
+              recordSpliceOnlyOrphan(event.conversationId, en.id, prefixHead);
             }
           }
           // The next entry in the batch chains under THIS injected user (its
