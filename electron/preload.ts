@@ -101,6 +101,7 @@ const appAPI = {
     getToolApprovalPrivateDetails: (toolCallId: string) =>
       ipcRenderer.invoke('agent:get-tool-approval-private-details', toolCallId) as Promise<{
         browserInput: unknown;
+        browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
       } | null>,
     approveToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:approve-tool', toolCallId),
     rejectToolCall: (toolCallId: string) => ipcRenderer.invoke('agent:reject-tool', toolCallId),
@@ -1019,6 +1020,9 @@ const appAPI = {
     stopFind: (conversationId: string, tabId: string) => ipcRenderer.invoke('browser:stop-find', conversationId, tabId),
     setZoom: (conversationId: string, tabId: string, level: number) =>
       ipcRenderer.invoke('browser:set-zoom', conversationId, tabId, level),
+    captureMenuPreview: (conversationId: string, tabId: string, requestId: string) =>
+      ipcRenderer.invoke('browser:capture-menu-preview', conversationId, tabId, requestId),
+    cancelMenuPreview: (requestId: string) => ipcRenderer.invoke('browser:cancel-menu-preview', requestId),
     screenshot: (conversationId: string, request: BrowserScreenshotRequest) =>
       ipcRenderer.invoke('browser:screenshot', conversationId, request),
     pickElement: (conversationId: string, tabId: string) =>
@@ -1041,6 +1045,10 @@ const appAPI = {
     listDownloads: (conversationId: string) => ipcRenderer.invoke('browser:list-downloads', conversationId),
     showDownload: (conversationId: string, downloadId: string) =>
       ipcRenderer.invoke('browser:show-download', conversationId, downloadId),
+    exportDownload: (conversationId: string, downloadId: string) =>
+      ipcRenderer.invoke('browser:export-download', conversationId, downloadId),
+    deleteDownload: (conversationId: string, downloadId: string) =>
+      ipcRenderer.invoke('browser:delete-download', conversationId, downloadId),
     cancelDownload: (conversationId: string, downloadId: string) =>
       ipcRenderer.invoke('browser:cancel-download', conversationId, downloadId),
     listSitePermissions: (conversationId: string, origin: string) =>

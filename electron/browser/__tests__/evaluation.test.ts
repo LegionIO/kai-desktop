@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 // @ts-expect-error jsdom is installed for Vitest's DOM environment without its optional declaration package.
 import { JSDOM } from 'jsdom';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD, boundedBrowserEvaluationExpression } from '../evaluation.js';
 
 async function evaluate(expression: string): Promise<string> {
@@ -9,6 +9,18 @@ async function evaluate(expression: string): Promise<string> {
 }
 
 describe('bounded browser evaluation', () => {
+  it('blocks native UI inside the exact isolated evaluation world', async () => {
+    const dom = new JSDOM('<!doctype html><p>Browser</p>', { runScripts: 'outside-only', url: 'https://example.com/' });
+    const print = vi.fn();
+    Object.defineProperty(dom.window, 'print', { configurable: true, writable: true, value: print });
+
+    await expect(dom.window.eval(boundedBrowserEvaluationExpression('window.print()'))).rejects.toThrow(
+      /printing is blocked/i,
+    );
+    expect(print).not.toHaveBeenCalled();
+    dom.window.close();
+  });
+
   it('preserves script completion values while serializing inside the page', async () => {
     const serialized = await evaluate(
       boundedBrowserEvaluationExpression('const values = [1, 2, 3]; ({ ok: true, values })'),

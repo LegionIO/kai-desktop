@@ -2,6 +2,10 @@ export const MAX_BROWSER_SCREENSHOT_PIXELS = 16_000_000;
 export const MAX_BROWSER_SCREENSHOT_DIMENSION = 16_384;
 export const MAX_BROWSER_SCREENSHOT_TILE_HEIGHT = 4_096;
 export const MAX_BROWSER_SCREENSHOT_ENCODED_BYTES = 24 * 1024 * 1024;
+/** A menu preview is presentation-only and may be preempted after Electron has
+ * already accepted its uncancellable native capture. Bound that one possible
+ * overlap independently from a real screenshot's larger allocation budget. */
+export const MAX_BROWSER_MENU_PREVIEW_NATIVE_PIXELS = 4_000_000;
 // `_modelContent` drops any single image above 5 MiB. Leave a small margin for
 // base64-size estimation so a screenshot that fits here is guaranteed to
 // survive the shared model-content sanitizer.
@@ -12,6 +16,29 @@ export type BrowserScreenshotTile = {
   y: number;
   width: number;
   height: number;
+};
+
+export type BrowserScreenshotLayoutMetrics = {
+  cssContentSize?: { width: number; height: number };
+  contentSize?: { width: number; height: number };
+  cssVisualViewport?: {
+    pageX: number;
+    pageY: number;
+    clientWidth: number;
+    clientHeight: number;
+  };
+};
+
+export type BrowserScreenshotCaptureGeometry = {
+  width: number;
+  height: number;
+  /** CDP Page.captureScreenshot clip scale that produces CSS-pixel output. */
+  scale: number;
+};
+
+export type BrowserScreenshotViewportGeometry = BrowserScreenshotCaptureGeometry & {
+  x: number;
+  y: number;
 };
 
 export type BrowserModelScreenshot = {
@@ -97,6 +124,97 @@ export function validateScreenshotSize(width: number, height: number): { width: 
     );
   }
   return normalized;
+}
+
+/** Validate the physical-pixel allocation Electron may make for capturePage().
+ * WebContentsView bounds are DIP while NativeImage dimensions follow display
+ * scale, so the pre-allocation check must include the largest display scale. */
+export function validateMenuPreviewNativeSize(
+  width: number,
+  height: number,
+  displayScaleFactor = 1,
+): { width: number; height: number } {
+  if (!Number.isFinite(displayScaleFactor) || displayScaleFactor <= 0) {
+    throw new Error('The display did not report a valid Browser menu preview scale.');
+  }
+  const physical = validateScreenshotSize(width * displayScaleFactor, height * displayScaleFactor);
+  if (physical.width * physical.height > MAX_BROWSER_MENU_PREVIEW_NATIVE_PIXELS) {
+    throw new Error(
+      `Browser menu preview exceeds the safe ${MAX_BROWSER_MENU_PREVIEW_NATIVE_PIXELS.toLocaleString()} physical-pixel limit.`,
+    );
+  }
+  return physical;
+}
+
+/**
+ * Page.getLayoutMetrics reports modern CSS dimensions alongside deprecated
+ * device-pixel dimensions. Page.captureScreenshot applies the target's device
+ * scale to a clip unless its scale is compensated. Derive a conservative
+ * inverse scale so a Retina renderer cannot allocate or return more pixels
+ * than validateScreenshotSize approved, and so tiled images retain CSS-sized
+ * offsets/canvases.
+ */
+function browserScreenshotDeviceScale(
+  css: { width: number; height: number },
+  device: { width: number; height: number },
+): number {
+  const ratios = [device.width / css.width, device.height / css.height];
+  if (ratios.some((ratio) => !Number.isFinite(ratio) || ratio <= 0)) {
+    throw new Error('The page did not report a valid screenshot device scale.');
+  }
+  // CDP accepts one clip scale for both axes. Derive the single least-squares
+  // device scale and require both reported dimensions to fit it within one
+  // independently rounded device pixel. Choosing either axis's raw ratio can
+  // otherwise make tiled captures a pixel short/wide and leave seams (or make
+  // Sharp reject a composite) on fractional-scale displays.
+  const denominator = css.width * css.width + css.height * css.height;
+  const deviceScaleFactor = (device.width * css.width + device.height * css.height) / denominator;
+  if (
+    !Number.isFinite(deviceScaleFactor) ||
+    deviceScaleFactor <= 0 ||
+    Math.abs(device.width - css.width * deviceScaleFactor) > 1 ||
+    Math.abs(device.height - css.height * deviceScaleFactor) > 1
+  ) {
+    throw new Error('The page reported inconsistent horizontal and vertical screenshot device scales.');
+  }
+  return 1 / deviceScaleFactor;
+}
+
+export function browserScreenshotCaptureGeometry(
+  metrics: BrowserScreenshotLayoutMetrics,
+): BrowserScreenshotCaptureGeometry {
+  const css = metrics.cssContentSize;
+  const device = metrics.contentSize;
+  if (!css || !device) {
+    throw new Error('The page did not report both CSS and device screenshot dimensions.');
+  }
+  const size = validateScreenshotSize(css.width, css.height);
+  return { ...size, scale: browserScreenshotDeviceScale(css, device) };
+}
+
+/** capturePage can stop resolving while a BrowserWindow is minimized. Derive
+ * a bounded current-viewport CDP clip so hidden/headless captures do not depend
+ * on the native view being painted or presented. */
+export function browserScreenshotViewportGeometry(
+  metrics: BrowserScreenshotLayoutMetrics,
+): BrowserScreenshotViewportGeometry {
+  const viewport = metrics.cssVisualViewport;
+  const cssContent = metrics.cssContentSize;
+  const deviceContent = metrics.contentSize;
+  if (!viewport || !cssContent || !deviceContent) {
+    throw new Error('The page did not report CSS viewport and device screenshot dimensions.');
+  }
+  const values = [viewport.pageX, viewport.pageY, viewport.clientWidth, viewport.clientHeight];
+  if (!values.every(Number.isFinite) || viewport.pageX < 0 || viewport.pageY < 0) {
+    throw new Error('The page did not report finite viewport screenshot bounds.');
+  }
+  const size = validateScreenshotSize(viewport.clientWidth, viewport.clientHeight);
+  return {
+    x: Math.floor(viewport.pageX),
+    y: Math.floor(viewport.pageY),
+    ...size,
+    scale: browserScreenshotDeviceScale(cssContent, deviceContent),
+  };
 }
 
 export function browserScreenshotTiles(width: number, height: number): BrowserScreenshotTile[] {

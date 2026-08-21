@@ -16,6 +16,7 @@ import {
   markPendingBrowserCleanupScopeKey,
 } from '../profile-data.js';
 import { browserPartitionForScopeKey } from '../session.js';
+import { assistantDownloadQuarantineDirectory } from '../download-quarantine.js';
 
 const homes: string[] = [];
 
@@ -49,6 +50,16 @@ describe('browser profile data detection', () => {
 
     expect(hasStoredBrowserScopeData(appHome, sessionDataPath, historyScope)).toBe(true);
     expect(hasStoredBrowserScopeData(appHome, sessionDataPath, downloadsScope)).toBe(true);
+  });
+
+  it('detects a crash-left assistant download quarantine before shelf metadata exists', () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-profile-'));
+    homes.push(appHome);
+    const sessionDataPath = join(appHome, 'chromium-session-data');
+    const scopeKey = 'conversation-bbbbbbbbbbbbbbbbbbbbbbbb';
+    mkdirSync(assistantDownloadQuarantineDirectory(appHome, scopeKey), { recursive: true });
+
+    expect(hasStoredBrowserScopeData(appHome, sessionDataPath, scopeKey)).toBe(true);
   });
 
   it('enumerates only validated Browser-owned Chromium partition directories', () => {

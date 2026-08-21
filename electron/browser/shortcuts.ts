@@ -17,7 +17,7 @@ export function resolveClipboardShortcutCommand(
 ): BrowserClipboardCommand | null {
   const normalized = keys.map((key) => key.toLowerCase());
   const control = normalized.some((key) => key === 'control' || key === 'ctrl');
-  const meta = normalized.some((key) => key === 'meta' || key === 'command');
+  const meta = normalized.some((key) => key === 'meta' || key === 'command' || key === 'cmd');
   const modified = isMac ? meta : control;
   const oppositePlatformModifier = isMac ? control : meta;
   const shift = normalized.includes('shift');
@@ -54,7 +54,7 @@ export function isClipboardShortcutKeys(keys: string[], isMac = process.platform
  * synthetic `browser_action(kind="press")` input. */
 export function isApplicationAcceleratorShortcutKeys(keys: string[]): boolean {
   const normalized = keys.map((key) => key.toLowerCase());
-  if (normalized.some((key) => ['control', 'ctrl', 'meta', 'command', 'alt'].includes(key))) return true;
+  if (normalized.some((key) => ['control', 'ctrl', 'meta', 'command', 'cmd', 'alt'].includes(key))) return true;
   return normalized.some((key) => /^f(?:[1-9]|1\d|2[0-4])$/.test(key));
 }
 
@@ -68,7 +68,7 @@ export function isReservedBrowserShortcutKeys(keys: string[]): boolean {
   const input: BrowserShortcutInput = {
     type: 'keyDown',
     key,
-    meta: normalized.some((item) => item === 'meta' || item === 'command'),
+    meta: normalized.some((item) => item === 'meta' || item === 'command' || item === 'cmd'),
     control: normalized.some((item) => item === 'control' || item === 'ctrl'),
     shift: normalized.includes('shift'),
     alt: normalized.includes('alt'),

@@ -12,11 +12,18 @@ const MAX_DOM_DISCOVERY_NODES = 4_096;
 const MAX_PENDING_DOM_DISCOVERY_JOBS = 4_096;
 const MAX_ELEMENT_PICKER_SELECTOR_CHARS = 8 * 1_024;
 const MAX_ELEMENT_PICKER_TOKEN_CHARS = 128;
+const MAX_SENSITIVITY_PROBE_TOKEN_CHARS = 128;
 const MAX_ELEMENT_PICKER_TIMEOUT_MS = 60_000;
 const AUTOMATION_COORDINATE_TOLERANCE = 3;
+const AUTOMATION_TIMESTAMP_TOLERANCE_SECONDS = 0.05;
+const MAX_AUTOMATION_TIMESTAMP_TOLERANCE_SECONDS = 5;
 const SHADOW_DISCOVERY_WINDOW_MS = 10_000;
 const PRIVATE_NETWORK_GUARD_ACTIVATOR = '__kaiBrowserActivatePrivateNetworkGuard_v1__';
 const PRIVATE_NETWORK_GUARD_ARGUMENT = '--kai-browser-private-network-guard';
+const NATIVE_UI_GUARD_STATE = '__kaiBrowserNativeUiGuardInstalled_v1__';
+const NATIVE_UI_GUARD_ACTIVATOR = '__kaiBrowserActivateNativeUiGuard_v1__';
+const NATIVE_UI_GUARD_ARGUMENT = '--kai-browser-native-ui-guard';
+const NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX = '--kai-browser-native-ui-token=';
 const knownPasswordFields = new Set();
 const listenedRoots = new WeakSet();
 const reportedGestureEvents = new WeakSet();
@@ -32,6 +39,7 @@ let sensorsRunning = false;
 let discoveryDrainRunning = false;
 let pendingDiscoveryJobs = [];
 let pendingDiscoveryRoots = new WeakSet();
+let pendingAutomationNativePicker = null;
 const pendingAutomationInputs = [];
 let elementPicker = null;
 
@@ -145,6 +153,423 @@ function installWebRtcMembrane() {
       contextBridge.executeInMainWorld({
         func: installMainWorldWebRtcMembrane,
         args: [PRIVATE_NETWORK_GUARD_ACTIVATOR, process.argv.includes(PRIVATE_NETWORK_GUARD_ARGUMENT)],
+      }) === true
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Install before remote page script can cache native-UI entry points. Every
+ * page receives inert trampolines; only a caller holding the random preload
+ * token can toggle their shared closure while preserving cached references. */
+function installMainWorldNativeUiMembrane(stateName, activatorName, token, initiallyBlocked) {
+  const root = globalThis;
+  const safeDefineProperty = Object.defineProperty;
+  const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  let blocked = initiallyBlocked === true;
+  try {
+    if (
+      safeGetOwnPropertyDescriptor(root, stateName) ||
+      safeGetOwnPropertyDescriptor(root, activatorName) ||
+      typeof token !== 'string' ||
+      !/^[0-9a-f-]{36}$/i.test(token)
+    )
+      return false;
+  } catch {
+    return false;
+  }
+  const SafeError = Error;
+  const SafeNumber = Number;
+  const SafeString = String;
+  const safeStringToLowerCase = SafeString.prototype.toLowerCase;
+  const NativeMap = Map;
+  const NativeSet = Set;
+  const NativeMutationObserver = root.MutationObserver;
+  const safeApply = Reflect.apply;
+  const safeGetPrototypeOf = Object.getPrototypeOf;
+  const safeMapClear = NativeMap.prototype.clear;
+  const safeMapGet = NativeMap.prototype.get;
+  const safeMapHas = NativeMap.prototype.has;
+  const safeMapSet = NativeMap.prototype.set;
+  const safeSetAdd = NativeSet.prototype.add;
+  const safeSetClear = NativeSet.prototype.clear;
+  const safeSetForEach = NativeSet.prototype.forEach;
+  const safeSetHas = NativeSet.prototype.has;
+  const eventPrototype = root.Event?.prototype;
+  const safeAddEventListener = root.EventTarget?.prototype?.addEventListener;
+  const safeComposedPath = eventPrototype?.composedPath;
+  const safePreventDefault = eventPrototype?.preventDefault;
+  const safeMutationObserve = NativeMutationObserver?.prototype?.observe;
+  const safeDocumentQuerySelectorAll = root.Document?.prototype?.querySelectorAll;
+  const safeElementQuerySelectorAll = root.Element?.prototype?.querySelectorAll;
+  const safeNodeListItem = root.NodeList?.prototype?.item;
+  const safeGetAttribute = root.Element?.prototype?.getAttribute;
+  const safeHasAttribute = root.Element?.prototype?.hasAttribute;
+  const safeRemoveAttribute = root.Element?.prototype?.removeAttribute;
+  const safeSetAttribute = root.Element?.prototype?.setAttribute;
+  const NativeElement = root.Element;
+  const NativeInput = root.HTMLInputElement;
+  const NativeNavigator = root.Navigator;
+  const NativePaymentRequest = root.PaymentRequest;
+  const NativePresentationRequest = root.PresentationRequest;
+  const NativeRemotePlayback = root.RemotePlayback;
+  const NativeSelect = root.HTMLSelectElement;
+  const NativeVideo = root.HTMLVideoElement;
+  const NativeEyeDropper = root.EyeDropper;
+  const nativeNavigator = root.navigator;
+  const nativeNavigatorPrototype = nativeNavigator ? safeGetPrototypeOf(nativeNavigator) : NativeNavigator?.prototype;
+  const nativeNavigatorHolder =
+    typeof nativeNavigatorPrototype?.share === 'function' ? nativeNavigatorPrototype : nativeNavigator;
+  const nativeCredentials = root.navigator?.credentials;
+  const nativeCredentialsPrototype = nativeCredentials
+    ? safeGetPrototypeOf(nativeCredentials)
+    : root.CredentialsContainer?.prototype;
+  const nativeCredentialsHolder =
+    typeof nativeCredentialsPrototype?.get === 'function' || typeof nativeCredentialsPrototype?.create === 'function'
+      ? nativeCredentialsPrototype
+      : nativeCredentials;
+  const disablePictureInPictureDescriptor = safeGetOwnPropertyDescriptor(
+    NativeVideo?.prototype,
+    'disablePictureInPicture',
+  );
+  const nativeDisablePictureInPictureGetter = disablePictureInPictureDescriptor?.get;
+  const nativeDisablePictureInPictureSetter = disablePictureInPictureDescriptor?.set;
+  const forcedPictureInPictureVideos = new NativeSet();
+  const originalPictureInPictureStates = new NativeMap();
+  const pickerInputTypes = new NativeSet(['color', 'date', 'datetime-local', 'file', 'month', 'time', 'week']);
+  const pickerKeys = new NativeSet([' ', 'arrowdown', 'enter', 'f4']);
+  const toLower = (value) => safeApply(safeStringToLowerCase, SafeString(value), []);
+
+  const guardMethod = (holder, name, message, required = false) => {
+    const original = holder?.[name];
+    if (typeof original !== 'function') return !required;
+    let delegate = original;
+    const guarded = function (...args) {
+      if (blocked) throw new SafeError(message);
+      return safeApply(delegate, this, args);
+    };
+    const descriptor = safeGetOwnPropertyDescriptor(holder, name);
+    safeDefineProperty(holder, name, {
+      configurable: false,
+      enumerable: descriptor?.enumerable ?? false,
+      get: () => guarded,
+      set: (next) => {
+        if (next === guarded) delegate = original;
+        else if (typeof next === 'function') delegate = next;
+      },
+    });
+    return true;
+  };
+  const isVideoTarget = (target) => {
+    try {
+      return toLower(target?.localName || target?.tagName || '') === 'video';
+    } catch {
+      return false;
+    }
+  };
+  const forceVideoPictureInPictureDisabled = (target) => {
+    if (!blocked || !isVideoTarget(target)) return;
+    try {
+      if (!safeApply(safeMapHas, originalPictureInPictureStates, [target])) {
+        const original =
+          typeof nativeDisablePictureInPictureGetter === 'function'
+            ? {
+                kind: 'property',
+                value: Boolean(safeApply(nativeDisablePictureInPictureGetter, target, [])),
+              }
+            : {
+                kind: 'attribute',
+                present:
+                  typeof safeHasAttribute === 'function'
+                    ? Boolean(safeApply(safeHasAttribute, target, ['disablepictureinpicture']))
+                    : false,
+                value:
+                  typeof safeGetAttribute === 'function'
+                    ? safeApply(safeGetAttribute, target, ['disablepictureinpicture'])
+                    : null,
+              };
+        safeApply(safeMapSet, originalPictureInPictureStates, [target, original]);
+        safeApply(safeSetAdd, forcedPictureInPictureVideos, [target]);
+      }
+      if (typeof nativeDisablePictureInPictureSetter === 'function') {
+        safeApply(nativeDisablePictureInPictureSetter, target, [true]);
+      } else if (typeof safeSetAttribute === 'function') {
+        safeApply(safeSetAttribute, target, ['disablepictureinpicture', '']);
+      }
+    } catch {}
+  };
+  const restoreVideoPictureInPictureStates = () => {
+    safeApply(safeSetForEach, forcedPictureInPictureVideos, [
+      (target) => {
+        try {
+          const original = safeApply(safeMapGet, originalPictureInPictureStates, [target]);
+          if (!original) return;
+          if (original.kind === 'property' && typeof nativeDisablePictureInPictureSetter === 'function') {
+            safeApply(nativeDisablePictureInPictureSetter, target, [original.value === true]);
+          } else if (original.kind === 'attribute') {
+            if (original.present && typeof safeSetAttribute === 'function') {
+              safeApply(safeSetAttribute, target, ['disablepictureinpicture', original.value ?? '']);
+            } else if (!original.present && typeof safeRemoveAttribute === 'function') {
+              safeApply(safeRemoveAttribute, target, ['disablepictureinpicture']);
+            }
+          }
+        } catch {}
+      },
+    ]);
+    safeApply(safeSetClear, forcedPictureInPictureVideos, []);
+    safeApply(safeMapClear, originalPictureInPictureStates, []);
+  };
+  const forceVideosInRoot = (candidate) => {
+    if (!blocked || !candidate) return;
+    forceVideoPictureInPictureDisabled(candidate);
+    let videos;
+    try {
+      const query = candidate === root.document ? safeDocumentQuerySelectorAll : safeElementQuerySelectorAll;
+      if (typeof query !== 'function') return;
+      videos = safeApply(query, candidate, ['video']);
+    } catch {
+      return;
+    }
+    const rawCount = SafeNumber(videos?.length) || 0;
+    const count = rawCount > 4_096 ? 4_096 : rawCount;
+    for (let index = 0; index < count; index += 1) {
+      let video;
+      try {
+        video = typeof safeNodeListItem === 'function' ? safeApply(safeNodeListItem, videos, [index]) : videos?.[index];
+      } catch {
+        continue;
+      }
+      forceVideoPictureInPictureDisabled(video);
+    }
+  };
+  const isPickerTarget = (target) => {
+    try {
+      const localName = toLower(target?.localName || target?.tagName || '');
+      if (localName === 'select') return true;
+      return localName === 'input' && safeApply(safeSetHas, pickerInputTypes, [toLower(target.type || '')]);
+    } catch {
+      return false;
+    }
+  };
+  const blockNativePickerDefault = (event) => {
+    if (!blocked || !event) return;
+    const pickerKeyAllowed = event.type !== 'keydown' || safeApply(safeSetHas, pickerKeys, [toLower(event.key || '')]);
+    let path = [];
+    try {
+      path = typeof safeComposedPath === 'function' ? safeApply(safeComposedPath, event, []) : [event.target];
+    } catch {
+      path = [event.target];
+    }
+    let pickerTarget = false;
+    for (let index = 0; index < path.length; index += 1) {
+      forceVideoPictureInPictureDisabled(path[index]);
+      if (isPickerTarget(path[index])) pickerTarget = true;
+    }
+    if (!pickerTarget || !pickerKeyAllowed) return;
+    safeApply(safePreventDefault, event, []);
+  };
+  try {
+    if (!guardMethod(root, 'print', 'Printing is blocked during assistant browser control.', true)) return false;
+    for (const name of ['alert', 'confirm', 'prompt']) {
+      if (!guardMethod(root, name, 'JavaScript dialogs are blocked during assistant browser control.')) return false;
+    }
+    for (const name of ['showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker']) {
+      if (!guardMethod(root, name, 'File System Access pickers are blocked during assistant browser control.')) {
+        return false;
+      }
+    }
+    if (!guardMethod(nativeNavigatorHolder, 'share', 'Web Share is blocked during assistant browser control.')) {
+      return false;
+    }
+    if (!guardMethod(NativeEyeDropper?.prototype, 'open', 'EyeDropper is blocked during assistant browser control.')) {
+      return false;
+    }
+    if (
+      !guardMethod(NativePaymentRequest?.prototype, 'show', 'Payment UI is blocked during assistant browser control.')
+    ) {
+      return false;
+    }
+    if (
+      !guardMethod(
+        NativeRemotePlayback?.prototype,
+        'prompt',
+        'Remote playback UI is blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (
+      !guardMethod(
+        NativePresentationRequest?.prototype,
+        'start',
+        'Presentation UI is blocked during assistant browser control.',
+      )
+    )
+      return false;
+    for (const name of [
+      'requestFullscreen',
+      'webkitRequestFullscreen',
+      'webkitRequestFullScreen',
+      'mozRequestFullScreen',
+      'msRequestFullscreen',
+    ]) {
+      if (!guardMethod(NativeElement?.prototype, name, 'Fullscreen is blocked during assistant browser control.')) {
+        return false;
+      }
+    }
+    if (
+      !guardMethod(NativeInput?.prototype, 'showPicker', 'Native pickers are blocked during assistant browser control.')
+    )
+      return false;
+    if (
+      !guardMethod(
+        NativeSelect?.prototype,
+        'showPicker',
+        'Native pickers are blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (
+      !guardMethod(
+        NativeVideo?.prototype,
+        'requestPictureInPicture',
+        'Picture-in-Picture is blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (
+      !guardMethod(
+        nativeCredentialsHolder,
+        'get',
+        'Passkey and security-key prompts are blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (
+      !guardMethod(
+        nativeCredentialsHolder,
+        'create',
+        'Passkey and security-key prompts are blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (
+      !guardMethod(
+        NativeVideo?.prototype,
+        'webkitSetPresentationMode',
+        'Native video presentation is blocked during assistant browser control.',
+      )
+    )
+      return false;
+    const documentPictureInPicture = root.documentPictureInPicture;
+    const documentPictureInPicturePrototype = documentPictureInPicture
+      ? safeGetPrototypeOf(documentPictureInPicture)
+      : root.DocumentPictureInPicture?.prototype;
+    const documentPictureInPictureHolder =
+      typeof documentPictureInPicturePrototype?.requestWindow === 'function'
+        ? documentPictureInPicturePrototype
+        : documentPictureInPicture;
+    if (
+      !guardMethod(
+        documentPictureInPictureHolder,
+        'requestWindow',
+        'Document Picture-in-Picture is blocked during assistant browser control.',
+      )
+    )
+      return false;
+    if (disablePictureInPictureDescriptor) {
+      safeDefineProperty(NativeVideo.prototype, 'disablePictureInPicture', {
+        configurable: false,
+        enumerable: disablePictureInPictureDescriptor.enumerable ?? false,
+        get() {
+          if (blocked) return true;
+          return typeof nativeDisablePictureInPictureGetter === 'function'
+            ? safeApply(nativeDisablePictureInPictureGetter, this, [])
+            : false;
+        },
+        set(value) {
+          if (typeof nativeDisablePictureInPictureSetter === 'function') {
+            if (blocked) forceVideoPictureInPictureDisabled(this);
+            else safeApply(nativeDisablePictureInPictureSetter, this, [value]);
+          }
+        },
+      });
+    }
+    if (typeof safeAddEventListener !== 'function' || typeof safePreventDefault !== 'function') return false;
+    // Register on Window before remote script runs. A page can install a Window
+    // capture listener that stops propagation before an event reaches Document;
+    // keeping the membrane first on the same earliest target closes that gap.
+    const pickerEventTarget = root;
+    for (const type of ['pointerdown', 'mousedown', 'touchstart', 'click', 'keydown']) {
+      safeApply(safeAddEventListener, pickerEventTarget, [
+        type,
+        blockNativePickerDefault,
+        { capture: true, passive: false },
+      ]);
+    }
+    if (typeof NativeMutationObserver === 'function' && typeof safeMutationObserve === 'function' && root.document) {
+      const observer = new NativeMutationObserver((records) => {
+        if (!blocked) return;
+        for (const record of records) {
+          const addedNodes = record?.addedNodes;
+          const rawCount = SafeNumber(addedNodes?.length) || 0;
+          const count = rawCount > 4_096 ? 4_096 : rawCount;
+          for (let index = 0; index < count; index += 1) {
+            let added;
+            try {
+              added =
+                typeof safeNodeListItem === 'function'
+                  ? safeApply(safeNodeListItem, addedNodes, [index])
+                  : addedNodes?.[index];
+            } catch {
+              continue;
+            }
+            forceVideosInRoot(added);
+          }
+        }
+      });
+      safeApply(safeMutationObserve, observer, [root.document, { childList: true, subtree: true }]);
+    }
+    const activate = (candidateToken, nextBlocked = true) => {
+      if (candidateToken !== token) return false;
+      blocked = nextBlocked === true;
+      if (blocked) forceVideosInRoot(root.document);
+      else restoreVideoPictureInPictureStates();
+      return true;
+    };
+    safeDefineProperty(root, stateName, {
+      configurable: false,
+      enumerable: false,
+      get: () => blocked,
+    });
+    safeDefineProperty(root, activatorName, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: activate,
+    });
+    if (blocked) forceVideosInRoot(root.document);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installNativeUiMembrane() {
+  try {
+    const tokenArgument = process.argv.find((argument) =>
+      argument.startsWith(NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX),
+    );
+    const token = tokenArgument?.slice(NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX.length) ?? '';
+    return (
+      contextBridge.executeInMainWorld({
+        func: installMainWorldNativeUiMembrane,
+        args: [
+          NATIVE_UI_GUARD_STATE,
+          NATIVE_UI_GUARD_ACTIVATOR,
+          token,
+          process.argv.includes(NATIVE_UI_GUARD_ARGUMENT),
+        ],
       }) === true
     );
   } catch {
@@ -392,6 +817,12 @@ function armAutomationInput(_event, payload) {
     payload.token.length > 128 ||
     !['pointerdown', 'keydown', 'wheel', 'input'].includes(payload.kind) ||
     !Number.isFinite(payload.expiresAt) ||
+    !Number.isFinite(payload.timestamp) ||
+    payload.timestamp <= 0 ||
+    (payload.timestampToleranceSeconds !== undefined &&
+      (!Number.isFinite(payload.timestampToleranceSeconds) ||
+        payload.timestampToleranceSeconds <= 0 ||
+        payload.timestampToleranceSeconds > MAX_AUTOMATION_TIMESTAMP_TOLERANCE_SECONDS)) ||
     payload.expiresAt < Date.now() ||
     payload.expiresAt > Date.now() + 5_000
   ) {
@@ -401,6 +832,8 @@ function armAutomationInput(_event, payload) {
     token: payload.token,
     kind: payload.kind,
     expiresAt: payload.expiresAt,
+    timestamp: payload.timestamp,
+    timestampToleranceSeconds: payload.timestampToleranceSeconds,
     x: Number.isFinite(payload.x) ? payload.x : undefined,
     y: Number.isFinite(payload.y) ? payload.y : undefined,
     screenX: Number.isFinite(payload.screenX) ? payload.screenX : undefined,
@@ -409,10 +842,31 @@ function armAutomationInput(_event, payload) {
     inputType: typeof payload.inputType === 'string' ? payload.inputType : undefined,
   });
   if (pendingAutomationInputs.length > MAX_PENDING_AUTOMATION_INPUTS) pendingAutomationInputs.shift();
+  // Main must not dispatch hidden CDP input until the isolated preload in
+  // every live frame has installed this exact one-shot token.
+  ipcRenderer.send('browser-page:automation-input-armed', { token: payload.token });
+}
+
+function disarmAutomationInput(_event, payload) {
+  if (!payload || typeof payload.token !== 'string' || payload.token.length > 128) return;
+  for (let index = pendingAutomationInputs.length - 1; index >= 0; index--) {
+    if (pendingAutomationInputs[index].token === payload.token) pendingAutomationInputs.splice(index, 1);
+  }
 }
 
 function matchesAutomationInput(expected, event) {
   if (expected.kind !== event.type) return false;
+  const rawTimestamp = Number(event.timeStamp);
+  const timeOrigin = Number(globalThis.performance?.timeOrigin);
+  const eventTimestamp =
+    Number.isFinite(rawTimestamp) && Number.isFinite(timeOrigin) ? (timeOrigin + rawTimestamp) / 1_000 : Number.NaN;
+  if (
+    !Number.isFinite(eventTimestamp) ||
+    Math.abs(eventTimestamp - expected.timestamp) >
+      (expected.timestampToleranceSeconds ?? AUTOMATION_TIMESTAMP_TOLERANCE_SECONDS)
+  ) {
+    return false;
+  }
   if (expected.key && String(event.key || '').toLowerCase() !== expected.key) return false;
   if (expected.inputType && String(event.inputType || '') !== expected.inputType) return false;
   const expectedX = expected.screenX ?? expected.x;
@@ -434,6 +888,36 @@ function matchesAutomationInput(expected, event) {
   return true;
 }
 
+function nativePickerTargetForEvent(event) {
+  let path = [];
+  try {
+    path = typeof event?.composedPath === 'function' ? event.composedPath() : [event?.target];
+  } catch {
+    path = [event?.target];
+  }
+  for (const target of path) {
+    if (isElement(target, 'select')) return target;
+    if (!isElement(target, 'input')) continue;
+    const type = String(target.type || '').toLowerCase();
+    if (['color', 'date', 'datetime-local', 'file', 'month', 'time', 'week'].includes(type)) return target;
+  }
+  return null;
+}
+
+function blockAutomationNativePickerDefault(event, armAccepted = false) {
+  const current = Date.now();
+  if (pendingAutomationNativePicker?.expiresAt < current) pendingAutomationNativePicker = null;
+  const target = nativePickerTargetForEvent(event);
+  if (armAccepted && target) {
+    pendingAutomationNativePicker = { target, expiresAt: current + 2_000 };
+  }
+  if (!target || pendingAutomationNativePicker?.target !== target) return;
+  try {
+    if (event.cancelable !== false) event.preventDefault();
+  } catch {}
+  if (event.type === 'click') pendingAutomationNativePicker = null;
+}
+
 function reportGesture(event) {
   if (!event || typeof event !== 'object' || event.isTrusted === false || reportedGestureEvents.has(event)) return;
   // Composed events are observed by both the shadow-root and document capture
@@ -441,45 +925,54 @@ function reportGesture(event) {
   // cannot consume it as unrelated user activity after the AI token is removed.
   reportedGestureEvents.add(event);
   pruneAutomationInputs();
-  const index = pendingAutomationInputs.findIndex((expected) => matchesAutomationInput(expected, event));
-  const matched = index >= 0 ? pendingAutomationInputs.splice(index, 1)[0] : null;
+  const rejectedMatches = [];
+  let matched = null;
+  let accepted = false;
+  while (true) {
+    const index = pendingAutomationInputs.findIndex((expected) => matchesAutomationInput(expected, event));
+    matched = index >= 0 ? pendingAutomationInputs.splice(index, 1)[0] : null;
+    if (!matched) break;
+    const gesturePayload = {
+      token: matched.token,
+      kind: event.type,
+      // Main retains the expected typed value and compares this one-shot event
+      // payload synchronously. The automation arm itself contains no plaintext,
+      // so unrelated cross-origin frame preloads never receive the secret.
+      ...(event.type === 'input' && typeof event.data === 'string' ? { data: event.data } : {}),
+      ...(event.type === 'keydown' && typeof event.key === 'string' ? { key: event.key } : {}),
+    };
+    try {
+      // Synchronous delivery establishes provenance before the page's own event
+      // handler can call window.open and reach main's popup handler.
+      accepted = ipcRenderer.sendSync('browser-page:gesture', gesturePayload) === true;
+    } catch {}
+    if (accepted) break;
+    rejectedMatches.push(matched);
+  }
+  if (accepted) {
+    blockAutomationNativePickerDefault(event, true);
+    return;
+  }
+  // A consumed token can remain in sibling frames until main's disarm message is
+  // delivered. Try every shape-compatible token before treating the event as
+  // user-owned so an older sibling copy cannot shadow the current arm.
+  for (const rejected of rejectedMatches) {
+    if (rejected.expiresAt >= Date.now()) pendingAutomationInputs.push(rejected);
+  }
+  while (pendingAutomationInputs.length > MAX_PENDING_AUTOMATION_INPUTS) pendingAutomationInputs.shift();
   // Pointer/key automation can synchronously produce a trusted checkbox/radio
   // `input` event after its one-shot token was consumed. Ignore unmatched input
   // here so it cannot overwrite the initiating assistant provenance. Genuine
   // user edits already have a trusted pointerdown/keydown gesture; exact
   // assistant insertText events carry their own input token.
-  if (!matched && event.type === 'input') return;
-  const gesturePayload = {
-    ...(matched ? { token: matched.token } : {}),
-    kind: event.type,
-    // Main retains the expected typed value and compares this one-shot event
-    // payload synchronously. The automation arm itself contains no plaintext,
-    // so unrelated cross-origin frame preloads never receive the secret.
-    ...(matched && event.type === 'input' && typeof event.data === 'string' ? { data: event.data } : {}),
-  };
-  let accepted = false;
+  if (rejectedMatches.length === 0 && event.type === 'input') return;
   try {
-    // Synchronous delivery establishes provenance before the page's own event
-    // handler can call window.open and reach main's popup handler.
-    accepted = ipcRenderer.sendSync('browser-page:gesture', gesturePayload) === true;
+    ipcRenderer.sendSync('browser-page:gesture', { kind: event.type });
   } catch {}
-  if (matched && !accepted) {
-    // The token is broadcast to every frame because Chromium does not expose
-    // the eventual input target at arm time. Main can reject a shape-matched
-    // event whose typed data differs; retain this frame's copy so the later
-    // real target event can still prove itself, and report the rejected event
-    // without a token so it remains user-owned.
-    if (matched.expiresAt >= Date.now()) {
-      pendingAutomationInputs.push(matched);
-      if (pendingAutomationInputs.length > MAX_PENDING_AUTOMATION_INPUTS) pendingAutomationInputs.shift();
-    }
-    try {
-      ipcRenderer.sendSync('browser-page:gesture', { kind: event.type });
-    } catch {}
-  }
 }
 
 ipcRenderer.on('browser-page:arm-automation-input', armAutomationInput);
+ipcRenderer.on('browser-page:disarm-automation-input', disarmAutomationInput);
 
 function latchSensitive() {
   if (sensitiveLatched) return;
@@ -511,6 +1004,59 @@ function checkKnownPasswords() {
     }
   }
 }
+
+/** Perform a bounded, value-only scan in the isolated preload world. Nothing
+ * page-controlled crosses IPC: main receives only booleans describing whether
+ * this exact frame is sensitive and whether the bounded scan was complete. */
+function probeFrameSensitivity() {
+  try {
+    checkKnownPasswords();
+    if (sensitiveLatched) return { sensitive: true, complete: true };
+    if (!sensorsRunning) return { sensitive: false, complete: false };
+
+    let remaining = MAX_DOM_DISCOVERY_NODES;
+    const roots = [document];
+    const seenRoots = new WeakSet();
+    while (roots.length > 0) {
+      const root = roots.shift();
+      if (!root || seenRoots.has(root)) continue;
+      seenRoots.add(root);
+      const ownerDocument = root.nodeType === 9 ? root : root.ownerDocument;
+      if (!ownerDocument || typeof ownerDocument.createTreeWalker !== 'function') {
+        return { sensitive: false, complete: false };
+      }
+      const walker = ownerDocument.createTreeWalker(root, 1);
+      let element = isElement(root) ? root : walker.nextNode();
+      while (element) {
+        if (remaining <= 0) return { sensitive: false, complete: false };
+        remaining -= 1;
+        rememberInput(element);
+        if (sensitiveLatched) return { sensitive: true, complete: true };
+        const shadowRoot = element.shadowRoot;
+        if (shadowRoot) roots.push(shadowRoot);
+        element = walker.nextNode();
+      }
+    }
+    checkKnownPasswords();
+    return { sensitive: sensitiveLatched, complete: true };
+  } catch {
+    // Ambiguous scans are unsafe but do not destructively latch the renderer.
+    return { sensitive: false, complete: false };
+  }
+}
+
+function reportSensitivityProbe(_event, payload) {
+  const token = payload?.token;
+  if (typeof token !== 'string' || token.length === 0 || token.length > MAX_SENSITIVITY_PROBE_TOKEN_CHARS) return;
+  const result = probeFrameSensitivity();
+  ipcRenderer.send('browser-page:sensitivity-probe-result', {
+    token,
+    sensitive: result.sensitive === true,
+    complete: result.complete === true,
+  });
+}
+
+ipcRenderer.on('browser-page:probe-sensitive', reportSensitivityProbe);
 
 function isElement(node, name) {
   return !!node && node.nodeType === 1 && (!name || String(node.localName).toLowerCase() === name);
@@ -816,6 +1362,16 @@ function installRootListeners(root) {
     },
     true,
   );
+  // A trusted CDP pointerdown is attributed before page handlers run. Retain
+  // its exact picker target across the derived mousedown/click sequence and
+  // cancel only the native default; programmatic showPicker is blocked by the
+  // main-world membrane above. Ordinary concurrent user gestures remain live.
+  for (const eventName of ['mousedown', 'click']) {
+    root.addEventListener(eventName, (event) => blockAutomationNativePickerDefault(event), {
+      capture: true,
+      passive: false,
+    });
+  }
   root.addEventListener(
     'submit',
     (event) => {
@@ -847,7 +1403,7 @@ function installRootListeners(root) {
         discoverEventPath(event);
         reportActivity(event);
       },
-      { capture: true, passive: true },
+      { capture: true, passive: eventName === 'wheel' },
     );
   }
 }
@@ -1140,7 +1696,25 @@ function stopSensors() {
   // pageshow without duplicating input/activity listeners.
 }
 
-installWebRtcMembrane();
+function abortUnsafeRenderer(message) {
+  // Preloads run before any remote document script. If a mandatory main-world
+  // membrane cannot be installed, crashing this renderer is the only
+  // synchronous fail-closed boundary: an IPC notification or later CDP probe
+  // would allow the first page/popup script to execute in the gap. Throw as a
+  // non-Electron fallback (and for deterministic tests) in case crash() is
+  // unavailable or unexpectedly returns.
+  try {
+    if (typeof process.crash === 'function') process.crash();
+  } catch {}
+  throw new Error(message);
+}
+
+if (!installWebRtcMembrane()) {
+  abortUnsafeRenderer('Kai Browser could not install its private-network security membrane.');
+}
+if (!installNativeUiMembrane()) {
+  abortUnsafeRenderer('Kai Browser could not install its native-UI security membrane.');
+}
 installClosedShadowSentinel();
 
 if (document.readyState === 'loading') {

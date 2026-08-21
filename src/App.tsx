@@ -2654,7 +2654,7 @@ function AppShell() {
                     onDoubleClick={() => window.app?.titlebar.doubleClick()}
                     className={`${titleMenuOpen || pluginTitleMenuOpen || taskTitleMenuOpen || agentTitleMenuOpen ? '' : 'titlebar-drag'} absolute left-0 -top-2 z-30 flex h-14 items-end pb-1 justify-between px-3 md:h-16 md:px-6 ${app.platform.os === 'win32' ? 'right-36' : 'right-2'}`}
                   >
-                    <div className="flex w-full items-center justify-between">
+                    <div className="flex min-w-0 w-full items-center justify-between gap-2">
                       {isMobile && (
                         <button
                           type="button"
@@ -2664,11 +2664,8 @@ function AppShell() {
                           <MenuIcon className="h-5 w-5" />
                         </button>
                       )}
-                      <div
-                        className="titlebar-no-drag min-w-0 shrink-0 flex items-center"
-                        onDoubleClick={(e) => e.stopPropagation()}
-                      >
-                        <div className="min-w-0">
+                      <div className="flex min-w-0 flex-1 items-center overflow-hidden">
+                        <div className="titlebar-no-drag min-w-0" onDoubleClick={(e) => e.stopPropagation()}>
                           {activeView === SETTINGS_VIEW ? (
                             <div className="flex items-center gap-1.5">
                               <div className="-ml-2 rounded-lg px-2 py-1 text-sm font-medium text-foreground">
@@ -3097,7 +3094,10 @@ function AppShell() {
                           ) : null}
                         </div>
                       </div>
-                      <div className="titlebar-no-drag ml-auto shrink-0" onDoubleClick={(e) => e.stopPropagation()}>
+                      <div
+                        className="titlebar-no-drag ml-auto min-w-0 max-w-[50%] shrink"
+                        onDoubleClick={(e) => e.stopPropagation()}
+                      >
                         <WorkspaceSelector
                           workspaces={workspaces}
                           activeWorkspaceId={activeWorkspaceId}

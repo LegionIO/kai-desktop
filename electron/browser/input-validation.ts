@@ -9,7 +9,7 @@ export const MAX_BROWSER_TYPED_VALUE_CHARS = 100_000;
 export const MAX_BROWSER_KEY_CHARS = 64;
 export const MAX_BROWSER_KEYS = 16;
 export const MAX_BROWSER_INPUT_COORDINATE = 100_000;
-const BROWSER_MODIFIER_KEYS = new Set(['shift', 'control', 'ctrl', 'alt', 'meta', 'command']);
+const BROWSER_MODIFIER_KEYS = new Set(['shift', 'control', 'ctrl', 'alt', 'meta', 'command', 'cmd']);
 
 const tabId = z.string().uuid().optional();
 const boundedCoordinate = z.number().finite().min(-MAX_BROWSER_INPUT_COORDINATE).max(MAX_BROWSER_INPUT_COORDINATE);

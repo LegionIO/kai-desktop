@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // @ts-expect-error jsdom is installed for Vitest's DOM environment without its optional declaration package.
@@ -9,9 +9,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const electronMocks = vi.hoisted(() => ({
   appOff: vi.fn(),
   appOn: vi.fn(),
+  baseWindow: vi.fn(),
   fromPartition: vi.fn(),
   ipcOff: vi.fn(),
   ipcOn: vi.fn(),
+  nativeImageCreateFromBuffer: vi.fn((buffer: Buffer) => ({
+    getSize: () => ({ width: 400, height: 300 }),
+    isEmpty: () => false,
+    resize: () => ({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => buffer,
+    }),
+    toPNG: () => buffer,
+  })),
   screenGetAllDisplays: vi.fn(() => [{ scaleFactor: 1 }]),
   showSaveDialog: vi.fn(),
   webContentsView: vi.fn(),
@@ -22,6 +32,11 @@ vi.mock('electron', () => ({
     getPath: (name: string) => (name === 'downloads' ? '/tmp/downloads' : '/tmp'),
     off: electronMocks.appOff,
     on: electronMocks.appOn,
+  },
+  BaseWindow: class BaseWindow {
+    constructor(options: Record<string, unknown>) {
+      Object.assign(this, electronMocks.baseWindow(options));
+    }
   },
   clipboard: { clear: vi.fn(), readText: vi.fn(() => ''), writeText: vi.fn() },
   dialog: { showSaveDialog: electronMocks.showSaveDialog },
@@ -41,6 +56,7 @@ vi.mock('electron', () => ({
       Object.assign(this, options);
     }
   },
+  nativeImage: { createFromBuffer: electronMocks.nativeImageCreateFromBuffer },
   safeStorage: {
     decryptString: vi.fn(),
     encryptString: vi.fn(),
@@ -57,9 +73,19 @@ vi.mock('electron', () => ({
   },
 }));
 
-const { BrowserManager, popupInitiatorFrameTreeNodeId } = await import('../manager.js');
+const { BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS, BrowserManager, popupInitiatorFrameTreeNodeId } =
+  await import('../manager.js');
+const { browserNativeUiGuardActivationProbe } = await import('../evaluation.js');
 const { MAX_BROWSER_URL_CHARS } = await import('../metadata.js');
-const { BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT } = await import('../session.js');
+const { MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB, MAX_BROWSER_NETWORK_REQUESTS_PER_TAB } =
+  await import('../network-diagnostics.js');
+const { assistantDownloadQuarantineDirectory, assistantDownloadQuarantinePath, pruneAssistantDownloadQuarantine } =
+  await import('../download-quarantine.js');
+const {
+  BROWSER_NATIVE_UI_GUARD_ARGUMENT,
+  BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX,
+  BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT,
+} = await import('../session.js');
 const { BrowserActionQueue } = await import('../action-queue.js');
 const { BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS } = await import('../service-workers.js');
 const { trackPluginBrowserWindow } = await import('../../plugins/browser-window/lifecycle.js');
@@ -76,6 +102,8 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
     manager as unknown as Record<string, unknown>,
     {
       activeDownloads: new Map(),
+      downloadExportLeases: new Map(),
+      downloads: new Map(),
       disposed: false,
       activeTabs: new Map(),
       activeFindRequests: new Map(),
@@ -92,13 +120,19 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       scriptInjectionPolicy: 'allow',
       passwordAccessPolicy: 'user-only',
       aiAllowPrivateNetwork: false,
+      startupDownloadReconciliation: Promise.resolve(),
       getWindow: () => null,
       getConfig: () => ({ browser: { dataScope: 'conversation', enabled: true } }),
       conversationExists: () => true,
       hostRendererAuthorityGeneration: 0,
       hostRendererAuthorityAvailable: true,
+      // Assistant actions are headless by default. Focused low-level tests call
+      // the prototype methods directly or override these transport seams.
+      isHostWindowInteractive: () => true,
+      isTargetViewInteractive: () => true,
       shuttingDown: false,
       pendingAuth: new Map(),
+      pendingAssistantTabClosures: new Map(),
       pendingCredentials: new Map(),
       pendingElementPickerCancels: new Map(),
       pendingElementPickerFrames: new Map(),
@@ -121,8 +155,33 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       removedConversations: new Set<string>(),
       restrictedBackgroundScopes: new Set<string>(),
       pendingCleanupQuarantineUnreadable: false,
+      menuPreviewCapture: null,
+      assistantTargetTabs: new Map<string, string>(),
+      assistantDialogProtectionRestores: new Map(),
       assistantControlledOrigins: new Map<string, Set<string>>(),
       assistantContinuationLeases: new Set<string>(),
+      assistantRuns: {
+        acquire: () => ({ generation: 1, release: vi.fn() }),
+        assertActive: () => 1,
+        generationIfActive: () => null,
+      },
+      automationGestureTokens: new Map(),
+      pendingAutomationArmAcknowledgements: new Map(),
+      pendingMenuSensitivityProbes: new Map(),
+      pendingSyntheticInputs: new Map(),
+      dispatchedSyntheticInputs: new Map(),
+      faviconFetches: new Map(),
+      webContentsToTab: new Map(),
+      probeMenuPreviewSensitivity: vi.fn(async () => ({ sensitive: false, complete: true })),
+      hasPopulatedPasswordFieldViaCdp: vi.fn(async () => false),
+      // Most lifecycle fixtures predate CDP preview capture and intentionally
+      // exercise orchestration through Electron's NativeImage test double. A
+      // focused helper test deletes this seam to cover the production CDP path.
+      captureMenuPreviewImage: async (_active: unknown, contents: { capturePage: () => Promise<unknown> }) =>
+        contents.capturePage(),
+      installAssistantNativeUiGuard: vi.fn(async () => undefined),
+      prepareAssistantDialogSafeRenderer: vi.fn(),
+      withBackgroundCaptureHost: (_tab: unknown, _contents: unknown, operation: () => Promise<unknown>) => operation(),
       screenshotQueue: new BrowserActionQueue(),
       visibleAssistantQueue: new BrowserActionQueue(),
       tabs: new Map(),
@@ -151,6 +210,71 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function createTrackedUserDownload(cancelImplementation: () => void = () => undefined) {
+  let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+  const listeners = new Map<string, (...args: unknown[]) => void>();
+  const store = {
+    addDownload: vi.fn(() => []),
+    flushDownloads: vi.fn(async () => undefined),
+  };
+  const tab = {
+    scopeKey: 'global',
+    popupGesture: {
+      source: 'user' as const,
+      assistantOwnerId: null,
+      expiresAt: Date.now() + 60_000,
+    },
+    trustedUserNavigation: false,
+    shell: { id: 'tab-download', conversationId: 'chat-1', keepOpen: true, owner: 'user' as const },
+  };
+  const manager = managerWithoutConstructor({
+    activeDownloads: new Map(),
+    clearingScopes: new Set(),
+    downloads: new Map(),
+    isTargetViewInteractive: () => true,
+    pagePreloadPath: '/tmp/browser-page.cjs',
+    releaseScopeRuntimeWhenIdle: vi.fn(),
+    scopeGenerations: new Map([['global', 0]]),
+    stores: new Map([['global', store]]),
+    tabs: new Map([[tab.shell.id, tab]]),
+    webContentsToTab: new Map([[42, tab.shell.id]]),
+    wiredSessions: new WeakSet(),
+  });
+  const fakeSession = {
+    getPreloadScripts: () => [],
+    on: (event: string, listener: typeof willDownload) => {
+      if (event === 'will-download') willDownload = listener;
+    },
+    registerPreloadScript: vi.fn(),
+    setPermissionCheckHandler: vi.fn(),
+    setPermissionRequestHandler: vi.fn(),
+    webRequest: {
+      onBeforeRequest: vi.fn(),
+      onCompleted: vi.fn(),
+      onErrorOccurred: vi.fn(),
+    },
+  };
+  invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+  const item = {
+    getFilename: () => 'report.pdf',
+    getReceivedBytes: () => 10,
+    getSavePath: () => '/tmp/downloads/report.pdf',
+    getTotalBytes: () => 100,
+    getURL: () => 'https://example.com/report.pdf',
+    cancel: vi.fn(cancelImplementation),
+    off: (event: string) => listeners.delete(event),
+    on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+    setSaveDialogOptions: vi.fn(),
+  };
+  willDownload?.({}, item, { id: 42 });
+  const active = [
+    ...(
+      Reflect.get(manager, 'activeDownloads') as Map<unknown, { cancel: () => Promise<void>; done: Promise<void> }>
+    ).values(),
+  ][0]!;
+  return { active, item, listeners, manager, store };
+}
+
 function visibleHostWindow(overrides: Record<string, unknown> = {}) {
   return {
     isDestroyed: () => false,
@@ -159,6 +283,38 @@ function visibleHostWindow(overrides: Record<string, unknown> = {}) {
     isFocused: () => true,
     ...overrides,
   };
+}
+
+function browserDebuggerMock() {
+  let attached = false;
+  const messageListeners = new Set<(event: unknown, method: string, params: unknown) => void>();
+  return {
+    attach: vi.fn(() => {
+      attached = true;
+    }),
+    detach: vi.fn(() => {
+      attached = false;
+    }),
+    isAttached: () => attached,
+    on: vi.fn((event: string, listener: (event: unknown, method: string, params: unknown) => void) => {
+      if (event === 'message') messageListeners.add(listener);
+    }),
+    off: vi.fn((event: string, listener: (event: unknown, method: string, params: unknown) => void) => {
+      if (event === 'message') messageListeners.delete(listener);
+    }),
+    sendCommand: vi.fn(
+      async (...args: unknown[]): Promise<unknown> =>
+        args[0] === 'Page.addScriptToEvaluateOnNewDocument' ? { identifier: 'document-guard-1' } : {},
+    ),
+    emitMessage: (method: string, params: unknown = {}) => {
+      for (const listener of messageListeners) listener({}, method, params);
+    },
+  };
+}
+
+function invokeCdpBeforeDispatch(args: unknown[]): void {
+  const beforeDispatch = args[5];
+  if (typeof beforeDispatch === 'function') beforeDispatch();
 }
 
 describe('assistant Browser authority revocation', () => {
@@ -265,10 +421,66 @@ describe('assistant Browser authority revocation', () => {
 });
 
 describe('assistant Browser download ownership', () => {
-  it('uses the current run for assistant tabs without making user-tab downloads temporary', () => {
+  it('expires Browser-chrome navigation authority when no request commits or downloads', async () => {
+    vi.useFakeTimers();
+    try {
+      const tab = {
+        shell: { id: 'tab-1' },
+        trustedUserNavigation: false,
+        trustedUserNavigationTarget: null as string | null,
+        trustedUserNavigationRequestId: null as number | null,
+        trustedUserNavigationLease: 0,
+        trustedUserNavigationTimer: null as ReturnType<typeof setTimeout> | null,
+      };
+      const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
+
+      invokePrivate(manager, 'beginTrustedUserNavigation', tab, 'https://example.com/report.pdf');
+      expect(tab.trustedUserNavigation).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(tab.trustedUserNavigation).toBe(false);
+      expect(tab.trustedUserNavigationTarget).toBeNull();
+      expect(tab.trustedUserNavigationRequestId).toBeNull();
+      expect(tab.trustedUserNavigationTimer).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not expire Browser-chrome navigation authority after Chromium claims the request', async () => {
+    vi.useFakeTimers();
+    try {
+      const tab = {
+        shell: { id: 'tab-1' },
+        trustedUserNavigation: false,
+        trustedUserNavigationTarget: null as string | null,
+        trustedUserNavigationRequestId: null as number | null,
+        trustedUserNavigationLease: 0,
+        trustedUserNavigationTimer: null as ReturnType<typeof setTimeout> | null,
+      };
+      const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
+
+      invokePrivate(manager, 'beginTrustedUserNavigation', tab, 'https://slow.example/login');
+      tab.trustedUserNavigationRequestId = 42;
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(tab.trustedUserNavigation).toBe(true);
+      expect(tab.trustedUserNavigationTarget).toBe('https://slow.example/login');
+      expect(tab.trustedUserNavigationRequestId).toBe(42);
+      expect(tab.trustedUserNavigationTimer).toBeNull();
+      invokePrivate(manager, 'clearTrustedUserNavigation', tab, tab.trustedUserNavigationLease);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('requires exact assistant provenance for user tabs and lets exact user input override it', () => {
     const manager = managerWithoutConstructor({
       assistantRuns: {
-        generationIfActive: (_conversationId: string, runId: string) => (runId === 'active-creator' ? 1 : null),
+        generationIfActive: (_conversationId: string, runId: string) =>
+          ['active-creator', 'current-run'].includes(runId) ? 1 : null,
       },
     });
     const shell = { conversationId: 'chat-1', owner: 'assistant' as const };
@@ -292,8 +504,76 @@ describe('assistant Browser download ownership', () => {
         shell: { ...shell, owner: 'user' },
         assistantOwnerId: null,
         aiControlOwnerId: 'current-run',
+        aiActionDepth: 1,
+        popupGesture: null,
       }),
     ).toBeNull();
+    expect(
+      invokePrivate(manager, 'assistantDownloadOwner', {
+        shell: { ...shell, owner: 'user' },
+        assistantOwnerId: null,
+        aiControlOwnerId: 'current-run',
+        trustedGestureGeneration: 2,
+        popupGesture: {
+          source: 'assistant',
+          assistantOwnerId: 'current-run',
+          expiresAt: Date.now() + 1_000,
+        },
+      }),
+    ).toBe('current-run');
+    expect(
+      invokePrivate(manager, 'assistantDownloadOwner', {
+        shell: { ...shell, owner: 'user' },
+        assistantOwnerId: null,
+        aiControlOwnerId: 'current-run',
+        trustedGestureGeneration: 3,
+        assistantDownloadAttribution: {
+          assistantOwnerId: 'current-run',
+          trustedGestureGeneration: 2,
+        },
+        popupGesture: {
+          source: 'user',
+          assistantOwnerId: null,
+          expiresAt: Date.now() + 1_000,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      invokePrivate(manager, 'assistantDownloadOwner', {
+        shell: { ...shell, owner: 'user' },
+        assistantOwnerId: null,
+        aiControlOwnerId: 'current-run',
+        trustedGestureGeneration: 2,
+        assistantDownloadAttribution: {
+          assistantOwnerId: 'current-run',
+          trustedGestureGeneration: 2,
+        },
+        popupGesture: null,
+      }),
+    ).toBe('current-run');
+  });
+
+  it('retains delayed download ownership while a completed run is draining cleanup', () => {
+    const manager = managerWithoutConstructor({
+      assistantRuns: { generationIfActive: () => null },
+    });
+    const tab = {
+      shell: { conversationId: 'chat-1', owner: 'user' as const },
+      assistantOwnerId: null,
+      aiControlOwnerId: 'run-1',
+      aiControlGeneration: 7,
+      trustedGestureGeneration: 3,
+      assistantDownloadAttribution: {
+        assistantOwnerId: 'run-1',
+        trustedGestureGeneration: 3,
+      },
+      popupGesture: null,
+    };
+
+    expect(invokePrivate(manager, 'assistantDownloadOwner', tab)).toBe('run-1');
+
+    tab.trustedGestureGeneration++;
+    expect(invokePrivate(manager, 'assistantDownloadOwner', tab)).toBeNull();
   });
 });
 
@@ -301,12 +581,381 @@ describe('browser manager renderer lifecycle', () => {
   beforeEach(() => {
     electronMocks.appOff.mockReset();
     electronMocks.appOn.mockReset();
+    electronMocks.baseWindow.mockReset();
     electronMocks.fromPartition.mockReset();
     electronMocks.ipcOff.mockReset();
     electronMocks.ipcOn.mockReset();
+    electronMocks.nativeImageCreateFromBuffer.mockReset().mockImplementation((buffer: Buffer) => ({
+      getSize: () => ({ width: 400, height: 300 }),
+      isEmpty: () => false,
+      resize: () => ({
+        getSize: () => ({ width: 400, height: 300 }),
+        toPNG: () => buffer,
+      }),
+      toPNG: () => buffer,
+    }));
     electronMocks.screenGetAllDisplays.mockReset().mockReturnValue([{ scaleFactor: 1 }]);
     electronMocks.showSaveDialog.mockReset();
     electronMocks.webContentsView.mockReset();
+  });
+
+  it('renders hidden screenshots in a reusable non-focusable host and restores the exact tab view', async () => {
+    const mainContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const captureContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const captureHost = {
+      contentView: captureContentView,
+      destroy: vi.fn(),
+      isDestroyed: () => false,
+      setContentSize: vi.fn(),
+    };
+    electronMocks.baseWindow.mockReturnValue(captureHost);
+    const contents = { isDestroyed: () => false };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' }, view };
+    const mainWindow = {
+      contentView: mainContentView,
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false },
+    };
+    const attachActiveView = vi.fn();
+    const manager = managerWithoutConstructor({
+      attachActiveView,
+      attachedView: view,
+      backgroundCaptureHost: null,
+      captureHostedView: null,
+      getWindow: () => mainWindow,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const capture = vi.fn(async () => {
+      expect(Reflect.get(manager, 'captureHostedView')).toBe(view);
+      expect(captureContentView.addChildView).toHaveBeenCalledWith(view);
+      return 'pixels';
+    });
+
+    await expect(invokePrivate(manager, 'withBackgroundCaptureHost', tab, contents, capture)).resolves.toBe('pixels');
+
+    expect(electronMocks.baseWindow).toHaveBeenCalledWith(
+      expect.objectContaining({ show: false, focusable: false, skipTaskbar: true, width: 400, height: 300 }),
+    );
+    expect(mainContentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(captureContentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(mainContentView.addChildView).toHaveBeenCalledWith(view);
+    expect(view.setVisible).toHaveBeenCalledWith(true);
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+    expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+    expect(Reflect.get(manager, 'backgroundCaptureHost')).toEqual(captureHost);
+    expect(captureHost.destroy).not.toHaveBeenCalled();
+    expect(attachActiveView).toHaveBeenCalledWith('chat-1');
+
+    await expect(
+      invokePrivate(manager, 'withBackgroundCaptureHost', tab, contents, async () => 'second'),
+    ).resolves.toBe('second');
+    expect(electronMocks.baseWindow).toHaveBeenCalledOnce();
+    expect(captureHost.setContentSize).toHaveBeenCalledWith(400, 300);
+  });
+
+  it('rejects a high-DPI hidden capture host before allocating its native surface', async () => {
+    electronMocks.screenGetAllDisplays.mockReturnValue([{ scaleFactor: 2 }]);
+    const mainContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const contents = { isDestroyed: () => false };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 3_000, height: 1_500 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' }, view };
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      backgroundCaptureHost: null,
+      captureHostedView: null,
+      getWindow: () => ({
+        contentView: mainContentView,
+        isDestroyed: () => false,
+        webContents: { isDestroyed: () => false },
+      }),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const capture = vi.fn(async () => 'pixels');
+
+    await expect(invokePrivate(manager, 'withBackgroundCaptureHost', tab, contents, capture)).rejects.toThrow(
+      /safe .*pixel limit/i,
+    );
+
+    expect(electronMocks.baseWindow).not.toHaveBeenCalled();
+    expect(mainContentView.removeChildView).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it('destroys the reusable capture BaseWindow before the primary window closes', () => {
+    const view = { setVisible: vi.fn(), webContents: { id: 42 } };
+    const captureHost = {
+      contentView: { removeChildView: vi.fn() },
+      destroy: vi.fn(),
+      isDestroyed: () => false,
+    };
+    const manager = managerWithoutConstructor({
+      backgroundCaptureHost: captureHost,
+      captureHostedView: view,
+      captureHostedViewLease: { view, host: captureHost, returnedToMain: false },
+    });
+
+    manager.handleHostWindowWillClose();
+
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(captureHost.contentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(captureHost.destroy).toHaveBeenCalledOnce();
+    expect(Reflect.get(manager, 'backgroundCaptureHost')).toBeNull();
+    expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+    expect(Reflect.get(manager, 'captureHostedViewLease')).toBeNull();
+  });
+
+  it('rehosts retained tab renderers exactly once after the primary window is recreated', () => {
+    const oldContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const newContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const oldWindow = {
+      contentView: oldContentView,
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false },
+    };
+    const newWindow = {
+      contentView: newContentView,
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false },
+    };
+    let currentWindow = oldWindow;
+    const view = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: { id: 42, close: vi.fn(), isDestroyed: () => false },
+    };
+    const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' }, view };
+    const manager = managerWithoutConstructor({
+      attachedView: view,
+      getWindow: () => currentWindow,
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    manager.handleHostWindowWillClose();
+
+    expect(oldContentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(Reflect.get(manager, 'mountedConversationId')).toBeNull();
+    expect(Reflect.get(manager, 'detachedHostViews')).toContain(view);
+    expect(view.webContents.close).not.toHaveBeenCalled();
+
+    currentWindow = newWindow;
+    manager.handleHostWindowCreated();
+    manager.handleHostWindowCreated();
+
+    expect(newContentView.addChildView).toHaveBeenCalledOnce();
+    expect(newContentView.addChildView).toHaveBeenCalledWith(view);
+    expect(Reflect.get(manager, 'detachedHostViews')).not.toContain(view);
+    expect(view.webContents.close).not.toHaveBeenCalled();
+  });
+
+  it('keeps a late capture finalizer from corrupting a successor view return', async () => {
+    const mainContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const captureContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const captureHost = {
+      contentView: captureContentView,
+      destroy: vi.fn(),
+      isDestroyed: () => false,
+      setContentSize: vi.fn(),
+    };
+    electronMocks.baseWindow.mockReturnValue(captureHost);
+    const makeView = (id: number) => {
+      let bounds = { x: 0, y: 0, width: 400, height: 300 };
+      return {
+        getBounds: () => bounds,
+        setBounds: vi.fn((next: typeof bounds) => {
+          bounds = next;
+        }),
+        setVisible: vi.fn(),
+        webContents: { id, isDestroyed: () => false },
+      };
+    };
+    const firstView = makeView(41);
+    const secondView = makeView(42);
+    const firstTab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: firstView as typeof firstView | null,
+    };
+    const secondTab = {
+      shell: { id: 'tab-2', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view: secondView,
+    };
+    const mainWindow = {
+      contentView: mainContentView,
+      isDestroyed: () => false,
+      isMinimized: () => false,
+      isVisible: () => true,
+      webContents: { isDestroyed: () => false },
+    };
+    const firstDone = deferred<string>();
+    const secondDone = deferred<string>();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', secondTab.shell.id]]),
+      attachedView: null,
+      backgroundCaptureHost: null,
+      captureHostedView: null,
+      captureHostedViewLease: null,
+      getWindow: () => mainWindow,
+      mountedBounds: { x: 10, y: 20, width: 600, height: 500 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([
+        [firstTab.shell.id, firstTab],
+        [secondTab.shell.id, secondTab],
+      ]),
+      webContentsToTab: new Map([
+        [41, firstTab.shell.id],
+        [42, secondTab.shell.id],
+      ]),
+    });
+
+    const firstCapture = invokePrivate(
+      manager,
+      'withBackgroundCaptureHost',
+      firstTab,
+      firstView.webContents,
+      () => firstDone.promise,
+    ) as Promise<string>;
+    await vi.waitFor(() => expect(Reflect.get(manager, 'captureHostedView')).toBe(firstView));
+    firstTab.view = null;
+    invokePrivate(manager, 'releaseBackgroundCaptureHostedView', firstView);
+
+    const secondCapture = invokePrivate(
+      manager,
+      'withBackgroundCaptureHost',
+      secondTab,
+      secondView.webContents,
+      () => secondDone.promise,
+    ) as Promise<string>;
+    await vi.waitFor(() => expect(Reflect.get(manager, 'captureHostedView')).toBe(secondView));
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+    expect(mainContentView.addChildView).toHaveBeenCalledTimes(1);
+
+    firstDone.resolve('first');
+    await expect(firstCapture).resolves.toBe('first');
+    secondDone.resolve('second');
+    await expect(secondCapture).resolves.toBe('second');
+
+    expect(mainContentView.addChildView).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['main-remove', 'capture-add'] as const)(
+    'releases background screenshot ownership when %s reparenting fails',
+    async (failureStage) => {
+      const mainContentView = {
+        addChildView: vi.fn(),
+        removeChildView: vi.fn(() => {
+          if (failureStage === 'main-remove') throw new Error('main removal failed');
+        }),
+      };
+      const captureContentView = {
+        addChildView: vi.fn(() => {
+          if (failureStage === 'capture-add') throw new Error('capture add failed');
+        }),
+        removeChildView: vi.fn(),
+      };
+      electronMocks.baseWindow.mockReturnValue({
+        contentView: captureContentView,
+        destroy: vi.fn(),
+        isDestroyed: () => false,
+        setContentSize: vi.fn(),
+      });
+      const contents = { isDestroyed: () => false };
+      const view = {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        setBounds: vi.fn(),
+        setVisible: vi.fn(),
+        webContents: contents,
+      };
+      const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' }, view };
+      const mainWindow = {
+        contentView: mainContentView,
+        isDestroyed: () => false,
+        webContents: { isDestroyed: () => false },
+      };
+      const manager = managerWithoutConstructor({
+        attachActiveView: vi.fn(),
+        attachedView: view,
+        backgroundCaptureHost: null,
+        captureHostedView: null,
+        getWindow: () => mainWindow,
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      await expect(
+        invokePrivate(manager, 'withBackgroundCaptureHost', tab, contents, async () => 'pixels'),
+      ).rejects.toThrow(failureStage === 'main-remove' ? /main removal failed/ : /capture add failed/);
+
+      expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+      expect(captureContentView.removeChildView).toHaveBeenCalledWith(view);
+      expect(mainContentView.addChildView).toHaveBeenCalledTimes(failureStage === 'capture-add' ? 1 : 0);
+    },
+  );
+
+  it('returns a background screenshot view immediately when the user opens its tab', async () => {
+    const mainContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    const captureContentView = { addChildView: vi.fn(), removeChildView: vi.fn() };
+    electronMocks.baseWindow.mockReturnValue({
+      contentView: captureContentView,
+      destroy: vi.fn(),
+      isDestroyed: () => false,
+      setContentSize: vi.fn(),
+    });
+    const contents = { isDestroyed: () => false };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const tab = { shell: { id: 'tab-1', conversationId: 'chat-1' }, view };
+    const mainWindow = {
+      contentView: mainContentView,
+      isDestroyed: () => false,
+      webContents: { isDestroyed: () => false },
+    };
+    const captureStarted = deferred<void>();
+    const captureFinished = deferred<string>();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      backgroundCaptureHost: null,
+      captureHostedView: null,
+      getWindow: () => mainWindow,
+      mountedBounds: { x: 10, y: 20, width: 600, height: 500 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const capture = invokePrivate(manager, 'withBackgroundCaptureHost', tab, contents, async () => {
+      captureStarted.resolve();
+      return captureFinished.promise;
+    }) as Promise<string>;
+    await captureStarted.promise;
+
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+
+    expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+    expect(captureContentView.removeChildView).toHaveBeenCalledWith(view);
+    expect(mainContentView.addChildView).toHaveBeenCalledOnce();
+    expect(view.setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 600, height: 500 });
+    expect(view.setVisible).toHaveBeenLastCalledWith(true);
+
+    captureFinished.resolve('pixels');
+    await expect(capture).resolves.toBe('pixels');
+    expect(mainContentView.addChildView).toHaveBeenCalledOnce();
   });
 
   it('accepts an element-picker result only after the exact armed frame and token report a trusted point', async () => {
@@ -467,6 +1116,7 @@ describe('browser manager renderer lifecycle', () => {
     const focus = vi.fn();
     const view = {
       setBounds: vi.fn(),
+      setVisible: vi.fn(),
       webContents: { focus },
     };
     const addChildView = vi.fn();
@@ -484,7 +1134,8 @@ describe('browser manager renderer lifecycle', () => {
 
     invokePrivate(manager, 'attachActiveView', 'chat-1');
 
-    expect(addChildView).toHaveBeenCalledWith(view);
+    expect(addChildView).not.toHaveBeenCalled();
+    expect(view.setVisible).toHaveBeenCalledWith(true);
     expect(focus).not.toHaveBeenCalled();
 
     invokePrivate(manager, 'attachActiveView', 'chat-1', true);
@@ -522,6 +1173,236 @@ describe('browser manager renderer lifecycle', () => {
     expect(emitTabs).toHaveBeenCalledTimes(2);
   });
 
+  it('turns a user-selected assistant tab into a kept presentation tab', async () => {
+    const activeTabs = new Map([['chat-1', 'presented']]);
+    const tab = {
+      shell: { id: 'assistant-tab', conversationId: 'chat-1', owner: 'assistant' as const, keepOpen: false },
+      assistantOwnerId: 'run-1' as string | null,
+      aiControlOwnerId: 'run-1',
+      aiControlGeneration: 1,
+      assistantDownloadAttribution: {
+        assistantOwnerId: 'run-1',
+        trustedGestureGeneration: 2,
+      },
+      popupGesture: null,
+      trustedGestureGeneration: 2,
+      userSelectionGeneration: 0,
+      lastUsedAt: 0,
+    };
+    const download = { tabId: tab.shell.id, keepOpen: false };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      activeTabs,
+      assistantRuns: { generationIfActive: () => 1 },
+      attachActiveView: vi.fn(),
+      cancelElementPickersForConversation: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureView: vi.fn(async () => ({ webContents: {} })),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'commandTabWithinOperation', tab, 'activate', 'user');
+
+    expect(activeTabs.get('chat-1')).toBe(tab.shell.id);
+    expect(tab.shell.keepOpen).toBe(true);
+    expect(tab.shell.owner).toBe('user');
+    expect(tab.assistantOwnerId).toBeNull();
+    expect(tab.aiControlOwnerId).toBe('run-1');
+    expect(tab.trustedGestureGeneration).toBe(2);
+    expect(tab.userSelectionGeneration).toBe(1);
+    expect(invokePrivate(manager, 'assistantDownloadOwner', tab)).toBe('run-1');
+    expect(download.keepOpen).toBe(true);
+  });
+
+  it('presents an activated assistant tab without joining or blocking its AI action queue', async () => {
+    const activeAssistantWork = deferred<void>();
+    const queue = new BrowserActionQueue();
+    const running = queue.run(() => activeAssistantWork.promise);
+    const guardedContents = { isDestroyed: () => false };
+    const guardedView = { webContents: guardedContents };
+    const tab = {
+      shell: {
+        id: 'assistant-tab',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: false,
+        sensitive: false,
+      },
+      assistantOwnerId: 'run-1' as string | null,
+      aiControlOwnerId: 'run-1' as string | null,
+      aiControlGeneration: 1 as number | null,
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'guard-1' },
+      generation: 1,
+      lastUsedAt: 0,
+      queue,
+      scriptTainted: false,
+      view: guardedView as typeof guardedView | null,
+    };
+    const attachActiveView = vi.fn();
+    const ensureView = vi.fn(async () => guardedView);
+    const releaseAssistantRunDialogGuard = vi.fn();
+    const destroyView = vi.fn(() => {
+      tab.assistantNativeUiNewDocumentGuard = undefined as never;
+      tab.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'old-tab']]),
+      attachActiveView,
+      cancelElementPickersForConversation: vi.fn(),
+      destroyView,
+      detachAttachedView: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureView,
+      notifyPanelStateChanged: vi.fn(),
+      releaseAssistantRunDialogGuard,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const activation = invokePrivate(manager, 'commandTabWithinOperation', tab, 'activate', 'user') as Promise<void>;
+    await activation;
+    expect(releaseAssistantRunDialogGuard).not.toHaveBeenCalled();
+    expect(ensureView).toHaveBeenCalledOnce();
+    expect(attachActiveView).toHaveBeenCalledWith('chat-1', true);
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.aiControlOwnerId).toBe('run-1');
+    expect(tab.aiControlGeneration).toBe(1);
+
+    let laterAiWorkRan = false;
+    const laterAiWork = queue.run(async () => {
+      laterAiWorkRan = true;
+    });
+    activeAssistantWork.resolve();
+    await Promise.all([running, laterAiWork]);
+    expect(laterAiWorkRan).toBe(true);
+  });
+
+  it('treats an assistant fallback tab as an explicit user takeover when the active user tab closes', async () => {
+    const closing = {
+      scopeKey: 'global',
+      shell: {
+        id: 'user-tab',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        url: 'https://user.example',
+        title: 'User tab',
+        sensitive: false,
+      },
+    };
+    const fallback = {
+      scopeKey: 'global',
+      shell: {
+        id: 'assistant-tab',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: false,
+        url: 'https://assistant.example',
+        title: 'Assistant tab',
+        sensitive: false,
+      },
+      lastUsedAt: 0,
+    };
+    const download = { tabId: fallback.shell.id, keepOpen: false };
+    const prepareTabForUserPresentation = vi.fn(() => null);
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      activeTabs: new Map([['chat-1', closing.shell.id]]),
+      attachActiveView: vi.fn(),
+      destroyView: vi.fn(),
+      dropPendingForTab: vi.fn(),
+      emitTabs: vi.fn(),
+      mountedBounds: null,
+      mountedConversationId: null,
+      prepareTabForUserPresentation,
+      releaseScopeRuntimeWhenIdle: vi.fn(),
+      tabOrder: new Map([['chat-1', [closing.shell.id, fallback.shell.id]]]),
+      tabs: new Map<string, unknown>([
+        [closing.shell.id, closing],
+        [fallback.shell.id, fallback],
+      ]),
+    });
+
+    await invokePrivate(manager, 'commandTabWithinOperation', closing, 'close', 'user');
+
+    expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe(fallback.shell.id);
+    expect(fallback.shell.keepOpen).toBe(true);
+    expect(download.keepOpen).toBe(true);
+    expect(prepareTabForUserPresentation).toHaveBeenCalledWith(fallback);
+  });
+
+  it.each(['close-others', 'close-right'] as const)(
+    'retains the assistant tab exposed by a user %s command',
+    async (command) => {
+      const assistant = {
+        scopeKey: 'global',
+        shell: {
+          id: 'assistant-tab',
+          conversationId: 'chat-1',
+          owner: 'assistant' as const,
+          keepOpen: false,
+          url: 'https://assistant.example',
+          title: 'Assistant tab',
+          sensitive: false,
+        },
+        lastUsedAt: 0,
+      };
+      const activeUser = {
+        scopeKey: 'global',
+        shell: {
+          id: 'active-user',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          url: 'https://user.example',
+          title: 'User tab',
+          sensitive: false,
+        },
+      };
+      const other = {
+        scopeKey: 'global',
+        shell: {
+          id: 'other-user',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          url: 'https://other.example',
+          title: 'Other tab',
+          sensitive: false,
+        },
+      };
+      const order =
+        command === 'close-others'
+          ? [activeUser.shell.id, assistant.shell.id, other.shell.id]
+          : [assistant.shell.id, activeUser.shell.id, other.shell.id];
+      const download = { tabId: assistant.shell.id, keepOpen: false };
+      const prepareTabForUserPresentation = vi.fn(() => null);
+      const manager = managerWithoutConstructor({
+        activeDownloads: new Map([[{}, download]]),
+        activeTabs: new Map([['chat-1', activeUser.shell.id]]),
+        attachActiveView: vi.fn(),
+        destroyView: vi.fn(),
+        emitTabs: vi.fn(),
+        notifyPanelStateChanged: vi.fn(),
+        prepareTabForUserPresentation,
+        releaseScopeRuntimeWhenIdle: vi.fn(),
+        restoreActiveViewAfterClose: vi.fn(),
+        tabOrder: new Map([['chat-1', order]]),
+        tabs: new Map<string, unknown>([
+          [assistant.shell.id, assistant],
+          [activeUser.shell.id, activeUser],
+          [other.shell.id, other],
+        ]),
+      });
+
+      await invokePrivate(manager, 'commandTabWithinOperation', assistant, command, 'user');
+
+      expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe(assistant.shell.id);
+      expect(assistant.shell.keepOpen).toBe(true);
+      expect(download.keepOpen).toBe(true);
+      expect(prepareTabForUserPresentation).toHaveBeenCalledWith(assistant);
+    },
+  );
+
   it('updates active download retention when an assistant tab is kept open', async () => {
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: false },
@@ -539,25 +1420,193 @@ describe('browser manager renderer lifecycle', () => {
     expect(download.keepOpen).toBe(true);
   });
 
-  it.each(['activate', 'close', 'keep-open'] as const)(
-    'opens the Browser panel before an assistant %s tab command',
+  it('runs an assistant keep-open tab command without opening the Browser panel', async () => {
+    const emit = vi.fn();
+    const commandTabWithinOperation = vi.fn(async () => undefined);
+    const tab = { scopeKey: 'global', shell: { id: 'tab-1', conversationId: 'chat-1' } };
+    const manager = managerWithoutConstructor({
+      commandTabWithinOperation,
+      emit,
+      runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
+      withAssistantControl: (_tab: unknown, _run: unknown, operation: () => Promise<void>) => operation(),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<void>) => operation(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    await manager.commandTab('chat-1', 'tab-1', 'keep-open', 'assistant', { id: 'run-1' });
+
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel', conversationId: 'chat-1' }));
+    expect(commandTabWithinOperation).toHaveBeenCalled();
+  });
+
+  it('closes a background assistant tab at the shell level without entering document control', async () => {
+    const tab = {
+      scopeKey: 'global',
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: false,
+        url: 'https://private.example',
+      },
+      assistantOwnerId: 'run-1',
+      generation: 4,
+      trustedUserNavigationLease: 2,
+      trustedGestureGeneration: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const closeTab = vi.fn();
+    const withAssistantControl = vi.fn(() => {
+      throw new Error('shell close must not enter document control');
+    });
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'user-visible-tab']]),
+      closeTab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      tabOrder: new Map([['chat-1', [tab.shell.id]]]),
+      withAssistantControl,
+    });
+
+    await expect(
+      manager.commandTab('chat-1', tab.shell.id, 'close', 'assistant', { id: 'run-1' }),
+    ).resolves.toBeUndefined();
+
+    expect(withAssistantControl).not.toHaveBeenCalled();
+    expect(closeTab).toHaveBeenCalledWith(tab, true, true, false);
+  });
+
+  it('rejects assistant activation without changing presentation or opening the Browser panel', async () => {
+    const emit = vi.fn();
+    const activeTabs = new Map([['chat-1', 'presented']]);
+    const presented = { shell: { id: 'presented', conversationId: 'chat-1' } };
+    const background = { shell: { id: 'background', conversationId: 'chat-1' } };
+    const manager = managerWithoutConstructor({
+      activeTabs,
+      emit,
+      tabs: new Map([
+        ['presented', presented],
+        ['background', background],
+      ]),
+    });
+
+    await expect(manager.commandTab('chat-1', 'background', 'activate', 'assistant', { id: 'run-1' })).rejects.toThrow(
+      /remain in the background/i,
+    );
+
+    expect(activeTabs.get('chat-1')).toBe('presented');
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
+  });
+
+  it('allows assistant close of a stale selected tab while the Browser sidebar is unmounted', async () => {
+    const tab = { shell: { id: 'presented', conversationId: 'chat-1' } };
+    const closeTab = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      closeTab,
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(manager, 'commandTabWithinOperation', tab, 'close', 'assistant'),
+    ).resolves.toBeUndefined();
+    expect(closeTab).toHaveBeenCalledWith(tab, true, true, false);
+  });
+
+  it('allows assistant close of a visibly presented tab without making sidebar state an authority boundary', async () => {
+    const tab = {
+      scopeKey: 'global',
+      shell: {
+        id: 'presented',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        url: 'https://example.com',
+      },
+      assistantOwnerId: null,
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const closeTab = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      closeTab,
+      getWindow: () => visibleHostWindow(),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      manager.commandTab('chat-1', tab.shell.id, 'close', 'assistant', { id: 'run-1' }),
+    ).resolves.toBeUndefined();
+    expect(closeTab).toHaveBeenCalledWith(tab, true, true, false);
+  });
+
+  it('does not treat a minimized Browser selection as a visible-user close blocker', async () => {
+    const tab = { shell: { id: 'presented', conversationId: 'chat-1' } };
+    const closeTab = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      closeTab,
+      emitTabs: vi.fn(),
+      getWindow: () => visibleHostWindow({ isMinimized: () => true }),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(manager, 'commandTabWithinOperation', tab, 'close', 'assistant'),
+    ).resolves.toBeUndefined();
+    expect(closeTab).toHaveBeenCalledWith(tab, true, true, false);
+  });
+
+  it.each(['close-others', 'close-right'] as const)(
+    'allows assistant %s to close a presentation-active target without consulting sidebar state',
     async (command) => {
-      const emit = vi.fn();
-      const commandTabWithinOperation = vi.fn(async () => undefined);
-      const tab = { scopeKey: 'global', shell: { id: 'tab-1', conversationId: 'chat-1' } };
+      const target = {
+        scopeKey: 'global',
+        shell: { id: 'target', conversationId: 'chat-1', owner: 'user' as const, keepOpen: false },
+        assistantOwnerId: null,
+        queue: new BrowserActionQueue(),
+      };
+      const presented = {
+        scopeKey: 'global',
+        shell: { id: 'presented', conversationId: 'chat-1', owner: 'user' as const, keepOpen: false },
+        assistantOwnerId: null,
+        queue: new BrowserActionQueue(),
+      };
+      const closeTab = vi.fn();
+      const acquire = vi.fn(() => ({ generation: 1, release: vi.fn() }));
       const manager = managerWithoutConstructor({
-        commandTabWithinOperation,
-        emit,
-        runTabOperation: (_tab: unknown, operation: () => Promise<void>) => operation(),
-        withAssistantControl: (_tab: unknown, _run: unknown, operation: () => Promise<void>) => operation(),
-        withScopeActivity: (_scopeKey: string, operation: () => Promise<void>) => operation(),
-        tabs: new Map([['tab-1', tab]]),
+        activeTabs: new Map([['chat-1', presented.shell.id]]),
+        assistantRuns: {
+          acquire,
+          assertActive: () => 1,
+          generationIfActive: () => null,
+        },
+        closeTab,
+        emitTabs: vi.fn(),
+        getWindow: () => visibleHostWindow(),
+        mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+        mountedConversationId: 'chat-1',
+        runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
+        tabOrder: new Map([['chat-1', [target.shell.id, presented.shell.id]]]),
+        tabs: new Map([
+          [target.shell.id, target],
+          [presented.shell.id, presented],
+        ]),
+        withAssistantControl: (_tab: unknown, _run: unknown, operation: () => Promise<unknown>) => operation(),
       });
 
-      await manager.commandTab('chat-1', 'tab-1', command, 'assistant', { id: 'run-1' });
-
-      expect(emit).toHaveBeenCalledWith({ type: 'open-panel', conversationId: 'chat-1', tabId: 'tab-1' });
-      expect(commandTabWithinOperation).toHaveBeenCalled();
+      await expect(
+        manager.commandTab('chat-1', target.shell.id, command, 'assistant', { id: 'run-1' }),
+      ).resolves.toBeUndefined();
+      expect(closeTab).toHaveBeenCalledWith(presented, false);
+      expect(acquire).toHaveBeenCalledOnce();
     },
   );
 
@@ -656,6 +1705,232 @@ describe('browser manager renderer lifecycle', () => {
     expect(emitTabs).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps an assistant popup unthrottled through its initial hidden navigation', () => {
+    const opener = {
+      shell: { id: 'opener', conversationId: 'chat-1', owner: 'user' as const },
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      assistantOwnerId: null,
+      aiNetworkRestricted: true,
+      aiControlOwnerId: 'run-1',
+      aiControlGeneration: 7,
+      assistantScriptDepth: 0,
+      popupGesture: {
+        source: 'assistant' as const,
+        assistantOwnerId: 'run-1',
+        expiresAt: Date.now() + 1_000,
+      },
+      scriptTainted: false,
+    };
+    const tabs = new Map<string, unknown>([['opener', opener]]);
+    const tabOrder = new Map([['chat-1', ['opener']]]);
+    const setBackgroundThrottling = vi.fn();
+    const contents = { debugger: browserDebuggerMock(), isDestroyed: () => false, setBackgroundThrottling };
+    let popupOptions: Record<string, unknown> | undefined;
+    let manager!: InstanceType<typeof BrowserManager>;
+    manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'opener']]),
+      assistantRuns: { generationIfActive: () => 7 },
+      config: () => ({ enabled: true, maxTabsPerConversation: 10, aiAllowPrivateNetwork: true }),
+      createView: vi.fn((tab: { view: unknown }, options: Record<string, unknown>) => {
+        popupOptions = options;
+        const view = { webContents: contents };
+        tab.view = view;
+        invokePrivate(manager, 'enableAssistantBackgroundRendering', tab, contents);
+        return view;
+      }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      pendingTabCreations: new Map(),
+      requireLiveWindow: vi.fn(),
+      assertScopeAvailable: vi.fn(),
+      storeForScope: () => ({ getZoomLevel: () => 0 }),
+      tabs,
+      tabOrder,
+    });
+
+    const createWindow = invokePrivate(
+      manager,
+      'createPopupTab',
+      opener,
+      'https://example.com/oauth',
+      'foreground-tab',
+    ) as (options: Record<string, unknown>) => unknown;
+    const popup = tabs.get(tabOrder.get('chat-1')![1]) as {
+      aiActionDepth: number;
+      assistantPopupBootstrapPending?: boolean;
+      assistantDialogGuard?: unknown;
+      assistantRunDialogGuardLease?: symbol;
+    };
+    createWindow({ webPreferences: { disableDialogs: false } });
+
+    expect(popup.aiActionDepth).toBe(1);
+    expect(popup.assistantPopupBootstrapPending).toBe(true);
+    expect(Reflect.get(popup, 'assistantPopupDialogsDisabled')).toBe(true);
+    expect(popupOptions).toMatchObject({ webPreferences: { disableDialogs: true } });
+    expect(setBackgroundThrottling).toHaveBeenCalledWith(false);
+
+    invokePrivate(manager, 'finishAssistantPopupBootstrap', popup, contents);
+    expect(popup.aiActionDepth).toBe(0);
+    expect(popup.assistantPopupBootstrapPending).toBe(false);
+    expect(typeof popup.assistantRunDialogGuardLease).toBe('symbol');
+    expect(popup.assistantDialogGuard).toBeDefined();
+    expect(setBackgroundThrottling).toHaveBeenLastCalledWith(true);
+
+    invokePrivate(manager, 'releaseAssistantRunDialogGuard', popup);
+    expect(popup.assistantRunDialogGuardLease).toBeUndefined();
+    expect(popup.assistantDialogGuard).toBeUndefined();
+  });
+
+  it('releases a retained streaming popup bootstrap at its creating run boundary', async () => {
+    const setBackgroundThrottling = vi.fn();
+    const contents = { isDestroyed: () => false, setBackgroundThrottling };
+    const popup = {
+      shell: {
+        id: 'popup',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: true,
+      },
+      view: { webContents: contents },
+      assistantOwnerId: 'run-1',
+      assistantPopupBootstrapPending: true,
+      assistantRunDialogGuardLease: undefined as symbol | undefined,
+      assistantRenderingContents: new Set([contents]),
+      aiActionDepth: 1,
+      aiControlOwnerId: null,
+      aiControlGeneration: null,
+      popupGesture: null,
+    };
+    const manager = managerWithoutConstructor({
+      emitTabs: vi.fn(),
+      tabOrder: new Map([['chat-1', [popup.shell.id]]]),
+      tabs: new Map([[popup.shell.id, popup]]),
+    });
+    const dialogLease = invokePrivate(manager, 'acquireAssistantDialogGuard', popup, 'run-1') as {
+      token: symbol;
+    };
+    popup.assistantRunDialogGuardLease = dialogLease.token;
+
+    await invokePrivate(manager, 'cleanupAssistantStateOwnedByRun', 'chat-1', 'run-1');
+
+    expect(popup.assistantPopupBootstrapPending).toBe(false);
+    expect(popup.aiActionDepth).toBe(0);
+    expect(popup.assistantRenderingContents).toBeUndefined();
+    expect(Reflect.get(popup, 'assistantDialogGuard')).toBeUndefined();
+    expect(setBackgroundThrottling).toHaveBeenCalledWith(true);
+  });
+
+  it('does not recreate a dialog-disabled popup while user presentation and queued AI work overlap', async () => {
+    const releaseAction = deferred<void>();
+    const bootstrapDrain = deferred<void>();
+    const queue = new BrowserActionQueue();
+    const activeAction = queue.run(() => releaseAction.promise);
+    const contents = { isDestroyed: () => false };
+    const popup = {
+      generation: 4,
+      shell: {
+        id: 'popup',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: false,
+        discarded: false,
+        sensitive: false,
+      },
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+      assistantPopupBootstrapPending: false,
+      assistantPopupBootstrapDrain: bootstrapDrain.promise,
+      assistantPopupDialogsDisabled: true,
+      assistantOwnerId: 'run-1' as string | null,
+      aiControlOwnerId: 'run-1',
+      trustedGestureGeneration: 0,
+      queue,
+    };
+    const destroyView = vi.fn((tab: typeof popup) => {
+      tab.view = null;
+    });
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      destroyView,
+      emitTabs,
+      tabs: new Map([[popup.shell.id, popup]]),
+    });
+
+    invokePrivate(manager, 'takeOverTabForUser', popup);
+
+    expect(popup.shell.keepOpen).toBe(true);
+    expect(popup.shell.owner).toBe('user');
+    expect(popup.assistantOwnerId).toBeNull();
+    expect(popup.aiControlOwnerId).toBe('run-1');
+    expect(popup.assistantPopupDialogsDisabled).toBe(true);
+    expect(popup.generation).toBe(4);
+    expect(destroyView).not.toHaveBeenCalled();
+
+    let laterBackgroundWorkCompleted = false;
+    const laterBackgroundWork = queue.run(async () => {
+      laterBackgroundWorkCompleted = true;
+    });
+
+    releaseAction.resolve();
+    await Promise.all([activeAction, laterBackgroundWork]);
+    await Promise.resolve();
+    expect(laterBackgroundWorkCompleted).toBe(true);
+    expect(destroyView).not.toHaveBeenCalled();
+
+    bootstrapDrain.resolve();
+    await Promise.resolve();
+    expect(popup.assistantPopupDialogsDisabled).toBe(true);
+    expect(popup.generation).toBe(4);
+    expect(popup.shell.discarded).toBe(false);
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(emitTabs).not.toHaveBeenCalled();
+  });
+
+  it('ends a streaming popup bootstrap immediately when the user presents it', async () => {
+    const bootstrapDrain = deferred<void>();
+    const setBackgroundThrottling = vi.fn();
+    const contents = { isDestroyed: () => false, setBackgroundThrottling };
+    const popup = {
+      generation: 1,
+      shell: {
+        id: 'popup',
+        conversationId: 'chat-1',
+        owner: 'assistant' as const,
+        keepOpen: false,
+        discarded: false,
+        sensitive: false,
+      },
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+      assistantPopupBootstrapPending: true,
+      assistantPopupBootstrapDrain: bootstrapDrain.promise,
+      resolveAssistantPopupBootstrap: bootstrapDrain.resolve,
+      assistantPopupDialogsDisabled: true,
+      assistantRenderingContents: new Set([contents]),
+      assistantOwnerId: 'run-1' as string | null,
+      aiActionDepth: 1,
+      aiControlOwnerId: 'run-1',
+      trustedGestureGeneration: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const destroyView = vi.fn((tab: typeof popup) => {
+      tab.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      destroyView,
+      emitTabs: vi.fn(),
+      tabs: new Map([[popup.shell.id, popup]]),
+    });
+
+    invokePrivate(manager, 'takeOverTabForUser', popup);
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(popup.assistantPopupBootstrapPending).toBe(false);
+    expect(popup.assistantPopupBootstrapDrain).toBeUndefined();
+    expect(popup.aiActionDepth).toBe(0);
+    expect(setBackgroundThrottling).toHaveBeenCalledWith(true);
+    expect(popup.assistantPopupDialogsDisabled).toBe(true);
+    expect(destroyView).not.toHaveBeenCalled();
+  });
+
   it('denies popups from an evaluated renderer before creating an unguarded WebContents', () => {
     const opener = {
       shell: { id: 'opener', conversationId: 'chat-1', owner: 'user' as const },
@@ -733,10 +2008,81 @@ describe('browser manager renderer lifecycle', () => {
     };
     const tabs = new Map<string, unknown>([['opener', opener]]);
     const tabOrder = new Map([['chat-1', ['opener']]]);
+    const activeTabs = new Map([['chat-1', 'opener']]);
+    const attachActiveView = vi.fn();
     const manager = managerWithoutConstructor({
-      activeTabs: new Map([['chat-1', 'opener']]),
+      activeTabs,
       assistantRuns: { generationIfActive: () => 1 },
-      attachActiveView: vi.fn(),
+      attachActiveView,
+      config: () => ({ enabled: true, maxTabsPerConversation: 10, aiAllowPrivateNetwork: true }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      pendingTabCreations: new Map(),
+      requireLiveWindow: vi.fn(),
+      assertScopeAvailable: vi.fn(),
+      createView: vi.fn((tab: { view?: unknown }) => {
+        const view = {
+          webContents: { debugger: browserDebuggerMock(), id: 99, isDestroyed: () => false },
+        };
+        tab.view = view;
+        return view;
+      }),
+      storeForScope: () => ({ getZoomLevel: () => 0 }),
+      tabs,
+      tabOrder,
+    });
+
+    const createWindow = invokePrivate(
+      manager,
+      'createPopupTab',
+      opener,
+      'https://popup.example',
+      'foreground-tab',
+      8,
+    ) as (options: Record<string, unknown>) => unknown;
+    expect(createWindow).toBeTypeOf('function');
+
+    const popupId = tabOrder.get('chat-1')?.[1];
+    expect(tabs.get(popupId!)).toMatchObject({
+      assistantOwnerId: 'run-1',
+      shell: { owner: 'assistant' },
+    });
+    createWindow({});
+    expect(activeTabs.get('chat-1')).toBe('opener');
+    expect(attachActiveView).not.toHaveBeenCalled();
+  });
+
+  it('keeps delayed assistant popups run-owned when a later user gesture overlaps in the same frame', () => {
+    const opener = {
+      shell: { id: 'opener', conversationId: 'chat-1', owner: 'user' as const },
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      assistantOwnerId: null,
+      aiNetworkRestricted: true,
+      aiControlOwnerId: 'run-1',
+      aiControlGeneration: 1,
+      assistantScriptDepth: 0,
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 5_000,
+        frameTreeNodeId: 7,
+        kind: 'pointerdown' as const,
+      },
+      assistantGesture: {
+        assistantOwnerId: 'run-1',
+        expiresAt: Date.now() + 5_000,
+        frameTreeNodeId: 7,
+        kind: 'pointerdown' as const,
+      },
+      scriptTainted: false,
+    };
+    const tabs = new Map<string, unknown>([['opener', opener]]);
+    const tabOrder = new Map([['chat-1', ['opener']]]);
+    const activeTabs = new Map([['chat-1', 'opener']]);
+    const manager = managerWithoutConstructor({
+      activeTabs,
+      assistantRuns: { generationIfActive: () => 1 },
       config: () => ({ enabled: true, maxTabsPerConversation: 10, aiAllowPrivateNetwork: true }),
       emit: vi.fn(),
       emitTabs: vi.fn(),
@@ -748,15 +2094,19 @@ describe('browser manager renderer lifecycle', () => {
       tabOrder,
     });
 
-    expect(invokePrivate(manager, 'createPopupTab', opener, 'https://popup.example', 'foreground-tab', 8)).toBeTypeOf(
+    expect(invokePrivate(manager, 'createPopupTab', opener, 'https://delayed.example', 'foreground-tab', 7)).toBeTypeOf(
       'function',
     );
 
     const popupId = tabOrder.get('chat-1')?.[1];
     expect(tabs.get(popupId!)).toMatchObject({
       assistantOwnerId: 'run-1',
+      aiNetworkRestricted: true,
       shell: { owner: 'assistant' },
     });
+    expect(activeTabs.get('chat-1')).toBe('opener');
+    expect(opener.popupGesture).toBeNull();
+    expect(opener.assistantGesture).toBeNull();
   });
 
   it('allows only an exact user popup after a completed run leaves the opener network-restricted', () => {
@@ -952,6 +2302,422 @@ describe('browser manager renderer lifecycle', () => {
     ]);
   });
 
+  it('reconciles pruned quarantine files without publishing them as new shelf downloads', async () => {
+    const emit = vi.fn();
+    const path = '/tmp/Kai-00000000-0000-4000-8000-000000000001.download';
+    const clearQuarantinedDownloadPath = vi.fn(() => ({
+      id: '00000000-0000-4000-8000-000000000001',
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed' as const,
+      quarantined: true,
+    }));
+    const flushDownloads = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      downloads: new Map([
+        [
+          '00000000-0000-4000-8000-000000000001',
+          {
+            scopeKey: 'global',
+            id: '00000000-0000-4000-8000-000000000001',
+            path,
+          },
+        ],
+      ]),
+      getConfig: () => ({ browser: { dataScope: 'global' } }),
+      stores: new Map([['global', { clearQuarantinedDownloadPath, flushDownloads }]]),
+      tabOrder: new Map([['chat-1', []]]),
+      emit,
+    });
+
+    await (invokePrivate(manager, 'reconcilePrunedAssistantDownloads', 'global', [
+      { id: '00000000-0000-4000-8000-000000000001', path },
+    ]) as Promise<void>);
+
+    expect(clearQuarantinedDownloadPath).toHaveBeenCalledWith('00000000-0000-4000-8000-000000000001', path);
+    expect(flushDownloads).toHaveBeenCalledOnce();
+    expect(
+      (Reflect.get(manager, 'downloads') as Map<string, unknown>).has('00000000-0000-4000-8000-000000000001'),
+    ).toBe(false);
+    expect(emit.mock.calls.map(([event]) => event)).toEqual([
+      {
+        type: 'download-history-changed',
+        conversationId: 'chat-1',
+        downloadId: '00000000-0000-4000-8000-000000000001',
+        change: 'unavailable',
+      },
+    ]);
+  });
+
+  it('reconciles persisted quarantine metadata when an earlier process already removed the file', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-stale-quarantine-metadata-'));
+    const id = '00000000-0000-4000-8000-000000000001';
+    const path = assistantDownloadQuarantinePath(appHome, 'global', id);
+    mkdirSync(assistantDownloadQuarantineDirectory(appHome, 'global'), { recursive: true });
+    writeFileSync(path, 'removed before metadata flush');
+    const firstManager = managerWithoutConstructor({ appHome });
+    const firstStore = invokePrivate(firstManager, 'storeForScope', 'global') as {
+      addDownload(download: Record<string, unknown>): void;
+      flushDownloads(): Promise<void>;
+    };
+    firstStore.addDownload({
+      id,
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 29,
+      totalBytes: 29,
+      state: 'completed',
+      quarantined: true,
+      path,
+    });
+    await firstStore.flushDownloads();
+    rmSync(path);
+
+    const restartedManager = managerWithoutConstructor({ appHome });
+    await (invokePrivate(restartedManager, 'reconcileAssistantDownloadQuarantineAtStartup') as Promise<void>);
+    const restartedStore = invokePrivate(restartedManager, 'storeForScope', 'global') as {
+      listDownloads(): Array<{ id: string; path?: string }>;
+      flushDownloads(): Promise<void>;
+    };
+
+    expect(restartedStore.listDownloads()).toContainEqual(expect.objectContaining({ id }));
+    expect(restartedStore.listDownloads().find((download) => download.id === id)?.path).toBeUndefined();
+    await restartedStore.flushDownloads();
+    rmSync(appHome, { recursive: true, force: true });
+  });
+
+  it('marks crash-persisted assistant downloads interrupted and removes their partial files', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-interrupted-quarantine-'));
+    const id = '00000000-0000-4000-8000-000000000001';
+    const path = assistantDownloadQuarantinePath(appHome, 'global', id);
+    mkdirSync(assistantDownloadQuarantineDirectory(appHome, 'global'), { recursive: true });
+    const chromiumPartialPath = `${path}.crdownload`;
+    writeFileSync(chromiumPartialPath, 'partial download');
+    const firstManager = managerWithoutConstructor({ appHome });
+    const firstStore = invokePrivate(firstManager, 'storeForScope', 'global') as {
+      addDownload(download: Record<string, unknown>): void;
+      flushDownloads(): Promise<void>;
+    };
+    firstStore.addDownload({
+      id,
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 8,
+      totalBytes: 32,
+      state: 'progressing',
+      quarantined: true,
+    });
+    await firstStore.flushDownloads();
+
+    const restartedManager = managerWithoutConstructor({ appHome });
+    await (invokePrivate(restartedManager, 'reconcileAssistantDownloadQuarantineAtStartup') as Promise<void>);
+    const restartedStore = invokePrivate(restartedManager, 'storeForScope', 'global') as {
+      listDownloads(): Array<{ id: string; path?: string; state: string }>;
+    };
+
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(chromiumPartialPath)).toBe(false);
+    expect(restartedStore.listDownloads()).toContainEqual(
+      expect.objectContaining({ id, state: 'interrupted', quarantined: true }),
+    );
+    expect(restartedStore.listDownloads().find((download) => download.id === id)?.path).toBeUndefined();
+    rmSync(appHome, { recursive: true, force: true });
+  });
+
+  it('continues startup download recovery after an earlier profile fails', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-quarantine-profile-isolation-'));
+    const profiles = join(appHome, 'browser', 'profiles');
+    mkdirSync(profiles, { recursive: true });
+    writeFileSync(join(profiles, 'global.json'), '{}');
+    const id = '00000000-0000-4000-8000-000000000001';
+    writeFileSync(
+      join(profiles, 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa.downloads.json'),
+      JSON.stringify({
+        version: 1,
+        downloads: [
+          {
+            id,
+            tabId: 'tab-1',
+            filename: 'report.pdf',
+            receivedBytes: 8,
+            totalBytes: 32,
+            state: 'progressing',
+            quarantined: true,
+          },
+        ],
+      }),
+    );
+    const markQuarantinedDownloadInterrupted = vi.fn(() => ({ id, state: 'interrupted' }));
+    const flushDownloads = vi.fn(async () => undefined);
+    const healthyStore = {
+      listDownloads: () => [
+        {
+          id,
+          tabId: 'tab-1',
+          filename: 'report.pdf',
+          receivedBytes: 8,
+          totalBytes: 32,
+          state: 'progressing' as const,
+          quarantined: true,
+        },
+      ],
+      markQuarantinedDownloadInterrupted,
+      clearQuarantinedDownloadPath: vi.fn(),
+      flushDownloads,
+    };
+    const storeForScope = vi.fn(() => healthyStore);
+    const manager = managerWithoutConstructor({ appHome, storeForScope });
+
+    await expect(
+      invokePrivate(manager, 'reconcileAssistantDownloadQuarantineAtStartup') as Promise<void>,
+    ).rejects.toThrow(/one or more Browser profiles/i);
+
+    expect(storeForScope).toHaveBeenCalledOnce();
+    expect(storeForScope).toHaveBeenCalledWith('conversation-aaaaaaaaaaaaaaaaaaaaaaaa', true);
+    expect(markQuarantinedDownloadInterrupted).toHaveBeenCalledWith(id);
+    expect(flushDownloads).toHaveBeenCalledOnce();
+    rmSync(appHome, { recursive: true, force: true });
+  });
+
+  it('allows a focused detached Downloads manager to export after startup recovery rejects', async () => {
+    const appHome = '/tmp/kai-browser-rejected-startup-recovery';
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const download = {
+      id: downloadId,
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 15,
+      totalBytes: 15,
+      state: 'completed' as const,
+      quarantined: true,
+      path: source,
+      scopeKey: 'global',
+    };
+    electronMocks.showSaveDialog.mockResolvedValue({ canceled: true });
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([[downloadId, download]]),
+      startupDownloadReconciliation: Promise.reject(new Error('corrupt crash-left journal')),
+    });
+
+    await expect(manager.exportDownload('chat-1', downloadId)).resolves.toEqual({ canceled: true });
+    expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce();
+  });
+
+  it('does not open an export dialog after startup recovery if Browser chrome lost focus', async () => {
+    const appHome = '/tmp/kai-browser-unfocused-after-startup-recovery';
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const startupRecovery = deferred<void>();
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([
+        [
+          downloadId,
+          {
+            id: downloadId,
+            tabId: 'tab-1',
+            filename: 'report.pdf',
+            receivedBytes: 15,
+            totalBytes: 15,
+            state: 'completed' as const,
+            quarantined: true,
+            path: source,
+            scopeKey: 'global',
+          },
+        ],
+      ]),
+      startupDownloadReconciliation: startupRecovery.promise,
+    });
+
+    const exporting = manager.exportDownload('chat-1', downloadId);
+    Reflect.set(manager, 'chromeFocusConversationId', null);
+    startupRecovery.resolve();
+
+    await expect(exporting).resolves.toEqual({ canceled: true });
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not open an export dialog after startup recovery if Kai became hidden', async () => {
+    const appHome = '/tmp/kai-browser-hidden-after-startup-recovery';
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const startupRecovery = deferred<void>();
+    let interactive = true;
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([
+        [
+          downloadId,
+          {
+            id: downloadId,
+            tabId: 'tab-1',
+            filename: 'report.pdf',
+            receivedBytes: 15,
+            totalBytes: 15,
+            state: 'completed' as const,
+            quarantined: true,
+            path: source,
+            scopeKey: 'global',
+          },
+        ],
+      ]),
+      isHostWindowInteractive: () => interactive,
+      startupDownloadReconciliation: startupRecovery.promise,
+    });
+
+    const exporting = manager.exportDownload('chat-1', downloadId);
+    interactive = false;
+    startupRecovery.resolve();
+
+    await expect(exporting).resolves.toEqual({ canceled: true });
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
+  });
+
+  it('leases a quarantined download before showing the export dialog so quota pruning cannot remove it', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-export-lease-'));
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const directory = assistantDownloadQuarantineDirectory(appHome, 'global');
+    const source = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    const destination = join(appHome, 'exported-report.pdf');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(source, 'leased contents');
+    utimesSync(source, new Date(1_000), new Date(1_000));
+    for (let index = 2; index <= 26; index++) {
+      const id = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+      const path = assistantDownloadQuarantinePath(appHome, 'global', id);
+      writeFileSync(path, String(index));
+      utimesSync(path, new Date(2_000 + index), new Date(2_000 + index));
+    }
+    const selected = deferred<{ canceled: boolean; filePath?: string }>();
+    electronMocks.showSaveDialog.mockReturnValue(selected.promise);
+    const download = {
+      id: downloadId,
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 15,
+      totalBytes: 15,
+      state: 'completed' as const,
+      quarantined: true,
+      path: source,
+    };
+    const manager = managerWithoutConstructor({
+      appHome,
+      chromeFocusConversationId: 'chat-1',
+      dataScope: 'global',
+      downloads: new Map([[downloadId, { ...download, scopeKey: 'global' }]]),
+    });
+
+    try {
+      const exporting = manager.exportDownload('chat-1', downloadId);
+      await vi.waitFor(() => expect(electronMocks.showSaveDialog).toHaveBeenCalledOnce());
+
+      const protectedPaths = invokePrivate(manager, 'protectedAssistantDownloadPaths', 'global') as Set<string>;
+      expect(protectedPaths).toContain(source);
+      pruneAssistantDownloadQuarantine(appHome, 'global', protectedPaths);
+      expect(existsSync(source)).toBe(true);
+
+      selected.resolve({ canceled: false, filePath: destination });
+      await expect(exporting).resolves.toEqual({ filePath: destination });
+      expect(readFileSync(destination, 'utf8')).toBe('leased contents');
+      expect(Reflect.get(manager, 'downloadExportLeases')).toHaveLength(0);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
+  });
+
+  it('emits a deletion receipt instead of republishing deleted download metadata', async () => {
+    const emit = vi.fn();
+    const removeDownload = vi.fn();
+    const flushDownloads = vi.fn(async () => undefined);
+    const download = {
+      id: 'download-1',
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed' as const,
+    };
+    const manager = managerWithoutConstructor({
+      downloads: new Map([['download-1', { ...download, scopeKey: 'global' }]]),
+      getConfig: () => ({ browser: { dataScope: 'global' } }),
+      stores: new Map([['global', { listDownloads: () => [download], removeDownload, flushDownloads }]]),
+      tabOrder: new Map([['chat-1', []]]),
+      emit,
+    });
+
+    await manager.deleteDownload('chat-1', 'download-1');
+
+    expect(removeDownload).toHaveBeenCalledWith('download-1');
+    expect(flushDownloads).toHaveBeenCalledOnce();
+    expect(emit.mock.calls.map(([event]) => event)).toEqual([
+      {
+        type: 'download-history-changed',
+        conversationId: 'chat-1',
+        downloadId: 'download-1',
+        change: 'deleted',
+      },
+    ]);
+  });
+
+  it('re-reads terminal download metadata after cancellation before deleting quarantine files', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-delete-download-race-'));
+    const downloadId = '00000000-0000-4000-8000-000000000001';
+    const path = assistantDownloadQuarantinePath(appHome, 'global', downloadId);
+    mkdirSync(assistantDownloadQuarantineDirectory(appHome, 'global'), { recursive: true });
+    writeFileSync(path, 'completed during cancellation');
+    const initial = {
+      id: downloadId,
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 0,
+      totalBytes: 28,
+      state: 'progressing' as 'progressing' | 'completed',
+      quarantined: true,
+      scopeKey: 'global',
+      path: undefined as string | undefined,
+    };
+    const downloads = new Map([[downloadId, initial]]);
+    const removeDownload = vi.fn();
+    const flushDownloads = vi.fn(async () => undefined);
+    const active = {
+      id: downloadId,
+      scopeKey: 'global',
+      cancel: vi.fn(async () => {
+        downloads.set(downloadId, {
+          ...initial,
+          receivedBytes: 28,
+          state: 'completed',
+          path,
+        });
+      }),
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, active]]),
+      appHome,
+      downloads,
+      getConfig: () => ({ browser: { dataScope: 'global' } }),
+      stores: new Map([['global', { listDownloads: () => [], removeDownload, flushDownloads }]]),
+      tabOrder: new Map([['chat-1', []]]),
+    });
+
+    await manager.deleteDownload('chat-1', downloadId);
+
+    expect(active.cancel).toHaveBeenCalledOnce();
+    expect(existsSync(path)).toBe(false);
+    expect(removeDownload).toHaveBeenCalledWith(downloadId);
+    rmSync(appHome, { recursive: true, force: true });
+  });
+
   it('broadcasts asynchronous profile errors across a shared scope', () => {
     const emit = vi.fn();
     const manager = managerWithoutConstructor({
@@ -1005,11 +2771,12 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
 
-    invokePrivate(manager, 'armAutomationGesture', tab, contents, {
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
       kind: 'pointerdown',
       x: 10,
       y: 20,
     });
+    invokePrivate(manager, 'publishAutomationGestureArm', contents, arm);
 
     expect(send).toHaveBeenCalledWith(
       'browser-page:arm-automation-input',
@@ -1021,6 +2788,7 @@ describe('browser manager renderer lifecycle', () => {
         screenY: 270,
       }),
     );
+    invokePrivate(manager, 'revokeAutomationGestureToken', (arm as { token: string }).token);
   });
 
   it('keeps typed plaintext in main instead of broadcasting it to page frames', () => {
@@ -1041,70 +2809,731 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
 
-    invokePrivate(manager, 'armAutomationGesture', tab, contents, {
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
       kind: 'input',
       inputType: 'insertText',
       data: 'assistant text',
     });
+    invokePrivate(manager, 'publishAutomationGestureArm', contents, arm);
 
     const published = send.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(published).toMatchObject({ kind: 'input', inputType: 'insertText' });
     expect(published).not.toHaveProperty('data');
     const pending = [...(Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>).values()];
     expect(pending).toEqual([expect.objectContaining({ inputData: 'assistant text' })]);
+    invokePrivate(manager, 'revokeAutomationGestureToken', (arm as { token: string }).token);
   });
 
-  it('publishes pointer provenance only from the exact synchronous before-mouse callback', () => {
-    const send = vi.fn();
-    const manager = managerWithoutConstructor({
-      attachedView: null,
-      automationGestureTokens: new Map(),
-      pendingSyntheticInputs: new Map(),
-      getWindow: () => null,
-    });
+  it('erases confirmed background text attribution without restoring stale user provenance after dispatch', async () => {
+    const previousGesture = {
+      source: 'user' as const,
+      assistantOwnerId: null,
+      expiresAt: Date.now() + 1_000,
+      kind: 'pointerdown' as const,
+    };
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: {
+        framesInSubtree: [{ detached: false, isDestroyed: () => false, send: vi.fn() }],
+      },
+    };
+    const view = { webContents: contents };
     const tab = {
       shell: { id: 'tab-1' },
       aiControlOwnerId: 'run-1',
-      popupGesture: {
-        source: 'user' as const,
-        assistantOwnerId: null,
-        expiresAt: Date.now() + 1_000,
-      },
-      view: null,
+      popupGesture: previousGesture,
+      view,
     };
-    const beforeEvent = { preventDefault: vi.fn() };
+    let manager!: InstanceType<typeof BrowserManager>;
+    const dispatchCdpInputCommand = vi.fn(async (...args: unknown[]) => invokeCdpBeforeDispatch(args));
+    manager = managerWithoutConstructor({
+      attachedView: view,
+      automationGestureTokens: new Map(),
+      assertAutomationGestureReadyForDispatch: vi.fn(),
+      dispatchCdpInputCommand,
+      publishAutomationGestureArmAndWait: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      waitForAutomationGestureConfirmation: vi.fn(async () => {
+        const pending = [...(Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>).values()][0];
+        Reflect.set(pending!, 'confirmed', true);
+        throw new Error('The page navigated while this assistant operation was waiting.');
+      }),
+    });
+
+    await expect(
+      invokePrivate(manager, 'insertAttributedText', tab, contents, 'TOP_SECRET') as Promise<void>,
+    ).rejects.toThrow(/page navigated/i);
+
+    expect(dispatchCdpInputCommand).toHaveBeenCalledWith(
+      tab,
+      contents,
+      { method: 'Input.insertText', params: { text: 'TOP_SECRET' } },
+      undefined,
+      undefined,
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(Reflect.get(manager, 'automationGestureTokens')).toHaveLength(0);
+    expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(0);
+    expect(tab.popupGesture).toMatchObject({
+      source: 'assistant',
+      assistantOwnerId: 'run-1',
+      kind: 'input',
+    });
+    expect(tab.popupGesture).not.toBe(previousGesture);
+    expect(JSON.stringify(Reflect.get(manager, 'automationGestureTokens'))).not.toContain('TOP_SECRET');
+  });
+
+  it('waits for exact frame-arm acknowledgement before background text dispatch', async () => {
+    const acknowledgement = deferred<void>();
+    const dispatchCdpInputCommand = vi.fn(async () => undefined);
     const contents = {
       id: 42,
-      getZoomFactor: () => 1,
-      mainFrame: {
-        framesInSubtree: [{ detached: false, isDestroyed: () => false, send }],
-      },
-      sendInputEvent: vi.fn((input: { type: Electron.InputEvent['type'] }) => {
-        // The preload has not received a shape token while a physical user
-        // event could race the queued synthetic click.
-        expect(send).not.toHaveBeenCalled();
-        invokePrivate(manager, 'handlePendingSyntheticInput', tab, contents, beforeEvent, input.type);
-      }),
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [] },
     };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      attachedView: view,
+      assertAutomationGestureReadyForDispatch: vi.fn(),
+      consumeAutomationGestureConfirmation: vi.fn(() => true),
+      dispatchCdpInputCommand,
+      publishAutomationGestureArmAndWait: vi.fn(() => acknowledgement.promise),
+      waitForAutomationGestureConfirmation: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const typing = invokePrivate(manager, 'insertAttributedText', tab, contents, 'Kai') as Promise<void>;
+    await Promise.resolve();
+    expect(dispatchCdpInputCommand).not.toHaveBeenCalled();
+
+    acknowledgement.resolve();
+    await typing;
+    expect(dispatchCdpInputCommand).toHaveBeenCalledWith(
+      tab,
+      contents,
+      { method: 'Input.insertText', params: { text: 'Kai' } },
+      undefined,
+      undefined,
+      expect.any(Function),
+      expect.any(Function),
+    );
+  });
+
+  it('uses real-clock timestamped key events for short text on a presented page', async () => {
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [] },
+    };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view,
+    };
+    let manager!: InstanceType<typeof BrowserManager>;
+    const dispatchCdpInputCommand = vi.fn(async (...args: unknown[]) => invokeCdpBeforeDispatch(args));
+    manager = managerWithoutConstructor({
+      attachedView: view,
+      attachActiveView: vi.fn(),
+      dispatchCdpInputCommand,
+      isTargetViewPresented: () => true,
+      publishAutomationGestureArmAndWait: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      waitForAutomationGestureConfirmation: vi.fn(async () => {
+        const pending = [...(Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>).values()][0];
+        Reflect.set(pending!, 'confirmed', true);
+      }),
+    });
+    const revalidate = vi.fn(async () => undefined);
+
+    await expect(
+      invokePrivate(manager, 'insertAttributedText', tab, contents, 'Kai', undefined, undefined, revalidate),
+    ).resolves.toBeUndefined();
+
+    const commands = dispatchCdpInputCommand.mock.calls.map((call) => call[2]) as Array<{
+      method: string;
+      params: { key: string; text: string; timestamp: number; type: string; unmodifiedText: string };
+    }>;
+    expect(commands).toHaveLength(3);
+    expect(
+      commands.map(({ method, params }) => ({
+        method,
+        key: params.key,
+        text: params.text,
+        type: params.type,
+        unmodifiedText: params.unmodifiedText,
+      })),
+    ).toEqual([
+      { method: 'Input.dispatchKeyEvent', key: 'K', text: 'K', type: 'keyDown', unmodifiedText: 'K' },
+      { method: 'Input.dispatchKeyEvent', key: 'a', text: 'a', type: 'keyDown', unmodifiedText: 'a' },
+      { method: 'Input.dispatchKeyEvent', key: 'i', text: 'i', type: 'keyDown', unmodifiedText: 'i' },
+    ]);
+    for (const command of commands) {
+      expect(Math.abs(command.params.timestamp - Date.now() / 1_000)).toBeLessThanOrEqual(0.05);
+    }
+    expect(commands[1]!.params.timestamp).toBeGreaterThanOrEqual(commands[0]!.params.timestamp);
+    expect(commands[2]!.params.timestamp).toBeGreaterThanOrEqual(commands[1]!.params.timestamp);
+    expect(revalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it('inserts paste-sized text on a presented page with one exact-data attribution cycle', async () => {
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [] },
+    };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view,
+    };
+    let manager!: InstanceType<typeof BrowserManager>;
+    const dispatchCdpInputCommand = vi.fn(async (...args: unknown[]) => invokeCdpBeforeDispatch(args));
+    const publishAutomationGestureArmAndWait = vi.fn(async () => undefined);
+    manager = managerWithoutConstructor({
+      attachedView: view,
+      attachActiveView: vi.fn(),
+      dispatchCdpInputCommand,
+      isTargetViewPresented: () => true,
+      publishAutomationGestureArmAndWait,
+      tabs: new Map([[tab.shell.id, tab]]),
+      waitForAutomationGestureConfirmation: vi.fn(async () => {
+        const pending = [...(Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>).values()][0];
+        Reflect.set(pending!, 'confirmed', true);
+      }),
+    });
+    const revalidate = vi.fn(async () => undefined);
+    const text = 'A long foreground value that should be inserted atomically without per-character CDP cycles.';
+
+    await expect(
+      invokePrivate(manager, 'insertAttributedText', tab, contents, text, undefined, undefined, revalidate),
+    ).resolves.toBeUndefined();
+
+    expect(publishAutomationGestureArmAndWait).toHaveBeenCalledOnce();
+    expect(dispatchCdpInputCommand).toHaveBeenCalledOnce();
+    expect(dispatchCdpInputCommand).toHaveBeenCalledWith(
+      tab,
+      contents,
+      { method: 'Input.insertText', params: { text } },
+      undefined,
+      undefined,
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(revalidate).toHaveBeenCalledOnce();
+  });
+
+  it('waits for every live frame to acknowledge background input provenance', async () => {
+    const frame = (frameTreeNodeId: number, processId: number, routingId: number) => ({
+      detached: false,
+      frameToken: `frame-${frameTreeNodeId}`,
+      frameTreeNodeId,
+      isDestroyed: () => false,
+      processId,
+      routingId,
+      send: vi.fn(),
+    });
+    const firstFrame = frame(101, 7, 11);
+    const secondFrame = frame(102, 8, 12);
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [firstFrame, secondFrame] },
+    };
+    const tab = {
+      shell: { id: 'tab-1' },
+      aiControlOwnerId: 'run-1',
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      automationGestureTokens: new Map(),
+      pendingAutomationArmAcknowledgements: new Map(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
+      kind: 'pointerdown',
+    }) as { token: string };
+    let finished = false;
+    const pending = (
+      invokePrivate(manager, 'publishAutomationGestureArmAndWait', tab, contents, arm) as Promise<void>
+    ).then(() => {
+      finished = true;
+    });
+    await Promise.resolve();
+
+    expect(firstFrame.send).toHaveBeenCalledWith('browser-page:arm-automation-input', arm);
+    expect(secondFrame.send).toHaveBeenCalledWith('browser-page:arm-automation-input', arm);
+    invokePrivate(
+      manager,
+      'acknowledgeAutomationInputArm',
+      { sender: contents, senderFrame: firstFrame },
+      { token: arm.token },
+    );
+    await Promise.resolve();
+    expect(finished).toBe(false);
 
     invokePrivate(
+      manager,
+      'acknowledgeAutomationInputArm',
+      { sender: contents, senderFrame: secondFrame },
+      { token: arm.token },
+    );
+    await pending;
+    expect(finished).toBe(true);
+    invokePrivate(manager, 'revokeAutomationGestureToken', arm.token);
+  });
+
+  it('uses attributed CDP input even when the Browser page is mounted and focused', async () => {
+    const sendInputEvent = vi.fn();
+    const contents = { id: 42, isDestroyed: () => false, mainFrame: { framesInSubtree: [] }, sendInputEvent };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view,
+    };
+    let manager!: InstanceType<typeof BrowserManager>;
+    const tombstoneSeenBeforeDispatch = vi.fn();
+    const dispatchCdpInputCommand = vi.fn(async (...args: unknown[]) => {
+      invokeCdpBeforeDispatch(args);
+      tombstoneSeenBeforeDispatch(Reflect.get(manager, 'dispatchedSyntheticInputs').get(contents.id));
+      const pending = [...Reflect.get(manager, 'automationGestureTokens').values()][0];
+      pending.confirmed = true;
+      pending.settleConfirmation?.(true);
+    });
+    const publishAutomationGestureArmAndWait = vi.fn(async () => undefined);
+    manager = managerWithoutConstructor({
+      attachedView: view,
+      dispatchCdpInputCommand,
+      isTargetViewPresented: () => true,
+      isTargetViewInteractive: () => true,
+      publishAutomationGestureArmAndWait,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'sendAttributedInputEvent',
+        tab,
+        contents,
+        { kind: 'pointerdown', x: 10, y: 20 },
+        { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1 },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 10, y: 20 } },
+      ) as Promise<void>,
+    ).resolves.toBeUndefined();
+
+    expect(sendInputEvent).not.toHaveBeenCalled();
+    expect(dispatchCdpInputCommand).toHaveBeenCalledOnce();
+    expect(tombstoneSeenBeforeDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ tabId: tab.shell.id, contents, kind: 'pointerdown' }),
+    );
+    expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(0);
+    expect(publishAutomationGestureArmAndWait).toHaveBeenCalledWith(
+      tab,
+      contents,
+      expect.objectContaining({ kind: 'pointerdown', x: 10, y: 20 }),
+      undefined,
+      undefined,
+      false,
+    );
+    expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+  });
+
+  it('does not let concurrent visible user input swap assistant provenance across CDP dispatch', () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: contents },
+      aiControlOwnerId: 'run-1',
+      trustedGestureGeneration: 0,
+      popupGesture: null as null | { source: 'assistant' | 'user'; assistantOwnerId: string | null },
+    };
+    const pending = {
+      tabId: tab.shell.id,
+      contentsId: contents.id,
+      assistantOwnerId: 'run-1',
+      expiresAt: Date.now() + 1_000,
+      kind: 'pointerdown' as const,
+      confirmed: false,
+      dispatchStarted: false,
+    };
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-input-arm-test',
+      () => ({ browser: { dataScope: 'global' } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    Reflect.set(manager, 'isTargetViewInteractive', () => true);
+    Reflect.get(manager, 'tabs').set(tab.shell.id, tab);
+    Reflect.get(manager, 'webContentsToTab').set(contents.id, tab.shell.id);
+    Reflect.get(manager, 'automationGestureTokens').set('arm-1', pending);
+    const reportGesture = Reflect.get(manager, 'handlePageGesture') as (event: unknown, payload: unknown) => void;
+
+    const premature = { sender: contents, senderFrame: { frameTreeNodeId: 7 }, returnValue: undefined as unknown };
+    reportGesture(premature, { token: 'arm-1', kind: 'pointerdown' });
+    expect(premature.returnValue).toBe(false);
+    expect(pending.confirmed).toBe(false);
+    expect(Reflect.get(manager, 'automationGestureTokens').has('arm-1')).toBe(true);
+
+    const userReport = { sender: contents, senderFrame: { frameTreeNodeId: 7 }, returnValue: undefined as unknown };
+    reportGesture(userReport, { kind: 'pointerdown' });
+    expect(userReport.returnValue).toBe(true);
+    expect(tab.popupGesture).toMatchObject({ source: 'user', assistantOwnerId: null });
+
+    pending.dispatchStarted = true;
+    invokePrivate(manager, 'trackDispatchedSyntheticInput', tab, contents, {
+      token: 'arm-1',
+      kind: 'pointerdown',
+      expiresAt: Date.now() + 1_000,
+    });
+    const dispatched = { sender: contents, senderFrame: { frameTreeNodeId: 7 }, returnValue: undefined as unknown };
+    reportGesture(dispatched, { token: 'arm-1', kind: 'pointerdown' });
+    expect(dispatched.returnValue).toBe(true);
+    expect(pending.confirmed).toBe(true);
+    expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+
+    // If the coincident user event matched the one-shot preload token first,
+    // the actual CDP event is re-reported without it. Retain the dispatch
+    // tombstone until the operation consumes confirmation so that later event
+    // cannot overwrite popup/download provenance as user-owned.
+    const tokenlessAssistant = {
+      sender: contents,
+      senderFrame: { frameTreeNodeId: 7 },
+      returnValue: undefined as unknown,
+    };
+    reportGesture(tokenlessAssistant, { kind: 'pointerdown' });
+    expect(tokenlessAssistant.returnValue).toBe(false);
+    expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+    expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(1);
+
+    expect(invokePrivate(manager, 'consumeAutomationGestureConfirmation', 'arm-1')).toBe(true);
+    expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(0);
+    Reflect.get(manager, 'tabs').clear();
+    manager.dispose();
+  });
+
+  it('rejects delayed tokenless foreground input and reclaims its renderer when attribution expires', async () => {
+    vi.useFakeTimers();
+    let manager: InstanceType<typeof BrowserManager> | undefined;
+    try {
+      const contents = {
+        close: vi.fn(),
+        id: 42,
+        isDestroyed: () => false,
+      };
+      const tab = {
+        generation: 3,
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        popupGesture: null,
+        view: { webContents: contents },
+      };
+      const destroyView = vi.fn((target: typeof tab) => {
+        invokePrivate(manager!, 'clearDispatchedSyntheticInput', contents.id);
+        target.view = null as never;
+      });
+      manager = new BrowserManager(
+        '/tmp/kai-browser-delayed-input-test',
+        () => ({ browser: { dataScope: 'global', enabled: true } }) as never,
+        () => null,
+        '/tmp/browser-page.cjs',
+      );
+      Reflect.set(manager, 'destroyView', destroyView);
+      Reflect.set(manager, 'emitTabs', vi.fn());
+      Reflect.set(manager, 'isTargetViewInteractive', () => true);
+      Reflect.get(manager, 'tabs').set(tab.shell.id, tab);
+      Reflect.get(manager, 'webContentsToTab').set(contents.id, tab.shell.id);
+      invokePrivate(manager, 'trackDispatchedSyntheticInput', tab, contents, {
+        token: 'delayed-token',
+        kind: 'pointerdown',
+        expiresAt: Date.now() + 100,
+      });
+      const event = { returnValue: true, sender: contents, senderFrame: { frameTreeNodeId: 7 } };
+
+      (Reflect.get(manager, 'handlePageGesture') as (event: unknown, payload: unknown) => void)(event, {
+        kind: 'pointerdown',
+      });
+
+      expect(event.returnValue).toBe(false);
+      expect(tab.popupGesture).toBeNull();
+      expect(destroyView).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(destroyView).toHaveBeenCalledWith(tab);
+      expect(tab.shell).toMatchObject({
+        discarded: true,
+        error: 'Attributed browser input expired before Chromium confirmed it.',
+      });
+      expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(0);
+    } finally {
+      if (manager) {
+        Reflect.get(manager, 'tabs').clear();
+        manager.dispose();
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the destructive input deadline on exact preload confirmation while CDP is still pending', async () => {
+    vi.useFakeTimers();
+    let manager: InstanceType<typeof BrowserManager> | undefined;
+    try {
+      const contents = { id: 42, isDestroyed: () => false };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        view: { webContents: contents },
+        aiControlOwnerId: 'run-1',
+        popupGesture: null,
+      };
+      const destroyView = vi.fn();
+      const settleConfirmation = vi.fn();
+      manager = new BrowserManager(
+        '/tmp/kai-browser-slow-cdp-confirmation-test',
+        () => ({ browser: { dataScope: 'global', enabled: true } }) as never,
+        () => null,
+        '/tmp/browser-page.cjs',
+      );
+      Reflect.set(manager, 'destroyView', destroyView);
+      Reflect.set(manager, 'isTargetViewInteractive', () => false);
+      Reflect.get(manager, 'tabs').set(tab.shell.id, tab);
+      Reflect.get(manager, 'webContentsToTab').set(contents.id, tab.shell.id);
+      Reflect.get(manager, 'automationGestureTokens').set('slow-cdp-token', {
+        tabId: tab.shell.id,
+        contentsId: contents.id,
+        assistantOwnerId: 'run-1',
+        expiresAt: Date.now() + 5_000,
+        kind: 'pointerdown',
+        confirmed: false,
+        dispatchStarted: true,
+        settleConfirmation,
+      });
+      // Model a CDP sendCommand that has dispatched to Chromium but whose
+      // promise has not yet settled by retaining the attribution tombstone.
+      invokePrivate(manager, 'trackDispatchedSyntheticInput', tab, contents, {
+        token: 'slow-cdp-token',
+        kind: 'pointerdown',
+        expiresAt: Date.now() + 100,
+      });
+
+      const event = {
+        sender: contents,
+        senderFrame: { frameTreeNodeId: 7 },
+        returnValue: undefined as unknown,
+      };
+      (Reflect.get(manager, 'handlePageGesture') as (event: unknown, payload: unknown) => void)(event, {
+        token: 'slow-cdp-token',
+        kind: 'pointerdown',
+      });
+
+      expect(event.returnValue).toBe(true);
+      expect(settleConfirmation).toHaveBeenCalledWith(true);
+      expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).not.toBeNull();
+      expect(invokePrivate(manager, 'consumeAutomationGestureConfirmation', 'slow-cdp-token')).toBe(true);
+      expect(Reflect.get(manager, 'dispatchedSyntheticInputs')).toHaveLength(0);
+    } finally {
+      if (manager) {
+        Reflect.get(manager, 'tabs').clear();
+        manager.dispose();
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps coordinate-bound provenance when Browser chrome owns focus over a presented page', async () => {
+    const contents = {
+      getZoomFactor: () => 1,
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [] },
+    };
+    const view = {
+      getBounds: () => ({ x: 10, y: 20, width: 300, height: 200 }),
+      webContents: contents,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view,
+    };
+    let publishedArm: Record<string, unknown> | undefined;
+    let publishedDetached: boolean | undefined;
+    let manager!: InstanceType<typeof BrowserManager>;
+    const dispatchCdpInputCommand = vi.fn(async (...args: unknown[]) => {
+      invokeCdpBeforeDispatch(args);
+      const pending = [
+        ...(
+          Reflect.get(manager, 'automationGestureTokens') as Map<
+            string,
+            { confirmed: boolean; settleConfirmation?: (confirmed: boolean) => void }
+          >
+        ).values(),
+      ][0];
+      pending.confirmed = true;
+      pending.settleConfirmation?.(true);
+    });
+    manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachActiveView: vi.fn(),
+      attachedView: view,
+      dispatchCdpInputCommand,
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ x: 100, y: 200, width: 1_000, height: 800 }),
+          isFocused: () => false,
+          webContents: { isDestroyed: () => false },
+        }),
+      isTargetViewInteractive: () => false,
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      publishAutomationGestureArmAndWait: vi.fn(
+        async (
+          _tab: unknown,
+          _contents: unknown,
+          arm: Record<string, unknown>,
+          _abortSignal: unknown,
+          _documentLease: unknown,
+          detached: boolean,
+        ) => {
+          publishedArm = arm;
+          publishedDetached = detached;
+        },
+      ),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    Reflect.deleteProperty(manager, 'isTargetViewPresented');
+
+    await (invokePrivate(
       manager,
       'sendAttributedInputEvent',
       tab,
       contents,
       { kind: 'pointerdown', x: 10, y: 20 },
       { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1 },
-    );
+      { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 10, y: 20 } },
+    ) as Promise<void>);
 
-    expect(beforeEvent.preventDefault).not.toHaveBeenCalled();
-    expect(send).toHaveBeenCalledOnce();
-    expect(send).toHaveBeenCalledWith(
-      'browser-page:arm-automation-input',
-      expect.objectContaining({ kind: 'pointerdown', token: expect.any(String) }),
-    );
-    expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
-    expect(Reflect.get(manager, 'pendingSyntheticInputs')).toHaveLength(0);
+    expect(publishedArm).toMatchObject({
+      kind: 'pointerdown',
+      x: 10,
+      y: 20,
+      screenX: 120,
+      screenY: 240,
+    });
+    expect(publishedDetached).toBe(false);
+    expect(dispatchCdpInputCommand).toHaveBeenCalledOnce();
   });
+
+  it('never falls back to native input when background attribution cannot be armed', async () => {
+    const previousGesture = {
+      source: 'user' as const,
+      assistantOwnerId: null,
+      expiresAt: Date.now() + 1_000,
+      kind: 'pointerdown' as const,
+    };
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [] },
+      sendInputEvent: vi.fn(),
+    };
+    const tab = {
+      shell: { id: 'tab-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: previousGesture,
+      view: { webContents: contents },
+    };
+    const dispatchCdpInputCommand = vi.fn();
+    const manager = managerWithoutConstructor({
+      dispatchCdpInputCommand,
+      publishAutomationGestureArmAndWait: vi.fn(async () => {
+        throw new Error('The browser page changed before assistant input could be attributed.');
+      }),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'sendAttributedInputEvent',
+        tab,
+        contents,
+        { kind: 'pointerdown', x: 10, y: 20 },
+        { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1 },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 10, y: 20 } },
+      ) as Promise<void>,
+    ).rejects.toThrow(/changed before assistant input could be attributed/i);
+
+    expect(contents.sendInputEvent).not.toHaveBeenCalled();
+    expect(dispatchCdpInputCommand).not.toHaveBeenCalled();
+    expect(tab.view).not.toBeNull();
+    expect(tab.popupGesture).toBe(previousGesture);
+  });
+
+  it.each(['pointer', 'text'] as const)(
+    'does not restore stale user popup provenance after background %s dispatch fails',
+    async (kind) => {
+      const previousGesture = {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 1_000,
+        kind: 'pointerdown' as const,
+      };
+      const contents = { id: 42, isDestroyed: () => false, mainFrame: { framesInSubtree: [] } };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1' },
+        aiControlOwnerId: 'run-1',
+        popupGesture: previousGesture,
+        view: { webContents: contents },
+      };
+      const manager = managerWithoutConstructor({
+        attachActiveView: vi.fn(),
+        dispatchCdpInputCommand: vi.fn(async (...args: unknown[]) => invokeCdpBeforeDispatch(args)),
+        isTargetViewInteractive: () => false,
+        publishAutomationGestureArmAndWait: vi.fn(async () => undefined),
+        tabs: new Map([[tab.shell.id, tab]]),
+        waitForAutomationGestureConfirmation: vi.fn(async () => {
+          throw new Error('The page navigated after input dispatch.');
+        }),
+      });
+
+      const operation =
+        kind === 'pointer'
+          ? (invokePrivate(
+              manager,
+              'sendAttributedInputEvent',
+              tab,
+              contents,
+              { kind: 'pointerdown', x: 10, y: 20 },
+              { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1 },
+              { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 10, y: 20 } },
+            ) as Promise<void>)
+          : (invokePrivate(manager, 'insertAttributedText', tab, contents, 'assistant text') as Promise<void>);
+
+      await expect(operation).rejects.toThrow(/navigated after input dispatch/i);
+      expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+      expect(tab.popupGesture).not.toBe(previousGesture);
+      invokePrivate(manager, 'clearDispatchedSyntheticInput', contents.id);
+    },
+  );
 
   it('uses kind-only provenance while an assistant page is detached', () => {
     const send = vi.fn();
@@ -1124,11 +3553,12 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
 
-    invokePrivate(manager, 'armAutomationGesture', tab, contents, {
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
       kind: 'pointerdown',
       x: 10,
       y: 20,
     });
+    invokePrivate(manager, 'publishAutomationGestureArm', contents, arm);
 
     const payload = send.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(payload).toMatchObject({ kind: 'pointerdown' });
@@ -1136,6 +3566,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(payload).not.toHaveProperty('y');
     expect(payload).not.toHaveProperty('screenX');
     expect(payload).not.toHaveProperty('screenY');
+    invokePrivate(manager, 'revokeAutomationGestureToken', (arm as { token: string }).token);
   });
 
   it('drops secrets and resolves site prompts even when the renderer view is already gone', () => {
@@ -1187,6 +3618,13 @@ describe('browser manager renderer lifecycle', () => {
       view: null,
       overlayTimer: null,
       overlayGeneration: 0,
+      networkRequests: new Map([
+        [1, { id: 1, sequence: 1, startedAt: Date.now(), url: 'https://secret.example/reset/TOKEN' }],
+      ]),
+      activeNetworkRequests: new Map([[1, 'xhr']]),
+      activeNetworkRequestUrls: new Map([[1, 'https://secret.example/reset/TOKEN']]),
+      networkRequestSequence: 1,
+      networkLastBlockingActivityAt: Date.now(),
     };
 
     invokePrivate(manager, 'destroyView', tab);
@@ -1199,6 +3637,12 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(manager, 'pendingPermissions')).toHaveLength(0);
     expect(Reflect.get(manager, 'pendingAuth')).toHaveLength(0);
     expect(Reflect.get(manager, 'oneTimePermissions')).toHaveLength(0);
+    expect(tab.networkRequests).toBeUndefined();
+    expect(tab.activeNetworkRequests).toBeUndefined();
+    expect(tab.activeNetworkRequestUrls).toBeUndefined();
+    expect(Reflect.get(tab, 'diagnosticActiveNetworkRequestIds')).toBeUndefined();
+    expect(tab.networkRequestSequence).toBe(0);
+    expect(tab.networkLastBlockingActivityAt).toBeUndefined();
   });
 
   it('reclaims the owning native view when its renderer process exits', () => {
@@ -1240,6 +3684,38 @@ describe('browser manager renderer lifecycle', () => {
       error: 'Page renderer exited: crashed',
     });
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
+  });
+
+  it('does not let a stale destroyed event clear replacement-view network diagnostics', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const oldContents = {
+      id: 41,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    const replacementContents = { id: 42 };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: oldContents },
+      networkRequests: new Map([[2, { id: 2 }]]),
+      activeNetworkRequests: new Map([[2, 'xhr']]),
+      networkRequestSequence: 2,
+      networkLastBlockingActivityAt: Date.now(),
+    };
+    const manager = managerWithoutConstructor({
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[41, 'tab-1']]),
+    });
+
+    invokePrivate(manager, 'wireWebContents', tab, oldContents);
+    tab.view = { webContents: replacementContents } as typeof tab.view;
+    listeners.get('destroyed')?.();
+
+    expect(tab.view.webContents).toBe(replacementContents);
+    expect(tab.networkRequests).toHaveLength(1);
+    expect(tab.activeNetworkRequests).toHaveLength(1);
+    expect(tab.networkRequestSequence).toBe(2);
+    expect(tab.networkLastBlockingActivityAt).toBeTypeOf('number');
   });
 
   it('uses the authenticated replacement path for accepted password-save prompts', async () => {
@@ -1442,7 +3918,7 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('marks HTTP-auth prompts opened by an assistant-controlled document', () => {
+  it('fails HTTP-auth challenges from assistant-controlled documents without waiting for Browser chrome', () => {
     const manager = new BrowserManager(
       '/tmp/kai-browser-ai-http-auth-test',
       () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
@@ -1482,13 +3958,152 @@ describe('browser manager renderer lifecycle', () => {
         callback,
       );
 
-      expect(manager.getState('chat-1').authPrompts).toEqual([
-        expect.objectContaining({
-          endpoint: 'https://accounts.example:443',
-          assistantTriggered: true,
-        }),
-      ]);
+      expect(manager.getState('chat-1').authPrompts).toEqual([]);
+      expect(callback).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledWith();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('allows HTTP auth for the exact target of an explicit trusted user navigation', () => {
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-trusted-http-auth-test',
+      () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    try {
+      const listener = electronMocks.appOn.mock.calls.find(([event]) => event === 'login')?.[1] as
+        | ((
+            event: { preventDefault: () => void },
+            contents: { id: number },
+            details: { url: string; pid: number },
+            authInfo: { isProxy: boolean; scheme: string; host: string; port: number; realm: string },
+            callback: (username?: string, password?: string) => void,
+          ) => void)
+        | undefined;
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1' },
+        scopeKey: 'global',
+        generation: 5,
+        aiNetworkRestricted: true,
+        trustedUserNavigation: true,
+        trustedUserNavigationTarget: 'https://accounts.example/login#form',
+        trustedUserNavigationRequestId: 77,
+        trustedUserNavigationLease: 3,
+        activeNetworkRequests: new Map([[77, 'mainFrame']]),
+        activeNetworkRequestUrls: new Map([[77, 'https://accounts.example/login']]),
+      };
+      Reflect.get(manager, 'tabs').set('tab-1', tab);
+      Reflect.get(manager, 'webContentsToTab').set(42, 'tab-1');
+      const event = { preventDefault: vi.fn() };
+      const callback = vi.fn();
+      const unrelatedCallback = vi.fn();
+
+      listener?.(
+        event,
+        { id: 42 },
+        { url: 'https://accounts.example/login', pid: 1 },
+        {
+          isProxy: false,
+          scheme: 'basic',
+          host: 'accounts.example',
+          port: 443,
+          realm: 'Members',
+        },
+        callback,
+      );
+      listener?.(
+        event,
+        { id: 42 },
+        { url: 'https://accounts.example/background-check', pid: 1 },
+        {
+          isProxy: false,
+          scheme: 'basic',
+          host: 'accounts.example',
+          port: 443,
+          realm: 'Members',
+        },
+        unrelatedCallback,
+      );
+
+      expect(event.preventDefault).toHaveBeenCalledTimes(2);
       expect(callback).not.toHaveBeenCalled();
+      expect(unrelatedCallback).toHaveBeenCalledOnce();
+      expect(unrelatedCallback).toHaveBeenCalledWith();
+      const prompts = manager.getState('chat-1').authPrompts ?? [];
+      expect(prompts).toMatchObject([
+        {
+          tabId: 'tab-1',
+          endpoint: 'https://accounts.example:443',
+          assistantTriggered: false,
+        },
+      ]);
+      manager.respondAuthPrompt(prompts[0]!.id, 'alice', 'secret');
+      expect(callback).toHaveBeenCalledOnce();
+      expect(callback).toHaveBeenCalledWith('alice', 'secret');
+      expect(manager.getState('chat-1').authPrompts).toEqual([]);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('does not route HTTP-auth credentials when a same-URL subresource makes the challenge ambiguous', () => {
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-ambiguous-http-auth-test',
+      () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    try {
+      const listener = electronMocks.appOn.mock.calls.find(([event]) => event === 'login')?.[1] as
+        | ((
+            event: { preventDefault: () => void },
+            contents: { id: number },
+            details: { url: string; pid: number },
+            authInfo: { isProxy: boolean; scheme: string; host: string; port: number; realm: string },
+            callback: (username?: string, password?: string) => void,
+          ) => void)
+        | undefined;
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1' },
+        scopeKey: 'global',
+        generation: 5,
+        aiNetworkRestricted: true,
+        trustedUserNavigation: true,
+        trustedUserNavigationTarget: 'https://accounts.example/login',
+        trustedUserNavigationRequestId: 77,
+        trustedUserNavigationLease: 3,
+        activeNetworkRequests: new Map([
+          [77, 'mainFrame'],
+          [78, 'xhr'],
+        ]),
+        activeNetworkRequestUrls: new Map([
+          [77, 'https://accounts.example/login'],
+          [78, 'https://accounts.example/login'],
+        ]),
+      };
+      Reflect.get(manager, 'tabs').set('tab-1', tab);
+      Reflect.get(manager, 'webContentsToTab').set(42, 'tab-1');
+      const callback = vi.fn();
+
+      listener?.(
+        { preventDefault: vi.fn() },
+        { id: 42 },
+        { url: 'https://accounts.example/login', pid: 1 },
+        {
+          isProxy: false,
+          scheme: 'basic',
+          host: 'accounts.example',
+          port: 443,
+          realm: 'Members',
+        },
+        callback,
+      );
+
+      expect(manager.getState('chat-1').authPrompts).toEqual([]);
+      expect(callback).toHaveBeenCalledWith();
     } finally {
       manager.dispose();
     }
@@ -1669,6 +4284,47 @@ describe('browser manager renderer lifecycle', () => {
     });
 
     expect(event.preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it('reclaims an assistant-controlled renderer when Chromium enters HTML fullscreen', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const contents = {
+      id: 42,
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', loading: true, sensitive: true } as Record<string, unknown>,
+      view,
+      generation: 4,
+      aiActionDepth: 1,
+      aiControlOwnerId: 'run-1',
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const emitTabs = vi.fn();
+    const setFullScreen = vi.fn();
+    const manager = managerWithoutConstructor({
+      destroyView,
+      emitTabs,
+      getWindow: () => ({ isDestroyed: () => false, isFullScreen: () => true, setFullScreen }),
+    });
+
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+    listeners.get('enter-html-full-screen')?.();
+
+    expect(setFullScreen).toHaveBeenCalledWith(false);
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.generation).toBe(5);
+    expect(tab.shell).toMatchObject({
+      discarded: true,
+      loading: false,
+      sensitive: false,
+      error: 'Browser fullscreen was blocked during assistant control.',
+    });
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
 
   it('ignores callbacks from WebContents that no longer owns the tab', () => {
@@ -1948,6 +4604,12 @@ describe('browser manager renderer lifecycle', () => {
       },
       scopeKey: 'global',
       generation: 1,
+      networkRequests: new Map([
+        [1, { id: 1, sequence: 1, startedAt: Date.now(), url: 'https://departed.example/private/TOKEN' }],
+      ]),
+      activeNetworkRequests: new Map([[1, 'xhr']]),
+      networkRequestSequence: 1,
+      networkLastBlockingActivityAt: Date.now(),
     };
     const manager = managerWithoutConstructor({
       cancelFaviconFetch: vi.fn(),
@@ -1979,6 +4641,7 @@ describe('browser manager renderer lifecycle', () => {
           },
         ],
       ]),
+      tabs: new Map([['tab-1', tab]]),
     });
     const contents = {
       getTitle: () => 'Departed',
@@ -2002,6 +4665,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(manager, 'pendingAuth')).toHaveLength(1);
     expect(Reflect.get(manager, 'oneTimePermissions')).toHaveLength(1);
     expect(Reflect.get(manager, 'cancelFaviconFetch')).not.toHaveBeenCalled();
+    expect(tab.networkRequests.size).toBe(1);
 
     listeners.get('did-start-navigation')?.({}, 'about:blank', false, true);
 
@@ -2013,6 +4677,188 @@ describe('browser manager renderer lifecycle', () => {
     expect(Reflect.get(manager, 'pendingAuth')).toHaveLength(0);
     expect(Reflect.get(manager, 'oneTimePermissions')).toHaveLength(0);
     expect(Reflect.get(manager, 'cancelFaviconFetch')).toHaveBeenCalledWith('tab-1');
+    expect(tab.networkRequests).toBeUndefined();
+    expect(tab.activeNetworkRequests).toEqual(new Map([[1, 'xhr']]));
+    expect(tab.networkRequestSequence).toBe(0);
+    expect(tab.networkLastBlockingActivityAt).toBeUndefined();
+    expect(
+      (Reflect.get(tab, 'provisionalNetworkNavigation') as { requests?: Map<number, unknown> })?.requests,
+    ).toHaveLength(1);
+
+    // A replacement navigation can still abort while the old document and its
+    // requests remain alive. Keep the exact request identity until Chromium's
+    // terminal event arrives, then restore its completed diagnostic when the
+    // original document survives ERR_ABORTED.
+    invokePrivate(manager, 'finishBrowserNetworkRequest', tab, { id: 1, statusCode: 200, resourceType: 'xhr' });
+    expect(tab.activeNetworkRequests).toHaveLength(0);
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', 'about:blank', true);
+
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(tab.networkRequests).toHaveLength(1);
+    expect(tab.networkRequests.get(1)).toMatchObject({ statusCode: 200, completedAt: expect.any(Number) });
+    expect(tab.networkRequestSequence).toBe(1);
+  });
+
+  it('retains failed navigation request diagnostics when ERR_ABORTED restores the committed document', () => {
+    const committedRedactionKey = new Uint8Array([1, 2, 3]);
+    const tab = {
+      shell: { id: 'tab-network-rollback' },
+      networkRequests: new Map([
+        [
+          20,
+          {
+            id: 20,
+            sequence: 1,
+            url: '[redacted https origin aaaaaaaaaaaaaaaa]',
+            method: 'GET',
+            resourceType: 'mainFrame',
+            startedAt: 200,
+            completedAt: 250,
+            error: 'ERR_ABORTED',
+          },
+        ],
+      ]),
+      networkRequestSequence: 1,
+      networkLastBlockingActivityAt: 250,
+      activeNetworkRequests: new Map<number, string>(),
+      provisionalNetworkNavigation: {
+        requests: new Map([
+          [
+            10,
+            {
+              id: 10,
+              sequence: 7,
+              url: '[redacted https origin bbbbbbbbbbbbbbbb]',
+              method: 'GET',
+              resourceType: 'xhr',
+              startedAt: 100,
+              completedAt: 150,
+            },
+          ],
+        ]),
+        activeRequestIds: new Set<number>(),
+        requestSequence: 7,
+        lastBlockingActivityAt: 150,
+        redactionKey: committedRedactionKey,
+        generation: 1,
+        urls: new Set(['https://failed.example']),
+        superseded: [],
+      },
+    };
+    const manager = managerWithoutConstructor({ tabs: new Map([[tab.shell.id, tab]]) });
+
+    invokePrivate(manager, 'rollbackBrowserNetworkNavigation', tab);
+
+    expect(tab.networkRequests).toHaveLength(2);
+    expect(tab.networkRequests.get(10)).toMatchObject({ sequence: 7, resourceType: 'xhr' });
+    expect(tab.networkRequests.get(20)).toMatchObject({
+      sequence: 8,
+      resourceType: 'mainFrame',
+      error: 'ERR_ABORTED',
+    });
+    expect(tab.networkRequestSequence).toBe(8);
+    expect(tab.networkLastBlockingActivityAt).toBe(250);
+    expect(Reflect.get(tab, 'networkRedactionKey')).toBe(committedRedactionKey);
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+  });
+
+  it('does not let a superseded navigation failure settle newer network diagnostics', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    let currentUrl = 'https://committed.example';
+    const tab = {
+      shell: {
+        id: 'tab-network-generation',
+        conversationId: 'chat-1',
+        url: currentUrl,
+        title: 'Committed',
+        sensitive: false,
+        reloadRequired: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      scriptTainted: false,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 0,
+      networkRequests: new Map([
+        [
+          1,
+          {
+            id: 1,
+            sequence: 1,
+            method: 'GET',
+            resourceType: 'xhr',
+            startedAt: Date.now(),
+            url: 'https://committed.example/data',
+          },
+        ],
+      ]),
+      activeNetworkRequests: new Map([[1, 'xhr']]),
+      networkRequestSequence: 1,
+      networkLastBlockingActivityAt: Date.now(),
+    };
+    const manager = managerWithoutConstructor({
+      cancelFaviconFetch: vi.fn(),
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const contents = {
+      getTitle: () => 'Current',
+      getURL: () => currentUrl,
+      isCurrentlyAudible: () => false,
+      isDestroyed: () => false,
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false, clear: vi.fn() },
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    Object.assign(tab, { view: { webContents: contents } });
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+
+    invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+      id: 10,
+      method: 'GET',
+      resourceType: 'mainFrame',
+      url: 'https://first.example',
+    });
+    listeners.get('did-start-navigation')?.({}, 'https://first.example', false, true);
+    const firstGeneration = (Reflect.get(tab, 'provisionalNetworkNavigation') as { generation: number }).generation;
+
+    invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+      id: 11,
+      method: 'GET',
+      resourceType: 'mainFrame',
+      url: 'https://second.example',
+    });
+    listeners.get('did-start-navigation')?.({}, 'https://second.example', false, true);
+    const secondNavigation = Reflect.get(tab, 'provisionalNetworkNavigation') as {
+      generation: number;
+      superseded: Array<{ generation: number }>;
+    };
+    expect(secondNavigation.generation).toBeGreaterThan(firstGeneration);
+    expect(secondNavigation.superseded).toContainEqual(expect.objectContaining({ generation: firstGeneration }));
+    expect(tab.networkRequests.has(10)).toBe(false);
+    expect(tab.networkRequests.has(11)).toBe(true);
+    expect(tab.activeNetworkRequests.has(10)).toBe(true);
+    expect(Reflect.get(tab, 'diagnosticActiveNetworkRequestIds')).toEqual(new Set([11]));
+
+    const secondRedactionKey = Reflect.get(tab, 'networkRedactionKey');
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', 'https://first.example', true);
+
+    expect((Reflect.get(tab, 'provisionalNetworkNavigation') as { generation: number }).generation).toBe(
+      secondNavigation.generation,
+    );
+    expect(Reflect.get(tab, 'networkRedactionKey')).toBe(secondRedactionKey);
+    expect(tab.networkRequests.has(11)).toBe(true);
+    expect(tab.networkRequests.has(1)).toBe(false);
+
+    currentUrl = 'https://second.example';
+    listeners.get('did-navigate')?.({}, currentUrl);
+
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(tab.networkRequests.has(11)).toBe(true);
+    expect(tab.networkRequests.has(1)).toBe(false);
+    expect(Reflect.get(tab, 'networkRedactionKey')).toBe(secondRedactionKey);
   });
 
   it('contains profile-marker filesystem failures inside Electron navigation callbacks', () => {
@@ -2092,23 +4938,37 @@ describe('browser manager renderer lifecycle', () => {
       aiControlGeneration: 1 as number | null,
     };
     const tabs = Reflect.get(manager, 'tabs') as Map<string, typeof tab>;
+    Reflect.set(manager, 'isTargetViewInteractive', () => true);
     const webContentsToTab = Reflect.get(manager, 'webContentsToTab') as Map<number, string>;
     const tokens = Reflect.get(manager, 'automationGestureTokens') as Map<
       string,
-      { tabId: string; assistantOwnerId: string; expiresAt: number; inputData?: string }
+      {
+        tabId: string;
+        contentsId: number;
+        assistantOwnerId: string;
+        expiresAt: number;
+        kind: 'pointerdown' | 'keydown' | 'input';
+        inputData?: string;
+        armedFrames?: Map<number, string>;
+        detachedArm?: boolean;
+        confirmed: boolean;
+      }
     >;
     tabs.set('tab-1', tab);
     webContentsToTab.set(42, 'tab-1');
     tokens.set('automation-token', {
       tabId: 'tab-1',
+      contentsId: 42,
       assistantOwnerId: 'run-1',
       expiresAt: Date.now() + 1_000,
+      kind: 'pointerdown',
+      confirmed: false,
     });
     const gestureHandler = electronMocks.ipcOn.mock.calls.find(
       ([channel]) => channel === 'browser-page:gesture',
     )?.[1] as (
       event: { sender: { id: number }; returnValue?: unknown },
-      payload?: { token?: string; kind?: string; data?: string },
+      payload?: { token?: string; kind?: string; data?: string; key?: string },
     ) => void;
 
     const assistantEvent = {
@@ -2125,9 +4985,12 @@ describe('browser manager renderer lifecycle', () => {
 
     tokens.set('typing-token', {
       tabId: 'tab-1',
+      contentsId: 42,
       assistantOwnerId: 'run-1',
       expiresAt: Date.now() + 1_000,
+      kind: 'input',
       inputData: 'assistant secret',
+      confirmed: false,
     });
     const mismatchedTypingEvent = { sender: { id: 42 }, returnValue: undefined as unknown };
     gestureHandler(mismatchedTypingEvent, {
@@ -2145,7 +5008,75 @@ describe('browser manager renderer lifecycle', () => {
       data: 'assistant secret',
     });
     expect(matchedTypingEvent.returnValue).toBe(true);
+    expect(tokens.get('typing-token')?.confirmed).toBe(true);
+    expect(invokePrivate(manager, 'consumeAutomationGestureConfirmation', 'typing-token')).toBe(true);
     expect(tokens.has('typing-token')).toBe(false);
+
+    tokens.set('presented-typing-token', {
+      tabId: 'tab-1',
+      contentsId: 42,
+      assistantOwnerId: 'run-1',
+      expiresAt: Date.now() + 1_000,
+      kind: 'keydown',
+      inputData: 'V',
+      confirmed: false,
+    });
+    const mismatchedKeyEvent = { sender: { id: 42 }, returnValue: undefined as unknown };
+    gestureHandler(mismatchedKeyEvent, {
+      token: 'presented-typing-token',
+      kind: 'keydown',
+      key: 'X',
+    });
+    expect(mismatchedKeyEvent.returnValue).toBe(false);
+    expect(tokens.has('presented-typing-token')).toBe(true);
+
+    const matchedKeyEvent = { sender: { id: 42 }, returnValue: undefined as unknown };
+    gestureHandler(matchedKeyEvent, {
+      token: 'presented-typing-token',
+      kind: 'keydown',
+      key: 'V',
+    });
+    expect(matchedKeyEvent.returnValue).toBe(true);
+    expect(tokens.get('presented-typing-token')?.confirmed).toBe(true);
+    expect(invokePrivate(manager, 'consumeAutomationGestureConfirmation', 'presented-typing-token')).toBe(true);
+
+    tokens.set('replacement-frame-token', {
+      tabId: 'tab-1',
+      contentsId: 42,
+      assistantOwnerId: 'run-1',
+      expiresAt: Date.now() + 1_000,
+      kind: 'pointerdown',
+      armedFrames: new Map([[7, '1:2:old-frame']]),
+      detachedArm: true,
+      confirmed: false,
+    });
+    const replacementFrame = {
+      detached: false,
+      frameToken: 'new-frame',
+      frameTreeNodeId: 7,
+      isDestroyed: () => false,
+      processId: 1,
+      routingId: 3,
+    };
+    const replacementTokenEvent = {
+      sender: { id: 42 },
+      senderFrame: replacementFrame,
+      returnValue: undefined as unknown,
+    };
+    gestureHandler(replacementTokenEvent, { token: 'replacement-frame-token', kind: 'pointerdown' });
+    expect(replacementTokenEvent.returnValue).toBe(false);
+    expect(tokens.get('replacement-frame-token')?.confirmed).toBe(false);
+
+    const unattributedReplacementEvent = {
+      sender: { id: 42 },
+      senderFrame: replacementFrame,
+      returnValue: undefined as unknown,
+    };
+    gestureHandler(unattributedReplacementEvent, { kind: 'pointerdown' });
+    expect(unattributedReplacementEvent.returnValue).toBe(false);
+    expect(tab.trustedGestureGeneration).toBe(0);
+    expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+    tokens.delete('replacement-frame-token');
 
     // A genuine pointer/key gesture without an exact automation token remains
     // user-owned even when it races an active AI operation.
@@ -2177,6 +5108,25 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.aiNetworkRestricted).toBe(true);
     expect(tab.aiControlOwnerId).toBe('run-1');
     expect(userEvent.returnValue).toBe(true);
+    expect(tab.trustedGestureGeneration).toBe(2);
+
+    tokens.set('expired-background-token', {
+      tabId: 'tab-1',
+      contentsId: 42,
+      assistantOwnerId: 'run-1',
+      expiresAt: Date.now() - 1,
+      kind: 'pointerdown',
+      confirmed: false,
+    });
+    Reflect.set(manager, 'isTargetViewInteractive', () => false);
+    const expiredTokenEvent = { sender: { id: 42 }, returnValue: undefined as unknown };
+    gestureHandler(expiredTokenEvent, { token: 'expired-background-token', kind: 'pointerdown' });
+    expect(expiredTokenEvent.returnValue).toBe(false);
+    expect(tokens.has('expired-background-token')).toBe(false);
+
+    const tokenlessBackgroundFollowup = { sender: { id: 42 }, returnValue: undefined as unknown };
+    gestureHandler(tokenlessBackgroundFollowup, { kind: 'pointerdown' });
+    expect(tokenlessBackgroundFollowup.returnValue).toBe(false);
     expect(tab.trustedGestureGeneration).toBe(2);
 
     manager.dispose();
@@ -2304,11 +5254,12 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
 
-    invokePrivate(manager, 'armAutomationGesture', tab, contents, {
+    const arm = invokePrivate(manager, 'createAutomationGestureArm', tab, contents, {
       kind: 'pointerdown',
       x: 4,
       y: 8,
     });
+    invokePrivate(manager, 'publishAutomationGestureArm', contents, arm);
 
     expect(tab.popupGesture).toMatchObject({
       source: 'assistant',
@@ -2321,7 +5272,53 @@ describe('browser manager renderer lifecycle', () => {
         token: expect.any(String),
       }),
     );
+    invokePrivate(manager, 'revokeAutomationGestureToken', (arm as { token: string }).token);
   });
+
+  it.each([
+    ['mounted', true],
+    ['background', false],
+  ] as const)(
+    'replaces stale user popup provenance before %s assistant mouse movement',
+    async (_label, interactive) => {
+      const tab = {
+        shell: { id: 'tab-1' },
+        aiControlOwnerId: 'run-1',
+        popupGesture: {
+          source: 'user' as const,
+          assistantOwnerId: null,
+          expiresAt: Date.now() + 5_000,
+          kind: 'pointerdown' as const,
+        },
+      };
+      const assertAssistantProvenance = () => {
+        expect(tab.popupGesture).toMatchObject({ source: 'assistant', assistantOwnerId: 'run-1' });
+      };
+      const contents = {
+        sendInputEvent: vi.fn(assertAssistantProvenance),
+      };
+      const dispatchCdpInputCommand = vi.fn(async () => assertAssistantProvenance());
+      const manager = managerWithoutConstructor({
+        dispatchCdpInputCommand,
+        isTargetViewInteractive: () => interactive,
+      });
+
+      await expect(
+        invokePrivate(
+          manager,
+          'dispatchInputEvent',
+          tab,
+          contents,
+          { type: 'mouseMove', x: 10, y: 20 },
+          { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 10, y: 20 } },
+        ) as Promise<void>,
+      ).resolves.toBeUndefined();
+
+      assertAssistantProvenance();
+      expect(contents.sendInputEvent).not.toHaveBeenCalled();
+      expect(dispatchCdpInputCommand).toHaveBeenCalledOnce();
+    },
+  );
 
   it('rejects an approval after its tab document or origin changes', () => {
     const tab = {
@@ -2524,7 +5521,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(assertNoClickThroughOverlayAtPoints).toHaveBeenCalledWith(contents, [target]);
   });
 
-  it.each(['target lookup', 'focus', 'user refocus'] as const)(
+  it.each(['target lookup', 'focus'] as const)(
     'does not type when target authority changes during %s',
     async (navigationStage) => {
       const insertedText = 'never-insert-this';
@@ -2535,7 +5532,7 @@ describe('browser manager renderer lifecycle', () => {
         insertText,
         isDestroyed: () => false,
       };
-      const view = { webContents: contents };
+      const view = { getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }), webContents: contents };
       const tab = {
         shell: {
           id: '00000000-0000-4000-8000-000000000001',
@@ -2570,7 +5567,6 @@ describe('browser manager renderer lifecycle', () => {
       });
       const evaluateWithDeadline = vi.fn(async () => {
         if (navigationStage === 'focus') tab.generation++;
-        if (navigationStage === 'user refocus') tab.trustedGestureGeneration++;
         return true;
       });
       const manager = managerWithoutConstructor({
@@ -2586,7 +5582,7 @@ describe('browser manager renderer lifecycle', () => {
         setAutomationOverlay: vi.fn(async () => undefined),
         tabs: new Map([[tab.shell.id, tab]]),
         validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
-        waitForPhysicalActionView: vi.fn(async () => undefined),
+        prepareAssistantOperationView: vi.fn(),
         withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
           task(documentLease),
         withAssistantScriptPopupAttribution: (_tab: unknown, task: () => Promise<unknown>) => task(),
@@ -2598,11 +5594,7 @@ describe('browser manager renderer lifecycle', () => {
           { tabId: tab.shell.id, kind: 'type', selector: '#password', value: insertedText },
           { id: 'run-1' },
         ),
-      ).rejects.toThrow(
-        navigationStage === 'user refocus'
-          ? /user changed browser focus while assistant typing was waiting/i
-          : /page navigated while this assistant operation was waiting/i,
-      );
+      ).rejects.toThrow(/page navigated while this assistant operation was waiting/i);
       await assertion;
 
       expect(insertText).not.toHaveBeenCalled();
@@ -2613,7 +5605,7 @@ describe('browser manager renderer lifecycle', () => {
   it('does not dispatch semantic input after the page replaces or obscures the located target', async () => {
     const sendInputEvent = vi.fn();
     const contents = { getZoomFactor: () => 1, isDestroyed: () => false, sendInputEvent };
-    const view = { webContents: contents };
+    const view = { getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }), webContents: contents };
     const tab = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
@@ -2658,7 +5650,7 @@ describe('browser manager renderer lifecycle', () => {
       validateLocatedTarget: vi.fn(async () => {
         throw new Error('The requested browser target moved, was replaced, or became obscured before input.');
       }),
-      waitForPhysicalActionView: vi.fn(async () => undefined),
+      prepareAssistantOperationView: vi.fn(),
       withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
         task(documentLease),
     });
@@ -2679,7 +5671,7 @@ describe('browser manager renderer lifecycle', () => {
     ['scroll', { kind: 'scroll', deltaY: 100 }, 'view creation'],
     ['drag', { kind: 'drag', selector: '#target', endX: 80, endY: 90 }, 'overlay'],
   ] as const)(
-    'does not dispatch a stale %s action after a trusted user gesture during %s',
+    'keeps hidden %s automation independent of a trusted user gesture during %s',
     async (_label, request, interruptionStage) => {
       const sendInputEvent = vi.fn();
       const armAutomationGesture = vi.fn();
@@ -2688,7 +5680,7 @@ describe('browser manager renderer lifecycle', () => {
         isDestroyed: () => false,
         sendInputEvent,
       };
-      const view = { webContents: contents };
+      const view = { getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }), webContents: contents };
       const tab = {
         shell: {
           id: '00000000-0000-4000-8000-000000000001',
@@ -2725,6 +5717,7 @@ describe('browser manager renderer lifecycle', () => {
         armAutomationGesture,
         assertAssistantDocumentLease: vi.fn(),
         attachActiveView: vi.fn(),
+        dispatchInputEvent: vi.fn(async () => undefined),
         emit: vi.fn(),
         emitTabs: vi.fn(),
         ensureAssistantView: vi.fn(async () => {
@@ -2736,7 +5729,9 @@ describe('browser manager renderer lifecycle', () => {
         runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
         setAutomationOverlay,
         tabs: new Map([[tab.shell.id, tab]]),
-        waitForPhysicalActionView: vi.fn(async () => undefined),
+        prepareAssistantOperationView: vi.fn(),
+        sendAttributedInputEvent: vi.fn(async () => undefined),
+        validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
         withAssistantControl: (
           _tab: unknown,
           _run: unknown,
@@ -2748,23 +5743,174 @@ describe('browser manager renderer lifecycle', () => {
         withAssistantScriptPopupAttribution: (_tab: unknown, task: () => Promise<unknown>) => task(),
       });
 
-      await expect(manager.action('chat-1', { tabId: tab.shell.id, ...request }, { id: 'run-1' })).rejects.toThrow(
-        /user interacted with the browser while the assistant action was waiting/i,
-      );
+      await expect(
+        manager.action('chat-1', { tabId: tab.shell.id, ...request }, { id: 'run-1' }),
+      ).resolves.toMatchObject({ ok: true });
 
       expect(sendInputEvent).not.toHaveBeenCalled();
       expect(armAutomationGesture).not.toHaveBeenCalled();
     },
   );
 
-  it('waits for the Browser panel to attach before dispatching physical input', async () => {
+  it.each([
+    ['presented', true, true],
+    ['fully backgrounded', false, false],
+  ] as const)(
+    '%s key input %s when unrelated trusted activity arrives during frame arming',
+    async (_label, presented, shouldReject) => {
+      const contents = { id: 42, getZoomFactor: () => 1, isDestroyed: () => false };
+      const view = {
+        getBounds: () => ({ x: 10, y: 20, width: 300, height: 200 }),
+        webContents: contents,
+      };
+      const tab = {
+        shell: {
+          id: '00000000-0000-4000-8000-000000000001',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: true,
+          url: 'https://example.com/form',
+          sensitive: false,
+        },
+        view,
+        generation: 4,
+        trustedUserNavigationLease: 0,
+        trustedGestureGeneration: 7,
+        lastUsedAt: 0,
+      };
+      const documentLease = {
+        runId: 'run-1',
+        runGeneration: 1,
+        hostRendererAuthorityGeneration: 0,
+        tabGeneration: tab.generation,
+        userNavigationLease: tab.trustedUserNavigationLease,
+        url: tab.shell.url,
+      };
+      const dispatchInputEvent = vi.fn(async () => undefined);
+      const sendAttributedInputEvent = vi.fn(async (...args: unknown[]) => {
+        // Model a real gesture/focus change after every frame acknowledged the
+        // key arm but before CDP dispatch starts.
+        tab.trustedGestureGeneration += 1;
+        await (args[7] as () => Promise<void>)();
+      });
+      const manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        assertAssistantDocumentLease: vi.fn(),
+        dispatchInputEvent,
+        emit: vi.fn(),
+        emitTabs: vi.fn(),
+        ensureAssistantView: vi.fn(async () => view),
+        isTargetViewPresented: () => presented,
+        prepareAssistantOperationView: vi.fn(),
+        runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+        sendAttributedInputEvent,
+        setAutomationOverlay: vi.fn(async () => undefined),
+        tabs: new Map([[tab.shell.id, tab]]),
+        withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+          task(documentLease),
+      });
+
+      const operation = manager.action(
+        'chat-1',
+        { tabId: tab.shell.id, kind: 'press', keys: ['Enter'] },
+        { id: 'run-1' },
+      );
+      if (shouldReject) await expect(operation).rejects.toThrow(/focus changed while .* input was being armed/i);
+      else await expect(operation).resolves.toMatchObject({ ok: true });
+
+      expect(sendAttributedInputEvent).toHaveBeenCalledOnce();
+      expect(dispatchInputEvent).toHaveBeenCalledTimes(shouldReject ? 0 : 1);
+    },
+  );
+
+  it.each([
+    ['presented', true, true],
+    ['fully backgrounded', false, false],
+  ] as const)(
+    '%s text input %s when trusted user typing arrives during frame arming',
+    async (_label, presented, shouldReject) => {
+      const contents = { id: 42, getZoomFactor: () => 1, isDestroyed: () => false };
+      const view = {
+        getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+        webContents: contents,
+      };
+      const tab = {
+        shell: {
+          id: '00000000-0000-4000-8000-000000000001',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: true,
+          url: 'https://example.com/form',
+          sensitive: false,
+        },
+        view,
+        generation: 4,
+        trustedUserNavigationLease: 0,
+        trustedGestureGeneration: 7,
+        lastUsedAt: 0,
+      };
+      const documentLease = {
+        runId: 'run-1',
+        runGeneration: 1,
+        hostRendererAuthorityGeneration: 0,
+        tabGeneration: tab.generation,
+        userNavigationLease: tab.trustedUserNavigationLease,
+        url: tab.shell.url,
+      };
+      const insertAttributedText = vi.fn(async (...args: unknown[]) => {
+        // Model physical typing after all frame preloads acknowledge the arm
+        // but before the timestamp-bound CDP char event is dispatched.
+        tab.trustedGestureGeneration += 1;
+        await (args[5] as () => Promise<void>)();
+      });
+      const manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        assertAssistantDocumentLease: vi.fn(),
+        emit: vi.fn(),
+        emitTabs: vi.fn(),
+        ensureAssistantView: vi.fn(async () => view),
+        evaluateWithDeadline: vi.fn(async () => true),
+        insertAttributedText,
+        isTargetViewPresented: () => presented,
+        locate: vi.fn(async () => ({ x: 20, y: 30, width: 100, height: 20 })),
+        prepareAssistantOperationView: vi.fn(async () => presented),
+        runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+        setAutomationOverlay: vi.fn(async () => undefined),
+        tabs: new Map([[tab.shell.id, tab]]),
+        validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+        withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+          task(documentLease),
+        withAssistantScriptPopupAttribution: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      });
+
+      const operation = manager.action(
+        'chat-1',
+        { tabId: tab.shell.id, kind: 'type', selector: '#field', value: 'assistant text' },
+        { id: 'run-1' },
+      );
+      if (shouldReject) await expect(operation).rejects.toThrow(/input changed while .* text input was being armed/i);
+      else await expect(operation).resolves.toMatchObject({ ok: true });
+
+      expect(insertAttributedText).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('dispatches physical input immediately against the hidden background view with passive attention', async () => {
     const sendInputEvent = vi.fn();
     const contents = {
+      debugger: browserDebuggerMock(),
       getZoomFactor: () => 1,
       isDestroyed: () => false,
       sendInputEvent,
     };
-    const view = { webContents: contents };
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+      setBounds,
+      setVisible,
+      webContents: contents,
+    };
     const tab = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
@@ -2789,6 +5935,7 @@ describe('browser manager renderer lifecycle', () => {
       url: tab.shell.url,
     };
     const emit = vi.fn();
+    const sendAttributedInputEvent = vi.fn(async () => undefined);
     const manager = managerWithoutConstructor({
       activeTabs: new Map([['chat-1', tab.shell.id]]),
       armAutomationGesture: vi.fn(),
@@ -2803,12 +5950,7 @@ describe('browser manager renderer lifecycle', () => {
       mountedBounds: null,
       mountedConversationId: null,
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
-      sendAttributedInputEvent: (
-        _tab: unknown,
-        targetContents: { sendInputEvent: (event: unknown) => void },
-        _arm: unknown,
-        event: unknown,
-      ) => targetContents.sendInputEvent(event),
+      sendAttributedInputEvent,
       setAutomationOverlay: vi.fn(async () => undefined),
       tabs: new Map([[tab.shell.id, tab]]),
       validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
@@ -2816,30 +5958,1636 @@ describe('browser manager renderer lifecycle', () => {
         task(documentLease),
     });
 
-    const action = manager.action(
-      'chat-1',
-      { tabId: tab.shell.id, kind: 'click', selector: '#submit' },
-      { id: 'run-1' },
-    );
-    await vi.waitFor(() =>
-      expect(emit).toHaveBeenCalledWith({ type: 'open-panel', conversationId: 'chat-1', tabId: tab.shell.id }),
-    );
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', selector: '#submit' }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
+    expect(setVisible).toHaveBeenCalledWith(false);
+    expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
     expect(sendInputEvent).not.toHaveBeenCalled();
-
-    Reflect.set(manager, 'mountedConversationId', 'chat-1');
-    Reflect.set(manager, 'mountedBounds', { x: 10, y: 20, width: 300, height: 200 });
-    Reflect.set(manager, 'attachedView', view);
-    invokePrivate(manager, 'notifyPanelStateChanged', 'chat-1');
-
-    await expect(action).resolves.toMatchObject({ ok: true });
-    expect(sendInputEvent).toHaveBeenCalled();
+    expect(sendAttributedInputEvent).toHaveBeenCalled();
   });
 
-  it('does not focus a physical action view until Kai is foregrounded and Browser chrome releases focus', async () => {
-    let windowFocused = false;
+  it('uses attributed CDP input while Kai is focused but the Browser sidebar is unmounted', async () => {
+    const sendInputEvent = vi.fn();
+    let debuggerAttached = false;
+    let manager!: InstanceType<typeof BrowserManager>;
+    let contents!: {
+      id: number;
+      debugger: Record<string, unknown>;
+      getZoomFactor: () => number;
+      insertText: ReturnType<typeof vi.fn>;
+      isDestroyed: () => boolean;
+      mainFrame: { framesInSubtree: Array<Record<string, unknown>> };
+      sendInputEvent: ReturnType<typeof vi.fn>;
+    };
+    const frame = {
+      detached: false,
+      frameToken: 'frame-token-1',
+      frameTreeNodeId: 101,
+      isDestroyed: () => false,
+      processId: 7,
+      routingId: 11,
+      send: vi.fn((channel: string, payload: { token?: string }) => {
+        if (channel !== 'browser-page:arm-automation-input') return;
+        queueMicrotask(() =>
+          invokePrivate(
+            manager,
+            'acknowledgeAutomationInputArm',
+            { sender: contents, senderFrame: frame },
+            { token: payload.token },
+          ),
+        );
+      }),
+    };
+    const sendCommand = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (
+        (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') ||
+        (method === 'Input.dispatchKeyEvent' && params.type === 'keyDown') ||
+        method === 'Input.insertText'
+      ) {
+        const tokens = Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>;
+        const token = tokens.keys().next().value;
+        const pending = token ? tokens.get(token) : undefined;
+        if (pending) Reflect.set(pending, 'confirmed', true);
+      }
+      return {};
+    });
+    contents = {
+      id: 42,
+      debugger: {
+        attach: vi.fn(() => {
+          debuggerAttached = true;
+        }),
+        detach: vi.fn(() => {
+          debuggerAttached = false;
+        }),
+        isAttached: () => debuggerAttached,
+        sendCommand,
+      },
+      getZoomFactor: () => 1,
+      insertText: vi.fn(),
+      isDestroyed: () => false,
+      mainFrame: {
+        framesInSubtree: [frame],
+      },
+      sendInputEvent,
+    };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const runRendererOperationWithDeadline = vi.fn(async (...args: unknown[]) => (args[4] as () => Promise<unknown>)());
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com/form',
+        sensitive: false,
+      },
+      view,
+      aiControlOwnerId: 'run-1',
+      generation: 4,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      lastUsedAt: 0,
+      popupGesture: null,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    };
+    const validateLocatedTarget = vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target);
+    manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      attachedView: null,
+      automationGestureTokens: new Map(),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureAssistantView: vi.fn(async () => view),
+      evaluateWithDeadline: vi.fn(async () => true),
+      getWindow: () =>
+        visibleHostWindow({
+          isFocused: () => true,
+          isVisible: () => true,
+        }),
+      isHostWindowInteractive: () => true,
+      isTargetViewInteractive: () => false,
+      locate: vi.fn(async () => ({ x: 20, y: 30, width: 100, height: 20 })),
+      mountedBounds: null,
+      mountedConversationId: null,
+      runRendererOperationWithDeadline,
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      setAutomationOverlay: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget,
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+      withAssistantScriptPopupAttribution: (_tab: unknown, task: () => Promise<unknown>) => task(),
+    });
+
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', selector: '#submit' }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'press', keys: ['Enter'] }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'press', keys: ['Shift', 'a'] }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'press', keys: ['SHIFT', '1'] }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'press', keys: ['cmd', 'enter'] }, { id: 'run-1' }),
+    ).rejects.toThrow(/application keyboard shortcuts/i);
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'type', selector: '#name', value: 'Kai' }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(sendInputEvent).not.toHaveBeenCalled();
+    expect(contents.insertText).not.toHaveBeenCalled();
+    expect(sendCommand).toHaveBeenCalledWith(
+      'Input.dispatchKeyEvent',
+      expect.objectContaining({ type: 'keyDown', key: 'Enter' }),
+    );
+    expect(sendCommand).toHaveBeenCalledWith(
+      'Input.dispatchKeyEvent',
+      expect.objectContaining({ type: 'keyDown', key: 'A', code: 'KeyA', text: 'A' }),
+    );
+    expect(sendCommand).toHaveBeenCalledWith(
+      'Input.dispatchKeyEvent',
+      expect.objectContaining({ type: 'keyDown', key: '!', code: 'Digit1', text: '!' }),
+    );
+    expect(sendCommand).toHaveBeenCalledWith('Input.insertText', { text: 'Kai' });
+    expect(frame.send).toHaveBeenCalledWith(
+      'browser-page:arm-automation-input',
+      expect.objectContaining({ kind: 'pointerdown' }),
+    );
+    expect((Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>).size).toBe(0);
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(view.setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(runRendererOperationWithDeadline).toHaveBeenCalledWith(
+      tab,
+      contents,
+      'Browser input',
+      15_000,
+      expect.any(Function),
+      undefined,
+      documentLease,
+    );
+    // Click and type each revalidate after the asynchronous frame-arm
+    // acknowledgement, in addition to their ordinary pre-dispatch checks.
+    expect(validateLocatedTarget).toHaveBeenCalledTimes(6);
+  });
+
+  it('completes empty typing without mounting, focusing, locating, or arming a page', async () => {
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com/form',
+      },
+      view: null,
+      trustedGestureGeneration: 0,
+    };
+    const emit = vi.fn();
+    const ensureAssistantView = vi.fn();
+    const locate = vi.fn();
+    const setAutomationOverlay = vi.fn();
+    const serializeVisibleAssistantOperation = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      emit,
+      ensureAssistantView,
+      locate,
+      requireTab: () => tab,
+      serializeVisibleAssistantOperation,
+      setAutomationOverlay,
+      snapshotTab: () => ({ ...tab.shell, active: true }),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'type', selector: '#name', value: '' }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true, tab: { id: tab.shell.id } });
+
+    expect(serializeVisibleAssistantOperation).not.toHaveBeenCalled();
+    expect(ensureAssistantView).not.toHaveBeenCalled();
+    expect(locate).not.toHaveBeenCalled();
+    expect(setAutomationOverlay).not.toHaveBeenCalled();
+    expect(emit).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ type: 'action', action: expect.objectContaining({ status: 'running' }) }),
+    );
+    expect(emit).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ type: 'action', action: expect.objectContaining({ status: 'completed' }) }),
+    );
+  });
+
+  it('revalidates a hidden target after frame acknowledgement and before CDP dispatch', async () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view: { webContents: contents },
+    };
+    const dispatchCdpInputCommand = vi.fn(async () => undefined);
+    const revalidate = vi.fn(async () => {
+      throw new Error('The requested browser target moved while background input was being armed.');
+    });
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      automationGestureTokens: new Map(),
+      dispatchCdpInputCommand,
+      isTargetViewInteractive: () => false,
+      publishAutomationGestureArmAndWait: vi.fn(async () => undefined),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'sendAttributedInputEvent',
+        tab,
+        contents,
+        { kind: 'pointerdown', x: 10, y: 20 },
+        { type: 'mouseDown', x: 10, y: 20, button: 'left', clickCount: 1 },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: 10, y: 20 } },
+        undefined,
+        undefined,
+        revalidate,
+      ) as Promise<void>,
+    ).rejects.toThrow(/target moved/i);
+    expect(revalidate).toHaveBeenCalledOnce();
+    expect(dispatchCdpInputCommand).not.toHaveBeenCalled();
+  });
+
+  it('fails hidden input when an acknowledged child frame is replaced before dispatch', async () => {
+    let manager!: InstanceType<typeof BrowserManager>;
+    let frames: Array<Record<string, unknown>>;
+    const oldFrame = {
+      detached: false,
+      frameToken: 'old-frame',
+      frameTreeNodeId: 7,
+      isDestroyed: () => false,
+      processId: 1,
+      routingId: 2,
+      send: vi.fn((channel: string, payload: { token?: string }) => {
+        if (channel !== 'browser-page:arm-automation-input') return;
+        queueMicrotask(() =>
+          invokePrivate(
+            manager,
+            'acknowledgeAutomationInputArm',
+            { sender: contents, senderFrame: oldFrame },
+            { token: payload.token },
+          ),
+        );
+      }),
+    };
+    const replacementFrame = {
+      detached: false,
+      frameToken: 'replacement-frame',
+      frameTreeNodeId: 7,
+      isDestroyed: () => false,
+      processId: 1,
+      routingId: 3,
+      send: vi.fn(),
+    };
+    frames = [oldFrame];
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: {
+        get framesInSubtree() {
+          return frames;
+        },
+      },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view: { webContents: contents },
+    };
+    const dispatchCdpInputCommand = vi.fn(async () => undefined);
+    manager = managerWithoutConstructor({
+      attachActiveView: vi.fn(),
+      attachedView: null,
+      dispatchCdpInputCommand,
+      getWindow: () => null,
+      isTargetViewInteractive: () => false,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'sendAttributedInputEvent',
+        tab,
+        contents,
+        { kind: 'keydown', key: 'Enter' },
+        { type: 'keyDown', keyCode: 'Enter' },
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Enter' } },
+        undefined,
+        undefined,
+        async () => {
+          frames = [replacementFrame];
+        },
+      ) as Promise<void>,
+    ).rejects.toThrow(/frame changed/i);
+    expect(dispatchCdpInputCommand).not.toHaveBeenCalled();
+    expect(replacementFrame.send).toHaveBeenCalledWith('browser-page:disarm-automation-input', {
+      token: expect.any(String),
+    });
+    expect(Reflect.get(manager, 'automationGestureTokens')).toHaveLength(0);
+  });
+
+  it('does not treat an expired background provenance token as confirmed input', async () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1' },
+      aiControlOwnerId: 'run-1',
+      popupGesture: null,
+      view: { webContents: contents },
+    };
+    const automationGestureTokens = new Map<string, unknown>();
+    const dispatchCdpInputCommand = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      automationGestureTokens,
+      dispatchCdpInputCommand,
+      isTargetViewInteractive: () => false,
+      publishAutomationGestureArmAndWait: vi.fn(async () => {
+        // Model timer expiry while a slow CDP command is still pending.
+        automationGestureTokens.clear();
+      }),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'sendAttributedInputEvent',
+        tab,
+        contents,
+        { kind: 'keydown', key: 'Enter' },
+        { type: 'keyDown', keyCode: 'Enter' },
+        { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Enter' } },
+      ) as Promise<void>,
+    ).rejects.toThrow(/expired before Chromium dispatch/i);
+    expect(dispatchCdpInputCommand).not.toHaveBeenCalled();
+  });
+
+  it('marks a down input before a rejecting CDP call so the surviving document receives its release', async () => {
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const [method, params] = args as [string, Record<string, unknown>];
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') {
+        throw new Error('CDP rejected after dispatching mouse down');
+      }
+      return {};
+    });
+    const contents = {
+      id: 42,
+      debugger: debuggerApi,
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: { id: 'tab-1' },
+      generation: 4,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const downCommand = {
+      method: 'Input.dispatchMouseEvent' as const,
+      params: { type: 'mousePressed', button: 'left', buttons: 1, x: 10, y: 20 },
+    };
+    const releaseEvent = { type: 'mouseUp' as const, button: 'left' as const, x: 10, y: 20, clickCount: 1 };
+    const releaseCommand = {
+      method: 'Input.dispatchMouseEvent' as const,
+      params: { type: 'mouseReleased', button: 'left', buttons: 0, x: 10, y: 20 },
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 1,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: 0,
+      url: 'https://example.com',
+    };
+    let potentiallyPressed = false;
+
+    await expect(
+      invokePrivate(
+        manager,
+        'dispatchCdpInputCommand',
+        tab,
+        contents,
+        downCommand,
+        undefined,
+        undefined,
+        undefined,
+        () => {
+          potentiallyPressed = true;
+        },
+      ) as Promise<void>,
+    ).rejects.toThrow(/rejected after dispatching mouse down/i);
+
+    expect(potentiallyPressed).toBe(true);
+    await invokePrivate(
+      manager,
+      'releaseInputIfDocumentCurrent',
+      tab,
+      contents,
+      releaseEvent,
+      releaseCommand,
+      documentLease,
+    );
+    expect(debuggerApi.sendCommand.mock.calls).toEqual([
+      ['Input.dispatchMouseEvent', { ...downCommand.params, timestamp: expect.any(Number) }],
+      ['Input.dispatchMouseEvent', { ...releaseCommand.params, timestamp: expect.any(Number) }],
+    ]);
+  });
+
+  it.each([
+    ['click', { kind: 'click' as const, selector: '#target' }],
+    ['press', { kind: 'press' as const, keys: ['Enter'] }],
+    ['drag', { kind: 'drag' as const, selector: '#target', endX: 80, endY: 90 }],
+  ])('does not emit an unmatched release when a background %s fails before down dispatch', async (_label, request) => {
+    const contents = {
+      id: 42,
+      getZoomFactor: () => 1,
+      isDestroyed: () => false,
+    };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com/form',
+        sensitive: false,
+      },
+      view,
+      aiControlOwnerId: 'run-1',
+      generation: 4,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      lastUsedAt: 0,
+      popupGesture: null,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    };
+    const releaseInputIfDocumentCurrent = vi.fn(async () => undefined);
+    const sendAttributedInputEvent = vi.fn(async () => {
+      throw new Error('Background input failed before Chromium dispatch.');
+    });
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      dispatchInputEvent: vi.fn(async () => undefined),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureAssistantView: vi.fn(async () => view),
+      isTargetViewInteractive: () => false,
+      locate: vi.fn(async () => ({ x: 20, y: 30, width: 100, height: 20 })),
+      prepareAssistantOperationView: vi.fn(),
+      releaseInputIfDocumentCurrent,
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      sendAttributedInputEvent,
+      serializeVisibleAssistantOperation: (
+        _conversationId: string,
+        _tab: unknown,
+        _run: unknown,
+        task: () => Promise<unknown>,
+      ) => task(),
+      setAutomationOverlay: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+    });
+
+    await expect(manager.action('chat-1', { tabId: tab.shell.id, ...request }, { id: 'run-1' })).rejects.toThrow(
+      /before Chromium dispatch/i,
+    );
+    expect(sendAttributedInputEvent).toHaveBeenCalledOnce();
+    expect(releaseInputIfDocumentCurrent).not.toHaveBeenCalled();
+  });
+
+  it('releases synthetic input after same-document navigation but never into a replacement document', async () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', url: 'https://example.com/after#section' },
+      generation: 4,
+      view: { webContents: contents },
+    };
+    const dispatchInputEvent = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      dispatchInputEvent,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const releaseEvent = { type: 'keyUp' as const, keyCode: 'Enter' };
+    const releaseCommand = {
+      method: 'Input.dispatchKeyEvent' as const,
+      params: { type: 'keyUp', key: 'Enter' },
+    };
+    const lease = {
+      runId: 'expired-run',
+      runGeneration: 1,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 4,
+      userNavigationLease: 0,
+      url: 'https://example.com/before',
+    };
+
+    await invokePrivate(manager, 'releaseInputIfDocumentCurrent', tab, contents, releaseEvent, releaseCommand, lease);
+    expect(dispatchInputEvent).toHaveBeenCalledWith(tab, contents, releaseEvent, releaseCommand);
+
+    tab.generation++;
+    await invokePrivate(manager, 'releaseInputIfDocumentCurrent', tab, contents, releaseEvent, releaseCommand, lease);
+    expect(dispatchInputEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      label: 'click release after mouse-down navigation',
+      request: { kind: 'click' as const, selector: '#target' },
+      changesDocument: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed',
+      forbiddenFollowup: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased',
+    },
+    {
+      label: 'key-up after key-down navigation',
+      request: { kind: 'press' as const, keys: ['Enter'] },
+      changesDocument: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchKeyEvent' && params.type === 'keyDown',
+      forbiddenFollowup: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchKeyEvent' && params.type === 'keyUp',
+    },
+    {
+      label: 'drag release after movement navigation',
+      request: { kind: 'drag' as const, selector: '#target', endX: 80, endY: 90 },
+      changesDocument: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchMouseEvent' && params.type === 'mouseMoved' && params.buttons === 1,
+      forbiddenFollowup: (method: string, params: Record<string, unknown>) =>
+        method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased',
+    },
+  ])(
+    'does not dispatch a $label into a replacement document',
+    async ({ request, changesDocument, forbiddenFollowup }) => {
+      let debuggerAttached = false;
+      let documentChanged = false;
+      let manager!: InstanceType<typeof BrowserManager>;
+      const sendCommand = vi.fn(async (method: string, params: Record<string, unknown>) => {
+        if (
+          (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed') ||
+          (method === 'Input.dispatchKeyEvent' && params.type === 'keyDown')
+        ) {
+          const tokens = Reflect.get(manager, 'automationGestureTokens') as Map<string, unknown>;
+          const token = tokens.keys().next().value;
+          const pending = token ? tokens.get(token) : undefined;
+          if (pending) Reflect.set(pending, 'confirmed', true);
+        }
+        if (changesDocument(method, params)) documentChanged = true;
+        return {};
+      });
+      const contents = {
+        id: 42,
+        debugger: {
+          attach: vi.fn(() => {
+            debuggerAttached = true;
+          }),
+          detach: vi.fn(() => {
+            debuggerAttached = false;
+          }),
+          isAttached: () => debuggerAttached,
+          sendCommand,
+        },
+        getZoomFactor: () => 1,
+        isDestroyed: () => false,
+        mainFrame: { framesInSubtree: [{ detached: false, isDestroyed: () => false, send: vi.fn() }] },
+        sendInputEvent: vi.fn(),
+      };
+      const view = {
+        getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+        setBounds: vi.fn(),
+        setVisible: vi.fn(),
+        webContents: contents,
+      };
+      const tab = {
+        shell: {
+          id: '00000000-0000-4000-8000-000000000001',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: true,
+          url: 'https://example.com/form',
+          sensitive: false,
+        },
+        view,
+        aiControlOwnerId: 'run-1',
+        get generation() {
+          return documentChanged ? 5 : 4;
+        },
+        trustedUserNavigationLease: 0,
+        trustedGestureGeneration: 0,
+        lastUsedAt: 0,
+        popupGesture: null,
+      };
+      const documentLease = {
+        runId: 'run-1',
+        runGeneration: 7,
+        hostRendererAuthorityGeneration: 0,
+        tabGeneration: tab.generation,
+        userNavigationLease: tab.trustedUserNavigationLease,
+        url: tab.shell.url,
+      };
+      manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        assertAssistantDocumentLease: vi.fn(() => {
+          if (documentChanged) throw new Error('The page navigated while this assistant operation was waiting.');
+        }),
+        attachedView: null,
+        automationGestureTokens: new Map(),
+        emit: vi.fn(),
+        emitTabs: vi.fn(),
+        ensureAssistantView: vi.fn(async () => view),
+        getWindow: () => visibleHostWindow({ isFocused: () => false, isVisible: () => false }),
+        isHostWindowInteractive: () => false,
+        isTargetViewInteractive: () => false,
+        locate: vi.fn(async () => ({ x: 20, y: 30, width: 100, height: 20 })),
+        mountedBounds: null,
+        mountedConversationId: null,
+        publishAutomationGestureArmAndWait: async (_tab: unknown, targetContents: typeof contents, arm: unknown) =>
+          invokePrivate(manager, 'publishAutomationGestureArm', targetContents, arm),
+        runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+        runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+        setAutomationOverlay: vi.fn(async () => undefined),
+        tabs: new Map([[tab.shell.id, tab]]),
+        validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+        withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+          task(documentLease),
+      });
+
+      await expect(manager.action('chat-1', { tabId: tab.shell.id, ...request }, { id: 'run-1' })).rejects.toThrow(
+        /page navigated/i,
+      );
+      expect(sendCommand.mock.calls.some(([method, params]) => forbiddenFollowup(method, params))).toBe(false);
+    },
+  );
+
+  it('releases assistant ownership when background-throttling setup races renderer teardown', async () => {
+    const release = vi.fn();
+    const setBackgroundThrottling = vi.fn(() => {
+      throw new Error('renderer destroyed');
+    });
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+      },
+      view: {
+        webContents: {
+          isDestroyed: () => false,
+          setBackgroundThrottling,
+        },
+      },
+      assistantOwnerId: null,
+      assistantRenderingContents: undefined,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+    });
+
+    await expect(invokePrivate(manager, 'withAssistantControl', tab, { id: 'run-1' }, vi.fn())).rejects.toThrow(
+      'renderer destroyed',
+    );
+
+    expect(setBackgroundThrottling).toHaveBeenCalledWith(false);
+    expect(release).toHaveBeenCalledOnce();
+    expect(tab.aiActionDepth).toBe(0);
+    expect(tab.assistantRenderingContents).toBeUndefined();
+  });
+
+  it('releases assistant ownership when background viewport restoration fails', async () => {
+    const release = vi.fn();
+    const restoreAssistantBackgroundRendering = vi.fn();
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+      },
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab: vi.fn(async () => ({})),
+      restoreAssistantBackgroundRendering,
+      restoreAssistantBackgroundViewport: vi.fn(async () => {
+        throw new Error('viewport restore failed');
+      }),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'withAssistantControl',
+        tab,
+        { id: 'run-1' },
+        vi.fn(async () => 'done'),
+      ),
+    ).rejects.toThrow('viewport restore failed');
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(tab.aiActionDepth).toBe(0);
+    expect(restoreAssistantBackgroundRendering).toHaveBeenCalledWith(tab);
+  });
+
+  it('prepares synchronous dialog suppression and installs the native-UI guard before asynchronous authorization', async () => {
+    const authorization = deferred<{
+      runId: string;
+      runGeneration: number;
+      hostRendererAuthorityGeneration: number;
+      tabGeneration: number;
+      userNavigationLease: number;
+      url: string;
+    }>();
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      setBackgroundThrottling: vi.fn(),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com',
+      },
+      view: { webContents: contents },
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    const installAssistantNativeUiGuard = vi.fn(async () => undefined);
+    const protectAssistantDialogs = vi.fn(async () => undefined);
+    const guardAssistantTab = vi.fn(() => authorization.promise);
+    const operation = vi.fn(async () => 'done');
+    const release = vi.fn();
+    const prepareAssistantDialogSafeRenderer = vi.fn();
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab,
+      installAssistantNativeUiGuard,
+      prepareAssistantDialogSafeRenderer,
+      protectAssistantDialogs,
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const controlling = invokePrivate(
+      manager,
+      'withAssistantControl',
+      tab,
+      { id: 'run-1' },
+      operation,
+    ) as Promise<string>;
+
+    await vi.waitFor(() => expect(guardAssistantTab).toHaveBeenCalledOnce());
+    expect(prepareAssistantDialogSafeRenderer).toHaveBeenCalledWith(tab, 'run-1');
+    expect(installAssistantNativeUiGuard).toHaveBeenCalledWith(tab, contents, undefined);
+    expect(protectAssistantDialogs).toHaveBeenCalledWith(tab, contents, expect.any(Object));
+    expect(protectAssistantDialogs.mock.invocationCallOrder[0]).toBeLessThan(
+      installAssistantNativeUiGuard.mock.invocationCallOrder[0]!,
+    );
+    expect(installAssistantNativeUiGuard.mock.invocationCallOrder[0]).toBeLessThan(
+      guardAssistantTab.mock.invocationCallOrder[0]!,
+    );
+    expect(prepareAssistantDialogSafeRenderer.mock.invocationCallOrder[0]).toBeLessThan(
+      protectAssistantDialogs.mock.invocationCallOrder[0]!,
+    );
+    expect(operation).not.toHaveBeenCalled();
+
+    authorization.resolve({
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 1,
+      userNavigationLease: 0,
+      url: tab.shell.url,
+    });
+    await expect(controlling).resolves.toBe('done');
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('preserves an existing user renderer while assistant dialog guards are armed', () => {
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      generation: 4,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        loading: true,
+        sensitive: true,
+      },
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+    });
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({ destroyView, emitTabs });
+    Reflect.deleteProperty(manager, 'prepareAssistantDialogSafeRenderer');
+
+    invokePrivate(manager, 'prepareAssistantDialogSafeRenderer', tab, 'run-1');
+
+    expect(tab.assistantDialogsDisabledRunId).toBeNull();
+    expect(tab.generation).toBe(4);
+    expect(tab.view).toEqual({ webContents: contents });
+    expect(tab.shell).toMatchObject({ discarded: false, loading: true, sensitive: true });
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(emitTabs).not.toHaveBeenCalled();
+  });
+
+  it('consumes ask-policy approval only for the exact discarded-tab restoration renderer', () => {
+    const replacementContents = { id: 42, isDestroyed: () => false };
+    const replacementView = { webContents: replacementContents };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      generation: 4,
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
+      trustedUserNavigationLease: 2,
+      view: null as typeof replacementView | null,
+      viewLoadPromise: null as Promise<unknown> | null,
+    };
+    const approval = {
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      origin: 'https://example.com',
+      url: tab.shell.url,
+      userNavigationLease: tab.trustedUserNavigationLease,
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserDocumentApproval: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
+    invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
+    tab.view = replacementView;
+    invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval, replacementView);
+
+    expect(approval).toMatchObject({ tabGeneration: 4, allowInternalRestore: false });
+  });
+
+  it.each(['generation', 'url', 'origin', 'navigation lease', 'different renderer', 'another run'] as const)(
+    'invalidates ask-policy approval when the replacement changes its %s',
+    (change) => {
+      const sourceContents = { id: 41, isDestroyed: () => false };
+      const replacementContents = { id: 42, isDestroyed: () => false };
+      const sourceView = { webContents: sourceContents };
+      const replacementView = { webContents: replacementContents };
+      const tab = {
+        assistantDialogsDisabledRunId: null as string | null,
+        generation: 4,
+        shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
+        trustedUserNavigationLease: 2,
+        view: null as typeof sourceView | typeof replacementView | null,
+        viewLoadPromise: null as Promise<unknown> | null,
+      };
+      const approval = {
+        tabId: tab.shell.id,
+        tabGeneration: tab.generation,
+        origin: 'https://example.com',
+        url: tab.shell.url,
+        userNavigationLease: tab.trustedUserNavigationLease,
+      };
+      const manager = managerWithoutConstructor({
+        assertBrowserDocumentApproval: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
+      invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
+      tab.view = replacementView;
+
+      let run = { id: 'run-1' };
+      let consumedView = replacementView;
+      if (change === 'generation') tab.generation += 1;
+      if (change === 'url') tab.shell.url = 'https://example.com/other';
+      if (change === 'origin') tab.shell.url = 'https://other.example/account';
+      if (change === 'navigation lease') tab.trustedUserNavigationLease += 1;
+      if (change === 'different renderer') consumedView = sourceView;
+      if (change === 'another run') run = { id: 'run-2' };
+
+      expect(() =>
+        invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, run, approval, consumedView),
+      ).toThrow(/page changed while approval was pending/i);
+    },
+  );
+
+  it('restores an active user tab normally when authorization fails after synchronous dialog-safe reclamation', async () => {
+    const release = vi.fn();
+    const restoreActiveViewAfterClose = vi.fn();
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+      },
+      view: null,
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab: vi.fn(async () => {
+        throw new Error('AI navigation resolved to a private-network address and was blocked.');
+      }),
+      prepareAssistantDialogSafeRenderer: vi.fn((target: typeof tab, runId: string) => {
+        target.assistantDialogsDisabledRunId = runId;
+        return true;
+      }),
+      restoreActiveViewAfterClose,
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'withAssistantControl',
+        tab,
+        { id: 'run-1' },
+        vi.fn(async () => undefined),
+      ),
+    ).rejects.toThrow(/private-network address/i);
+
+    expect(tab.assistantDialogsDisabledRunId).toBeNull();
+    expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', 'tab-1');
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back dialog suppression and restores an already-presented tab when approval setup fails', async () => {
+    const release = vi.fn();
+    const contents = { id: 41, isDestroyed: () => false };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      assistantDownloadAttribution: undefined,
+      assistantRunDialogGuardLease: undefined,
+      generation: 4,
+      shell: {
+        id: 'tab-approval-setup',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        url: 'https://example.com/account',
+        discarded: false,
+        loading: false,
+        sensitive: false,
+      },
+      trustedUserNavigationLease: 0,
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+      target.shell.discarded = true;
+    });
+    const restoreActiveViewAfterClose = vi.fn();
+    const operation = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      assistantRuns: { acquire: () => ({ generation: 1, release }), generationIfActive: () => 1 },
+      assertAssistantMayControlTab: vi.fn(),
+      destroyView,
+      ensureAssistantRunDialogGuard: vi.fn(),
+      finishBrowserApprovalRendererReset: vi.fn(),
+      prepareAssistantDialogSafeRenderer: vi.fn((target: typeof tab, runId: string) => {
+        target.assistantDialogsDisabledRunId = runId;
+        target.generation++;
+        destroyView(target);
+        return true;
+      }),
+      prepareBrowserApprovalRendererReset: vi.fn(() => {
+        throw new Error('approval renderer setup failed');
+      }),
+      restoreActiveViewAfterClose,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'withAssistantControl', tab, { id: 'run-1' }, operation)).rejects.toThrow(
+      /approval renderer setup failed/i,
+    );
+
+    expect(tab.assistantDialogsDisabledRunId).toBeNull();
+    expect(tab.view).toBeNull();
+    expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', tab.shell.id);
+    expect(operation).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('clears a new dialog flag and reclaims a renderer restored during failed discarded-tab authorization', async () => {
+    const release = vi.fn();
+    const contents = { id: 42, isDestroyed: () => false, setBackgroundThrottling: vi.fn() };
+    const view = { webContents: contents };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+      generation: 4,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        discarded: true,
+        loading: false,
+        sensitive: false,
+      },
+      view: null as typeof view | null,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+    });
+    const restoreActiveViewAfterClose = vi.fn();
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      destroyView,
+      emitTabs: vi.fn(),
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab: vi.fn(async () => {
+        tab.view = view;
+        throw new Error('AI navigation resolved to a private-network address and was blocked.');
+      }),
+      prepareAssistantDialogSafeRenderer: vi.fn((target: typeof tab, runId: string) => {
+        target.assistantDialogsDisabledRunId = runId;
+        return false;
+      }),
+      restoreActiveViewAfterClose,
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'withAssistantControl',
+        tab,
+        { id: 'run-1' },
+        vi.fn(async () => undefined),
+      ),
+    ).rejects.toThrow(/private-network address/i);
+
+    expect(tab.assistantDialogsDisabledRunId).toBeNull();
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.view).toBeNull();
+    expect(tab.generation).toBe(5);
+    expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', tab.shell.id);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('reclaims a native-UI-guarded renderer when hidden assistant authorization fails', async () => {
+    const release = vi.fn();
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      setBackgroundThrottling: vi.fn(),
+    };
+    const view = { webContents: contents };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://private.example',
+        discarded: false,
+        loading: true,
+        sensitive: true,
+      },
+      view: view as typeof view | null,
+      generation: 4,
+      assistantOwnerId: null,
+      aiControlOwnerId: null,
+      aiControlGeneration: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+      assistantNativeUiNewDocumentGuard: undefined as { contentsId: number; identifier: string } | undefined,
+    };
+    const installAssistantNativeUiGuard = vi.fn(async () => {
+      tab.assistantNativeUiNewDocumentGuard = { contentsId: contents.id, identifier: 'native-ui-guard-1' };
+    });
+    const destroyView = vi.fn(() => {
+      tab.assistantNativeUiNewDocumentGuard = undefined;
+      tab.view = null;
+    });
+    const emitTabs = vi.fn();
+    const restoreActiveViewAfterClose = vi.fn();
+    const operation = vi.fn(async () => 'done');
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      destroyView,
+      emitTabs,
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab: vi.fn(async () => {
+        tab.aiControlOwnerId = null;
+        tab.aiControlGeneration = null;
+        throw new Error('AI navigation resolved to a private-network address and was blocked.');
+      }),
+      installAssistantNativeUiGuard,
+      mountedBounds: null,
+      mountedConversationId: null,
+      protectAssistantDialogs: vi.fn(async () => undefined),
+      restoreActiveViewAfterClose,
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'withAssistantControl', tab, { id: 'run-1' }, operation)).rejects.toThrow(
+      'private-network address',
+    );
+
+    expect(installAssistantNativeUiGuard).toHaveBeenCalledWith(tab, contents, undefined);
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.generation).toBe(5);
+    expect(tab.view).toBeNull();
+    expect(tab.shell).toMatchObject({ discarded: true, loading: false, sensitive: false });
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
+    expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', tab.shell.id);
+    expect(operation).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('dismisses blocking JavaScript dialogs and retains protection until assistant-run cleanup', async () => {
+    const release = vi.fn();
+    const debuggerApi = browserDebuggerMock();
+    const contents = {
+      debugger: debuggerApi,
+      id: 42,
+      isDestroyed: () => false,
+      setBackgroundThrottling: vi.fn(),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com',
+        error: undefined as string | undefined,
+      },
+      view: { webContents: contents },
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 1,
+      userNavigationLease: 0,
+      url: tab.shell.url,
+    };
+    const operation = deferred<void>();
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      emitTabs,
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab: vi.fn(async () => documentLease),
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const controlling = invokePrivate(
+      manager,
+      'withAssistantControl',
+      tab,
+      { id: 'run-1' },
+      () => operation.promise,
+    ) as Promise<void>;
+    let controlSettled = false;
+    void controlling.then(
+      () => {
+        controlSettled = true;
+      },
+      () => {
+        controlSettled = true;
+      },
+    );
+    await vi.waitFor(() => expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.enable'));
+    debuggerApi.emitMessage('Page.javascriptDialogOpening', { type: 'prompt', message: 'do-not-expose-this' });
+
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.handleJavaScriptDialog', { accept: false }),
+    );
+    await Promise.resolve();
+    expect(controlSettled).toBe(false);
+    expect(release).not.toHaveBeenCalled();
+
+    operation.resolve();
+    await expect(controlling).rejects.toThrow(/blocking prompt dialog.*blocked/i);
+    expect(tab.shell.error).not.toContain('do-not-expose-this');
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
+    // The live user document is retained. Its run-lifetime CDP listener stays
+    // installed until cleanup so a delayed callback cannot open a second native
+    // dialog after the failed action has unwound.
+    expect(debuggerApi.off).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+
+    await invokePrivate(manager, 'releaseAssistantRunDialogGuard', tab);
+    expect(debuggerApi.off).toHaveBeenCalledWith('message', expect.any(Function));
+
+    const dismissCalls = debuggerApi.sendCommand.mock.calls.filter(
+      ([method]) => method === 'Page.handleJavaScriptDialog',
+    );
+    debuggerApi.emitMessage('Page.javascriptDialogOpening', { type: 'alert' });
+    expect(
+      debuggerApi.sendCommand.mock.calls.filter(([method]) => method === 'Page.handleJavaScriptDialog'),
+    ).toHaveLength(dismissCalls.length);
+  });
+
+  it('cancels native file choosers during assistant control and restores them afterward', async () => {
+    const debuggerApi = browserDebuggerMock();
+    const contents = {
+      debugger: debuggerApi,
+      id: 42,
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        sensitive: false,
+        error: undefined as string | undefined,
+      },
+      view: { webContents: contents },
+      generation: 3,
+      trustedUserNavigationLease: 2,
+    };
+    const manager = managerWithoutConstructor({
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const dialogLease = invokePrivate(manager, 'acquireAssistantDialogGuard', tab, 'run-1') as {
+      guard: { failure: Promise<never> };
+      token: symbol;
+    };
+
+    await invokePrivate(manager, 'protectAssistantDialogs', tab, contents, dialogLease.guard);
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.setInterceptFileChooserDialog', {
+      enabled: true,
+      cancel: true,
+    });
+    const failure = expect(dialogLease.guard.failure).rejects.toThrow(/native file chooser.*cancelled/i);
+
+    debuggerApi.emitMessage('Page.fileChooserOpened', { mode: 'selectSingle' });
+    await failure;
+    expect(tab.shell.error).not.toContain('selectSingle');
+
+    invokePrivate(manager, 'releaseAssistantDialogGuard', tab, dialogLease.token);
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.setInterceptFileChooserDialog', { enabled: false }),
+    );
+  });
+
+  it('retains file-chooser interception after an operation and waits for restoration at run cleanup', async () => {
+    const restore = deferred<object>();
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (method: unknown, params?: unknown) => {
+      if (
+        method === 'Page.setInterceptFileChooserDialog' &&
+        params &&
+        typeof params === 'object' &&
+        (params as { enabled?: unknown }).enabled === false
+      ) {
+        return restore.promise;
+      }
+      return {};
+    });
+    const contents = {
+      debugger: debuggerApi,
+      id: 42,
+      isDestroyed: () => false,
+      setBackgroundThrottling: vi.fn(),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com',
+      },
+      view: { webContents: contents },
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 1,
+      userNavigationLease: 0,
+      url: tab.shell.url,
+    };
+    const releaseRun = vi.fn();
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release: releaseRun }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      emitTabs: vi.fn(),
+      guardAssistantTab: vi.fn(async () => documentLease),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const controlling = invokePrivate(
+      manager,
+      'withAssistantControl',
+      tab,
+      { id: 'run-1' },
+      async () => 'done',
+    ) as Promise<string>;
+    await expect(controlling).resolves.toBe('done');
+    expect(releaseRun).toHaveBeenCalledOnce();
+    expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('Page.setInterceptFileChooserDialog', {
+      enabled: false,
+    });
+
+    const cleanup = invokePrivate(manager, 'releaseAssistantRunDialogGuard', tab) as Promise<void>;
+    let cleanupSettled = false;
+    void cleanup.finally(() => {
+      cleanupSettled = true;
+    });
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.setInterceptFileChooserDialog', { enabled: false }),
+    );
+    await Promise.resolve();
+    expect(cleanupSettled).toBe(false);
+
+    restore.resolve({});
+    await expect(cleanup).resolves.toBeUndefined();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+  });
+
+  it('bounds JavaScript dialog protection setup and reclaims only its wedged renderer', async () => {
+    vi.useFakeTimers();
+    try {
+      const pageEnable = deferred<never>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation((method: unknown) =>
+        method === 'Page.enable' ? pageEnable.promise : Promise.resolve({}),
+      );
+      const contents = { debugger: debuggerApi, id: 42, isDestroyed: () => false };
+      const tab = {
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          discarded: false,
+          sensitive: false,
+          error: undefined as string | undefined,
+        },
+        view: { webContents: contents } as { webContents: typeof contents } | null,
+      };
+      const destroyView = vi.fn((target: typeof tab) => {
+        target.view = null;
+      });
+      const manager = managerWithoutConstructor({
+        destroyView,
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const dialogLease = invokePrivate(manager, 'acquireAssistantDialogGuard', tab, 'run-1') as {
+        guard: { failure: Promise<never> };
+        token: symbol;
+      };
+      const protection = invokePrivate(
+        manager,
+        'protectAssistantDialogs',
+        tab,
+        contents,
+        dialogLease.guard,
+      ) as Promise<void>;
+      const rejection = expect(protection).rejects.toThrow(/could not enable fail-closed/i);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejection;
+
+      expect(destroyView).toHaveBeenCalledOnce();
+      expect(destroyView).toHaveBeenCalledWith(tab);
+      expect(tab.view).toBeNull();
+      expect(tab.shell.discarded).toBe(true);
+      invokePrivate(manager, 'releaseAssistantDialogGuard', tab, dialogLease.token);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds a wedged JavaScript dialog dismissal and fails the assistant operation closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const dialogDismissal = deferred<never>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation((method: unknown) =>
+        method === 'Page.handleJavaScriptDialog' ? dialogDismissal.promise : Promise.resolve({}),
+      );
+      const contents = { debugger: debuggerApi, id: 42, isDestroyed: () => false };
+      const tab = {
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          discarded: false,
+          sensitive: false,
+          error: undefined as string | undefined,
+        },
+        view: { webContents: contents } as { webContents: typeof contents } | null,
+      };
+      const destroyView = vi.fn((target: typeof tab) => {
+        target.view = null;
+      });
+      const manager = managerWithoutConstructor({
+        destroyView,
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const dialogLease = invokePrivate(manager, 'acquireAssistantDialogGuard', tab, 'run-1') as {
+        guard: { failure: Promise<never> };
+        token: symbol;
+      };
+      await invokePrivate(manager, 'protectAssistantDialogs', tab, contents, dialogLease.guard);
+      const guardFailure = expect(dialogLease.guard.failure).rejects.toThrow(/blocking alert dialog.*blocked/i);
+
+      debuggerApi.emitMessage('Page.javascriptDialogOpening', { type: 'alert', message: 'secret' });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await guardFailure;
+
+      expect(destroyView).toHaveBeenCalledOnce();
+      expect(destroyView).toHaveBeenCalledWith(tab);
+      expect(tab.view).toBeNull();
+      expect(tab.shell.error).not.toContain('secret');
+      invokePrivate(manager, 'releaseAssistantDialogGuard', tab, dialogLease.token);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases run and dialog ownership when initial assistant authorization cannot install dialog protection', async () => {
+    const release = vi.fn();
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation((method: unknown) =>
+      method === 'Page.enable' ? Promise.reject(new Error('dialog domain unavailable')) : Promise.resolve({}),
+    );
+    const contents = { debugger: debuggerApi, id: 42, isDestroyed: () => false };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com',
+      },
+      view: null as { webContents: typeof contents } | null,
+      assistantOwnerId: null,
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiNetworkReleaseRequested: false,
+    };
+    let manager!: InstanceType<typeof BrowserManager>;
+    const guardAssistantTab = vi.fn(async () => {
+      tab.view = { webContents: contents };
+      await invokePrivate(manager, 'protectAssistantDialogs', tab, contents, Reflect.get(tab, 'assistantDialogGuard'));
+      return {};
+    });
+    const operation = vi.fn(async () => 'unreachable');
+    manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: () => ({ generation: 7, release }),
+        generationIfActive: () => null,
+      },
+      assertAssistantMayControlTab: vi.fn(),
+      emitTabs: vi.fn(),
+      enableAssistantBackgroundRendering: vi.fn(),
+      guardAssistantTab,
+      restoreAssistantBackgroundRendering: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'withAssistantControl', tab, { id: 'run-1' }, operation)).rejects.toThrow(
+      /could not enable fail-closed/i,
+    );
+
+    expect(guardAssistantTab).toHaveBeenCalledOnce();
+    expect(operation).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    expect(tab.aiActionDepth).toBe(0);
+    expect(Reflect.get(tab, 'assistantDialogGuard')).toBeDefined();
+    await invokePrivate(manager, 'releaseAssistantRunDialogGuard', tab);
+    expect(Reflect.get(tab, 'assistantDialogGuard')).toBeUndefined();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+  });
+
+  it('moves a hidden physical-action view to the deterministic background surface', async () => {
     const hostFocus = vi.fn();
     const attachActiveView = vi.fn();
-    const view = { webContents: { isDestroyed: () => false } };
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const debuggerApi = browserDebuggerMock();
+    const view = {
+      setBounds,
+      setVisible,
+      webContents: { debugger: debuggerApi, isDestroyed: () => false },
+    };
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       view,
@@ -2852,37 +7600,328 @@ describe('browser manager renderer lifecycle', () => {
       attachedView: view,
       getWindow: () =>
         visibleHostWindow({
-          isFocused: () => windowFocused,
+          isVisible: () => false,
+          isFocused: () => false,
           webContents: { focus: hostFocus, isDestroyed: () => false },
         }),
+      isTargetViewInteractive: () => false,
+      mountedBounds: { x: 20, y: 30, width: 420, height: 640 },
+      mountedConversationId: 'chat-1',
+      detachAttachedView: vi.fn(() => {
+        Reflect.set(manager, 'attachedView', null);
+      }),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    Reflect.deleteProperty(manager, 'isTargetViewPresented');
+
+    manager.setChromeFocus('chat-1', true);
+    hostFocus.mockClear();
+    await invokePrivate(manager, 'prepareAssistantOperationView', tab, view, undefined, {}, vi.fn());
+
+    expect(attachActiveView).not.toHaveBeenCalled();
+    expect(setVisible).toHaveBeenCalledWith(false);
+    expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride', {
+      width: 1_280,
+      height: 800,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    expect(hostFocus).not.toHaveBeenCalled();
+  });
+
+  it('selects the deterministic background surface before locating a semantic target on an unfocused page', async () => {
+    const contents = { getZoomFactor: () => 1, isDestroyed: () => false };
+    const view = { getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }), webContents: contents };
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com',
+        sensitive: false,
+      },
+      view,
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      lastUsedAt: 0,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 3,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 2,
+      userNavigationLease: 0,
+      url: tab.shell.url,
+    };
+    const prepareAssistantOperationView = vi.fn(async () => undefined);
+    const locate = vi.fn(async () => ({ x: 20, y: 30, width: 40, height: 20 }));
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      dispatchInputEvent: vi.fn(async () => undefined),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureAssistantView: vi.fn(async () => view),
+      isTargetViewInteractive: () => false,
+      locate,
+      prepareAssistantOperationView,
+      releaseLocatedTarget: vi.fn(async () => undefined),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      serializeVisibleAssistantOperation: (
+        _conversationId: string,
+        _tab: unknown,
+        _run: unknown,
+        task: () => Promise<unknown>,
+      ) => task(),
+      setAutomationOverlay: vi.fn(async () => undefined),
+      snapshotTab: () => tab.shell,
+      tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+    });
+
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'hover', selector: '#target' }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(prepareAssistantOperationView).toHaveBeenCalledWith(tab, view, undefined, documentLease);
+    expect(prepareAssistantOperationView.mock.invocationCallOrder[0]).toBeLessThan(locate.mock.invocationCallOrder[0]);
+  });
+
+  it('clears a temporary background viewport before a browser page can be mounted again', async () => {
+    const debuggerApi = browserDebuggerMock();
+    const contents = { debugger: debuggerApi, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+      view: { webContents: contents },
+    };
+    const attachActiveView = vi.fn();
+    const manager = managerWithoutConstructor({
+      attachActiveView,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'enableAssistantBackgroundViewport', tab, contents);
+    await invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab);
+
+    expect(debuggerApi.sendCommand).toHaveBeenLastCalledWith('Emulation.clearDeviceMetricsOverride');
+    expect(Reflect.get(tab, 'assistantBackgroundViewportContents')).toBeUndefined();
+    expect(attachActiveView).toHaveBeenCalledWith('chat-1');
+  });
+
+  it('keeps a target quarantined when background viewport cleanup reaches its deadline', async () => {
+    const contents = { isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, error: undefined as string | undefined },
+      view: { webContents: contents },
+      assistantBackgroundViewportContents: new Set([contents]),
+    };
+    const destroyView = vi.fn();
+    const runRendererOperationWithDeadline = vi.fn(async (...args: unknown[]) => {
+      expect(args[7]).toBe(false);
+      throw new Error('cleanup deadline');
+    });
+    const manager = managerWithoutConstructor({
+      attachActiveView: vi.fn(),
+      destroyView,
+      emitTabs: vi.fn(),
+      runRendererOperationWithDeadline,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab, contents);
+
+    expect(runRendererOperationWithDeadline).toHaveBeenCalledOnce();
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view.webContents).toBe(contents);
+    expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
+    expect(tab.shell.error).toBe('The background browser viewport could not be restored.');
+  });
+
+  it('quarantines a page from native mounting for the full background viewport transition', async () => {
+    const setup = deferred<void>();
+    const cleanup = deferred<void>();
+    let debuggerAttached = false;
+    const sendCommand = vi.fn((method: string) => {
+      if (method === 'Emulation.setDeviceMetricsOverride') return setup.promise;
+      if (method === 'Emulation.clearDeviceMetricsOverride') return cleanup.promise;
+      return Promise.resolve({});
+    });
+    const contents = {
+      id: 42,
+      debugger: {
+        attach: vi.fn(() => {
+          debuggerAttached = true;
+        }),
+        detach: vi.fn(() => {
+          debuggerAttached = false;
+        }),
+        isAttached: () => debuggerAttached,
+        sendCommand,
+      },
+      focus: vi.fn(),
+      isDestroyed: () => false,
+      isFocused: () => false,
+    };
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const view = { setBounds, setVisible, webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, reloadRequired: false },
+      scriptTainted: false,
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      getWindow: () => visibleHostWindow(),
       mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
       mountedConversationId: 'chat-1',
       tabs: new Map([[tab.shell.id, tab]]),
     });
 
-    manager.setChromeFocus('chat-1', true);
-    const gestureGeneration = tab.trustedGestureGeneration;
-    const waiting = invokePrivate(manager, 'waitForPhysicalActionView', tab, view, undefined, {}, () => {
-      if (tab.trustedGestureGeneration !== gestureGeneration) throw new Error('physical authority changed');
-    }) as Promise<void>;
-    await Promise.resolve();
-    expect(attachActiveView).not.toHaveBeenCalled();
+    const enabling = invokePrivate(manager, 'enableAssistantBackgroundViewport', tab, contents) as Promise<void>;
+    expect(Reflect.get(tab, 'assistantBackgroundViewportContents')).toEqual(new Set([contents]));
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
 
-    windowFocused = true;
-    manager.handleHostWindowVisibilityChanged();
-    await Promise.resolve();
-    expect(attachActiveView).not.toHaveBeenCalled();
+    setup.resolve();
+    await enabling;
+    const restoring = invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab) as Promise<void>;
+    await vi.waitFor(() => expect(sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride'));
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
 
-    manager.setChromeFocus('chat-1', false);
-    await expect(waiting).rejects.toThrow('physical authority changed');
-    expect(attachActiveView).not.toHaveBeenCalled();
+    cleanup.resolve();
+    await restoring;
+    expect(Reflect.get(tab, 'assistantBackgroundViewportContents')).toBeUndefined();
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(setVisible).toHaveBeenLastCalledWith(true);
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+  });
 
-    await expect(
-      invokePrivate(manager, 'waitForPhysicalActionView', tab, view, undefined, {}, vi.fn()) as Promise<void>,
-    ).resolves.toBeUndefined();
-    expect(attachActiveView).toHaveBeenCalledWith('chat-1', true);
-    expect(hostFocus).toHaveBeenCalledOnce();
-    expect(tab.trustedGestureGeneration).toBe(2);
+  it('keeps an uncertain dispatched-input renderer detached until its tombstone clears', () => {
+    const contents = { focus: vi.fn(), id: 42, isDestroyed: () => false };
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 1, height: 1 }),
+      setBounds,
+      setVisible,
+      webContents: contents,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      getWindow: () => visibleHostWindow(),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    Reflect.get(manager, 'dispatchedSyntheticInputs').set(contents.id, {
+      tabId: tab.shell.id,
+      contents,
+      token: 'uncertain-input',
+      kind: 'pointerdown',
+      timer: null,
+    });
+
+    invokePrivate(manager, 'attachActiveView', 'chat-1', true);
+
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(contents.focus).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
+
+    invokePrivate(manager, 'clearDispatchedSyntheticInput', contents.id, 'uncertain-input');
+    invokePrivate(manager, 'attachActiveView', 'chat-1', true);
+
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(setVisible).toHaveBeenLastCalledWith(true);
+    expect(contents.focus).toHaveBeenCalledOnce();
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+  });
+
+  it('keeps a mounted Browser page visible for live automation regardless of focus', async () => {
+    const debuggerApi = browserDebuggerMock();
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const contents = {
+      debugger: debuggerApi,
+      isDestroyed: () => false,
+      isFocused: () => false,
+    };
+    const view = { setBounds, setVisible, webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      attachedView: view,
+      getWindow: () => visibleHostWindow(),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    Reflect.deleteProperty(manager, 'isTargetViewPresented');
+
+    await invokePrivate(manager, 'prepareAssistantOperationView', tab, view, undefined, {}, vi.fn());
+
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+    expect(setVisible).toHaveBeenLastCalledWith(true);
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride', expect.anything());
+  });
+
+  it('dispatches foreground input only while the native Browser page owns focus', () => {
+    let pageFocused = false;
+    const contents = {
+      isDestroyed: () => false,
+      isFocused: () => pageFocused,
+    };
+    const view = { webContents: contents };
+    const tab = { view };
+    const manager = managerWithoutConstructor({
+      attachedView: view,
+      isHostWindowInteractive: () => true,
+      isTargetViewPresented: () => true,
+    });
+
+    expect(invokePrivate(manager, 'isTargetViewInteractive', tab, contents)).toBe(false);
+    pageFocused = true;
+    expect(invokePrivate(manager, 'isTargetViewInteractive', tab, contents)).toBe(true);
+  });
+
+  it('disables renderer throttling only for the lifetime of active assistant work', () => {
+    const setBackgroundThrottling = vi.fn();
+    const contents = {
+      isDestroyed: () => false,
+      setBackgroundThrottling,
+    };
+    const tab = { aiActionDepth: 1 };
+    const manager = managerWithoutConstructor({});
+
+    invokePrivate(manager, 'enableAssistantBackgroundRendering', tab, contents);
+    invokePrivate(manager, 'enableAssistantBackgroundRendering', tab, contents);
+    expect(setBackgroundThrottling).toHaveBeenCalledTimes(1);
+    expect(setBackgroundThrottling).toHaveBeenCalledWith(false);
+
+    tab.aiActionDepth = 0;
+    invokePrivate(manager, 'restoreAssistantBackgroundRendering', tab);
+    expect(setBackgroundThrottling).toHaveBeenLastCalledWith(true);
+    expect(Reflect.get(tab, 'assistantRenderingContents')).toBeUndefined();
   });
 
   it('keeps a guard-only structured-action page attached so automation remains visible', () => {
@@ -2890,6 +7929,7 @@ describe('browser manager renderer lifecycle', () => {
     const setBounds = vi.fn();
     const view = {
       setBounds,
+      setVisible: vi.fn(),
       webContents: { focus: vi.fn(), isDestroyed: () => false },
     };
     const tab = {
@@ -2912,12 +7952,12 @@ describe('browser manager renderer lifecycle', () => {
 
     invokePrivate(manager, 'attachActiveView', 'chat-1');
 
-    expect(addChildView).toHaveBeenCalledWith(view);
+    expect(addChildView).not.toHaveBeenCalled();
     expect(setBounds).toHaveBeenCalledWith({ x: 10, y: 20, width: 300, height: 200 });
     expect(Reflect.get(manager, 'attachedView')).toBe(view);
   });
 
-  it('revokes physical input on window blur and visible operations on minimize', () => {
+  it('keeps assistant operations valid when Kai is blurred, minimized, or hidden', () => {
     let focused = true;
     let minimized = false;
     const tab = {
@@ -2954,25 +7994,181 @@ describe('browser manager renderer lifecycle', () => {
     expect(() => invokePrivate(manager, 'assertAssistantDocumentLease', tab, documentLease)).not.toThrow();
     focused = false;
     manager.handleHostWindowVisibilityChanged();
-    expect(tab.trustedGestureGeneration).toBe(1);
+    expect(tab.trustedGestureGeneration).toBe(0);
     expect(tab.visibleAssistantGeneration).toBe(0);
 
     minimized = true;
     manager.handleHostWindowVisibilityChanged();
-    expect(tab.visibleAssistantGeneration).toBe(1);
-    expect(() => invokePrivate(manager, 'assertAssistantDocumentLease', tab, documentLease)).toThrow(
-      /stopped being visible/i,
-    );
+    expect(tab.visibleAssistantGeneration).toBe(0);
+    expect(() => invokePrivate(manager, 'assertAssistantDocumentLease', tab, documentLease)).not.toThrow();
   });
 
-  it('does not dispatch physical input after the Browser panel detaches during target lookup', async () => {
-    const sendInputEvent = vi.fn();
+  it('cancels a minimized menu preview without destroying the live renderer or SPA state', async () => {
+    const pendingCapture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    let minimized = false;
     const contents = {
+      id: 42,
+      capturePage: vi.fn(() => pendingCapture.promise),
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+        discarded: false,
+        loading: false,
+        error: undefined as string | undefined,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      scopeKey: 'global',
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      } as {
+        getBounds: () => { x: number; y: number; width: number; height: number };
+        webContents: typeof contents;
+      } | null,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      destroyView,
+      emitTabs: vi.fn(),
+      getWindow: () =>
+        visibleHostWindow({
+          isMinimized: () => minimized,
+        }),
+      hostWindowInteractive: true,
+      hostWindowShown: true,
+      requireTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'minimized-preview');
+    await vi.waitFor(() => expect(contents.capturePage).toHaveBeenCalledOnce());
+
+    minimized = true;
+    manager.handleHostWindowVisibilityChanged();
+
+    await expect(preview).rejects.toThrow(/hidden or minimized/i);
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view?.webContents).toBe(contents);
+    expect(tab.shell.discarded).toBe(false);
+    expect(tab.shell.error).toBeUndefined();
+
+    // A late native completion releases only the preview slot. The tab keeps
+    // the exact renderer and therefore its unsaved document state.
+    pendingCapture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('late-menu-preview'),
+    });
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view?.webContents).toBe(contents);
+  });
+
+  it('reattaches the current mounted tab when Kai is restored after background tab changes', () => {
+    let visible = false;
+    const attachActiveView = vi.fn();
+    const manager = managerWithoutConstructor({
+      attachActiveView,
+      getWindow: () =>
+        visibleHostWindow({
+          isVisible: () => visible,
+        }),
+      hostWindowInteractive: false,
+      hostWindowShown: false,
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+    });
+
+    manager.handleHostWindowVisibilityChanged();
+    expect(attachActiveView).not.toHaveBeenCalled();
+
+    visible = true;
+    manager.handleHostWindowVisibilityChanged();
+    expect(attachActiveView).toHaveBeenCalledOnce();
+    expect(attachActiveView).toHaveBeenCalledWith('chat-1');
+
+    manager.handleHostWindowVisibilityChanged();
+    expect(attachActiveView).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a mounted view hidden until a broad background input arm is revoked', () => {
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const contents = { id: 42, isDestroyed: () => false };
+    const view = { setBounds, setVisible, webContents: contents };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view,
+    };
+    const automationGestureTokens = new Map([
+      [
+        'background-token',
+        {
+          tabId: tab.shell.id,
+          contentsId: contents.id,
+          assistantOwnerId: 'run-1',
+          expiresAt: Date.now() + 1_000,
+          kind: 'pointerdown' as const,
+          armedFrames: new Map([[1, '1:1:frame']]),
+          detachedArm: true,
+          confirmed: false,
+        },
+      ],
+    ]);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      automationGestureTokens,
+      getWindow: () => visibleHostWindow(),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
+
+    automationGestureTokens.clear();
+    invokePrivate(manager, 'attachActiveView', 'chat-1');
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(setVisible).toHaveBeenLastCalledWith(true);
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+  });
+
+  it('continues physical input in the background after the Browser panel detaches', async () => {
+    const sendInputEvent = vi.fn();
+    const setAutomationOverlay = vi.fn(async () => undefined);
+    const contents = {
+      debugger: browserDebuggerMock(),
       getZoomFactor: () => 1,
       isDestroyed: () => false,
       sendInputEvent,
     };
-    const view = { webContents: contents };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
     const tab = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
@@ -2998,7 +8194,7 @@ describe('browser manager renderer lifecycle', () => {
     };
     let manager!: InstanceType<typeof BrowserManager>;
     manager = managerWithoutConstructor({
-      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      activeTabs: new Map([['chat-1', 'user-visible-tab']]),
       armAutomationGesture: vi.fn(),
       assertAssistantDocumentLease: vi.fn(),
       attachActiveView: vi.fn(),
@@ -3016,17 +8212,217 @@ describe('browser manager renderer lifecycle', () => {
       mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
       mountedConversationId: 'chat-1',
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
-      setAutomationOverlay: vi.fn(async () => undefined),
+      sendAttributedInputEvent: (
+        _tab: unknown,
+        targetContents: { sendInputEvent: (event: unknown) => void },
+        _arm: unknown,
+        event: unknown,
+      ) => targetContents.sendInputEvent(event),
+      setAutomationOverlay,
       tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
       withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
         task(documentLease),
     });
 
     await expect(
       manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', selector: '#submit' }, { id: 'run-1' }),
-    ).rejects.toThrow(/Browser panel visibility changed while the assistant action was waiting/i);
+    ).resolves.toMatchObject({ ok: true });
+    expect(sendInputEvent).toHaveBeenCalled();
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(view.setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(tab.trustedGestureGeneration).toBe(0);
+    expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe('user-visible-tab');
+    expect(setAutomationOverlay).not.toHaveBeenCalledWith(
+      tab,
+      expect.objectContaining({ status: 'running' }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('keeps raw-coordinate input on the presented surface when the window is blurred', async () => {
+    const sendInputEvent = vi.fn();
+    let bounds = { x: 10, y: 20, width: 300, height: 200 };
+    const view = {
+      getBounds: () => bounds,
+      setBounds: vi.fn((next: typeof bounds) => {
+        bounds = next;
+      }),
+      setVisible: vi.fn(),
+      webContents: {
+        debugger: browserDebuggerMock(),
+        getZoomFactor: () => 1,
+        isDestroyed: () => false,
+        sendInputEvent,
+      },
+    };
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com/form',
+        sensitive: false,
+      },
+      view,
+      generation: 4,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      lastUsedAt: 0,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      attachedView: view,
+      dispatchInputEvent: vi.fn(async () => undefined),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureAssistantView: vi.fn(async () => view),
+      getWindow: () => visibleHostWindow({ isFocused: () => false }),
+      isTargetViewInteractive: () => false,
+      locate: vi.fn(async () => ({ x: 20, y: 30, width: 1, height: 1 })),
+      mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+      mountedConversationId: 'chat-1',
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      sendAttributedInputEvent: vi.fn(async () => undefined),
+      setAutomationOverlay: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+    });
+    Reflect.deleteProperty(manager, 'isTargetViewPresented');
+
+    await expect(
+      manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', x: 20, y: 30 }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(view.setVisible).toHaveBeenCalledWith(true);
+    expect(view.setBounds).toHaveBeenCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(view.webContents.debugger.sendCommand).not.toHaveBeenCalledWith(
+      'Emulation.setDeviceMetricsOverride',
+      expect.anything(),
+    );
     expect(sendInputEvent).not.toHaveBeenCalled();
-    expect(tab.trustedGestureGeneration).toBe(1);
+  });
+
+  it.each([
+    ['close sidebar', 'raw-coordinate'],
+    ['minimize Kai', 'raw-coordinate'],
+    ['close sidebar', 'semantic'],
+    ['minimize Kai', 'semantic'],
+  ] as const)('handles a user choosing to %s during %s input without retargeting', async (transition, targetKind) => {
+    const sendInputEvent = vi.fn();
+    const initiallyMounted = true;
+    let minimized = false;
+    let bounds = initiallyMounted
+      ? { x: 10, y: 20, width: 300, height: 200 }
+      : { x: 0, y: 0, width: 1_280, height: 800 };
+    const contents = {
+      debugger: browserDebuggerMock(),
+      getZoomFactor: () => 1,
+      isDestroyed: () => false,
+      sendInputEvent,
+    };
+    const view = {
+      getBounds: () => bounds,
+      setBounds: vi.fn((next: typeof bounds) => {
+        bounds = next;
+      }),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+        url: 'https://example.com/form',
+        sensitive: false,
+        reloadRequired: false,
+      },
+      view,
+      generation: 4,
+      trustedUserNavigationLease: 0,
+      trustedGestureGeneration: 0,
+      lastUsedAt: 0,
+      scriptTainted: false,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    };
+    const sendAttributedInputEvent = vi.fn(async () => undefined);
+    let manager!: InstanceType<typeof BrowserManager>;
+    manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assertAssistantDocumentLease: vi.fn(),
+      attachedView: initiallyMounted ? view : null,
+      cancelElementPickersForConversation: vi.fn(),
+      dispatchInputEvent: vi.fn(async () => undefined),
+      emit: vi.fn(),
+      emitPendingPrompts: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureAssistantView: vi.fn(async () => view),
+      ensureView: vi.fn(async () => view),
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ x: 0, y: 0, width: 1_000, height: 800 }),
+          isMinimized: () => minimized,
+        }),
+      hostWindowInteractive: initiallyMounted,
+      hostWindowShown: true,
+      isTargetViewInteractive: (_tab: unknown, targetContents: unknown) =>
+        !minimized && Reflect.get(manager, 'attachedView') === view && targetContents === contents,
+      locate: vi.fn(async () => {
+        if (transition === 'close sidebar') await manager.mount('chat-1', null);
+        if (transition === 'minimize Kai') {
+          minimized = true;
+          manager.handleHostWindowVisibilityChanged();
+        }
+        return { x: 20, y: 30, width: 1, height: 1 };
+      }),
+      mountedBounds: initiallyMounted ? { x: 10, y: 20, width: 300, height: 200 } : null,
+      mountedConversationId: initiallyMounted ? 'chat-1' : null,
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      sendAttributedInputEvent,
+      setAutomationOverlay: vi.fn(async () => undefined),
+      tabs: new Map([[tab.shell.id, tab]]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+    });
+
+    const action = manager.action(
+      'chat-1',
+      targetKind === 'raw-coordinate'
+        ? { tabId: tab.shell.id, kind: 'click', x: 20, y: 30 }
+        : { tabId: tab.shell.id, kind: 'click', selector: '#submit' },
+      { id: 'run-1' },
+    );
+    await expect(action).resolves.toMatchObject({ ok: true });
+    expect(sendAttributedInputEvent).toHaveBeenCalled();
+    expect(sendInputEvent).not.toHaveBeenCalled();
+    if (transition === 'close sidebar') {
+      expect(view.setVisible).toHaveBeenCalledWith(false);
+      expect(view.setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    }
   });
 
   it('restores renderer zoom and leaves shell state unchanged when zoom persistence fails', async () => {
@@ -3067,7 +8463,7 @@ describe('browser manager renderer lifecycle', () => {
   });
 
   it.each(['sidebar bounds', 'page zoom'] as const)(
-    'does not dispatch physical input after %s changes during target lookup',
+    'revalidates and dispatches physical input after %s changes during target lookup',
     async (change) => {
       const sendInputEvent = vi.fn();
       const setZoomLevel = vi.fn();
@@ -3077,7 +8473,15 @@ describe('browser manager renderer lifecycle', () => {
         sendInputEvent,
         setZoomLevel,
       };
-      const view = { webContents: contents };
+      let viewBounds = { x: 10, y: 20, width: 300, height: 200 };
+      const view = {
+        getBounds: () => viewBounds,
+        setBounds: vi.fn((next: typeof viewBounds) => {
+          viewBounds = next;
+        }),
+        setVisible: vi.fn(),
+        webContents: contents,
+      };
       const tab = {
         shell: {
           id: '00000000-0000-4000-8000-000000000001',
@@ -3133,10 +8537,14 @@ describe('browser manager renderer lifecycle', () => {
         }),
         mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
         mountedConversationId: 'chat-1',
+        prepareAssistantOperationView: vi.fn(async () => true),
+        dispatchInputEvent: vi.fn(async () => undefined),
         runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+        sendAttributedInputEvent: vi.fn(async () => undefined),
         setAutomationOverlay: vi.fn(async () => undefined),
         storeForScope: () => ({ setZoomLevel: vi.fn() }),
         tabs: new Map([[tab.shell.id, tab]]),
+        validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
         withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
           task(documentLease),
         withScopeActivity: (_scopeKey: string, task: () => Promise<unknown>) => task(),
@@ -3144,15 +8552,92 @@ describe('browser manager renderer lifecycle', () => {
 
       await expect(
         manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', selector: '#submit' }, { id: 'run-1' }),
-      ).rejects.toThrow(/panel layout or page zoom changed while the assistant action was waiting/i);
+      ).resolves.toMatchObject({ ok: true });
       expect(sendInputEvent).not.toHaveBeenCalled();
       expect(setZoomLevel).toHaveBeenCalledTimes(change === 'page zoom' ? 1 : 0);
     },
   );
 
-  it('revokes a queued physical action for an inactive tab when the Browser panel closes', async () => {
+  it.each(['sidebar bounds', 'page zoom'] as const)(
+    'aborts raw coordinate input when %s changes during target lookup',
+    async (change) => {
+      const sendInputEvent = vi.fn();
+      let zoomFactor = 1;
+      let bounds = { x: 10, y: 20, width: 300, height: 200 };
+      const contents = {
+        getZoomFactor: () => zoomFactor,
+        isDestroyed: () => false,
+        sendInputEvent,
+      };
+      const view = { getBounds: () => bounds, webContents: contents };
+      const tab = {
+        shell: {
+          id: '00000000-0000-4000-8000-000000000001',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: true,
+          url: 'https://example.com/form',
+          sensitive: false,
+        },
+        view,
+        generation: 4,
+        trustedUserNavigationLease: 0,
+        trustedGestureGeneration: 0,
+        lastUsedAt: 0,
+      };
+      const documentLease = {
+        runId: 'run-1',
+        runGeneration: 7,
+        hostRendererAuthorityGeneration: 0,
+        tabGeneration: tab.generation,
+        userNavigationLease: tab.trustedUserNavigationLease,
+        url: tab.shell.url,
+      };
+      const sendAttributedInputEvent = vi.fn();
+      const manager = managerWithoutConstructor({
+        activeTabs: new Map([['chat-1', tab.shell.id]]),
+        assertAssistantDocumentLease: vi.fn(),
+        dispatchInputEvent: vi.fn(async () => undefined),
+        emit: vi.fn(),
+        emitTabs: vi.fn(),
+        ensureAssistantView: vi.fn(async () => view),
+        locate: vi.fn(async () => {
+          if (change === 'sidebar bounds') bounds = { ...bounds, width: 360 };
+          else zoomFactor = 1.25;
+          return { x: 20, y: 30, width: 1, height: 1 };
+        }),
+        prepareAssistantOperationView: vi.fn(),
+        runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+        sendAttributedInputEvent,
+        setAutomationOverlay: vi.fn(async () => undefined),
+        tabs: new Map([[tab.shell.id, tab]]),
+        validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
+        withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+          task(documentLease),
+      });
+
+      await expect(
+        manager.action('chat-1', { tabId: tab.shell.id, kind: 'click', x: 20, y: 30 }, { id: 'run-1' }),
+      ).rejects.toThrow(/viewport or zoom changed before coordinate input/i);
+      expect(sendInputEvent).not.toHaveBeenCalled();
+      expect(sendAttributedInputEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('continues a queued action for an inactive tab when the Browser panel closes', async () => {
     const queueBlocker = deferred<void>();
-    const ensureAssistantView = vi.fn();
+    const sendInputEvent = vi.fn();
+    const hiddenView = {
+      getBounds: () => ({ x: 0, y: 0, width: 1_280, height: 800 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: {
+        debugger: browserDebuggerMock(),
+        getZoomFactor: () => 1,
+        isDestroyed: () => false,
+        sendInputEvent,
+      },
+    };
     const target = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
@@ -3168,7 +8653,11 @@ describe('browser manager renderer lifecycle', () => {
       trustedGestureGeneration: 0,
       lastUsedAt: 0,
     };
-    const visibleView = { webContents: { isDestroyed: () => false } };
+    const visibleView = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: { isDestroyed: () => false },
+    };
     const visible = {
       shell: { id: '00000000-0000-4000-8000-000000000002', conversationId: 'chat-1' },
       view: visibleView,
@@ -3189,19 +8678,25 @@ describe('browser manager renderer lifecycle', () => {
       cancelElementPickersForConversation: vi.fn(),
       emit: vi.fn(),
       emitTabs: vi.fn(),
-      ensureAssistantView,
+      ensureAssistantView: vi.fn(async () => {
+        target.view = hiddenView as never;
+        return hiddenView;
+      }),
       getConfig: () => ({ browser: { enabled: true } }),
       mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
       mountedConversationId: 'chat-1',
+      locate: vi.fn(async () => ({ x: 20, y: 30, width: 100, height: 20 })),
       runTabOperation: async (_tab: unknown, task: () => Promise<unknown>) => {
         await queueBlocker.promise;
         return task();
       },
+      sendAttributedInputEvent: vi.fn(async () => undefined),
       setAutomationOverlay: vi.fn(async () => undefined),
       tabs: new Map<string, unknown>([
         [target.shell.id, target],
         [visible.shell.id, visible],
       ]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, point: unknown) => point),
       withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
         task(documentLease),
     });
@@ -3214,19 +8709,31 @@ describe('browser manager renderer lifecycle', () => {
     await manager.mount('chat-1', null);
     queueBlocker.resolve();
 
-    await expect(action).rejects.toThrow(/Browser panel visibility changed while the assistant action was waiting/i);
-    expect(ensureAssistantView).not.toHaveBeenCalled();
+    await expect(action).resolves.toMatchObject({ ok: true });
+    expect(sendInputEvent).not.toHaveBeenCalled();
+    expect(hiddenView.setVisible).toHaveBeenCalledWith(false);
+    expect(hiddenView.setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
   });
 
-  it('does not dispatch physical input after the user switches away during target lookup', async () => {
+  it('continues physical input in the background after the user switches tabs', async () => {
     const sendInputEvent = vi.fn();
     const contents = {
+      debugger: browserDebuggerMock(),
       getZoomFactor: () => 1,
       isDestroyed: () => false,
       sendInputEvent,
     };
-    const firstView = { webContents: contents };
-    const secondView = { webContents: { isDestroyed: () => false } };
+    const firstView = {
+      getBounds: () => ({ x: 10, y: 20, width: 300, height: 200 }),
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: contents,
+    };
+    const secondView = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: { isDestroyed: () => false },
+    };
     const first = {
       shell: {
         id: '00000000-0000-4000-8000-000000000001',
@@ -3277,25 +8784,27 @@ describe('browser manager renderer lifecycle', () => {
       mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
       mountedConversationId: 'chat-1',
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      sendAttributedInputEvent: vi.fn(async () => undefined),
       setAutomationOverlay: vi.fn(async () => undefined),
       tabs: new Map([
         [first.shell.id, first],
         [second.shell.id, second],
       ]),
+      validateLocatedTarget: vi.fn(async (_tab: unknown, _contents: unknown, target: unknown) => target),
       withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
         task(documentLease),
     });
 
     await expect(
       manager.action('chat-1', { tabId: first.shell.id, kind: 'click', selector: '#submit' }, { id: 'run-1' }),
-    ).rejects.toThrow(/user interacted with the browser while the assistant action was waiting/i);
+    ).resolves.toMatchObject({ ok: true });
     expect(sendInputEvent).not.toHaveBeenCalled();
-    expect(first.trustedGestureGeneration).toBe(1);
+    expect(first.trustedGestureGeneration).toBe(0);
     expect(activeTabs.get('chat-1')).toBe(second.shell.id);
   });
 
   it.each(['inspect', 'evaluate', 'screenshot', 'autofill'] as const)(
-    'publishes %s as a visible assistant operation with terminal status',
+    'publishes %s status silently without forcing Browser attention or opening the panel',
     async (kind) => {
       const contents = { isDestroyed: () => false };
       const view = { webContents: contents };
@@ -3318,6 +8827,7 @@ describe('browser manager renderer lifecycle', () => {
         getWindow: () => visibleHostWindow(),
         mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
         mountedConversationId: 'chat-1',
+        prepareAssistantOperationView: vi.fn(async () => true),
         setAutomationOverlay,
         tabs: new Map([[tab.shell.id, tab]]),
       });
@@ -3342,8 +8852,8 @@ describe('browser manager renderer lifecycle', () => {
 
       expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe('tab-1');
       expect(emitTabs).toHaveBeenCalledWith('chat-1');
-      expect(attachActiveView).toHaveBeenCalledWith('chat-1', false);
-      expect(emit).toHaveBeenCalledWith({ type: 'open-panel', conversationId: 'chat-1', tabId: 'tab-1' });
+      expect(attachActiveView).not.toHaveBeenCalled();
+      expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
       expect(emit).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'action',
@@ -3363,7 +8873,50 @@ describe('browser manager renderer lifecycle', () => {
     },
   );
 
-  it('serializes assistant-visible operations before switching tabs', async () => {
+  it('does not inject a live automation overlay into a hidden assistant tab', async () => {
+    const contents = { isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: contents },
+      lastUsedAt: 0,
+    };
+    const setAutomationOverlay = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      assertAssistantDocumentLease: vi.fn(),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      prepareAssistantOperationView: vi.fn(async () => false),
+      setAutomationOverlay,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(
+      invokePrivate(
+        manager,
+        'withVisibleAssistantOperation',
+        'chat-1',
+        tab,
+        { id: 'run-1' },
+        'inspect',
+        'inspecting page',
+        async (reveal: (target: unknown, documentLease: unknown) => Promise<void>) => {
+          await reveal(contents, {});
+          return 'done';
+        },
+      ),
+    ).resolves.toBe('done');
+
+    expect(setAutomationOverlay).toHaveBeenCalledOnce();
+    expect(setAutomationOverlay).toHaveBeenCalledWith(tab, expect.objectContaining({ status: 'completed' }));
+    expect(setAutomationOverlay).not.toHaveBeenCalledWith(
+      tab,
+      expect.objectContaining({ status: 'running' }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('allows independent background tabs to run assistant operations concurrently', async () => {
     const firstTab = {
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       scopeKey: 'global',
@@ -3423,15 +8976,15 @@ describe('browser manager renderer lifecycle', () => {
     ) as Promise<string>;
     await Promise.resolve();
 
-    expect(order).toEqual(['first:start']);
+    expect(order).toEqual(['first:start', 'second']);
     expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe(firstTab.shell.id);
     expect(firstTab.visibleAssistantGeneration).toBe(0);
 
     releaseFirst.resolve();
     await expect(Promise.all([first, second])).resolves.toEqual(['first', 'second']);
-    expect(order).toEqual(['first:start', 'first:end', 'second']);
-    expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe(secondTab.shell.id);
-    expect(firstTab.visibleAssistantGeneration).toBe(1);
+    expect(order).toEqual(['first:start', 'second', 'first:end']);
+    expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe(firstTab.shell.id);
+    expect(firstTab.visibleAssistantGeneration).toBe(0);
   });
 
   it('redacts page-controlled URLs from failed action events before renderer exposure', async () => {
@@ -3476,9 +9029,11 @@ describe('browser manager renderer lifecycle', () => {
     expect(JSON.stringify(emit.mock.calls)).not.toContain('never-expose');
   });
 
-  it('does not begin a visible assistant operation until the requested chat and tab are mounted', async () => {
-    const contents = { isDestroyed: () => false };
-    const view = { webContents: contents };
+  it('begins an assistant operation immediately when another chat is mounted', async () => {
+    const contents = { debugger: browserDebuggerMock(), isDestroyed: () => false };
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const view = { setBounds, setVisible, webContents: contents };
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1' },
       view,
@@ -3488,6 +9043,7 @@ describe('browser manager renderer lifecycle', () => {
     const emit = vi.fn();
     let operated = false;
     const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
       assertAssistantDocumentLease: vi.fn(),
       attachActiveView: vi.fn(),
       attachedView: null,
@@ -3500,32 +9056,28 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([[tab.shell.id, tab]]),
     });
 
-    const operation = invokePrivate(
-      manager,
-      'withVisibleAssistantOperation',
-      'chat-1',
-      tab,
-      { id: 'run-1' },
-      'autofill',
-      'autofilling saved password',
-      async (reveal: (target: unknown, documentLease: Record<string, unknown>) => Promise<void>) => {
-        const lease: Record<string, unknown> = {};
-        await reveal(contents, lease);
-        operated = true;
-        return lease.visibleAssistantGeneration;
-      },
-    ) as Promise<unknown>;
-    await vi.waitFor(() =>
-      expect(emit).toHaveBeenCalledWith({ type: 'open-panel', conversationId: 'chat-1', tabId: 'tab-1' }),
-    );
-    expect(operated).toBe(false);
+    await expect(
+      invokePrivate(
+        manager,
+        'withVisibleAssistantOperation',
+        'chat-1',
+        tab,
+        { id: 'run-1' },
+        'autofill',
+        'autofilling saved password',
+        async (reveal: (target: unknown, documentLease: Record<string, unknown>) => Promise<void>) => {
+          const lease: Record<string, unknown> = {};
+          await reveal(contents, lease);
+          operated = true;
+          return 'done';
+        },
+      ) as Promise<unknown>,
+    ).resolves.toBe('done');
 
-    Reflect.set(manager, 'mountedConversationId', 'chat-1');
-    Reflect.set(manager, 'attachedView', view);
-    invokePrivate(manager, 'notifyPanelStateChanged', 'chat-1');
-
-    await expect(operation).resolves.toBe(0);
     expect(operated).toBe(true);
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
+    expect(setVisible).toHaveBeenCalledWith(false);
+    expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
   });
 
   it('quarantines a scripted page before evaluation and keeps it detached after failure', async () => {
@@ -3557,6 +9109,7 @@ describe('browser manager renderer lifecycle', () => {
       throw new Error('script failed');
     });
     const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
       assertAssistantDocumentLease: vi.fn(),
       attachActiveView: vi.fn(),
       attachedView: view,
@@ -3569,6 +9122,7 @@ describe('browser manager renderer lifecycle', () => {
       installPrivateNetworkNewDocumentGuard,
       mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
       mountedConversationId: 'chat-1',
+      prepareAssistantOperationView: vi.fn(async () => undefined),
       assertTabNotSensitive: vi.fn(async () => undefined),
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
       setAutomationOverlay: vi.fn(async () => undefined),
@@ -3586,7 +9140,7 @@ describe('browser manager renderer lifecycle', () => {
     );
     expect(tab.scriptTainted).toBe(true);
     expect(tab.shell.reloadRequired).toBe(true);
-    expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledWith(tab, view.webContents);
+    expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledWith(tab, view.webContents, undefined, {});
     expect(markScriptCleanupOrigin).toHaveBeenCalledWith('https://example.com');
     expect(emitTabs).toHaveBeenCalledWith('chat-1');
   });
@@ -3722,6 +9276,42 @@ describe('browser manager renderer lifecycle', () => {
     });
   });
 
+  it('defers the private-network document guard until a brand-new empty realm has navigated', async () => {
+    const sendCommand = vi.fn(async () => ({ identifier: 'guard-empty' }));
+    const executeJavaScript = vi.fn(async () => true);
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 7,
+      isDestroyed: () => false,
+      executeJavaScript,
+      framesInSubtree: [] as unknown[],
+    };
+    mainFrame.framesInSubtree = [mainFrame];
+    const contents = {
+      id: 42,
+      getURL: () => '',
+      mainFrame,
+      debugger: {
+        attach: vi.fn(),
+        detach: vi.fn(),
+        isAttached: () => false,
+        sendCommand,
+      },
+      isDestroyed: () => false,
+    };
+    const tab = {
+      privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
+    };
+    const manager = managerWithoutConstructor({ aiAllowPrivateNetwork: false });
+
+    await invokePrivate(manager, 'installPrivateNetworkNewDocumentGuard', tab, contents);
+
+    expect(contents.debugger.attach).not.toHaveBeenCalled();
+    expect(sendCommand).not.toHaveBeenCalled();
+    expect(executeJavaScript).not.toHaveBeenCalled();
+    expect(tab.privateNetworkNewDocumentGuard).toEqual({ contentsId: 42, identifier: 'preload-pending' });
+  });
+
   it('rejects an assistant page when any live frame reports a failed WebRTC membrane installation', async () => {
     const topFrame = {
       detached: false,
@@ -3758,6 +9348,366 @@ describe('browser manager renderer lifecycle', () => {
     );
 
     expect(tab.privateNetworkNewDocumentGuard).toEqual({ contentsId: 42, identifier: 'preload-pending' });
+  });
+
+  it.each(['registration', 'frame-probe'] as const)(
+    'bounds a stalled private-network guard %s and reclaims only its renderer',
+    async (stage) => {
+      vi.useFakeTimers();
+      try {
+        const blocked = deferred<never>();
+        const executeJavaScript = vi.fn(() => (stage === 'frame-probe' ? blocked.promise : Promise.resolve(true)));
+        const mainFrame = {
+          detached: false,
+          frameTreeNodeId: 7,
+          isDestroyed: () => false,
+          executeJavaScript,
+          framesInSubtree: [] as unknown[],
+        };
+        mainFrame.framesInSubtree = [mainFrame];
+        let attached = false;
+        const contents = {
+          id: 42,
+          getURL: () => 'https://example.com',
+          mainFrame,
+          debugger: {
+            attach: vi.fn(() => {
+              attached = true;
+            }),
+            detach: vi.fn(() => {
+              attached = false;
+            }),
+            isAttached: () => attached,
+            sendCommand: vi.fn(() =>
+              stage === 'registration' ? blocked.promise : Promise.resolve({ identifier: 'guard-1' }),
+            ),
+          },
+          isDestroyed: () => false,
+        };
+        const tab = {
+          shell: {
+            id: 'tab-1',
+            conversationId: 'chat-1',
+            discarded: false,
+            sensitive: false,
+            error: undefined as string | undefined,
+          },
+          view: { webContents: contents } as { webContents: typeof contents } | null,
+          privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
+        };
+        const destroyView = vi.fn((target: typeof tab) => {
+          target.view = null;
+          blocked.reject(new Error('target closed'));
+        });
+        const manager = managerWithoutConstructor({
+          aiAllowPrivateNetwork: false,
+          destroyView,
+          emitTabs: vi.fn(),
+          tabs: new Map([[tab.shell.id, tab]]),
+        });
+        const installation = invokePrivate(
+          manager,
+          'installPrivateNetworkNewDocumentGuard',
+          tab,
+          contents,
+        ) as Promise<void>;
+        const rejection = expect(installation).rejects.toThrow(/guard installation exceeded 15 seconds/i);
+
+        await vi.advanceTimersByTimeAsync(15_000);
+        await rejection;
+
+        expect(destroyView).toHaveBeenCalledOnce();
+        expect(destroyView).toHaveBeenCalledWith(tab);
+        expect(tab.view).toBeNull();
+        expect(tab.shell.discarded).toBe(true);
+        expect(contents.debugger.detach).toHaveBeenCalledOnce();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('cancels private-network guard installation without waiting for a mounted Browser panel', async () => {
+    const blocked = deferred<never>();
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 7,
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+      framesInSubtree: [] as unknown[],
+    };
+    mainFrame.framesInSubtree = [mainFrame];
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(() => blocked.promise);
+    const contents = {
+      debugger: debuggerApi,
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        sensitive: false,
+        error: undefined as string | undefined,
+      },
+      view: { webContents: contents } as { webContents: typeof contents } | null,
+      privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null;
+      blocked.reject(new Error('target closed'));
+    });
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      destroyView,
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const controller = new AbortController();
+    const installation = invokePrivate(
+      manager,
+      'installPrivateNetworkNewDocumentGuard',
+      tab,
+      contents,
+      controller.signal,
+    ) as Promise<void>;
+
+    controller.abort();
+
+    await expect(installation).rejects.toThrow(/guard installation was cancelled/i);
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.view).toBeNull();
+  });
+
+  it('verifies the immutable native-UI guard in every live frame', async () => {
+    const nativeUiGuardToken = '11111111-1111-4111-8111-111111111111';
+    const debuggerApi = browserDebuggerMock();
+    const childFrame = {
+      detached: false,
+      frameTreeNodeId: 102,
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    mainFrame.framesInSubtree = [mainFrame, childFrame];
+    const contents = {
+      debugger: debuggerApi,
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: { webContents: contents },
+      generation: 3,
+      nativeUiGuardToken,
+      trustedUserNavigationLease: 0,
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'installAssistantNativeUiGuard', tab, contents)).resolves.toBeUndefined();
+
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith(
+      'Page.addScriptToEvaluateOnNewDocument',
+      expect.objectContaining({ source: expect.stringContaining(nativeUiGuardToken), runImmediately: false }),
+    );
+    expect(mainFrame.executeJavaScript).toHaveBeenCalledWith(
+      browserNativeUiGuardActivationProbe(nativeUiGuardToken, true),
+    );
+    expect(childFrame.executeJavaScript).toHaveBeenCalledWith(
+      browserNativeUiGuardActivationProbe(nativeUiGuardToken, true),
+    );
+    expect(tab).toMatchObject({
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'document-guard-1' },
+    });
+  });
+
+  it('publishes the native-UI pending marker before asynchronous frame verification', async () => {
+    const nativeUiGuardToken = '22222222-2222-4222-8222-222222222222';
+    const verification = deferred<boolean>();
+    const debuggerApi = browserDebuggerMock();
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(() => verification.promise),
+    };
+    mainFrame.framesInSubtree = [mainFrame];
+    const contents = {
+      debugger: debuggerApi,
+      getURL: () => 'https://example.com',
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: { webContents: contents },
+      generation: 3,
+      nativeUiGuardToken,
+      trustedUserNavigationLease: 0,
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const installation = invokePrivate(manager, 'installAssistantNativeUiGuard', tab, contents) as Promise<void>;
+    expect(tab).toMatchObject({
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
+    });
+
+    verification.resolve(true);
+    await expect(installation).resolves.toBeUndefined();
+    expect(tab).toMatchObject({
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'document-guard-1' },
+    });
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith(
+      'Page.addScriptToEvaluateOnNewDocument',
+      expect.objectContaining({ source: expect.stringContaining(nativeUiGuardToken), runImmediately: false }),
+    );
+  });
+
+  it('removes future native-UI activation and restores the same live document', async () => {
+    const nativeUiGuardToken = '33333333-3333-4333-8333-333333333333';
+    const debuggerApi = browserDebuggerMock();
+    const mainFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    mainFrame.framesInSubtree = [mainFrame];
+    const contents = {
+      debugger: debuggerApi,
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame,
+    };
+    const guard = { contentsId: 42, identifier: 'document-guard-1' };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      assistantNativeUiNewDocumentGuard: guard as typeof guard | undefined,
+      nativeUiGuardToken,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+    });
+
+    await expect(invokePrivate(manager, 'releaseAssistantNativeUiGuard', tab)).resolves.toBeUndefined();
+
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.removeScriptToEvaluateOnNewDocument', {
+      identifier: guard.identifier,
+    });
+    expect(mainFrame.executeJavaScript).toHaveBeenCalledWith(
+      browserNativeUiGuardActivationProbe(nativeUiGuardToken, false),
+    );
+    expect(tab.assistantNativeUiNewDocumentGuard).toBeUndefined();
+    expect(tab.view.webContents).toBe(contents);
+  });
+
+  it('removes future native-UI activation before restoring a document replaced during cleanup', async () => {
+    const nativeUiGuardToken = '44444444-4444-4444-8444-444444444444';
+    const order: string[] = [];
+    const departingFrame = {
+      detached: false,
+      frameTreeNodeId: 101,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => {
+        order.push('departing-frame');
+        return true;
+      }),
+    };
+    departingFrame.framesInSubtree = [departingFrame];
+    const replacementFrame = {
+      detached: false,
+      frameTreeNodeId: 102,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => {
+        order.push('replacement-frame');
+        return true;
+      }),
+    };
+    replacementFrame.framesInSubtree = [replacementFrame];
+    let mainFrame = departingFrame;
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (command: unknown) => {
+      if (command === 'Page.removeScriptToEvaluateOnNewDocument') {
+        order.push('remove-future-guard');
+        mainFrame = replacementFrame;
+      }
+      return {};
+    });
+    const contents = {
+      debugger: debuggerApi,
+      id: 42,
+      isDestroyed: () => false,
+      get mainFrame() {
+        return mainFrame;
+      },
+    };
+    const guard = { contentsId: 42, identifier: 'document-guard-1' };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      assistantNativeUiNewDocumentGuard: guard as typeof guard | undefined,
+      nativeUiGuardToken,
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeoutMs: number,
+        operation: () => Promise<unknown>,
+      ) => operation(),
+    });
+
+    await expect(invokePrivate(manager, 'releaseAssistantNativeUiGuard', tab)).resolves.toBeUndefined();
+
+    expect(order).toEqual(['remove-future-guard', 'replacement-frame']);
+    expect(departingFrame.executeJavaScript).not.toHaveBeenCalled();
+    expect(replacementFrame.executeJavaScript).toHaveBeenCalledWith(
+      browserNativeUiGuardActivationProbe(nativeUiGuardToken, false),
+    );
+    expect(tab.assistantNativeUiNewDocumentGuard).toBeUndefined();
   });
 
   it('activates the WebRTC guard before a ready page is exposed to structured assistant actions', async () => {
@@ -3797,8 +9747,37 @@ describe('browser manager renderer lifecycle', () => {
     await expect(invokePrivate(manager, 'ensureAssistantView', tab, { id: 'run-1' }, lease)).resolves.toBe(view);
 
     expect(setWebRTCIPHandlingPolicy).toHaveBeenCalledWith('disable_non_proxied_udp');
-    expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledWith(tab, view.webContents);
-    expect(order).toEqual(['assert', 'native-policy', 'guard', 'assert']);
+    expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledWith(tab, view.webContents, undefined, lease);
+    expect(order).toEqual(['assert', 'native-policy', 'guard', 'assert', 'assert']);
+  });
+
+  it('recreates a discarded assistant target under the hidden deterministic initial-load viewport', async () => {
+    const view = { webContents: { isDestroyed: () => false } };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      view: null,
+      viewLoadPromise: null,
+      generation: 3,
+      trustedUserNavigationLease: 0,
+    };
+    const lease = {
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 3,
+      userNavigationLease: 0,
+      url: 'https://example.com',
+    };
+    const ensureView = vi.fn(async () => view);
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: true,
+      assertAssistantDocumentLease: vi.fn(),
+      ensureView,
+    });
+
+    await expect(invokePrivate(manager, 'ensureAssistantView', tab, { id: 'run-1' }, lease)).resolves.toBe(view);
+
+    expect(ensureView).toHaveBeenCalledWith(tab, undefined, 30_000, true, false);
   });
 
   it('autofills a saved credential only in its matching top-level frame', async () => {
@@ -3966,6 +9945,106 @@ describe('browser manager renderer lifecycle', () => {
     expect(withAssistantControl).not.toHaveBeenCalled();
   });
 
+  it('routes assistant duplicate and reopen through background-owned tab creation', async () => {
+    const source = {
+      shell: {
+        id: 'source',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        sensitive: false,
+        url: 'https://source.example',
+      },
+      generation: 1,
+    };
+    const activeTabs = new Map([['chat-1', 'presented']]);
+    const createTab = vi.fn(async (request: Record<string, unknown>) => ({
+      id: request.url === 'https://closed.example' ? 'reopened' : 'duplicated',
+    }));
+    const manager = managerWithoutConstructor({
+      activeTabs,
+      assertAssistantDocumentLease: vi.fn(),
+      closedTabs: new Map([
+        [
+          'chat-1',
+          [
+            {
+              id: 'closed',
+              url: 'https://closed.example',
+              title: 'Closed',
+              owner: 'user',
+              keepOpen: false,
+              sensitive: false,
+              scopeKey: 'global',
+            },
+          ],
+        ],
+      ]),
+      createTab,
+      runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
+      tabs: new Map([[source.shell.id, source]]),
+      withAssistantControl: (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+    });
+
+    await manager.duplicateAssistantTab('chat-1', source.shell.id, { id: 'run-1' });
+    await manager.reopenClosedTab('chat-1', 'assistant', { id: 'run-1' });
+
+    expect(createTab).toHaveBeenNthCalledWith(
+      1,
+      { conversationId: 'chat-1', url: 'https://source.example', owner: 'assistant' },
+      { id: 'run-1' },
+    );
+    expect(createTab).toHaveBeenNthCalledWith(
+      2,
+      { conversationId: 'chat-1', url: 'https://closed.example', owner: 'assistant' },
+      { id: 'run-1' },
+    );
+    expect(activeTabs.get('chat-1')).toBe('presented');
+  });
+
+  it('leaves the source queue before duplicate tab creation can drain same-origin work', async () => {
+    const source = {
+      shell: {
+        id: 'source',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        sensitive: false,
+        url: 'https://scripted.example',
+      },
+      generation: 1,
+    };
+    let sourceQueueActive = false;
+    const createTab = vi.fn(async () => {
+      if (sourceQueueActive) throw new Error('destination creation re-entered the source queue');
+      return { id: 'duplicated' };
+    });
+    const manager = managerWithoutConstructor({
+      assertAssistantDocumentLease: vi.fn(),
+      createTab,
+      runTabOperation: async (_tab: unknown, operation: () => Promise<unknown>) => {
+        sourceQueueActive = true;
+        try {
+          return await operation();
+        } finally {
+          sourceQueueActive = false;
+        }
+      },
+      tabs: new Map([[source.shell.id, source]]),
+      withAssistantControl: (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+    });
+
+    await expect(manager.duplicateAssistantTab('chat-1', source.shell.id, { id: 'run-1' })).resolves.toEqual({
+      id: 'duplicated',
+    });
+    expect(createTab).toHaveBeenCalledWith(
+      { conversationId: 'chat-1', url: 'https://scripted.example', owner: 'assistant' },
+      { id: 'run-1' },
+    );
+  });
+
   it('does not duplicate a temporary tab owned by another active assistant run', async () => {
     const manager = new BrowserManager(
       '/tmp/kai-browser-duplicate-owner-test',
@@ -4038,6 +10117,7 @@ describe('browser manager renderer lifecycle', () => {
 
   it('binds approved reopen and multi-tab close operations to the exact captured list state', async () => {
     const retained = {
+      scopeKey: 'global',
       shell: {
         id: 'tab-a',
         conversationId: 'chat-1',
@@ -4047,8 +10127,10 @@ describe('browser manager renderer lifecycle', () => {
       },
       generation: 1,
       assistantOwnerId: null,
+      queue: new BrowserActionQueue(),
     };
     const rightOne = {
+      scopeKey: 'global',
       shell: {
         id: 'tab-b',
         conversationId: 'chat-1',
@@ -4058,8 +10140,10 @@ describe('browser manager renderer lifecycle', () => {
       },
       generation: 1,
       assistantOwnerId: null,
+      queue: new BrowserActionQueue(),
     };
     const rightTwo = {
+      scopeKey: 'global',
       shell: {
         id: 'tab-c',
         conversationId: 'chat-1',
@@ -4069,6 +10153,7 @@ describe('browser manager renderer lifecycle', () => {
       },
       generation: 1,
       assistantOwnerId: null,
+      queue: new BrowserActionQueue(),
     };
     const closed = {
       id: 'closed-1',
@@ -4087,7 +10172,6 @@ describe('browser manager renderer lifecycle', () => {
       ['tab-c', rightTwo],
     ]);
     const closeTab = vi.fn();
-    let queueCompletions = 0;
     const manager = managerWithoutConstructor({
       assistantRuns: {
         acquire: () => ({ generation: 1, release: vi.fn() }),
@@ -4099,13 +10183,6 @@ describe('browser manager renderer lifecycle', () => {
       emitTabs: vi.fn(),
       tabs,
       tabOrder,
-      runTabOperation: async (_target: unknown, operation: () => Promise<unknown>) => {
-        const result = await operation();
-        queueCompletions++;
-        if (queueCompletions === 3) tabOrder.set('chat-1', ['tab-a', 'tab-c', 'tab-b']);
-        return result;
-      },
-      withAssistantControl: async (_target: unknown, _run: unknown, operation: () => Promise<unknown>) => operation(),
     });
 
     const reopenApproval = manager.captureTabsApproval('chat-1', 'reopen_closed');
@@ -4115,11 +10192,180 @@ describe('browser manager renderer lifecycle', () => {
     );
 
     const closeApproval = manager.captureTabsApproval('chat-1', 'close_right', retained.shell.id);
+    tabOrder.set('chat-1', ['tab-a', 'tab-c', 'tab-b']);
     await expect(
       manager.commandTab('chat-1', retained.shell.id, 'close-right', 'assistant', { id: 'run-1' }, closeApproval),
     ).rejects.toThrow(/tab order changed/);
     expect(closeTab).not.toHaveBeenCalled();
   });
+
+  it('fences successor work without deadlocking same-origin queue drains during assistant multi-tab close', async () => {
+    const retained = {
+      scopeKey: 'global',
+      shell: {
+        id: 'tab-a',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        url: 'https://a.example',
+      },
+      assistantOwnerId: null,
+      queue: new BrowserActionQueue(),
+    };
+    const closing = {
+      scopeKey: 'global',
+      shell: {
+        id: 'tab-b',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        url: 'https://b.example',
+      },
+      assistantOwnerId: null,
+      queue: new BrowserActionQueue(),
+    };
+    const events: string[] = [];
+    const withAssistantControl = vi.fn(() => {
+      throw new Error('bulk close must not enter document control');
+    });
+    const tabs = new Map<string, typeof retained | typeof closing>([
+      [retained.shell.id, retained],
+      [closing.shell.id, closing],
+    ]);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', retained.shell.id]]),
+      assistantRuns: {
+        acquire: () => ({ generation: 1, release: vi.fn() }),
+        assertActive: () => 1,
+        generationIfActive: () => null,
+      },
+      closeTab: vi.fn((target: typeof closing) => {
+        events.push(`close:${target.shell.id}`);
+        tabs.delete(target.shell.id);
+      }),
+      emitTabs: vi.fn(),
+      pendingAssistantTabClosures: new Map(),
+      tabOrder: new Map([['chat-1', [retained.shell.id, closing.shell.id]]]),
+      tabs,
+      withAssistantControl,
+    });
+
+    const continueSanitizing = deferred<void>();
+    const sanitizing = retained.queue.run(async () => {
+      await continueSanitizing.promise;
+      await closing.queue.whenIdle();
+      events.push('sanitized');
+    });
+    await Promise.resolve();
+    const close = manager.commandTab('chat-1', retained.shell.id, 'close-right', 'assistant', { id: 'run-1' });
+    const successor = invokePrivate(manager, 'runTabOperation', closing, async () => {
+      events.push('successor');
+    }) as Promise<void>;
+    const successorRejection = expect(successor).rejects.toThrow(/being closed/i);
+    expect(events).toEqual([]);
+
+    continueSanitizing.resolve();
+    await sanitizing;
+    await close;
+    await successorRejection;
+
+    expect(events).toEqual(['sanitized', 'close:tab-b']);
+    expect(withAssistantControl).not.toHaveBeenCalled();
+  });
+
+  it.each(['selection', 'navigation', 'reorder'] as const)(
+    'aborts an unapproved assistant bulk close after concurrent user %s',
+    async (mutation) => {
+      const retained = {
+        scopeKey: 'global',
+        shell: {
+          id: 'tab-a',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          url: 'https://a.example',
+        },
+        generation: 1,
+        userSelectionGeneration: 0,
+        trustedGestureGeneration: 0,
+        trustedUserNavigation: false,
+        trustedUserNavigationLease: 0,
+        assistantOwnerId: null,
+        queue: new BrowserActionQueue(),
+      };
+      const contents = {
+        getURL: () => 'https://b.example',
+        isDestroyed: () => false,
+        reload: vi.fn(),
+      };
+      const closing = {
+        scopeKey: 'global',
+        shell: {
+          id: 'tab-b',
+          conversationId: 'chat-1',
+          owner: 'user' as const,
+          keepOpen: false,
+          url: 'https://b.example',
+        },
+        generation: 1,
+        userSelectionGeneration: 0,
+        trustedGestureGeneration: 0,
+        trustedUserNavigation: false,
+        trustedUserNavigationLease: 0,
+        assistantOwnerId: null,
+        queue: new BrowserActionQueue(),
+        view: { webContents: contents },
+      };
+      const activeTabs = new Map([['chat-1', retained.shell.id]]);
+      const tabOrder = new Map([['chat-1', [retained.shell.id, closing.shell.id]]]);
+      const closeTab = vi.fn();
+      const pendingAssistantTabClosures = new Map<string, symbol>();
+      const manager = managerWithoutConstructor({
+        activeTabs,
+        assistantRuns: {
+          acquire: () => ({ generation: 1, release: vi.fn() }),
+          assertActive: () => 1,
+          generationIfActive: () => null,
+        },
+        attachActiveView: vi.fn(),
+        cancelElementPickersForConversation: vi.fn(),
+        closeTab,
+        emitTabs: vi.fn(),
+        ensureView: vi.fn(async () => closing.view),
+        getWindow: () => visibleHostWindow(),
+        mountedBounds: { x: 10, y: 20, width: 300, height: 200 },
+        mountedConversationId: 'chat-1',
+        notifyPanelStateChanged: vi.fn(),
+        pendingAssistantTabClosures,
+        prepareTabForUserPresentation: vi.fn(() => null),
+        tabOrder,
+        tabs: new Map([
+          [retained.shell.id, retained],
+          [closing.shell.id, closing],
+        ]),
+      });
+
+      const releaseBusyTab = deferred<void>();
+      const busy = closing.queue.run(() => releaseBusyTab.promise);
+      await Promise.resolve();
+      const close = manager.commandTab('chat-1', retained.shell.id, 'close-right', 'assistant', { id: 'run-1' });
+      const closeRejection = expect(close).rejects.toThrow(/changed.*waiting|user changed/i);
+      await vi.waitFor(() => expect(pendingAssistantTabClosures.has(closing.shell.id)).toBe(true));
+
+      if (mutation === 'selection') {
+        await manager.commandTab('chat-1', closing.shell.id, 'activate', 'user');
+      } else if (mutation === 'navigation') {
+        await manager.commandTab('chat-1', closing.shell.id, 'reload', 'user');
+      } else {
+        manager.reorderTabs('chat-1', [closing.shell.id, retained.shell.id]);
+      }
+
+      releaseBusyTab.resolve();
+      await busy;
+      await closeRejection;
+      expect(closeTab).not.toHaveBeenCalled();
+    },
+  );
 
   it('hands temporary tabs to an automatic continuation and reclaims an abandoned handoff', async () => {
     const manager = new BrowserManager(
@@ -4140,10 +10386,24 @@ describe('browser manager renderer lifecycle', () => {
       assistantOwnerId: 'run-1',
       aiControlOwnerId: 'run-1',
       aiControlGeneration: 1,
+      assistantDownloadAttribution: {
+        assistantOwnerId: 'run-1',
+        trustedGestureGeneration: 0,
+      },
+      assistantDialogsDisabledRunId: 'run-1',
       popupGesture: {
         source: 'assistant' as const,
         assistantOwnerId: 'run-1',
         expiresAt: Date.now() + 1_000,
+      },
+      assistantDialogGuard: {
+        runId: 'run-1',
+        owners: new Set([Symbol('popup-bootstrap')]),
+        protectedContents: new Map(),
+        failure: new Promise<never>(() => undefined),
+        reject: vi.fn(),
+        handlingDialog: false,
+        settled: false,
       },
     };
     const tabs = Reflect.get(manager, 'tabs') as Map<string, typeof tab>;
@@ -4179,6 +10439,9 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.assistantOwnerId).toBe('run-2');
     expect(tab.aiControlOwnerId).toBe('run-2');
     expect(tab.popupGesture.assistantOwnerId).toBe('run-2');
+    expect(tab.assistantDownloadAttribution.assistantOwnerId).toBe('run-2');
+    expect(tab.assistantDialogGuard.runId).toBe('run-2');
+    expect(tab.assistantDialogsDisabledRunId).toBe('run-2');
     expect([...activeDownloads.values()][0]?.assistantOwnerId).toBe('run-2');
     expect(() => manager.assertAssistantRun('chat-1', { id: 'run-2' })).not.toThrow();
 
@@ -4195,6 +10458,40 @@ describe('browser manager renderer lifecycle', () => {
     expect(tabs.has(tab.shell.id)).toBe(false);
     activeDownloads.clear();
     manager.dispose();
+  });
+
+  it('retains failed continuation cleanup ownership and retries it without Browser presentation', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const manager = new BrowserManager(
+        '/tmp/kai-browser-continuation-retry-test',
+        () => ({ browser: { dataScope: 'global', enabled: true } }) as never,
+        () => null,
+        '/tmp/browser-page.cjs',
+      );
+      manager.beginAssistantRun('chat-1', 'run-1');
+      expect(manager.prepareAssistantContinuation('chat-1', 'run-1')).toBe(true);
+      const cleanup = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('temporary dialog restoration failure'))
+        .mockResolvedValue(undefined);
+      Reflect.set(manager, 'cleanupAssistantStateOwnedByRun', cleanup);
+
+      await expect(manager.cancelAssistantContinuations('chat-1')).rejects.toThrow(/will be retried/i);
+      expect(manager.hasPendingAssistantContinuation('chat-1', 'run-1')).toBe(true);
+      expect(Reflect.get(manager, 'assistantContinuationLeases').has('chat-1\u0000run-1')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(cleanup).toHaveBeenCalledTimes(2);
+      expect(manager.hasPendingAssistantContinuation('chat-1', 'run-1')).toBe(false);
+      expect(Reflect.get(manager, 'assistantContinuationLeases').has('chat-1\u0000run-1')).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+      manager.dispose();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it('reclaims a retained predecessor when Realtime wins before continuation admission', async () => {
@@ -4363,6 +10660,7 @@ describe('browser manager renderer lifecycle', () => {
         reloadRequired: false,
       },
       assistantOwnerId: null,
+      assistantDialogsDisabledRunId: 'run-1' as string | null,
       aiControlOwnerId: 'run-1' as string | null,
       aiControlGeneration: 1 as number | null,
       aiNetworkRestricted: true,
@@ -4400,7 +10698,77 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.shell).toMatchObject({ discarded: true, sensitive: false, reloadRequired: false });
     expect(tab.aiNetworkRestricted).toBe(true);
     expect(tab.aiControlOwnerId).toBeNull();
+    expect(tab.assistantDialogsDisabledRunId).toBeNull();
     expect(restoreActiveViewAfterClose).toHaveBeenCalledWith('chat-1', tab.shell.id);
+  });
+
+  it('restores native-UI trampolines without reloading a retained user document', async () => {
+    const lifecycle: string[] = [];
+    const view = { webContents: { id: 51, isDestroyed: () => false } };
+    const tab = {
+      shell: {
+        id: 'tab-native-ui',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        discarded: false,
+        sensitive: false,
+        reloadRequired: false,
+      },
+      assistantOwnerId: null,
+      aiControlOwnerId: 'run-1' as string | null,
+      aiControlGeneration: 1 as number | null,
+      aiNetworkRestricted: true,
+      assistantDownloadAttribution: {
+        assistantOwnerId: 'run-1',
+        trustedGestureGeneration: 0,
+      } as { assistantOwnerId: string; trustedGestureGeneration: number } | undefined,
+      assistantDialogGuard: { runId: 'run-1' } as { runId: string } | undefined,
+      assistantRunDialogGuardLease: Symbol('run-dialog'),
+      assistantNativeUiNewDocumentGuard: { contentsId: 51, identifier: 'native-ui-guard-1' } as
+        | { contentsId: number; identifier: string }
+        | undefined,
+      popupGesture: null,
+      scriptTainted: false,
+      generation: 4,
+      view: view as typeof view | null,
+    };
+    const destroyView = vi.fn(() => {
+      lifecycle.push('destroy');
+      tab.assistantNativeUiNewDocumentGuard = undefined;
+      tab.view = null;
+    });
+    const restoreActiveViewAfterClose = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      assistantRuns: { end: vi.fn(async () => undefined) },
+      automationGestureTokens: new Map(),
+      cancelActiveDownloadsForAssistantRun: vi.fn(async () => undefined),
+      closeTab: vi.fn(),
+      destroyView,
+      emitTabs: vi.fn(),
+      releaseAssistantNativeUiGuard: vi.fn(async () => {
+        lifecycle.push('release-native-ui');
+        tab.assistantNativeUiNewDocumentGuard = undefined;
+      }),
+      releaseAssistantRunDialogGuard: vi.fn(async () => {
+        lifecycle.push('release-dialog');
+        tab.assistantDialogGuard = undefined;
+      }),
+      restoreActiveViewAfterClose,
+      tabOrder: new Map([['chat-1', [tab.shell.id]]]),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await manager.cleanupAssistantTabs('chat-1', 'run-1');
+
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.generation).toBe(4);
+    expect(tab.view).toBe(view);
+    expect(tab.assistantDownloadAttribution).toBeUndefined();
+    expect(tab.aiControlOwnerId).toBeNull();
+    expect(lifecycle).toEqual(['release-native-ui', 'release-dialog']);
+    expect(restoreActiveViewAfterClose).not.toHaveBeenCalled();
   });
 
   it('cancels run-owned downloads after their temporary assistant tabs have already closed', async () => {
@@ -4556,6 +10924,34 @@ describe('browser manager renderer lifecycle', () => {
     expect(release).not.toHaveBeenCalled();
   });
 
+  it('retains assistant ownership until cleanup reclaims a native-UI-guarded renderer', () => {
+    const tab = {
+      aiActionDepth: 0,
+      aiActionUntil: 0,
+      aiControlGeneration: 1,
+      aiControlOwnerId: 'run-1',
+      aiNetworkReleaseRequested: false,
+      aiNetworkReleaseTimer: null,
+      aiNetworkRestricted: true,
+      assistantNativeUiNewDocumentGuard: { contentsId: 51, identifier: 'native-ui-guard-1' },
+      privateNetworkNewDocumentGuard: undefined,
+      scriptTainted: false,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/next',
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 3,
+    };
+    const manager = managerWithoutConstructor({ tabs: new Map() });
+
+    invokePrivate(manager, 'completeTrustedUserNavigation', tab, 'https://example.com/next');
+
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.aiNetworkRestricted).toBe(true);
+    expect(tab.aiControlOwnerId).toBe('run-1');
+    expect(tab.aiControlGeneration).toBe(1);
+    expect(tab.aiNetworkReleaseRequested).toBe(false);
+  });
+
   it('scans for password data before printing the active Browser tab', async () => {
     let completePrint!: (success: boolean, failureReason: string) => void;
     const print = vi.fn((_options: unknown, callback: (success: boolean, failureReason: string) => void) => {
@@ -4676,7 +11072,90 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('keeps an active download bound to the profile where it started', () => {
+  it('binds a delayed context-menu image save to its exact document and URL', () => {
+    let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+    const store = {
+      addDownload: vi.fn(() => []),
+      flushDownloads: vi.fn(async () => undefined),
+    };
+    const contents = { id: 42, isDestroyed: () => false };
+    const tab = {
+      scopeKey: 'global',
+      generation: 4,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 7,
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() - 1,
+      },
+      view: { webContents: contents },
+      shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user' as const },
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map(),
+      clearingScopes: new Set(),
+      contextMenuDownloadAuthorities: new Map(),
+      downloads: new Map(),
+      isTargetViewInteractive: () => false,
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      scopeGenerations: new Map([['global', 0]]),
+      stores: new Map([['global', store]]),
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+      wiredSessions: new WeakSet(),
+    });
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: (event: string, listener: typeof willDownload) => {
+        if (event === 'will-download') willDownload = listener;
+      },
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: vi.fn(),
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    invokePrivate(manager, 'authorizeContextMenuDownload', tab, contents, 'https://example.com/image.png');
+
+    const unrelated = {
+      getURL: () => 'https://example.com/timer.png',
+      cancel: vi.fn(),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, unrelated, contents);
+    expect(unrelated.cancel).toHaveBeenCalledOnce();
+    expect(Reflect.get(manager, 'contextMenuDownloadAuthorities')).toHaveLength(1);
+
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const exact = {
+      getFilename: () => 'image.png',
+      getReceivedBytes: () => 10,
+      getSavePath: () => '/tmp/downloads/image.png',
+      getTotalBytes: () => 10,
+      getURL: () => 'https://example.com/image.png',
+      cancel: vi.fn(),
+      off: (event: string) => listeners.delete(event),
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, exact, contents);
+
+    expect(exact.cancel).not.toHaveBeenCalled();
+    expect(exact.setSaveDialogOptions).toHaveBeenCalledWith({ defaultPath: '/tmp/downloads/image.png' });
+    expect(Reflect.get(manager, 'contextMenuDownloadAuthorities')).toHaveLength(0);
+    expect(Reflect.get(manager, 'activeDownloads')).toHaveLength(1);
+  });
+
+  it('binds a Browser-chrome navigation download to its exact request and consumes the one-use authority', () => {
     let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
     const globalStore = {
       addDownload: vi.fn(),
@@ -4688,13 +11167,22 @@ describe('browser manager renderer lifecycle', () => {
     };
     const tab = {
       scopeKey: 'global',
-      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      popupGesture: null,
+      trustedUserNavigation: true,
+      trustedUserNavigationTarget: 'https://example.com/report.pdf',
+      trustedUserNavigationRequestId: 7,
+      trustedUserNavigationLease: 1,
+      trustedUserNavigationTimer: null,
+      shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user' as const },
     };
     const manager = managerWithoutConstructor({
       activeDownloads: new Map(),
       clearingScopes: new Set(),
       downloads: new Map(),
       getWindow: () => null,
+      // Omnibox submission keeps focus in Browser chrome rather than the page.
+      // Exact request-bound navigation authority must remain sufficient.
+      isTargetViewInteractive: () => false,
       oneTimePermissions: new Set(),
       pagePreloadPath: '/tmp/browser-page.cjs',
       pendingAuth: new Map(),
@@ -4739,12 +11227,37 @@ describe('browser manager renderer lifecycle', () => {
       off: (event: string) => listeners.delete(event),
       on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
       setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
     };
 
+    const mismatchedItem = {
+      getURL: () => 'https://example.com/unrelated.pdf',
+      cancel: vi.fn(),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, mismatchedItem, { id: 42 });
+    expect(mismatchedItem.cancel).toHaveBeenCalledOnce();
+    expect(tab.trustedUserNavigation).toBe(true);
+
     willDownload?.({}, item, { id: 42 });
+    expect(item.setSaveDialogOptions).toHaveBeenCalledWith({ defaultPath: '/tmp/downloads/report.pdf' });
+    expect(item.setSavePath).not.toHaveBeenCalled();
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.trustedUserNavigationTarget).toBeNull();
+    expect(tab.trustedUserNavigationRequestId).toBeNull();
     expect([...(Reflect.get(manager, 'activeDownloads') as Map<unknown, { conversationId: string }>).values()]).toEqual(
       [expect.objectContaining({ conversationId: 'chat-1' })],
     );
+    const unrelatedItem = {
+      getURL: () => 'https://example.com/unrelated-later-download.pdf',
+      cancel: vi.fn(),
+      setSaveDialogOptions: vi.fn(),
+      setSavePath: vi.fn(),
+    };
+    willDownload?.({}, unrelatedItem, { id: 42 });
+    expect(unrelatedItem.cancel).toHaveBeenCalledOnce();
+    expect(unrelatedItem.setSaveDialogOptions).not.toHaveBeenCalled();
     tab.scopeKey = 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa';
     listeners.get('done')?.({}, 'completed');
 
@@ -4752,6 +11265,230 @@ describe('browser manager renderer lifecycle', () => {
     expect(globalStore.flushDownloads).toHaveBeenCalledOnce();
     expect(conversationStore.addDownload).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      label: 'an exact assistant gesture',
+      popupGesture: {
+        source: 'assistant' as const,
+        assistantOwnerId: 'run-1',
+        expiresAt: Date.now() + 60_000,
+      },
+      assistantDownloadAttribution: undefined,
+      trustedGestureGeneration: 0,
+      expected: 'assistant' as const,
+      interactive: true,
+    },
+    {
+      label: 'an exact programmatic assistant operation',
+      popupGesture: null,
+      assistantDownloadAttribution: { assistantOwnerId: 'run-1', trustedGestureGeneration: 2 },
+      trustedGestureGeneration: 2,
+      expected: 'assistant' as const,
+      interactive: true,
+    },
+    {
+      label: 'only broad assistant-control timing',
+      popupGesture: null,
+      assistantDownloadAttribution: undefined,
+      trustedGestureGeneration: 0,
+      expected: 'blocked' as const,
+      interactive: true,
+    },
+    {
+      label: 'a concurrent exact user gesture',
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 60_000,
+      },
+      assistantDownloadAttribution: { assistantOwnerId: 'run-1', trustedGestureGeneration: 2 },
+      trustedGestureGeneration: 3,
+      expected: 'user' as const,
+      interactive: true,
+    },
+    {
+      label: 'a hidden exact user gesture',
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 60_000,
+      },
+      assistantDownloadAttribution: undefined,
+      trustedGestureGeneration: 1,
+      expected: 'blocked' as const,
+      interactive: false,
+    },
+  ])(
+    'attributes user-tab downloads from $label without relying on broad action timing',
+    ({ popupGesture, assistantDownloadAttribution, trustedGestureGeneration, expected, interactive }) => {
+      let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+      const store = {
+        addDownload: vi.fn(() => []),
+        flushDownloads: vi.fn(async () => undefined),
+      };
+      const tab = {
+        aiActionDepth: 1,
+        aiControlOwnerId: 'run-1',
+        assistantDownloadAttribution,
+        popupGesture,
+        trustedGestureGeneration,
+        scopeKey: 'global',
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          keepOpen: true,
+          owner: 'user' as const,
+        },
+      };
+      const manager = managerWithoutConstructor({
+        appHome: '/tmp/kai-browser-download-tests',
+        activeDownloads: new Map(),
+        assistantRuns: {
+          generationIfActive: (_conversationId: string, runId: string) => (runId === 'run-1' ? 1 : null),
+        },
+        clearingScopes: new Set(),
+        downloads: new Map(),
+        getWindow: () => null,
+        isTargetViewInteractive: () => interactive,
+        pagePreloadPath: '/tmp/browser-page.cjs',
+        scopeGenerations: new Map([['global', 0]]),
+        stores: new Map([['global', store]]),
+        tabs: new Map([['tab-1', tab]]),
+        webContentsToTab: new Map([[42, 'tab-1']]),
+        wiredSessions: new WeakSet(),
+      });
+      const fakeSession = {
+        getPreloadScripts: () => [],
+        on: (event: string, listener: typeof willDownload) => {
+          if (event === 'will-download') willDownload = listener;
+        },
+        registerPreloadScript: vi.fn(),
+        setPermissionCheckHandler: vi.fn(),
+        setPermissionRequestHandler: vi.fn(),
+        webRequest: {
+          onBeforeRequest: vi.fn(),
+          onCompleted: vi.fn(),
+          onErrorOccurred: vi.fn(),
+        },
+      };
+      invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+      let savePath = '';
+      const item = {
+        getFilename: () => '../../quarterly.Report.PDF',
+        getReceivedBytes: () => 0,
+        getSavePath: () => savePath,
+        getTotalBytes: () => 100,
+        getURL: () => 'https://example.com/report.pdf',
+        cancel: vi.fn(),
+        off: vi.fn(),
+        on: vi.fn(),
+        setSaveDialogOptions: vi.fn(),
+        setSavePath: vi.fn((path: string) => {
+          savePath = path;
+        }),
+      };
+
+      willDownload?.({}, item, { id: 42 });
+
+      if (expected === 'assistant') {
+        expect(item.setSavePath).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^\/tmp\/kai-browser-download-tests\/browser\/download-quarantine\/global\/Kai-[0-9a-f-]{36}\.download$/,
+          ),
+        );
+        expect(item.setSavePath.mock.calls[0]?.[0]).not.toContain('quarterly');
+        expect(item.setSaveDialogOptions).not.toHaveBeenCalled();
+        expect(item.cancel).not.toHaveBeenCalled();
+        expect(Reflect.get(manager, 'activeDownloads')).toHaveLength(1);
+      } else if (expected === 'user') {
+        expect(item.setSavePath).not.toHaveBeenCalled();
+        expect(item.setSaveDialogOptions).toHaveBeenCalledWith({
+          defaultPath: '/tmp/downloads/quarterly.Report.PDF',
+        });
+        expect(item.cancel).not.toHaveBeenCalled();
+        expect(Reflect.get(manager, 'activeDownloads')).toHaveLength(1);
+      } else {
+        expect(item.setSavePath).not.toHaveBeenCalled();
+        expect(item.setSaveDialogOptions).not.toHaveBeenCalled();
+        expect(item.cancel).toHaveBeenCalledOnce();
+        expect(Reflect.get(manager, 'activeDownloads')).toHaveLength(0);
+      }
+      if (expected !== 'blocked') {
+        expect([
+          ...(Reflect.get(manager, 'activeDownloads') as Map<unknown, { assistantOwnerId: string | null }>).values(),
+        ]).toEqual([expect.objectContaining({ assistantOwnerId: expected === 'assistant' ? 'run-1' : null })]);
+      }
+    },
+  );
+
+  it.each([0, -1])(
+    'rejects an assistant download with unknown length %i before assigning a disk path',
+    (totalBytes) => {
+      let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+      const emitTabs = vi.fn();
+      const tab = {
+        aiActionDepth: 1,
+        aiControlOwnerId: 'run-1',
+        assistantDownloadAttribution: { assistantOwnerId: 'run-1', trustedGestureGeneration: 2 },
+        popupGesture: null,
+        trustedGestureGeneration: 2,
+        scopeKey: 'global',
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          keepOpen: true,
+          owner: 'user' as const,
+          error: undefined as string | undefined,
+        },
+      };
+      const manager = managerWithoutConstructor({
+        appHome: '/tmp/kai-browser-unknown-download-test',
+        activeDownloads: new Map(),
+        assistantRuns: { generationIfActive: () => 1 },
+        clearingScopes: new Set(),
+        downloads: new Map(),
+        emitTabs,
+        pagePreloadPath: '/tmp/browser-page.cjs',
+        scopeGenerations: new Map([['global', 0]]),
+        stores: new Map(),
+        tabs: new Map([['tab-1', tab]]),
+        webContentsToTab: new Map([[42, 'tab-1']]),
+        wiredSessions: new WeakSet(),
+      });
+      const fakeSession = {
+        getPreloadScripts: () => [],
+        on: (event: string, listener: typeof willDownload) => {
+          if (event === 'will-download') willDownload = listener;
+        },
+        registerPreloadScript: vi.fn(),
+        setPermissionCheckHandler: vi.fn(),
+        setPermissionRequestHandler: vi.fn(),
+        webRequest: {
+          onBeforeRequest: vi.fn(),
+          onCompleted: vi.fn(),
+          onErrorOccurred: vi.fn(),
+        },
+      };
+      invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+      const item = {
+        cancel: vi.fn(),
+        getFilename: () => 'chunked.bin',
+        getReceivedBytes: () => 0,
+        getTotalBytes: () => totalBytes,
+        setSaveDialogOptions: vi.fn(),
+        setSavePath: vi.fn(),
+      };
+
+      willDownload?.({}, item, { id: 42 });
+
+      expect(item.cancel).toHaveBeenCalledOnce();
+      expect(item.setSavePath).not.toHaveBeenCalled();
+      expect(Reflect.get(manager, 'activeDownloads')).toHaveLength(0);
+      expect(tab.shell.error).toMatch(/declared positive content length/i);
+      expect(emitTabs).toHaveBeenCalledWith('chat-1');
+    },
+  );
 
   it('cancels only an active download in the current browser profile', async () => {
     const cancel = vi.fn(async () => undefined);
@@ -4776,6 +11513,196 @@ describe('browser manager renderer lifecycle', () => {
     await manager.cancelDownload('chat-1', 'download-1');
     expect(cancel).toHaveBeenCalledOnce();
     await expect(manager.cancelDownload('chat-1', 'missing-download')).rejects.toThrow(/no longer active/i);
+  });
+
+  it('keeps the profile download barrier until Electron reports cancellation complete', async () => {
+    let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+    const store = {
+      addDownload: vi.fn(() => []),
+      flushDownloads: vi.fn(async () => undefined),
+    };
+    const tab = {
+      scopeKey: 'global',
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 60_000,
+      },
+      trustedUserNavigation: false,
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true, owner: 'user' as const },
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map(),
+      clearingScopes: new Set(),
+      downloads: new Map(),
+      isTargetViewInteractive: () => true,
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      releaseScopeRuntimeWhenIdle: vi.fn(),
+      scopeGenerations: new Map([['global', 0]]),
+      stores: new Map([['global', store]]),
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+      wiredSessions: new WeakSet(),
+    });
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: (event: string, listener: typeof willDownload) => {
+        if (event === 'will-download') willDownload = listener;
+      },
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: vi.fn(),
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const item = {
+      getFilename: () => 'report.pdf',
+      getReceivedBytes: () => 10,
+      getSavePath: () => '/tmp/downloads/report.pdf',
+      getTotalBytes: () => 100,
+      getURL: () => 'https://example.com/report.pdf',
+      cancel: vi.fn(),
+      off: (event: string) => listeners.delete(event),
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setSaveDialogOptions: vi.fn(),
+    };
+
+    willDownload?.({}, item, { id: 42 });
+    const active = [
+      ...(Reflect.get(manager, 'activeDownloads') as Map<unknown, { cancel: () => Promise<void> }>).values(),
+    ][0]!;
+    let settled = false;
+    const cancellation = active.cancel().then(() => {
+      settled = true;
+    });
+
+    expect(item.cancel).toHaveBeenCalledOnce();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(Reflect.get(manager, 'activeDownloads').has(item)).toBe(true);
+    expect(listeners.has('done')).toBe(true);
+
+    listeners.get('done')?.({}, 'cancelled');
+    await cancellation;
+
+    expect(settled).toBe(true);
+    expect(Reflect.get(manager, 'activeDownloads').has(item)).toBe(false);
+    expect(listeners.has('done')).toBe(false);
+  });
+
+  it('rejects a thrown DownloadItem cancellation without releasing state and allows a retry', async () => {
+    const fixture = createTrackedUserDownload(() => {
+      throw new Error('cancel failed');
+    });
+
+    await expect(fixture.active.cancel()).rejects.toThrow(/could not be cancelled/i);
+    expect(Reflect.get(fixture.manager, 'activeDownloads').has(fixture.item)).toBe(true);
+    expect(fixture.listeners.has('done')).toBe(true);
+    expect(fixture.listeners.has('updated')).toBe(true);
+
+    fixture.item.cancel.mockImplementation(() => fixture.listeners.get('done')?.({}, 'cancelled'));
+    await expect(fixture.active.cancel()).resolves.toBeUndefined();
+    expect(fixture.item.cancel).toHaveBeenCalledTimes(2);
+    expect(Reflect.get(fixture.manager, 'activeDownloads').has(fixture.item)).toBe(false);
+  });
+
+  it('bounds a missing DownloadItem done event without synthesizing cleanup and allows a retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = createTrackedUserDownload();
+      const cancellation = fixture.active.cancel();
+      const rejected = expect(cancellation).rejects.toThrow(/did not reach a terminal state/i);
+
+      await vi.advanceTimersByTimeAsync(BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS);
+      await rejected;
+      expect(Reflect.get(fixture.manager, 'activeDownloads').has(fixture.item)).toBe(true);
+      expect(fixture.listeners.has('done')).toBe(true);
+      expect(fixture.listeners.has('updated')).toBe(true);
+
+      fixture.item.cancel.mockImplementation(() => fixture.listeners.get('done')?.({}, 'cancelled'));
+      await expect(fixture.active.cancel()).resolves.toBeUndefined();
+      expect(fixture.item.cancel).toHaveBeenCalledTimes(2);
+      expect(Reflect.get(fixture.manager, 'activeDownloads').has(fixture.item)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('persists a terminal download state when lifecycle cancellation follows a scope generation bump', async () => {
+    let willDownload: ((event: unknown, item: Record<string, unknown>, contents: { id: number }) => void) | undefined;
+    const persistedStates: string[] = [];
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const store = {
+      addDownload: vi.fn((download: { state: string }) => {
+        persistedStates.push(download.state);
+        return [];
+      }),
+      flushDownloads: vi.fn(async () => undefined),
+    };
+    const tab = {
+      scopeKey: 'global',
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 60_000,
+      },
+      trustedUserNavigation: false,
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true, owner: 'user' as const },
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map(),
+      clearingScopes: new Set(),
+      downloads: new Map(),
+      isTargetViewInteractive: () => true,
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      releaseScopeRuntimeWhenIdle: vi.fn(),
+      scopeGenerationSerial: 0,
+      scopeGenerations: new Map([['global', 0]]),
+      stores: new Map([['global', store]]),
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+      wiredSessions: new WeakSet(),
+    });
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: (event: string, listener: typeof willDownload) => {
+        if (event === 'will-download') willDownload = listener;
+      },
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: vi.fn(),
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    const item = {
+      getFilename: () => 'report.pdf',
+      getReceivedBytes: () => 10,
+      getSavePath: () => '/tmp/downloads/report.pdf',
+      getTotalBytes: () => 100,
+      getURL: () => 'https://example.com/report.pdf',
+      cancel: vi.fn(() => listeners.get('done')?.({}, 'cancelled')),
+      off: (event: string) => listeners.delete(event),
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setSaveDialogOptions: vi.fn(),
+    };
+
+    willDownload?.({}, item, { id: 42 });
+    invokePrivate(manager, 'bumpScopeGeneration', 'global');
+    await invokePrivate(manager, 'cancelActiveDownloadsForScopes', new Set(['global']));
+
+    expect(item.cancel).toHaveBeenCalledOnce();
+    expect(persistedStates).toEqual(['progressing', 'cancelled']);
+    expect(store.flushDownloads).toHaveBeenCalledOnce();
+    expect(Reflect.get(manager, 'activeDownloads').has(item)).toBe(false);
   });
 
   it('lists and resets remembered and one-time permissions for one site', () => {
@@ -4822,7 +11749,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(manager.listSitePermissions('chat-1', 'about:blank')).toEqual([]);
   });
 
-  it('requires fresh approval for remembered permissions while assistant control is active', () => {
+  it('fails permission requests closed without waiting for Browser chrome while assistant control is active', () => {
     type PermissionContents = { id: number; getURL: () => string };
     type PermissionDetails = { requestingUrl?: string; securityOrigin?: string };
     let checkPermission:
@@ -4901,38 +11828,17 @@ describe('browser manager renderer lifecycle', () => {
 
     const firstAssistantRequest = vi.fn();
     requestPermission?.(contents, 'camera', firstAssistantRequest, {});
-    expect(firstAssistantRequest).not.toHaveBeenCalled();
-    const firstPrompt = [
-      ...(Reflect.get(manager, 'pendingPermissions') as Map<string, { assistantTriggered: boolean }>),
-    ].at(0);
-    expect(firstPrompt?.[1].assistantTriggered).toBe(true);
-    expect(emit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'permission-prompt',
-        prompt: expect.objectContaining({ assistantTriggered: true, canPersist: false }),
-      }),
-    );
-    expect(manager.getState('chat-1').permissionPrompts).toEqual([
-      expect.objectContaining({ id: firstPrompt?.[0], assistantTriggered: true, canPersist: false }),
-    ]);
+    expect(firstAssistantRequest).toHaveBeenCalledWith(false);
+    expect(Reflect.get(manager, 'pendingPermissions')).toHaveLength(0);
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'permission-prompt' }));
+    expect(manager.getState('chat-1').permissionPrompts).toEqual([]);
 
-    manager.respondPermissionPrompt(firstPrompt![0], 'allow-once');
-    expect(firstAssistantRequest).toHaveBeenCalledWith(true);
     const repeatedAssistantRequest = vi.fn();
     requestPermission?.(contents, 'camera', repeatedAssistantRequest, {});
-    expect(repeatedAssistantRequest).not.toHaveBeenCalled();
-    const repeatedPromptId = [
-      ...(Reflect.get(manager, 'pendingPermissions') as Map<string, { assistantTriggered: boolean }>).keys(),
-    ][0];
-    invokePrivate(manager, 'finishPendingPermission', repeatedPromptId, false);
+    expect(repeatedAssistantRequest).toHaveBeenCalledWith(false);
 
     const oneTimeAssistantRequest = vi.fn();
     requestPermission?.(contents, 'notifications', oneTimeAssistantRequest, {});
-    expect(oneTimeAssistantRequest).not.toHaveBeenCalled();
-    const oneTimePromptId = [
-      ...(Reflect.get(manager, 'pendingPermissions') as Map<string, { assistantTriggered: boolean }>).keys(),
-    ][0];
-    manager.respondPermissionPrompt(oneTimePromptId, 'deny');
     expect(oneTimeAssistantRequest).toHaveBeenCalledWith(false);
     expect(store.setPermissions).not.toHaveBeenCalled();
 
@@ -5145,9 +12051,16 @@ describe('browser manager renderer lifecycle', () => {
     const emitTabs = vi.fn();
     const tab = {
       scopeKey: 'global',
-      shell: { id: 'tab-1', conversationId: 'chat-1' } as {
+      popupGesture: {
+        source: 'user' as const,
+        assistantOwnerId: null,
+        expiresAt: Date.now() + 60_000,
+      },
+      trustedUserNavigation: false,
+      shell: { id: 'tab-1', conversationId: 'chat-1', owner: 'user' as const } as {
         id: string;
         conversationId: string;
+        owner: 'user';
         error?: string;
       },
     };
@@ -5597,6 +12510,21 @@ describe('browser manager renderer lifecycle', () => {
     rmSync(appHome, { recursive: true, force: true });
   });
 
+  it('surfaces and recovers a quarantine-only profile after a crash before shelf persistence', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-summary-download-quarantine-'));
+    const scopeKey = 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa';
+    mkdirSync(assistantDownloadQuarantineDirectory(appHome, scopeKey), { recursive: true });
+    const manager = managerWithoutConstructor({ appHome });
+
+    try {
+      const summaries = await manager.dataSummary();
+      expect(summaries).toContainEqual(expect.objectContaining({ scopeKey }));
+      expect(invokePrivate(manager, 'discoverBrowserProfileScopeKeysForRecovery')).toContain(scopeKey);
+    } finally {
+      rmSync(appHome, { recursive: true, force: true });
+    }
+  });
+
   it('lifts process-wide cleanup quarantine after metadata becomes readable again', async () => {
     const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-summary-recovery-'));
     const markerPath = join(appHome, 'browser', 'pending-profile-cleanup.json');
@@ -5704,6 +12632,7 @@ describe('browser manager renderer lifecycle', () => {
       | ((
           details: {
             id: number;
+            method: string;
             webContentsId?: number;
             resourceType: string;
             url: string;
@@ -5711,9 +12640,24 @@ describe('browser manager renderer lifecycle', () => {
           callback: (result: object) => void,
         ) => void)
       | undefined;
-    let completed: ((details: { id: number }) => void) | undefined;
-    let failed: ((details: { id: number }) => void) | undefined;
+    let completed:
+      | ((details: {
+          id: number;
+          webContentsId?: number;
+          statusCode?: number;
+          fromCache?: boolean;
+          responseHeaders?: Record<string, string[]>;
+          error?: string;
+        }) => void)
+      | undefined;
+    let failed: ((details: { id: number; webContentsId?: number; error?: string }) => void) | undefined;
     const scopeActivityCounts = new Map<string, number>();
+    const tab: {
+      shell: { id: string };
+      aiNetworkRestricted: boolean;
+      networkRequests?: Map<number, Record<string, unknown>>;
+      activeNetworkRequests?: Map<number, string>;
+    } = { shell: { id: 'tab-1' }, aiNetworkRestricted: false };
     const manager = managerWithoutConstructor({
       clearingScopes: new Set(),
       getConfig: () => ({ browser: { aiAllowPrivateNetwork: false } }),
@@ -5727,7 +12671,7 @@ describe('browser manager renderer lifecycle', () => {
       scopeGenerations: new Map([['global', 0]]),
       scopeIdleWaiters: new Map(),
       scopeRequestActivities: new Map(),
-      tabs: new Map([['tab-1', { shell: { id: 'tab-1' }, aiNetworkRestricted: false }]]),
+      tabs: new Map([['tab-1', tab]]),
       webContentsToTab: new Map([[42, 'tab-1']]),
       wiredSessions: new WeakSet(),
     });
@@ -5755,21 +12699,39 @@ describe('browser manager renderer lifecycle', () => {
     requestPolicy?.(
       {
         id: 11,
+        method: 'GET',
         webContentsId: 42,
         resourceType: 'xhr',
-        url: 'https://example.com/data',
+        url: 'https://example.com/data?token=NETWORK_SECRET',
       },
       admitted,
     );
     expect(admitted).toHaveBeenCalledWith({});
     expect(scopeActivityCounts.get('global')).toBe(1);
 
-    completed?.({ id: 11 });
+    completed?.({
+      id: 11,
+      webContentsId: 42,
+      statusCode: 200,
+      fromCache: false,
+      responseHeaders: { 'Content-Length': ['42'], 'Set-Cookie': ['SESSION_SECRET'] },
+      error: 'net::OK',
+    });
     expect(scopeActivityCounts.has('global')).toBe(false);
+    const completedRequest = [...(tab.networkRequests?.values() ?? [])][0];
+    expect(completedRequest).toMatchObject({
+      url: expect.stringMatching(/^\[redacted https origin [a-f0-9]{16}\]\/\[redacted-path\]$/),
+      urlRedacted: true,
+      statusCode: 200,
+      responseBytes: 42,
+    });
+    expect(completedRequest?.error).toBeUndefined();
+    expect(JSON.stringify(completedRequest)).not.toMatch(/NETWORK_SECRET|SESSION_SECRET/);
 
     requestPolicy?.(
       {
         id: 12,
+        method: 'GET',
         webContentsId: 42,
         resourceType: 'webSocket',
         url: 'wss://example.com/socket',
@@ -5777,8 +12739,845 @@ describe('browser manager renderer lifecycle', () => {
       vi.fn(),
     );
     expect(scopeActivityCounts.get('global')).toBe(1);
-    failed?.({ id: 12 });
+    failed?.({ id: 12, webContentsId: 42, error: 'net::ERR_CONNECTION_RESET' });
     expect(scopeActivityCounts.has('global')).toBe(false);
+    expect([...(tab.networkRequests?.values() ?? [])][1]).toMatchObject({
+      resourceType: 'webSocket',
+      error: 'net::ERR_CONNECTION_RESET',
+    });
+
+    tab.activeNetworkRequests = new Map(
+      Array.from({ length: MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB }, (_, index) => [10_000 + index, 'xhr']),
+    );
+    const rejectedAtCap = vi.fn();
+    requestPolicy?.(
+      {
+        id: 99_999,
+        method: 'GET',
+        webContentsId: 42,
+        resourceType: 'xhr',
+        url: 'https://example.com/hostile-overflow',
+      },
+      rejectedAtCap,
+    );
+    expect(rejectedAtCap).toHaveBeenCalledWith({ cancel: true });
+    expect(scopeActivityCounts.has('global')).toBe(false);
+    expect(tab.activeNetworkRequests).toHaveLength(MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB);
+  });
+
+  it('keeps exact admitted request identities independently of bounded diagnostic history', () => {
+    const tab: {
+      shell: { id: string };
+      networkRequests?: Map<number, Record<string, unknown>>;
+      activeNetworkRequests?: Map<number, string>;
+      networkRequestSequence?: number;
+      networkLastBlockingActivityAt?: number;
+    } = { shell: { id: 'tab-1' } };
+    const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
+
+    for (let id = 1; id <= MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB; id += 1) {
+      expect(
+        invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+          id,
+          method: 'GET',
+          resourceType: 'xhr',
+          url: `https://example.com/request/${id}`,
+        }),
+      ).toBe(true);
+    }
+
+    expect(tab.networkRequests?.size).toBe(500);
+    expect(tab.networkRequests?.has(1)).toBe(false);
+    expect(tab.activeNetworkRequests?.size).toBe(MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB);
+    expect(tab.activeNetworkRequests?.has(1)).toBe(true);
+    const beforeCompletion = tab.networkLastBlockingActivityAt ?? 0;
+
+    invokePrivate(manager, 'finishBrowserNetworkRequest', tab, {
+      id: 1,
+      statusCode: 200,
+      resourceType: 'xhr',
+    });
+
+    expect(tab.activeNetworkRequests?.size).toBe(MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB - 1);
+    expect(tab.activeNetworkRequests?.has(1)).toBe(false);
+    expect(tab.networkLastBlockingActivityAt).toBeGreaterThanOrEqual(beforeCompletion);
+
+    expect(
+      invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+        id: MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB + 1,
+        method: 'GET',
+        resourceType: 'xhr',
+        url: 'https://example.com/admitted-after-completion',
+      }),
+    ).toBe(true);
+    expect(
+      invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+        id: MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB + 2,
+        method: 'GET',
+        resourceType: 'xhr',
+        url: 'https://example.com/rejected-at-cap',
+      }),
+    ).toBe(false);
+    expect(tab.activeNetworkRequests?.size).toBe(MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB);
+  });
+
+  it('excludes evicted requests from the next document network diagnostics while retaining exact identities', async () => {
+    const tab = {
+      shell: {
+        id: 'tab-network-document-scope',
+        conversationId: 'chat-1',
+        url: 'https://old.example',
+        loading: false,
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView: vi.fn(async () => ({ webContents: {} })),
+      evaluateWithDeadline: vi.fn(async () => ({})),
+      requireAssistantTab: () => tab,
+      runTabOperation: async (_tab: unknown, operation: () => Promise<unknown>) => operation(),
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+      withVisibleAssistantOperation: async (...args: unknown[]) =>
+        (args[5] as (reveal: () => Promise<void>) => Promise<unknown>)(async () => undefined),
+    });
+
+    for (let id = 1; id <= MAX_BROWSER_NETWORK_REQUESTS_PER_TAB + 1; id += 1) {
+      expect(
+        invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+          id,
+          method: 'GET',
+          resourceType: 'xhr',
+          url: `https://old.example/request/${id}`,
+        }),
+      ).toBe(true);
+    }
+    expect(Reflect.get(tab, 'networkRequests')).toHaveLength(MAX_BROWSER_NETWORK_REQUESTS_PER_TAB);
+    expect((Reflect.get(tab, 'networkRequests') as Map<number, unknown>).has(1)).toBe(false);
+
+    const navigationRequestId = 10_000;
+    invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+      id: navigationRequestId,
+      method: 'GET',
+      resourceType: 'mainFrame',
+      url: 'https://new.example',
+    });
+    invokePrivate(manager, 'beginBrowserNetworkNavigation', tab, 'https://new.example');
+    tab.shell.url = 'https://new.example';
+
+    expect(Reflect.get(tab, 'activeNetworkRequests')).toHaveLength(MAX_BROWSER_NETWORK_REQUESTS_PER_TAB + 2);
+    expect((Reflect.get(tab, 'activeNetworkRequests') as Map<number, string>).has(1)).toBe(true);
+    expect(Reflect.get(tab, 'diagnosticActiveNetworkRequestIds')).toEqual(new Set([navigationRequestId]));
+
+    const beforeOldCompletion = Reflect.get(tab, 'networkLastBlockingActivityAt');
+    invokePrivate(manager, 'finishBrowserNetworkRequest', tab, { id: 1, resourceType: 'xhr', statusCode: 200 });
+    expect(Reflect.get(tab, 'networkLastBlockingActivityAt')).toBe(beforeOldCompletion);
+
+    const diagnostics = await manager.networkDiagnostics('chat-1', { waitFor: 'none', limit: 10 }, { id: 'run-1' });
+    expect(diagnostics.inFlight).toBe(1);
+    expect(diagnostics.requestCount).toBe(1);
+  });
+
+  it('keeps streaming media and WebSockets out of network-idle quiet-time accounting', () => {
+    const tab = {
+      shell: { id: 'tab-1' },
+      networkLastBlockingActivityAt: 123,
+    };
+    const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(456);
+    try {
+      invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+        id: 1,
+        method: 'GET',
+        resourceType: 'media',
+        url: 'https://media.example/video',
+      });
+      invokePrivate(manager, 'finishBrowserNetworkRequest', tab, { id: 1, statusCode: 200 });
+      invokePrivate(manager, 'trackBrowserNetworkRequest', tab, {
+        id: 2,
+        method: 'GET',
+        resourceType: 'webSocket',
+        url: 'wss://stream.example/socket',
+      });
+      invokePrivate(manager, 'finishBrowserNetworkRequest', tab, { id: 2 });
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(tab.networkLastBlockingActivityAt).toBe(123);
+  });
+
+  it('does not report a page load complete when only a private subresource is blocked', async () => {
+    let requestPolicy:
+      | ((
+          details: {
+            id: number;
+            method: string;
+            webContentsId?: number;
+            resourceType: string;
+            url: string;
+          },
+          callback: (result: object) => void,
+        ) => void)
+      | undefined;
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', loading: true, error: undefined as string | undefined },
+      aiNetworkRestricted: true,
+    };
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      assertAssistantNavigationAllowed: vi.fn(async () => {
+        throw new Error('private network blocked');
+      }),
+      emitTabs,
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      tabs: new Map([['tab-1', tab]]),
+      webContentsToTab: new Map([[42, 'tab-1']]),
+    });
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: vi.fn(),
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: (_filter: unknown, listener: typeof requestPolicy) => {
+          requestPolicy = listener;
+        },
+        onCompleted: vi.fn(),
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+    const callback = vi.fn();
+
+    requestPolicy?.(
+      {
+        id: 1,
+        method: 'GET',
+        webContentsId: 42,
+        resourceType: 'image',
+        url: 'http://127.0.0.1/private.png',
+      },
+      callback,
+    );
+    await vi.waitFor(() => expect(callback).toHaveBeenCalledWith({ cancel: true }));
+
+    expect(tab.shell.loading).toBe(true);
+    expect(tab.shell.error).toBeUndefined();
+    expect(emitTabs).not.toHaveBeenCalled();
+  });
+
+  it('attributes validating-proxy restrictions only to AI requests and releases them at terminal state', async () => {
+    let requestPolicy:
+      | ((
+          details: {
+            id: number;
+            method: string;
+            webContentsId?: number;
+            resourceType: string;
+            url: string;
+          },
+          callback: (result: object) => void,
+        ) => void)
+      | undefined;
+    let completed: ((details: { id: number; webContentsId?: number; resourceType?: string }) => void) | undefined;
+    const assistantTab = {
+      shell: { id: 'assistant-tab', conversationId: 'chat-1', url: 'https://internal.example', loading: true },
+      aiNetworkRestricted: true,
+    };
+    const userTab = {
+      shell: { id: 'user-tab', conversationId: 'chat-1', url: 'https://internal.example', loading: true },
+      aiNetworkRestricted: false,
+    };
+    const validatingProxy = {
+      configureSession: vi.fn(async () => undefined),
+      restrictRequest: vi.fn(),
+      releaseRequest: vi.fn(),
+      releaseScope: vi.fn(),
+    };
+    const manager = managerWithoutConstructor({
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      trackUnrestrictedDocumentRequest: vi.fn(),
+      validatingProxy,
+      tabs: new Map([
+        [assistantTab.shell.id, assistantTab],
+        [userTab.shell.id, userTab],
+      ]),
+      webContentsToTab: new Map([
+        [42, assistantTab.shell.id],
+        [43, userTab.shell.id],
+      ]),
+    });
+    const fakeSession = {
+      closeAllConnections: vi.fn(async () => undefined),
+      getPreloadScripts: () => [],
+      on: vi.fn(),
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      setProxy: vi.fn(async () => undefined),
+      webRequest: {
+        onBeforeRequest: (_filter: unknown, listener: typeof requestPolicy) => {
+          requestPolicy = listener;
+        },
+        onCompleted: (_filter: unknown, listener: typeof completed) => {
+          completed = listener;
+        },
+        onErrorOccurred: vi.fn(),
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+
+    const assistantCallback = vi.fn();
+    requestPolicy?.(
+      {
+        id: 101,
+        method: 'GET',
+        webContentsId: 42,
+        resourceType: 'mainFrame',
+        url: 'https://internal.example/account',
+      },
+      assistantCallback,
+    );
+    await vi.waitFor(() => expect(assistantCallback).toHaveBeenCalledWith({}));
+    expect(validatingProxy.configureSession).toHaveBeenCalledWith(fakeSession);
+    expect(validatingProxy.restrictRequest).toHaveBeenCalledWith('global', 101, 'https://internal.example/account');
+
+    const userCallback = vi.fn();
+    requestPolicy?.(
+      {
+        id: 102,
+        method: 'GET',
+        webContentsId: 43,
+        resourceType: 'mainFrame',
+        url: 'https://internal.example/account',
+      },
+      userCallback,
+    );
+    await vi.waitFor(() => expect(userCallback).toHaveBeenCalledWith({}));
+    expect(validatingProxy.restrictRequest).not.toHaveBeenCalledWith('global', 102, 'https://internal.example/account');
+    expect(validatingProxy.releaseRequest).toHaveBeenCalledWith('global', 102);
+
+    completed?.({ id: 101, webContentsId: 42, resourceType: 'mainFrame' });
+    expect(validatingProxy.releaseRequest).toHaveBeenCalledWith('global', 101);
+  });
+
+  it('returns bounded load timing and sanitized recent requests to assistant diagnostics', async () => {
+    const currentTime = Date.now();
+    const contents = {
+      executeJavaScript: vi.fn(),
+      id: 42,
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/account?session=PAGE_SECRET',
+        loading: false,
+      },
+      networkRequests: new Map([
+        [
+          1,
+          {
+            id: 1,
+            sequence: 1,
+            url: 'https://api.example.com/profile?token=REQUEST_SECRET',
+            method: 'GET',
+            resourceType: 'mainFrame',
+            startedAt: currentTime - 75,
+            responseStartedAt: currentTime - 50,
+            completedAt: currentTime,
+            statusCode: 200,
+          },
+        ],
+      ]),
+      generation: 3,
+      queue: new BrowserActionQueue(),
+      trustedUserNavigationLease: 0,
+      view: { webContents: contents },
+      viewLoadPromise: null,
+    };
+    const withVisibleAssistantOperation = vi.fn(async (...args: unknown[]) => {
+      const operation = args[5] as (reveal: () => Promise<void>) => Promise<unknown>;
+      return operation(async () => undefined);
+    });
+    const assertTabNotSensitive = vi.fn(async () => undefined);
+    const withAssistantControl = vi.fn(
+      async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => operation({}),
+    );
+    const manager = managerWithoutConstructor({
+      requireAssistantTab: () => tab,
+      withVisibleAssistantOperation,
+      withAssistantControl,
+      ensureAssistantView: vi.fn(async () => ({ webContents: contents })),
+      assertAssistantDocumentLease: vi.fn(),
+      assertTabNotSensitive,
+      assertBrowserDocumentApproval: vi.fn(),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const diagnostics = await manager.networkDiagnostics('chat-1', { waitFor: 'none', limit: 10 }, { id: 'run-1' });
+
+    expect(withVisibleAssistantOperation).toHaveBeenCalledWith(
+      'chat-1',
+      tab,
+      { id: 'run-1' },
+      'network',
+      'checking network activity',
+      expect.any(Function),
+    );
+    expect(diagnostics).toMatchObject({
+      tabId: 'tab-1',
+      url: expect.stringMatching(/^\[redacted https origin [a-f0-9]{16}\]$/),
+      waitFor: 'none',
+      waitTimedOut: false,
+      loadTiming: { navigationType: 'unknown', timeToFirstByteMs: 25, responseEndMs: 75, durationMs: 75 },
+      requests: [
+        {
+          url: expect.stringMatching(/^\[redacted https origin [a-f0-9]{16}\]\/\[redacted-path\]$/),
+          statusCode: 200,
+          pending: false,
+        },
+      ],
+    });
+    expect(contents.executeJavaScript).not.toHaveBeenCalled();
+    expect(withAssistantControl).toHaveBeenCalledOnce();
+    expect(assertTabNotSensitive).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(diagnostics)).not.toMatch(/PAGE_SECRET|REQUEST_SECRET/);
+  });
+
+  it('prepares network diagnostics in the hidden target without consulting Browser presentation', async () => {
+    const pendingLoad = deferred<object>();
+    let loadSettled = false;
+    void pendingLoad.promise.then(() => {
+      loadSettled = true;
+    });
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/loading',
+        loading: true,
+      },
+      view: null,
+      viewLoadPromise: pendingLoad.promise,
+      queue: new BrowserActionQueue(),
+    };
+    const mount = vi.fn();
+    const selectTab = vi.fn();
+    const focusActiveViewAfterNativeShortcut = vi.fn();
+    const contents = { isDestroyed: () => false };
+    const ensureAssistantView = vi.fn(async () => ({ webContents: contents }));
+    const withAssistantControl = vi.fn(
+      async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => operation({}),
+    );
+    const manager = managerWithoutConstructor({
+      assertAssistantMayControlTab: vi.fn(),
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView,
+      focusActiveViewAfterNativeShortcut,
+      mount,
+      requireAssistantTab: () => tab,
+      selectTab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl,
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+
+    await expect(
+      manager.networkDiagnostics('chat-1', { waitFor: 'none', limit: 10 }, { id: 'run-1' }),
+    ).resolves.toMatchObject({ tabId: tab.shell.id, loading: true, waitFor: 'none', waitTimedOut: false });
+
+    expect(loadSettled).toBe(false);
+    expect(ensureAssistantView).toHaveBeenCalledOnce();
+    expect(withAssistantControl).toHaveBeenCalledOnce();
+    expect(mount).not.toHaveBeenCalled();
+    expect(selectTab).not.toHaveBeenCalled();
+    expect(focusActiveViewAfterNativeShortcut).not.toHaveBeenCalled();
+  });
+
+  it('counts action publication and setup time against the requested network wait deadline', async () => {
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/loading',
+        loading: true,
+      },
+      view: null,
+      viewLoadPromise: null,
+      queue: new BrowserActionQueue(),
+    };
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(150);
+    const contents = { isDestroyed: () => false };
+    const manager = managerWithoutConstructor({
+      assertAssistantMayControlTab: vi.fn(),
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView: vi.fn(async () => ({ webContents: contents })),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+    try {
+      await expect(
+        manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100, limit: 10 }, { id: 'run-1' }),
+      ).resolves.toMatchObject({
+        waitFor: 'load',
+        waitTimedOut: true,
+        loading: true,
+        requests: [],
+        loadTiming: {},
+      });
+      expect(Reflect.get(manager, 'ensureAssistantView')).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('bounds hidden renderer restoration by the remaining network wait budget', async () => {
+    const tab = {
+      shell: {
+        id: 'tab-network-remaining-budget',
+        conversationId: 'chat-1',
+        url: 'https://example.com/loading',
+        loading: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const contents = { isDestroyed: () => false };
+    const ensureAssistantView = vi.fn(async () => ({ webContents: contents }));
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValue(1_040);
+    const manager = managerWithoutConstructor({
+      assistantRuns: { assertActive: () => 1 },
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView,
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+    try {
+      await expect(
+        manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100 }, { id: 'run-1' }),
+      ).resolves.toMatchObject({ waitFor: 'load', waitTimedOut: false, loading: false });
+      expect(ensureAssistantView).toHaveBeenCalledWith(tab, { id: 'run-1' }, {}, 60, undefined, true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('returns content-free diagnostics when sensitivity checks consume the requested wait budget', async () => {
+    let currentTime = 1_000;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => currentTime);
+    const tab = {
+      shell: {
+        id: 'tab-network-scan-budget',
+        conversationId: 'chat-1',
+        url: 'https://example.com/account',
+        loading: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      networkRequests: new Map([
+        [
+          1,
+          {
+            id: 1,
+            sequence: 1,
+            url: 'https://secret.example/account',
+            method: 'GET',
+            resourceType: 'xhr',
+            startedAt: 900,
+            completedAt: 950,
+          },
+        ],
+      ]),
+      networkRequestSequence: 1,
+      queue: new BrowserActionQueue(),
+    };
+    const contents = { isDestroyed: () => false };
+    const assertTabNotSensitive = vi.fn(async (..._args: unknown[]) => {
+      currentTime = 1_101;
+    });
+    const manager = managerWithoutConstructor({
+      assistantRuns: { assertActive: () => 1 },
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive,
+      ensureAssistantView: vi.fn(async () => ({ webContents: contents })),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+        operation({}),
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+    try {
+      await expect(
+        manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100 }, { id: 'run-1' }),
+      ).resolves.toMatchObject({
+        waitTimedOut: true,
+        requestCount: 1,
+        requestsTruncated: true,
+        requests: [],
+        loadTiming: {},
+      });
+      expect(assertTabNotSensitive).toHaveBeenCalledOnce();
+      expect(assertTabNotSensitive.mock.calls[0]?.[5]).toBe(100);
+      expect(assertTabNotSensitive.mock.calls[0]?.[6]).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('cancels a network wait without routing the main-process poll through a destructive renderer deadline', async () => {
+    const controller = new AbortController();
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com', loading: true },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const runRendererOperationWithDeadline = vi.fn();
+    const destroyView = vi.fn();
+    const acquire = vi.fn(() => ({ generation: 1, release: vi.fn() }));
+    const contents = { isDestroyed: () => false };
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire,
+        assertActive: () => 1,
+        generationIfActive: () => 1,
+      },
+      requireAssistantTab: () => tab,
+      assertAssistantDocumentLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView: vi.fn(async () => ({ webContents: contents })),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => {
+        const lease = acquire();
+        try {
+          return await operation({});
+        } finally {
+          lease.release();
+        }
+      },
+      withVisibleAssistantOperation: async (...args: unknown[]) =>
+        (args[5] as (reveal: () => Promise<void>) => Promise<unknown>)(async () => undefined),
+      assertBrowserDocumentApproval: vi.fn(),
+      runRendererOperationWithDeadline,
+      destroyView,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const diagnostics = manager.networkDiagnostics(
+      'chat-1',
+      { waitFor: 'load', timeoutMs: 30_000 },
+      { id: 'run-1', abortSignal: controller.signal },
+    );
+    const rejected = expect(diagnostics).rejects.toThrow(/cancelled/i);
+    await vi.waitFor(() => expect(acquire).toHaveBeenCalledOnce());
+    controller.abort();
+
+    await rejected;
+    expect(runRendererOperationWithDeadline).not.toHaveBeenCalled();
+    expect(destroyView).not.toHaveBeenCalled();
+  });
+
+  it('blocks network diagnostics immediately while the tab contains password data', async () => {
+    const tab = {
+      shell: {
+        id: 'tab-network-sensitive',
+        conversationId: 'chat-1',
+        url: 'https://example.com/account',
+        loading: false,
+        sensitive: true,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const manager = managerWithoutConstructor({
+      assertAssistantMayControlTab: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+
+    await expect(manager.networkDiagnostics('chat-1', { waitFor: 'none' }, { id: 'run-1' })).rejects.toThrow(
+      /blocked while this tab contains password data/i,
+    );
+  });
+
+  it('blocks network diagnostics if password data appears during a background wait', async () => {
+    const acquire = vi.fn(() => ({ generation: 1, release: vi.fn() }));
+    const tab = {
+      shell: {
+        id: 'tab-network-becomes-sensitive',
+        conversationId: 'chat-1',
+        url: 'https://example.com/account',
+        loading: true,
+        sensitive: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: { acquire, assertActive: () => 1, generationIfActive: () => 1 },
+      assertAssistantMayControlTab: vi.fn(),
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => {
+        if (tab.shell.sensitive)
+          throw new Error('Network diagnostics is blocked while this tab contains password data.');
+      }),
+      ensureAssistantView: vi.fn(async () => ({ webContents: { isDestroyed: () => false } })),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => {
+        const lease = acquire();
+        try {
+          return await operation({});
+        } finally {
+          lease.release();
+        }
+      },
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+
+    const diagnostics = manager.networkDiagnostics(
+      'chat-1',
+      { waitFor: 'network-idle', timeoutMs: 1_000, idleMs: 500 },
+      { id: 'run-1' },
+    );
+    await vi.waitFor(() => expect(acquire).toHaveBeenCalledOnce());
+    tab.shell.sensitive = true;
+
+    await expect(diagnostics).rejects.toThrow(/blocked while this tab contains password data/i);
+  });
+
+  it('serializes network diagnostics with assistant tab operations without consulting Browser presentation', async () => {
+    const queue = new BrowserActionQueue();
+    const blocker = deferred<void>();
+    const blockingOperation = queue.run(() => blocker.promise);
+    const acquire = vi.fn(() => ({ generation: 1, release: vi.fn() }));
+    const tab = {
+      shell: {
+        id: 'tab-network-serialized',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        loading: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue,
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: { acquire, assertActive: () => 1, generationIfActive: () => 1 },
+      assertAssistantMayControlTab: vi.fn(),
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView: vi.fn(async () => ({ webContents: { isDestroyed: () => false } })),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => {
+        const lease = acquire();
+        try {
+          return await operation({});
+        } finally {
+          lease.release();
+        }
+      },
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+
+    const diagnostics = manager.networkDiagnostics('chat-1', { waitFor: 'none' }, { id: 'run-1' });
+    await Promise.resolve();
+    expect(acquire).not.toHaveBeenCalled();
+
+    blocker.resolve();
+    await blockingOperation;
+    await expect(diagnostics).resolves.toMatchObject({ tabId: tab.shell.id, waitFor: 'none' });
+    expect(acquire).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      label: 'document navigation',
+      mutate: (manager: InstanceType<typeof BrowserManager>, tab: { generation: number }) => {
+        tab.generation++;
+      },
+      expected: /page navigated/i,
+    },
+    {
+      label: 'profile generation change',
+      mutate: (manager: InstanceType<typeof BrowserManager>, _tab: { generation: number }) => {
+        invokePrivate(manager, 'bumpScopeGeneration', 'global');
+      },
+      expected: /profile changed/i,
+    },
+  ])('invalidates a network wait after a concurrent $label', async ({ mutate, expected }) => {
+    const acquire = vi.fn(() => ({ generation: 1, release: vi.fn() }));
+    const tab = {
+      shell: {
+        id: 'tab-network-invalidated',
+        conversationId: 'chat-1',
+        url: 'https://example.com/loading',
+        loading: true,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+    };
+    const manager = managerWithoutConstructor({
+      assistantRuns: { acquire, assertActive: () => 1, generationIfActive: () => 1 },
+      assertAssistantMayControlTab: vi.fn(),
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      ensureAssistantView: vi.fn(async () => ({ webContents: { isDestroyed: () => false } })),
+      requireAssistantTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) => {
+        const lease = acquire();
+        try {
+          return await operation({});
+        } finally {
+          lease.release();
+        }
+      },
+      withVisibleAssistantOperation: async (...args: unknown[]) => (args[5] as () => Promise<unknown>)(),
+    });
+
+    const diagnostics = manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 1_000 }, { id: 'run-1' });
+    await vi.waitFor(() => expect(acquire).toHaveBeenCalledOnce());
+    mutate(manager, tab);
+
+    await expect(diagnostics).rejects.toThrow(expected);
   });
 
   it('finalizes live and closed tabs before profile clearing can partially fail without reporting success', async () => {
@@ -5872,6 +13671,26 @@ describe('browser manager renderer lifecycle', () => {
     };
 
     const successful = buildFixture(async () => undefined);
+    const screenshotRelease = deferred<void>();
+    const screenshotCapture = (
+      Reflect.get(successful.manager, 'screenshotQueue') as InstanceType<typeof BrowserActionQueue>
+    ).run(async () => screenshotRelease.promise);
+    const menuPreviewController = new AbortController();
+    const menuPreviewTeardownController = new AbortController();
+    const menuPreviewCompletion = new Promise<void>((resolve) => {
+      menuPreviewTeardownController.signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+    Reflect.set(successful.manager, 'menuPreviewCapture', {
+      key: 'preview-1',
+      tabId: 'tab-1',
+      contentsId: 42,
+      scopeKey: 'global',
+      controller: menuPreviewController,
+      teardownController: menuPreviewTeardownController,
+      subscribers: new Map(),
+      operation: null,
+      completion: menuPreviewCompletion,
+    });
     (Reflect.get(successful.manager, 'scopeRuntimeReleaseTokens') as Map<string, object>).set('global', {});
     const successfulClear = invokePrivate(successful.manager, 'clearDataLocked', {
       includeGlobal: true,
@@ -5879,6 +13698,11 @@ describe('browser manager renderer lifecycle', () => {
     expect((Reflect.get(successful.manager, 'scopeRuntimeReleaseTokens') as Map<string, object>).has('global')).toBe(
       false,
     );
+    await vi.waitFor(() => expect(successful.browserSession.closeAllConnections).toHaveBeenCalledOnce());
+    expect(successful.browserSession.clearStorageData).not.toHaveBeenCalled();
+    expect(menuPreviewController.signal.aborted).toBe(true);
+    screenshotRelease.resolve();
+    await screenshotCapture;
     await successfulClear;
     expect(successful.destroyView).toHaveBeenCalledWith(successful.tab);
     expect(successful.browserSession.closeAllConnections).toHaveBeenCalledOnce();
@@ -6000,6 +13824,59 @@ describe('browser manager renderer lifecycle', () => {
     expect(workerFailed.store.restrictBackgroundNetwork).toHaveBeenCalledOnce();
     expect((Reflect.get(workerFailed.manager, 'clearQuarantinedScopes') as Set<string>).has('global')).toBe(true);
     rmSync(workerFailedAppHome, { force: true, recursive: true });
+
+    const downloadFailedAppHome = '/tmp/kai-browser-clear-data-download-failed-test';
+    rmSync(downloadFailedAppHome, { force: true, recursive: true });
+    const downloadFailed = buildFixture(async () => undefined, downloadFailedAppHome);
+    const downloadId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const quarantinePath = assistantDownloadQuarantinePath(downloadFailedAppHome, 'global', downloadId);
+    mkdirSync(join(downloadFailedAppHome, 'browser', 'download-quarantine', 'global'), { recursive: true });
+    writeFileSync(quarantinePath, 'partial download');
+    const cancelDownload = vi.fn(async () => {
+      throw new Error('download cancellation failed');
+    });
+    const downloadDone = deferred<void>();
+    const downloadItem = {};
+    Reflect.set(
+      downloadFailed.manager,
+      'activeDownloads',
+      new Map([
+        [
+          downloadItem,
+          {
+            id: downloadId,
+            scopeKey: 'global',
+            conversationId: 'chat-1',
+            tabId: 'tab-1',
+            assistantOwnerId: 'run-1',
+            keepOpen: false,
+            quarantinePath,
+            item: downloadItem,
+            done: downloadDone.promise,
+            cancel: cancelDownload,
+          },
+        ],
+      ]),
+    );
+    const retainedSessionGuard = vi.fn();
+    Reflect.set(downloadFailed.manager, 'wiredSessionCleanups', new Map([['global', retainedSessionGuard]]));
+
+    await expect(
+      invokePrivate(downloadFailed.manager, 'clearDataLocked', { includeGlobal: true }) as Promise<void>,
+    ).rejects.toThrow(/download cancellation failed|active download could not be stopped/i);
+
+    expect(cancelDownload).toHaveBeenCalledOnce();
+    expect((Reflect.get(downloadFailed.manager, 'activeDownloads') as Map<unknown, unknown>).has(downloadItem)).toBe(
+      true,
+    );
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(downloadFailed.browserSession.clearStorageData).not.toHaveBeenCalled();
+    expect(downloadFailed.browserSession.clearCache).not.toHaveBeenCalled();
+    expect(downloadFailed.browserSession.clearAuthCache).not.toHaveBeenCalled();
+    expect(downloadFailed.store.clear).not.toHaveBeenCalled();
+    expect(downloadFailed.vault.clear).not.toHaveBeenCalled();
+    expect(retainedSessionGuard).not.toHaveBeenCalled();
+    rmSync(downloadFailedAppHome, { force: true, recursive: true });
 
     const deletedProfileRetry = buildFixture(async () => undefined);
     Reflect.set(deletedProfileRetry.manager, 'tabs', new Map());
@@ -6438,17 +14315,24 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.shell.discarded).toBe(true);
   });
 
-  it('bounds a stalled Chromium user-origin automation overlay and stops the action', async () => {
+  it('bounds a stalled Chromium compositor cursor without stopping automation or reclaiming the page', async () => {
     vi.useFakeTimers();
     try {
       const forcefullyCrashRenderer = vi.fn();
+      let debuggerAttached = false;
       const contents = {
         debugger: {
-          isAttached: () => false,
-          sendCommand: vi.fn(),
+          isAttached: () => debuggerAttached,
+          attach: vi.fn(() => {
+            debuggerAttached = true;
+          }),
+          detach: vi.fn(() => {
+            debuggerAttached = false;
+          }),
+          sendCommand: vi.fn((method: string) =>
+            method === 'Overlay.highlightRect' ? new Promise<never>(() => undefined) : Promise.resolve({}),
+          ),
         },
-        insertCSS: vi.fn(() => new Promise<never>(() => undefined)),
-        removeInsertedCSS: vi.fn(async () => undefined),
         forcefullyCrashRenderer,
         isDestroyed: () => false,
       };
@@ -6457,13 +14341,14 @@ describe('browser manager renderer lifecycle', () => {
         view: { webContents: contents },
         overlayGeneration: 0,
         overlayTimer: null,
-        overlayCssKey: null,
-        overlayCssText: null,
+        automationOverlay: null,
       };
       const destroyView = vi.fn();
       const manager = managerWithoutConstructor({
+        attachedView: tab.view,
         destroyView,
         emitTabs: vi.fn(),
+        isHostWindowShown: () => true,
         tabs: new Map([['tab-1', tab]]),
         withAssistantScriptPopupAttribution: (_tab: unknown, operation: () => Promise<unknown>) => operation(),
       });
@@ -6474,27 +14359,36 @@ describe('browser manager renderer lifecycle', () => {
         kind: 'click',
         status: 'running',
         startedAt: new Date().toISOString(),
+        x: 40,
+        y: 60,
       }) as Promise<void>;
-      const rejected = expect(overlay).rejects.toThrow(/Browser automation overlay exceeded 5 seconds/);
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(5_000);
 
-      await rejected;
+      await expect(overlay).resolves.toBeUndefined();
       expect(forcefullyCrashRenderer).not.toHaveBeenCalled();
-      expect(destroyView).toHaveBeenCalledWith(tab);
-      expect(tab.shell.discarded).toBe(true);
-      expect(Reflect.get(tab.shell, 'error')).toBe('Browser automation overlay timed out.');
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.shell.discarded).toBe(false);
+      expect(Reflect.get(tab.shell, 'error')).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('renders automation disclosure as page-untouchable user-origin CSS', async () => {
-    const insertCSS = vi.fn(async (_css: string, _options?: { cssOrigin?: 'author' | 'user' }) => 'overlay-css-key');
-    const removeInsertedCSS = vi.fn(async () => undefined);
+  it('renders the automation cursor through Chromium outside the page DOM', async () => {
+    let debuggerAttached = false;
+    const sendCommand = vi.fn(async () => ({}));
     const contents = {
-      insertCSS,
-      removeInsertedCSS,
+      debugger: {
+        isAttached: () => debuggerAttached,
+        attach: vi.fn(() => {
+          debuggerAttached = true;
+        }),
+        detach: vi.fn(() => {
+          debuggerAttached = false;
+        }),
+        sendCommand,
+      },
       isDestroyed: () => false,
     };
     const tab = {
@@ -6502,10 +14396,11 @@ describe('browser manager renderer lifecycle', () => {
       view: { webContents: contents },
       overlayGeneration: 0,
       overlayTimer: null,
-      overlayCssKey: null,
-      overlayCssText: null,
+      automationOverlay: null,
     };
     const manager = managerWithoutConstructor({
+      attachedView: tab.view,
+      isHostWindowShown: () => true,
       tabs: new Map([['tab-1', tab]]),
     });
 
@@ -6520,18 +14415,24 @@ describe('browser manager renderer lifecycle', () => {
       y: 60,
     });
 
-    expect(insertCSS).toHaveBeenCalledWith(expect.stringContaining('Kai · clicking Sign in'), { cssOrigin: 'user' });
-    expect(insertCSS.mock.calls[0]?.[0]).toContain('left: 40px !important');
-    expect(insertCSS.mock.calls[0]?.[0]).toContain('top: 60px !important');
-    expect(tab.overlayCssKey).toBe('overlay-css-key');
+    expect(sendCommand).toHaveBeenCalledWith('DOM.enable');
+    expect(sendCommand).toHaveBeenCalledWith('Overlay.enable');
+    expect(sendCommand).toHaveBeenCalledWith('Overlay.highlightRect', {
+      x: 31,
+      y: 51,
+      width: 18,
+      height: 18,
+      color: { r: 139, g: 92, b: 246, a: 0.18 },
+      outlineColor: { r: 139, g: 92, b: 246, a: 1 },
+    });
+    expect(tab.automationOverlay).toMatchObject({ contents, x: 40, y: 60 });
   });
 
-  it('retains the prior automation overlay key when cancellation prevents CSS removal', async () => {
-    const insertCSS = vi.fn(async () => 'replacement-key');
-    const removeInsertedCSS = vi.fn(async () => undefined);
+  it('releases the prior compositor cursor when cancellation prevents its cleanup command', async () => {
+    const releaseDebugger = vi.fn();
+    const sendCommand = vi.fn(async () => ({}));
     const contents = {
-      insertCSS,
-      removeInsertedCSS,
+      debugger: { isAttached: () => true, sendCommand },
       isDestroyed: () => false,
     };
     const tab = {
@@ -6539,8 +14440,7 @@ describe('browser manager renderer lifecycle', () => {
       view: { webContents: contents },
       overlayGeneration: 4,
       overlayTimer: null,
-      overlayCssKey: 'existing-key',
-      overlayCssText: 'existing-css',
+      automationOverlay: { contents, releaseDebugger, x: 10, y: 20 },
     };
     const manager = managerWithoutConstructor({
       tabs: new Map([['tab-1', tab]]),
@@ -6562,12 +14462,11 @@ describe('browser manager renderer lifecycle', () => {
         },
         controller.signal,
       ),
-    ).rejects.toThrow(/automation overlay was cancelled/i);
+    ).resolves.toBeUndefined();
 
-    expect(removeInsertedCSS).not.toHaveBeenCalled();
-    expect(insertCSS).not.toHaveBeenCalled();
-    expect(tab.overlayCssKey).toBe('existing-key');
-    expect(tab.overlayCssText).toBe('existing-css');
+    expect(sendCommand).not.toHaveBeenCalled();
+    expect(releaseDebugger).toHaveBeenCalledOnce();
+    expect(tab.automationOverlay).toBeNull();
   });
 
   it('cleans up a failed visible operation without reusing its aborted action signal', async () => {
@@ -6578,7 +14477,7 @@ describe('browser manager renderer lifecycle', () => {
     };
     const setAutomationOverlay = vi.fn(async () => undefined);
     const manager = managerWithoutConstructor({
-      activeTabs: new Map(),
+      activeTabs: new Map([['chat-1', 'user-visible-tab']]),
       emit: vi.fn(),
       emitTabs: vi.fn(),
       tabs: new Map([['tab-1', tab]]),
@@ -6606,6 +14505,7 @@ describe('browser manager renderer lifecycle', () => {
       expect.objectContaining({ status: 'failed', error: 'operation cancelled' }),
     );
     expect(setAutomationOverlay.mock.calls[0]).toHaveLength(2);
+    expect(Reflect.get(manager, 'activeTabs').get('chat-1')).toBe('user-visible-tab');
   });
 
   it('keeps favicon payloads out of routine tab-state broadcasts', () => {
@@ -6750,6 +14650,9 @@ describe('browser manager renderer lifecycle', () => {
           callback: (result: { cancel?: boolean }) => void,
         ) => void)
       | undefined;
+    let failedRequest:
+      | ((details: { id: number; webContentsId?: number; resourceType: string; error: string }) => void)
+      | undefined;
     electronMocks.fromPartition.mockReturnValue({ resolveHost: vi.fn() });
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1', loading: true } as {
@@ -6762,6 +14665,7 @@ describe('browser manager renderer lifecycle', () => {
       trustedUserNavigationTarget: 'https://example.com/',
       trustedUserNavigationRequestId: null as number | null,
       trustedUserNavigationLease: 1,
+      trustedUserNavigationTimer: setTimeout(() => undefined, 60_000),
       aiNetworkRestricted: true,
     };
     const manager = managerWithoutConstructor({
@@ -6793,7 +14697,9 @@ describe('browser manager renderer lifecycle', () => {
           requestPolicy = listener;
         },
         onCompleted: vi.fn(),
-        onErrorOccurred: vi.fn(),
+        onErrorOccurred: (_filter: unknown, listener: typeof failedRequest) => {
+          failedRequest = listener;
+        },
       },
     };
     invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
@@ -6810,6 +14716,7 @@ describe('browser manager renderer lifecycle', () => {
     );
     expect(intended).toHaveBeenCalledWith({});
     expect(tab.trustedUserNavigationRequestId).toBe(7);
+    expect(tab.trustedUserNavigationTimer).toBeNull();
 
     const raced = vi.fn();
     requestPolicy?.(
@@ -6834,6 +14741,15 @@ describe('browser manager renderer lifecycle', () => {
       redirect,
     );
     expect(redirect).toHaveBeenCalledWith({});
+
+    failedRequest?.({
+      id: 7,
+      webContentsId: 42,
+      resourceType: 'mainFrame',
+      error: 'net::ERR_CONNECTION_RESET',
+    });
+    expect(tab.trustedUserNavigation).toBe(false);
+    expect(tab.trustedUserNavigationRequestId).toBeNull();
   });
 
   it('cancels stalled DNS validation with the assistant run signal', async () => {
@@ -6925,6 +14841,87 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.aiNetworkRestricted).toBe(false);
     expect(tab.aiControlOwnerId).toBeNull();
     expect(tab.aiControlGeneration).toBeNull();
+  });
+
+  it('cancels native permission and HTTP-auth prompts before assistant control can wait on Browser chrome', async () => {
+    const permissionCallback = vi.fn();
+    const authCallback = vi.fn();
+    const permissionTimer = setTimeout(() => undefined, 60_000);
+    const authTimer = setTimeout(() => undefined, 60_000);
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'about:blank' },
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      generation: 1,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 0,
+      aiNetworkRestricted: false,
+      aiControlOwnerId: null as string | null,
+      aiControlGeneration: null as number | null,
+    };
+    const pendingPermissions = new Map([
+      [
+        'permission-1',
+        {
+          tabId: tab.shell.id,
+          conversationId: tab.shell.conversationId,
+          scopeKey: tab.scopeKey,
+          tabGeneration: tab.generation,
+          origin: 'https://example.com',
+          permission: 'camera',
+          canPersist: false,
+          assistantTriggered: false,
+          storageKeys: ['camera'],
+          callback: permissionCallback,
+          timer: permissionTimer,
+        },
+      ],
+    ]);
+    const pendingAuth = new Map([
+      [
+        'auth-1',
+        {
+          tabId: tab.shell.id,
+          conversationId: tab.shell.conversationId,
+          scopeKey: tab.scopeKey,
+          tabGeneration: tab.generation,
+          prompt: {
+            id: 'auth-1',
+            tabId: tab.shell.id,
+            host: 'example.com',
+            endpoint: 'https://example.com:443',
+            authScheme: 'basic',
+            isProxy: false,
+            assistantTriggered: false,
+          },
+          callback: authCallback,
+          timer: authTimer,
+        },
+      ],
+    ]);
+    const manager = managerWithoutConstructor({
+      assistantGeneration: vi.fn(() => 7),
+      emit: vi.fn(),
+      getConfig: () => ({ browser: { enabled: true } }),
+      markAssistantControlledOrigin: vi.fn(),
+      pendingAuth,
+      pendingPermissions,
+      restrictBackgroundNetworkForScope: vi.fn(),
+      sanitizeUnrestrictedDocumentForAssistant: vi.fn(async (_tab, _run, lease) => lease),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'guardAssistantTab', tab, { id: 'run-1' }, 7)).resolves.toMatchObject({
+      runId: 'run-1',
+      tabGeneration: 1,
+    });
+
+    expect(permissionCallback).toHaveBeenCalledWith(false);
+    expect(authCallback).toHaveBeenCalledWith(undefined, undefined);
+    expect(pendingPermissions).toHaveLength(0);
+    expect(pendingAuth).toHaveLength(0);
   });
 
   it('clears non-cookie origin state and recreates under AI restrictions after an unrestricted private resource', async () => {
@@ -7173,6 +15170,111 @@ describe('browser manager renderer lifecycle', () => {
     await expect(manager.navigate('chat-1', 'tab-1', 'https://example.com')).rejects.toThrow(/navigation failed/);
     expect(tab.trustedUserNavigation).toBe(false);
     expect(tab.aiNetworkRestricted).toBe(true);
+  });
+
+  it.each(['reload', 'hard-reload', 'back', 'forward'] as const)(
+    'recreates an irreversibly native-UI-guarded renderer before user %s',
+    async (command) => {
+      const tab: {
+        assistantNativeUiNewDocumentGuard?: { contentsId: number; identifier: string };
+        scopeKey: string;
+        scriptTainted: boolean;
+        privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+        shell: { id: string; conversationId: string; url: string };
+        trustedUserNavigation: boolean;
+        trustedUserNavigationTarget: string | null;
+        trustedUserNavigationRequestId: number | null;
+        trustedUserNavigationLease: number;
+      } = {
+        assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'native-ui-guard' },
+        scopeKey: 'global',
+        scriptTainted: false,
+        shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+        trustedUserNavigation: false,
+        trustedUserNavigationTarget: null,
+        trustedUserNavigationRequestId: null,
+        trustedUserNavigationLease: 0,
+      };
+      const resetScriptedRendererForUser = vi.fn((target: typeof tab) => {
+        target.assistantNativeUiNewDocumentGuard = undefined;
+      });
+      const ensureView = vi.fn(async () => ({ webContents: {} }));
+      const manager = managerWithoutConstructor({
+        emitTabs: vi.fn(),
+        ensureView,
+        resetScriptedRendererForUser,
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      await invokePrivate(manager, 'commandTabWithinOperation', tab, command, 'user');
+
+      expect(resetScriptedRendererForUser).toHaveBeenCalledWith(tab);
+      expect(ensureView).toHaveBeenCalledOnce();
+      expect(tab.assistantNativeUiNewDocumentGuard).toBeUndefined();
+    },
+  );
+
+  it('recreates an irreversibly native-UI-guarded renderer before user omnibox navigation', async () => {
+    const tab: {
+      aiControlGeneration: number | null;
+      aiControlOwnerId: string | null;
+      assistantNativeUiNewDocumentGuard?: { contentsId: number; identifier: string };
+      assistantDownloadAttribution?: { assistantOwnerId: string; trustedGestureGeneration: number };
+      generation: number;
+      scopeKey: string;
+      scriptTainted: boolean;
+      privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+      shell: { id: string; conversationId: string; url: string; discarded?: boolean; sensitive?: boolean };
+      trustedUserNavigation: boolean;
+      trustedUserNavigationTarget: string | null;
+      trustedUserNavigationRequestId: number | null;
+      trustedUserNavigationLease: number;
+      trustedUserNavigationTimer: ReturnType<typeof setTimeout> | null;
+      view: { webContents: Record<string, never> } | null;
+    } = {
+      aiControlGeneration: 7,
+      aiControlOwnerId: 'run-1',
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'native-ui-guard' },
+      assistantDownloadAttribution: { assistantOwnerId: 'run-1', trustedGestureGeneration: 2 },
+      generation: 3,
+      scopeKey: 'global',
+      scriptTainted: false,
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com' },
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 0,
+      trustedUserNavigationTimer: null,
+      view: { webContents: {} },
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.assistantNativeUiNewDocumentGuard = undefined;
+      target.view = null;
+    });
+    const ensureView = vi.fn(async () => {
+      expect(tab.aiControlOwnerId).toBeNull();
+      expect(tab.aiControlGeneration).toBeNull();
+      expect(tab.assistantDownloadAttribution).toBeUndefined();
+      return { webContents: {} };
+    });
+    const manager = managerWithoutConstructor({
+      destroyView,
+      emitTabs: vi.fn(),
+      ensureView,
+      getConfig: () => ({ browser: { searchProvider: 'duckduckgo' } }),
+      preemptMenuPreviewForTab: vi.fn(() => null),
+      tabs: new Map([[tab.shell.id, tab]]),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    await manager.navigate('chat-1', tab.shell.id, 'https://example.com/next');
+
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(ensureView).toHaveBeenCalledOnce();
+    expect(tab.shell.url).toBe('https://example.com/next');
+    expect(tab.assistantNativeUiNewDocumentGuard).toBeUndefined();
+    expect(tab.aiControlOwnerId).toBeNull();
+    expect(tab.aiControlGeneration).toBeNull();
   });
 
   it('does not let an older user load clear a newer trusted-navigation lease', async () => {
@@ -7635,7 +15737,11 @@ describe('browser manager renderer lifecycle', () => {
     const manager = managerWithoutConstructor({ dispatchClipboardCommand });
     const contents = { id: 42 };
     const tab = {
-      shell: { id: 'tab-1', conversationId: 'chat-1', sensitive: false },
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        sensitive: false,
+      },
       aiActionDepth: 0,
     };
     const keyUpEvent = { preventDefault: vi.fn() };
@@ -8658,11 +16764,13 @@ describe('browser manager renderer lifecycle', () => {
     expect(retained.shell.error).toMatch(/ERR_NAME_NOT_RESOLVED/);
   });
 
-  it('publishes an unmounted background tab as discarded so approval can restore it', async () => {
+  it('loads an unmounted background tab immediately in a hidden renderer', async () => {
     const tabs = new Map<string, unknown>();
     const tabOrder = new Map<string, string[]>([['chat-1', ['existing-tab']]]);
-    const ensureView = vi.fn(async () => {
-      throw new Error('A background renderer must not be created before the panel mounts.');
+    const hiddenView = { webContents: { isDestroyed: () => false } };
+    const ensureView = vi.fn(async (tab: { view: typeof hiddenView | null }) => {
+      tab.view = hiddenView;
+      return hiddenView;
     });
     const manager = managerWithoutConstructor({
       activeTabs: new Map([['chat-1', 'existing-tab']]),
@@ -8692,27 +16800,44 @@ describe('browser manager renderer lifecycle', () => {
       url: 'https://background.example',
     });
 
-    expect(ensureView).not.toHaveBeenCalled();
-    expect(created.discarded).toBe(true);
-    expect(manager.captureDocumentApproval('chat-1', created.id)).toMatchObject({
-      allowInternalRestore: true,
-      tabId: created.id,
-    });
+    expect(ensureView).toHaveBeenCalledWith(
+      expect.objectContaining({ shell: expect.objectContaining({ id: created.id }) }),
+      undefined,
+      0,
+      false,
+    );
+    expect(created.discarded).toBe(false);
+    expect(manager.captureDocumentApproval('chat-1', created.id)).toMatchObject({ tabId: created.id });
   });
 
-  it('publishes an unmounted assistant tab before creating its restricted native view', async () => {
+  it('loads an unmounted assistant tab immediately and emits passive Browser attention', async () => {
     const tabs = new Map<string, unknown>();
-    const tabOrder = new Map<string, string[]>();
-    const ensureView = vi.fn(async () => {
-      throw new Error('A restricted renderer must wait until its Browser panel mounts.');
-    });
+    const tabOrder = new Map<string, string[]>([['chat-1', ['presented-tab']]]);
+    const hiddenView = { webContents: { isDestroyed: () => false } };
+    let guardedBeforeInitialNavigation = false;
+    const ensureView = vi.fn(
+      async (tab: {
+        view: typeof hiddenView | null;
+        assistantDialogGuard?: { owners: Set<symbol> };
+        assistantRunDialogGuardLease?: symbol;
+      }) => {
+        guardedBeforeInitialNavigation =
+          tab.assistantDialogGuard?.owners.has(tab.assistantRunDialogGuardLease!) === true;
+        tab.view = hiddenView;
+        return hiddenView;
+      },
+    );
     const emit = vi.fn();
     const release = vi.fn();
+    const attachActiveView = vi.fn();
+    const activeTabs = new Map([['chat-1', 'presented-tab']]);
     const manager = managerWithoutConstructor({
-      activeTabs: new Map(),
+      activeTabs,
+      attachActiveView,
       assistantRuns: {
         acquire: vi.fn(() => ({ generation: 3, release })),
         assertActive: vi.fn(() => 3),
+        generationIfActive: vi.fn(() => 3),
       },
       assertAssistantNavigationAllowed: vi.fn(async () => undefined),
       assertScopeAvailable: vi.fn(),
@@ -8741,15 +16866,114 @@ describe('browser manager renderer lifecycle', () => {
       {
         conversationId: 'chat-1',
         owner: 'assistant',
-        url: 'about:blank',
+        url: 'https://assistant.example',
       },
       { id: 'run-1' },
     );
 
-    expect(ensureView).not.toHaveBeenCalled();
-    expect(created).toMatchObject({ discarded: true, owner: 'assistant' });
-    expect(emit).toHaveBeenCalledWith({ type: 'open-panel', conversationId: 'chat-1', tabId: created.id });
+    expect(ensureView).toHaveBeenCalledWith(
+      expect.objectContaining({ shell: expect.objectContaining({ id: created.id }) }),
+      undefined,
+      30_000,
+      true,
+    );
+    expect(created).toMatchObject({ discarded: false, owner: 'assistant' });
+    expect(guardedBeforeInitialNavigation).toBe(true);
+    expect(created.active).toBe(false);
+    expect(activeTabs.get('chat-1')).toBe('presented-tab');
+    expect(manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toBe(created.id);
+    expect(attachActiveView).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a closed assistant target as a run-local tombstone', () => {
+    const closed = {
+      scopeKey: 'global',
+      shell: {
+        id: 'closed-tab',
+        conversationId: 'chat-1',
+        url: 'https://closed.example',
+        title: 'Closed',
+        owner: 'user' as const,
+        keepOpen: true,
+        sensitive: false,
+      },
+    };
+    const replacement = {
+      shell: {
+        id: 'replacement-tab',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: true,
+      },
+      assistantOwnerId: null,
+    };
+    const assistantTargetTabs = new Map([['chat-1\u0000run-1', closed.shell.id]]);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', replacement.shell.id]]),
+      assistantTargetTabs,
+      destroyView: vi.fn(),
+      dropPendingForTab: vi.fn(),
+      releaseScopeRuntimeWhenIdle: vi.fn(),
+      tabOrder: new Map([['chat-1', [closed.shell.id, replacement.shell.id]]]),
+      tabs: new Map<string, typeof closed | typeof replacement>([
+        [closed.shell.id, closed],
+        [replacement.shell.id, replacement],
+      ]),
+    });
+
+    invokePrivate(manager, 'closeTab', closed, false, false);
+
+    expect(assistantTargetTabs.get('chat-1\u0000run-1')).toBe(closed.shell.id);
+    expect(() => manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toThrow(/has closed/i);
+  });
+
+  it('never uses presentation-active state to select among existing tabs for a fresh run', () => {
+    const first = {
+      shell: { id: 'first-tab', conversationId: 'chat-1', owner: 'user' as const, keepOpen: true },
+      assistantOwnerId: null,
+    };
+    const second = {
+      shell: { id: 'second-tab', conversationId: 'chat-1', owner: 'user' as const, keepOpen: true },
+      assistantOwnerId: null,
+    };
+    const activeTabs = new Map([['chat-1', first.shell.id]]);
+    const manager = managerWithoutConstructor({
+      activeTabs,
+      tabOrder: new Map([['chat-1', [first.shell.id, second.shell.id]]]),
+      tabs: new Map([
+        [first.shell.id, first],
+        [second.shell.id, second],
+      ]),
+    });
+
+    expect(() => manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toThrow(/specify the tabId/i);
+    activeTabs.set('chat-1', second.shell.id);
+    expect(() => manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toThrow(/specify the tabId/i);
+    expect(manager.resolveAssistantTabId('chat-1', first.shell.id, { id: 'run-1' })).toBe(first.shell.id);
+  });
+
+  it('does not change the implicit run target while previewing another tab for approval', () => {
+    const first = {
+      shell: { id: 'first-tab', conversationId: 'chat-1', owner: 'user' as const, keepOpen: true },
+      assistantOwnerId: null,
+    };
+    const second = {
+      shell: { id: 'second-tab', conversationId: 'chat-1', owner: 'user' as const, keepOpen: true },
+      assistantOwnerId: null,
+    };
+    const manager = managerWithoutConstructor({
+      assistantTargetTabs: new Map([['chat-1\u0000run-1', first.shell.id]]),
+      tabOrder: new Map([['chat-1', [first.shell.id, second.shell.id]]]),
+      tabs: new Map([
+        [first.shell.id, first],
+        [second.shell.id, second],
+      ]),
+    });
+
+    expect(manager.previewAssistantTabId('chat-1', second.shell.id, { id: 'run-1' })).toBe(second.shell.id);
+    expect(manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toBe(first.shell.id);
   });
 
   it('attaches a restored active view before its page load settles', async () => {
@@ -8761,6 +16985,8 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
     const tab = {
+      aiControlOwnerId: null,
+      assistantDialogGuard: { runId: 'completed-run' },
       shell: {
         id: 'tab-1',
         conversationId: 'chat-1',
@@ -8771,6 +16997,7 @@ describe('browser manager renderer lifecycle', () => {
       viewLoadPromise: null as Promise<typeof view> | null,
     };
     const attachActiveView = vi.fn();
+    const protectAssistantDialogs = vi.fn(async () => undefined);
     const createView = vi.fn(() => {
       tab.view = view;
       return view;
@@ -8778,6 +17005,7 @@ describe('browser manager renderer lifecycle', () => {
     const manager = managerWithoutConstructor({
       disposed: false,
       getConfig: () => ({ browser: { enabled: true } }),
+      protectAssistantDialogs,
       requireLiveWindow: vi.fn(),
       assertScopeAvailable: vi.fn(),
       storeForScope: () => ({ listScriptCleanupOrigins: () => [] }),
@@ -8801,6 +17029,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(createView).toHaveBeenCalledOnce();
     expect(view.webContents.loadURL).toHaveBeenCalledOnce();
     expect(attachActiveView).toHaveBeenCalledWith('chat-1');
+    expect(protectAssistantDialogs).not.toHaveBeenCalled();
     await Promise.resolve();
     expect(joinedSettled).toBe(false);
 
@@ -8809,12 +17038,218 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.viewLoadPromise).toBeNull();
   });
 
+  it('preserves the requested URL across a hidden assistant renderer bootstrap', async () => {
+    let currentUrl = '';
+    const loadURL = vi.fn(async (url: string) => {
+      currentUrl = url;
+      tab.shell.url = url;
+    });
+    const view = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL,
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://assistant.example/requested',
+      },
+      scopeKey: 'global',
+      aiNetworkRestricted: false,
+      trustedUserNavigation: false,
+      assistantBackgroundInitialLoadPending: false,
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+    };
+    const restoreAssistantBackgroundViewport = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      enableAssistantBackgroundViewport: vi.fn(async () => undefined),
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      restoreAssistantBackgroundViewport,
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>).resolves.toBe(
+      view,
+    );
+
+    expect(loadURL.mock.calls.map(([url]) => url)).toEqual(['about:blank', 'https://assistant.example/requested']);
+    expect(restoreAssistantBackgroundViewport).toHaveBeenCalledWith(tab, view.webContents, 5_000);
+    expect(tab.assistantBackgroundInitialLoadPending).toBe(false);
+  });
+
+  it('does not install hidden viewport metrics after the user takes over during bootstrap', async () => {
+    const bootstrap = deferred<void>();
+    let currentUrl = '';
+    const loadURL = vi.fn(async (url: string) => {
+      currentUrl = url;
+      if (url === 'about:blank') await bootstrap.promise;
+    });
+    const view = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL,
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://assistant.example/requested',
+      },
+      scopeKey: 'global',
+      aiNetworkRestricted: false,
+      trustedUserNavigation: false,
+      assistantBackgroundInitialLoadPending: false,
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+    };
+    const enableAssistantBackgroundViewport = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      enableAssistantBackgroundViewport,
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      restoreAssistantBackgroundViewport: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>;
+    await vi.waitFor(() => expect(loadURL).toHaveBeenCalledWith('about:blank'));
+    expect(invokePrivate(manager, 'prepareTabForUserPresentation', tab)).toBeNull();
+    expect(tab.assistantBackgroundInitialLoadPending).toBe(false);
+    bootstrap.resolve();
+    await expect(loading).resolves.toBe(view);
+
+    expect(enableAssistantBackgroundViewport).not.toHaveBeenCalled();
+    expect(loadURL).toHaveBeenLastCalledWith('https://assistant.example/requested');
+  });
+
+  it('leaves hidden viewport cleanup to the bootstrap owner when the user takes over mid-setup', async () => {
+    const viewportSetup = deferred<void>();
+    let currentUrl = '';
+    let debuggerAttached = false;
+    const sendCommand = vi.fn((method: string) => {
+      if (method === 'Emulation.setDeviceMetricsOverride') return viewportSetup.promise;
+      return Promise.resolve({});
+    });
+    const view = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: {
+        debugger: {
+          attach: vi.fn(() => {
+            debuggerAttached = true;
+          }),
+          detach: vi.fn(() => {
+            debuggerAttached = false;
+          }),
+          isAttached: () => debuggerAttached,
+          sendCommand,
+        },
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL: vi.fn(async (url: string) => {
+          currentUrl = url;
+        }),
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://assistant.example/requested',
+      },
+      scopeKey: 'global',
+      aiNetworkRestricted: false,
+      trustedUserNavigation: false,
+      assistantBackgroundInitialLoadPending: false,
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+    };
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const loading = invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>;
+    await vi.waitFor(() =>
+      expect(sendCommand).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride', {
+        width: 1_280,
+        height: 800,
+        deviceScaleFactor: 1,
+        mobile: false,
+      }),
+    );
+
+    expect(invokePrivate(manager, 'prepareTabForUserPresentation', tab)).toBeNull();
+    expect(tab.assistantBackgroundInitialLoadPending).toBe(false);
+    expect(sendCommand).not.toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+    viewportSetup.resolve();
+
+    await expect(loading).resolves.toBe(view);
+    expect(sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+    expect(Reflect.get(tab, 'assistantBackgroundViewportContents')).toBeUndefined();
+  });
+
   it('attaches an in-flight native view as soon as its Browser panel mounts', async () => {
     const pageLoad = deferred<void>();
     const addChildView = vi.fn();
     const setBounds = vi.fn();
     const view = {
       setBounds,
+      setVisible: vi.fn(),
       webContents: { isDestroyed: () => false },
     };
     const tab = {
@@ -8845,10 +17280,226 @@ describe('browser manager renderer lifecycle', () => {
 
     const mounting = manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 });
 
-    expect(addChildView).toHaveBeenCalledWith(view);
+    expect(addChildView).not.toHaveBeenCalled();
     expect(setBounds).toHaveBeenCalledWith({ x: 10, y: 20, width: 300, height: 200 });
     pageLoad.resolve();
     await mounting;
+  });
+
+  it('drains a menu preview before mount restores or captures a renderer', async () => {
+    const previewDrain = deferred<void>();
+    const oldView = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: { isDestroyed: () => false },
+    };
+    const replacementView = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents: { isDestroyed: () => false },
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view: oldView as typeof oldView | null,
+    };
+    const ensureView = vi.fn(async () => {
+      expect(tab.view).toBeNull();
+      tab.view = replacementView;
+      return replacementView;
+    });
+    const preemptMenuPreviewForTab = vi.fn(async () => {
+      await previewDrain.promise;
+      tab.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachActiveView: vi.fn(),
+      emitPendingPrompts: vi.fn(),
+      ensureView,
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged: vi.fn(),
+      preemptMenuPreviewForTab,
+      prepareTabForUserPresentation: vi.fn(() => null),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const mounting = manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 });
+    await Promise.resolve();
+
+    expect(preemptMenuPreviewForTab).toHaveBeenCalledWith(tab, expect.stringMatching(/user opened this tab/i));
+    expect(ensureView).not.toHaveBeenCalled();
+
+    previewDrain.resolve();
+    await mounting;
+
+    expect(ensureView).toHaveBeenCalledOnce();
+    expect(tab.view).toBe(replacementView);
+  });
+
+  it('records presentation intent without mutating a background AI viewport', async () => {
+    const releaseAction = deferred<void>();
+    const queue = new BrowserActionQueue();
+    const activeAction = queue.run(async () => releaseAction.promise);
+    const debuggerApi = browserDebuggerMock();
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    const contents = {
+      id: 42,
+      debugger: debuggerApi,
+      focus: vi.fn(),
+      isDestroyed: () => false,
+    };
+    const view = { setBounds, setVisible, webContents: contents };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        reloadRequired: false,
+      },
+      scriptTainted: false,
+      trustedGestureGeneration: 3,
+      assistantBackgroundInitialLoadPending: false,
+      assistantBackgroundViewportContents: new Set([contents]),
+      queue,
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      emitPendingPrompts: vi.fn(),
+      ensureView: vi.fn(async () => view),
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged: vi.fn(),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 })).resolves.toBeUndefined();
+
+    expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+    expect(tab.trustedGestureGeneration).toBe(3);
+    expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(setVisible).toHaveBeenLastCalledWith(false);
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
+
+    releaseAction.resolve();
+    await activeAction;
+    await invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab, contents);
+
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+    expect(tab.assistantBackgroundViewportContents).toBeUndefined();
+    expect(setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 200 });
+    expect(setVisible).toHaveBeenLastCalledWith(true);
+    expect(Reflect.get(manager, 'attachedView')).toBe(view);
+  });
+
+  it('does not let panel mount trigger a failing background viewport cleanup', async () => {
+    const cleanupError = new Error('clear metrics failed');
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockRejectedValueOnce(cleanupError);
+    const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+    const view = { setBounds: vi.fn(), setVisible: vi.fn(), webContents: contents };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        discarded: false,
+        error: undefined as string | undefined,
+        reloadRequired: false,
+      },
+      scriptTainted: false,
+      assistantBackgroundInitialLoadPending: false,
+      assistantBackgroundViewportContents: new Set([contents]),
+      view: view as typeof view | null,
+    };
+    const destroyView = vi.fn(() => {
+      tab.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachedView: null,
+      destroyView,
+      emitPendingPrompts: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureView: vi.fn(async () => view),
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged: vi.fn(),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 })).resolves.toBeUndefined();
+
+    expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride');
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view).toBe(view);
+    expect(tab.assistantBackgroundViewportContents).toEqual(new Set([contents]));
+    expect(tab.shell.error).toBeUndefined();
+    expect(debuggerApi.sendCommand).not.toHaveBeenCalled();
+  });
+
+  it('does not detach a shared debugger while viewport restoration overlaps assistant CDP input', async () => {
+    const clearMetrics = deferred<void>();
+    const dispatchInput = deferred<void>();
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const method = args[0] as string;
+      if (method === 'Emulation.clearDeviceMetricsOverride') await clearMetrics.promise;
+      if (method === 'Input.dispatchKeyEvent') await dispatchInput.promise;
+      return {};
+    });
+    const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: contents },
+      assistantBackgroundViewportContents: new Set([contents]),
+    };
+    const manager = managerWithoutConstructor({
+      attachActiveView: vi.fn(),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const restoring = invokePrivate(manager, 'restoreAssistantBackgroundViewport', tab, contents) as Promise<void>;
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride'),
+    );
+    const dispatching = invokePrivate(manager, 'dispatchCdpInputCommand', tab, contents, {
+      method: 'Input.dispatchKeyEvent',
+      params: { type: 'keyDown', key: 'Enter' },
+    }) as Promise<void>;
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Input.dispatchKeyEvent', expect.anything()),
+    );
+
+    clearMetrics.resolve();
+    await restoring;
+    expect(debuggerApi.detach).not.toHaveBeenCalled();
+
+    dispatchInput.resolve();
+    await dispatching;
+    expect(debuggerApi.attach).toHaveBeenCalledOnce();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
   });
 
   it('installs the private-network document guard before a restricted tab first loads', async () => {
@@ -8902,7 +17553,57 @@ describe('browser manager renderer lifecycle', () => {
     expect(order).toEqual(['guard', 'load']);
   });
 
-  it('starts every newly created restricted view with the preload WebRTC guard active', () => {
+  it('navigates a brand-new empty restricted view to about:blank while unmounted', async () => {
+    const order: string[] = [];
+    let currentUrl = '';
+    const loadURL = vi.fn(async (url: string) => {
+      order.push('load');
+      currentUrl = url;
+    });
+    const view = {
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL,
+      },
+    };
+    const tab = {
+      aiNetworkRestricted: true,
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'about:blank',
+      },
+      scopeKey: 'global',
+      trustedUserNavigation: false,
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+    };
+    const installPrivateNetworkNewDocumentGuard = vi.fn(async () => {
+      order.push('guard');
+    });
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      getConfig: () => ({ browser: { enabled: true } }),
+      installPrivateNetworkNewDocumentGuard,
+      requireLiveWindow: vi.fn(),
+      storeForScope: () => ({ listScriptCleanupOrigins: () => [] }),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(invokePrivate(manager, 'ensureView', tab, new AbortController().signal, 30_000)).resolves.toBe(view);
+    expect(installPrivateNetworkNewDocumentGuard).toHaveBeenCalledOnce();
+    expect(loadURL).toHaveBeenCalledWith('about:blank');
+    expect(order).toEqual(['load', 'guard']);
+  });
+
+  it('starts every newly created assistant view with preload network and native-UI guards active', () => {
     const pageSession = { setUserAgent: vi.fn() };
     electronMocks.fromPartition.mockReturnValue(pageSession);
     const webContents = {
@@ -8913,9 +17614,14 @@ describe('browser manager renderer lifecycle', () => {
       setZoomLevel: vi.fn(),
     };
     const setBounds = vi.fn();
-    electronMocks.webContentsView.mockReturnValue({ setBounds, webContents });
+    const setVisible = vi.fn();
+    electronMocks.webContentsView.mockReturnValue({ setBounds, setVisible, webContents });
+    const addChildView = vi.fn();
     const tab = {
+      aiControlOwnerId: 'run-1',
       aiNetworkRestricted: true,
+      assistantDialogsDisabledRunId: 'run-1',
+      assistantOwnerId: null,
       partition: 'persist:kai-browser-global',
       scopeKey: 'global',
       shell: {
@@ -8932,7 +17638,10 @@ describe('browser manager renderer lifecycle', () => {
       aiAllowPrivateNetwork: false,
       assertScopeAvailable: vi.fn(),
       getConfig: () => ({ browser: { aiAllowPrivateNetwork: false } }),
-      requireLiveWindow: vi.fn(),
+      requireLiveWindow: vi.fn(() => ({
+        contentView: { addChildView, removeChildView: vi.fn() },
+        isDestroyed: () => false,
+      })),
       webContentsToTab: new Map(),
       wireSession: vi.fn(),
       wireWebContents: vi.fn(),
@@ -8945,15 +17654,24 @@ describe('browser manager renderer lifecycle', () => {
 
     expect(electronMocks.webContentsView).toHaveBeenCalledWith({
       webPreferences: expect.objectContaining({
-        additionalArguments: [BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT],
+        additionalArguments: [
+          BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT,
+          BROWSER_NATIVE_UI_GUARD_ARGUMENT,
+          expect.stringMatching(new RegExp(`^${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}[0-9a-f-]{36}$`)),
+        ],
+        disableDialogs: true,
       }),
     });
     expect(tab).toMatchObject({
       privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
+      assistantNativeUiNewDocumentGuard: { contentsId: 42, identifier: 'preload-pending' },
       shell: { discarded: false },
       view: { webContents },
     });
     expect(webContents.setWebRTCIPHandlingPolicy).toHaveBeenCalledWith('disable_non_proxied_udp');
+    expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(setVisible).toHaveBeenCalledWith(false);
+    expect(addChildView).toHaveBeenCalledWith(expect.objectContaining({ webContents }));
   });
 
   it('keeps ordinary user-created views on Chromium default WebRTC behavior', () => {
@@ -8966,7 +17684,10 @@ describe('browser manager renderer lifecycle', () => {
       setWebRTCIPHandlingPolicy: vi.fn(),
       setZoomLevel: vi.fn(),
     };
-    electronMocks.webContentsView.mockReturnValue({ setBounds: vi.fn(), webContents });
+    const setBounds = vi.fn();
+    const setVisible = vi.fn();
+    electronMocks.webContentsView.mockReturnValue({ setBounds, setVisible, webContents });
+    const addChildView = vi.fn();
     const tab = {
       aiNetworkRestricted: false,
       partition: 'persist:kai-browser-global',
@@ -8985,7 +17706,10 @@ describe('browser manager renderer lifecycle', () => {
       aiAllowPrivateNetwork: false,
       assertScopeAvailable: vi.fn(),
       getConfig: () => ({ browser: { aiAllowPrivateNetwork: false } }),
-      requireLiveWindow: vi.fn(),
+      requireLiveWindow: vi.fn(() => ({
+        contentView: { addChildView, removeChildView: vi.fn() },
+        isDestroyed: () => false,
+      })),
       webContentsToTab: new Map(),
       wireSession: vi.fn(),
       wireWebContents: vi.fn(),
@@ -8994,10 +17718,188 @@ describe('browser manager renderer lifecycle', () => {
     expect(invokePrivate(manager, 'createView', tab)).toMatchObject({ webContents });
 
     expect(electronMocks.webContentsView).toHaveBeenCalledWith({
-      webPreferences: expect.objectContaining({ additionalArguments: [] }),
+      webPreferences: expect.objectContaining({
+        additionalArguments: [
+          expect.stringMatching(new RegExp(`^${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}[0-9a-f-]{36}$`)),
+        ],
+      }),
     });
     expect(webContents.setWebRTCIPHandlingPolicy).toHaveBeenCalledWith('default');
+    expect(setBounds).toHaveBeenCalledWith({ x: 0, y: 0, width: 1_280, height: 800 });
+    expect(setVisible).toHaveBeenCalledWith(false);
+    expect(addChildView).toHaveBeenCalledWith(expect.objectContaining({ webContents }));
     expect(tab).not.toHaveProperty('privateNetworkNewDocumentGuard');
+  });
+
+  it('does not reactivate the native-UI guard from historical assistant creator ownership', () => {
+    const pageSession = { setUserAgent: vi.fn() };
+    electronMocks.fromPartition.mockReturnValue(pageSession);
+    const webContents = {
+      id: 44,
+      setAudioMuted: vi.fn(),
+      setUserAgent: vi.fn(),
+      setWebRTCIPHandlingPolicy: vi.fn(),
+      setZoomLevel: vi.fn(),
+    };
+    electronMocks.webContentsView.mockReturnValue({
+      setBounds: vi.fn(),
+      setVisible: vi.fn(),
+      webContents,
+    });
+    const tab = {
+      aiControlOwnerId: null,
+      aiNetworkRestricted: false,
+      assistantOwnerId: 'completed-run',
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      shell: {
+        conversationId: 'chat-1',
+        discarded: true,
+        id: 'tab-kept-assistant',
+        muted: false,
+        zoomLevel: 0,
+      },
+      trustedUserNavigation: false,
+      view: null,
+    };
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      assertScopeAvailable: vi.fn(),
+      getConfig: () => ({ browser: { aiAllowPrivateNetwork: false } }),
+      requireLiveWindow: vi.fn(() => ({
+        contentView: { addChildView: vi.fn(), removeChildView: vi.fn() },
+        isDestroyed: () => false,
+      })),
+      webContentsToTab: new Map(),
+      wireSession: vi.fn(),
+      wireWebContents: vi.fn(),
+    });
+
+    expect(invokePrivate(manager, 'createView', tab)).toMatchObject({ webContents });
+
+    expect(electronMocks.webContentsView).toHaveBeenCalledWith({
+      webPreferences: expect.objectContaining({
+        additionalArguments: [
+          expect.stringMatching(new RegExp(`^${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}[0-9a-f-]{36}$`)),
+        ],
+      }),
+    });
+    expect(tab).not.toHaveProperty('assistantNativeUiNewDocumentGuard');
+  });
+
+  it('rolls back a hidden native child when renderer initialization fails', () => {
+    electronMocks.fromPartition.mockReturnValue({ setUserAgent: vi.fn() });
+    const close = vi.fn();
+    const webContents = {
+      close,
+      id: 45,
+      isDestroyed: () => false,
+      setAudioMuted: vi.fn(),
+      setUserAgent: vi.fn(() => {
+        throw new Error('user-agent setup failed');
+      }),
+      setWebRTCIPHandlingPolicy: vi.fn(),
+      setZoomLevel: vi.fn(),
+    };
+    const view = { setBounds: vi.fn(), setVisible: vi.fn(), webContents };
+    electronMocks.webContentsView.mockReturnValue(view);
+    const addChildView = vi.fn();
+    const removeChildView = vi.fn();
+    const tab = {
+      aiNetworkRestricted: false,
+      partition: 'persist:kai-browser-global',
+      scopeKey: 'global',
+      shell: {
+        discarded: true,
+        id: 'tab-failed',
+        muted: false,
+        zoomLevel: 0,
+      },
+      trustedUserNavigation: false,
+      view: null,
+    };
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      assertScopeAvailable: vi.fn(),
+      requireLiveWindow: vi.fn(() => ({
+        contentView: { addChildView, removeChildView },
+        isDestroyed: () => false,
+      })),
+      webContentsToTab: new Map(),
+      wireSession: vi.fn(),
+      wireWebContents: vi.fn(),
+    });
+
+    expect(() => invokePrivate(manager, 'createView', tab)).toThrow('user-agent setup failed');
+
+    expect(addChildView).toHaveBeenCalledWith(view);
+    expect(removeChildView).toHaveBeenCalledWith(view);
+    expect(close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    expect(tab.view).toBeNull();
+    expect((Reflect.get(manager, 'webContentsToTab') as Map<number, string>).has(45)).toBe(false);
+  });
+
+  it('removes a hidden hosted view and settles attributed input before closing its renderer', async () => {
+    const close = vi.fn();
+    const removeChildView = vi.fn();
+    const removeCaptureChildView = vi.fn();
+    const view = {
+      webContents: { close, id: 44, isDestroyed: () => false },
+    };
+    const tab = {
+      aiNetworkReleaseRequested: false,
+      aiNetworkReleaseTimer: null,
+      automationOverlay: null,
+      overlayGeneration: 0,
+      overlayTimer: null,
+      popupGesture: null,
+      privateNetworkNewDocumentGuard: undefined,
+      shell: { id: 'tab-hidden' },
+      view,
+      viewLoadPromise: null,
+    };
+    const confirmation = deferred<boolean>();
+    const manager = managerWithoutConstructor({
+      attachedView: null,
+      backgroundCaptureHost: {
+        contentView: { removeChildView: removeCaptureChildView },
+        isDestroyed: () => false,
+      },
+      captureHostedView: view,
+      automationGestureTokens: new Map([
+        [
+          'gesture-token',
+          {
+            tabId: tab.shell.id,
+            contentsId: 44,
+            assistantOwnerId: 'run-1',
+            expiresAt: Date.now() + 1_000,
+            kind: 'pointerdown',
+            confirmed: false,
+            settleConfirmation: confirmation.resolve,
+          },
+        ],
+      ]),
+      cancelFaviconFetch: vi.fn(),
+      dropPendingForTab: vi.fn(),
+      getWindow: () => ({
+        contentView: { removeChildView },
+        isDestroyed: () => false,
+      }),
+      pendingSyntheticInputs: new Map(),
+      resetUnrestrictedDocumentNetworkState: vi.fn(),
+      webContentsToTab: new Map([[44, 'tab-hidden']]),
+    });
+
+    invokePrivate(manager, 'destroyView', tab);
+
+    expect(removeChildView).toHaveBeenCalledWith(view);
+    expect(removeCaptureChildView).toHaveBeenCalledWith(view);
+    expect(Reflect.get(manager, 'captureHostedView')).toBeNull();
+    expect(close).toHaveBeenCalledWith({ waitForBeforeUnload: false });
+    expect(tab.view).toBeNull();
+    expect((Reflect.get(manager, 'webContentsToTab') as Map<number, string>).has(44)).toBe(false);
+    await expect(confirmation.promise).resolves.toBe(false);
   });
 
   it('refreshes an assistant lease when joining an in-flight discarded-tab restore', async () => {
@@ -9077,7 +17979,12 @@ describe('browser manager renderer lifecycle', () => {
     expect(createView).toHaveBeenCalledOnce();
     expect(view.webContents.loadURL).toHaveBeenCalledOnce();
     expect(guardAssistantTab).toHaveBeenCalledWith(tab, { id: 'run-1' }, 7);
-    expect(Reflect.get(manager, 'installPrivateNetworkNewDocumentGuard')).toHaveBeenCalledWith(tab, view.webContents);
+    expect(Reflect.get(manager, 'installPrivateNetworkNewDocumentGuard')).toHaveBeenCalledWith(
+      tab,
+      view.webContents,
+      undefined,
+      lease,
+    );
     expect(lease).toMatchObject({ tabGeneration: 4, url: 'https://example.com/restored' });
   });
 
@@ -9167,7 +18074,159 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('can bound network observation without reclaiming an existing loading renderer', async () => {
+    vi.useFakeTimers();
+    const contents = {
+      debugger: { isAttached: () => false },
+      forcefullyCrashRenderer: vi.fn(),
+      isDestroyed: () => false,
+    };
+    const view = { webContents: contents };
+    const pageLoad = deferred<typeof view>();
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://slow.example',
+        discarded: false,
+      },
+      scopeKey: 'global',
+      view,
+      viewLoadPromise: pageLoad.promise,
+    };
+    const destroyView = vi.fn();
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      destroyView,
+      emitTabs: vi.fn(),
+      getConfig: () => ({ browser: { enabled: true } }),
+      requireLiveWindow: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    try {
+      const joined = invokePrivate(manager, 'ensureView', tab, undefined, 25, false, true) as Promise<unknown>;
+      const rejected = expect(joined).rejects.toThrow('Browser page load exceeded 0.025 seconds');
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+
+      expect(contents.forcefullyCrashRenderer).not.toHaveBeenCalled();
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).toBe(view);
+      expect(tab.shell.discarded).toBe(false);
+      pageLoad.resolve(view);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not destroy a replacement view when an old renderer operation times out', async () => {
+    vi.useFakeTimers();
+    try {
+      const oldContents = {
+        debugger: { isAttached: () => false },
+        isDestroyed: () => false,
+      };
+      const replacementContents = {
+        debugger: { isAttached: () => false },
+        isDestroyed: () => false,
+      };
+      const oldView = { webContents: oldContents };
+      const replacementView = { webContents: replacementContents };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        view: oldView,
+      };
+      const destroyView = vi.fn();
+      const manager = managerWithoutConstructor({
+        destroyView,
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const stalled = deferred<void>();
+
+      const operation = invokePrivate(
+        manager,
+        'runRendererOperationWithDeadline',
+        tab,
+        oldContents,
+        'Old renderer operation',
+        25,
+        () => stalled.promise,
+      ) as Promise<void>;
+      tab.view = replacementView;
+
+      const rejected = expect(operation).rejects.toThrow('Old renderer operation exceeded 0.025 seconds');
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).toBe(replacementView);
+      expect(tab.shell.discarded).toBe(false);
+      stalled.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not terminate or destroy a same-WebContents user navigation when stale work times out', async () => {
+    vi.useFakeTimers();
+    try {
+      const sendCommand = vi.fn(async () => ({}));
+      const contents = {
+        debugger: { isAttached: () => true, sendCommand },
+        isDestroyed: () => false,
+      };
+      const view = { webContents: contents };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        view,
+        generation: 4,
+        trustedUserNavigationLease: 2,
+      };
+      const destroyView = vi.fn();
+      const manager = managerWithoutConstructor({
+        destroyView,
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const stalled = deferred<void>();
+
+      const operation = invokePrivate(
+        manager,
+        'runRendererOperationWithDeadline',
+        tab,
+        contents,
+        'Old document operation',
+        25,
+        () => stalled.promise,
+      ) as Promise<void>;
+      // A normal navigation reuses WebContents but replaces the document and
+      // advances both authority fences before the old operation's deadline.
+      tab.generation++;
+      tab.trustedUserNavigationLease++;
+
+      const rejected = expect(operation).rejects.toThrow('Old document operation exceeded 0.025 seconds');
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+
+      expect(sendCommand).not.toHaveBeenCalledWith('Runtime.terminateExecution');
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).toBe(view);
+      expect(tab.shell.discarded).toBe(false);
+      stalled.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('revokes assistant authority and destroys host-owned views while preserving tab shells', () => {
+    const lifecycle: string[] = [];
+    const cancelAssistantDownload = vi.fn(async () => {
+      lifecycle.push('cancel-assistant-download');
+    });
+    const cancelKeptDownload = vi.fn(async () => undefined);
+    const cancelUserDownload = vi.fn(async () => undefined);
     const first = {
       shell: {
         id: 'tab-1',
@@ -9194,8 +18253,38 @@ describe('browser manager renderer lifecycle', () => {
       tab.view = null as unknown as typeof tab.view;
     });
     const emitTabs = vi.fn();
-    const assistantRuns = { clear: vi.fn() };
+    const assistantRuns = {
+      clear: vi.fn(() => {
+        lifecycle.push('clear-assistant-runs');
+      }),
+    };
     const manager = managerWithoutConstructor({
+      activeDownloads: new Map([
+        [
+          {},
+          {
+            assistantOwnerId: 'run-1',
+            keepOpen: false,
+            cancel: cancelAssistantDownload,
+          },
+        ],
+        [
+          {},
+          {
+            assistantOwnerId: 'run-1',
+            keepOpen: true,
+            cancel: cancelKeptDownload,
+          },
+        ],
+        [
+          {},
+          {
+            assistantOwnerId: null,
+            keepOpen: false,
+            cancel: cancelUserDownload,
+          },
+        ],
+      ]),
       assistantRuns,
       attachedView: first.view,
       destroyView,
@@ -9213,6 +18302,10 @@ describe('browser manager renderer lifecycle', () => {
 
     manager.handleHostRendererUnavailable();
 
+    expect(cancelAssistantDownload).toHaveBeenCalledOnce();
+    expect(cancelKeptDownload).not.toHaveBeenCalled();
+    expect(cancelUserDownload).not.toHaveBeenCalled();
+    expect(lifecycle).toEqual(['cancel-assistant-download', 'clear-assistant-runs']);
     expect(assistantRuns.clear).toHaveBeenCalledOnce();
     expect(destroyView).toHaveBeenCalledTimes(2);
     expect(first.shell).toMatchObject({ discarded: true, sensitive: false });
@@ -9728,13 +18821,27 @@ describe('browser manager renderer lifecycle', () => {
     const cleanupConversation = vi.fn();
     const flush = vi.fn(async () => undefined);
     const disposeVault = vi.fn();
+    const orphanGestureConfirmation = deferred<boolean>();
     const idleTimer = setInterval(() => undefined, 60_000);
     const manager = managerWithoutConstructor({
       activeDownloads: new Map(),
       activeTabs: new Map(),
       assistantContinuationLeases: new Set(),
       assistantRuns: { clear: vi.fn() },
-      automationGestureTokens: new Map(),
+      automationGestureTokens: new Map([
+        [
+          'orphan-gesture-token',
+          {
+            tabId: 'closed-tab',
+            contentsId: 44,
+            assistantOwnerId: 'run-1',
+            expiresAt: Date.now() + 1_000,
+            kind: 'pointerdown',
+            confirmed: false,
+            settleConfirmation: orphanGestureConfirmation.resolve,
+          },
+        ],
+      ]),
       pendingSyntheticInputs: new Map(),
       cancelActiveDownloadsForScopes: vi.fn(async () => undefined),
       closedTabs: new Map(),
@@ -9772,6 +18879,7 @@ describe('browser manager renderer lifecycle', () => {
     expect((Reflect.get(manager, 'wiredSessionsByScope') as Map<string, unknown>).size).toBe(0);
     expect((Reflect.get(manager, 'stores') as Map<string, unknown>).size).toBe(0);
     expect((Reflect.get(manager, 'vaults') as Map<string, unknown>).size).toBe(0);
+    await expect(orphanGestureConfirmation.promise).resolves.toBe(false);
   });
 
   it('does not let a stale BrowserPanel mount recreate tabs for a removed conversation', async () => {
@@ -10266,6 +19374,177 @@ describe('browser manager renderer lifecycle', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
+  it('recreates irreversibly guarded renderers when private-network AI access is loosened', async () => {
+    const contents = { isDestroyed: () => false, setWebRTCIPHandlingPolicy: vi.fn() };
+    const view = { webContents: contents };
+    const queue = new BrowserActionQueue();
+    const blocker = deferred<void>();
+    const activeOperation = queue.run(async () => blocker.promise);
+    const tab: {
+      generation: number;
+      privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+      queue: InstanceType<typeof BrowserActionQueue>;
+      shell: { id: string; conversationId: string; discarded: boolean; sensitive: boolean };
+      view: typeof view | null;
+    } = {
+      generation: 3,
+      privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'guard-1' },
+      queue,
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, sensitive: false },
+      view,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.privateNetworkNewDocumentGuard = undefined;
+      target.view = null;
+    });
+    const emitTabs = vi.fn();
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      browserEnabled: true,
+      dataScope: 'global',
+      destroyView,
+      emitTabs,
+      mountedConversationId: null,
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const transition = manager.handleConfigChanged({
+      dataScope: 'global',
+      enabled: true,
+      readAccess: 'allow',
+      structuredActions: 'allow',
+      scriptInjection: 'allow',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: true,
+    } as never);
+    await Promise.resolve();
+    expect(destroyView).not.toHaveBeenCalled();
+
+    blocker.resolve();
+    await activeOperation;
+    await expect(transition).resolves.toEqual({ committed: true });
+
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(true);
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(tab.generation).toBe(4);
+    expect(tab.shell.discarded).toBe(true);
+    expect(emitTabs).toHaveBeenCalledWith('chat-1');
+  });
+
+  it('waits for an in-flight private-network guard install before committing relaxed access', async () => {
+    const guardCommand = deferred<{ identifier: string }>();
+    const frame = {
+      detached: false,
+      frameTreeNodeId: 1,
+      framesInSubtree: [] as unknown[],
+      isDestroyed: () => false,
+      executeJavaScript: vi.fn(async () => true),
+    };
+    const contents = {
+      id: 42,
+      debugger: { sendCommand: vi.fn(() => guardCommand.promise) },
+      getURL: () => 'https://example.com',
+      isDestroyed: () => false,
+      mainFrame: frame,
+      setWebRTCIPHandlingPolicy: vi.fn(),
+    };
+    const view = { webContents: contents };
+    const queue = new BrowserActionQueue();
+    const tab: {
+      generation: number;
+      privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+      queue: InstanceType<typeof BrowserActionQueue>;
+      shell: { id: string; conversationId: string; discarded: boolean; sensitive: boolean };
+      view: typeof view | null;
+    } = {
+      generation: 3,
+      queue,
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, sensitive: false },
+      view,
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.privateNetworkNewDocumentGuard = undefined;
+      target.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => vi.fn(),
+      aiAllowPrivateNetwork: false,
+      browserEnabled: true,
+      dataScope: 'global',
+      destroyView,
+      emitTabs: vi.fn(),
+      mountedConversationId: null,
+      runRendererOperationWithDeadline: (
+        _tab: unknown,
+        _contents: unknown,
+        _label: string,
+        _timeout: number,
+        operation: () => Promise<void>,
+      ) => operation(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const installation = queue.run(
+      () => invokePrivate(manager, 'installPrivateNetworkNewDocumentGuard', tab, contents) as Promise<void>,
+    );
+    await vi.waitFor(() => expect(tab.privateNetworkNewDocumentGuard).toBeDefined());
+
+    const transition = manager.handleConfigChanged({
+      dataScope: 'global',
+      enabled: true,
+      readAccess: 'allow',
+      structuredActions: 'allow',
+      scriptInjection: 'allow',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: true,
+    } as never);
+    await Promise.resolve();
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
+    expect(destroyView).not.toHaveBeenCalled();
+
+    guardCommand.resolve({ identifier: 'guard-1' });
+    await installation;
+    await expect(transition).resolves.toEqual({ committed: true });
+
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(true);
+  });
+
+  it('does not publish private-network access when a loosening transition fails', async () => {
+    const contents = { isDestroyed: () => false, setWebRTCIPHandlingPolicy: vi.fn() };
+    const tab = {
+      generation: 3,
+      privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'guard-1' },
+      queue: new BrowserActionQueue(),
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, sensitive: false },
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      browserEnabled: true,
+      dataScope: 'global',
+      destroyView: vi.fn(() => {
+        throw new Error('renderer teardown failed');
+      }),
+      emitTabs: vi.fn(),
+      mountedConversationId: null,
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const transition = manager.handleConfigChanged({
+      dataScope: 'global',
+      enabled: true,
+      readAccess: 'allow',
+      structuredActions: 'allow',
+      scriptInjection: 'allow',
+      passwordAccess: 'user-only',
+      aiAllowPrivateNetwork: true,
+    } as never);
+
+    await expect(transition).rejects.toThrow(/renderer teardown failed/i);
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
+  });
+
   it('publishes private-network tightening before a queued profile transition can admit a new scope', async () => {
     const queuedMutation = deferred<void>();
     const applyBrowserConfig = vi.fn(async () => undefined);
@@ -10326,6 +19605,76 @@ describe('browser manager renderer lifecycle', () => {
     await expect(staleAllow).resolves.toEqual({ committed: false });
     await expect(latestDeny).resolves.toEqual({ committed: true });
 
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
+  });
+
+  it('does not republish a stale private-network allow after a newer deny preempts its tab wait', async () => {
+    const queue = new BrowserActionQueue();
+    const blocker = deferred<void>();
+    const activeOperation = queue.run(async () => blocker.promise);
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      setWebRTCIPHandlingPolicy: vi.fn(),
+    };
+    const tab: {
+      aiNetworkRestricted: boolean;
+      generation: number;
+      privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+      queue: InstanceType<typeof BrowserActionQueue>;
+      scopeKey: string;
+      shell: { id: string; conversationId: string; discarded: boolean; sensitive: boolean };
+      trustedUserNavigation: boolean;
+      view: { webContents: typeof contents } | null;
+    } = {
+      aiNetworkRestricted: true,
+      generation: 3,
+      privateNetworkNewDocumentGuard: { contentsId: 42, identifier: 'guard-1' },
+      queue,
+      scopeKey: 'global',
+      shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false, sensitive: false },
+      trustedUserNavigation: false,
+      view: { webContents: contents },
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.privateNetworkNewDocumentGuard = undefined;
+      target.view = null;
+    });
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: false,
+      browserEnabled: true,
+      cancelActiveDownloadsForScopes: vi.fn(async () => undefined),
+      dataScope: 'global',
+      destroyView,
+      emitTabs: vi.fn(),
+      mountedConversationId: null,
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      tabs: new Map([['tab-1', tab]]),
+      wiredSessionsByScope: new Map([['global', { closeAllConnections: vi.fn(async () => undefined) }]]),
+    });
+    const config = (aiAllowPrivateNetwork: boolean) =>
+      ({
+        dataScope: 'global',
+        enabled: true,
+        readAccess: 'allow',
+        structuredActions: 'allow',
+        scriptInjection: 'allow',
+        passwordAccess: 'user-only',
+        aiAllowPrivateNetwork,
+      }) as never;
+
+    const queueRun = vi.spyOn(queue, 'run');
+    const staleAllow = manager.handleConfigChanged(config(true));
+    await vi.waitFor(() => expect(queueRun).toHaveBeenCalled());
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
+
+    const latestDeny = manager.handleConfigChanged(config(false));
+    expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
+
+    blocker.resolve();
+    await activeOperation;
+    await expect(staleAllow).resolves.toEqual({ committed: false });
+    await expect(latestDeny).resolves.toEqual({ committed: true });
     expect(Reflect.get(manager, 'aiAllowPrivateNetwork')).toBe(false);
   });
 
@@ -10722,11 +20071,13 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('keeps Browser request guards and views alive until shutdown network drains complete', async () => {
+  it('reclaims a pending menu capture while keeping Browser request guards until shutdown drains complete', async () => {
     const workerStop = deferred<void>();
     const connectionDrain = deferred<void>();
     const cleanupSession = vi.fn();
-    const destroyView = vi.fn();
+    const destroyView = vi.fn((tab: { view: unknown }) => {
+      tab.view = null;
+    });
     const stopRunningServiceWorkers = vi.fn(() => workerStop.promise);
     const contents = { id: 42 };
     const scopedSession = {
@@ -10749,22 +20100,87 @@ describe('browser manager renderer lifecycle', () => {
       view: { webContents: contents },
       queue: { whenIdle: vi.fn(async () => undefined) },
     });
+    const screenshotRelease = deferred<void>();
+    const screenshotCapture = (Reflect.get(manager, 'screenshotQueue') as InstanceType<typeof BrowserActionQueue>).run(
+      async () => screenshotRelease.promise,
+    );
+    const menuPreviewController = new AbortController();
+    const menuPreviewTeardownController = new AbortController();
+    const menuPreviewCompletion = new Promise<void>((resolve) => {
+      menuPreviewTeardownController.signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+    Reflect.set(manager, 'menuPreviewCapture', {
+      key: 'preview-1',
+      tabId: 'tab-1',
+      contentsId: 42,
+      scopeKey: 'global',
+      controller: menuPreviewController,
+      teardownController: menuPreviewTeardownController,
+      subscribers: new Map(),
+      operation: null,
+      completion: menuPreviewCompletion,
+    });
 
     const shutdown = manager.shutdown();
-    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledWith(scopedSession, contents, true));
+    await vi.waitFor(() => expect(stopRunningServiceWorkers).toHaveBeenCalledWith(scopedSession, undefined, true));
+    expect(menuPreviewController.signal.aborted).toBe(true);
     expect(scopedSession.closeAllConnections).toHaveBeenCalledOnce();
     expect(cleanupSession).not.toHaveBeenCalled();
-    expect(destroyView).not.toHaveBeenCalled();
+    expect(destroyView).toHaveBeenCalledOnce();
 
     workerStop.resolve();
     await Promise.resolve();
     expect(cleanupSession).not.toHaveBeenCalled();
-    expect(destroyView).not.toHaveBeenCalled();
 
     connectionDrain.resolve();
+    await Promise.resolve();
+    expect(cleanupSession).not.toHaveBeenCalled();
+
+    screenshotRelease.resolve();
+    await screenshotCapture;
     await shutdown;
     expect(cleanupSession).toHaveBeenCalledOnce();
-    expect(destroyView).toHaveBeenCalledOnce();
+    expect(destroyView).toHaveBeenCalledTimes(2);
+  });
+
+  it('drains tab work and destroys live views before removing Browser request guards during shutdown', async () => {
+    const queueDrain = deferred<void>();
+    const order: string[] = [];
+    const cleanupSession = vi.fn(() => order.push('cleanup-session'));
+    const destroyView = vi.fn((tab: { view: unknown }) => {
+      order.push('destroy-view');
+      tab.view = null;
+    });
+    const queueIdle = vi.fn(() => queueDrain.promise);
+    const scopedSession = {
+      closeAllConnections: vi.fn(async () => undefined),
+      serviceWorkers: { getAllRunning: () => ({}) },
+    };
+    const manager = new BrowserManager(
+      '/tmp/kai-browser-shutdown-queue-guard-test',
+      () => ({ browser: { dataScope: 'global', enabled: true } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    Reflect.set(manager, 'destroyView', destroyView);
+    Reflect.get(manager, 'wiredSessionsByScope').set('global', scopedSession);
+    Reflect.get(manager, 'wiredSessionCleanups').set('global', cleanupSession);
+    Reflect.get(manager, 'tabs').set('tab-1', {
+      scopeKey: 'global',
+      shell: { id: 'tab-1', conversationId: 'chat-1' },
+      view: { webContents: { id: 42 } },
+      queue: { whenIdle: queueIdle },
+    });
+
+    const shutdown = manager.shutdown();
+    await vi.waitFor(() => expect(queueIdle).toHaveBeenCalledOnce());
+    expect(cleanupSession).not.toHaveBeenCalled();
+    expect(destroyView).not.toHaveBeenCalled();
+
+    queueDrain.resolve();
+    await shutdown;
+
+    expect(order).toEqual(['destroy-view', 'cleanup-session']);
   });
 
   it.each([
@@ -10899,6 +20315,29 @@ describe('browser manager renderer lifecycle', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
     expect(flush).toHaveBeenCalledOnce();
+  });
+
+  it('joins startup download recovery before completing shutdown', async () => {
+    const appHome = mkdtempSync(join(tmpdir(), 'kai-browser-shutdown-startup-recovery-'));
+    const manager = new BrowserManager(
+      appHome,
+      () => ({ browser: { dataScope: 'global', enabled: true } }) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    await (Reflect.get(manager, 'startupDownloadReconciliation') as Promise<void>);
+    const startupRecovery = deferred<void>();
+    Reflect.set(manager, 'startupDownloadReconciliation', startupRecovery.promise);
+    Reflect.set(manager, 'profileMutationTail', Promise.resolve());
+
+    const shutdown = manager.shutdown();
+    await Promise.resolve();
+    expect(Reflect.get(manager, 'disposed')).toBe(false);
+
+    startupRecovery.resolve();
+    await shutdown;
+    expect(Reflect.get(manager, 'disposed')).toBe(true);
+    rmSync(appHome, { recursive: true, force: true });
   });
 
   it('disposes cached credential vaults during shutdown', async () => {
@@ -11042,19 +20481,1351 @@ describe('browser manager renderer lifecycle', () => {
     ).rejects.toThrow();
   });
 
+  it('accepts complete boolean-only menu sensitivity replies from every exact live frame', async () => {
+    const manager = managerWithoutConstructor({});
+    const frame = {
+      detached: false,
+      frameTreeNodeId: 7,
+      frameToken: 'frame-token-1',
+      isDestroyed: () => false,
+      processId: 101,
+      routingId: 202,
+      send: vi.fn((_channel: string, payload: { token: string }) => {
+        queueMicrotask(() => {
+          const pending = Reflect.get(manager, 'pendingMenuSensitivityProbes').get(payload.token);
+          pending.responses.set(7, { sensitive: false, complete: true });
+          pending.settle();
+        });
+      }),
+    };
+    const contents = {
+      id: 42,
+      isDestroyed: () => false,
+      mainFrame: { framesInSubtree: [frame] },
+    };
+    const tab = { shell: { id: 'tab-1', sensitive: false }, view: { webContents: contents } };
+
+    await expect(
+      invokePrivate(manager, 'probeMenuPreviewSensitivity', tab, contents, new AbortController().signal),
+    ).resolves.toEqual({ sensitive: false, complete: true });
+    expect(frame.send).toHaveBeenCalledWith('browser-page:probe-sensitive', { token: expect.any(String) });
+  });
+
+  it('fails a menu sensitivity probe closed on missing or frame-raced replies without destroying the renderer', async () => {
+    vi.useFakeTimers();
+    try {
+      const destroyView = vi.fn();
+      const manager = managerWithoutConstructor({ destroyView });
+      const frame = {
+        detached: false,
+        frameTreeNodeId: 7,
+        frameToken: 'frame-token-1',
+        isDestroyed: () => false,
+        processId: 101,
+        routingId: 202,
+        send: vi.fn(),
+      };
+      const contents = {
+        id: 42,
+        isDestroyed: () => false,
+        mainFrame: { framesInSubtree: [frame] },
+      };
+      const tab = { shell: { id: 'tab-1', sensitive: false }, view: { webContents: contents } };
+      const missing = invokePrivate(
+        manager,
+        'probeMenuPreviewSensitivity',
+        tab,
+        contents,
+        new AbortController().signal,
+      ) as Promise<{ sensitive: boolean; complete: boolean }>;
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(missing).resolves.toEqual({ sensitive: false, complete: false });
+
+      frame.send.mockImplementation((_channel: string, payload: { token: string }) => {
+        queueMicrotask(() => {
+          const pending = Reflect.get(manager, 'pendingMenuSensitivityProbes').get(payload.token);
+          pending.responses.set(7, { sensitive: false, complete: true });
+          frame.frameToken = 'replacement-frame-token';
+          pending.settle();
+        });
+      });
+      await expect(
+        invokePrivate(manager, 'probeMenuPreviewSensitivity', tab, contents, new AbortController().signal),
+      ).resolves.toEqual({ sensitive: false, complete: false });
+      expect(destroyView).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('captures menu preview pixels through the production CDP viewport helper', async () => {
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0];
+      if (command === 'Page.getLayoutMetrics') {
+        return {
+          cssContentSize: { width: 800, height: 600 },
+          contentSize: { width: 1_600, height: 1_200 },
+          cssVisualViewport: { pageX: 12, pageY: 34, clientWidth: 800, clientHeight: 600 },
+        };
+      }
+      if (command === 'Page.captureScreenshot') {
+        return { data: Buffer.from('cdp-menu-preview').toString('base64') };
+      }
+      throw new Error(`Unexpected debugger command: ${command}`);
+    });
+    const contents = { debugger: debuggerApi, id: 42, isDestroyed: () => false };
+    const active = { teardownController: new AbortController() };
+    const manager = managerWithoutConstructor({});
+    Reflect.deleteProperty(manager, 'captureMenuPreviewImage');
+
+    await expect(
+      invokePrivate(manager, 'captureMenuPreviewImage', active, contents, new AbortController().signal),
+    ).resolves.toMatchObject({ isEmpty: expect.any(Function), toPNG: expect.any(Function) });
+
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      fromSurface: true,
+      optimizeForSpeed: true,
+      clip: { x: 12, y: 34, width: 800, height: 600, scale: 0.5 },
+    });
+    expect(debuggerApi.attach).toHaveBeenCalledWith('1.3');
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+  });
+
+  it('detaches a manager-owned CDP menu capture promptly when cancellation wedges its command', async () => {
+    const captureStarted = deferred<void>();
+    const wedgedCapture = deferred<{ data: string }>();
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0];
+      if (command === 'Page.getLayoutMetrics') {
+        return {
+          cssContentSize: { width: 400, height: 300 },
+          contentSize: { width: 400, height: 300 },
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 400, clientHeight: 300 },
+        };
+      }
+      if (command === 'Page.captureScreenshot') {
+        captureStarted.resolve();
+        return wedgedCapture.promise;
+      }
+      throw new Error(`Unexpected debugger command: ${command}`);
+    });
+    const contents = { debugger: debuggerApi, id: 42, isDestroyed: () => false };
+    const active = { teardownController: new AbortController() };
+    const controller = new AbortController();
+    const manager = managerWithoutConstructor({});
+    Reflect.deleteProperty(manager, 'captureMenuPreviewImage');
+
+    const capture = invokePrivate(
+      manager,
+      'captureMenuPreviewImage',
+      active,
+      contents,
+      controller.signal,
+    ) as Promise<unknown>;
+    await captureStarted.promise;
+    controller.abort();
+
+    await expect(capture).rejects.toThrow(/cancelled/i);
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    expect(debuggerApi.isAttached()).toBe(false);
+
+    wedgedCapture.resolve({ data: Buffer.from('late-menu-preview').toString('base64') });
+  });
+
+  it('withholds menu-preview pixels for parser-created declarative closed shadow roots', async () => {
+    let attached = false;
+    const sendCommand = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'DOM.performSearch' && params?.query === '*') {
+        return { searchId: 'document-search', resultCount: 2 };
+      }
+      if (method === 'DOM.getFlattenedDocument') {
+        return { nodes: [{ nodeName: '#document' }, { nodeName: '#document-fragment', shadowRootType: 'closed' }] };
+      }
+      return {};
+    });
+    const capturePage = vi.fn();
+    const contents = {
+      id: 42,
+      capturePage,
+      debugger: {
+        attach: vi.fn(() => {
+          attached = true;
+        }),
+        detach: vi.fn(() => {
+          attached = false;
+        }),
+        isAttached: () => attached,
+        sendCommand,
+      },
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 1,
+      queue: new BrowserActionQueue(),
+      scopeKey: 'global',
+      trustedUserNavigationLease: 0,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+      viewLoadPromise: null,
+    };
+    let manager!: InstanceType<typeof BrowserManager>;
+    manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      hasPopulatedPasswordFieldViaCdp: (target: unknown) =>
+        invokePrivate(manager, 'hasPopulatedPasswordFieldViaCdp', target),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', tab.shell.id)).rejects.toThrow(/password data/i);
+    expect(capturePage).not.toHaveBeenCalled();
+    expect(tab.shell.sensitive).toBe(true);
+    expect(sendCommand).toHaveBeenCalledWith('DOM.getFlattenedDocument', expect.objectContaining({ pierce: true }));
+  });
+
+  it('keeps the renderer live while validating menu-preview sensitivity before and after capture', async () => {
+    const events: string[] = [];
+    const toPNG = vi.fn(() => Buffer.from('menu-preview'));
+    const contents = {
+      id: 42,
+      capturePage: vi.fn(async () => {
+        events.push('capture');
+        return { getSize: () => ({ width: 400, height: 300 }), toPNG };
+      }),
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    let scan = 0;
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      hasPopulatedPasswordFieldViaCdp: vi.fn(async () => {
+        events.push(`scan-${++scan}`);
+        return false;
+      }),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', tab.shell.id)).resolves.toMatchObject({
+      tabId: tab.shell.id,
+      width: 400,
+      height: 300,
+    });
+
+    expect(events).toEqual(['scan-1', 'capture', 'scan-2']);
+    expect(toPNG).toHaveBeenCalledOnce();
+  });
+
+  it('preempts a wedged post-capture scan without holding ordinary tab work', async () => {
+    const postCaptureScan = deferred<boolean>();
+    const events: string[] = [];
+    const capturePage = vi.fn(async () => ({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('menu-preview'),
+    }));
+    const contents = { id: 42, capturePage, isDestroyed: () => false };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    let scan = 0;
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      destroyView,
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      hasPopulatedPasswordFieldViaCdp: vi.fn(async () => {
+        events.push(`scan-${++scan}`);
+        return scan === 2 ? postCaptureScan.promise : false;
+      }),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'wedged-cdp-preview');
+    const previewRejection = expect(preview).rejects.toThrow(/preempted by Browser work/i);
+    await vi.waitFor(() => expect(events).toContain('scan-2'));
+    const ordinaryStarted = vi.fn();
+    const ordinaryWork = tab.queue.run(async () => {
+      ordinaryStarted();
+      return 'ordinary work';
+    });
+
+    await vi.waitFor(() => expect(ordinaryStarted).toHaveBeenCalledOnce());
+    await expect(ordinaryWork).resolves.toBe('ordinary work');
+    await previewRejection;
+    expect(capturePage).toHaveBeenCalledOnce();
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view).not.toBeNull();
+
+    postCaptureScan.resolve(false);
+    expect(Reflect.get(manager, 'hasPopulatedPasswordFieldViaCdp')).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+  });
+
+  it.each([1, 2])(
+    'bounds menu-preview CDP sensitivity scan %i and promptly releases the global slot',
+    async (blockedScan) => {
+      vi.useFakeTimers();
+      try {
+        const blocked = deferred<boolean>();
+        let scan = 0;
+        const contents = {
+          id: 42,
+          capturePage: vi.fn(async () => ({
+            getSize: () => ({ width: 400, height: 300 }),
+            toPNG: () => Buffer.from('menu-preview'),
+          })),
+          isDestroyed: () => false,
+        };
+        const tab = {
+          shell: {
+            id: 'tab-1',
+            conversationId: 'chat-1',
+            url: 'https://example.com',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+            sensitive: false,
+            discarded: false,
+            loading: false,
+            error: undefined as string | undefined,
+          },
+          generation: 2,
+          trustedUserNavigationLease: 0,
+          queue: new BrowserActionQueue(),
+          scopeKey: 'global',
+          viewLoadPromise: null,
+          view: {
+            getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+            webContents: contents,
+          } as {
+            getBounds: () => { x: number; y: number; width: number; height: number };
+            webContents: typeof contents;
+          } | null,
+        };
+        const destroyView = vi.fn((target: typeof tab) => {
+          target.view = null;
+        });
+        const hasPopulatedPasswordFieldViaCdp = vi.fn(async () => {
+          scan += 1;
+          return scan === blockedScan ? blocked.promise : false;
+        });
+        const manager = managerWithoutConstructor({
+          assertBrowserPageLease: vi.fn(),
+          attachedView: null,
+          captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+          destroyView,
+          emit: vi.fn(),
+          emitTabs: vi.fn(),
+          hasPopulatedPasswordFieldViaCdp,
+          isHostWindowShown: () => false,
+          requireTab: () => tab,
+          tabs: new Map([[tab.shell.id, tab]]),
+        });
+
+        const preview = manager.captureMenuPreview('chat-1', tab.shell.id, `blocked-scan-${blockedScan}`);
+        const rejection = expect(preview).rejects.toThrow(/menu preview|sensitivity could not be verified/i);
+        await vi.waitFor(() => expect(hasPopulatedPasswordFieldViaCdp).toHaveBeenCalledTimes(blockedScan));
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        await rejection;
+        expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+        await expect(manager.captureMenuPreview('chat-1', tab.shell.id, 'replacement-preview')).resolves.toMatchObject({
+          tabId: tab.shell.id,
+        });
+
+        expect(destroyView).not.toHaveBeenCalled();
+        expect(tab.view).not.toBeNull();
+        expect(tab.shell.discarded).toBe(false);
+
+        blocked.resolve(false);
+        await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('holds the shared image allocator while a post-capture sensitivity scan drains', async () => {
+    const postCaptureScan = deferred<boolean>();
+    let scan = 0;
+    const toPNG = vi.fn(() => Buffer.from('must-not-encode-after-preemption'));
+    const contents = {
+      id: 42,
+      capturePage: vi.fn(async () => ({ getSize: () => ({ width: 400, height: 300 }), toPNG })),
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const screenshotQueue = new BrowserActionQueue();
+    const hasPopulatedPasswordFieldViaCdp = vi.fn(async () => {
+      scan += 1;
+      return scan === 2 ? postCaptureScan.promise : false;
+    });
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      destroyView,
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      hasPopulatedPasswordFieldViaCdp,
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      screenshotQueue,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'post-scan-preview');
+    await vi.waitFor(() => expect(hasPopulatedPasswordFieldViaCdp).toHaveBeenCalledTimes(2));
+    const screenshotStarted = vi.fn();
+    const screenshot = screenshotQueue.run(async () => {
+      screenshotStarted();
+      return 'screenshot';
+    });
+
+    await expect(preview).rejects.toThrow(/preempted by screenshot work/i);
+    await vi.waitFor(() => expect(screenshotStarted).toHaveBeenCalledOnce());
+    await expect(screenshot).resolves.toBe('screenshot');
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view).not.toBeNull();
+    expect(toPNG).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+    postCaptureScan.resolve(false);
+  });
+
+  it('withholds menu-preview pixels when password data appears during native capture', async () => {
+    let scan = 0;
+    const toPNG = vi.fn(() => Buffer.from('must-not-escape'));
+    const contents = {
+      id: 42,
+      capturePage: vi.fn(async () => ({ getSize: () => ({ width: 400, height: 300 }), toPNG })),
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      hasPopulatedPasswordFieldViaCdp: vi.fn(async () => ++scan === 2),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', tab.shell.id)).rejects.toThrow(/password data/i);
+
+    expect(tab.shell.sensitive).toBe(true);
+    expect(toPNG).not.toHaveBeenCalled();
+  });
+
+  it('does not recreate a live renderer after a menu preview', async () => {
+    const contents = {
+      id: 42,
+      capturePage: vi.fn(async () => ({
+        getSize: () => ({ width: 400, height: 300 }),
+        toPNG: () => Buffer.from('menu-preview'),
+      })),
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+        discarded: false,
+      },
+      generation: 2,
+      scopeKey: 'global',
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      viewLoadPromise: null,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const ensureView = vi.fn();
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      destroyView,
+      emitTabs: vi.fn(),
+      ensureView,
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', tab.shell.id)).resolves.toMatchObject({ tabId: 'tab-1' });
+
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(ensureView).not.toHaveBeenCalled();
+    expect(tab.shell.discarded).toBe(false);
+    expect(tab.view?.webContents).toBe(contents);
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+  });
+
+  it('never issues page lifecycle transitions for a menu preview', async () => {
+    vi.useFakeTimers();
+    try {
+      const hungThaw = deferred<object>();
+      const browserDebugger = browserDebuggerMock();
+      let activeAttempts = 0;
+      browserDebugger.sendCommand.mockImplementation(async (...args: unknown[]) => {
+        const [method, rawParams] = args;
+        const params = rawParams && typeof rawParams === 'object' ? (rawParams as { state?: unknown }) : undefined;
+        if (method === 'Page.setWebLifecycleState' && params?.state === 'active' && ++activeAttempts === 1) {
+          return hungThaw.promise;
+        }
+        return {};
+      });
+      const contents = {
+        id: 42,
+        capturePage: vi.fn(async () => ({
+          getSize: () => ({ width: 400, height: 300 }),
+          toPNG: () => Buffer.from('menu-preview'),
+        })),
+        debugger: browserDebugger,
+        isDestroyed: () => false,
+      };
+      const tab = {
+        shell: {
+          id: 'tab-1',
+          conversationId: 'chat-1',
+          url: 'https://example.com',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+          sensitive: false,
+          discarded: false,
+        },
+        generation: 2,
+        scopeKey: 'global',
+        trustedUserNavigationLease: 0,
+        queue: new BrowserActionQueue(),
+        viewLoadPromise: null,
+        view: {
+          getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+          webContents: contents,
+        },
+      };
+      const replacementView = {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: { id: 43, isDestroyed: () => false },
+      };
+      const destroyView = vi.fn((target: typeof tab) => {
+        const active = Reflect.get(manager, 'menuPreviewCapture') as { teardownController: AbortController } | null;
+        active?.teardownController.abort();
+        target.view = null as never;
+      });
+      const ensureView = vi.fn(async (target: typeof tab) => {
+        target.view = replacementView as never;
+        target.shell.discarded = false;
+        return replacementView;
+      });
+      let manager!: InstanceType<typeof BrowserManager>;
+      manager = managerWithoutConstructor({
+        assertBrowserPageLease: vi.fn(),
+        attachedView: null,
+        captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+        destroyView,
+        emitTabs: vi.fn(),
+        ensureView,
+        hasPopulatedPasswordFieldViaCdp: vi.fn(async () => false),
+        isHostWindowShown: () => false,
+        requireTab: () => tab,
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+
+      const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'hung-thaw-preview');
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(preview).resolves.toMatchObject({ tabId: tab.shell.id });
+      await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+      expect(activeAttempts).toBe(0);
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(ensureView).not.toHaveBeenCalled();
+      expect(tab.view.webContents).toBe(contents);
+
+      const ordinaryWork = vi.fn(async () => 'ordinary work');
+      await expect(invokePrivate(manager, 'runTabOperation', tab, ordinaryWork) as Promise<string>).resolves.toBe(
+        'ordinary work',
+      );
+      expect(activeAttempts).toBe(0);
+      expect(ordinaryWork).toHaveBeenCalledOnce();
+
+      hungThaw.resolve({});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tab.view.webContents).toBe(contents);
+      expect(activeAttempts).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces same-page menu previews without claiming the AI screenshot queue', async () => {
+    const firstTabId = '00000000-0000-4000-8000-000000000001';
+    const secondTabId = '00000000-0000-4000-8000-000000000002';
+    const capture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const capturePage = vi.fn(() => capture.promise);
+    let contentsId = 0;
+    const makeTab = (id: string) => ({
+      shell: { id, conversationId: 'chat-1', sensitive: false },
+      queue: new BrowserActionQueue(),
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: { id: ++contentsId, capturePage, isDestroyed: () => false },
+      },
+    });
+    const firstTab = makeTab(firstTabId);
+    const secondTab = makeTab(secondTabId);
+    const tabs = new Map([
+      [firstTabId, firstTab],
+      [secondTabId, secondTab],
+    ]);
+    let sensitivitySignal: AbortSignal | undefined;
+    const probeMenuPreviewSensitivity = vi.fn(async (...args: unknown[]) => {
+      sensitivitySignal = args[2] as AbortSignal | undefined;
+      return { sensitive: false, complete: true };
+    });
+    const hasPopulatedPasswordFieldViaCdp = vi.fn(async () => false);
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      probeMenuPreviewSensitivity,
+      hasPopulatedPasswordFieldViaCdp,
+      attachedView: null,
+      browserPageLeaseToken: (lease: { tabId: string }) => lease.tabId,
+      captureBrowserPageLease: (tab: typeof firstTab) => ({ tabId: tab.shell.id }),
+      ensureView: async (tab: typeof firstTab) => tab.view,
+      isHostWindowShown: () => false,
+      requireTab: (_conversationId: string, tabId: string) => tabs.get(tabId)!,
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      screenshotQueue: new BrowserActionQueue(),
+    });
+
+    const first = manager.captureMenuPreview('chat-1', firstTabId, 'first-preview');
+    const duplicate = manager.captureMenuPreview('chat-1', firstTabId, 'second-preview');
+    await vi.waitFor(() => expect(capturePage).toHaveBeenCalledOnce());
+
+    expect(capturePage).toHaveBeenCalledWith();
+    await expect(manager.captureMenuPreview('chat-1', secondTabId)).rejects.toThrow(/another browser menu preview/i);
+    manager.cancelMenuPreview('first-preview');
+    await expect(first).rejects.toThrow(/cancelled/i);
+    expect(sensitivitySignal).toBeInstanceOf(AbortSignal);
+    expect(sensitivitySignal?.aborted).toBe(false);
+
+    capture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('menu-preview'),
+    });
+    await expect(duplicate).resolves.toEqual(expect.objectContaining({ tabId: firstTabId, width: 400, height: 300 }));
+    expect(probeMenuPreviewSensitivity).toHaveBeenCalledTimes(2);
+    expect(hasPopulatedPasswordFieldViaCdp).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails fast instead of restoring a discarded page for a menu preview', async () => {
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      view: null,
+      viewLoadPromise: null,
+    };
+    const ensureView = vi.fn();
+    const manager = managerWithoutConstructor({ ensureView, requireTab: () => tab });
+
+    await expect(manager.captureMenuPreview('chat-1', 'tab-1')).rejects.toThrow(/loading or discarded/i);
+    expect(ensureView).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+  });
+
+  it('fails fast instead of capturing a page during ordinary navigation', async () => {
+    const capturePage = vi.fn();
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        loading: true,
+        sensitive: false,
+      },
+      view: {
+        webContents: { id: 42, capturePage, isDestroyed: () => false },
+      },
+      viewLoadPromise: null,
+    };
+    const manager = managerWithoutConstructor({ requireTab: () => tab });
+
+    await expect(manager.captureMenuPreview('chat-1', 'tab-1')).rejects.toThrow(/page is loading/i);
+    expect(capturePage).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+  });
+
+  it('releases the global menu-preview slot once its native target has closed', async () => {
+    const firstCapture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const firstCapturePage = vi.fn(() => firstCapture.promise);
+    const secondCapturePage = vi.fn(async () => ({
+      getSize: () => ({ width: 320, height: 200 }),
+      toPNG: () => Buffer.from('second-preview'),
+    }));
+    const firstListeners = new Map<string, (...args: unknown[]) => void>();
+    const makeTab = (
+      id: string,
+      contentsId: number,
+      capturePage: typeof firstCapturePage,
+      listeners?: Map<string, (...args: unknown[]) => void>,
+    ) => ({
+      shell: { id, conversationId: 'chat-1', sensitive: false },
+      scopeKey: 'global',
+      queue: new BrowserActionQueue(),
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 320, height: 200 }),
+        webContents: {
+          id: contentsId,
+          capturePage,
+          isDestroyed: () => false,
+          on: (event: string, listener: (...args: unknown[]) => void) => listeners?.set(event, listener),
+          setWindowOpenHandler: vi.fn(),
+        },
+      },
+    });
+    const firstTab = makeTab('tab-1', 41, firstCapturePage, firstListeners);
+    const secondTab = makeTab('tab-2', 42, secondCapturePage as typeof firstCapturePage);
+    const tabs = new Map([
+      ['tab-1', firstTab],
+      ['tab-2', secondTab],
+    ]);
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: (tab: typeof firstTab) => ({ tabId: tab.shell.id }),
+      emitTabs: vi.fn(),
+      isHostWindowShown: () => false,
+      requireTab: (_conversationId: string, tabId: string) => tabs.get(tabId)!,
+      tabs,
+      webContentsToTab: new Map([[41, 'tab-1']]),
+    });
+
+    invokePrivate(manager, 'wireWebContents', firstTab, firstTab.view.webContents);
+    const pending = manager.captureMenuPreview('chat-1', 'tab-1', 'closing-preview');
+    await vi.waitFor(() => expect(firstCapturePage).toHaveBeenCalledOnce());
+    firstListeners.get('destroyed')?.();
+    await expect(pending).rejects.toThrow(/page closed/i);
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+    await expect(manager.captureMenuPreview('chat-1', 'tab-2')).resolves.toMatchObject({ tabId: 'tab-2' });
+    expect(secondCapturePage).toHaveBeenCalledOnce();
+
+    firstCapture.resolve({
+      getSize: () => ({ width: 320, height: 200 }),
+      toPNG: () => Buffer.from('late-preview'),
+    });
+  });
+
+  it('captures the complete viewport before scaling a menu preview', async () => {
+    const resizedImage = {
+      getSize: () => ({ width: 1_024, height: 512 }),
+      toPNG: () => Buffer.from('scaled-menu-preview'),
+    };
+    const resize = vi.fn(() => resizedImage);
+    const capturePage = vi.fn(async () => ({
+      getSize: () => ({ width: 2_000, height: 1_000 }),
+      resize,
+      toPNG: () => Buffer.from('unscaled-menu-preview'),
+    }));
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', sensitive: false },
+      scopeKey: 'global',
+      queue: new BrowserActionQueue(),
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 2_000, height: 1_000 }),
+        webContents: { id: 42, capturePage, isDestroyed: () => false },
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserMenuPreviewIdentity: vi.fn(),
+      assertBrowserPageLease: vi.fn(),
+      assertMenuPreviewNotSensitive: vi.fn(async () => undefined),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', 'tab-1')).resolves.toMatchObject({
+      tabId: 'tab-1',
+      width: 1_024,
+      height: 512,
+    });
+    expect(capturePage).toHaveBeenCalledWith();
+    expect(resize).toHaveBeenCalledWith({ width: 1_024, height: 512, quality: 'good' });
+  });
+
+  it('rejects a menu preview captured across same-document page identity changes', async () => {
+    const capture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const capturePage = vi.fn(() => capture.promise);
+    const contents = { id: 42, capturePage, isDestroyed: () => false };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com/start',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      queue: new BrowserActionQueue(),
+      trustedUserNavigationLease: 0,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+      ensureView: async () => tab.view,
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+    });
+
+    const pending = manager.captureMenuPreview('chat-1', 'tab-1');
+    await vi.waitFor(() => expect(capturePage).toHaveBeenCalledOnce());
+    tab.shell.url = 'https://example.com/next#section';
+    tab.shell.updatedAt = '2026-01-01T00:00:01.000Z';
+    await expect(manager.captureMenuPreview('chat-1', 'tab-1')).rejects.toThrow(/another browser menu preview/i);
+
+    capture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('stale-preview'),
+    });
+    await expect(pending).rejects.toThrow(/page changed/i);
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+  });
+
+  it('preserves a cancelled menu capture target while releasing headless screenshot capacity', async () => {
+    const pendingCapture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const image = {
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('menu-preview'),
+    };
+    const capturePage = vi
+      .fn()
+      .mockImplementationOnce(() => pendingCapture.promise)
+      .mockImplementation(async () => image);
+    const debuggerMock = browserDebuggerMock();
+    const captureScreenshot = vi.fn(async () => ({ data: image.toPNG().toString('base64') }));
+    debuggerMock.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0];
+      if (command === 'Page.getLayoutMetrics') {
+        return {
+          cssContentSize: { width: 400, height: 300 },
+          contentSize: { width: 400, height: 300 },
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 400, clientHeight: 300 },
+        };
+      }
+      if (command === 'Page.captureScreenshot') return captureScreenshot();
+      return {};
+    });
+    const contents = { id: 42, capturePage, debugger: debuggerMock, isDestroyed: () => false };
+    const tabQueue = new BrowserActionQueue();
+    const tab = {
+      shell: {
+        id: '00000000-0000-4000-8000-000000000001',
+        conversationId: 'chat-1',
+        sensitive: false,
+      },
+      scopeKey: 'global',
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+      queue: tabQueue,
+    };
+    const screenshotQueue = new BrowserActionQueue();
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const ensureView = vi.fn(async () => tab.view);
+    let sensitivitySignal: AbortSignal | undefined;
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async (...args: unknown[]) => {
+        sensitivitySignal = args[3] as AbortSignal | undefined;
+      }),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      destroyView,
+      ensureView,
+      hideAutomationOverlay: vi.fn(async () => null),
+      isBrowserPageLeaseCurrent: () => true,
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      restoreAutomationOverlay: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      screenshotQueue,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'preview-request');
+    await vi.waitFor(() => expect(capturePage).toHaveBeenCalledOnce());
+    const activePreview = Reflect.get(manager, 'menuPreviewCapture') as { controller: AbortController };
+    manager.cancelMenuPreview('preview-request');
+    await expect(preview).rejects.toThrow(/cancelled/i);
+    expect(activePreview.controller.signal.aborted).toBe(true);
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(sensitivitySignal).toBeUndefined();
+    await expect(manager.captureMenuPreview('chat-1', tab.shell.id, 'reopened-preview')).resolves.toMatchObject({
+      tabId: tab.shell.id,
+    });
+
+    await expect(manager.screenshot('chat-1', { tabId: tab.shell.id, mode: 'viewport' })).resolves.toMatchObject({
+      tabId: tab.shell.id,
+      mode: 'viewport',
+      width: 400,
+      height: 300,
+    });
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(ensureView).toHaveBeenCalled();
+    expect(tab.view.webContents).toBe(contents);
+    pendingCapture.resolve(image);
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+    await expect(manager.screenshot('chat-1', { tabId: tab.shell.id, mode: 'viewport' })).resolves.toMatchObject({
+      tabId: tab.shell.id,
+      mode: 'viewport',
+    });
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view.webContents).toBe(contents);
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+    expect(capturePage).toHaveBeenCalledTimes(2);
+    expect(captureScreenshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('preempts a menu preview before newly started AI tab work runs', async () => {
+    const capture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const capturePage = vi.fn(() => capture.promise);
+    const queue = new BrowserActionQueue();
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      trustedUserNavigationLease: 0,
+      queue,
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: { id: 42, capturePage, isDestroyed: () => false },
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      destroyView: vi.fn((target: typeof tab) => {
+        target.view = null as never;
+      }),
+      emitTabs: vi.fn(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', 'tab-1');
+    await vi.waitFor(() => expect(capturePage).toHaveBeenCalledOnce());
+    const aiStarted = deferred<void>();
+    const releaseAi = deferred<void>();
+    const aiWork = queue.run(async () => {
+      aiStarted.resolve();
+      return releaseAi.promise;
+    });
+    await aiStarted.promise;
+
+    await expect(preview).rejects.toThrow(/preempted by Browser work/i);
+    expect(Reflect.get(manager, 'destroyView')).not.toHaveBeenCalled();
+    expect(tab.view).not.toBeNull();
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+    releaseAi.resolve();
+    await aiWork;
+    capture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('menu-preview'),
+    });
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+  });
+
+  it('preempts a menu preview before a concurrent user command reaches the same page', async () => {
+    const capture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const events: string[] = [];
+    const contents = {
+      id: 42,
+      capturePage: vi.fn(() => capture.promise),
+      isDestroyed: () => false,
+      stop: vi.fn(() => events.push('stop')),
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        sensitive: false,
+      },
+      generation: 2,
+      scopeKey: 'global',
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationLease: 0,
+      queue: new BrowserActionQueue(),
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const destroyView = vi.fn((target: typeof tab) => {
+      target.view = null as never;
+    });
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+      destroyView,
+      emitTabs: vi.fn(),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', 'tab-1', 'navigation-preview');
+    await vi.waitFor(() => expect(contents.capturePage).toHaveBeenCalledOnce());
+    const stopping = manager.commandTab('chat-1', 'tab-1', 'stop', 'user');
+
+    await expect(preview).rejects.toThrow(/user navigated this tab/i);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(events).toEqual(['stop']);
+    expect(destroyView).not.toHaveBeenCalled();
+    expect(tab.view).not.toBeNull();
+
+    capture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('late-menu-preview'),
+    });
+    await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+  });
+
+  it('preserves a page at a wedged menu-capture deadline while background AI screenshots continue', async () => {
+    vi.useFakeTimers();
+    try {
+      const pendingCapture = deferred<{
+        getSize: () => { width: number; height: number };
+        toPNG: () => Buffer;
+      }>();
+      const capturePage = vi.fn(() => pendingCapture.promise);
+      const contents = {
+        id: 42,
+        capturePage,
+        debugger: { isAttached: () => false },
+        isDestroyed: () => false,
+      };
+      const tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', sensitive: false, discarded: false },
+        queue: new BrowserActionQueue(),
+        view: {
+          getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+          webContents: contents,
+        },
+      };
+      const screenshotQueue = new BrowserActionQueue();
+      const destroyView = vi.fn((target: typeof tab) => {
+        target.view = null as never;
+      });
+      const manager = managerWithoutConstructor({
+        assertBrowserPageLease: vi.fn(),
+        assertTabNotSensitive: vi.fn(async () => undefined),
+        attachedView: null,
+        captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+        destroyView,
+        emitTabs: vi.fn(),
+        isHostWindowShown: () => false,
+        requireTab: () => tab,
+        screenshotQueue,
+        tabs: new Map([['tab-1', tab]]),
+      });
+
+      const preview = manager.captureMenuPreview('chat-1', 'tab-1', 'wedged-preview');
+      const previewRejection = expect(preview).rejects.toThrow(/menu preview capture exceeded 5 seconds/i);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(capturePage).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await previewRejection;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).not.toBeNull();
+      expect(tab.shell.discarded).toBe(false);
+      // Cancellation releases the one global slot immediately. The production
+      // CDP helper also detaches its manager-owned debugger command here.
+      expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+
+      const screenshot = invokePrivate(
+        manager,
+        'runScreenshotAllocation',
+        async () => 'ai-screenshot',
+      ) as Promise<string>;
+      await expect(screenshot).resolves.toBe('ai-screenshot');
+      // The legacy test promise is intentionally still unresolved here, but it
+      // no longer occupies manager state or discards unsaved DOM/SPA state.
+      expect(destroyView).not.toHaveBeenCalled();
+      expect(tab.view).not.toBeNull();
+      pendingCapture.resolve({
+        getSize: () => ({ width: 400, height: 300 }),
+        toPNG: () => Buffer.from('late-menu-preview'),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reclaims a wedged menu capture before profile lifecycle drains resolve', async () => {
+    const pendingCapture = deferred<{
+      getSize: () => { width: number; height: number };
+      toPNG: () => Buffer;
+    }>();
+    const capturePage = vi.fn(() => pendingCapture.promise);
+    const contents = { id: 42, capturePage, isDestroyed: () => false };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', sensitive: false },
+      queue: new BrowserActionQueue(),
+      scopeKey: 'global',
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: contents,
+      },
+    };
+    const destroyView = vi.fn();
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      attachedView: null,
+      captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+      destroyView,
+      emitTabs: vi.fn(),
+      isHostWindowShown: () => false,
+      requireTab: () => tab,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const preview = manager.captureMenuPreview('chat-1', tab.shell.id, 'lifecycle-preview');
+    await vi.waitFor(() => expect(capturePage).toHaveBeenCalledOnce());
+    const drain = invokePrivate(
+      manager,
+      'drainMenuPreviewCapture',
+      new Set(['global']),
+      new Error('Browser profile is closing.'),
+    ) as Promise<void>;
+
+    await expect(preview).rejects.toThrow(/profile is closing/i);
+    await expect(drain).resolves.toBeUndefined();
+    expect(destroyView).toHaveBeenCalledWith(tab);
+    expect(Reflect.get(manager, 'menuPreviewCapture')).toBeNull();
+
+    pendingCapture.resolve({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('late-menu-preview'),
+    });
+  });
+
+  it('fails a menu preview fast while the shared screenshot allocator is busy', async () => {
+    const screenshotQueue = new BrowserActionQueue();
+    const release = deferred<void>();
+    const blocker = screenshotQueue.run(async () => release.promise);
+    const capturePage = vi.fn(async () => ({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('menu-preview'),
+    }));
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', sensitive: false },
+      queue: new BrowserActionQueue(),
+      view: {
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+        webContents: { id: 42, capturePage, isDestroyed: () => false },
+      },
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      browserPageLeaseToken: () => 'lease-1',
+      captureBrowserPageLease: () => ({ tabId: 'tab-1' }),
+      ensureView: async () => tab.view,
+      requireTab: () => tab,
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      screenshotQueue,
+    });
+
+    await expect(manager.captureMenuPreview('chat-1', 'tab-1')).rejects.toThrow(/screenshot capture is busy/i);
+    expect(capturePage).not.toHaveBeenCalled();
+    release.resolve();
+    await blocker;
+  });
+
   it('serializes screenshot capture and postprocessing across different tabs', async () => {
     const firstTabId = '00000000-0000-4000-8000-000000000001';
     const secondTabId = '00000000-0000-4000-8000-000000000002';
     const processingStarted = deferred<void>();
     const releaseProcessing = deferred<void>();
-    const image = (label: string) => ({
-      getSize: () => ({ width: 1, height: 1 }),
-      toPNG: () => Buffer.from(label),
+    const firstCapture = vi.fn(async () => ({ data: Buffer.from('first').toString('base64') }));
+    const secondCapture = vi.fn(async () => ({ data: Buffer.from('second').toString('base64') }));
+    const contents = (id: number, capture: typeof firstCapture) => ({
+      id,
+      capturePage: vi.fn(),
+      debugger: {
+        sendCommand: vi.fn(async (command: string) => {
+          if (command === 'Page.getLayoutMetrics') {
+            return {
+              cssContentSize: { width: 1, height: 1 },
+              contentSize: { width: 1, height: 1 },
+              cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1, clientHeight: 1 },
+            };
+          }
+          if (command === 'Page.captureScreenshot') return capture();
+          return {};
+        }),
+      },
+      isDestroyed: () => false,
     });
-    const firstCapture = vi.fn(async () => image('first'));
-    const secondCapture = vi.fn(async () => image('second'));
-    const firstContents = { id: 1, capturePage: firstCapture, isDestroyed: () => false };
-    const secondContents = { id: 2, capturePage: secondCapture, isDestroyed: () => false };
+    const firstContents = contents(1, firstCapture);
+    const secondContents = contents(2, secondCapture);
     const firstTab = {
       shell: { id: firstTabId, conversationId: 'chat-1', url: 'https://one.example', sensitive: false },
       view: { webContents: firstContents },
@@ -11068,11 +21839,14 @@ describe('browser manager renderer lifecycle', () => {
       [secondTabId, secondTab],
     ]);
     const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      attachedView: firstTab.view,
       assertBrowserPageLease: vi.fn(),
       assertTabNotSensitive: vi.fn(async () => undefined),
       captureBrowserPageLease: vi.fn((tab: typeof firstTab | typeof secondTab) => ({ tabId: tab.shell.id })),
       ensureView: vi.fn(async (tab: typeof firstTab | typeof secondTab) => tab.view),
       hideAutomationOverlay: vi.fn(async () => false),
+      isHostWindowShown: () => true,
       isBrowserPageLeaseCurrent: vi.fn(() => true),
       requireTab: (_conversationId: string, tabId?: string) => tabs.get(tabId ?? '')!,
       runRendererOperationWithDeadline: vi.fn(
@@ -11100,6 +21874,8 @@ describe('browser manager renderer lifecycle', () => {
     );
     await processingStarted.promise;
     expect(firstCapture).toHaveBeenCalledOnce();
+    expect(firstContents.capturePage).not.toHaveBeenCalled();
+    Reflect.set(manager, 'attachedView', secondTab.view);
     const second = manager.screenshot('chat-1', { tabId: secondTabId, mode: 'viewport' });
     await Promise.resolve();
     expect(secondCapture).not.toHaveBeenCalled();
@@ -11110,12 +21886,228 @@ describe('browser manager renderer lifecycle', () => {
       expect.objectContaining({ tabId: secondTabId }),
     ]);
     expect(secondCapture).toHaveBeenCalledOnce();
+    expect(secondContents.capturePage).not.toHaveBeenCalled();
   });
 
-  it('rejects oversized viewport bounds before capturePage allocates a NativeImage', async () => {
+  it('keeps an element screenshot live while scanning before and after capture', async () => {
+    const events: string[] = [];
+    const captureScreenshot = vi.fn(async () => {
+      events.push('capture');
+      return { data: Buffer.from('element-png').toString('base64') };
+    });
+    const contents = {
+      id: 42,
+      debugger: {
+        sendCommand: vi.fn(async (command: string) => {
+          if (command === 'Page.getLayoutMetrics') {
+            return {
+              cssContentSize: { width: 400, height: 300 },
+              contentSize: { width: 400, height: 300 },
+            };
+          }
+          if (command === 'Page.captureScreenshot') return captureScreenshot();
+          return {};
+        }),
+      },
+      executeJavaScript: vi.fn(async () => {
+        events.push('geometry');
+        return { x: 10, y: 20, width: 30, height: 40 };
+      }),
+      isDestroyed: () => false,
+    };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+      webContents: contents,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        sensitive: false,
+      },
+      view,
+    };
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => {
+        events.push('initial-scan');
+      }),
+      attachedView: view,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      ensureView: vi.fn(async () => view),
+      hideAutomationOverlay: vi.fn(async () => null),
+      isBrowserPageLeaseCurrent: () => true,
+      isHostWindowShown: () => true,
+      requireTab: () => tab,
+      restoreAutomationOverlay: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.screenshot('chat-1', { mode: 'element', selector: '#target' })).resolves.toMatchObject({
+      width: 30,
+      height: 40,
+    });
+    expect(events).toEqual(['initial-scan', 'geometry', 'capture', 'initial-scan']);
+  });
+
+  it('discards screenshot pixels when password data appears during capture', async () => {
+    const capturePage = vi.fn(async () => ({
+      getSize: () => ({ width: 400, height: 300 }),
+      toPNG: () => Buffer.from('must-not-capture'),
+    }));
+    const captureScreenshot = vi.fn(async () => ({ data: Buffer.from('must-not-return').toString('base64') }));
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0];
+      if (command === 'Page.getLayoutMetrics') {
+        return {
+          cssContentSize: { width: 400, height: 300 },
+          contentSize: { width: 400, height: 300 },
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 400, clientHeight: 300 },
+        };
+      }
+      if (command === 'Page.captureScreenshot') return captureScreenshot();
+      return {};
+    });
+    const contents = { id: 42, capturePage, debugger: debuggerApi, isDestroyed: () => false };
+    const view = {
+      getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
+      webContents: contents,
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://example.com',
+        sensitive: false,
+      },
+      view,
+    };
+    let sensitivityScan = 0;
+    const manager = managerWithoutConstructor({
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => {
+        if (++sensitivityScan === 2) throw new Error('Screenshots are blocked while this tab contains password data.');
+      }),
+      attachedView: view,
+      captureBrowserPageLease: () => ({ tabId: tab.shell.id }),
+      emit: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureView: vi.fn(async () => view),
+      hideAutomationOverlay: vi.fn(async () => null),
+      isBrowserPageLeaseCurrent: () => true,
+      isHostWindowShown: () => true,
+      requireTab: () => tab,
+      restoreAutomationOverlay: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: async (...args: unknown[]) => (args[4] as () => Promise<unknown>)(),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await expect(manager.screenshot('chat-1', { mode: 'viewport' })).rejects.toThrow(/password data/i);
+    expect(capturePage).not.toHaveBeenCalled();
+    expect(captureScreenshot).toHaveBeenCalledOnce();
+    expect(sensitivityScan).toBe(2);
+  });
+
+  it('uses CDP for an assistant viewport capture even when its tab is visibly presented', async () => {
+    const tabId = '00000000-0000-4000-8000-000000000001';
+    const capturePage = vi.fn(() => new Promise<never>(() => undefined));
+    const captureScreenshot = vi.fn(async () => ({ data: Buffer.from('assistant-viewport').toString('base64') }));
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const command = args[0];
+      if (command === 'Page.getLayoutMetrics') {
+        return {
+          cssContentSize: { width: 400, height: 300 },
+          contentSize: { width: 400, height: 300 },
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 400, clientHeight: 300 },
+        };
+      }
+      if (command === 'Page.captureScreenshot') return captureScreenshot();
+      return {};
+    });
+    const contents = { id: 42, capturePage, debugger: debuggerApi, isDestroyed: () => false };
+    const view = { webContents: contents };
+    const tab = {
+      shell: { id: tabId, conversationId: 'chat-1', url: 'https://example.com', sensitive: false },
+      view,
+      generation: 3,
+      trustedUserNavigationLease: 0,
+    };
+    const documentLease = {
+      runId: 'run-1',
+      runGeneration: 1,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 3,
+      userNavigationLease: 0,
+      url: tab.shell.url,
+    };
+    const pageLease = { tabId, contents };
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      assertAssistantDocumentLease: vi.fn(),
+      assertBrowserDocumentApproval: vi.fn(),
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      attachedView: view,
+      captureBrowserPageLease: () => pageLease,
+      ensureAssistantView: vi.fn(async () => view),
+      hideAutomationOverlay: vi.fn(async () => null),
+      isBrowserPageLeaseCurrent: () => true,
+      isHostWindowShown: () => true,
+      requireAssistantTab: () => tab,
+      restoreAutomationOverlay: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: vi.fn(
+        async (
+          _tab: unknown,
+          _contents: unknown,
+          _operation: string,
+          _timeoutMs: number,
+          task: () => Promise<unknown>,
+        ) => task(),
+      ),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      tabs: new Map([[tabId, tab]]),
+      withAssistantControl: (_tab: unknown, _run: unknown, task: (lease: typeof documentLease) => Promise<unknown>) =>
+        task(documentLease),
+      withVisibleAssistantOperation: (...args: unknown[]) =>
+        (args[5] as (reveal: () => Promise<void>) => Promise<unknown>)(async () => undefined),
+    });
+
+    await expect(
+      manager.screenshot('chat-1', { tabId, mode: 'viewport' }, 'assistant', { id: 'run-1' }),
+    ).resolves.toMatchObject({ tabId, width: 400, height: 300 });
+    expect(capturePage).not.toHaveBeenCalled();
+    expect(captureScreenshot).toHaveBeenCalledOnce();
+  });
+
+  it('rejects oversized CDP viewport geometry before requesting screenshot pixels', async () => {
     const tabId = '00000000-0000-4000-8000-000000000001';
     const capturePage = vi.fn();
-    const contents = { id: 1, capturePage, isDestroyed: () => false };
+    const captureScreenshot = vi.fn();
+    const contents = {
+      id: 1,
+      capturePage,
+      debugger: {
+        sendCommand: vi.fn(async (command: string) => {
+          if (command === 'Page.getLayoutMetrics') {
+            return {
+              cssContentSize: { width: 8_000, height: 8_000 },
+              contentSize: { width: 8_000, height: 8_000 },
+              cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 8_000, clientHeight: 8_000 },
+            };
+          }
+          if (command === 'Page.captureScreenshot') return captureScreenshot();
+          return {};
+        }),
+      },
+      isDestroyed: () => false,
+    };
     const tab = {
       shell: { id: tabId, conversationId: 'chat-1', url: 'https://example.com', sensitive: false },
       view: {
@@ -11124,12 +22116,15 @@ describe('browser manager renderer lifecycle', () => {
       },
     };
     const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      attachedView: tab.view,
       assertBrowserPageLease: vi.fn(),
       assertTabNotSensitive: vi.fn(async () => undefined),
       captureBrowserPageLease: vi.fn(() => ({ tabId })),
       ensureView: vi.fn(async () => tab.view),
       hideAutomationOverlay: vi.fn(async () => false),
       isBrowserPageLeaseCurrent: vi.fn(() => true),
+      isHostWindowShown: () => true,
       requireTab: () => tab,
       restoreAutomationOverlay: vi.fn(async () => undefined),
       runRendererOperationWithDeadline: vi.fn(
@@ -11146,27 +22141,54 @@ describe('browser manager renderer lifecycle', () => {
 
     await expect(manager.screenshot('chat-1', { tabId, mode: 'viewport' })).rejects.toThrow(/safe .*pixel limit/i);
     expect(capturePage).not.toHaveBeenCalled();
+    expect(captureScreenshot).not.toHaveBeenCalled();
   });
 
-  it('accounts for display scale before viewport capture allocates a NativeImage', async () => {
-    electronMocks.screenGetAllDisplays.mockReturnValue([{ scaleFactor: 2 }]);
+  it('keeps a visible user viewport capture on CDP when presentation changes mid-capture', async () => {
     const tabId = '00000000-0000-4000-8000-000000000002';
-    const capturePage = vi.fn();
-    const contents = { id: 2, capturePage, isDestroyed: () => false };
+    const capturePage = vi.fn(() => new Promise<never>(() => undefined));
+    const captureStarted = deferred<void>();
+    const captured = deferred<{ data: string }>();
+    const captureScreenshot = vi.fn(() => {
+      captureStarted.resolve();
+      return captured.promise;
+    });
+    const contents = {
+      id: 2,
+      capturePage,
+      debugger: {
+        sendCommand: vi.fn(async (command: string) => {
+          if (command === 'Page.getLayoutMetrics') {
+            return {
+              cssContentSize: { width: 400, height: 300 },
+              contentSize: { width: 400, height: 300 },
+              cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 400, clientHeight: 300 },
+            };
+          }
+          if (command === 'Page.captureScreenshot') return captureScreenshot();
+          return {};
+        }),
+      },
+      isDestroyed: () => false,
+    };
     const tab = {
       shell: { id: tabId, conversationId: 'chat-1', url: 'https://example.com', sensitive: false },
       view: {
         webContents: contents,
-        getBounds: () => ({ x: 0, y: 0, width: 3_000, height: 2_000 }),
+        getBounds: () => ({ x: 0, y: 0, width: 400, height: 300 }),
       },
     };
+    let shown = true;
     const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      attachedView: tab.view,
       assertBrowserPageLease: vi.fn(),
       assertTabNotSensitive: vi.fn(async () => undefined),
       captureBrowserPageLease: vi.fn(() => ({ tabId })),
       ensureView: vi.fn(async () => tab.view),
       hideAutomationOverlay: vi.fn(async () => false),
       isBrowserPageLeaseCurrent: vi.fn(() => true),
+      isHostWindowShown: () => shown,
       requireTab: () => tab,
       restoreAutomationOverlay: vi.fn(async () => undefined),
       runRendererOperationWithDeadline: vi.fn(
@@ -11181,8 +22203,15 @@ describe('browser manager renderer lifecycle', () => {
       runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
     });
 
-    await expect(manager.screenshot('chat-1', { tabId, mode: 'viewport' })).rejects.toThrow(/safe .*pixel limit/i);
+    const screenshot = manager.screenshot('chat-1', { tabId, mode: 'viewport' });
+    await captureStarted.promise;
+    shown = false;
+    Reflect.set(manager, 'attachedView', null);
+    captured.resolve({ data: Buffer.from('user-viewport').toString('base64') });
+
+    await expect(screenshot).resolves.toMatchObject({ tabId, width: 400, height: 300 });
     expect(capturePage).not.toHaveBeenCalled();
+    expect(captureScreenshot).toHaveBeenCalledOnce();
   });
 
   it('preserves negative element origins until the screenshot clip is intersected', async () => {
@@ -11199,7 +22228,10 @@ describe('browser manager renderer lifecycle', () => {
         isAttached: () => true,
         sendCommand: vi.fn(async (command: string, params?: Record<string, unknown>) => {
           if (command === 'Page.getLayoutMetrics') {
-            return { cssContentSize: { width: 100, height: 100 } };
+            return {
+              cssContentSize: { width: 100, height: 100 },
+              contentSize: { width: 200, height: 200 },
+            };
           }
           if (command === 'Page.captureScreenshot') return captureScreenshot(params);
           throw new Error(`Unexpected debugger command: ${command}`);
@@ -11236,7 +22268,7 @@ describe('browser manager renderer lifecycle', () => {
     });
     expect(captureScreenshot).toHaveBeenCalledWith(
       expect.objectContaining({
-        clip: { x: 0, y: 0, width: 30, height: 15, scale: 1 },
+        clip: { x: 0, y: 0, width: 30, height: 15, scale: 0.5 },
       }),
     );
     expect(runRendererOperationWithDeadline).toHaveBeenCalledWith(
@@ -11248,6 +22280,75 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
       undefined,
     );
+  });
+
+  it('captures and composites Retina full-page tiles at bounded CSS-pixel dimensions', async () => {
+    const capturedClips: Array<{ x: number; y: number; width: number; height: number; scale: number }> = [];
+    const contents = {
+      debugger: {
+        sendCommand: vi.fn(async (command: string, params?: Record<string, unknown>) => {
+          if (command === 'Page.getLayoutMetrics') {
+            return {
+              cssContentSize: { width: 2, height: 5_000 },
+              contentSize: { width: 4, height: 10_000 },
+            };
+          }
+          if (command === 'Page.captureScreenshot') {
+            const clip = params?.clip as (typeof capturedClips)[number];
+            capturedClips.push(clip);
+            const sharp = (await import('sharp')).default;
+            const png = await sharp({
+              create: {
+                width: clip.width,
+                height: clip.height,
+                channels: 4,
+                background: { r: 1, g: 2, b: 3, alpha: 1 },
+              },
+            })
+              .png()
+              .toBuffer();
+            return { data: png.toString('base64') };
+          }
+          throw new Error(`Unexpected debugger command: ${command}`);
+        }),
+      },
+      isDestroyed: () => false,
+    };
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com', sensitive: false },
+      view: { webContents: contents },
+    };
+    const manager = managerWithoutConstructor({
+      acquireBrowserDebugger: () => () => undefined,
+      assertBrowserPageLease: vi.fn(),
+      assertTabNotSensitive: vi.fn(async () => undefined),
+      captureBrowserPageLease: vi.fn(() => ({ tabId: 'tab-1' })),
+      ensureView: vi.fn(async () => tab.view),
+      hideAutomationOverlay: vi.fn(async () => null),
+      isBrowserPageLeaseCurrent: vi.fn(() => true),
+      requireTab: () => tab,
+      restoreAutomationOverlay: vi.fn(async () => undefined),
+      runRendererOperationWithDeadline: vi.fn(
+        async (
+          _tab: unknown,
+          _contents: unknown,
+          _operation: string,
+          _timeoutMs: number,
+          task: () => Promise<unknown>,
+        ) => task(),
+      ),
+      runTabOperation: (_tab: unknown, task: () => Promise<unknown>) => task(),
+      tabs: new Map([['tab-1', tab]]),
+    });
+
+    await expect(manager.screenshot('chat-1', { mode: 'full-page' })).resolves.toMatchObject({
+      width: 2,
+      height: 5_000,
+    });
+    expect(capturedClips).toEqual([
+      { x: 0, y: 0, width: 2, height: 4_096, scale: 0.5 },
+      { x: 0, y: 4_096, width: 2, height: 904, scale: 0.5 },
+    ]);
   });
 
   it('rejects an element capture when the picked document token is stale', async () => {

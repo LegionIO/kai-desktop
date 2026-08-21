@@ -50,11 +50,16 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function openBrowserMenu(): Promise<HTMLElement> {
+  fireEvent.click(screen.getByTitle('Browser menu'));
+  return await screen.findByRole('menu', { name: 'Browser menu' });
+}
+
 afterEach(() => uninstallAppBridgeStub());
 beforeEach(() => vi.clearAllMocks());
 
 describe('BrowserPanel', () => {
-  it('hydrates retained Browser prompts after a renderer reload and opens the hidden panel', async () => {
+  it('hydrates retained Browser prompts after a renderer reload without opening the hidden panel', async () => {
     installAppBridgeStub({
       browser: {
         getAttentionState: async () => [{ conversationId: 'chat-1', promptIds: ['retained-prompt'] }],
@@ -71,7 +76,98 @@ describe('BrowserPanel', () => {
       </SidePanelProvider>,
     );
 
+    expect(await screen.findByRole('alert')).toHaveTextContent('The Browser needs attention.');
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
     expect(await screen.findByText('open:browser')).toBeInTheDocument();
+  });
+
+  it('keeps an assistant-triggered prompt in the background until the user opens it', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    installAppBridgeStub({
+      browser: {
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    const State = () => {
+      const panel = useSidePanel();
+      return <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>;
+    };
+    render(
+      <SidePanelProvider>
+        <BrowserPanelAutoOpen conversationId="chat-1" />
+        <State />
+      </SidePanelProvider>,
+    );
+
+    act(() => {
+      emit?.({
+        type: 'permission-prompt',
+        conversationId: 'chat-1',
+        prompt: {
+          id: 'assistant-prompt',
+          tabId: tab.id,
+          origin: 'https://example.com',
+          permission: 'camera',
+          assistantTriggered: true,
+        },
+      });
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent('The Browser needs attention.');
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    expect(await screen.findByText('open:browser')).toBeInTheDocument();
+  });
+
+  it('clears passive Browser attention when the user opens the panel directly', () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    installAppBridgeStub({
+      browser: {
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    const Controls = () => {
+      const panel = useSidePanel();
+      return (
+        <>
+          <span>{`${panel.state}:${panel.activeTabId ?? 'none'}`}</span>
+          <button type="button" onClick={() => panel.openPanel('browser')}>
+            Open Browser directly
+          </button>
+          <button type="button" onClick={panel.minimizePanel}>
+            Collapse Browser directly
+          </button>
+        </>
+      );
+    };
+    render(
+      <SidePanelProvider>
+        <BrowserPanelAutoOpen conversationId="chat-1" />
+        <Controls />
+      </SidePanelProvider>,
+    );
+
+    act(() => emit?.({ type: 'open-panel', conversationId: 'chat-1', tabId: tab.id }));
+    expect(screen.getByRole('alert')).toHaveTextContent('The Browser needs attention.');
+
+    fireEvent.click(screen.getByText('Open Browser directly'));
+    expect(screen.getByText('open:browser')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Collapse Browser directly'));
+    expect(screen.getByText('minimized:browser')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('does not restart retained-prompt hydration for unrelated Browser activity', async () => {
@@ -114,7 +210,7 @@ describe('BrowserPanel', () => {
     expect(getAttentionState).toHaveBeenCalledOnce();
   });
 
-  it('opens for active prompts and surfaces prompts owned by another chat', async () => {
+  it('keeps all prompts attention-only and surfaces Browser work owned by another chat', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const setActiveId = vi.fn(async () => undefined);
     const onRevealChat = vi.fn();
@@ -156,7 +252,17 @@ describe('BrowserPanel', () => {
         },
       });
     });
-    expect(screen.getByText('open:browser')).toBeInTheDocument();
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/i);
+
+    act(() => {
+      emit?.({
+        type: 'prompt-dismissed',
+        conversationId: 'chat-1',
+        promptId: 'prompt-1',
+        promptKind: 'permission',
+      });
+    });
 
     act(() => {
       emit?.({
@@ -207,7 +313,7 @@ describe('BrowserPanel', () => {
         },
       });
     });
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/);
 
     fireEvent.click(screen.getByText('Collapse test panel'));
     expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/);
@@ -253,7 +359,7 @@ describe('BrowserPanel', () => {
         },
       });
     });
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/);
 
     rerender(
       <SidePanelProvider>
@@ -307,7 +413,8 @@ describe('BrowserPanel', () => {
     expect(screen.getByText('minimized:none')).toBeInTheDocument();
 
     act(() => emit?.({ type: 'open-panel', conversationId: 'chat-2', tabId: tab.id }));
-    expect(screen.getByText('open:browser')).toBeInTheDocument();
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/i);
   });
 
   it('routes Browser events with the committed chat while a later transition is suspended', async () => {
@@ -360,8 +467,8 @@ describe('BrowserPanel', () => {
 
     act(() => emit?.({ type: 'open-panel', conversationId: 'chat-1', tabId: tab.id }));
 
-    expect(screen.getByText('open:browser')).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/needs attention/i);
   });
 
   it('keeps cross-chat Browser attention when opening that chat fails', async () => {
@@ -571,7 +678,7 @@ describe('BrowserPanel', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('opens the active chat attention even when an older chat is first in the queue', async () => {
+  it('keeps queued attention minimized until the user opens it', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     installAppBridgeStub({
       browser: {
@@ -605,8 +712,12 @@ describe('BrowserPanel', () => {
       </SidePanelProvider>,
     );
 
-    await waitFor(() => expect(screen.getByText('open:browser')).toBeInTheDocument());
     expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText('minimized:none')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    await waitFor(() => expect(screen.getByText('open:browser')).toBeInTheDocument());
   });
 
   it('surfaces same-chat prompts while another app view hides the browser surface', () => {
@@ -1007,7 +1118,7 @@ describe('BrowserPanel', () => {
     render(<BrowserPanel conversationId="chat-1" />);
     const tabControl = await screen.findByRole('tab', { name: 'Example' });
 
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     expect(screen.getByRole('menu')).toBeInTheDocument();
     fireEvent.pointerDown(document.body);
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
@@ -1025,6 +1136,431 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument();
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
+  it('keeps a protected viewport frame visible while the Browser menu covers the native page', async () => {
+    const mount = vi.fn(async (_conversationId: string, _bounds: unknown) => undefined);
+    const pendingCapture = deferred<{
+      tabId: string;
+      mode: 'viewport';
+      mimeType: 'image/png';
+      dataUrl: string;
+      width: number;
+      height: number;
+    }>();
+    const screenshot = vi.fn(() => pendingCapture.promise);
+    const capture = {
+      tabId: tab.id,
+      mode: 'viewport' as const,
+      mimeType: 'image/png' as const,
+      dataUrl: 'data:image/png;base64,AAAA',
+      width: 400,
+      height: 300,
+    };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [tab],
+          activeTabId: tab.id,
+        }),
+        mount,
+        captureMenuPreview: screenshot,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    const detachedBeforeClick = mount.mock.calls.filter(([, bounds]) => bounds === null).length;
+    fireEvent.click(screen.getByTitle('Browser menu'));
+
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(mount.mock.calls.filter(([, bounds]) => bounds === null)).toHaveLength(detachedBeforeClick);
+    await act(async () => pendingCapture.resolve(capture));
+
+    expect(screen.getByRole('menu', { name: 'Browser menu' })).toBeInTheDocument();
+    const preview = screen.getByTestId('browser-menu-page-preview');
+    await waitFor(() => expect(preview.querySelector('img')).toHaveAttribute('src', 'data:image/png;base64,AAAA'));
+    expect(screenshot).toHaveBeenCalledWith('chat-1', tab.id, expect.any(String));
+    await waitFor(() => expect(mount).toHaveBeenLastCalledWith('chat-1', null));
+
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByTestId('browser-menu-page-preview')).not.toBeInTheDocument();
+  });
+
+  it.each(['Escape', 'outside pointer'] as const)(
+    'cancels a pending menu preview on %s without reopening after capture resolves',
+    async (dismissal) => {
+      const cancelMenuPreview = vi.fn(async () => undefined);
+      const pendingCapture = deferred<{
+        tabId: string;
+        mode: 'viewport';
+        mimeType: 'image/png';
+        dataUrl: string;
+        width: number;
+        height: number;
+      }>();
+      installAppBridgeStub({
+        browser: {
+          available: async () => true,
+          getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+          mount: async () => undefined,
+          captureMenuPreview: () => pendingCapture.promise,
+          cancelMenuPreview,
+          listBookmarks: async () => [],
+          listHistory: async () => [],
+        },
+      });
+      render(<BrowserPanel conversationId="chat-1" />);
+      await screen.findByText('Example');
+
+      fireEvent.click(screen.getByTitle('Browser menu'));
+      expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+      if (dismissal === 'Escape') fireEvent.keyDown(window, { key: 'Escape' });
+      else fireEvent.pointerDown(document.body);
+      await waitFor(() => expect(cancelMenuPreview).toHaveBeenCalledWith(expect.any(String)));
+      await act(async () =>
+        pendingCapture.resolve({
+          tabId: tab.id,
+          mode: 'viewport',
+          mimeType: 'image/png',
+          dataUrl: 'data:image/png;base64,CANCELLED',
+          width: 400,
+          height: 300,
+        }),
+      );
+
+      expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId('browser-menu-page-preview')).not.toBeInTheDocument();
+    },
+  );
+
+  it('keeps the native page mounted while bounded menu-preview capture is delayed', async () => {
+    const mount = vi.fn(async (_conversationId: string, _bounds: unknown) => undefined);
+    const pendingCapture = deferred<{
+      tabId: string;
+      mode: 'viewport';
+      mimeType: 'image/png';
+      dataUrl: string;
+      width: number;
+      height: number;
+    }>();
+    const screenshot = vi.fn(() => pendingCapture.promise);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        captureMenuPreview: screenshot,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    const detachedBeforeClick = mount.mock.calls.filter(([, bounds]) => bounds === null).length;
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByTitle('Browser menu'));
+      expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+      await act(async () => vi.advanceTimersByTimeAsync(1_100));
+      expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+      expect(mount.mock.calls.filter(([, bounds]) => bounds === null)).toHaveLength(detachedBeforeClick);
+      expect(screenshot).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await act(async () =>
+      pendingCapture.resolve({
+        tabId: tab.id,
+        mode: 'viewport',
+        mimeType: 'image/png',
+        dataUrl: 'data:image/png;base64,LATE',
+        width: 400,
+        height: 300,
+      }),
+    );
+    expect(await screen.findByRole('menu', { name: 'Browser menu' })).toBeInTheDocument();
+    expect(screen.getByTestId('browser-menu-page-preview').querySelector('img')).toHaveAttribute(
+      'src',
+      'data:image/png;base64,LATE',
+    );
+    await waitFor(() => expect(mount).toHaveBeenLastCalledWith('chat-1', null));
+  });
+
+  it('never captures a menu preview from a sensitive page', async () => {
+    const screenshot = vi.fn();
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [{ ...tab, sensitive: true }],
+          activeTabId: tab.id,
+        }),
+        mount: async () => undefined,
+        captureMenuPreview: screenshot,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    await openBrowserMenu();
+
+    expect(screen.getByText('Sensitive page hidden while Browser controls are open.')).toBeInTheDocument();
+    expect(screenshot).not.toHaveBeenCalled();
+  });
+
+  it('waits for main to hide the native page before opening Browser chrome', async () => {
+    const detached = deferred<void>();
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (bounds === null) await detached.promise;
+    });
+    const screenshot = vi.fn();
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [{ ...tab, sensitive: true }],
+          activeTabId: tab.id,
+        }),
+        mount,
+        captureMenuPreview: screenshot,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    fireEvent.click(screen.getByTitle('Browser menu'));
+    await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', null));
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(screenshot).not.toHaveBeenCalled();
+
+    await act(async () => detached.resolve());
+    expect(await screen.findByRole('menu', { name: 'Browser menu' })).toBeInTheDocument();
+    expect(screen.getByText('Sensitive page hidden while Browser controls are open.')).toBeInTheDocument();
+  });
+
+  it('cancels a sensitive-page menu while native detachment is still pending', async () => {
+    const detached = deferred<void>();
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (bounds === null) await detached.promise;
+    });
+    const captureMenuPreview = vi.fn();
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [{ ...tab, sensitive: true }],
+          activeTabId: tab.id,
+        }),
+        mount,
+        captureMenuPreview,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    fireEvent.click(screen.getByTitle('Browser menu'));
+    await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', null));
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await act(async () => detached.resolve());
+
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(captureMenuPreview).not.toHaveBeenCalled();
+  });
+
+  it('cancels a fallback menu while native detachment after capture failure is still pending', async () => {
+    const detached = deferred<void>();
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (bounds === null) await detached.promise;
+    });
+    const captureMenuPreview = vi.fn(async () => {
+      throw new Error('capture failed');
+    });
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        captureMenuPreview,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    fireEvent.click(screen.getByTitle('Browser menu'));
+    await waitFor(() => expect(captureMenuPreview).toHaveBeenCalledOnce());
+    await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', null));
+    fireEvent.pointerDown(document.body);
+    await act(async () => detached.resolve());
+
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('browser-menu-page-preview')).not.toBeInTheDocument();
+  });
+
+  it('republishes current bounds when a dismissed menu detach completes late', async () => {
+    const detached = deferred<void>();
+    let delayDetach = false;
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (delayDetach && bounds === null) await detached.promise;
+    });
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        captureMenuPreview: async () => ({
+          tabId: tab.id,
+          mode: 'viewport',
+          mimeType: 'image/png',
+          dataUrl: 'data:image/png;base64,CURRENT',
+          width: 400,
+          height: 300,
+        }),
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    await waitFor(() => expect(mount.mock.calls.some(([, bounds]) => bounds !== null)).toBe(true));
+
+    delayDetach = true;
+    fireEvent.click(screen.getByTitle('Browser menu'));
+    await waitFor(() => expect(mount.mock.calls.some(([, bounds]) => bounds === null)).toBe(true));
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument());
+    const visibleMountsBeforeLateDetach = mount.mock.calls.filter(([, bounds]) => bounds !== null).length;
+
+    await act(async () => detached.resolve());
+    await waitFor(() =>
+      expect(mount.mock.calls.filter(([, bounds]) => bounds !== null).length).toBeGreaterThan(
+        visibleMountsBeforeLateDetach,
+      ),
+    );
+    expect(mount).toHaveBeenLastCalledWith('chat-1', expect.objectContaining({ width: expect.any(Number) }));
+  });
+
+  it('does not open a menu with a preview captured for a superseded document', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const pendingCapture = deferred<{
+      tabId: string;
+      mode: 'viewport';
+      mimeType: 'image/png';
+      dataUrl: string;
+      width: number;
+      height: number;
+    }>();
+    const screenshot = vi.fn(() => pendingCapture.promise);
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        captureMenuPreview: screenshot,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+
+    fireEvent.click(screen.getByTitle('Browser menu'));
+    await waitFor(() => expect(screenshot).toHaveBeenCalledOnce());
+    act(() => {
+      emit?.({
+        type: 'tabs-changed',
+        conversationId: 'chat-1',
+        tabs: [
+          {
+            ...tab,
+            title: 'Replacement',
+            url: 'https://replacement.example',
+            updatedAt: '2026-01-01T00:00:01.000Z',
+          },
+        ],
+      });
+    });
+    await act(async () => {
+      pendingCapture.resolve({
+        tabId: tab.id,
+        mode: 'viewport',
+        mimeType: 'image/png',
+        dataUrl: 'data:image/png;base64,STALE',
+        width: 400,
+        height: 300,
+      });
+    });
+
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('browser-menu-page-preview')).not.toBeInTheDocument();
+  });
+
+  it('dismisses an open preview in the document-change layout commit', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount: async () => undefined,
+        captureMenuPreview: async () => ({
+          tabId: tab.id,
+          mode: 'viewport',
+          mimeType: 'image/png',
+          dataUrl: 'data:image/png;base64,CURRENT',
+          width: 400,
+          height: 300,
+        }),
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    await openBrowserMenu();
+    expect(screen.getByTestId('browser-menu-page-preview')).toBeInTheDocument();
+
+    act(() => {
+      emit?.({
+        type: 'tabs-changed',
+        conversationId: 'chat-1',
+        tabs: [
+          {
+            ...tab,
+            title: 'Replacement',
+            url: 'https://replacement.example',
+            updatedAt: '2026-01-01T00:00:01.000Z',
+          },
+        ],
+      });
+    });
+
+    expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('browser-menu-page-preview')).not.toBeInTheDocument();
   });
 
   it('reviews and resets remembered permissions from Site information', async () => {
@@ -1221,7 +1757,7 @@ describe('BrowserPanel', () => {
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByRole('tab', { name: 'Example' });
 
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Screenshot component'));
 
     await waitFor(() =>
@@ -1235,6 +1771,103 @@ describe('BrowserPanel', () => {
     );
     expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id);
   });
+
+  it.each([
+    ['Screenshot viewport', 'viewport'],
+    ['Screenshot component', 'element'],
+  ] as const)('waits for the native page to remount before running %s from the Browser menu', async (label, mode) => {
+    const visibleMount = deferred<void>();
+    let holdVisibleMount = false;
+    const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+      if (holdVisibleMount && bounds !== null) await visibleMount.promise;
+    });
+    const pickElement = vi.fn(async () => ({
+      selector: '#picked',
+      documentToken: 'picked-document-token',
+    }));
+    const screenshot = vi.fn(async () => ({
+      tabId: tab.id,
+      mode,
+      mimeType: 'image/png' as const,
+      width: 10,
+      height: 10,
+    }));
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+        mount,
+        captureMenuPreview: async () => ({
+          tabId: tab.id,
+          mode: 'viewport' as const,
+          mimeType: 'image/png' as const,
+          width: 400,
+          height: 300,
+        }),
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        pickElement,
+        screenshot,
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByRole('tab', { name: 'Example' });
+    await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', expect.any(Object)));
+
+    await openBrowserMenu();
+    holdVisibleMount = true;
+    fireEvent.click(screen.getByText(label));
+    await waitFor(() =>
+      expect(mount.mock.calls.filter(([, bounds]) => bounds !== null).length).toBeGreaterThanOrEqual(2),
+    );
+    expect(pickElement).not.toHaveBeenCalled();
+    expect(screenshot).not.toHaveBeenCalled();
+
+    await act(async () => visibleMount.resolve());
+    if (mode === 'element') await waitFor(() => expect(pickElement).toHaveBeenCalledWith('chat-1', tab.id));
+    await waitFor(() => expect(screenshot).toHaveBeenCalledOnce());
+  });
+
+  it.each(['Screenshot viewport', 'Screenshot component'] as const)(
+    'fails closed when the native page cannot remount before %s',
+    async (label) => {
+      let rejectVisibleMount = false;
+      const mount = vi.fn(async (_conversationId: string, bounds: unknown) => {
+        if (rejectVisibleMount && bounds !== null) throw new Error('Native remount failed');
+      });
+      const pickElement = vi.fn();
+      const screenshot = vi.fn();
+      installAppBridgeStub({
+        browser: {
+          available: async () => true,
+          getState: async () => ({ conversationId: 'chat-1', tabs: [tab], activeTabId: tab.id }),
+          mount,
+          captureMenuPreview: async () => ({
+            tabId: tab.id,
+            mode: 'viewport' as const,
+            mimeType: 'image/png' as const,
+            width: 400,
+            height: 300,
+          }),
+          listBookmarks: async () => [],
+          listHistory: async () => [],
+          pickElement,
+          screenshot,
+        },
+      });
+      render(<BrowserPanel conversationId="chat-1" />);
+      await screen.findByRole('tab', { name: 'Example' });
+      await waitFor(() => expect(mount).toHaveBeenCalledWith('chat-1', expect.any(Object)));
+
+      await openBrowserMenu();
+      rejectVisibleMount = true;
+      fireEvent.click(screen.getByText(label));
+
+      expect(await screen.findByText('Native remount failed')).toBeInTheDocument();
+      expect(pickElement).not.toHaveBeenCalled();
+      expect(screenshot).not.toHaveBeenCalled();
+    },
+  );
 
   it('uses tab semantics, roving arrow navigation, and separately focusable close controls', async () => {
     const second = {
@@ -1759,7 +2392,7 @@ describe('BrowserPanel', () => {
     render(<BrowserPanel conversationId="chat-1" />);
     const browserMenuTrigger = await screen.findByTitle('Browser menu');
     fireEvent.click(browserMenuTrigger);
-    const browserMenu = screen.getByRole('menu', { name: 'Browser menu' });
+    const browserMenu = await screen.findByRole('menu', { name: 'Browser menu' });
     expect(browserMenu.parentElement).toBe(document.body);
     expect(browserMenu).toHaveClass('fixed');
     await waitFor(() => expect(screen.getByRole('menuitem', { name: 'New tab' })).toHaveFocus());
@@ -1768,7 +2401,7 @@ describe('BrowserPanel', () => {
     expect(screen.queryByRole('menu', { name: 'Browser menu' })).not.toBeInTheDocument();
 
     fireEvent.click(browserMenuTrigger);
-    const reopenedBrowserMenu = screen.getByRole('menu', { name: 'Browser menu' });
+    const reopenedBrowserMenu = await screen.findByRole('menu', { name: 'Browser menu' });
     await waitFor(() => expect(screen.getByRole('menuitem', { name: 'New tab' })).toHaveFocus());
     fireEvent.keyDown(reopenedBrowserMenu, { key: 'End' });
     expect(screen.getByRole('menuitem', { name: 'Developer tools' })).toHaveFocus();
@@ -1977,7 +2610,7 @@ describe('BrowserPanel', () => {
     });
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Bookmarks'));
 
     fireEvent.click(await screen.findByTitle('Move Second bookmark up'));
@@ -2084,7 +2717,7 @@ describe('BrowserPanel', () => {
     });
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Downloads'));
     expect(await screen.findByText('progressing · 1 / 10 bytes')).toBeInTheDocument();
 
@@ -2146,6 +2779,115 @@ describe('BrowserPanel', () => {
     expect(managerTitle.closest('button')).toBeDisabled();
     expect(screen.getByText(/completed · 10 \/ 10 bytes · file unavailable/)).toBeInTheDocument();
     expect(showDownload).not.toHaveBeenCalled();
+  });
+
+  it('exports completed quarantined files from the detached Downloads manager', async () => {
+    const completed = {
+      id: 'download-exportable',
+      tabId: tab.id,
+      filename: 'assistant-report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed' as const,
+      quarantined: true,
+      path: '/tmp/Kai-download.download',
+    };
+    const exportDownload = vi.fn(async () => ({ canceled: true }));
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [tab],
+          activeTabId: tab.id,
+        }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        listDownloads: async () => [completed],
+        exportDownload,
+      },
+    });
+
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    await openBrowserMenu();
+    fireEvent.click(screen.getByText('Downloads'));
+    fireEvent.click(await screen.findByTitle('Export assistant-report.pdf'));
+
+    await waitFor(() => expect(exportDownload).toHaveBeenCalledWith('chat-1', completed.id));
+  });
+
+  it('updates or clears only the matching shelf item for download-history changes', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const completed = {
+      id: 'download-latest',
+      tabId: tab.id,
+      filename: 'assistant-report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed' as const,
+      quarantined: true,
+      path: '/tmp/Kai-download.download',
+    };
+    const exportDownload = vi.fn(async () => ({ canceled: true }));
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [tab],
+          activeTabId: tab.id,
+        }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        listDownloads: async () => [completed],
+        exportDownload,
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByText('Example');
+    act(() => {
+      emit?.({ type: 'download', conversationId: 'chat-1', download: completed });
+    });
+    expect(await screen.findByText(/assistant-report\.pdf · completed/)).toBeInTheDocument();
+
+    act(() => {
+      emit?.({
+        type: 'download-history-changed',
+        conversationId: 'chat-1',
+        downloadId: 'older-download',
+        change: 'deleted',
+      });
+    });
+    expect(screen.getByText(/assistant-report\.pdf · completed/)).toBeInTheDocument();
+
+    act(() => {
+      emit?.({
+        type: 'download-history-changed',
+        conversationId: 'chat-1',
+        downloadId: completed.id,
+        change: 'unavailable',
+      });
+    });
+    const unavailable = await screen.findByText(/assistant-report\.pdf · completed · file unavailable/);
+    expect(unavailable.tagName).toBe('SPAN');
+    expect(exportDownload).not.toHaveBeenCalled();
+
+    act(() => {
+      emit?.({
+        type: 'download-history-changed',
+        conversationId: 'chat-1',
+        downloadId: completed.id,
+        change: 'deleted',
+      });
+    });
+    expect(screen.queryByText(/assistant-report\.pdf/)).not.toBeInTheDocument();
   });
 
   it('cancels active downloads from the shelf and downloads manager', async () => {
@@ -2224,7 +2966,7 @@ describe('BrowserPanel', () => {
     fireEvent.change(omnibox, { target: { value: 'query' } });
     expect(await screen.findByText('History unavailable')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     expect(await screen.findByText('alice')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('Copy with Touch ID'));
@@ -2262,7 +3004,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
 
     expect(await screen.findByText(/Touch ID is unavailable on this Mac/)).toHaveTextContent(
@@ -2308,7 +3050,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     const editButton = await screen.findByTitle('Edit with Touch ID');
 
@@ -2367,7 +3109,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     const editButtons = await screen.findAllByTitle('Edit with Touch ID');
     const revealButtons = screen.getAllByTitle('Reveal with Touch ID');
@@ -2436,7 +3178,7 @@ describe('BrowserPanel', () => {
 
       render(<BrowserPanel conversationId="chat-1" />);
       await screen.findByText('Example');
-      fireEvent.click(screen.getByTitle('Browser menu'));
+      await openBrowserMenu();
       fireEvent.click(screen.getByText('Passwords'));
       expect(await screen.findByText('alice')).toBeInTheDocument();
 
@@ -2485,7 +3227,7 @@ describe('BrowserPanel', () => {
       });
       render(<BrowserPanel conversationId="chat-1" />);
       await screen.findByText('Example');
-      fireEvent.click(screen.getByTitle('Browser menu'));
+      await openBrowserMenu();
       fireEvent.click(screen.getByText('Passwords'));
       await screen.findByText('alice');
       const search = screen.getByPlaceholderText('Search passwords');
@@ -2533,7 +3275,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
 
     const displayedOrigin = await screen.findByText(origin);
@@ -2571,7 +3313,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await waitFor(() => expect(screen.getByTitle('Browser menu')).toBeEnabled());
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     expect(await screen.findByText('alice')).toBeInTheDocument();
 
@@ -3263,6 +4005,64 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
   });
 
+  it('shows live AI status only for the tab currently presented in the sidebar', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const backgroundTab: BrowserTab = {
+      ...tab,
+      id: '00000000-0000-0000-0000-000000000002',
+      title: 'Background',
+      active: false,
+    };
+    installAppBridgeStub({
+      browser: {
+        available: async () => true,
+        getState: async () => ({
+          conversationId: 'chat-1',
+          tabs: [tab, backgroundTab],
+          activeTabId: tab.id,
+          runningActions: [
+            {
+              id: 'background-action',
+              tabId: backgroundTab.id,
+              kind: 'scroll' as const,
+              status: 'running' as const,
+              startedAt: '2026-01-01T00:00:00.000Z',
+              summary: 'scrolling elsewhere',
+            },
+          ],
+        }),
+        mount: async () => undefined,
+        listBookmarks: async () => [],
+        listHistory: async () => [],
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+    });
+
+    render(<BrowserPanel conversationId="chat-1" />);
+    await screen.findByLabelText('Address and search bar');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    act(() => {
+      emit?.({
+        type: 'action',
+        conversationId: 'chat-1',
+        action: {
+          id: 'visible-action',
+          tabId: tab.id,
+          kind: 'click',
+          status: 'running',
+          startedAt: '2026-01-01T00:00:01.000Z',
+          summary: 'clicking here',
+        },
+      });
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent('Kai · clicking here');
+  });
+
   it('identifies file-system targets and offers request-scoped access only', async () => {
     installAppBridgeStub({
       browser: {
@@ -3296,7 +4096,7 @@ describe('BrowserPanel', () => {
     expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
   });
 
-  it('announces blocking prompts and focuses the highest-priority response control', async () => {
+  it('announces blocking prompts and auto-focuses only user-triggered response controls', async () => {
     let emit: ((event: BrowserEvent) => void) | undefined;
     const setChromeFocus = vi.fn().mockResolvedValue(undefined);
     const respondCredentialPrompt = vi.fn().mockResolvedValue(undefined);
@@ -3375,7 +4175,8 @@ describe('BrowserPanel', () => {
     });
     expect(screen.getByRole('alertdialog', { name: 'Browser authentication required' })).toBeInTheDocument();
     expect(screen.getByText(/Verify this endpoint before sending credentials/)).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Block' })).toHaveFocus());
+    expect(screen.getByRole('button', { name: 'Cancel' })).not.toHaveFocus();
     expect(screen.queryByPlaceholderText('Username')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
@@ -3868,7 +4669,7 @@ describe('BrowserPanel', () => {
 
     const rendered = render(<BrowserPanel conversationId="chat-1" />);
     const firstOmnibox = await screen.findByLabelText('Address and search bar');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     await screen.findByText('alice');
     fireEvent.click(screen.getByTitle('Reveal with Touch ID'));
@@ -3925,7 +4726,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     await screen.findByText('global-user');
     fireEvent.click(screen.getByTitle('Reveal with Touch ID'));
@@ -4172,7 +4973,7 @@ describe('BrowserPanel', () => {
     });
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Passwords'));
     await screen.findByText('alice');
 
@@ -4363,7 +5164,7 @@ describe('BrowserPanel', () => {
     });
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('History'));
     expect(await screen.findByText('Before clear')).toBeInTheDocument();
 
@@ -4565,7 +5366,7 @@ describe('BrowserPanel', () => {
     });
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Bookmarks'));
     expect(await screen.findByText('Nothing here yet.')).toBeInTheDocument();
 
@@ -4659,9 +5460,12 @@ describe('BrowserPanel', () => {
     render(<BrowserPanel conversationId="chat-1" />);
     const trigger = await screen.findByTitle('New tab (⌘/Ctrl+T)');
     trigger.focus();
+    await act(async () => undefined);
 
-    fireEvent.keyDown(trigger, { key: '+', ctrlKey: true });
-    fireEvent.keyDown(trigger, { key: '+', ctrlKey: true });
+    act(() => {
+      fireEvent.keyDown(trigger, { key: '+', ctrlKey: true });
+      fireEvent.keyDown(trigger, { key: '+', ctrlKey: true });
+    });
 
     expect(setZoom).toHaveBeenNthCalledWith(1, 'chat-1', tab.id, 0.5);
     expect(setZoom).toHaveBeenNthCalledWith(2, 'chat-1', tab.id, 1);
@@ -4825,7 +5629,7 @@ describe('BrowserPanel', () => {
 
   it('surfaces browser data-clear failures from the sidebar menu', async () => {
     const clearData = vi.fn().mockRejectedValue(new Error('Profile storage is busy'));
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     installAppBridgeStub({
       browser: {
         available: async () => true,
@@ -4843,11 +5647,13 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('Clear browser data…'));
 
     expect(await screen.findByText('Profile storage is busy')).toBeInTheDocument();
     expect(clearData).toHaveBeenCalledWith({ conversationId: 'chat-1' });
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/unexported assistant download quarantine copies/i));
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/already exported or saved remain on disk/i));
   });
 
   it('confirms that History clear removes the complete profile history', async () => {
@@ -4878,7 +5684,7 @@ describe('BrowserPanel', () => {
 
     render(<BrowserPanel conversationId="chat-1" />);
     await screen.findByText('Example');
-    fireEvent.click(screen.getByTitle('Browser menu'));
+    await openBrowserMenu();
     fireEvent.click(screen.getByText('History'));
     const clear = await screen.findByRole('button', { name: 'Clear' });
     fireEvent.click(clear);

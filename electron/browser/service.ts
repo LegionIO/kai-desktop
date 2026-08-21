@@ -4,6 +4,7 @@ import { readConversation } from '../ipc/conversation-store.js';
 import { BrowserManager } from './manager.js';
 import { BrowserCredentialVault } from './credential-vault.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
+import { removeAssistantDownloadQuarantineForScope } from './download-quarantine.js';
 import { browserPartitionForScopeKey, browserScopeKey } from './session.js';
 import { BrowserProfileStore } from './store.js';
 import { stopRunningBrowserServiceWorkers } from './service-workers.js';
@@ -113,6 +114,10 @@ export async function removeBrowserConversationData(appHome: string, conversatio
           { label: 'Chromium storage', run: () => scopedSession.clearStorageData() },
           { label: 'Chromium cache', run: () => scopedSession.clearCache() },
           { label: 'HTTP authentication cache', run: () => scopedSession.clearAuthCache() },
+          {
+            label: 'assistant download quarantine',
+            run: () => removeAssistantDownloadQuarantineForScope(appHome, scopeKey),
+          },
           {
             label: 'history, bookmarks, permissions, and downloads',
             run: () => new BrowserProfileStore(appHome, scopeKey).clear(),

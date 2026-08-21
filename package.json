@@ -3,7 +3,7 @@
   "productName": "Kai",
   "version": "1.0.230",
   "pluginProcessProtocolVersion": 3,
-  "desktopShellProtocolVersion": 1,
+  "desktopShellProtocolVersion": 2,
   "description": "Kai - Local AI Assistant",
   "main": "./out/main/index.js",
   "bin": {

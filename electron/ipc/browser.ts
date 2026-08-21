@@ -120,6 +120,10 @@ export function registerBrowserHandlers(
     }
     return getBrowserManager().setZoom(conversationId, tabId, level);
   });
+  handle('browser:capture-menu-preview', (conversationId: string, tabId: string, requestId: string) =>
+    getBrowserManager().captureMenuPreview(conversationId, tabId, requestId),
+  );
+  handle('browser:cancel-menu-preview', (requestId: string) => getBrowserManager().cancelMenuPreview(requestId));
   handle('browser:screenshot', (conversationId: string, request: BrowserScreenshotRequest) =>
     getBrowserManager().screenshot(conversationId, request),
   );
@@ -150,6 +154,12 @@ export function registerBrowserHandlers(
   handle('browser:list-downloads', (conversationId: string) => getBrowserManager().listDownloads(conversationId));
   handle('browser:show-download', (conversationId: string, downloadId: string) =>
     getBrowserManager().showDownload(conversationId, downloadId),
+  );
+  handle('browser:export-download', (conversationId: string, downloadId: string) =>
+    getBrowserManager().exportDownload(conversationId, downloadId),
+  );
+  handle('browser:delete-download', (conversationId: string, downloadId: string) =>
+    getBrowserManager().deleteDownload(conversationId, downloadId),
   );
   handle('browser:cancel-download', (conversationId: string, downloadId: string) =>
     getBrowserManager().cancelDownload(conversationId, downloadId),

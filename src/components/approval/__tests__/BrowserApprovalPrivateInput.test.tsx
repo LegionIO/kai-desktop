@@ -15,6 +15,7 @@ describe('BrowserApprovalPrivateInput', () => {
   it('fetches and displays exact script text only for a Browser-control approval', async () => {
     getToolApprovalPrivateDetails.mockResolvedValue({
       browserInput: { script: 'document.querySelector("#save").click()' },
+      browserTarget: { tabId: 'tab-1', origin: 'https://secret-login.example' },
     });
     render(
       <BrowserApprovalPrivateInput
@@ -27,6 +28,7 @@ describe('BrowserApprovalPrivateInput', () => {
       'document.querySelector("#save").click()',
     );
     expect(getToolApprovalPrivateDetails).toHaveBeenCalledWith('approval-1');
+    expect(screen.getByTestId('browser-private-approval-target')).toHaveTextContent('secret-login.example');
   });
 
   it('does not fetch or retain private input when the approval is inactive', async () => {

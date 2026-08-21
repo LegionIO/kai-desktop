@@ -50,6 +50,9 @@ describe('browser input validation', () => {
     expect(parseBrowserActionRequest({ kind: 'press', keys: ['Control', 'Shift', 'A'] })).toMatchObject({
       keys: ['Control', 'Shift', 'A'],
     });
+    expect(parseBrowserActionRequest({ kind: 'press', keys: ['cmd', 'Enter'] })).toMatchObject({
+      keys: ['cmd', 'Enter'],
+    });
     expect(() => parseBrowserActionRequest({ kind: 'press', keys: ['x', 'Enter'] })).toThrow(/only modifiers/i);
   });
 

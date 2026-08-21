@@ -42,11 +42,15 @@ export const BrowserApprovalPrivateInput: FC<{
   active?: boolean;
 }> = ({ approvalId, args, active = true }) => {
   const [input, setInput] = useState<unknown>(undefined);
+  const [target, setTarget] = useState<{ tabId: string; origin: string; destinationOrigin?: string } | undefined>(
+    undefined,
+  );
   const browserControl = isBrowserControlApproval(args);
 
   useEffect(() => {
     let current = true;
     setInput(undefined);
+    setTarget(undefined);
     if (!active || !browserControl)
       return () => {
         current = false;
@@ -60,6 +64,7 @@ export const BrowserApprovalPrivateInput: FC<{
       .then((details) => {
         if (current && details && Object.prototype.hasOwnProperty.call(details, 'browserInput')) {
           setInput(details.browserInput);
+          setTarget(details.browserTarget);
         }
       })
       .catch(() => undefined);
@@ -69,17 +74,32 @@ export const BrowserApprovalPrivateInput: FC<{
   }, [active, approvalId, browserControl]);
 
   const display = useMemo(() => exactInputText(input), [input]);
-  if (!active || !display) return null;
+  if (!active || (!display && !target)) return null;
 
   return (
-    <section aria-label={display.label} className="space-y-1.5">
-      <p className="text-xs font-medium text-foreground">{display.label}</p>
-      <pre
-        data-testid="browser-private-approval-input"
-        className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] leading-relaxed text-foreground"
-      >
-        {display.text}
-      </pre>
+    <section aria-label={display?.label ?? 'Exact Browser target'} className="space-y-1.5">
+      {target && (
+        <>
+          <p className="text-xs font-medium text-foreground">Exact Browser target</p>
+          <pre
+            data-testid="browser-private-approval-target"
+            className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] leading-relaxed text-foreground"
+          >
+            {JSON.stringify(target, null, 2)}
+          </pre>
+        </>
+      )}
+      {display && (
+        <>
+          <p className="text-xs font-medium text-foreground">{display.label}</p>
+          <pre
+            data-testid="browser-private-approval-input"
+            className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] leading-relaxed text-foreground"
+          >
+            {display.text}
+          </pre>
+        </>
+      )}
       <p className="text-[10px] text-muted-foreground">
         Shown only in this trusted Kai approval UI; chat history keeps it redacted.
       </p>

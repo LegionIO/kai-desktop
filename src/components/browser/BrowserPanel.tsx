@@ -120,6 +120,39 @@ function isEditableBrowserChromeTarget(target: EventTarget | null): boolean {
   return target.closest('[contenteditable]:not([contenteditable="false"])') !== null;
 }
 
+// Main bounds sensitivity probing and capture to five seconds; decoding is
+// separately bounded to two seconds. Keep the real page mounted throughout
+// that legitimate work instead of replacing it with a dark placeholder after
+// an arbitrary UI-frame delay.
+const BROWSER_MENU_PREVIEW_FALLBACK_MS = 7_500;
+const BROWSER_MENU_PREVIEW_DECODE_TIMEOUT_MS = 2_000;
+
+async function decodeBrowserMenuPreview(dataUrl: string, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  if (typeof Image === 'undefined') return true;
+  const image = new Image();
+  image.src = dataUrl;
+  if (typeof image.decode !== 'function') return !signal.aborted;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (decoded: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      signal.removeEventListener('abort', abort);
+      if (!decoded) image.src = '';
+      resolve(decoded && !signal.aborted);
+    };
+    const abort = () => finish(false);
+    const timeout = window.setTimeout(() => finish(false), BROWSER_MENU_PREVIEW_DECODE_TIMEOUT_MS);
+    signal.addEventListener('abort', abort, { once: true });
+    void image.decode().then(
+      () => finish(true),
+      () => finish(false),
+    );
+  });
+}
+
 function clearPanelTabAttention(
   current: Map<string, BrowserAttention>,
   conversationId: string,
@@ -178,17 +211,20 @@ export const BrowserPanelAutoOpen: FC<{
   // passive-effect cleanup for the previous render. Keep one subscription and
   // classify every event against the latest committed render inputs.
   const conversationIdRef = useRef(conversationId);
-  const chatViewActiveRef = useRef(chatViewActive);
+  const browserPanelVisibleRef = useRef(false);
+  const browserPanelVisible = chatViewActive && sidePanelState === 'open' && activeTabId === BROWSER_PANEL_TAB_ID;
   useLayoutEffect(() => {
     conversationIdRef.current = conversationId;
-    chatViewActiveRef.current = chatViewActive;
-  }, [conversationId, chatViewActive]);
-  const browserPanelVisible = chatViewActive && sidePanelState === 'open' && activeTabId === BROWSER_PANEL_TAB_ID;
+    browserPanelVisibleRef.current = browserPanelVisible;
+  }, [browserPanelVisible, chatViewActive, conversationId]);
+  useLayoutEffect(() => {
+    if (!browserPanelVisible || !conversationId) return;
+    setAttentionByConversation((current) => clearPanelTabAttention(current, conversationId));
+  }, [browserPanelVisible, conversationId]);
   const attentionConversationId =
     [...attentionByConversation.keys()].find((candidate) => candidate !== conversationId || !browserPanelVisible) ??
     null;
   const visibleAttention = attentionConversationId ? attentionByConversation.get(attentionConversationId) : undefined;
-  const activeConversationNeedsAttention = conversationId ? attentionByConversation.has(conversationId) : false;
   useEffect(() => {
     const browser = window.app?.browser;
     if (!browser) return;
@@ -204,9 +240,11 @@ export const BrowserPanelAutoOpen: FC<{
         attentionRevision += 1;
       }
       if (event.type === 'open-panel') {
-        if (event.conversationId === conversationIdRef.current && chatViewActiveRef.current) {
+        // This legacy event is attention only. Browser automation is a native
+        // main-process capability and must never mount, reveal, or focus the
+        // sidebar; only the user's explicit Open action may do that.
+        if (event.conversationId === conversationIdRef.current && browserPanelVisibleRef.current) {
           setAttentionByConversation((current) => clearPanelTabAttention(current, event.conversationId));
-          openPanel(BROWSER_PANEL_TAB_ID);
         } else {
           setAttentionByConversation((current) => {
             const next = new Map(current);
@@ -236,9 +274,10 @@ export const BrowserPanelAutoOpen: FC<{
           });
           return next;
         });
-        if (event.conversationId === conversationIdRef.current && chatViewActiveRef.current) {
-          openPanel(BROWSER_PANEL_TAB_ID);
-        }
+        // Prompts are attention only. A delayed page request can arrive after
+        // the user has hidden the Browser, and background AI work must never
+        // mount or focus the sidebar. The user explicitly reveals the prompt
+        // through the attention affordance when they are ready to respond.
       } else if (event.type === 'tabs-changed') {
         setAttentionByConversation((current) => {
           const previous = current.get(event.conversationId);
@@ -303,12 +342,6 @@ export const BrowserPanelAutoOpen: FC<{
     };
   }, [openPanel]);
 
-  useEffect(() => {
-    if (!chatViewActive || !conversationId || !activeConversationNeedsAttention) return;
-    setAttentionByConversation((current) => clearPanelTabAttention(current, conversationId));
-    openPanel(BROWSER_PANEL_TAB_ID);
-  }, [activeConversationNeedsAttention, chatViewActive, conversationId, openPanel]);
-
   if (!attentionConversationId) return null;
   return (
     <div
@@ -316,7 +349,11 @@ export const BrowserPanelAutoOpen: FC<{
       className="fixed bottom-5 left-5 z-[10001] flex max-w-[min(24rem,calc(100vw-2.5rem))] items-center gap-2 rounded-xl border border-amber-500/40 bg-popover px-3 py-2.5 text-xs text-foreground shadow-xl"
     >
       <ShieldAlertIcon className="h-4 w-4 shrink-0 text-amber-500" />
-      <span className="flex-1">The Browser needs attention in another chat or app view.</span>
+      <span className="flex-1">
+        {attentionConversationId === conversationId
+          ? 'The Browser needs attention.'
+          : 'The Browser needs attention in another chat or app view.'}
+      </span>
       <button
         type="button"
         className="rounded bg-primary px-2 py-1 text-primary-foreground"
@@ -387,6 +424,8 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const [bookmarkRevision, setBookmarkRevision] = useState(0);
   const [downloadRevision, setDownloadRevision] = useState(0);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [browserMenuPreview, setBrowserMenuPreview] = useState<string | null>(null);
+  const [browserMenuPreviewPending, setBrowserMenuPreviewPending] = useState(false);
   const [siteInfoOpen, setSiteInfoOpen] = useState(false);
   const [tabMenu, setTabMenu] = useState<{
     tabId: string;
@@ -417,6 +456,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const emptyNewTabButtonRef = useRef<HTMLButtonElement>(null);
   const pendingClosedTabFocusRef = useRef<{ closedTabId: string; preferredTabIds: string[] } | null>(null);
   const suggestionRequestRef = useRef(0);
+  const browserMenuPreviewRequestRef = useRef(0);
+  const browserMenuPreviewAbortRef = useRef<AbortController | null>(null);
+  const browserMenuPageRef = useRef<string | null>(null);
   const stateRequestRef = useRef(0);
   const tabSnapshotRevisionRef = useRef(0);
   const auxiliarySnapshotRevisionRef = useRef({
@@ -432,6 +474,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   const activePermissionOriginRef = useRef<string | null>(null);
   const conversationIdRef = useRef(conversationId);
   const lastNativeMountRef = useRef<string | null | undefined>(undefined);
+  const nativeMountPromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const refreshNativeMountRef = useRef<() => Promise<void>>(async () => {
+    lastNativeMountRef.current = undefined;
+  });
   const activeTabIdRef = useRef<string | null>(null);
   const findTextRef = useRef('');
   const findTabIdRef = useRef<string | null>(null);
@@ -492,6 +538,9 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   }, []);
 
   const active = state?.tabs.find((tab) => tab.active) ?? null;
+  const activeRunningActions = active
+    ? [...runningActions.values()].filter((action) => action.tabId === active.id)
+    : [];
   const activePermissionOrigin = active ? browserPermissionOrigin(active.url) : null;
   activePermissionOriginRef.current = activePermissionOrigin;
   const browserConfig = (config?.browser ?? {}) as {
@@ -508,6 +557,149 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     !active?.reloadRequired &&
     available === true &&
     !!conversationId;
+
+  const dismissBrowserMenu = useCallback(() => {
+    browserMenuPreviewRequestRef.current += 1;
+    browserMenuPreviewAbortRef.current?.abort();
+    browserMenuPreviewAbortRef.current = null;
+    setMenuOpen(false);
+    setBrowserMenuPreview(null);
+    setBrowserMenuPreviewPending(false);
+  }, []);
+
+  const toggleBrowserMenu = useCallback(() => {
+    if (menuOpen || browserMenuPreviewPending) {
+      dismissBrowserMenu();
+      return;
+    }
+    setSiteInfoOpen(false);
+    setTabMenu(null);
+    setBrowserMenuPreview(null);
+    const request = ++browserMenuPreviewRequestRef.current;
+    if (!browser || !conversationId || !active) {
+      setBrowserMenuPreviewPending(false);
+      setMenuOpen(true);
+      return;
+    }
+    const pageIdentity = `${conversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}`;
+    const requestIsCurrent = (): boolean => {
+      const current = stateRef.current?.tabs.find((tab) => tab.active);
+      return (
+        browserMenuPreviewRequestRef.current === request &&
+        browserMenuPageRef.current === pageIdentity &&
+        !!current &&
+        `${conversationId}\u0000${current.id}\u0000${current.url}\u0000${current.updatedAt}` === pageIdentity
+      );
+    };
+    const revealProtectedMenu = async (preview: string | null): Promise<void> => {
+      if (!requestIsCurrent()) return;
+      try {
+        // Native child views paint above React. Do not commit Browser chrome
+        // until main has synchronously hidden/rebounded the real page view.
+        await browser.mount(conversationId, null);
+      } catch (reason) {
+        if (requestIsCurrent()) {
+          reportError(reason);
+          setBrowserMenuPreviewPending(false);
+        } else void refreshNativeMountRef.current();
+        return;
+      }
+      if (!requestIsCurrent()) {
+        // A dismissal or document change can supersede this request while main
+        // is still detaching the native child view. That late detach wins over
+        // an intervening bounds report, so force the current layout effect to
+        // publish its bounds again instead of trusting the cached signature.
+        void refreshNativeMountRef.current();
+        return;
+      }
+      lastNativeMountRef.current = null;
+      setBrowserMenuPreview(preview);
+      setMenuOpen(true);
+      setBrowserMenuPreviewPending(false);
+    };
+    setBrowserMenuPreviewPending(true);
+    if (active.sensitive) {
+      void revealProtectedMenu(null);
+      return;
+    }
+    const controller = new AbortController();
+    const previewRequestId = window.crypto.randomUUID();
+    const cancelNativePreview = () => {
+      void browser.cancelMenuPreview(previewRequestId).catch(() => undefined);
+    };
+    controller.signal.addEventListener('abort', cancelNativePreview, { once: true });
+    browserMenuPreviewAbortRef.current?.abort();
+    browserMenuPreviewAbortRef.current = controller;
+    let revealPromise: Promise<void> | null = null;
+    const startProtectedReveal = (preview: string | null): Promise<void> => {
+      revealPromise ??= revealProtectedMenu(preview);
+      return revealPromise;
+    };
+    // Main admits this presentation-only capture only when the tab is idle.
+    // Its capture and our decode both have explicit deadlines. Leave the real
+    // page mounted until those bounds expire; only then fall back to a protected
+    // placeholder and cancel native work so it cannot block later operations.
+    const fallback = window.setTimeout(() => {
+      if (
+        !controller.signal.aborted &&
+        browserMenuPreviewRequestRef.current === request &&
+        browserMenuPageRef.current === pageIdentity
+      ) {
+        controller.abort();
+        void startProtectedReveal(null);
+      }
+    }, BROWSER_MENU_PREVIEW_FALLBACK_MS);
+    void browser
+      .captureMenuPreview(conversationId, active.id, previewRequestId)
+      .then(async (capture) => {
+        if (!requestIsCurrent()) return;
+        const decoded = capture.dataUrl ? await decodeBrowserMenuPreview(capture.dataUrl, controller.signal) : false;
+        if (!requestIsCurrent()) return;
+        if (controller.signal.aborted) return;
+        await startProtectedReveal(decoded ? (capture.dataUrl ?? null) : null);
+      })
+      .catch(async () => {
+        if (
+          !controller.signal.aborted &&
+          browserMenuPreviewRequestRef.current === request &&
+          browserMenuPageRef.current === pageIdentity
+        ) {
+          await startProtectedReveal(null);
+        }
+      })
+      .finally(() => {
+        window.clearTimeout(fallback);
+        controller.signal.removeEventListener('abort', cancelNativePreview);
+        if (browserMenuPreviewAbortRef.current === controller) browserMenuPreviewAbortRef.current = null;
+        if (!revealPromise && browserMenuPreviewRequestRef.current === request) setBrowserMenuPreviewPending(false);
+      });
+  }, [active, browser, browserMenuPreviewPending, conversationId, dismissBrowserMenu, menuOpen, reportError]);
+
+  useLayoutEffect(() => {
+    const nextPage = active ? `${conversationId}\u0000${active.id}\u0000${active.url}\u0000${active.updatedAt}` : null;
+    const pageChanged = browserMenuPageRef.current !== nextPage;
+    browserMenuPageRef.current = nextPage;
+    if ((menuOpen || browserMenuPreviewPending) && pageChanged) dismissBrowserMenu();
+    // A captured frame belongs to one document only. Switching tabs must not
+    // briefly display pixels from the previous tab beneath Browser chrome.
+  }, [
+    active?.id,
+    active?.updatedAt,
+    active?.url,
+    browserMenuPreviewPending,
+    conversationId,
+    dismissBrowserMenu,
+    menuOpen,
+  ]);
+
+  useEffect(
+    () => () => {
+      browserMenuPreviewRequestRef.current += 1;
+      browserMenuPreviewAbortRef.current?.abort();
+      browserMenuPreviewAbortRef.current = null;
+    },
+    [],
+  );
 
   const refreshState = useCallback(async () => {
     if (!browser || !conversationId) return;
@@ -826,6 +1018,15 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       } else if (event.type === 'download') {
         setLatestDownload(event.download);
         setDownloadRevision((revision) => revision + 1);
+      } else if (event.type === 'download-history-changed') {
+        setLatestDownload((current) => {
+          if (current?.id !== event.downloadId) return current;
+          if (event.change === 'deleted') return null;
+          const unavailable = { ...current };
+          delete unavailable.path;
+          return unavailable;
+        });
+        setDownloadRevision((revision) => revision + 1);
       }
     });
     // Subscribe before hydrating. Native prompts/actions can be emitted between
@@ -898,13 +1099,19 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         : null;
       if (lastNativeMountRef.current === signature) return;
       lastNativeMountRef.current = signature;
-      void browser.mount(conversationId, bounds).catch((reason) => {
+      const mountPromise = browser.mount(conversationId, bounds);
+      // Keep the original promise so screenshot and element-picker commands
+      // fail closed when the native page could not be remounted. The detached
+      // UI error handler is observed separately and must not turn that rejected
+      // mount into an apparently successful one.
+      void mountPromise.catch((reason) => {
         if (lastNativeMountRef.current !== signature) return;
         // Let a later resize or visibility change retry the same bounds instead
         // of permanently caching a failed native mount.
         lastNativeMountRef.current = undefined;
         setError(reason instanceof Error ? reason.message : String(reason));
       });
+      nativeMountPromiseRef.current = mountPromise;
     };
     const report = () => {
       cancelAnimationFrame(raf);
@@ -932,6 +1139,16 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         });
       });
     };
+    const refreshNativeMount = async (): Promise<void> => {
+      lastNativeMountRef.current = undefined;
+      report();
+      // report() publishes bounds in its animation-frame callback. Wait for that
+      // callback to select the current mount promise, then join main's native
+      // attach before starting any page interaction.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await nativeMountPromiseRef.current;
+    };
+    refreshNativeMountRef.current = refreshNativeMount;
     const observedGeometryTargets = new Set<Element>();
     const geometryObserver = new ResizeObserver((entries) => {
       // Ordinary layout elements are admitted as candidates only when their
@@ -1084,6 +1301,11 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       window.visualViewport?.removeEventListener('scroll', report);
       window.visualViewport?.removeEventListener('resize', refreshCandidatesAndReport);
       document.fonts?.removeEventListener('loadingdone', refreshCandidatesAndReport);
+      if (refreshNativeMountRef.current === refreshNativeMount) {
+        refreshNativeMountRef.current = async () => {
+          lastNativeMountRef.current = undefined;
+        };
+      }
       lastNativeMountRef.current = undefined;
       void browser.mount(conversationId, null).catch(() => undefined);
     };
@@ -1275,12 +1497,16 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   };
 
   useEffect(() => {
-    if (!menuOpen && !siteInfoOpen && !tabMenu) return;
+    if (!menuOpen && !browserMenuPreviewPending && !siteInfoOpen && !tabMenu) return;
     const dismissOutside = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (menuOpen && !menuContainerRef.current?.contains(target) && !browserMenuRef.current?.contains(target))
-        setMenuOpen(false);
+      if (
+        (menuOpen || browserMenuPreviewPending) &&
+        !menuContainerRef.current?.contains(target) &&
+        !browserMenuRef.current?.contains(target)
+      )
+        dismissBrowserMenu();
       if (
         siteInfoOpen &&
         !siteInfoTriggerRef.current?.contains(target) &&
@@ -1292,13 +1518,19 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
     };
     document.addEventListener('pointerdown', dismissOutside, true);
     return () => document.removeEventListener('pointerdown', dismissOutside, true);
-  }, [menuOpen, siteInfoOpen, tabMenu]);
+  }, [browserMenuPreviewPending, dismissBrowserMenu, menuOpen, siteInfoOpen, tabMenu]);
 
   const screenshot = async (mode: 'viewport' | 'full-page' | 'element') => {
     if (!browser || !conversationId || !active) return;
-    setMenuOpen(false);
+    dismissBrowserMenu();
     setError(null);
     try {
+      // Menu dismissal is a React commit, while the native Chromium view is
+      // mounted by the following layout/animation-frame pass. Join that mount
+      // before capture or element picking so these commands never race the
+      // protected menu-preview surface.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await refreshNativeMountRef.current();
       let selector: string | undefined;
       let documentToken: string | undefined;
       if (mode === 'element') {
@@ -1321,10 +1553,10 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   useEffect(() => {
     if (!browser || !conversationId) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && (menuOpen || siteInfoOpen || tabMenu)) {
+      if (event.key === 'Escape' && (menuOpen || browserMenuPreviewPending || siteInfoOpen || tabMenu)) {
         event.preventDefault();
         const restoreSiteInfoTrigger = siteInfoOpen;
-        setMenuOpen(false);
+        dismissBrowserMenu();
         setSiteInfoOpen(false);
         setTabMenu(null);
         if (restoreSiteInfoTrigger) requestAnimationFrame(() => siteInfoTriggerRef.current?.focus());
@@ -1397,10 +1629,12 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   }, [
     active,
     browser,
+    browserMenuPreviewPending,
     command,
     closeTab,
     conversationId,
     createTab,
+    dismissBrowserMenu,
     findOpen,
     findText,
     menuOpen,
@@ -1477,7 +1711,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
             onContextMenu={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              setMenuOpen(false);
+              dismissBrowserMenu();
               setSiteInfoOpen(false);
               setTabMenu({ tabId: tab.id, x: event.clientX, y: event.clientY });
             }}
@@ -1595,7 +1829,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
               ref={siteInfoTriggerRef}
               type="button"
               onClick={() => {
-                setMenuOpen(false);
+                dismissBrowserMenu();
                 setTabMenu(null);
                 setSiteInfoOpen((open) => !open);
               }}
@@ -1793,15 +2027,15 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
             </div>
           )}
         </div>
-        {runningActions.size > 0 && (
+        {activeRunningActions.length > 0 && (
           <span
             role="status"
             aria-live="polite"
             className="max-w-24 truncate rounded-full bg-violet-500/15 px-2 py-1 text-[9px] text-violet-600"
           >
-            {runningActions.size === 1
-              ? `Kai · ${runningActions.values().next().value?.summary ?? 'working'}`
-              : `Kai · ${runningActions.size} actions`}
+            {activeRunningActions.length === 1
+              ? `Kai · ${activeRunningActions[0]?.summary ?? 'working'}`
+              : `Kai · ${activeRunningActions.length} actions`}
           </span>
         )}
         <button
@@ -1816,11 +2050,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
           <button
             ref={menuTriggerRef}
             className={iconButton}
-            onClick={() => {
-              setSiteInfoOpen(false);
-              setTabMenu(null);
-              setMenuOpen((open) => !open);
-            }}
+            onClick={toggleBrowserMenu}
             title="Browser menu"
             aria-haspopup="menu"
             aria-expanded={menuOpen}
@@ -1835,7 +2065,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
               }}
               onSelect={(action) => void handleMenuAction(action).catch(reportError)}
               onDismiss={() => {
-                setMenuOpen(false);
+                dismissBrowserMenu();
                 requestAnimationFrame(() => {
                   if (managerViewRef.current === null) menuTriggerRef.current?.focus();
                 });
@@ -1956,7 +2186,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         <PermissionPrompt
           key={permissionPrompts[0].id}
           prompt={permissionPrompts[0]}
-          shouldFocus={!authPrompts[0]}
+          shouldFocus={!authPrompts[0] && !permissionPrompts[0].assistantTriggered}
           canFocus={canFocusBrowserPrompt}
           onError={(message) => setError(message)}
           onClose={() => {
@@ -1970,7 +2200,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         <AuthPrompt
           key={authPrompts[0].id}
           prompt={authPrompts[0]}
-          shouldFocus
+          shouldFocus={!authPrompts[0].assistantTriggered}
           canFocus={canFocusBrowserPrompt}
           onError={(message) => setError(message)}
           onClose={() => {
@@ -1987,9 +2217,16 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
             <button
               type="button"
               className="min-w-0 flex-1 truncate text-left hover:underline"
-              onClick={() => void browser.showDownload(conversationId, latestDownload.id).catch(reportError)}
+              onClick={() =>
+                void (
+                  latestDownload.quarantined
+                    ? browser.exportDownload(conversationId, latestDownload.id)
+                    : browser.showDownload(conversationId, latestDownload.id)
+                ).catch(reportError)
+              }
             >
               {latestDownload.filename} · {latestDownload.state}
+              {latestDownload.quarantined && latestDownload.state === 'completed' ? ' · export to use' : ''}
             </button>
           ) : (
             <span className="min-w-0 flex-1 truncate text-left text-muted-foreground">
@@ -2026,6 +2263,36 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
         data-browser-native-surface
         className="relative min-h-0 flex-1 bg-white dark:bg-neutral-950"
       >
+        {menuOpen && !managerView && active && (
+          <div
+            data-testid="browser-menu-page-preview"
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center overflow-hidden bg-background"
+          >
+            {browserMenuPreview ? (
+              <img
+                src={browserMenuPreview}
+                alt=""
+                draggable={false}
+                className="h-full w-full select-none object-fill"
+              />
+            ) : (
+              <div className="flex max-w-64 flex-col items-center gap-2 px-4 text-center text-muted-foreground">
+                {browserMenuPreviewPending ? (
+                  <Loader2Icon className="h-5 w-5 animate-spin" />
+                ) : (
+                  <ShieldCheckIcon className="h-5 w-5" />
+                )}
+                <p className="text-xs">
+                  {active.sensitive
+                    ? 'Sensitive page hidden while Browser controls are open.'
+                    : browserMenuPreviewPending
+                      ? 'Preserving the current page…'
+                      : 'Page preview unavailable while Browser controls are open.'}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
         {managerView && (
           <BrowserManagerView
             key={`${conversationId}:${appliedDataScope}:${managerView}:${managerRevision}`}
@@ -2129,7 +2396,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
   );
 
   async function handleMenuAction(action: string) {
-    setMenuOpen(false);
+    dismissBrowserMenu();
     if (!browser || !conversationId) return;
     const movesFocus =
       action === 'new-tab' ||
@@ -2159,7 +2426,7 @@ const BrowserPanelContent: FC<{ conversationId: string | null }> = ({ conversati
       else if (
         action === 'clear' &&
         window.confirm(
-          'Clear browser cookies, storage, history, bookmarks, permissions, saved passwords, and retained Browser screenshots for the current browser profile? Downloaded files are kept.',
+          'Clear browser cookies, storage, history, bookmarks, permissions, saved passwords, retained Browser screenshots, and unexported assistant download quarantine copies for the current browser profile? Files you already exported or saved remain on disk.',
         )
       ) {
         setError(null);
@@ -3056,7 +3323,14 @@ const BrowserManagerView: FC<{
               }`}
               icon={<DownloadIcon className="h-4 w-4" />}
               onOpen={
-                item.path ? () => void perform(() => app.browser.showDownload(conversationId, item.id)) : undefined
+                item.path
+                  ? () =>
+                      void perform(() =>
+                        item.quarantined
+                          ? app.browser.exportDownload(conversationId, item.id).then(() => undefined)
+                          : app.browser.showDownload(conversationId, item.id),
+                      )
+                  : undefined
               }
               action={
                 item.state === 'progressing' ? (
@@ -3073,6 +3347,34 @@ const BrowserManagerView: FC<{
                   >
                     <XIcon className="h-3.5 w-3.5" />
                   </button>
+                ) : item.quarantined ? (
+                  <div className="flex items-center gap-1">
+                    {item.path && item.state === 'completed' && (
+                      <button
+                        type="button"
+                        className={iconButton}
+                        title={`Export ${item.filename}`}
+                        onClick={() =>
+                          void perform(() => app.browser.exportDownload(conversationId, item.id).then(() => undefined))
+                        }
+                      >
+                        <DownloadIcon className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className={iconButton}
+                      title={`Delete ${item.filename}`}
+                      onClick={() =>
+                        void perform(async () => {
+                          await app.browser.deleteDownload(conversationId, item.id);
+                          await reload();
+                        })
+                      }
+                    >
+                      <Trash2Icon className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ) : undefined
               }
             />

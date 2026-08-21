@@ -10,6 +10,7 @@ import type {
 import { browserActionRequestSchema, browserScreenshotToolInputSchema } from '../browser/input-validation.js';
 import { MAX_BROWSER_URL_CHARS } from '../browser/metadata.js';
 import { fitBrowserScreenshotForModel } from '../browser/screenshots.js';
+import { sanitizeBrowserNetworkError } from '../browser/network-diagnostics.js';
 import { broadcastStreamEventRaw, registerPendingApproval } from '../ipc/tool-approval.js';
 import type {
   BrowserActionRequest,
@@ -124,10 +125,17 @@ export function browserApprovalArgs(
   target?: BrowserApprovalTarget,
 ): Record<string, unknown> {
   const displayInput = redactBrowserToolArgsForExposure(toolName, input);
+  const displayTarget = target
+    ? {
+        tabId: target.tabId,
+        origin: '[redacted Browser origin]',
+        ...(target.destinationOrigin ? { destinationOrigin: '[redacted Browser origin]' } : {}),
+      }
+    : undefined;
   const source =
     displayInput && typeof displayInput === 'object' && !Array.isArray(displayInput)
-      ? { ...(displayInput as Record<string, unknown>), ...(target ? { target } : {}) }
-      : { input: displayInput, ...(target ? { target } : {}) };
+      ? { ...(displayInput as Record<string, unknown>), ...(displayTarget ? { target: displayTarget } : {}) }
+      : { input: displayInput, ...(displayTarget ? { target: displayTarget } : {}) };
   const budget = { remaining: MAX_APPROVAL_ARGUMENT_CHARS, truncated: false };
   const bounded = boundedApprovalValue(source, budget);
   if (budget.truncated) {
@@ -167,6 +175,25 @@ function assistantRun(
   return run;
 }
 
+function assistantTargetResolver(
+  manager: ReturnType<typeof getBrowserManager>,
+  activeConversationId: string,
+  requestedTabId: string | undefined,
+  run: { id: string; abortSignal?: AbortSignal },
+): (commit?: boolean) => string {
+  let previewedTabId: string | undefined;
+  return (commit = false) => {
+    if (!commit) {
+      previewedTabId ??= manager.previewAssistantTabId(activeConversationId, requestedTabId, run);
+      return previewedTabId;
+    }
+    // Ask-policy capture is descriptive only. Commit the exact previewed tab
+    // only after approval succeeds so a denial cannot mutate this run's
+    // implicit background target.
+    return manager.resolveAssistantTabId(activeConversationId, previewedTabId ?? requestedTabId, run);
+  };
+}
+
 function assertBrowserToolAvailable(getConfig: () => AppConfig, context: ToolExecutionContext): void {
   if (context.abortSignal?.aborted) throw new Error('Browser action was cancelled.');
   if (!getConfig().browser.enabled) throw new Error('The in-app browser is disabled in Settings.');
@@ -188,6 +215,7 @@ async function enforcePolicy<Approval = never>(
     throw new Error(`${toolName} requires approval from a live user.`);
   }
   const approval = await captureApproval?.();
+  const approvalTarget = capturedApprovalTarget(approval);
   const decisionPromise = registerPendingApproval(context.toolCallId, context.abortSignal, 'native-browser', {
     conversationId: context.conversationId,
     browserOwnerId: context.browserOwnerId,
@@ -195,14 +223,17 @@ async function enforcePolicy<Approval = never>(
     // retained only for the lifetime of this pending approval and is available
     // through an authority-checked native IPC so the user can make an informed
     // decision (especially for arbitrary browser_evaluate JavaScript).
-    privateDetails: { browserInput: input },
+    privateDetails: {
+      browserInput: input,
+      ...(approvalTarget ? { browserTarget: approvalTarget } : {}),
+    },
   });
   broadcastStreamEventRaw({
     conversationId: context.conversationId,
     type: 'tool-approval-required',
     toolCallId: context.toolCallId,
     toolName,
-    args: browserApprovalArgs(toolName, input, reason, capturedApprovalTarget(approval)),
+    args: browserApprovalArgs(toolName, input, reason, approvalTarget),
   });
   const decision = await decisionPromise;
   if (decision !== true)
@@ -214,18 +245,17 @@ async function enforcePolicy<Approval = never>(
   return approval;
 }
 
-const tabId = z.string().uuid().optional().describe('Tab id. Omit to use the active tab.');
+const tabId = z.string().uuid().optional().describe("Tab id. Omit to use this assistant run's current background tab.");
 
 export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[] {
   const browserTabs: ToolDefinition = {
     name: 'browser_tabs',
     description:
-      'List and manage the current chat’s in-app browser tabs. Tabs opened by the assistant close when the turn ends unless keep_open is set.',
+      'List and manage the current chat’s in-app Chromium tabs. Tabs load and remain controllable in the background without the Browser sidebar being mounted, visible, or focused. Assistant tabs close when the turn ends unless keep_open is set.',
     inputSchema: z.object({
       action: z.enum([
         'list',
         'open',
-        'activate',
         'close',
         'duplicate',
         'reopen_closed',
@@ -243,7 +273,6 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         action:
           | 'list'
           | 'open'
-          | 'activate'
           | 'close'
           | 'duplicate'
           | 'reopen_closed'
@@ -277,8 +306,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       }
       const tabsAction = payload.action as BrowserTabsApproval['action'];
       const requiresTarget = payload.action !== 'open' && payload.action !== 'reopen_closed';
-      const targetTabId = requiresTarget ? (payload.tabId ?? manager.getState(cid).activeTabId) : undefined;
-      if (requiresTarget && !targetTabId) throw new Error(`No active browser tab is available for ${payload.action}.`);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const approvedTabs = await enforcePolicy<BrowserTabsApproval>(
         () => getConfig().browser.structuredActions,
         'browser_tabs',
@@ -286,7 +314,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         undefined,
-        () => manager.captureTabsApproval(cid, tabsAction, targetTabId ?? undefined),
+        () => manager.captureTabsApproval(cid, tabsAction, requiresTarget ? resolveTarget() : undefined, run),
       );
       assertBrowserToolAvailable(getConfig, context);
       if (payload.action === 'open') {
@@ -305,6 +333,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         const reopened = await manager.reopenClosedTab(cid, 'assistant', run, approvedTabs);
         return { ok: reopened !== null, action: payload.action, tabId: reopened?.id ?? null };
       }
+      const targetTabId = resolveTarget(true);
       if (payload.action === 'duplicate') {
         const duplicated = await manager.duplicateAssistantTab(cid, targetTabId!, run, approvedTabs);
         return { ok: true, action: payload.action, tabId: duplicated.id };
@@ -324,7 +353,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
   const browserInspect: ToolDefinition = {
     name: 'browser_inspect',
     description:
-      'Inspect visible text and interactive elements in a current-chat browser tab. Password values are excluded, and inspection is blocked while password data is present.',
+      'Inspect page text and interactive elements in a current-chat browser tab, including while the Browser sidebar is hidden or unmounted. Password values are excluded, and inspection is blocked while password data is present.',
     inputSchema: z.object({ tabId }),
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
@@ -332,6 +361,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const approvedDocument = await enforcePolicy<BrowserDocumentApproval>(
         () => getConfig().browser.readAccess ?? 'allow',
         'browser_inspect',
@@ -339,19 +369,67 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         undefined,
-        () => manager.captureDocumentApproval(cid, payload.tabId),
+        () => manager.captureDocumentApproval(cid, resolveTarget(), run),
       );
       assertBrowserToolAvailable(getConfig, context);
-      const inspection = await manager.inspect(cid, approvedDocument?.tabId ?? payload.tabId, run, approvedDocument);
+      const targetTabId = resolveTarget(true);
+      const inspection = await manager.inspect(cid, approvedDocument?.tabId ?? targetTabId, run, approvedDocument);
       const identity = assistantVisiblePageIdentity({ ...inspection, sensitive: false });
       return { ...inspection, title: identity.title, url: identity.url };
+    },
+  };
+
+  const browserNetwork: ToolDefinition = {
+    name: 'browser_network',
+    description:
+      'Inspect bounded page-load timings and recent network requests for a current-chat Browser tab, including during background operation with no mounted sidebar. Request and response bodies, headers, hostnames, credentials, paths, query strings, and fragments are never returned; opaque origin tokens correlate requests safely. Can wait for the load event or a network-idle window.',
+    inputSchema: z.object({
+      tabId,
+      waitFor: z.enum(['none', 'load', 'network-idle']).optional().default('none'),
+      limit: z.number().int().min(1).max(100).optional().default(50),
+      timeoutMs: z.number().int().min(100).max(30_000).optional().default(10_000),
+      idleMs: z.number().int().min(100).max(5_000).optional().default(500),
+    }),
+    execute: async (input, context) => {
+      assertBrowserToolAvailable(getConfig, context);
+      const payload = input as {
+        tabId?: string;
+        waitFor?: 'none' | 'load' | 'network-idle';
+        limit?: number;
+        timeoutMs?: number;
+        idleMs?: number;
+      };
+      const cid = conversationId(context);
+      const manager = getBrowserManager();
+      const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
+      const approvedDocument = await enforcePolicy<BrowserDocumentApproval>(
+        () => getConfig().browser.readAccess ?? 'allow',
+        'browser_network',
+        'Inspect page-load timing and recent network requests',
+        payload,
+        context,
+        undefined,
+        () => manager.captureDocumentApproval(cid, resolveTarget(), run),
+      );
+      assertBrowserToolAvailable(getConfig, context);
+      const targetTabId = resolveTarget(true);
+      const request = { ...payload, tabId: approvedDocument?.tabId ?? targetTabId };
+      try {
+        return await manager.networkDiagnostics(cid, request, run, approvedDocument);
+      } catch (error) {
+        // The network tool promises not to expose hostnames. The generic
+        // Browser sanitizer intentionally retains bare HTTP(S) origins, so
+        // collapse native/load failures to bounded Chromium error codes here.
+        throw new Error(sanitizeBrowserNetworkError(error) ?? 'Network request failed.');
+      }
     },
   };
 
   const browserAction: ToolDefinition = {
     name: 'browser_action',
     description:
-      'Interact with the in-app Chromium browser using real mouse/keyboard input or semantic element targeting. Actions are shown live in the Browser sidebar.',
+      'Interact with the in-app Chromium browser using real mouse/keyboard input or semantic element targeting. No mounted, visible, or focused Browser sidebar is required; when the sidebar is already open it mirrors actions live.',
     inputSchema: browserActionRequestSchema,
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
@@ -359,6 +437,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const approvedDocument = await enforcePolicy<BrowserDocumentApproval>(
         () => getConfig().browser.structuredActions,
         'browser_action',
@@ -366,10 +445,11 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         undefined,
-        () => manager.captureDocumentApproval(cid, payload.tabId),
+        () => manager.captureDocumentApproval(cid, resolveTarget(), run),
       );
       assertBrowserToolAvailable(getConfig, context);
-      const request = approvedDocument ? { ...payload, tabId: approvedDocument.tabId } : payload;
+      const targetTabId = resolveTarget(true);
+      const request = { ...payload, tabId: approvedDocument?.tabId ?? targetTabId };
       const result = approvedDocument
         ? await manager.action(cid, request, run, approvedDocument)
         : await manager.action(cid, request, run);
@@ -383,7 +463,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
   const browserScreenshot: ToolDefinition = {
     name: 'browser_screenshot',
     description:
-      'Capture the browser viewport, complete page, or a CSS-selected component. The image is returned directly to the model and can optionally be retained as a Kai media file.',
+      'Capture the browser viewport, complete page, or a CSS-selected component even while the Browser sidebar is hidden or unmounted. The image is returned directly to the model and can optionally be retained as a Kai media file.',
     inputSchema: browserScreenshotToolInputSchema,
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
@@ -396,6 +476,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const approvedDocument = await enforcePolicy<BrowserDocumentApproval>(
         () => getConfig().browser.readAccess ?? 'allow',
         'browser_screenshot',
@@ -403,10 +484,11 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         undefined,
-        () => manager.captureDocumentApproval(cid, payload.tabId),
+        () => manager.captureDocumentApproval(cid, resolveTarget(), run),
       );
       assertBrowserToolAvailable(getConfig, context);
-      const request = approvedDocument ? { ...payload, tabId: approvedDocument.tabId } : payload;
+      const targetTabId = resolveTarget(true);
+      const request = { ...payload, tabId: approvedDocument?.tabId ?? targetTabId };
       const { shot, modelImage } = await manager.screenshot(
         cid,
         request,
@@ -449,7 +531,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
   const browserEvaluate: ToolDefinition = {
     name: 'browser_evaluate',
     description:
-      'Run JavaScript in the active web page and return a bounded JSON-serializable result. Controlled separately by the Browser script-injection policy.',
+      'Run JavaScript in a current-chat page in the background and return a bounded JSON-serializable result; no mounted Browser sidebar is required. Controlled separately by the Browser script-injection policy.',
     inputSchema: z.object({ tabId, script: z.string().min(1).max(100_000) }),
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
@@ -457,6 +539,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const approvedDocument = await enforcePolicy<BrowserDocumentApproval>(
         () => getConfig().browser.scriptInjection,
         'browser_evaluate',
@@ -464,13 +547,14 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         undefined,
-        () => manager.captureDocumentApproval(cid, payload.tabId),
+        () => manager.captureDocumentApproval(cid, resolveTarget(), run),
       );
       assertBrowserToolAvailable(getConfig, context);
+      const targetTabId = resolveTarget(true);
       return {
         result: approvedDocument
           ? await manager.evaluate(cid, payload.script, approvedDocument.tabId, run, approvedDocument)
-          : await manager.evaluate(cid, payload.script, payload.tabId, run),
+          : await manager.evaluate(cid, payload.script, targetTabId, run),
       };
     },
   };
@@ -478,7 +562,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
   const browserAutofill: ToolDefinition = {
     name: 'browser_autofill',
     description:
-      'Fill a matching saved credential into the current page without revealing the password. Availability follows the Browser password AI-access policy.',
+      'Fill a matching saved credential into the current page without revealing the password, including while the Browser sidebar is hidden or unmounted. Availability follows the Browser password AI-access policy.',
     inputSchema: z.object({ tabId, credentialId: z.string().uuid().optional() }),
     execute: async (input, context) => {
       assertBrowserToolAvailable(getConfig, context);
@@ -486,6 +570,7 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
       const cid = conversationId(context);
       const manager = getBrowserManager();
       const run = assistantRun(context, cid);
+      const resolveTarget = assistantTargetResolver(manager, cid, payload.tabId, run);
       const passwordPolicy = (): BrowserControlPolicy => {
         const policy = getConfig().browser.passwordAccess;
         return policy === 'automatic' ? 'allow' : policy === 'ask' ? 'ask' : 'deny';
@@ -497,12 +582,11 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
         payload,
         context,
         'Saved-password autofill is user-only in Browser Settings.',
-        () => manager.captureAutofillApproval(cid, payload.tabId, payload.credentialId, run),
+        () => manager.captureAutofillApproval(cid, resolveTarget(), payload.credentialId, run),
       );
       assertBrowserToolAvailable(getConfig, context);
-      const state = manager.getState(cid);
-      const resolvedTabId = approvedDocument?.tabId ?? payload.tabId ?? state.activeTabId;
-      if (!resolvedTabId) throw new Error('No active browser tab.');
+      const targetTabId = resolveTarget(true);
+      const resolvedTabId = approvedDocument?.tabId ?? targetTabId;
       if (approvedDocument) {
         await manager.autofill(cid, resolvedTabId, payload.credentialId, 'assistant', run, approvedDocument);
       } else {
@@ -512,20 +596,26 @@ export function createBrowserTools(getConfig: () => AppConfig): ToolDefinition[]
     },
   };
 
-  return [browserTabs, browserInspect, browserAction, browserScreenshot, browserEvaluate, browserAutofill].map(
-    (tool) => {
-      const execute = tool.execute;
-      return {
-        ...tool,
-        source: 'browser' as const,
-        execute: async (input: unknown, context: ToolExecutionContext) => {
-          try {
-            return await execute(input, context);
-          } catch (error) {
-            throw new Error(redactBrowserToolErrorForExposure(tool.name, error));
-          }
-        },
-      };
-    },
-  );
+  return [
+    browserTabs,
+    browserInspect,
+    browserNetwork,
+    browserAction,
+    browserScreenshot,
+    browserEvaluate,
+    browserAutofill,
+  ].map((tool) => {
+    const execute = tool.execute;
+    return {
+      ...tool,
+      source: 'browser' as const,
+      execute: async (input: unknown, context: ToolExecutionContext) => {
+        try {
+          return await execute(input, context);
+        } catch (error) {
+          throw new Error(redactBrowserToolErrorForExposure(tool.name, error));
+        }
+      },
+    };
+  });
 }

@@ -4,6 +4,12 @@ import type { BrowserTabsReadApproval } from '../../browser/manager.js';
 
 const manager = {
   assertAssistantRun: vi.fn(),
+  previewAssistantTabId: vi.fn(
+    (_conversationId: string, requestedTabId?: string) => requestedTabId ?? '00000000-0000-0000-0000-000000000001',
+  ),
+  resolveAssistantTabId: vi.fn(
+    (_conversationId: string, requestedTabId?: string) => requestedTabId ?? '00000000-0000-0000-0000-000000000001',
+  ),
   getState: vi.fn(),
   createTab: vi.fn(),
   duplicateAssistantTab: vi.fn(),
@@ -42,6 +48,7 @@ const manager = {
     destinationOrigin: 'https://login.example',
   })),
   inspect: vi.fn(),
+  networkDiagnostics: vi.fn(),
   action: vi.fn(),
   screenshot: vi.fn(),
   evaluate: vi.fn(),
@@ -98,7 +105,15 @@ function mockScreenshotResult(result: Record<string, unknown>): void {
 }
 
 describe('browser tools', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    manager.previewAssistantTabId.mockImplementation(
+      (_conversationId: string, requestedTabId?: string) => requestedTabId ?? '00000000-0000-0000-0000-000000000001',
+    );
+    manager.resolveAssistantTabId.mockImplementation(
+      (_conversationId: string, requestedTabId?: string) => requestedTabId ?? '00000000-0000-0000-0000-000000000001',
+    );
+  });
 
   it('lists only the active conversation state and marks assistant-created tabs', async () => {
     manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [], activeTabId: null });
@@ -347,31 +362,44 @@ describe('browser tools', () => {
     expect(manager.duplicateAssistantTab).toHaveBeenCalledWith('chat-1', id, assistantRun, undefined);
   });
 
-  it('marks tab commands as assistant initiated', async () => {
-    manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [], activeTabId: null });
+  it('does not expose presentation activation to the assistant', () => {
     const tabs = createBrowserTools(() => config()).find((tool) => tool.name === 'browser_tabs')!;
     const id = '00000000-0000-0000-0000-000000000001';
 
-    await tabs.execute({ action: 'activate', tabId: id }, context);
-
-    expect(manager.commandTab).toHaveBeenCalledWith('chat-1', id, 'activate', 'assistant', assistantRun, undefined);
+    expect(tabs.inputSchema.safeParse({ action: 'activate', tabId: id }).success).toBe(false);
   });
 
-  it('uses the active tab when a tab command omits tabId', async () => {
+  it('uses the assistant run target when a tab command omits tabId', async () => {
     const id = '00000000-0000-0000-0000-000000000001';
-    manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [{ id }], activeTabId: id });
     const tabs = createBrowserTools(() => config()).find((tool) => tool.name === 'browser_tabs')!;
 
     await tabs.execute({ action: 'close' }, context);
 
     expect(manager.commandTab).toHaveBeenCalledWith('chat-1', id, 'close', 'assistant', assistantRun, undefined);
+    expect(manager.resolveAssistantTabId).toHaveBeenCalledWith('chat-1', undefined, assistantRun);
   });
 
-  it('reports a clear error when a tab command omits tabId without an active tab', async () => {
-    manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [], activeTabId: null });
+  it('reports a clear error when a tab command omits tabId without an assistant target', async () => {
+    manager.resolveAssistantTabId.mockImplementationOnce(() => {
+      throw new Error('Browser tab not found in this chat.');
+    });
     const tabs = createBrowserTools(() => config()).find((tool) => tool.name === 'browser_tabs')!;
 
-    await expect(tabs.execute({ action: 'close' }, context)).rejects.toThrow(/No active browser tab/);
+    await expect(tabs.execute({ action: 'close' }, context)).rejects.toThrow(/not found in this chat/);
+    expect(manager.commandTab).not.toHaveBeenCalled();
+  });
+
+  it('does not commit an explicitly previewed tab when ask-policy approval is denied', async () => {
+    const id = '00000000-0000-0000-0000-000000000002';
+    registerPendingApproval.mockResolvedValueOnce(false);
+    const tabs = createBrowserTools(() => config({ structuredActions: 'ask' })).find(
+      (tool) => tool.name === 'browser_tabs',
+    )!;
+
+    await expect(tabs.execute({ action: 'close', tabId: id }, context)).rejects.toThrow(/approval was denied/i);
+
+    expect(manager.previewAssistantTabId).toHaveBeenCalledWith('chat-1', id, assistantRun);
+    expect(manager.resolveAssistantTabId).not.toHaveBeenCalled();
     expect(manager.commandTab).not.toHaveBeenCalled();
   });
 
@@ -391,7 +419,7 @@ describe('browser tools', () => {
     expect(manager.action).not.toHaveBeenCalled();
   });
 
-  it('enforces the independent read policy for tab listing, inspection, and screenshots', async () => {
+  it('enforces the independent read policy for tab listing, inspection, network diagnostics, and screenshots', async () => {
     manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [], activeTabId: null });
     const tools = createBrowserTools(() => config({ readAccess: 'deny' }));
 
@@ -401,12 +429,16 @@ describe('browser tools', () => {
     await expect(tools.find((tool) => tool.name === 'browser_inspect')!.execute({}, context)).rejects.toThrow(
       /disabled/,
     );
+    await expect(tools.find((tool) => tool.name === 'browser_network')!.execute({}, context)).rejects.toThrow(
+      /disabled/,
+    );
     await expect(
       tools.find((tool) => tool.name === 'browser_screenshot')!.execute({ mode: 'viewport' }, context),
     ).rejects.toThrow(/disabled/);
 
     expect(manager.getState).not.toHaveBeenCalled();
     expect(manager.inspect).not.toHaveBeenCalled();
+    expect(manager.networkDiagnostics).not.toHaveBeenCalled();
     expect(manager.screenshot).not.toHaveBeenCalled();
   });
 
@@ -492,6 +524,13 @@ describe('browser tools', () => {
         denied: { readAccess: 'deny' as const },
         input: {},
         called: manager.inspect,
+      },
+      {
+        toolName: 'browser_network',
+        initial: { readAccess: 'ask' as const },
+        denied: { readAccess: 'deny' as const },
+        input: { waitFor: 'load' },
+        called: manager.networkDiagnostics,
       },
       {
         toolName: 'browser_screenshot',
@@ -602,7 +641,7 @@ describe('browser tools', () => {
           value: '[redacted typed text: 18 characters]',
           target: {
             tabId: '00000000-0000-0000-0000-000000000001',
-            origin: 'https://example.com',
+            origin: '[redacted Browser origin]',
           },
           approvalKind: 'browser-control',
           reason: 'Interact with the current web page',
@@ -614,7 +653,10 @@ describe('browser tools', () => {
     expect(registerPendingApproval).toHaveBeenCalledWith('tool-1', context.abortSignal, 'native-browser', {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
-      privateDetails: { browserInput: input },
+      privateDetails: {
+        browserInput: input,
+        browserTarget: expect.objectContaining({ origin: 'https://example.com' }),
+      },
     });
     expect(manager.action).toHaveBeenCalledWith(
       'chat-1',
@@ -668,9 +710,9 @@ describe('browser tools', () => {
     await tabs.execute({ action: 'reopen_closed' }, context);
     await tabs.execute({ action: 'close_right', tabId: id }, context);
 
-    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(1, 'chat-1', 'duplicate', id);
-    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(2, 'chat-1', 'reopen_closed', undefined);
-    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(3, 'chat-1', 'close_right', id);
+    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(1, 'chat-1', 'duplicate', id, assistantRun);
+    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(2, 'chat-1', 'reopen_closed', undefined, assistantRun);
+    expect(manager.captureTabsApproval).toHaveBeenNthCalledWith(3, 'chat-1', 'close_right', id, assistantRun);
     expect(manager.duplicateAssistantTab).toHaveBeenCalledWith('chat-1', id, assistantRun, approvals.get('duplicate'));
     expect(manager.reopenClosedTab).toHaveBeenCalledWith(
       'chat-1',
@@ -714,9 +756,9 @@ describe('browser tools', () => {
     await tools.find((tool) => tool.name === 'browser_evaluate')!.execute({ script: 'document.title' }, context);
     await tools.find((tool) => tool.name === 'browser_autofill')!.execute({}, context);
 
-    expect(manager.captureDocumentApproval).toHaveBeenNthCalledWith(1, 'chat-1', undefined);
-    expect(manager.captureDocumentApproval).toHaveBeenNthCalledWith(2, 'chat-1', undefined);
-    expect(manager.captureAutofillApproval).toHaveBeenCalledWith('chat-1', undefined, undefined, assistantRun);
+    expect(manager.captureDocumentApproval).toHaveBeenNthCalledWith(1, 'chat-1', approval.tabId, assistantRun);
+    expect(manager.captureDocumentApproval).toHaveBeenNthCalledWith(2, 'chat-1', approval.tabId, assistantRun);
+    expect(manager.captureAutofillApproval).toHaveBeenCalledWith('chat-1', approval.tabId, undefined, assistantRun);
     expect(manager.action).toHaveBeenCalledWith(
       'chat-1',
       { kind: 'wait', waitMs: 0, tabId: approval.tabId },
@@ -729,8 +771,8 @@ describe('browser tools', () => {
         args: expect.objectContaining({
           target: {
             tabId: approval.tabId,
-            origin: approval.origin,
-            destinationOrigin: 'https://login.example',
+            origin: '[redacted Browser origin]',
+            destinationOrigin: '[redacted Browser origin]',
           },
         }),
       }),
@@ -769,6 +811,7 @@ describe('browser tools', () => {
       activeTabId: documentApproval.tabId,
     });
     manager.inspect.mockResolvedValue({ tabId: documentApproval.tabId, url: 'https://example.com', title: 'Example' });
+    manager.networkDiagnostics.mockResolvedValue({ tabId: documentApproval.tabId, requests: [] });
     mockScreenshotResult({
       tabId: documentApproval.tabId,
       mode: 'viewport',
@@ -781,11 +824,18 @@ describe('browser tools', () => {
 
     await tools.find((tool) => tool.name === 'browser_tabs')!.execute({ action: 'list' }, context);
     await tools.find((tool) => tool.name === 'browser_inspect')!.execute({}, context);
+    await tools.find((tool) => tool.name === 'browser_network')!.execute({}, context);
     await tools.find((tool) => tool.name === 'browser_screenshot')!.execute({ mode: 'viewport' }, context);
 
     expect(manager.captureTabsReadApproval).toHaveBeenCalledWith('chat-1');
     expect(manager.assertTabsReadApproval).toHaveBeenCalledWith('chat-1', tabsApproval);
     expect(manager.inspect).toHaveBeenCalledWith('chat-1', documentApproval.tabId, assistantRun, documentApproval);
+    expect(manager.networkDiagnostics).toHaveBeenCalledWith(
+      'chat-1',
+      { tabId: documentApproval.tabId },
+      assistantRun,
+      documentApproval,
+    );
     expect(manager.screenshot).toHaveBeenCalledWith(
       'chat-1',
       { mode: 'viewport', tabId: documentApproval.tabId },
@@ -823,7 +873,10 @@ describe('browser tools', () => {
     expect(registerPendingApproval).toHaveBeenCalledWith('tool-1', context.abortSignal, 'native-browser', {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
-      privateDetails: { browserInput: { script } },
+      privateDetails: {
+        browserInput: { script },
+        browserTarget: expect.objectContaining({ origin: 'https://example.com' }),
+      },
     });
     expect(manager.evaluate).toHaveBeenCalledWith(
       'chat-1',
@@ -834,7 +887,7 @@ describe('browser tools', () => {
     );
   });
 
-  it('uses host-captured target metadata instead of an untrusted input target', () => {
+  it('keeps host-captured target origins transient while persisting only a redacted marker', () => {
     const args = browserApprovalArgs(
       'browser_action',
       { kind: 'click', target: { tabId: 'fake', origin: 'https://attacker.example' } },
@@ -846,8 +899,9 @@ describe('browser tools', () => {
     );
     expect(args.target).toEqual({
       tabId: '00000000-0000-0000-0000-000000000001',
-      origin: 'https://example.com',
+      origin: '[redacted Browser origin]',
     });
+    expect(JSON.stringify(args)).not.toContain('example.com');
   });
 
   it('passes the turn abort signal into script evaluation', async () => {
@@ -855,11 +909,17 @@ describe('browser tools', () => {
     const evaluate = createBrowserTools(() => config()).find((tool) => tool.name === 'browser_evaluate')!;
 
     await expect(evaluate.execute({ script: 'document.title' }, context)).resolves.toEqual({ result: 'ok' });
-    expect(manager.evaluate).toHaveBeenCalledWith('chat-1', 'document.title', undefined, assistantRun);
+    expect(manager.evaluate).toHaveBeenCalledWith(
+      'chat-1',
+      'document.title',
+      '00000000-0000-0000-0000-000000000001',
+      assistantRun,
+    );
   });
 
-  it('passes the turn abort signal into inspection and screenshots', async () => {
+  it('passes turn ownership into inspection, network diagnostics, and screenshots', async () => {
     manager.inspect.mockResolvedValue({ tabId: 'tab-1' });
+    manager.networkDiagnostics.mockResolvedValue({ tabId: 'tab-1', requests: [] });
     mockScreenshotResult({
       tabId: 'tab-1',
       mode: 'viewport',
@@ -871,17 +931,39 @@ describe('browser tools', () => {
     const tools = createBrowserTools(() => config());
 
     await tools.find((tool) => tool.name === 'browser_inspect')!.execute({ tabId: 'tab-1' }, context);
+    await tools
+      .find((tool) => tool.name === 'browser_network')!
+      .execute({ tabId: 'tab-1', waitFor: 'network-idle', limit: 25, timeoutMs: 5_000, idleMs: 250 }, context);
     await tools.find((tool) => tool.name === 'browser_screenshot')!.execute({ mode: 'viewport' }, context);
 
     expect(manager.inspect).toHaveBeenCalledWith('chat-1', 'tab-1', assistantRun, undefined);
+    expect(manager.networkDiagnostics).toHaveBeenCalledWith(
+      'chat-1',
+      { tabId: 'tab-1', waitFor: 'network-idle', limit: 25, timeoutMs: 5_000, idleMs: 250 },
+      assistantRun,
+      undefined,
+    );
     expect(manager.screenshot).toHaveBeenCalledWith(
       'chat-1',
-      { mode: 'viewport' },
+      { mode: 'viewport', tabId: '00000000-0000-0000-0000-000000000001' },
       'assistant',
       assistantRun,
       expect.any(Function),
       undefined,
     );
+  });
+
+  it('never exposes a secret-bearing hostname from browser_network failures', async () => {
+    manager.networkDiagnostics.mockRejectedValueOnce(
+      new Error("net::ERR_NAME_NOT_RESOLVED loading 'https://reset-token.secret-host.example/account'"),
+    );
+    const network = createBrowserTools(() => config()).find((tool) => tool.name === 'browser_network')!;
+
+    const error = await network.execute({}, context).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('net::ERR_NAME_NOT_RESOLVED');
+    expect((error as Error).message).not.toContain('secret-host.example');
   });
 
   it('returns screenshots through model content without duplicating the data URL', async () => {
@@ -900,7 +982,7 @@ describe('browser tools', () => {
     expect(result._modelContent).toEqual([{ type: 'image', data: 'AAAA', mediaType: 'image/png' }]);
     expect(manager.screenshot).toHaveBeenCalledWith(
       'chat-1',
-      { mode: 'viewport' },
+      { mode: 'viewport', tabId: '00000000-0000-0000-0000-000000000001' },
       'assistant',
       assistantRun,
       expect.any(Function),
@@ -928,7 +1010,7 @@ describe('browser tools', () => {
   });
 
   it('allows automatic autofill without returning a password', async () => {
-    manager.getState.mockReturnValue({ conversationId: 'chat-1', tabs: [], activeTabId: 'tab-1' });
+    manager.resolveAssistantTabId.mockReturnValue('tab-1');
     manager.autofill.mockResolvedValue(undefined);
     const autofill = createBrowserTools(() => config({ passwordAccess: 'automatic' })).find(
       (tool) => tool.name === 'browser_autofill',

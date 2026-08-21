@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, openSync, opendirSync, readSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { assistantDownloadQuarantineDirectory } from './download-quarantine.js';
 import { browserPartitionForScopeKey, isBrowserScopeKey } from './session.js';
 
 type PendingBrowserCleanupFile = { version: 1; scopeKeys: string[] };
@@ -239,6 +240,9 @@ export function hasStoredBrowserScopeData(appHome: string, sessionDataPath: stri
   if (pathExists(join(appHome, 'browser', 'profiles', `${scopeKey}.history.json`))) return true;
   if (pathExists(join(appHome, 'browser', 'profiles', `${scopeKey}.downloads.json`))) return true;
   if (pathExists(join(appHome, 'browser', 'credentials', `${scopeKey}.json`))) return true;
+  // DownloadItem can create its private destination before the shelf sidecar is
+  // durably written. Treat even an empty crash-left directory as profile data.
+  if (pathExists(assistantDownloadQuarantineDirectory(appHome, scopeKey))) return true;
   return (
     !isChromiumBrowserScopeCleared(appHome, scopeKey) && pathExists(join(sessionDataPath, 'Partitions', partitionName))
   );

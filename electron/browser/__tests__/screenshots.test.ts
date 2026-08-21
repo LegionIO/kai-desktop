@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  browserScreenshotCaptureGeometry,
   browserScreenshotTiles,
+  browserScreenshotViewportGeometry,
   elementCaptureRect,
   fitBrowserScreenshotForModel,
+  MAX_BROWSER_MENU_PREVIEW_NATIVE_PIXELS,
   MAX_BROWSER_SCREENSHOT_ENCODED_BYTES,
   MAX_BROWSER_SCREENSHOT_TILE_HEIGHT,
+  validateMenuPreviewNativeSize,
   validateScreenshotEncodedBytes,
   validateScreenshotSize,
 } from '../screenshots.js';
@@ -17,6 +21,13 @@ describe('browser screenshot bounds', () => {
     expect(() => validateScreenshotSize(100, Number.POSITIVE_INFINITY)).toThrow(/finite capturable/);
     expect(() => validateScreenshotSize(20_000, 100)).toThrow(/safe/);
     expect(() => validateScreenshotSize(12_000, 12_000)).toThrow(/safe/);
+  });
+
+  it('independently caps a preemptible native menu-preview allocation at display scale', () => {
+    expect(validateMenuPreviewNativeSize(1_000, 1_000, 2)).toEqual({ width: 2_000, height: 2_000 });
+    expect(2_000 * 2_000).toBe(MAX_BROWSER_MENU_PREVIEW_NATIVE_PIXELS);
+    expect(() => validateMenuPreviewNativeSize(1_001, 1_000, 2)).toThrow(/menu preview.*physical-pixel limit/i);
+    expect(() => validateMenuPreviewNativeSize(100, 100, 0)).toThrow(/valid .*scale/i);
   });
 
   it('intersects element captures with every document edge', () => {
@@ -54,6 +65,80 @@ describe('browser screenshot bounds', () => {
       },
       { x: 0, y: MAX_BROWSER_SCREENSHOT_TILE_HEIGHT * 2, width: 1_000, height: 10 },
     ]);
+  });
+
+  it('compensates CDP clips for Retina device scale before capture allocation', () => {
+    expect(
+      browserScreenshotCaptureGeometry({
+        cssContentSize: { width: 4_000, height: 2_000 },
+        contentSize: { width: 8_000, height: 4_000 },
+      }),
+    ).toEqual({ width: 4_000, height: 2_000, scale: 0.5 });
+
+    expect(
+      browserScreenshotCaptureGeometry({
+        cssContentSize: { width: 100, height: 100 },
+        contentSize: { width: 150, height: 151 },
+      }).scale,
+    ).toBeCloseTo(1 / 1.505);
+
+    expect(
+      browserScreenshotCaptureGeometry({
+        cssContentSize: { width: 2_000, height: 1_000 },
+        contentSize: { width: 1_000, height: 500 },
+      }),
+    ).toEqual({ width: 2_000, height: 1_000, scale: 2 });
+  });
+
+  it('fails closed when CDP omits dimensions needed to bound device-scaled output', () => {
+    expect(() => browserScreenshotCaptureGeometry({ cssContentSize: { width: 100, height: 100 } })).toThrow(
+      /both CSS and device/i,
+    );
+    expect(() =>
+      browserScreenshotCaptureGeometry({
+        cssContentSize: { width: 100, height: 100 },
+        contentSize: { width: Number.NaN, height: 100 },
+      }),
+    ).toThrow(/device scale/i);
+    expect(() =>
+      browserScreenshotCaptureGeometry({
+        cssContentSize: { width: 4_000, height: 2_000 },
+        contentSize: { width: 6_000, height: 4_000 },
+      }),
+    ).toThrow(/inconsistent horizontal and vertical/i);
+  });
+
+  it('derives a bounded scrolled viewport clip for hidden CDP capture', () => {
+    expect(
+      browserScreenshotViewportGeometry({
+        cssContentSize: { width: 4_000, height: 8_000 },
+        contentSize: { width: 8_000, height: 16_000 },
+        cssVisualViewport: { pageX: 10.9, pageY: 200.4, clientWidth: 1_280, clientHeight: 800 },
+      }),
+    ).toEqual({ x: 10, y: 200, width: 1_280, height: 800, scale: 0.5 });
+  });
+
+  it('fails closed on missing, negative, or oversized viewport geometry', () => {
+    expect(() =>
+      browserScreenshotViewportGeometry({
+        cssContentSize: { width: 100, height: 100 },
+        contentSize: { width: 100, height: 100 },
+      }),
+    ).toThrow(/CSS viewport and device/i);
+    expect(() =>
+      browserScreenshotViewportGeometry({
+        cssContentSize: { width: 100, height: 100 },
+        contentSize: { width: 100, height: 100 },
+        cssVisualViewport: { pageX: -1, pageY: 0, clientWidth: 100, clientHeight: 100 },
+      }),
+    ).toThrow(/finite viewport/i);
+    expect(() =>
+      browserScreenshotViewportGeometry({
+        cssContentSize: { width: 20_000, height: 20_000 },
+        contentSize: { width: 20_000, height: 20_000 },
+        cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 20_000, clientHeight: 20_000 },
+      }),
+    ).toThrow(/safe/i);
   });
 
   it('bounds encoded PNG memory independently of page dimensions', () => {

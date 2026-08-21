@@ -404,6 +404,16 @@ describe('Browser tool hook exposure', () => {
       }),
     ).toEqual({ tabId });
     expect(
+      __internal.redactBrowserToolArgsForExposure('browser_network', {
+        tabId,
+        waitFor: 'network-idle',
+        limit: 25,
+        timeoutMs: 5_000,
+        idleMs: 250,
+        headers: { authorization: 'network-secret' },
+      }),
+    ).toEqual({ tabId, waitFor: 'network-idle', limit: 25, timeoutMs: 5_000, idleMs: 250 });
+    expect(
       __internal.redactBrowserToolArgsForExposure('browser_action', {
         kind: 'click',
         x: 10,
@@ -447,7 +457,9 @@ describe('Browser tool hook exposure', () => {
     const invalid = { redacted: true, reason: 'Invalid Browser tool arguments.' };
     const exposed = [
       __internal.redactBrowserToolArgsForExposure('browser_tabs', { action: secret }),
+      __internal.redactBrowserToolArgsForExposure('browser_tabs', { action: 'activate', tabId }),
       __internal.redactBrowserToolArgsForExposure('browser_inspect', { tabId: secret }),
+      __internal.redactBrowserToolArgsForExposure('browser_network', { waitFor: secret }),
       __internal.redactBrowserToolArgsForExposure('browser_screenshot', { mode: secret }),
       __internal.redactBrowserToolArgsForExposure('browser_autofill', { credentialId: secret }),
       __internal.redactBrowserToolArgsForExposure('browser_action', { kind: secret }),

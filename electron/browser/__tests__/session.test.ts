@@ -3,6 +3,8 @@ import vm from 'node:vm';
 import { JSDOM } from 'jsdom';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  BROWSER_NATIVE_UI_GUARD_ARGUMENT,
+  BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX,
   BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT,
   aiRequestPolicyUrl,
   assertAiNavigationAllowed,
@@ -69,6 +71,7 @@ describe('browser session helpers', () => {
   });
 
   it('keeps subframe Node integration disabled and registers an isolated frame sensor once', () => {
+    const guardToken = '11111111-1111-4111-8111-111111111111';
     const preferences = browserWebPreferences('persist:kai-browser-global');
     expect(preferences).toMatchObject({
       nodeIntegration: false,
@@ -78,11 +81,26 @@ describe('browser session helpers', () => {
       sandbox: true,
       webviewTag: false,
       webSecurity: true,
+      backgroundThrottling: true,
+      disableHtmlFullscreenWindowResize: true,
       additionalArguments: [],
     });
     expect(browserWebPreferences('persist:kai-browser-global', undefined, true).additionalArguments).toEqual([
       BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT,
     ]);
+    expect(
+      browserWebPreferences('persist:kai-browser-global', undefined, false, true, guardToken).additionalArguments,
+    ).toEqual([BROWSER_NATIVE_UI_GUARD_ARGUMENT, `${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}${guardToken}`]);
+    expect(
+      browserWebPreferences('persist:kai-browser-global', undefined, true, true, guardToken).additionalArguments,
+    ).toEqual([
+      BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT,
+      BROWSER_NATIVE_UI_GUARD_ARGUMENT,
+      `${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}${guardToken}`,
+    ]);
+    expect(() =>
+      browserWebPreferences('persist:kai-browser-global', undefined, false, false, 'page-controlled-token'),
+    ).toThrow(/guard token/i);
     const scripts: Array<{ id: string; type: 'frame' | 'service-worker'; filePath: string }> = [];
     const target = {
       getPreloadScripts: () => scripts,
@@ -120,6 +138,7 @@ describe('browser session helpers', () => {
       sandbox: true,
       webviewTag: false,
       webSecurity: true,
+      disableHtmlFullscreenWindowResize: true,
     });
     expect(preferences).not.toHaveProperty('preload');
   });

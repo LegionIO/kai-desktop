@@ -210,6 +210,7 @@ function isDownload(value: unknown): value is BrowserDownload {
     Number.isFinite(value.totalBytes) &&
     typeof value.state === 'string' &&
     DOWNLOAD_STATES.has(value.state as BrowserDownload['state']) &&
+    (value.quarantined === undefined || typeof value.quarantined === 'boolean') &&
     (value.path === undefined || typeof value.path === 'string') &&
     (value.url === undefined || typeof value.url === 'string')
   );
@@ -740,6 +741,42 @@ export class BrowserProfileStore {
     return this.data.downloads.map((item) => ({ ...item }));
   }
 
+  clearQuarantinedDownloadPath(id: string, expectedPath: string): BrowserDownload | null {
+    this.assertWritable();
+    const index = this.data.downloads.findIndex((item) => item.id === id);
+    const current = index >= 0 ? this.data.downloads[index] : undefined;
+    if (!current?.quarantined || current.path !== expectedPath) return null;
+    const updated = { ...current };
+    delete updated.path;
+    const downloads = [...this.data.downloads];
+    downloads[index] = updated;
+    this.data.downloads = downloads;
+    this.scheduleDownloadsSave();
+    return { ...updated };
+  }
+
+  markQuarantinedDownloadInterrupted(id: string): BrowserDownload | null {
+    this.assertWritable();
+    const index = this.data.downloads.findIndex((item) => item.id === id);
+    const current = index >= 0 ? this.data.downloads[index] : undefined;
+    if (!current?.quarantined || current.state !== 'progressing') return null;
+    const updated: BrowserDownload = { ...current, state: 'interrupted' };
+    delete updated.path;
+    const downloads = [...this.data.downloads];
+    downloads[index] = updated;
+    this.data.downloads = downloads;
+    this.scheduleDownloadsSave();
+    return { ...updated };
+  }
+
+  removeDownload(id: string): void {
+    this.assertWritable();
+    const downloads = this.data.downloads.filter((item) => item.id !== id);
+    if (downloads.length === this.data.downloads.length) return;
+    this.data.downloads = downloads;
+    this.scheduleDownloadsSave();
+  }
+
   getPermission(origin: string, permission: string): 'allow' | 'deny' | undefined {
     return this.data.permissions[origin]?.[permission];
   }
@@ -1029,6 +1066,35 @@ export async function readStoredBrowserProfileCountsAsync(
     MAX_BROWSER_DOWNLOAD_BYTES,
   );
   return storedBrowserProfileCounts(scopeKey, profile, historySidecar, downloadSidecar);
+}
+
+/** Read only persisted download metadata without constructing/caching a full
+ * BrowserProfileStore. The dedicated sidecar is authoritative when present;
+ * legacy profiles fall back to their inline downloads until the next normal
+ * store write migrates them. Startup quarantine recovery uses this preflight to
+ * avoid retaining every historical conversation profile in memory. */
+export async function readStoredBrowserDownloadsAsync(appHome: string, scopeKey: string): Promise<BrowserDownload[]> {
+  scopeKey = safeScopeKey(scopeKey);
+  const directory = join(appHome, 'browser', 'profiles');
+  const sidecar = await readSummaryJsonAsync(join(directory, `${scopeKey}.downloads.json`), MAX_BROWSER_DOWNLOAD_BYTES);
+  if (sidecar !== null) {
+    if (
+      !isRecord(sidecar) ||
+      sidecar.version !== 1 ||
+      !Array.isArray(sidecar.downloads) ||
+      !sidecar.downloads.every(isDownload)
+    ) {
+      throw new Error('Invalid browser download data.');
+    }
+    return boundedDownloads(sidecar.downloads).map((download) => ({ ...download }));
+  }
+
+  const profile = await readSummaryJsonAsync(join(directory, `${scopeKey}.json`), MAX_BROWSER_PROFILE_BYTES);
+  if (profile === null) return [];
+  if (!isRecord(profile) || !Array.isArray(profile.downloads) || !profile.downloads.every(isDownload)) {
+    throw new Error('Invalid browser profile download data.');
+  }
+  return boundedDownloads(profile.downloads).map((download) => ({ ...download }));
 }
 
 export function listStoredBrowserScopeKeys(appHome: string): string[] {

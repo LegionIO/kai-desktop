@@ -39,14 +39,17 @@ function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAft
       id: 'tab-1',
       conversationId: 'chat-1',
       url: 'https://example.com',
+      owner: 'user' as const,
+      keepOpen: true,
     },
     scopeKey: 'global',
     generation: 4,
     trustedUserNavigationLease: 2,
+    assistantOwnerId: null,
     aiControlOwnerId: 'run-1',
     aiControlGeneration: 7,
     visibleAssistantGeneration: 0,
-    view: { webContents: contents },
+    view: { setBounds: vi.fn(), setVisible: vi.fn(), webContents: contents },
   };
   const lease = {
     runId: 'run-1',
@@ -59,6 +62,10 @@ function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAft
   const manager = Object.create(BrowserManager.prototype) as InstanceType<typeof BrowserManager>;
   Object.assign(manager as unknown as Record<string, unknown>, {
     activeTabs: new Map([['chat-1', tab.shell.id]]),
+    assistantRuns: {
+      assertActive: () => 7,
+      generationIfActive: () => null,
+    },
     appHome: '/tmp/kai-browser-screenshot-authority',
     attachActiveView: vi.fn(),
     attachedView: tab.view,
@@ -86,6 +93,7 @@ function screenshotManager(options?: { revokeAfterCapture?: boolean; navigateAft
     }),
     captureBrowserPageLease: vi.fn(() => ({ tabId: tab.shell.id, generation: tab.generation })),
     setAutomationOverlay: vi.fn(async () => undefined),
+    tabOrder: new Map([['chat-1', [tab.shell.id]]]),
     tabs: new Map([[tab.shell.id, tab]]),
     requireTab: () => tab,
     runTabOperation: (_tab: unknown, operation: () => Promise<unknown>) => operation(),

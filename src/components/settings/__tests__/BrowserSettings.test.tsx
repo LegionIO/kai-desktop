@@ -35,7 +35,9 @@ describe('BrowserSettings data management', () => {
 
     expect(screen.getByLabelText('Browser data scope')).toBeInstanceOf(HTMLSelectElement);
     expect(screen.getByLabelText('Omnibox search provider')).toBeInstanceOf(HTMLSelectElement);
-    expect(screen.getByLabelText('Tab listing, page inspection, and screenshots')).toBeInstanceOf(HTMLSelectElement);
+    expect(screen.getByLabelText('Tab listing, page inspection, screenshots, and network diagnostics')).toBeInstanceOf(
+      HTMLSelectElement,
+    );
     expect(screen.getByLabelText('Clicks, typing, scrolling, and navigation')).toBeInstanceOf(HTMLSelectElement);
     expect(screen.getByLabelText('Injected JavaScript')).toBeInstanceOf(HTMLSelectElement);
     expect(screen.getByLabelText('AI saved-password access')).toBeInstanceOf(HTMLSelectElement);
@@ -54,7 +56,7 @@ describe('BrowserSettings data management', () => {
       />,
     );
 
-    fireEvent.change(screen.getByLabelText('Tab listing, page inspection, and screenshots'), {
+    fireEvent.change(screen.getByLabelText('Tab listing, page inspection, screenshots, and network diagnostics'), {
       target: { value: 'ask' },
     });
 
@@ -96,7 +98,7 @@ describe('BrowserSettings data management', () => {
 
   it('shows a clear-data failure instead of discarding it', async () => {
     const clearData = vi.fn().mockRejectedValue(new Error('Credential vault is locked'));
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     installAppBridgeStub({
       conversations: { getActiveId: async () => 'chat-1' },
       browser: {
@@ -126,6 +128,8 @@ describe('BrowserSettings data management', () => {
       conversationId: 'chat-1',
       scopeKeys: ['global'],
     });
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/unexported assistant download quarantine copies/i));
+    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/already exported or saved remain on disk/i));
   });
 
   it('uses the atomic main-process path to clear and delete plugin partition data', async () => {

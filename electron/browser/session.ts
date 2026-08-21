@@ -31,6 +31,14 @@ export function browserPartitionForScopeKey(scopeKey: string): string {
   return `persist:${brandSlug()}-browser-${scopeKey}`;
 }
 
+/** Ephemeral Chromium network context used only to resolve the host operating
+ * system's current direct/PAC/proxy route. Browser data sessions are pointed at
+ * Kai's validating proxy, so asking one of them would recursively resolve back
+ * to the local guard instead of preserving the upstream system route. */
+export function browserSystemProxyResolverPartition(): string {
+  return `${brandSlug()}-browser-system-proxy-resolver`;
+}
+
 /** True only for Chromium partition directories owned by the in-app Browser. */
 export function isInAppBrowserPartitionName(value: string): boolean {
   const normalized = value.toLowerCase();
@@ -92,19 +100,32 @@ export function validatePluginPartitionClearNames(values: string[] | undefined):
 }
 
 export const BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT = '--kai-browser-private-network-guard';
+export const BROWSER_NATIVE_UI_GUARD_ARGUMENT = '--kai-browser-native-ui-guard';
+export const BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX = '--kai-browser-native-ui-token=';
 
 export function browserWebPreferences(
   partition: string,
   preload?: string,
   activatePrivateNetworkGuard = false,
+  activateNativeUiGuard = false,
+  nativeUiGuardToken?: string,
 ): WebPreferences {
+  const additionalArguments: string[] = [];
+  if (activatePrivateNetworkGuard) additionalArguments.push(BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT);
+  if (activateNativeUiGuard) additionalArguments.push(BROWSER_NATIVE_UI_GUARD_ARGUMENT);
+  if (nativeUiGuardToken) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(nativeUiGuardToken)) {
+      throw new Error('Invalid Browser native-UI guard token.');
+    }
+    additionalArguments.push(`${BROWSER_NATIVE_UI_GUARD_TOKEN_ARGUMENT_PREFIX}${nativeUiGuardToken.toLowerCase()}`);
+  }
   return {
     partition,
     ...(preload ? { preload } : {}),
     // Electron exposes these only to the sandboxed preload's process.argv. Pin
     // the list instead of inheriting popup-supplied preferences so a restricted
     // renderer can activate its WebRTC membrane before the first page script.
-    additionalArguments: activatePrivateNetworkGuard ? [BROWSER_PRIVATE_NETWORK_GUARD_ARGUMENT] : [],
+    additionalArguments,
     nodeIntegration: false,
     nodeIntegrationInSubFrames: false,
     nodeIntegrationInWorker: false,
@@ -114,6 +135,15 @@ export function browserWebPreferences(
     webSecurity: true,
     allowRunningInsecureContent: false,
     experimentalFeatures: false,
+    // HTML fullscreen stays confined to the Browser page surface instead of
+    // resizing Kai's native window. BrowserManager additionally reclaims an
+    // assistant-controlled renderer if Chromium's UA controls enter fullscreen.
+    disableHtmlFullscreenWindowResize: true,
+    // Keep ordinary idle pages throttleable. BrowserManager disables
+    // throttling only for the lifetime of an active assistant operation, then
+    // restores it. Permanently disabling it on one child WebContents also keeps
+    // the entire containing BrowserWindow drawing while minimized.
+    backgroundThrottling: true,
     spellcheck: true,
   };
 }
@@ -132,6 +162,7 @@ export function hardenRemoteWebPreferences(
   webPreferences.webSecurity = true;
   webPreferences.allowRunningInsecureContent = false;
   webPreferences.experimentalFeatures = false;
+  webPreferences.disableHtmlFullscreenWindowResize = true;
   delete webPreferences.enableBlinkFeatures;
   if (params) {
     delete params.nodeintegration;
@@ -288,7 +319,7 @@ function isPrivateIpv6(host: string): boolean {
   return false;
 }
 
-function isPrivateResolvedAddress(address: string): boolean {
+export function isPrivateResolvedAddress(address: string): boolean {
   const host = address
     .trim()
     .toLowerCase()
@@ -347,11 +378,11 @@ export async function assertAiNavigationAllowed(
 
   const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (isIP(hostname) !== 0) return;
-  // A hostname can resolve publicly for this preflight and privately for the
-  // subsequent connection. Requiring authenticated TLS prevents Chromium from
-  // sending the HTTP request to an unrelated rebound endpoint: the peer must
-  // prove it owns this hostname before request headers/body are transmitted.
-  // Literal public IPs remain usable over HTTP because they cannot rebind.
+  // This preflight provides an early, useful failure before Chromium starts a
+  // navigation. BrowserValidatingProxy independently resolves and connects to
+  // the exact validated IP at dispatch time, closing the DNS-rebinding window.
+  // Hostname HTTP remains disallowed because it has no authenticated origin;
+  // literal public IPs cannot rebind.
   if (parsed.protocol !== 'https:') {
     throw new Error(
       'AI navigation to hostname-based HTTP pages is blocked while private-network access is disabled. Use HTTPS or enable private-network access in Browser Settings.',
@@ -364,7 +395,9 @@ export async function assertAiNavigationAllowed(
   }
   const addresses = resolution.addresses;
   if (addresses.some(isPrivateResolvedAddress)) {
-    throw new Error('AI navigation resolved to a private-network address and was blocked.');
+    throw new Error(
+      'AI navigation resolved to a private-network address and was blocked. Enable “Allow AI navigation to private-network and localhost addresses” in Browser Settings for trusted internal sites.',
+    );
   }
 }
 

@@ -14,6 +14,27 @@ type BrowserIntegrationDriver = {
   beginAssistantRun: (conversationId: string, runId: string) => void;
   createAssistantTab: (conversationId: string, targetUrl: string, runId: string) => Promise<BrowserTabResult>;
   runAssistantAction: (conversationId: string, runId: string, request: Record<string, unknown>) => Promise<unknown>;
+  runAssistantInspect: (conversationId: string, runId: string, tabId: string) => Promise<Record<string, unknown>>;
+  runAssistantNetwork: (
+    conversationId: string,
+    runId: string,
+    request: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  runAssistantEvaluate: (conversationId: string, runId: string, tabId: string, script: string) => Promise<unknown>;
+  runAssistantScreenshot: (
+    conversationId: string,
+    runId: string,
+    request: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  getPresentationState: () => {
+    mountedConversationId: string | null;
+    chromeFocusConversationId: string | null;
+    attached: boolean;
+    windowMinimized: boolean;
+    windowFocused: boolean;
+  };
+  isBrowserConfigTransitionPending: () => boolean;
+  getTabContentsId: (conversationId: string, tabId: string) => number | null;
   keepAssistantTabOpen: (conversationId: string, tabId: string, runId: string) => Promise<void>;
   endAssistantRun: (conversationId: string, runId: string) => Promise<void>;
 };
@@ -50,7 +71,13 @@ test.beforeAll(async () => {
     response.end(`<!doctype html>
       <title>Browser integration</title>
       <style>body{margin:0}.spacer{height:9000px}#capture{width:180px;height:90px;background:#7c3aed;color:white}</style>
-      <script>addEventListener('message',event=>{if(event.data==='oauth-complete')document.body.dataset.oauth='complete'})</script>
+      <script>
+        document.documentElement.dataset.initialViewport=innerWidth+'x'+innerHeight;
+        addEventListener('message',event=>{if(event.data==='oauth-complete')document.body.dataset.oauth='complete'});
+        addEventListener('pointerdown',event=>{document.body.dataset.pointerTimestampOffset=String(performance.timeOrigin+event.timeStamp-Date.now())},true);
+        addEventListener('keydown',event=>{document.body.dataset.keydownTimestampOffset=String(performance.timeOrigin+event.timeStamp-Date.now())},true);
+        addEventListener('input',event=>{document.body.dataset.inputTimestampOffset=String(performance.timeOrigin+event.timeStamp-Date.now())},true);
+      </script>
       <input id="field"><button id="button" onclick="document.body.dataset.clicked='yes'">Click</button>
       <button id="popup" onclick="document.body.dataset.popupClicked='yes';window.open('/popup','oauth')">OAuth popup</button>
       <div class="spacer"></div><div id="capture">component</div>`);
@@ -89,7 +116,7 @@ async function persistBrowserTestConversation(conversationId: string): Promise<v
     ).app.conversations.put({
       id,
       title: null,
-      fallbackTitle: null,
+      fallbackTitle: id,
       messages: [],
       messageTree: [],
       headId: null,
@@ -139,6 +166,11 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
   const conversationId = 'browser-electron-local';
   await persistBrowserTestConversation(conversationId);
   await persistBrowserTestConversation('browser-electron-other-chat');
+  await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({
+    mountedConversationId: null,
+    chromeFocusConversationId: null,
+    attached: false,
+  });
   await expect(
     handle.page.evaluate(() =>
       (window as unknown as { app: { browser: { available: () => Promise<boolean> } } }).app.browser.available(),
@@ -221,18 +253,6 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
     },
     { conversationId, tabId: tab.id },
   );
-  // This integration chat is persisted directly and is not the renderer's
-  // active chat, so its open-panel attention event cannot mount the native
-  // view automatically. Mount it explicitly before exercising AI control:
-  // production AI actions are required to be visible in the Browser sidebar.
-  await handle.page.evaluate(async (id) => {
-    const browser = (
-      window as unknown as {
-        app: { browser: { mount: (conversationId: string, bounds: Record<string, number>) => Promise<void> } };
-      }
-    ).app.browser;
-    await browser.mount(id, { x: 20, y: 100, width: 600, height: 420 });
-  }, conversationId);
   const historyRunId = 'browser-integration-private-history';
   await callIntegrationDriver('beginAssistantRun', [conversationId, historyRunId]);
   await expect(
@@ -242,6 +262,19 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
     .poll(async () => (await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id)?.url)
     .toBe('about:blank');
   await callIntegrationDriver('endAssistantRun', [conversationId, historyRunId]);
+  await handle.page.evaluate(async () => {
+    await (
+      window as unknown as {
+        app: { config: { set: (path: string, value: unknown) => Promise<unknown> } };
+      }
+    ).app.config.set('browser.aiAllowPrivateNetwork', true);
+  });
+  await expect.poll(() => callIntegrationDriver('isBrowserConfigTransitionPending', [])).toBe(false);
+  await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({
+    mountedConversationId: null,
+    chromeFocusConversationId: null,
+    attached: false,
+  });
   await handle.page.evaluate(
     async ({ conversationId: id, tabId, url }) => {
       const browser = (
@@ -255,6 +288,16 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
   );
 
   const contentsId = await browserContentsId(`${origin}/`);
+  await handle.page.evaluate(async (id) => {
+    await (
+      window as unknown as {
+        app: { browser: { mount: (conversationId: string, bounds: Record<string, number>) => Promise<void> } };
+      }
+    ).app.browser.mount(id, { x: 20, y: 100, width: 600, height: 420 });
+  }, conversationId);
+  await handle.app.evaluate(async ({ webContents }, id) => {
+    await webContents.fromId(id)?.executeJavaScript(`document.querySelector('#field').value = ''`);
+  }, contentsId);
   await handle.app.evaluate(async ({ webContents }, id) => {
     const contents = webContents.fromId(id);
     if (!contents) throw new Error('Browser contents disappeared.');
@@ -326,6 +369,10 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
   // 1.5 seconds after an automation action. Exercise the user-owned OAuth
   // popup after that bounded provenance handoff, not during the safety grace.
   await new Promise((resolve) => setTimeout(resolve, 2_000));
+  expect((await browserState(conversationId)).tabs.find((entry) => entry.id === tab.id)).toMatchObject({
+    discarded: false,
+  });
+  await expect(callIntegrationDriver('getTabContentsId', [conversationId, tab.id])).resolves.toBe(contentsId);
   await handle.app.evaluate(async ({ webContents }, id) => {
     const contents = webContents.fromId(id);
     if (!contents) throw new Error('Browser contents disappeared.');
@@ -466,6 +513,244 @@ test('native sidebar browser navigation, input, sessions, popups, screenshots, s
       authContents,
     ),
   ).resolves.toBe('authenticated');
+
+  const activeSentinelTab = await handle.page.evaluate(
+    async ({ conversationId: id, url }) =>
+      (
+        window as unknown as {
+          app: { browser: { createTab: (request: Record<string, unknown>) => Promise<BrowserTabResult> } };
+        }
+      ).app.browser.createTab({ conversationId: id, url, owner: 'user' }),
+    { conversationId, url: `${origin}/?active-sentinel=1` },
+  );
+  const activeSentinelContentsId = await browserContentsId('active-sentinel=1');
+  await expect.poll(async () => (await browserState(conversationId)).activeTabId).toBe(activeSentinelTab.id);
+
+  const backgroundRunId = 'browser-integration-headless-actions';
+  await callIntegrationDriver('beginAssistantRun', [conversationId, backgroundRunId]);
+  await handle.page.evaluate(
+    async ({ conversationId: id, tabId }) => {
+      await (
+        window as unknown as {
+          app: { browser: { commandTab: (conversationId: string, tabId: string, command: string) => Promise<void> } };
+        }
+      ).app.browser.commandTab(id, tabId, 'activate');
+    },
+    { conversationId, tabId: tab.id },
+  );
+  await expect.poll(async () => (await browserState(conversationId)).activeTabId).toBe(tab.id);
+  await handle.app.evaluate(async ({ webContents }, id) => {
+    await webContents
+      .fromId(id)
+      ?.executeJavaScript(
+        `(() => { const field=document.querySelector('#field'); field.focus(); field.setSelectionRange(field.value.length,field.value.length); })()`,
+      );
+  }, contentsId);
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    backgroundRunId,
+    { tabId: tab.id, kind: 'type', selector: '#field', value: 'V' },
+  ]);
+  const presentedInputState = await handle.app.evaluate(
+    async ({ webContents }, id) =>
+      webContents.fromId(id)?.executeJavaScript(
+        `({
+          value: document.querySelector('#field').value,
+          keydownTimestampOffset: Number(document.body.dataset.keydownTimestampOffset),
+        })`,
+      ),
+    contentsId,
+  );
+  expect(presentedInputState?.value).toBe('typed by userV');
+  expect(Math.abs(presentedInputState?.keydownTimestampOffset ?? Number.POSITIVE_INFINITY)).toBeLessThan(2_000);
+  await handle.app.evaluate(async ({ webContents }, id) => {
+    await webContents
+      .fromId(id)
+      ?.executeJavaScript(
+        `(() => { document.querySelector('#field').value='typed by user'; delete document.body.dataset.keydownTimestampOffset; delete document.body.dataset.inputTimestampOffset; })()`,
+      );
+  }, contentsId);
+  await handle.page.evaluate(
+    async ({ conversationId: id, tabId }) => {
+      await (
+        window as unknown as {
+          app: { browser: { commandTab: (conversationId: string, tabId: string, command: string) => Promise<void> } };
+        }
+      ).app.browser.commandTab(id, tabId, 'activate');
+    },
+    { conversationId, tabId: activeSentinelTab.id },
+  );
+  await expect.poll(async () => (await browserState(conversationId)).activeTabId).toBe(activeSentinelTab.id);
+
+  // Change chats through the real renderer path, then minimize Kai. Every
+  // assistant operation below must remain independent of BrowserPanel mount,
+  // selected chat/tab, main-window visibility, and OS focus.
+  const otherChatButton = handle.page.getByRole('button', { name: /browser-electron-other-chat/i }).first();
+  await expect(otherChatButton).toBeVisible();
+  await otherChatButton.click();
+  await expect(
+    handle.page.evaluate(() =>
+      (
+        window as unknown as {
+          app: { conversations: { getActiveId: () => Promise<string | null> } };
+        }
+      ).app.conversations.getActiveId(),
+    ),
+  ).resolves.toBe('browser-electron-other-chat');
+  await handle.page.evaluate(async (id) => {
+    const browser = (
+      window as unknown as {
+        app: {
+          browser: {
+            mount: (conversationId: string, bounds: null) => Promise<void>;
+            setChromeFocus: (conversationId: string, focused: boolean) => Promise<void>;
+          };
+        };
+      }
+    ).app.browser;
+    await browser.setChromeFocus(id, false);
+    await browser.mount(id, null);
+  }, conversationId);
+  await handle.app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (!window) throw new Error('Kai window disappeared.');
+    window.minimize();
+  });
+  await expect.poll(async () => (await callIntegrationDriver('getPresentationState', [])).windowMinimized).toBe(true);
+  await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({
+    mountedConversationId: null,
+    chromeFocusConversationId: null,
+    attached: false,
+    windowMinimized: true,
+    windowFocused: false,
+  });
+
+  const hiddenCreatedTab = await callIntegrationDriver<BrowserTabResult>('createAssistantTab', [
+    conversationId,
+    `${origin}/?created-while-minimized=1`,
+    backgroundRunId,
+  ]);
+  const hiddenCreatedContentsId = await callIntegrationDriver<number | null>('getTabContentsId', [
+    conversationId,
+    hiddenCreatedTab.id,
+  ]);
+  if (hiddenCreatedContentsId === null) throw new Error('Hidden assistant tab did not retain a live renderer.');
+  await expect.poll(async () => (await browserState(conversationId)).activeTabId).toBe(activeSentinelTab.id);
+  await expect(
+    handle.app.evaluate(
+      async ({ webContents }, id) =>
+        webContents
+          .fromId(id)
+          ?.executeJavaScript(
+            `({ readyState: document.readyState, initialViewport: document.documentElement.dataset.initialViewport })`,
+          ),
+      hiddenCreatedContentsId,
+    ),
+  ).resolves.toEqual({ readyState: 'complete', initialViewport: '1280x800' });
+
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    backgroundRunId,
+    { tabId: hiddenCreatedTab.id, kind: 'click', selector: '#button' },
+  ]);
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    backgroundRunId,
+    { tabId: tab.id, kind: 'click', selector: '#button' },
+  ]);
+  await callIntegrationDriver('runAssistantAction', [
+    conversationId,
+    backgroundRunId,
+    { tabId: tab.id, kind: 'type', selector: '#field', value: 'typed by AI while hidden' },
+  ]);
+  await expect.poll(async () => (await browserState(conversationId)).activeTabId).toBe(activeSentinelTab.id);
+  await expect(
+    callIntegrationDriver<Record<string, unknown>>('runAssistantInspect', [
+      conversationId,
+      backgroundRunId,
+      hiddenCreatedTab.id,
+    ]),
+  ).resolves.toMatchObject({ tabId: hiddenCreatedTab.id, title: 'Browser integration' });
+  await expect(
+    callIntegrationDriver<Record<string, unknown>>('runAssistantNetwork', [
+      conversationId,
+      backgroundRunId,
+      { tabId: hiddenCreatedTab.id, waitFor: 'network-idle', timeoutMs: 5_000 },
+    ]),
+  ).resolves.toMatchObject({ tabId: hiddenCreatedTab.id, waitFor: 'network-idle', loading: false });
+  await expect(
+    callIntegrationDriver<Record<string, unknown>>('runAssistantScreenshot', [
+      conversationId,
+      backgroundRunId,
+      { tabId: hiddenCreatedTab.id, mode: 'viewport' },
+    ]),
+  ).resolves.toMatchObject({
+    tabId: hiddenCreatedTab.id,
+    mode: 'viewport',
+    width: 1_280,
+    height: 800,
+    dataUrl: expect.stringMatching(/^data:image\/png;base64,/),
+  });
+  await expect(
+    callIntegrationDriver('runAssistantEvaluate', [
+      conversationId,
+      backgroundRunId,
+      hiddenCreatedTab.id,
+      `(() => { document.body.dataset.evaluated = 'yes'; return document.body.dataset.evaluated; })()`,
+    ]),
+  ).resolves.toBe('yes');
+  const backgroundInputState = await handle.app.evaluate(
+    async ({ webContents }, id) =>
+      webContents.fromId(id)?.executeJavaScript(
+        `({
+          clicked: document.body.dataset.clicked,
+          value: document.querySelector('#field').value,
+          pointerTimestampOffset: Number(document.body.dataset.pointerTimestampOffset),
+          inputTimestampOffset: Number(document.body.dataset.inputTimestampOffset),
+        })`,
+      ),
+    contentsId,
+  );
+  expect(backgroundInputState).toMatchObject({
+    clicked: 'yes',
+    value: 'typed by usertyped by AI while hidden',
+  });
+  expect(Math.abs(backgroundInputState?.pointerTimestampOffset ?? Number.POSITIVE_INFINITY)).toBeLessThan(5_000);
+  // Bulk Input.insertText has no CDP timestamp field. This path is allowed only
+  // while the exact view is detached and quarantined from physical input.
+  expect(Math.abs(backgroundInputState?.inputTimestampOffset ?? Number.POSITIVE_INFINITY)).toBeLessThan(5_000);
+  await expect(
+    handle.app.evaluate(
+      async ({ webContents }, id) =>
+        webContents
+          .fromId(id)
+          ?.executeJavaScript(
+            `({ clicked: document.body.dataset.clicked, evaluated: document.body.dataset.evaluated })`,
+          ),
+      hiddenCreatedContentsId,
+    ),
+  ).resolves.toEqual({ clicked: 'yes', evaluated: 'yes' });
+  await expect(
+    handle.app.evaluate(
+      async ({ webContents }, id) =>
+        webContents
+          .fromId(id)
+          ?.executeJavaScript(
+            `({ clicked: document.body.dataset.clicked || null, value: document.querySelector('#field').value })`,
+          ),
+      activeSentinelContentsId,
+    ),
+  ).resolves.toEqual({ clicked: null, value: '' });
+  await expect(callIntegrationDriver('getPresentationState', [])).resolves.toMatchObject({
+    mountedConversationId: null,
+    chromeFocusConversationId: null,
+    attached: false,
+    windowMinimized: true,
+    windowFocused: false,
+  });
+  await callIntegrationDriver('endAssistantRun', [conversationId, backgroundRunId]);
+  await handle.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.restore());
+  await expect.poll(async () => (await callIntegrationDriver('getPresentationState', [])).windowMinimized).toBe(false);
 
   const openTabs = await browserState(conversationId);
   expect(openTabs.tabs.some((entry) => entry.url.endsWith('/popup'))).toBe(true);

@@ -197,6 +197,40 @@ function installBrowserIntegrationTestDriver(): void {
         manager.createTab({ conversationId, url, owner: 'assistant' }, { id: runId }),
       runAssistantAction: (conversationId: string, runId: string, request: Parameters<typeof manager.action>[1]) =>
         manager.action(conversationId, request, { id: runId }),
+      runAssistantInspect: (conversationId: string, runId: string, tabId: string) =>
+        manager.inspect(conversationId, tabId, { id: runId }),
+      runAssistantNetwork: (
+        conversationId: string,
+        runId: string,
+        request: Parameters<typeof manager.networkDiagnostics>[1],
+      ) => manager.networkDiagnostics(conversationId, request, { id: runId }),
+      runAssistantEvaluate: (conversationId: string, runId: string, tabId: string, script: string) =>
+        manager.evaluate(conversationId, script, tabId, { id: runId }),
+      runAssistantScreenshot: (
+        conversationId: string,
+        runId: string,
+        request: Parameters<typeof manager.screenshot>[1],
+      ) => manager.screenshot(conversationId, request, 'assistant', { id: runId }),
+      getPresentationState: () => ({
+        mountedConversationId: Reflect.get(manager, 'mountedConversationId') as string | null,
+        chromeFocusConversationId: Reflect.get(manager, 'chromeFocusConversationId') as string | null,
+        attached: Reflect.get(manager, 'attachedView') !== null,
+        windowMinimized: primaryWindowRef?.isMinimized() ?? false,
+        windowFocused: primaryWindowRef?.isFocused() ?? false,
+      }),
+      isBrowserConfigTransitionPending: () => browserConfigTransitions?.isPending() ?? false,
+      getTabContentsId: (conversationId: string, tabId: string) => {
+        const tab = (
+          Reflect.get(manager, 'tabs') as Map<
+            string,
+            { shell: { conversationId: string }; view: { webContents: { id: number; isDestroyed(): boolean } } | null }
+          >
+        ).get(tabId);
+        if (!tab || tab.shell.conversationId !== conversationId || !tab.view || tab.view.webContents.isDestroyed()) {
+          return null;
+        }
+        return tab.view.webContents.id;
+      },
       keepAssistantTabOpen: (conversationId: string, tabId: string, runId: string) =>
         manager.commandTab(conversationId, tabId, 'keep-open', 'assistant', {
           id: runId,
@@ -982,6 +1016,7 @@ function createWindow(): BrowserWindow {
       join(codePaths.preload, 'browser-page.cjs'),
     );
   }
+  getExistingBrowserManager()?.handleHostWindowCreated();
   installBrowserIntegrationTestDriver();
   mainWindow.webContents.on('before-input-event', (event, input) => {
     getExistingBrowserManager()?.handleChromeShortcut(event, input);
@@ -1216,6 +1251,7 @@ function createWindow(): BrowserWindow {
   mainWindow.on('close', () => {
     if (saveTimeout) clearTimeout(saveTimeout);
     saveWindowState(mainWindow);
+    getExistingBrowserManager()?.handleHostWindowWillClose();
   });
   mainWindow.on('closed', () => {
     revokeBrowserHostRendererAccess();

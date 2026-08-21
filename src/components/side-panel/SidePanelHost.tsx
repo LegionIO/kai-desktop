@@ -147,7 +147,10 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
     // user can still navigate between panels while collapsed. `titlebar-no-drag`
     // on every button — this rail sits in the window's drag region.
     return (
-      <div className="titlebar-no-drag relative z-40 flex w-9 shrink-0 flex-col items-center gap-2 border-l border-border/60 bg-card/40 py-3">
+      <div
+        data-side-panel-surface="minimized"
+        className="titlebar-no-drag relative z-40 flex w-9 shrink-0 flex-col items-center gap-2 border-l border-border/60 bg-card py-3"
+      >
         <Tooltip content="Expand panel" side="left">
           <button
             type="button"
@@ -194,7 +197,8 @@ export const SidePanelHost: FC<{ tabs: SidePanelTab[] }> = ({ tabs }) => {
       // z-40 so the tab bar paints ABOVE the window's absolute z-30 title-bar
       // overlay that spans the top band — otherwise that overlay occludes the
       // tab/collapse buttons and swallows their clicks.
-      className="relative z-40 flex min-h-0 shrink-0 flex-col border-l border-border/60 bg-card/40"
+      data-side-panel-surface="open"
+      className="relative z-40 flex min-h-0 shrink-0 flex-col border-l border-border/60 bg-card"
       style={{ width: `${widthPct}%` }}
     >
       {/* Drag handle */}

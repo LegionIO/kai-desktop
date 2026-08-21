@@ -54,6 +54,13 @@ export type PendingToolApproval = {
 
 export type ToolApprovalPrivateDetails = {
   browserInput: unknown;
+  /** Exact main-process-captured tab/origin identity. This is deliberately
+   * transient and available only through the native approval authority. */
+  browserTarget?: {
+    tabId: string;
+    origin: string;
+    destinationOrigin?: string;
+  };
 };
 
 export const pendingToolApprovals = new Map<string, PendingToolApproval>();

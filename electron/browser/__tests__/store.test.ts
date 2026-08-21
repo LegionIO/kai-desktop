@@ -23,6 +23,7 @@ import {
   MAX_BOOKMARKS,
   MAX_PERMISSION_ORIGINS,
   MAX_PERMISSIONS_PER_ORIGIN,
+  readStoredBrowserDownloadsAsync,
   readStoredBrowserProfileCounts,
   readStoredBrowserProfileCountsAsync,
 } from '../store.js';
@@ -197,6 +198,37 @@ describe('BrowserProfileStore', () => {
       bookmarkCount: 1,
       downloadCount: 1,
     });
+  });
+
+  it('preflights download metadata from the authoritative sidecar before falling back to a legacy profile', async () => {
+    const appHome = home();
+    const directory = join(appHome, 'browser', 'profiles');
+    mkdirSync(directory, { recursive: true });
+    const legacyDownload = {
+      id: 'legacy-download',
+      tabId: 'tab-1',
+      filename: 'legacy.pdf',
+      receivedBytes: 1,
+      totalBytes: 1,
+      state: 'completed',
+    };
+    const sidecarDownload = {
+      id: 'sidecar-download',
+      tabId: 'tab-2',
+      filename: 'sidecar.pdf',
+      receivedBytes: 2,
+      totalBytes: 2,
+      state: 'completed',
+    };
+    writeFileSync(join(directory, 'global.json'), JSON.stringify({ downloads: [legacyDownload] }));
+
+    await expect(readStoredBrowserDownloadsAsync(appHome, 'global')).resolves.toEqual([legacyDownload]);
+
+    writeFileSync(
+      join(directory, 'global.downloads.json'),
+      JSON.stringify({ version: 1, downloads: [sidecarDownload] }),
+    );
+    await expect(readStoredBrowserDownloadsAsync(appHome, 'global')).resolves.toEqual([sidecarDownload]);
   });
 
   it('clears metadata without touching unrelated profile files', async () => {
@@ -572,6 +604,45 @@ describe('BrowserProfileStore', () => {
       expect.objectContaining({ id: 'download-1', state: 'completed', receivedBytes: 100 }),
     ]);
     expect(listStoredBrowserScopeKeys(appHome)).toContain('conversation-dddddddddddddddddddddddd');
+  });
+
+  it('clears only the matching quarantined download path and persists it as unavailable', async () => {
+    const appHome = home();
+    const store = new BrowserProfileStore(appHome, 'global');
+    const quarantinedPath = '/tmp/Kai-00000000-0000-4000-8000-000000000001.download';
+    store.addDownload({
+      id: 'download-1',
+      tabId: 'tab-1',
+      filename: 'report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed',
+      quarantined: true,
+      path: quarantinedPath,
+    });
+    store.addDownload({
+      id: 'download-2',
+      tabId: 'tab-1',
+      filename: 'user-report.pdf',
+      receivedBytes: 10,
+      totalBytes: 10,
+      state: 'completed',
+      path: '/tmp/user-report.pdf',
+    });
+
+    expect(store.clearQuarantinedDownloadPath('download-1', '/tmp/different.download')).toBeNull();
+    expect(store.clearQuarantinedDownloadPath('download-2', '/tmp/user-report.pdf')).toBeNull();
+    const cleared = store.clearQuarantinedDownloadPath('download-1', quarantinedPath);
+    expect(cleared).toMatchObject({ id: 'download-1', quarantined: true });
+    expect(cleared).not.toHaveProperty('path');
+
+    await store.flushDownloads();
+    const persisted = new BrowserProfileStore(appHome, 'global').listDownloads();
+    expect(persisted).toEqual([
+      expect.objectContaining({ id: 'download-2', path: '/tmp/user-report.pdf' }),
+      expect.objectContaining({ id: 'download-1' }),
+    ]);
+    expect(persisted[1]).not.toHaveProperty('path');
   });
 
   it('evicts oldest downloads before aggregate sidecar metadata can poison the profile', async () => {

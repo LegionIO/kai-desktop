@@ -1,20 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   app,
+  BaseWindow,
   type BrowserWindow,
   clipboard,
   dialog,
   ipcMain,
   Menu,
   MenuItem,
+  nativeImage,
   screen,
   session,
   shell,
   WebContentsView,
   type IpcMainEvent,
   type DownloadItem,
+  type NativeImage,
   type Session,
   type WebContents,
   type WebFrameMain,
@@ -39,6 +42,9 @@ import type {
   BrowserInspection,
   BrowserManagerState,
   BrowserMenuAction,
+  BrowserNetworkDiagnostics,
+  BrowserNetworkDiagnosticsRequest,
+  BrowserNetworkWaitMode,
   BrowserProfilePersistenceArea,
   BrowserScreenshotRequest,
   BrowserScreenshotResult,
@@ -51,6 +57,7 @@ import type {
 import { redactBrowserErrorForExposure } from '../../shared/browser.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { BrowserActionQueue } from './action-queue.js';
+import { BrowserValidatingProxy } from './validating-proxy.js';
 import { BrowserAssistantRunRegistry, type BrowserAssistantModality } from './assistant-runs.js';
 import { parseBookmarksHtml, readBoundedBookmarksHtmlFileSync, renderBookmarksHtml } from './bookmarks-html.js';
 import {
@@ -59,12 +66,29 @@ import {
   readStoredCredentialCountAsync,
 } from './credential-vault.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
+import {
+  assistantDownloadQuarantinePath,
+  exportAssistantDownloadFile,
+  isAssistantDownloadQuarantineFileAvailable,
+  isAssistantDownloadQuarantinePath,
+  listAssistantDownloadQuarantineScopeKeys,
+  MAX_ASSISTANT_DOWNLOAD_BYTES,
+  prepareAssistantDownloadQuarantine,
+  pruneAssistantDownloadQuarantine,
+  reconcileAssistantDownloadExportJournal,
+  removeAssistantDownloadFile,
+  removeAssistantDownloadQuarantineForScope,
+  secureAssistantDownloadFile,
+  type PrunedAssistantDownload,
+} from './download-quarantine.js';
 import { clearPluginBrowserPartitions } from './plugin-partitions.js';
 import { browserAutofillProbeScript, browserAutofillScript } from './credential-dom.js';
 import {
   BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE,
   BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD,
   boundedBrowserEvaluationExpression,
+  browserNativeUiGuardActivationProbe,
+  browserNativeUiNewDocumentGuard,
 } from './evaluation.js';
 import {
   MAX_BROWSER_TYPED_VALUE_CHARS,
@@ -73,6 +97,21 @@ import {
   parseBrowserScreenshotRequest,
 } from './input-validation.js';
 import { browserInspectionExpression, MAX_BROWSER_INSPECTION_OCCLUSION_POINTS } from './inspection.js';
+import {
+  browserNetworkResourceBlocksIdle,
+  browserLoadTimingFromNetworkRequests,
+  browserNetworkPageIdentity,
+  createBrowserNetworkRedactionKey,
+  MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB,
+  MAX_BROWSER_NETWORK_DIAGNOSTIC_RESULTS,
+  MAX_BROWSER_NETWORK_REQUESTS_PER_TAB,
+  responseContentLength,
+  sanitizeBrowserNetworkUrl,
+  sanitizeBrowserNetworkError,
+  snapshotBrowserNetworkRequests,
+  type BrowserNetworkRedactionKey,
+  type TrackedBrowserNetworkRequest,
+} from './network-diagnostics.js';
 import { browserSemanticHelpersExpression } from './semantics.js';
 import { validatePickedElementSelector } from './element-picker.js';
 import {
@@ -124,8 +163,11 @@ import {
   markPendingBrowserCleanupScopeKey,
 } from './profile-data.js';
 import {
+  browserScreenshotCaptureGeometry,
   browserScreenshotTiles,
+  browserScreenshotViewportGeometry,
   elementCaptureRect,
+  validateMenuPreviewNativeSize,
   validateScreenshotEncodedBytes,
   validateScreenshotSize,
 } from './screenshots.js';
@@ -134,7 +176,12 @@ import {
   removeBrowserScreenshotsForConversation,
   removeBrowserScreenshotsForScopeKey,
 } from './screenshot-store.js';
-import { BrowserProfileStore, listStoredBrowserScopeKeys, readStoredBrowserProfileCountsAsync } from './store.js';
+import {
+  BrowserProfileStore,
+  listStoredBrowserScopeKeys,
+  readStoredBrowserDownloadsAsync,
+  readStoredBrowserProfileCountsAsync,
+} from './store.js';
 import { boundedBrowserTitle, boundedBrowserUrl } from './metadata.js';
 import { stopRunningBrowserServiceWorkers } from './service-workers.js';
 import {
@@ -142,6 +189,7 @@ import {
   assertAiNavigationAllowed,
   browserPartition,
   browserPartitionForScopeKey,
+  browserSystemProxyResolverPartition,
   browserFocusTargetScript,
   browserScopeKey,
   browserWebPreferences,
@@ -166,16 +214,32 @@ const MAX_CREDENTIAL_USERNAME_LENGTH = 1_024;
 const MAX_CREDENTIAL_PASSWORD_LENGTH = 16_384;
 const AUTOMATION_OVERLAY_CLEAR_MS = 900;
 const AUTOMATION_ACTIVITY_GRACE_MS = 1_500;
-const AUTOMATION_GESTURE_ARM_MS = 1_000;
+const AUTOMATION_GESTURE_ARM_MS = 5_000;
+const AUTOMATION_GESTURE_ACK_TIMEOUT_MS = 1_000;
+// Presented text stays per-code-point for ordinary typing, preserving native
+// key events and exact timestamps. Paste-sized values use one exact-data
+// Input.insertText arm so large inputs do not perform thousands of IPC/CDP
+// acknowledgement cycles.
+const AUTOMATION_BULK_TEXT_THRESHOLD = 32;
 const POPUP_GESTURE_PROVENANCE_MS = 5_000;
+const TRUSTED_USER_NAVIGATION_AUTHORITY_MS = 30_000;
+const CONTEXT_MENU_DOWNLOAD_AUTHORITY_MS = 30_000;
 const EVALUATE_TIMEOUT_MS = 15_000;
 const INSPECT_TIMEOUT_MS = 15_000;
 const TARGET_LOCATION_TIMEOUT_MS = 15_000;
+const BROWSER_INPUT_TIMEOUT_MS = 15_000;
 const AUTOMATION_OVERLAY_TIMEOUT_MS = 5_000;
-const ASSISTANT_VIEW_ATTACH_TIMEOUT_MS = 10_000;
+const ASSISTANT_DIALOG_CDP_TIMEOUT_MS = 5_000;
 const ELEMENT_PICKER_TIMEOUT_MS = 60_000;
 const ASSISTANT_PAGE_LOAD_TIMEOUT_MS = 30_000;
+const MENU_PREVIEW_CAPTURE_TIMEOUT_MS = 5_000;
+const MENU_PREVIEW_SENSITIVITY_PROBE_TIMEOUT_MS = 1_000;
+const MENU_PREVIEW_CDP_SENSITIVITY_TIMEOUT_MS = 5_000;
+const MENU_PREVIEW_MAX_WIDTH = 1_024;
+const MENU_PREVIEW_MAX_HEIGHT = 768;
+const MAX_SUPERSEDED_NETWORK_NAVIGATIONS = 32;
 const PRELOAD_PRIVATE_NETWORK_GUARD_PENDING_IDENTIFIER = 'preload-pending';
+const PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER = 'preload-pending';
 const UNSAFE_ORIGIN_STORAGE_TYPES: NonNullable<Electron.ClearStorageDataOptions['storages']> = [
   'filesystem',
   'indexdb',
@@ -186,6 +250,16 @@ const UNSAFE_ORIGIN_STORAGE_TYPES: NonNullable<Electron.ClearStorageDataOptions[
 ];
 const SCRIPTED_ORIGIN_STORAGE_TYPES: NonNullable<Electron.ClearStorageDataOptions['storages']> = ['serviceworkers'];
 
+class BrowserRendererDeadlineError extends Error {
+  constructor(
+    readonly operation: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${operation} exceeded ${timeoutMs / 1_000} seconds.`);
+    this.name = 'BrowserRendererDeadlineError';
+  }
+}
+
 function comparablePopupReferrerUrl(value: string): string | null {
   if (!value) return null;
   try {
@@ -195,6 +269,35 @@ function comparablePopupReferrerUrl(value: string): string | null {
   } catch {
     return value.split('#', 1)[0] || null;
   }
+}
+
+function browserNetworkEventTime(timestamp: unknown): number {
+  return typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp >= 0 ? timestamp : Date.now();
+}
+
+function waitForBrowserDownloadTerminal(done: Promise<void>, operation: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error !== undefined) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      finish(
+        new Error(
+          `${operation} did not reach a terminal state within ${BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS / 1_000} seconds.`,
+        ),
+      );
+    }, BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS);
+    timer.unref?.();
+    void done.then(
+      () => finish(),
+      (error: unknown) => finish(error),
+    );
+  });
 }
 
 /** Electron's window-open callback is WebContents-wide. Bind its referrer to a
@@ -235,9 +338,14 @@ function browserAuthEndpoint(details: Electron.AuthenticationResponseDetails, au
 // compaction for up to five minutes. Retain the logical turn's temporary tabs
 // slightly longer, then reclaim them if no successor adopts the handoff.
 export const ASSISTANT_CONTINUATION_HANDOFF_TIMEOUT_MS = 6 * 60_000;
+const ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS = 1_000;
 const SCREENSHOT_TIMEOUT_MS = 60_000;
+const BACKGROUND_VIEWPORT_TIMEOUT_MS = 5_000;
+const PRIVATE_NETWORK_GUARD_TIMEOUT_MS = 15_000;
+const NATIVE_UI_GUARD_TIMEOUT_MS = 15_000;
 const DNS_RESOLUTION_TIMEOUT_MS = 10_000;
 const FAVICON_FETCH_TIMEOUT_MS = 10_000;
+export const BROWSER_DOWNLOAD_TERMINAL_TIMEOUT_MS = 5_000;
 const MAX_CONCURRENT_FAVICON_FETCHES = 8;
 const MAX_FAVICON_BYTES = 64 * 1024;
 const MAX_FAVICON_DATA_URL_CHARS = 96 * 1024;
@@ -412,6 +520,19 @@ function browserClipboardFocusFingerprintScript(stateKey: string, token: string,
   })()`;
 }
 
+type BrowserAutomationOverlay = {
+  contents: WebContents;
+  releaseDebugger: () => void;
+  x: number;
+  y: number;
+};
+
+type BrowserBackgroundCaptureLease = {
+  view: WebContentsView;
+  host: BaseWindow;
+  returnedToMain: boolean;
+};
+
 type InternalTab = {
   shell: BrowserTab;
   view: WebContentsView | null;
@@ -429,6 +550,13 @@ type InternalTab = {
   aiNetworkReleaseRequested: boolean;
   aiNetworkReleaseTimer: ReturnType<typeof setTimeout> | null;
   assistantScriptDepth: number;
+  /** Exact run attribution for a programmatic operation that can synchronously
+   * initiate a download (for example loadURL or injected evaluation). A real
+   * user gesture increments trustedGestureGeneration and invalidates it. */
+  assistantDownloadAttribution?: {
+    assistantOwnerId: string;
+    trustedGestureGeneration: number;
+  };
   popupGesture: {
     source: 'assistant' | 'user';
     assistantOwnerId: string | null;
@@ -436,12 +564,34 @@ type InternalTab = {
     frameTreeNodeId?: number;
     kind?: 'pointerdown' | 'keydown' | 'wheel' | 'input' | 'touchstart';
   } | null;
+  /** Preserve recent assistant activation independently from the last real
+   * user gesture. When both overlap, popup/download ownership fails closed to
+   * the assistant instead of letting a delayed AI side effect escape cleanup. */
+  assistantGesture: {
+    assistantOwnerId: string;
+    expiresAt: number;
+    frameTreeNodeId?: number;
+    kind?: 'pointerdown' | 'keydown' | 'wheel' | 'input' | 'touchstart';
+  } | null;
   scriptTainted: boolean;
   privateNetworkNewDocumentGuard?: { contentsId: number; identifier: string };
+  /** Irreversible document-start membrane that prevents a remote page from
+   * opening native print UI while this renderer is assistant-controlled. */
+  assistantNativeUiNewDocumentGuard?: { contentsId: number; identifier: string };
+  /** Random per-WebContents capability used only to toggle preload-installed
+   * native-UI trampolines from main. Remote pages can see the trampoline but
+   * cannot activate or deactivate it without this token. */
+  nativeUiGuardToken?: string;
   trustedUserNavigation: boolean;
   trustedUserNavigationTarget: string | null;
   trustedUserNavigationRequestId: number | null;
   trustedUserNavigationLease: number;
+  trustedUserNavigationTimer: ReturnType<typeof setTimeout> | null;
+  /** Browser-chrome selection/takeover is lifecycle intent, not trusted input
+   * delivered to the remote page. Track it separately so assistant close
+   * transactions can observe even a transient selection without invalidating
+   * exact assistant download provenance. */
+  userSelectionGeneration: number;
   trustedGestureGeneration: number;
   visibleAssistantGeneration: number;
   unrestrictedNetworkGeneration: number;
@@ -450,8 +600,96 @@ type InternalTab = {
   queue: BrowserActionQueue;
   overlayGeneration: number;
   overlayTimer: ReturnType<typeof setTimeout> | null;
-  overlayCssKey: string | null;
-  overlayCssText: string | null;
+  /** Chromium's compositor-owned DevTools highlight is outside the remote
+   * document, so page CSS/script cannot conceal or counterfeit Kai's live
+   * automation cursor. Retaining the debugger lease keeps it visible until
+   * completion, capture, validation, or teardown explicitly clears it. */
+  automationOverlay: BrowserAutomationOverlay | null;
+  /** Random per-document key for correlating redacted request origins without
+   * creating a cross-tab or cross-navigation hostname equality oracle. */
+  networkRedactionKey: BrowserNetworkRedactionKey;
+  networkRequests?: Map<number, TrackedBrowserNetworkRequest>;
+  /** Exact identities for every admitted request, independently bounded from
+   * the smaller diagnostic-history map. Requests beyond the hard admission cap
+   * are cancelled before Chromium dispatches them. */
+  activeNetworkRequests?: Map<number, string>;
+  /** Exact in-process URL for each admitted request. This never crosses the
+   * Browser tool boundary; it exists so native HTTP-auth callbacks, which omit
+   * Chromium's request id, can fail closed when a same-URL subresource makes
+   * the challenged request ambiguous. */
+  activeNetworkRequestUrls?: Map<number, string>;
+  /** Subset of activeNetworkRequests owned by the current document/navigation.
+   * Older requests remain in the complete map until Chromium reports their
+   * terminal event, but must not contaminate this document's idle/in-flight
+   * diagnostics after the bounded history has evicted their metadata. */
+  diagnosticActiveNetworkRequestIds?: Set<number>;
+  networkRequestSequence?: number;
+  /** Most recent start or completion of a request that participates in the
+   * network-idle wait. Streaming media and WebSockets remain visible in the
+   * diagnostic snapshot without keeping the page perpetually non-idle. */
+  networkLastBlockingActivityAt?: number;
+  /** Monotonic identity for main-frame navigation attempts in this renderer. */
+  networkNavigationSequence?: number;
+  /** The committed document's diagnostics while a replacement navigation is
+   * provisional. A failed/aborted navigation restores this snapshot; a commit
+   * discards it without ever mixing document-local redaction identities. */
+  provisionalNetworkNavigation?: {
+    requests?: Map<number, TrackedBrowserNetworkRequest>;
+    activeRequestIds: Set<number>;
+    requestSequence: number;
+    lastBlockingActivityAt?: number;
+    redactionKey: BrowserNetworkRedactionKey;
+    generation: number;
+    urls: Set<string>;
+    superseded: Array<{ generation: number; urls: Set<string> }>;
+  };
+  /** Bounded terminal-event tombstones for attempts superseded before the
+   * current document committed. Electron's did-fail-load event has no request
+   * id, so these prevent a late failure from settling a newer navigation. */
+  supersededNetworkNavigations?: Array<{ generation: number; urls: Set<string> }>;
+  /** Renderers temporarily exempted from Chromium background throttling while
+   * this tab has active assistant work. A tab can replace its renderer during
+   * sanitization, so retain all live targets until the outermost action ends. */
+  assistantRenderingContents?: Set<WebContents>;
+  /** WebContents with the temporary deterministic CDP viewport used by hidden
+   * assistant operations. A target already presented in the sidebar retains
+   * its native bounds so automation remains observable live. */
+  assistantBackgroundViewportContents?: Set<WebContents>;
+  /** In-flight metric installation keyed by the exact renderer. Presentation
+   * waits only for this short CDP transition before clearing it; it never waits
+   * for the surrounding assistant operation or its per-tab action queue. */
+  assistantBackgroundViewportSetups?: Map<WebContents, Promise<void>>;
+  /** Coalesces a user-presentation clear with the assistant operation's own
+   * finally cleanup so concurrent debugger attach/detach sequences cannot race. */
+  assistantBackgroundViewportRestores?: Map<WebContents, Promise<void>>;
+  /** Prevents a newly created assistant WebContents from being mounted before
+   * its deterministic hidden initial-load viewport has been installed. */
+  assistantBackgroundInitialLoadPending?: boolean;
+  /** Keeps a newly created assistant popup runnable while Chromium completes
+   * its first hidden navigation. Popup targets are created outside the normal
+   * withAssistantControl lifetime, so they need their own balanced exemption. */
+  assistantPopupBootstrapPending?: boolean;
+  /** Resolves when that first popup navigation reaches a terminal load event or
+   * the owning run/renderer is torn down. User presentation waits for this
+   * independently from the per-tab action queue so it cannot reclaim a target
+   * whose popup bootstrap is still executing outside the queue. */
+  assistantPopupBootstrapDrain?: Promise<void>;
+  resolveAssistantPopupBootstrap?: () => void;
+  /** Assistant popup targets can begin executing as soon as createWindow
+   * returns, before asynchronous CDP interception is ready. This marker forces
+   * Chromium's synchronous disableDialogs WebPreference for that renderer. */
+  assistantPopupDialogsDisabled?: boolean;
+  /** Existing user pages are recreated once per controlling run with Chromium's
+   * immutable disableDialogs preference. This closes the interval before CDP's
+   * Page domain can subscribe to dialog events without consulting Browser UI. */
+  assistantDialogsDisabledRunId: string | null;
+  /** Dialog suppression is capability-scoped rather than a permanent
+   * WebPreferences flag so an ordinary user-owned tab retains Chromium's native
+   * alert/confirm/prompt behavior as soon as assistant control ends. */
+  assistantDialogGuard?: AssistantDialogGuard;
+  /** Run-lifetime native-dialog guard for an assistant-created tab. This covers
+   * its initial navigation and delayed page work between explicit tool calls. */
+  assistantRunDialogGuardLease?: symbol;
   isPopup: boolean;
 };
 
@@ -459,6 +697,12 @@ type BrowserAutomationInputArm = {
   token: string;
   kind: 'pointerdown' | 'keydown' | 'wheel' | 'input';
   expiresAt: number;
+  /** CDP TimeSinceEpoch value, in seconds, for the exact dispatched event. */
+  timestamp: number;
+  /** Background-only Input.insertText has no CDP timestamp field. Its view is
+   * quarantined from physical input, so allow delivery-time drift within the
+   * same bounded arm while retaining exact text and frame validation. */
+  timestampToleranceSeconds?: number;
   x?: number;
   y?: number;
   screenX?: number;
@@ -468,11 +712,57 @@ type BrowserAutomationInputArm = {
   data?: string;
 };
 
+type AssistantDialogGuard = {
+  runId: string;
+  owners: Set<symbol>;
+  protectedContents: Map<
+    WebContents,
+    {
+      onMessage: (event: unknown, method: string, params: unknown) => void;
+      ready: Promise<void>;
+      releaseDebugger: () => void;
+    }
+  >;
+  failure: Promise<never>;
+  reject: (error: Error) => void;
+  handlingDialog: boolean;
+  settled: boolean;
+};
+
 type PendingAutomationGesture = {
   tabId: string;
+  contentsId: number;
   assistantOwnerId: string;
   expiresAt: number;
+  kind: BrowserAutomationInputArm['kind'];
   inputData?: string;
+  /** Exact frame documents that acknowledged this arm. A replacement frame
+   * must never inherit the old token's provenance, regardless of whether the
+   * eventual input uses the visible native surface or hidden CDP dispatch. */
+  armedFrames?: Map<number, string>;
+  /** Detached arms are kind-bound and cannot coexist with an interactive page.
+   * Visible insertText arms retain exact frame identity without hiding the page. */
+  detachedArm?: boolean;
+  /** Set only by the isolated frame preload after Chromium delivers the exact
+   * trusted event. Keep the record until the dispatching operation consumes
+   * this receipt so timer expiry can never be mistaken for attribution. */
+  confirmed: boolean;
+  /** Remains false while visible frames acknowledge the one-shot arm. A real
+   * user event that races that setup must be rejected as automation and then
+   * re-reported as user-owned before the page's own handler can open a popup. */
+  dispatchStarted: boolean;
+  /** Created with every real arm. Optional only so defensive cleanup remains
+   * compatible with partially constructed records during teardown. */
+  confirmation?: Promise<boolean>;
+  settleConfirmation?: (confirmed: boolean) => void;
+};
+
+type PendingAutomationArmAcknowledgement = {
+  tabId: string;
+  contentsId: number;
+  expectedFrames: Map<number, string>;
+  acknowledgedFrames: Set<number>;
+  settle: (error?: Error) => void;
 };
 
 type PendingSyntheticInput = {
@@ -480,6 +770,61 @@ type PendingSyntheticInput = {
   arm: BrowserAutomationInputArm;
   expectedType: Electron.InputEvent['type'];
   error?: Error;
+};
+
+type DispatchedSyntheticInput = {
+  tabId: string;
+  contents: WebContents;
+  token: string;
+  kind: BrowserAutomationInputArm['kind'];
+  /** Kept as a provenance tombstone until the dispatching operation consumes
+   * the exact preload receipt. Once confirmed, the destructive deadline is no
+   * longer needed, but the record itself must survive until CDP returns so a
+   * coincident real gesture cannot consume the token and make the later
+   * assistant event look user-owned. */
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+type BrowserMenuPreviewSubscriber = {
+  promise: Promise<BrowserScreenshotResult>;
+  resolve: (result: BrowserScreenshotResult) => void;
+  reject: (error: Error) => void;
+  settled: boolean;
+};
+
+type BrowserMenuPreviewCapture = {
+  key: string;
+  tabId: string;
+  contentsId: number;
+  scopeKey: string;
+  controller: AbortController;
+  /** Lifecycle cancellation is separate from ordinary presentation
+   * cancellation so profile clear/shutdown can reclaim the exact target. */
+  teardownController: AbortController;
+  subscribers: Map<string, BrowserMenuPreviewSubscriber>;
+  operation: Promise<BrowserScreenshotResult> | null;
+  completion: Promise<void> | null;
+  outcome?: { result: BrowserScreenshotResult } | { error: Error };
+};
+
+type PendingMenuSensitivityProbe = {
+  contentsId: number;
+  expectedFrames: Map<number, string>;
+  responses: Map<number, { sensitive: boolean; complete: boolean }>;
+  settle: () => void;
+};
+
+type BrowserCdpInputCommand = {
+  method: 'Input.dispatchMouseEvent' | 'Input.dispatchKeyEvent' | 'Input.insertText';
+  params: Record<string, unknown>;
+};
+
+type BrowserInputCoordinateLease = {
+  bounds: BrowserBounds;
+  zoomFactor: number;
+  /** Raw coordinates bind to one exact zoom. Semantic targets may be
+   * re-located after zoom, but still require stable native view bounds. */
+  lockZoom: boolean;
 };
 
 type PendingElementPicker = {
@@ -524,7 +869,12 @@ type AssistantDocumentLease = {
 type BrowserSemanticTargetLease = {
   contextId: number;
   globalKey: string;
-  detachDebugger: boolean;
+  releaseDebugger?: () => void;
+};
+
+type BrowserDebuggerOwnership = {
+  references: number;
+  detachWhenIdle: boolean;
 };
 
 type BrowserLocatedTarget = {
@@ -543,6 +893,16 @@ type BrowserPageLease = {
   tabGeneration: number;
   userNavigationLease: number;
   contents: WebContents;
+};
+
+type BrowserContextMenuDownloadAuthority = {
+  tabId: string;
+  tabGeneration: number;
+  userNavigationLease: number;
+  contents: WebContents;
+  url: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 type BrowserClipboardFocusLease = {
@@ -575,6 +935,23 @@ export type BrowserDocumentApproval = {
   allowInternalRestore?: boolean;
 };
 
+type BrowserApprovalWithDocument = BrowserDocumentApproval | BrowserTabsApproval;
+
+/** One tool-approval object may cross exactly one manager-owned renderer
+ * replacement. The lease is main-process-only and is created only after the
+ * approved document has been revalidated inside the tab queue. */
+type BrowserApprovalRendererResetLease = {
+  approval: BrowserApprovalWithDocument;
+  tab: InternalTab;
+  runId: string;
+  origin: string;
+  url: string;
+  userNavigationLease: number;
+  sourceGeneration: number;
+  sourceContents: WebContents | null;
+  preparedGeneration?: number;
+};
+
 /** Password approval also binds the exact saved record and the frame origin
  * that will receive it. The top-level origin remains useful context, but is not
  * necessarily the credential destination when login UI lives in an OOPIF. */
@@ -595,7 +972,6 @@ function isBrowserAutofillApproval(value: BrowserDocumentApproval): value is Bro
 
 export type BrowserTabsMutationAction =
   | 'open'
-  | 'activate'
   | 'close'
   | 'duplicate'
   | 'reopen_closed'
@@ -649,9 +1025,10 @@ type ActiveBrowserDownload = {
   tabId: string;
   assistantOwnerId: string | null;
   keepOpen: boolean;
+  quarantinePath?: string;
   item: DownloadItem;
   done: Promise<void>;
-  cancel: () => Promise<void>;
+  cancel: (persistTerminalAcrossGeneration?: boolean) => Promise<void>;
 };
 
 type BrowserConfigPreemption = {
@@ -662,6 +1039,7 @@ type BrowserConfigPreemption = {
   privateNetworkTightened: boolean;
   connectionDrain: Promise<void>;
   downloadDrain: Promise<void>;
+  menuPreviewDrain: Promise<void>;
 };
 
 export type BrowserAssistantRun = {
@@ -710,6 +1088,11 @@ type PendingAuth = {
   conversationId: string;
   scopeKey: string;
   tabGeneration: number;
+  /** Present only when the challenge belongs to the exact main-frame request
+   * claimed by an explicit user navigation through an AI-restricted tab. */
+  trustedUserNavigationLease?: number;
+  trustedUserNavigationRequestId?: number;
+  trustedUserNavigationUrl?: string;
   prompt: BrowserAuthPrompt;
   callback: (username?: string, password?: string) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -717,6 +1100,114 @@ type PendingAuth = {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function cdpKeyboardModifiers(modifiers: ReadonlyArray<'shift' | 'control' | 'alt' | 'meta'>): number {
+  let result = 0;
+  if (modifiers.includes('alt')) result |= 1;
+  if (modifiers.includes('control')) result |= 2;
+  if (modifiers.includes('meta')) result |= 4;
+  if (modifiers.includes('shift')) result |= 8;
+  return result;
+}
+
+function cdpKeyboardEventParams(
+  type: 'keyDown' | 'keyUp',
+  keyCode: string,
+  modifiers: ReadonlyArray<'shift' | 'control' | 'alt' | 'meta'>,
+): Record<string, unknown> {
+  const aliases: Record<string, { key: string; code: string; virtualKeyCode: number }> = {
+    enter: { key: 'Enter', code: 'Enter', virtualKeyCode: 13 },
+    tab: { key: 'Tab', code: 'Tab', virtualKeyCode: 9 },
+    alt: { key: 'Alt', code: 'AltLeft', virtualKeyCode: 18 },
+    control: { key: 'Control', code: 'ControlLeft', virtualKeyCode: 17 },
+    ctrl: { key: 'Control', code: 'ControlLeft', virtualKeyCode: 17 },
+    shift: { key: 'Shift', code: 'ShiftLeft', virtualKeyCode: 16 },
+    meta: { key: 'Meta', code: 'MetaLeft', virtualKeyCode: 91 },
+    command: { key: 'Meta', code: 'MetaLeft', virtualKeyCode: 91 },
+    cmd: { key: 'Meta', code: 'MetaLeft', virtualKeyCode: 91 },
+    esc: { key: 'Escape', code: 'Escape', virtualKeyCode: 27 },
+    escape: { key: 'Escape', code: 'Escape', virtualKeyCode: 27 },
+    backspace: { key: 'Backspace', code: 'Backspace', virtualKeyCode: 8 },
+    delete: { key: 'Delete', code: 'Delete', virtualKeyCode: 46 },
+    insert: { key: 'Insert', code: 'Insert', virtualKeyCode: 45 },
+    arrowleft: { key: 'ArrowLeft', code: 'ArrowLeft', virtualKeyCode: 37 },
+    arrowup: { key: 'ArrowUp', code: 'ArrowUp', virtualKeyCode: 38 },
+    arrowright: { key: 'ArrowRight', code: 'ArrowRight', virtualKeyCode: 39 },
+    arrowdown: { key: 'ArrowDown', code: 'ArrowDown', virtualKeyCode: 40 },
+    home: { key: 'Home', code: 'Home', virtualKeyCode: 36 },
+    end: { key: 'End', code: 'End', virtualKeyCode: 35 },
+    pageup: { key: 'PageUp', code: 'PageUp', virtualKeyCode: 33 },
+    pagedown: { key: 'PageDown', code: 'PageDown', virtualKeyCode: 34 },
+    space: { key: ' ', code: 'Space', virtualKeyCode: 32 },
+    ' ': { key: ' ', code: 'Space', virtualKeyCode: 32 },
+  };
+  const shiftedDigits: Record<string, string> = {
+    '0': ')',
+    '1': '!',
+    '2': '@',
+    '3': '#',
+    '4': '$',
+    '5': '%',
+    '6': '^',
+    '7': '&',
+    '8': '*',
+    '9': '(',
+  };
+  const punctuation: Record<string, { shifted: string; code: string; virtualKeyCode: number }> = {
+    '`': { shifted: '~', code: 'Backquote', virtualKeyCode: 192 },
+    '-': { shifted: '_', code: 'Minus', virtualKeyCode: 189 },
+    '=': { shifted: '+', code: 'Equal', virtualKeyCode: 187 },
+    '[': { shifted: '{', code: 'BracketLeft', virtualKeyCode: 219 },
+    ']': { shifted: '}', code: 'BracketRight', virtualKeyCode: 221 },
+    '\\': { shifted: '|', code: 'Backslash', virtualKeyCode: 220 },
+    ';': { shifted: ':', code: 'Semicolon', virtualKeyCode: 186 },
+    "'": { shifted: '"', code: 'Quote', virtualKeyCode: 222 },
+    ',': { shifted: '<', code: 'Comma', virtualKeyCode: 188 },
+    '.': { shifted: '>', code: 'Period', virtualKeyCode: 190 },
+    '/': { shifted: '?', code: 'Slash', virtualKeyCode: 191 },
+  };
+  const lowerKeyCode = keyCode.toLowerCase();
+  const shifted = modifiers.includes('shift');
+  const functionKey = /^f([1-9]|1\d|2[0-4])$/i.exec(keyCode);
+  const punctuationKey = punctuation[keyCode];
+  const normalized =
+    aliases[lowerKeyCode] ??
+    (functionKey
+      ? {
+          key: `F${functionKey[1]}`,
+          code: `F${functionKey[1]}`,
+          virtualKeyCode: 111 + Number(functionKey[1]),
+        }
+      : punctuationKey
+        ? {
+            key: shifted ? punctuationKey.shifted : keyCode,
+            code: punctuationKey.code,
+            virtualKeyCode: punctuationKey.virtualKeyCode,
+          }
+        : /^[a-z]$/i.test(keyCode)
+          ? {
+              key: shifted ? keyCode.toUpperCase() : keyCode.toLowerCase(),
+              code: `Key${keyCode.toUpperCase()}`,
+              virtualKeyCode: keyCode.toUpperCase().charCodeAt(0),
+            }
+          : /^\d$/.test(keyCode)
+            ? {
+                key: shifted ? shiftedDigits[keyCode] : keyCode,
+                code: `Digit${keyCode}`,
+                virtualKeyCode: keyCode.charCodeAt(0),
+              }
+            : { key: keyCode, code: keyCode, virtualKeyCode: 0 });
+  const printable = normalized.key.length === 1 && !modifiers.some((modifier) => modifier !== 'shift');
+  return {
+    type,
+    key: normalized.key,
+    code: normalized.code,
+    modifiers: cdpKeyboardModifiers(modifiers),
+    windowsVirtualKeyCode: normalized.virtualKeyCode,
+    nativeVirtualKeyCode: normalized.virtualKeyCode,
+    ...(type === 'keyDown' && printable ? { text: normalized.key } : {}),
+  };
 }
 
 function assistantContinuationKey(conversationId: string, runId: string): string {
@@ -797,10 +1288,18 @@ export class BrowserManager {
   private readonly activeTabs = new Map<string, string>();
   private readonly closedTabs = new Map<string, ClosedTab[]>();
   private readonly stores = new Map<string, BrowserProfileStore>();
+  /** Stores created solely to repair persisted startup download metadata. A
+   * normal runtime access removes its marker, preventing reconciliation from
+   * evicting a store that UI/tool work began using concurrently. */
+  private startupOnlyStores = new Map<string, BrowserProfileStore>();
   private readonly vaults = new Map<string, BrowserCredentialVault>();
   private readonly wiredSessions = new WeakSet<Session>();
   private readonly wiredSessionsByScope = new Map<string, Session>();
   private readonly wiredSessionCleanups = new Map<string, () => void>();
+  /** All Browser sessions use one authenticated loopback proxy so DNS
+   * validation is bound to the TCP destination. Restrictions are request- and
+   * hostname-scoped, preserving unrelated user traffic in a global profile. */
+  private readonly validatingProxy: BrowserValidatingProxy;
   private readonly pendingCredentials = new Map<string, PendingCredential>();
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private readonly pendingAuth = new Map<string, PendingAuth>();
@@ -811,11 +1310,26 @@ export class BrowserManager {
   private readonly oneTimePermissions = new Set<string>();
   private readonly downloads = new Map<string, CachedBrowserDownload>();
   private readonly activeDownloads = new Map<DownloadItem, ActiveBrowserDownload>();
+  /** A native context-menu selection is itself a fresh, explicit user command.
+   * Bind Save Image As to one exact document, WebContents, and URL instead of
+   * depending on the earlier right-click's short popup provenance window. */
+  private contextMenuDownloadAuthorities?: Map<number, BrowserContextMenuDownloadAuthority> = new Map();
+  /** Completed quarantine files being exported through a native save dialog.
+   * Ref counts cover duplicate concurrent exports of the same file. */
+  private readonly downloadExportLeases = new Map<string, Map<string, number>>();
   private readonly faviconFetches = new Map<string, PendingFaviconFetch>();
   private readonly webContentsToTab = new Map<number, string>();
   private readonly pendingTabCreations = new Map<string, number>();
+  /** Assistant bulk-close transactions synchronously fence every captured tab
+   * before draining its already-admitted work. New work fails cleanly instead
+   * of entering a sibling queue behind a partially acquired multi-queue lock. */
+  private pendingAssistantTabClosures = new Map<string, symbol>();
   private readonly removedConversations = new Set<string>();
   private readonly assistantRuns = new BrowserAssistantRunRegistry();
+  /** Automation selection is capability state, not presentation state. The
+   * Browser panel's active tab remains user-owned while each assistant run
+   * independently remembers the last tab it opened or explicitly targeted. */
+  private assistantTargetTabs = new Map<string, string>();
   private readonly pendingAssistantContinuations = new Map<string, PendingAssistantContinuation>();
   private assistantTabCleanups?: Map<string, Set<Promise<void>>>;
   /** Run ids whose temporary tabs are retained across the gap between a
@@ -844,12 +1358,32 @@ export class BrowserManager {
   private readonly restrictedBackgroundScopes = new Set<string>();
   private readonly assistantControlledOrigins = new Map<string, Set<string>>();
   private readonly automationGestureTokens = new Map<string, PendingAutomationGesture>();
+  private readonly pendingAutomationArmAcknowledgements = new Map<string, PendingAutomationArmAcknowledgement>();
+  private readonly pendingMenuSensitivityProbes = new Map<string, PendingMenuSensitivityProbe>();
   private readonly pendingSyntheticInputs = new Map<number, PendingSyntheticInput>();
+  private readonly dispatchedSyntheticInputs = new Map<number, DispatchedSyntheticInput>();
+  /** Every manager-owned CDP operation participates in one synchronous,
+   * per-WebContents reference count. Presentation can clear a hidden viewport
+   * without joining the tab action queue, so a plain `wasAttached` check lets
+   * either operation detach the debugger while the other still uses it. */
+  private debuggerOwnership = new WeakMap<WebContents, BrowserDebuggerOwnership>();
+  /** Ask-policy consent is document-bound, while the first assistant operation
+   * must synchronously replace a user renderer to disable native dialogs. This
+   * weak lease lets only that exact manager-owned replacement retain consent. */
+  private approvalRendererResetLeases = new WeakMap<object, BrowserApprovalRendererResetLease>();
+  /** Disabling file-chooser interception is asynchronous. A successor guard on
+   * the same target must wait for that restore so an older disable command can
+   * never overtake and silently remove the new assistant protection. */
+  private assistantDialogProtectionRestores = new Map<number, Promise<void>>();
   private readonly panelAuthorityGenerations = new Map<string, number>();
   /** Host bounds and page zoom both change the coordinate space used by
    * Chromium input events. Physical assistant actions capture this generation
    * before queueing and must re-resolve their target after either changes. */
   private readonly panelLayoutGenerations = new Map<string, number>();
+  /** Raw coordinates identify one exact rendered viewport. Presentation may be
+   * hidden or switched while input is in flight, but it must not resize that
+   * surface until the final input event has been dispatched. */
+  private inputCoordinateSurfaceLeases?: WeakMap<WebContentsView, Set<BrowserInputCoordinateLease>>;
   private readonly panelStateWaiters = new Map<string, Set<() => void>>();
   private readonly hostRendererOperationContext = new AsyncLocalStorage<HostRendererOperationLease>();
   private readonly hostRendererOperationControllers = new Set<AbortController>();
@@ -862,16 +1396,35 @@ export class BrowserManager {
    * remount a renderer; older queued transitions still update the internal
    * scope state so the newest transition can apply from a coherent baseline. */
   private browserConfigGeneration = 0;
-  /** Screenshot capture and encoding can each hold buffers near the global
-   * pixel ceiling. Serialize them across tabs to cap process-wide peak memory
-   * while each tab's own action queue still preserves document ordering. */
+  /** Real screenshot capture/encoding can hold buffers near the global pixel
+   * ceiling, so serialize it across tabs. Menu previews use the opportunistic
+   * path and a separate, much smaller pixel cap. */
   private readonly screenshotQueue = new BrowserActionQueue();
-  /** Only one native Browser page can be attached to the primary window at a
-   * time. Serialize every assistant operation that must become visible so a
-   * parallel call cannot switch tabs underneath another call's document lease. */
-  private readonly visibleAssistantQueue = new BrowserActionQueue();
+  /** Admit at most one bounded CDP menu preview process-wide and let duplicate
+   * requests for the same document share it. */
+  private menuPreviewCapture: BrowserMenuPreviewCapture | null = null;
+  /** Crash recovery begins after construction so startup is not synchronously
+   * blocked on profile I/O. It remains an explicit shutdown/profile-mutation
+   * barrier so no recovery writer can outlive this manager. */
+  private startupDownloadReconciliation: Promise<void> = Promise.resolve();
   private shutdownPromise: Promise<void> | null = null;
   private attachedView: WebContentsView | null = null;
+  /** A minimized BrowserWindow stops producing compositor frames even while
+   * background throttling is disabled. Hidden screenshots temporarily reparent
+   * their existing WebContentsView into a non-focusable BaseWindow so Chromium
+   * can paint without mounting, showing, restoring, or focusing Kai's UI. */
+  private captureHostedView: WebContentsView | null = null;
+  /** Operation-scoped ownership prevents a timed-out capture's late finalizer
+   * from corrupting the returned-to-main state of a successor capture. */
+  private captureHostedViewLease: BrowserBackgroundCaptureLease | null = null;
+  /** Reusable renderer-free capture host. It is explicitly destroyed before
+   * the primary window closes so it cannot suppress last-window shutdown. */
+  private backgroundCaptureHost: BaseWindow | null = null;
+  /** WebContentsViews survive primary-window recreation. Keep exact detached
+   * ownership so a replacement window can host each retained renderer once,
+   * without recreating authenticated DOM state or requiring a mounted panel. */
+  private detachedHostViews = new Set<WebContentsView>();
+  private closingHostWindow: BrowserWindow | null = null;
   private mountedConversationId: string | null = null;
   private mountedBounds: BrowserBounds | null = null;
   private disposed = false;
@@ -906,11 +1459,28 @@ export class BrowserManager {
     this.scriptInjectionPolicy = browserConfig.scriptInjection ?? 'allow';
     this.passwordAccessPolicy = browserConfig.passwordAccess ?? 'user-only';
     this.aiAllowPrivateNetwork = browserConfig.aiAllowPrivateNetwork ?? false;
+    this.validatingProxy = new BrowserValidatingProxy((url) =>
+      session.fromPartition(browserSystemProxyResolverPartition()).resolveProxy(url),
+    );
     this.refreshPendingCleanupQuarantine();
+    // Quarantined AI downloads are app-owned temporary artifacts, not files in
+    // the user's Downloads folder. Expire them independently of whether the
+    // Browser sidebar is ever mounted during this app session.
+    this.startupDownloadReconciliation = new Promise<void>((resolve, reject) => {
+      const immediate = setImmediate(() => {
+        void this.reconcileAssistantDownloadQuarantineAtStartup().then(resolve, reject);
+      });
+      immediate.unref?.();
+    });
+    this.profileMutationTail = this.startupDownloadReconciliation.catch((error: unknown) => {
+      console.warn('[Browser] Could not reconcile assistant download quarantine:', error);
+    });
     ipcMain.on('browser-page:sensitive', this.handleSensitiveEvent);
     ipcMain.on('browser-page:login-submitted', this.handleLoginSubmitted);
     ipcMain.on('browser-page:activity', this.handlePageActivity);
     ipcMain.on('browser-page:gesture', this.handlePageGesture);
+    ipcMain.on('browser-page:automation-input-armed', this.handleAutomationInputArmed);
+    ipcMain.on('browser-page:sensitivity-probe-result', this.handleMenuSensitivityProbeResult);
     ipcMain.on('browser-page:element-picker-click', this.handleElementPickerClick);
     ipcMain.on('browser-page:element-picker-result', this.handleElementPickerResult);
     ipcMain.on('browser-page:element-picker-cancel', this.handleElementPickerCancel);
@@ -998,6 +1568,7 @@ export class BrowserManager {
     }
 
     const downloadDrain = this.cancelActiveDownloadsForScopes(oldScopeKeys);
+    void downloadDrain.catch(() => undefined);
     const changedConversations = new Set<string>();
     for (const tab of affectedTabs) {
       if (
@@ -1015,6 +1586,11 @@ export class BrowserManager {
       changedConversations.add(tab.shell.conversationId);
     }
     for (const conversationId of changedConversations) this.emitTabs(conversationId);
+    const menuPreviewDrain = this.drainMenuPreviewCapture(
+      oldScopeKeys,
+      new Error('Browser menu preview was cancelled because Browser settings changed.'),
+    );
+    void menuPreviewDrain.catch(() => undefined);
 
     // Start connection shutdown now rather than after the profile-mutation
     // queue. Request accounting is released only after Chromium has been asked
@@ -1044,6 +1620,7 @@ export class BrowserManager {
       privateNetworkTightened,
       connectionDrain,
       downloadDrain,
+      menuPreviewDrain,
     };
   }
 
@@ -1057,7 +1634,6 @@ export class BrowserManager {
       if (this.chromeFocusConversationId !== conversationId) {
         const previousConversationId = this.chromeFocusConversationId;
         this.chromeFocusConversationId = conversationId;
-        this.invalidatePhysicalAssistantActions(this.tabs.get(this.activeTabs.get(conversationId) ?? ''));
         if (previousConversationId) this.notifyPanelStateChanged(previousConversationId);
         this.notifyPanelStateChanged(conversationId);
       }
@@ -1065,30 +1641,47 @@ export class BrowserManager {
       if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.focus();
     } else if (this.chromeFocusConversationId === conversationId) {
       this.chromeFocusConversationId = null;
-      this.invalidatePhysicalAssistantActions(this.tabs.get(this.activeTabs.get(conversationId) ?? ''));
       this.notifyPanelStateChanged(conversationId);
     }
   }
 
-  /** BrowserWindow focus and visibility are native state, so React bounds
-   * updates cannot wake operations waiting for them. Main forwards the native
-   * window lifecycle events here. Losing foreground authority revokes queued
-   * physical input; hiding/minimizing also revokes operations whose output or
-   * credential fill was promised to be visible. */
+  /** BrowserWindow focus and visibility affect only presentation. Assistant
+   * operations keep running against hidden hosted views when Kai is blurred,
+   * minimized, or hidden. */
   handleHostWindowVisibilityChanged(): void {
     if (this.disposed || this.shuttingDown) return;
+    this.handleHostWindowCreated();
+    const wasShown = this.hostWindowShown;
+    const wasInteractive = this.hostWindowInteractive;
     const shown = this.isHostWindowShown();
     const interactive = shown && this.isHostWindowInteractive();
-    const lostShown = this.hostWindowShown && !shown;
-    const lostInteraction = this.hostWindowInteractive && !interactive;
     this.hostWindowShown = shown;
     this.hostWindowInteractive = interactive;
-
-    if (lostShown || lostInteraction) {
-      for (const tab of this.tabs.values()) {
-        if (lostShown) this.invalidateVisibleAssistantOperations(tab);
-        if (lostInteraction) this.invalidatePhysicalAssistantActions(tab);
+    // A menu preview is presentation-only. Cancel it when the host disappears;
+    // manager-owned CDP work is detached without destroying live DOM/SPA state.
+    const menuPreview = this.menuPreviewCapture;
+    if (!shown && menuPreview && !menuPreview.teardownController.signal.aborted) {
+      const tab = this.tabs.get(menuPreview.tabId);
+      const recovery = tab
+        ? this.preemptMenuPreviewForTab(tab, 'Browser menu preview was cancelled because Kai was hidden or minimized.')
+        : null;
+      if (!recovery) {
+        menuPreview.controller.abort();
+        this.settleMenuPreviewCapture(menuPreview, {
+          error: new Error('Browser menu preview was cancelled because Kai was hidden or minimized.'),
+        });
+      } else {
+        void recovery.catch((error: unknown) => {
+          console.warn('[Browser] Could not cancel a hidden menu preview cleanly:', error);
+        });
       }
+    }
+    // A background operation can select a different tab or detach the mounted
+    // view while Kai is hidden/minimized. Native child views paint above React,
+    // so restore the current mounted tab synchronously before the window can
+    // expose a stale (and still clickable) page surface.
+    if (shown && (!wasShown || (!wasInteractive && interactive)) && this.mountedConversationId && this.mountedBounds) {
+      this.attachActiveView(this.mountedConversationId);
     }
     const conversations = new Set(this.panelStateWaiters.keys());
     if (this.mountedConversationId) conversations.add(this.mountedConversationId);
@@ -1305,10 +1898,15 @@ export class BrowserManager {
     // DownloadItems outlive their initiating WebContents. Revoke temporary
     // assistant downloads directly instead of relying on their tabs still
     // being present in the live tab map below.
-    void this.cancelActiveAssistantDownloads();
-    void this.cancelAssistantContinuations();
+    void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
+      console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
+    });
+    void this.cancelAssistantContinuations().catch((error: unknown) => {
+      console.warn('[Browser] Assistant continuation revocation will be retried:', error);
+    });
     this.assistantRuns.clear();
-    this.automationGestureTokens.clear();
+    this.assistantTargetTabs?.clear();
+    for (const token of [...this.automationGestureTokens.keys()]) this.revokeAutomationGestureToken(token);
 
     const focusedConversationId = this.chromeFocusConversationId;
     this.chromeFocusConversationId = null;
@@ -1326,6 +1924,7 @@ export class BrowserManager {
         this.closeTab(tab, false);
         continue;
       }
+      void this.releaseAssistantRunDialogGuard(tab).catch(() => undefined);
       // A retained user/kept tab can still have an in-flight navigation,
       // evaluation, or page-scheduled work from the revoked assistant. Closing
       // its renderer is the only reliable cancellation primitive Electron
@@ -1336,6 +1935,8 @@ export class BrowserManager {
         tab.shell.sensitive = false;
       }
       if (tab.popupGesture?.source === 'assistant') tab.popupGesture = null;
+      tab.assistantGesture = null;
+      tab.assistantDownloadAttribution = undefined;
       tab.aiControlOwnerId = null;
       tab.aiControlGeneration = null;
       tab.aiActionDepth = 0;
@@ -1421,6 +2022,7 @@ export class BrowserManager {
         serviceWorkerStops.push(this.stopRunningServiceWorkers(scopedSession, undefined, true));
       }
       const downloadDrain = this.cancelActiveDownloadsForScopes(scopesToQuiesce);
+      void downloadDrain.catch(() => undefined);
       for (const tab of affectedTabs) {
         this.destroyView(tab);
         tab.shell.discarded = true;
@@ -1441,8 +2043,16 @@ export class BrowserManager {
         throw new AggregateError(networkFailures, 'Browser network quiescence failed during a config transition.');
       }
       for (const scopeKey of oldScopeKeys) this.finishAllScopeRequestActivities(scopeKey);
-      await Promise.all([this.visibleAssistantQueue.whenIdle(), ...affectedTabs.map((tab) => tab.queue.whenIdle())]);
-      await Promise.all([downloadDrain, preemption?.downloadDrain]);
+      await Promise.all(affectedTabs.map((tab) => tab.queue.whenIdle()));
+      await Promise.all([
+        downloadDrain,
+        preemption?.downloadDrain,
+        preemption?.menuPreviewDrain,
+        this.drainMenuPreviewCapture(
+          oldScopeKeys,
+          new Error('Browser menu preview was cancelled because Browser settings changed.'),
+        ),
+      ]);
       await Promise.all([...oldScopeKeys].map((scopeKey) => this.waitForScopeIdle(scopeKey)));
     }
 
@@ -1454,6 +2064,47 @@ export class BrowserManager {
     // profile after every older barrier has completed.
     const isLatestRequest = requestGeneration === this.browserConfigGeneration;
     if (!isLatestRequest) return { committed: false };
+
+    const privateNetworkLoosened = this.aiAllowPrivateNetwork === false && config.aiAllowPrivateNetwork === true;
+    if (privateNetworkLoosened) {
+      // The document-start WebRTC membrane is intentionally irreversible. A
+      // native policy change alone cannot make an already-guarded renderer
+      // honor the newly relaxed setting, so replace guarded targets at their
+      // per-tab queue boundary before publishing the relaxed policy. Operations
+      // admitted while this transition is pending continue to observe the last
+      // committed, stricter setting; a failed or superseded transition can
+      // therefore never expose private-network access early.
+      const guardedTabs = [...this.tabs.values()].filter(
+        (tab) => !!tab.privateNetworkNewDocumentGuard && !!tab.view && !tab.view.webContents.isDestroyed(),
+      );
+      await Promise.all(
+        guardedTabs.map((tab) =>
+          tab.queue.run(async () => {
+            if (
+              this.tabs.get(tab.shell.id) !== tab ||
+              !tab.privateNetworkNewDocumentGuard ||
+              !tab.view ||
+              tab.view.webContents.isDestroyed()
+            )
+              return;
+            tab.generation++;
+            this.destroyView(tab);
+            tab.shell.discarded = true;
+            tab.shell.sensitive = false;
+            changedConversations.add(tab.shell.conversationId);
+          }),
+        ),
+      );
+      await this.drainMenuPreviewCapture(
+        new Set(guardedTabs.map((tab) => tab.scopeKey)),
+        new Error('Browser menu preview was cancelled because Browser settings changed.'),
+      );
+      // A stricter Settings write can preempt while we wait for a live tab's
+      // operation queue. Its preemption has already restored the deny policy;
+      // the stale allow transition must not publish its old value or release
+      // any profile gates after that point.
+      if (requestGeneration !== this.browserConfigGeneration) return { committed: false };
+    }
 
     if (scopeChangeRequested) {
       // A tab URL is profile data too: reloading an old shell in the newly
@@ -1600,15 +2251,23 @@ export class BrowserManager {
     return browserScopeKey(this.dataScope ?? this.config().dataScope, conversationId);
   }
 
-  private storeForScope(scopeKey: string): BrowserProfileStore {
+  private storeForScope(scopeKey: string, startupRecovery = false): BrowserProfileStore {
     let store = this.stores.get(scopeKey);
     if (!store) {
       store = new BrowserProfileStore(this.appHome, scopeKey, undefined, (area, error) => {
         this.emitProfileErrorForScope(scopeKey, area, error);
       });
       this.stores.set(scopeKey, store);
+      if (startupRecovery) (this.startupOnlyStores ??= new Map()).set(scopeKey, store);
     }
+    if (!startupRecovery) this.startupOnlyStores?.delete(scopeKey);
     return store;
+  }
+
+  private releaseStartupOnlyStore(scopeKey: string, store: BrowserProfileStore): void {
+    if (this.startupOnlyStores?.get(scopeKey) !== store || this.stores.get(scopeKey) !== store) return;
+    this.startupOnlyStores.delete(scopeKey);
+    this.stores.delete(scopeKey);
   }
 
   private store(conversationId: string): BrowserProfileStore {
@@ -1634,7 +2293,7 @@ export class BrowserManager {
 
   private requireLiveWindow(): BrowserWindow {
     const win = this.getWindow();
-    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+    if (!win || win === this.closingHostWindow || win.isDestroyed() || win.webContents.isDestroyed()) {
       throw new Error('The in-app browser requires a live primary window.');
     }
     return win;
@@ -1739,6 +2398,7 @@ export class BrowserManager {
   }
 
   private finishScopeRequestActivity(scopeKey: string, requestId: number): void {
+    this.validatingProxy?.releaseRequest(scopeKey, requestId);
     const requests = this.scopeRequestActivities.get(scopeKey);
     const finish = requests?.get(requestId);
     if (!finish) return;
@@ -1748,6 +2408,7 @@ export class BrowserManager {
   }
 
   private finishAllScopeRequestActivities(scopeKey: string): void {
+    this.validatingProxy?.releaseScope(scopeKey);
     const requests = this.scopeRequestActivities.get(scopeKey);
     if (!requests) return;
     this.scopeRequestActivities.delete(scopeKey);
@@ -1755,12 +2416,65 @@ export class BrowserManager {
   }
 
   private runTabOperation<T>(tab: InternalTab, operation: () => Promise<T>): Promise<T> {
-    return tab.queue.run(() => this.withScopeActivity(tab.scopeKey, operation));
+    if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+      return Promise.reject(new Error('This browser tab is being closed by another assistant operation.'));
+    }
+    return tab.queue.run(() => {
+      // A close transaction can begin after this operation was admitted but
+      // before its queue turn starts. Reject that not-yet-running work so the
+      // transaction drains only operations that were already executing.
+      if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+        throw new Error('This browser tab is being closed by another assistant operation.');
+      }
+      return this.withScopeActivity(tab.scopeKey, async () => {
+        return operation();
+      });
+    });
   }
 
   private assistantDownloadOwner(tab: InternalTab): string | null {
+    const activeOwner = (ownerId: string | null | undefined): string | null =>
+      ownerId && this.assistantRuns.generationIfActive(tab.shell.conversationId, ownerId) !== null ? ownerId : null;
+    const operation = tab.assistantDownloadAttribution;
+    // cleanupAssistantTabs stops accepting new work before already-acquired
+    // operations drain. Preserve exact download provenance across that drain;
+    // cleanup clears both this attribution and aiControlOwnerId before the tab
+    // returns to ordinary user ownership.
+    const retainedOperationOwner =
+      operation &&
+      operation.trustedGestureGeneration === (tab.trustedGestureGeneration ?? 0) &&
+      tab.aiControlOwnerId === operation.assistantOwnerId &&
+      tab.aiControlGeneration !== null
+        ? operation.assistantOwnerId
+        : null;
+    const retainedAssistantGesture =
+      tab.assistantGesture?.expiresAt && tab.assistantGesture.expiresAt >= Date.now() ? tab.assistantGesture : null;
+    const assistantGestureOwner = activeOwner(retainedAssistantGesture?.assistantOwnerId);
+    // A later user gesture cannot safely prove that a delayed download belongs
+    // to it while the same document still has a live assistant activation.
+    // Quarantine ambiguous overlap under the assistant run rather than opening
+    // a native save dialog or retaining an AI-selected file as user-owned.
+    if (assistantGestureOwner) return assistantGestureOwner;
+    const gesture = tab.popupGesture?.expiresAt && tab.popupGesture.expiresAt >= Date.now() ? tab.popupGesture : null;
+    // Exact real-user input wins even if it occurs while an assistant operation
+    // is active on the same authenticated page.
+    if (gesture?.source === 'user') return null;
+    if (gesture?.source === 'assistant') {
+      return (
+        activeOwner(gesture.assistantOwnerId) ??
+        (gesture.assistantOwnerId === retainedOperationOwner ? retainedOperationOwner : null)
+      );
+    }
+    if (retainedOperationOwner) return retainedOperationOwner;
+    if (operation) {
+      const owner = activeOwner(operation.assistantOwnerId);
+      if (owner && operation.trustedGestureGeneration === (tab.trustedGestureGeneration ?? 0)) return owner;
+    }
+    // Automatic downloads from a temporary assistant-created tab remain owned
+    // by that run. User tabs require one of the exact provenances above.
     if (tab.shell.owner !== 'assistant') return null;
-    if (tab.aiControlOwnerId) return tab.aiControlOwnerId;
+    const currentOwner = activeOwner(tab.aiControlOwnerId);
+    if (currentOwner) return currentOwner;
     return tab.assistantOwnerId &&
       this.assistantRuns.generationIfActive(tab.shell.conversationId, tab.assistantOwnerId) !== null
       ? tab.assistantOwnerId
@@ -1792,7 +2506,9 @@ export class BrowserManager {
     } satisfies PendingAssistantContinuation;
     pending.timer = setTimeout(
       () => {
-        void this.expireAssistantContinuation(key, pending);
+        void this.expireAssistantContinuation(key, pending).catch((error: unknown) => {
+          console.warn('[Browser] Assistant continuation cleanup will be retried:', error);
+        });
       },
       Math.max(0, timeoutMs),
     );
@@ -1836,6 +2552,8 @@ export class BrowserManager {
 
     this.pendingAssistantContinuations.delete(key);
     clearTimeout(pending.timer);
+    const predecessorTargetId = this.assistantTargetTabs?.get(key);
+    let predecessorCleanupRetained = false;
     try {
       const generation = this.assistantRuns.begin(conversationId, runId);
       await Promise.all([pending.drain, this.finishAssistantContinuations(unrelated, true)]);
@@ -1850,7 +2568,7 @@ export class BrowserManager {
       }
 
       for (const [token, gesture] of this.automationGestureTokens) {
-        if (gesture.assistantOwnerId === predecessorRunId) this.automationGestureTokens.delete(token);
+        if (gesture.assistantOwnerId === predecessorRunId) this.revokeAutomationGestureToken(token);
       }
       let changed = false;
       for (const id of this.tabOrder.get(conversationId) ?? []) {
@@ -1869,10 +2587,38 @@ export class BrowserManager {
           tab.popupGesture.assistantOwnerId = runId;
           changed = true;
         }
+        if (tab.assistantGesture?.assistantOwnerId === predecessorRunId) {
+          tab.assistantGesture.assistantOwnerId = runId;
+          changed = true;
+        }
+        if (tab.assistantDownloadAttribution?.assistantOwnerId === predecessorRunId) {
+          tab.assistantDownloadAttribution.assistantOwnerId = runId;
+          changed = true;
+        }
+        if (tab.assistantDialogGuard?.runId === predecessorRunId) {
+          // A streaming assistant popup can retain a dialog-protection owner
+          // beyond the predecessor's final action. Move that live capability
+          // with the tab so the successor does not dispose it as foreign and
+          // leave the still-loading hidden page able to block on native UI.
+          tab.assistantDialogGuard.runId = runId;
+          changed = true;
+        }
+        if (tab.assistantDialogsDisabledRunId === predecessorRunId) {
+          tab.assistantDialogsDisabledRunId = runId;
+          changed = true;
+        }
       }
       for (const download of this.activeDownloads.values()) {
         if (download.conversationId !== conversationId || download.assistantOwnerId !== predecessorRunId) continue;
         download.assistantOwnerId = runId;
+      }
+      const predecessorTarget = predecessorTargetId ? this.tabs.get(predecessorTargetId) : undefined;
+      if (predecessorTarget?.shell.conversationId === conversationId) {
+        this.rememberAssistantTarget(conversationId, runId, predecessorTarget);
+      } else if (predecessorTargetId) {
+        // Preserve a closed-target tombstone across an automatic continuation;
+        // the successor must explicitly select or open a replacement tab.
+        this.assistantTargetTabs.set(assistantContinuationKey(conversationId, runId), predecessorTargetId);
       }
       if (changed) this.emitTabs(conversationId);
     } catch (error) {
@@ -1885,14 +2631,19 @@ export class BrowserManager {
         this.assistantRuns.end(conversationId, runId),
         this.finishAssistantContinuations(unrelated, true),
       ]);
-      await Promise.allSettled([
+      const cleanupResults = await Promise.allSettled([
         this.cleanupAssistantStateOwnedByRun(conversationId, predecessorRunId),
         this.cleanupAssistantStateOwnedByRun(conversationId, runId),
       ]);
+      if (cleanupResults[0]?.status === 'rejected') {
+        this.scheduleAssistantContinuationCleanupRetry(pending);
+        predecessorCleanupRetained = true;
+      }
       this.emitTabs(conversationId);
       throw error;
     } finally {
-      this.assistantContinuationLeases.delete(key);
+      this.forgetAssistantTarget(conversationId, predecessorRunId);
+      if (!predecessorCleanupRetained) this.assistantContinuationLeases.delete(key);
     }
   }
 
@@ -1918,35 +2669,63 @@ export class BrowserManager {
     closeTabs: boolean,
   ): Promise<void> {
     if (pendingContinuations.length === 0) return;
-    try {
-      await Promise.all(pendingContinuations.map((pending) => pending.drain));
-      if (!closeTabs || this.disposed) return;
-      const conversations = new Set<string>();
-      await Promise.all(
-        pendingContinuations.map(async (pending) => {
+    const conversations = new Set<string>();
+    const results = await Promise.allSettled(
+      pendingContinuations.map(async (pending) => {
+        await pending.drain;
+        if (closeTabs && !this.disposed) {
           await this.cleanupAssistantStateOwnedByRun(pending.conversationId, pending.runId);
           conversations.add(pending.conversationId);
-        }),
-      );
-      for (const conversationId of conversations) this.emitTabs(conversationId);
-    } finally {
-      for (const pending of pendingContinuations) {
+        }
         this.assistantContinuationLeases.delete(assistantContinuationKey(pending.conversationId, pending.runId));
-      }
+      }),
+    );
+    for (const conversationId of conversations) this.emitTabs(conversationId);
+    const failures: unknown[] = [];
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index]!;
+      if (result.status === 'fulfilled') continue;
+      failures.push(result.reason);
+      this.scheduleAssistantContinuationCleanupRetry(pendingContinuations[index]!);
     }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'One or more Browser continuation cleanups failed and will be retried.');
+    }
+  }
+
+  private scheduleAssistantContinuationCleanupRetry(pending: PendingAssistantContinuation): void {
+    const key = assistantContinuationKey(pending.conversationId, pending.runId);
+    if (this.disposed || this.shuttingDown) {
+      this.assistantContinuationLeases.delete(key);
+      return;
+    }
+    const current = this.pendingAssistantContinuations.get(key);
+    if (current && current !== pending) return;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      void this.expireAssistantContinuation(key, pending).catch((error: unknown) => {
+        console.warn('[Browser] Assistant continuation cleanup will be retried:', error);
+      });
+    }, ASSISTANT_CONTINUATION_CLEANUP_RETRY_MS);
+    pending.timer.unref?.();
+    this.pendingAssistantContinuations.set(key, pending);
+    this.assistantContinuationLeases.add(key);
   }
 
   private async expireAssistantContinuation(key: string, pending: PendingAssistantContinuation): Promise<void> {
     if (this.pendingAssistantContinuations.get(key) !== pending) return;
     this.pendingAssistantContinuations.delete(key);
+    clearTimeout(pending.timer);
     await this.finishAssistantContinuations([pending], true);
   }
 
   private async cleanupAssistantStateOwnedByRun(conversationId: string, runId: string): Promise<void> {
+    this.forgetAssistantTarget(conversationId, runId);
     for (const [token, gesture] of this.automationGestureTokens) {
-      if (gesture.assistantOwnerId === runId) this.automationGestureTokens.delete(token);
+      if (gesture.assistantOwnerId === runId) this.revokeAutomationGestureToken(token);
     }
     let guardedActiveTabToRestore: string | null = null;
+    const dialogRestoreFailures: unknown[] = [];
     for (const id of [...(this.tabOrder.get(conversationId) ?? [])]) {
       const tab = this.tabs.get(id);
       if (!tab) continue;
@@ -1954,23 +2733,57 @@ export class BrowserManager {
         this.closeTab(tab, false);
         continue;
       }
+      // A retained or user-taken-over popup may stream forever and never emit a
+      // load completion event. The creating run boundary is therefore the hard
+      // upper bound for its bootstrap rendering/dialog lease.
+      if (
+        tab.assistantOwnerId === runId ||
+        (tab.assistantPopupBootstrapPending && tab.assistantDialogGuard?.runId === runId)
+      ) {
+        this.finishAssistantPopupBootstrap(tab, tab.view?.webContents);
+        if (tab.assistantOwnerId === runId && tab.assistantPopupDialogsDisabled) {
+          // disableDialogs is immutable for a WebContents. A kept popup crosses
+          // the run boundary by preserving its shell/profile but recreating a
+          // normal renderer when the user next opens it.
+          tab.assistantPopupDialogsDisabled = false;
+          if (tab.view && !tab.view.webContents.isDestroyed()) {
+            tab.generation++;
+            this.destroyView(tab);
+            tab.shell.discarded = true;
+            tab.shell.sensitive = false;
+          }
+        }
+      }
       if (tab.popupGesture?.assistantOwnerId === runId) tab.popupGesture = null;
+      if (tab.assistantGesture?.assistantOwnerId === runId) tab.assistantGesture = null;
+      if (tab.aiControlOwnerId === runId && tab.assistantNativeUiNewDocumentGuard) {
+        try {
+          await this.releaseAssistantNativeUiGuard(tab);
+        } catch (error) {
+          // Keep the irreversible marker set so the guarded renderer is
+          // reclaimed below. A failed restoration must never make a partially
+          // protected page interactive.
+          dialogRestoreFailures.push(error);
+        }
+      }
       // User-owned and explicitly kept-open tabs survive the run, but their
       // document may still contain AI-scheduled work. Revoke the expired run's
       // control capability while retaining the private-network restriction
       // until a verified user navigation replaces or reloads that document.
+      const dialogsDisabledForRun = tab.assistantDialogsDisabledRunId === runId;
       if (tab.aiControlOwnerId === runId) {
         tab.aiControlOwnerId = null;
         tab.aiControlGeneration = null;
-        if ((tab.scriptTainted || tab.privateNetworkNewDocumentGuard) && tab.view) {
-          const guardedOnly = !tab.scriptTainted && !!tab.privateNetworkNewDocumentGuard;
+        if ((tab.scriptTainted || tab.assistantNativeUiNewDocumentGuard || dialogsDisabledForRun) && tab.view) {
+          const guardedOnly = !tab.scriptTainted && !!(tab.assistantNativeUiNewDocumentGuard || dialogsDisabledForRun);
           // Arbitrary evaluation can leave timers, dedicated workers, event
           // listeners, and authenticated fetches alive in the page. A
-          // structured action also installs an irreversible WebRTC membrane.
-          // Retained user/kept-open tabs preserve only their shell and profile;
-          // destroy either renderer at the run boundary. Script-evaluated pages
-          // still require an explicit user reload, while guard-only pages can be
-          // restored immediately under the retained strict network policy.
+          // Script-evaluated pages can retain arbitrary timers, workers, and
+          // listeners and therefore still require an explicit user reload. A
+          // private-network membrane alone remains attached to the live user
+          // document until a trusted user navigation replaces it; it must not
+          // force a reload merely because an assistant inspected or clicked the
+          // existing authenticated SPA.
           tab.generation++;
           this.destroyView(tab);
           tab.shell.discarded = true;
@@ -1980,6 +2793,32 @@ export class BrowserManager {
           }
         }
       }
+      if (dialogsDisabledForRun) {
+        tab.assistantDialogsDisabledRunId = null;
+        if (tab.view && !tab.view.webContents.isDestroyed()) {
+          tab.generation++;
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.sensitive = false;
+          if (this.activeTabs.get(conversationId) === tab.shell.id) guardedActiveTabToRestore = tab.shell.id;
+        }
+      }
+      if (tab.assistantDialogGuard?.runId === runId) {
+        try {
+          // Reclaim any AI-mutated/guarded renderer above before releasing the
+          // final dialog lease. Otherwise a delayed callback could open an
+          // alert in the gap between removing the listener and closing the
+          // target at this same run boundary.
+          await this.releaseAssistantRunDialogGuard(tab);
+        } catch (error) {
+          // Continue reclaiming download authority even if Chromium could not
+          // acknowledge file-chooser restoration on a retained clean target.
+          dialogRestoreFailures.push(error);
+        }
+      }
+      if (tab.assistantDownloadAttribution?.assistantOwnerId === runId) {
+        tab.assistantDownloadAttribution = undefined;
+      }
     }
     // Chromium downloads can survive their initiating WebContents, including a
     // tab closed before turn cleanup begins. Cancel by captured run ownership,
@@ -1988,11 +2827,120 @@ export class BrowserManager {
     if (guardedActiveTabToRestore) {
       this.restoreActiveViewAfterClose(conversationId, guardedActiveTabToRestore);
     }
+    if (dialogRestoreFailures.length > 0) {
+      throw new AggregateError(dialogRestoreFailures, 'Browser native-dialog protection could not be fully restored.');
+    }
   }
 
   assertAssistantRun(conversationId: string, run: BrowserAssistantRun): void {
     throwIfBrowserAborted(run.abortSignal);
     this.assistantRuns.assertActive(conversationId, run.id);
+  }
+
+  /** Resolve an automation target without consulting Browser chrome state after
+   * the run has selected a tab. This is intentionally public so tool approval
+   * capture and execution bind to the same hidden tab identity. */
+  resolveAssistantTabId(conversationId: string, tabId: string | undefined, run: BrowserAssistantRun): string {
+    return this.requireAssistantTab(conversationId, run, tabId).shell.id;
+  }
+
+  /** Resolve the exact tab displayed by an ask-policy prompt without changing
+   * the run's implicit target. Only execution after approval may commit it. */
+  previewAssistantTabId(conversationId: string, tabId: string | undefined, run: BrowserAssistantRun): string {
+    return this.requireAssistantTab(conversationId, run, tabId, false).shell.id;
+  }
+
+  private rememberAssistantTarget(conversationId: string, runId: string, tab: InternalTab): void {
+    if (tab.shell.conversationId !== conversationId || this.tabs.get(tab.shell.id) !== tab) {
+      throw new Error('Browser tab not found in this chat.');
+    }
+    (this.assistantTargetTabs ??= new Map()).set(assistantContinuationKey(conversationId, runId), tab.shell.id);
+  }
+
+  private forgetAssistantTarget(conversationId: string, runId: string): void {
+    this.assistantTargetTabs?.delete(assistantContinuationKey(conversationId, runId));
+  }
+
+  private forgetAssistantTargetsForConversation(conversationId: string): void {
+    const prefix = `${conversationId}\u0000`;
+    for (const key of this.assistantTargetTabs?.keys() ?? []) {
+      if (key.startsWith(prefix)) this.assistantTargetTabs.delete(key);
+    }
+  }
+
+  private assertAssistantMayControlTab(tab: InternalTab, run: BrowserAssistantRun): void {
+    const ownerRunActive = tab.assistantOwnerId
+      ? this.assistantRuns.generationIfActive(tab.shell.conversationId, tab.assistantOwnerId) !== null
+      : false;
+    if (!assistantMayControlTab(tab.shell.owner, tab.assistantOwnerId, run.id, tab.shell.keepOpen, ownerRunActive)) {
+      throw new Error('This temporary browser tab belongs to another active assistant run.');
+    }
+  }
+
+  private requireAssistantTab(
+    conversationId: string,
+    run: BrowserAssistantRun,
+    tabId?: string,
+    rememberTarget = true,
+  ): InternalTab {
+    this.assertAssistantRun(conversationId, run);
+    const key = assistantContinuationKey(conversationId, run.id);
+    const rememberedId = this.assistantTargetTabs?.get(key);
+    let tab: InternalTab | undefined;
+    if (tabId) {
+      tab = this.requireTab(conversationId, tabId);
+    } else if (rememberedId) {
+      tab = this.tabs.get(rememberedId);
+      if (!tab || tab.shell.conversationId !== conversationId) {
+        // Retain the closed id as a run-local tombstone. Falling through to a
+        // different user tab would turn an omitted tabId into an unintended
+        // click, evaluation, or navigation target.
+        throw new Error(
+          "This assistant run's current Browser tab has closed. Specify another tabId or open a new tab.",
+        );
+      }
+    }
+
+    // Prefer the newest tab owned/controlled by this run. A fresh run may use a
+    // sole eligible tab, but presentation-active state is never an automation
+    // selector; multiple existing tabs require an explicit id.
+    if (!tab) {
+      const order = this.tabOrder.get(conversationId) ?? [];
+      tab = [...order]
+        .reverse()
+        .map((id) => this.tabs.get(id))
+        .find(
+          (candidate): candidate is InternalTab =>
+            !!candidate && (candidate.assistantOwnerId === run.id || candidate.aiControlOwnerId === run.id),
+        );
+      if (!tab) {
+        const eligible = order
+          .map((id) => this.tabs.get(id))
+          .filter((candidate): candidate is InternalTab => {
+            if (!candidate || candidate.shell.conversationId !== conversationId) return false;
+            const ownerRunActive = candidate.assistantOwnerId
+              ? this.assistantRuns.generationIfActive(conversationId, candidate.assistantOwnerId) !== null
+              : false;
+            return assistantMayControlTab(
+              candidate.shell.owner,
+              candidate.assistantOwnerId,
+              run.id,
+              candidate.shell.keepOpen,
+              ownerRunActive,
+            );
+          });
+        if (eligible.length > 1) {
+          throw new Error('Multiple Browser tabs are available. Specify the tabId to control.');
+        }
+        tab = eligible[0];
+      }
+    }
+    if (!tab || tab.shell.conversationId !== conversationId) {
+      throw new Error('Browser tab not found in this chat.');
+    }
+    this.assertAssistantMayControlTab(tab, run);
+    if (rememberTarget) this.rememberAssistantTarget(conversationId, run.id, tab);
+    return tab;
   }
 
   private assistantGeneration(conversationId: string, runId: string): number {
@@ -2003,26 +2951,503 @@ export class BrowserManager {
     tab: InternalTab,
     run: BrowserAssistantRun,
     operation: (documentLease: AssistantDocumentLease) => Promise<T>,
+    approvedDocument?: BrowserApprovalWithDocument,
   ): Promise<T> {
     throwIfBrowserAborted(run.abortSignal);
-    const ownerRunActive = tab.assistantOwnerId
-      ? this.assistantRuns.generationIfActive(tab.shell.conversationId, tab.assistantOwnerId) !== null
-      : false;
-    if (!assistantMayControlTab(tab.shell.owner, tab.assistantOwnerId, run.id, tab.shell.keepOpen, ownerRunActive)) {
-      throw new Error('This temporary browser tab belongs to another active assistant run.');
-    }
-    const lease = this.assistantRuns.acquire(tab.shell.conversationId, run.id);
-    tab.aiActionDepth++;
+    this.assertAssistantMayControlTab(tab, run);
+    // Consent must be checked before any renderer or dialog-protection state is
+    // changed. If run admission itself races cleanup, discard the unused weak
+    // reset lease immediately.
+    const approvalResetLease = this.beginBrowserApprovalRendererReset(tab, run, approvedDocument);
+    const previousAssistantDownloadAttribution = tab.assistantDownloadAttribution;
+    const previousDialogsDisabledRunId = tab.assistantDialogsDisabledRunId;
+    const previousRunDialogGuardLease = tab.assistantRunDialogGuardLease;
+    let lease: ReturnType<BrowserAssistantRunRegistry['acquire']>;
     try {
-      const documentLease = await this.guardAssistantTab(tab, run, lease.generation);
-      throwIfBrowserAborted(run.abortSignal);
-      return await operation(documentLease);
-    } finally {
-      tab.aiActionDepth = Math.max(0, tab.aiActionDepth - 1);
-      tab.aiActionUntil = Date.now() + AUTOMATION_ACTIVITY_GRACE_MS;
-      lease.release();
-      if (tab.aiNetworkReleaseRequested) this.releaseAiNetworkRestrictionForUser(tab);
+      lease = this.assistantRuns.acquire(tab.shell.conversationId, run.id);
+    } catch (error) {
+      this.finishBrowserApprovalRendererReset(approvedDocument);
+      throw error;
     }
+    // Native-dialog suppression and download ownership last for the complete
+    // assistant run, not merely for the Promise returned by one tool call.
+    // Page handlers/evaluated code can schedule delayed work after that Promise
+    // resolves; cleanup releases these capabilities only after the run drains.
+    let dialogSuppressionIntroduced = false;
+    let dialogSafeRendererReclaimed = false;
+    let runDialogGuardIntroduced = false;
+    let dialogLease: ReturnType<BrowserManager['acquireAssistantDialogGuard']> | undefined;
+    try {
+      this.ensureAssistantRunDialogGuard(tab, run.id);
+      runDialogGuardIntroduced = tab.assistantRunDialogGuardLease !== previousRunDialogGuardLease;
+      dialogSafeRendererReclaimed = this.prepareAssistantDialogSafeRenderer(tab, run.id) === true;
+      dialogSuppressionIntroduced =
+        previousDialogsDisabledRunId !== tab.assistantDialogsDisabledRunId &&
+        tab.assistantDialogsDisabledRunId === run.id;
+      this.prepareBrowserApprovalRendererReset(tab, approvedDocument, approvalResetLease, dialogSafeRendererReclaimed);
+      tab.assistantDownloadAttribution = {
+        assistantOwnerId: run.id,
+        trustedGestureGeneration: tab.trustedGestureGeneration ?? 0,
+      };
+      dialogLease = this.acquireAssistantDialogGuard(tab, run.id);
+    } catch (error) {
+      const cleanupFailures: unknown[] = [];
+      const attemptCleanup = async (operation: () => void | Promise<void>): Promise<void> => {
+        try {
+          await operation();
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
+        }
+      };
+      await attemptCleanup(() => this.finishBrowserApprovalRendererReset(approvedDocument));
+      if (dialogLease) {
+        await attemptCleanup(() => this.releaseAssistantDialogGuard(tab, dialogLease!.token));
+      }
+      if (runDialogGuardIntroduced) {
+        await attemptCleanup(() => this.releaseAssistantRunDialogGuard(tab));
+      }
+      tab.assistantDownloadAttribution = previousAssistantDownloadAttribution;
+      let rendererReclaimed = dialogSafeRendererReclaimed;
+      if (dialogSuppressionIntroduced && this.tabs.get(tab.shell.id) === tab) {
+        tab.assistantDialogsDisabledRunId = previousDialogsDisabledRunId;
+        const currentView = tab.view;
+        if (currentView && !currentView.webContents.isDestroyed()) {
+          tab.generation++;
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.loading = false;
+          tab.shell.sensitive = false;
+          this.emitTabs(tab.shell.conversationId);
+          rendererReclaimed = true;
+        }
+      }
+      if ((rendererReclaimed || dialogSuppressionIntroduced) && this.tabs.get(tab.shell.id) === tab) {
+        // A setup failure must restore an already-presented user tab. Hidden
+        // tabs remain discarded and are not mounted or focused by this helper.
+        this.restoreActiveViewAfterClose(tab.shell.conversationId, tab.shell.id);
+      }
+      lease.release();
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupFailures],
+          `Browser assistant control setup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      throw error;
+    }
+    let actionDepthIncremented = false;
+    let nativeUiGuardAttemptedContents: WebContents | null = null;
+    let assistantAuthorizationCompleted = false;
+    try {
+      tab.aiActionDepth++;
+      actionDepthIncremented = true;
+      this.enableAssistantBackgroundRendering(tab, tab.view?.webContents);
+      if (tab.view && !tab.view.webContents.isDestroyed()) {
+        // Assistant-created pages and subsequent operations in this run are
+        // already synchronously dialog-disabled. Keep the CDP file-chooser and
+        // native-UI membranes verified before authorization can continue.
+        nativeUiGuardAttemptedContents = tab.view.webContents;
+        const dialogProtection = this.protectAssistantDialogs(tab, tab.view.webContents, dialogLease!.guard);
+        const nativeUiProtection = this.installAssistantNativeUiGuard(tab, tab.view.webContents, run.abortSignal);
+        await Promise.all([dialogProtection, nativeUiProtection]);
+      }
+      const documentLease = await this.awaitAssistantDialogProtectedOperation(
+        this.guardAssistantTab(tab, run, lease.generation),
+        dialogLease!.guard,
+      );
+      assistantAuthorizationCompleted = true;
+      if (tab.view && !tab.view.webContents.isDestroyed()) {
+        await this.protectAssistantDialogs(tab, tab.view.webContents, dialogLease!.guard);
+      }
+      this.enableAssistantBackgroundRendering(tab, tab.view?.webContents);
+      throwIfBrowserAborted(run.abortSignal);
+      return await this.awaitAssistantDialogProtectedOperation(
+        Promise.resolve().then(() => operation(documentLease)),
+        dialogLease!.guard,
+      );
+    } catch (error) {
+      // If authorization rejects after the native-UI trampoline activated,
+      // restore it in the same document. A partial/fallback installation cannot
+      // prove restoration and is reclaimed fail-closed; neither path mounts or
+      // focuses the Browser panel.
+      let failedAuthorizationRendererReclaimed = false;
+      if (
+        !assistantAuthorizationCompleted &&
+        nativeUiGuardAttemptedContents &&
+        this.tabs.get(tab.shell.id) === tab &&
+        tab.view?.webContents === nativeUiGuardAttemptedContents &&
+        !nativeUiGuardAttemptedContents.isDestroyed()
+      ) {
+        try {
+          await this.releaseAssistantNativeUiGuard(tab);
+        } catch {
+          tab.generation++;
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.loading = false;
+          tab.shell.sensitive = false;
+          this.emitTabs(tab.shell.conversationId);
+          failedAuthorizationRendererReclaimed = true;
+        }
+      }
+      if (!assistantAuthorizationCompleted && dialogSuppressionIntroduced && this.tabs.get(tab.shell.id) === tab) {
+        // This invocation introduced immutable dialog suppression even when the
+        // tab started discarded. Roll the marker back on failed authorization,
+        // and reclaim any renderer concurrently restored under that flag. A
+        // pre-existing successful guard from the same run is never cleared.
+        tab.assistantDialogsDisabledRunId = null;
+        const currentView = tab.view;
+        if (currentView && !currentView.webContents.isDestroyed()) {
+          tab.generation++;
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.loading = false;
+          tab.shell.sensitive = false;
+          this.emitTabs(tab.shell.conversationId);
+          failedAuthorizationRendererReclaimed = true;
+        }
+      }
+      if (
+        !assistantAuthorizationCompleted &&
+        (dialogSafeRendererReclaimed || dialogSuppressionIntroduced || failedAuthorizationRendererReclaimed) &&
+        this.tabs.get(tab.shell.id) === tab
+      ) {
+        // Restore an already-presented user tab with ordinary dialog behavior;
+        // hidden/discarded tabs remain presentation-independent.
+        this.restoreActiveViewAfterClose(tab.shell.conversationId, tab.shell.id);
+      }
+      throw error;
+    } finally {
+      try {
+        if (actionDepthIncremented) {
+          try {
+            await this.restoreAssistantBackgroundViewport(tab);
+          } finally {
+            tab.aiActionDepth = Math.max(0, tab.aiActionDepth - 1);
+            if (tab.aiActionDepth === 0) this.restoreAssistantBackgroundRendering(tab);
+          }
+        }
+      } finally {
+        // Renderer/view cleanup is best-effort, but run ownership is not. A
+        // failed CDP viewport restore must never strand the assistant-run
+        // drain or keep temporary tabs alive indefinitely.
+        tab.aiActionUntil = Date.now() + AUTOMATION_ACTIVITY_GRACE_MS;
+        try {
+          // A visible user-owned page must not become ordinary/interactive
+          // again until Chromium has acknowledged that file-chooser
+          // interception is disabled. A failed restore unloads the exact page
+          // rather than returning it with stale assistant-only behavior.
+          await this.releaseAssistantDialogGuard(tab, dialogLease!.token);
+        } finally {
+          this.finishBrowserApprovalRendererReset(approvedDocument);
+          lease.release();
+          if (tab.aiNetworkReleaseRequested) this.releaseAiNetworkRestrictionForUser(tab);
+        }
+      }
+    }
+  }
+
+  /** A discarded target can be constructed under Chromium's immutable
+   * disableDialogs preference. A live user document is instead preserved: its
+   * preload-installed native-UI trampoline and CDP dialog/file-picker guard are
+   * activated and awaited before assistant authorization continues. */
+  private prepareAssistantDialogSafeRenderer(tab: InternalTab, runId: string): boolean {
+    if (tab.assistantDialogsDisabledRunId === runId) return false;
+    const view = tab.view;
+    if (view && !view.webContents.isDestroyed()) return false;
+    tab.assistantDialogsDisabledRunId = runId;
+    return false;
+  }
+
+  /** If dialog protection fails first, keep the tab queue, renderer surface,
+   * and assistant-run lease owned until the already-started work settles. The
+   * dialog handler dismisses the modal (or reclaims the renderer), allowing
+   * bounded navigation/input/evaluation operations to unwind without escaping
+   * into later Browser work after this call has reported failure. */
+  private async awaitAssistantDialogProtectedOperation<T>(
+    operation: Promise<T>,
+    guard: AssistantDialogGuard,
+  ): Promise<T> {
+    try {
+      return await Promise.race([operation, guard.failure]);
+    } catch (error) {
+      await operation.catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private enableAssistantBackgroundRendering(tab: InternalTab, contents?: WebContents | null): void {
+    if (
+      (tab.aiActionDepth ?? 0) <= 0 ||
+      !contents ||
+      (typeof contents.isDestroyed === 'function' && contents.isDestroyed()) ||
+      typeof contents.setBackgroundThrottling !== 'function'
+    )
+      return;
+    const active = (tab.assistantRenderingContents ??= new Set());
+    if (active.has(contents)) return;
+    // Electron otherwise lets one permanent exemption keep the entire
+    // containing BrowserWindow drawing while it is minimized. Scope the
+    // exemption to active work and restore it in the outermost finally block.
+    contents.setBackgroundThrottling(false);
+    active.add(contents);
+  }
+
+  private restoreAssistantBackgroundRendering(tab: InternalTab, only?: WebContents): void {
+    const active = tab.assistantRenderingContents;
+    if (!active) return;
+    for (const contents of [...active]) {
+      if (only && contents !== only) continue;
+      active.delete(contents);
+      try {
+        if (
+          typeof contents.setBackgroundThrottling === 'function' &&
+          (typeof contents.isDestroyed !== 'function' || !contents.isDestroyed())
+        ) {
+          contents.setBackgroundThrottling(true);
+        }
+      } catch {
+        // Renderer teardown can race the final assistant lease release.
+      }
+    }
+    if (active.size === 0) tab.assistantRenderingContents = undefined;
+  }
+
+  private finishAssistantPopupBootstrap(tab: InternalTab, contents?: WebContents): void {
+    if (!tab.assistantPopupBootstrapPending) return;
+    tab.assistantPopupBootstrapPending = false;
+    const resolveBootstrap = tab.resolveAssistantPopupBootstrap;
+    tab.resolveAssistantPopupBootstrap = undefined;
+    tab.assistantPopupBootstrapDrain = undefined;
+    tab.aiActionDepth = Math.max(0, tab.aiActionDepth - 1);
+    if (tab.aiActionDepth === 0) this.restoreAssistantBackgroundRendering(tab, contents);
+    resolveBootstrap?.();
+  }
+
+  private releaseAssistantRunDialogGuard(tab: InternalTab): Promise<void> {
+    const token = tab.assistantRunDialogGuardLease;
+    if (!token) return Promise.resolve();
+    tab.assistantRunDialogGuardLease = undefined;
+    return this.releaseAssistantDialogGuard(tab, token);
+  }
+
+  private async enableAssistantBackgroundViewport(
+    tab: InternalTab,
+    contents: WebContents,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+    timeoutMs = BACKGROUND_VIEWPORT_TIMEOUT_MS,
+  ): Promise<void> {
+    const active = (tab.assistantBackgroundViewportContents ??= new Set());
+    if (active.has(contents)) return;
+    // This set is also the native-mount quarantine. Publish membership before
+    // the first asynchronous debugger step so a concurrent panel mount cannot
+    // expose a view while its deterministic background viewport is only
+    // partially installed.
+    active.add(contents);
+    const setup = this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser background viewport setup',
+      timeoutMs,
+      async () => {
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        try {
+          await contents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+            width: DEFAULT_DETACHED_VIEW_BOUNDS.width,
+            height: DEFAULT_DETACHED_VIEW_BOUNDS.height,
+            deviceScaleFactor: 1,
+            mobile: false,
+          });
+        } finally {
+          releaseDebugger();
+        }
+      },
+      abortSignal,
+      documentLease,
+    );
+    const setups = (tab.assistantBackgroundViewportSetups ??= new Map());
+    setups.set(contents, setup);
+    try {
+      await setup;
+    } finally {
+      if (setups.get(contents) === setup) setups.delete(contents);
+      if (setups.size === 0) tab.assistantBackgroundViewportSetups = undefined;
+    }
+    if (tab.view?.webContents !== contents || contents.isDestroyed()) {
+      throw new Error('The browser page changed while its background viewport was being prepared.');
+    }
+  }
+
+  private async restoreAssistantBackgroundViewport(
+    tab: InternalTab,
+    only?: WebContents,
+    timeoutMs = BACKGROUND_VIEWPORT_TIMEOUT_MS,
+  ): Promise<void> {
+    const active = tab.assistantBackgroundViewportContents;
+    if (!active) return;
+    for (const contents of [...active]) {
+      if (only && contents !== only) continue;
+      const existingRestore = tab.assistantBackgroundViewportRestores?.get(contents);
+      if (existingRestore) {
+        await existingRestore;
+        continue;
+      }
+      const restore = (async () => {
+        // A user can request presentation while the metrics override is still
+        // being installed. Serialize only those two short CDP transitions so a
+        // late setDeviceMetricsOverride cannot land after the clear.
+        const setup = tab.assistantBackgroundViewportSetups?.get(contents);
+        if (setup) await setup.catch(() => undefined);
+        if (contents.isDestroyed()) return;
+        const targetWasCurrent = tab.view?.webContents === contents;
+        let restored = false;
+        try {
+          await this.runRendererOperationWithDeadline(
+            tab,
+            contents,
+            'Browser background viewport cleanup',
+            timeoutMs,
+            async () => {
+              const releaseDebugger = this.acquireBrowserDebugger(contents);
+              try {
+                await contents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride');
+              } finally {
+                releaseDebugger();
+              }
+            },
+            undefined,
+            undefined,
+            false,
+          );
+          restored = true;
+          if (tab.shell.error === 'The background browser viewport could not be restored.') {
+            tab.shell.error = undefined;
+            this.emitTabs(tab.shell.conversationId);
+          }
+        } catch {
+          // Presentation must never destroy or cancel an assistant target. Keep
+          // the native-mount quarantine so the operation's own finally path can
+          // retry after concurrent CDP work settles.
+          if (this.tabs.get(tab.shell.id) === tab && tab.view?.webContents === contents && !contents.isDestroyed()) {
+            tab.shell.error = 'The background browser viewport could not be restored.';
+            this.emitTabs(tab.shell.conversationId);
+          }
+          // Target teardown can race this cleanup independently. There is then
+          // no stale viewport left to quarantine or retry. Cleanup itself is
+          // non-destructive: presentation state may never reclaim an AI target.
+          if (targetWasCurrent && (!tab.view || tab.view.webContents !== contents || contents.isDestroyed())) {
+            restored = true;
+          }
+        } finally {
+          if (restored) active.delete(contents);
+        }
+      })();
+      const restores = (tab.assistantBackgroundViewportRestores ??= new Map());
+      restores.set(contents, restore);
+      try {
+        await restore;
+      } finally {
+        if (restores.get(contents) === restore) restores.delete(contents);
+        if (restores.size === 0) tab.assistantBackgroundViewportRestores = undefined;
+      }
+    }
+    if (active.size === 0) tab.assistantBackgroundViewportContents = undefined;
+    if (this.tabs.get(tab.shell.id) === tab) this.attachActiveView(tab.shell.conversationId);
+  }
+
+  /** Record presentation intent independently from the per-tab AI action queue.
+   * Only short target-state transitions needed to mount this exact view are
+   * awaited; an already-running or later assistant action remains admitted and
+   * continues against the same renderer. */
+  private prepareTabForUserPresentation(tab: InternalTab): Promise<void> | null {
+    const transitions: Promise<void>[] = [];
+    const menuPreviewRecovery = this.preemptMenuPreviewForTab(
+      tab,
+      'Browser menu preview was cancelled because the user opened this tab.',
+    );
+    if (menuPreviewRecovery) transitions.push(menuPreviewRecovery);
+    const contents = tab.view?.webContents;
+    const dialogRestore = contents ? this.assistantDialogProtectionRestores?.get(contents.id) : undefined;
+    if (dialogRestore) {
+      // File-chooser interception is native target state. Keep this view
+      // detached until Chromium confirms it has returned to ordinary user
+      // behavior; merely removing the debugger listener is not sufficient.
+      if (this.attachedView === tab.view) this.detachAttachedView();
+      tab.view?.setVisible(false);
+      tab.view?.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      transitions.push(dialogRestore);
+    }
+    const takingOverBackgroundInitialLoad = tab.assistantBackgroundInitialLoadPending === true;
+    if (takingOverBackgroundInitialLoad) {
+      // The initial hidden bootstrap is presentation-only setup, not an
+      // assistant action. A user selecting the tab cancels any setup that has
+      // not started and takes responsibility for clearing one already in
+      // flight. The ordinary assistant-operation viewport remains quarantined
+      // until that operation's own finally block restores it.
+      tab.assistantBackgroundInitialLoadPending = false;
+    }
+    const backgroundViewportActive = !!contents && tab.assistantBackgroundViewportContents?.has(contents) === true;
+    if (
+      contents &&
+      !contents.isDestroyed() &&
+      (backgroundViewportActive ||
+        takingOverBackgroundInitialLoad ||
+        this.hasPendingBackgroundAutomationArm(tab, contents) ||
+        this.hasDispatchedSyntheticInput(tab, contents))
+    ) {
+      if (this.attachedView === tab.view) this.detachAttachedView();
+      tab.view?.setVisible(false);
+      tab.view?.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      // The Browser panel is a passive mirror. It records presentation intent
+      // and leaves the deterministic AI viewport untouched; the operation that
+      // acquired that viewport restores it from its own `finally` path, then
+      // attachActiveView() observes the pending mount and presents the page.
+    }
+    return transitions.length > 0 ? Promise.all(transitions).then(() => undefined) : null;
+  }
+
+  /** Selecting an assistant-created shell through Browser chrome transfers its
+   * lifecycle to the user. Closing the active tab can select a neighboring
+   * shell just as explicitly as clicking that tab, so both paths use the same
+   * retention and download-ownership transition. */
+  private takeOverTabForUser(tab: InternalTab): void {
+    // This durable per-tab generation lets an assistant bulk-close detect even
+    // a transient user selection (select, then switch back) while it drains
+    // already admitted tab work. Browser chrome is not input to the remote page,
+    // so it must not invalidate exact assistant download attribution.
+    tab.userSelectionGeneration = (tab.userSelectionGeneration ?? 0) + 1;
+    const assistantOwned = tab.shell.owner === 'assistant';
+    if (assistantOwned && !tab.shell.keepOpen) {
+      tab.shell.keepOpen = true;
+      for (const download of this.activeDownloads.values()) {
+        if (download.tabId === tab.shell.id) download.keepOpen = true;
+      }
+    }
+    // Creator ownership is durable lifecycle/download metadata, not the active
+    // AI control lease. Explicit user selection transfers the former while an
+    // already-admitted assistant operation keeps aiControlOwnerId until its
+    // normal run boundary, so concurrent background work does not get paused.
+    tab.shell.owner = 'user';
+    tab.assistantOwnerId = null;
+    // Selection is presentation, not an action-queue or native-target-state
+    // barrier. Keep the run-level dialog guard and irreversible document guards
+    // intact until the run boundary so neither the current nor a later AI action
+    // waits for Chromium restoration triggered only by opening the sidebar.
+    if (tab.assistantPopupBootstrapPending) this.finishAssistantPopupBootstrap(tab, tab.view?.webContents);
+    tab.lastUsedAt = Date.now();
+  }
+
+  private async takeOverActiveAssistantPresentation(conversationId: string): Promise<void> {
+    const activeId = this.activeTabs.get(conversationId);
+    const active = activeId ? this.tabs.get(activeId) : undefined;
+    if (!active || active.shell.owner !== 'assistant') return;
+    this.takeOverTabForUser(active);
+    const presentationTransition = this.prepareTabForUserPresentation(active);
+    if (presentationTransition) await presentationTransition;
+    if (this.tabs.get(active.shell.id) !== active || this.activeTabs.get(conversationId) !== active.shell.id) return;
+    this.attachActiveView(conversationId);
+    this.notifyPanelStateChanged(conversationId);
   }
 
   private assertAssistantDocumentLease(tab: InternalTab, lease: AssistantDocumentLease): void {
@@ -2072,6 +3497,117 @@ export class BrowserManager {
     }
   }
 
+  private browserDocumentApprovalFrom(
+    approval: BrowserApprovalWithDocument | undefined,
+  ): BrowserDocumentApproval | undefined {
+    if (
+      !approval ||
+      typeof approval.tabId !== 'string' ||
+      typeof approval.tabGeneration !== 'number' ||
+      typeof approval.origin !== 'string'
+    ) {
+      return undefined;
+    }
+    return approval as BrowserDocumentApproval;
+  }
+
+  /** Revalidate ask-policy consent before any dialog-safe renderer mutation.
+   * The returned lease is intentionally not stored on the serializable approval
+   * object, and therefore cannot be forged or replayed across tool calls. */
+  private beginBrowserApprovalRendererReset(
+    tab: InternalTab,
+    run: BrowserAssistantRun,
+    approval: BrowserApprovalWithDocument | undefined,
+  ): BrowserApprovalRendererResetLease | undefined {
+    const documentApproval = this.browserDocumentApprovalFrom(approval);
+    if (!approval || !documentApproval) return undefined;
+    this.assertBrowserDocumentApproval(tab, documentApproval);
+    const sourceView = tab.view;
+    const sourceContents = sourceView && !sourceView.webContents.isDestroyed() ? sourceView.webContents : null;
+    const needsDialogSafeReplacement = sourceContents === null && tab.assistantDialogsDisabledRunId !== run.id;
+    const needsDiscardedRestore = sourceContents === null && tab.shell.discarded;
+    if (!needsDialogSafeReplacement && !needsDiscardedRestore) return undefined;
+    const lease: BrowserApprovalRendererResetLease = {
+      approval,
+      tab,
+      runId: run.id,
+      origin: documentApproval.origin,
+      url: documentApproval.url ?? tab.shell.url,
+      userNavigationLease: documentApproval.userNavigationLease ?? tab.trustedUserNavigationLease,
+      sourceGeneration: tab.generation,
+      sourceContents,
+    };
+    this.approvalRendererResetLeases ??= new WeakMap<object, BrowserApprovalRendererResetLease>();
+    this.approvalRendererResetLeases.set(approval, lease);
+    return lease;
+  }
+
+  /** Bind consent to the exact post-reclamation shell state. No renderer load is
+   * authorized here; ensureAssistantView must later consume the lease against
+   * the exact replacement WebContents and completed URL. */
+  private prepareBrowserApprovalRendererReset(
+    tab: InternalTab,
+    approval: BrowserApprovalWithDocument | undefined,
+    lease: BrowserApprovalRendererResetLease | undefined,
+    rendererReclaimed: boolean,
+  ): void {
+    if (!approval || !lease) return;
+    const expectedGeneration = lease.sourceGeneration + (rendererReclaimed ? 1 : 0);
+    const sourceStillCurrent =
+      lease.tab === tab &&
+      this.tabs.get(tab.shell.id) === tab &&
+      tab.generation === expectedGeneration &&
+      tab.trustedUserNavigationLease === lease.userNavigationLease &&
+      tab.shell.url === lease.url &&
+      normalizedOrigin(tab.shell.url) === lease.origin &&
+      (lease.sourceContents === null || tab.view === null);
+    if (!sourceStillCurrent) {
+      this.approvalRendererResetLeases.delete(approval);
+      throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
+    }
+    approval.tabGeneration = tab.generation;
+    approval.allowInternalRestore = true;
+    lease.preparedGeneration = tab.generation;
+  }
+
+  /** Consume the one-shot lease only after ensureView has completed the exact
+   * replacement load. Redirects, user navigation, a reused tab id, or the old
+   * renderer all invalidate consent instead of being papered over by a numeric
+   * generation allowance. */
+  private consumeBrowserApprovalRendererReset(
+    tab: InternalTab,
+    run: BrowserAssistantRun,
+    approval: BrowserApprovalWithDocument | undefined,
+    view: WebContentsView,
+  ): void {
+    if (!approval) return;
+    const lease = this.approvalRendererResetLeases?.get(approval);
+    if (!lease) return;
+    const replacementIsExact =
+      lease.preparedGeneration !== undefined &&
+      lease.tab === tab &&
+      lease.runId === run.id &&
+      this.tabs.get(tab.shell.id) === tab &&
+      tab.generation === lease.preparedGeneration &&
+      tab.view === view &&
+      !view.webContents.isDestroyed() &&
+      view.webContents !== lease.sourceContents &&
+      !tab.viewLoadPromise &&
+      tab.trustedUserNavigationLease === lease.userNavigationLease &&
+      tab.shell.url === lease.url &&
+      normalizedOrigin(tab.shell.url) === lease.origin;
+    this.approvalRendererResetLeases.delete(approval);
+    if (!replacementIsExact) {
+      throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
+    }
+    approval.tabGeneration = tab.generation;
+    approval.allowInternalRestore = false;
+  }
+
+  private finishBrowserApprovalRendererReset(approval: BrowserApprovalWithDocument | undefined): void {
+    if (approval) this.approvalRendererResetLeases?.delete(approval);
+  }
+
   private captureBrowserPageLease(tab: InternalTab, contents: WebContents): BrowserPageLease {
     return {
       tabId: tab.shell.id,
@@ -2097,8 +3633,75 @@ export class BrowserManager {
     }
   }
 
+  private clearContextMenuDownloadAuthority(contentsId: number, expected?: BrowserContextMenuDownloadAuthority): void {
+    const authorities = this.contextMenuDownloadAuthorities;
+    const current = authorities?.get(contentsId);
+    if (!current || (expected && current !== expected)) return;
+    authorities?.delete(contentsId);
+    clearTimeout(current.timer);
+  }
+
+  private authorizeContextMenuDownload(
+    tab: InternalTab,
+    contents: WebContents,
+    url: string,
+  ): BrowserContextMenuDownloadAuthority {
+    this.clearContextMenuDownloadAuthority(contents.id);
+    let authority: BrowserContextMenuDownloadAuthority;
+    const timer = setTimeout(
+      () => this.clearContextMenuDownloadAuthority(contents.id, authority),
+      CONTEXT_MENU_DOWNLOAD_AUTHORITY_MS,
+    );
+    timer.unref?.();
+    authority = {
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      contents,
+      url,
+      expiresAt: Date.now() + CONTEXT_MENU_DOWNLOAD_AUTHORITY_MS,
+      timer,
+    };
+    (this.contextMenuDownloadAuthorities ??= new Map()).set(contents.id, authority);
+    return authority;
+  }
+
+  private consumeContextMenuDownloadAuthority(tab: InternalTab, contents: WebContents, url: string): boolean {
+    const authority = this.contextMenuDownloadAuthorities?.get(contents.id);
+    if (!authority) return false;
+    const documentStillMatches =
+      authority.tabId === tab.shell.id &&
+      authority.tabGeneration === tab.generation &&
+      authority.userNavigationLease === tab.trustedUserNavigationLease &&
+      authority.contents === contents &&
+      this.tabs.get(tab.shell.id) === tab &&
+      tab.view?.webContents === contents &&
+      !contents.isDestroyed();
+    if (!documentStillMatches || authority.expiresAt < Date.now()) {
+      this.clearContextMenuDownloadAuthority(contents.id, authority);
+      return false;
+    }
+    // An unrelated timer/service download must not consume the explicit menu
+    // command. Leave the authority available for only the exact requested URL.
+    if (authority.url !== url) return false;
+    this.clearContextMenuDownloadAuthority(contents.id, authority);
+    return true;
+  }
+
   private browserPageLeaseToken(lease: BrowserPageLease): string {
     return [lease.tabId, lease.tabGeneration, lease.userNavigationLease, lease.contents.id].join(':');
+  }
+
+  private browserMenuPreviewIdentity(tab: InternalTab): string {
+    return [tab.shell.id, tab.generation, tab.trustedUserNavigationLease, tab.shell.url, tab.shell.updatedAt].join(
+      '\u0000',
+    );
+  }
+
+  private assertBrowserMenuPreviewIdentity(tab: InternalTab, identity: string): void {
+    if (this.browserMenuPreviewIdentity(tab) !== identity) {
+      throw new Error('The browser page changed while this Browser menu preview was in progress.');
+    }
   }
 
   private async ensureAssistantView(
@@ -2106,9 +3709,21 @@ export class BrowserManager {
     run: BrowserAssistantRun,
     lease: AssistantDocumentLease,
     timeoutMs = ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
+    approvedDocument?: BrowserApprovalWithDocument,
+    preserveExistingLoadingViewOnTimeout = false,
   ): Promise<WebContentsView> {
     const hadReadyView = !!tab.view && !tab.view.webContents.isDestroyed() && !tab.viewLoadPromise;
-    const view = await this.ensureView(tab, run.abortSignal, timeoutMs);
+    // A discarded assistant target must be recreated under the deterministic
+    // hidden viewport before its requested page begins loading. Presentation
+    // state may never determine responsive layout, document visibility, or
+    // script behavior for a background operation.
+    const view = await this.ensureView(
+      tab,
+      run.abortSignal,
+      timeoutMs,
+      !hadReadyView,
+      preserveExistingLoadingViewOnTimeout,
+    );
     try {
       this.assertAssistantDocumentLease(tab, lease);
     } catch (error) {
@@ -2133,7 +3748,7 @@ export class BrowserManager {
         // unrestricted, then switch to the proxy-only path only while the
         // assistant owns this document.
         configureBrowserWebContents(view.webContents, false);
-        await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents);
+        await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents, run.abortSignal, lease);
         this.assertAssistantDocumentLease(tab, lease);
       } catch (error) {
         // Changing the native policy or installing the document membrane can
@@ -2149,59 +3764,145 @@ export class BrowserManager {
         throw error;
       }
     }
+    if (tab.assistantDialogGuard) {
+      await this.protectAssistantDialogs(tab, view.webContents, tab.assistantDialogGuard);
+    }
+    try {
+      await this.installAssistantNativeUiGuard(tab, view.webContents, run.abortSignal, lease);
+      this.assertAssistantDocumentLease(tab, lease);
+    } catch (error) {
+      // A page that cannot prove print suppression must never remain available
+      // to hidden assistant work. Reclaim the exact renderer so no delayed
+      // native sheet can outlive the failed operation.
+      if (this.tabs.get(tab.shell.id) === tab && tab.view === view && !view.webContents.isDestroyed()) {
+        tab.generation++;
+        this.destroyView(tab);
+        tab.shell.discarded = true;
+        tab.shell.sensitive = false;
+        this.emitTabs(tab.shell.conversationId);
+      }
+      throw error;
+    }
+    this.consumeBrowserApprovalRendererReset(tab, run, approvedDocument, view);
     return view;
   }
 
   private async withAssistantScriptPopupAttribution<T>(tab: InternalTab, operation: () => Promise<T>): Promise<T> {
+    const previousDownloadAttribution = tab.assistantDownloadAttribution;
+    if (tab.aiControlOwnerId) {
+      tab.assistantDownloadAttribution = {
+        assistantOwnerId: tab.aiControlOwnerId,
+        trustedGestureGeneration: tab.trustedGestureGeneration ?? 0,
+      };
+    }
     tab.assistantScriptDepth++;
     try {
       return await operation();
     } finally {
       tab.assistantScriptDepth = Math.max(0, tab.assistantScriptDepth - 1);
+      tab.assistantDownloadAttribution = previousDownloadAttribution;
     }
+  }
+
+  private async withAssistantDownloadAttribution<T>(
+    tab: InternalTab,
+    assistantOwnerId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = tab.assistantDownloadAttribution;
+    tab.assistantDownloadAttribution = {
+      assistantOwnerId,
+      trustedGestureGeneration: tab.trustedGestureGeneration ?? 0,
+    };
+    try {
+      return await operation();
+    } finally {
+      tab.assistantDownloadAttribution = previous;
+    }
+  }
+
+  private rememberAssistantGesture(
+    tab: InternalTab,
+    assistantOwnerId: string,
+    expiresAt: number,
+    kind?: NonNullable<InternalTab['assistantGesture']>['kind'],
+    frameTreeNodeId?: number,
+  ): void {
+    const assistantGesture = {
+      assistantOwnerId,
+      expiresAt,
+      ...(frameTreeNodeId !== undefined ? { frameTreeNodeId } : {}),
+      ...(kind !== undefined ? { kind } : {}),
+    };
+    tab.assistantGesture = assistantGesture;
+    tab.popupGesture = { source: 'assistant', ...assistantGesture };
+  }
+
+  private timestampCdpInputCommand(command: BrowserCdpInputCommand): BrowserCdpInputCommand {
+    if (command.method === 'Input.insertText') return command;
+    const supplied = command.params.timestamp;
+    if (typeof supplied === 'number' && Number.isFinite(supplied) && supplied > 0) return command;
+    return {
+      ...command,
+      params: { ...command.params, timestamp: Date.now() / 1_000 },
+    };
   }
 
   private createAutomationGestureArm(
     tab: InternalTab,
     contents: WebContents,
-    input: Omit<BrowserAutomationInputArm, 'token' | 'expiresAt'>,
+    input: Omit<BrowserAutomationInputArm, 'token' | 'expiresAt' | 'timestamp'>,
+    background = this.attachedView !== tab.view,
+    timestamp = Date.now() / 1_000,
   ): BrowserAutomationInputArm {
     const assistantOwnerId = tab.aiControlOwnerId;
     if (!assistantOwnerId) throw new Error('Assistant input lost ownership of this browser tab.');
     const token = randomUUID();
     const expiresAt = Date.now() + AUTOMATION_GESTURE_ARM_MS;
+    let confirmationSettled = false;
+    let resolveConfirmation!: (confirmed: boolean) => void;
+    const confirmation = new Promise<boolean>((resolve) => {
+      resolveConfirmation = resolve;
+    });
+    const settleConfirmation = (confirmed: boolean): void => {
+      if (confirmationSettled) return;
+      confirmationSettled = true;
+      resolveConfirmation(confirmed);
+    };
     this.automationGestureTokens.set(token, {
       tabId: tab.shell.id,
+      contentsId: contents.id,
       assistantOwnerId,
       expiresAt,
+      kind: input.kind,
       ...(input.data !== undefined ? { inputData: input.data } : {}),
+      confirmed: false,
+      dispatchStarted: false,
+      confirmation,
+      settleConfirmation,
     });
     // Attribute the input in main before Chromium dispatches it. A page-level
     // window capture handler can synchronously call window.open() before the
     // preload's document listener reports the one-shot token; without this
     // early marker that popup could inherit a stale real-user gesture.
-    tab.popupGesture = {
-      source: 'assistant',
-      assistantOwnerId,
-      expiresAt,
-      kind: input.kind,
-    };
+    this.rememberAssistantGesture(tab, assistantOwnerId, expiresAt, input.kind);
     // Text is retained only in main for a one-shot comparison when the target
     // frame reports the trusted input event. Broadcasting it to every preload
     // would disclose typed secrets to every unrelated cross-origin frame.
     const { data: _privateInputData, ...publicInput } = input;
-    const arm: BrowserAutomationInputArm = { ...publicInput, token, expiresAt };
+    const arm: BrowserAutomationInputArm = { ...publicInput, token, expiresAt, timestamp };
     const win = this.getWindow();
     // A detached page cannot receive real pointer input from the user. Match
     // its synthetic event by kind only so clicks delivered inside an OOPIF do
     // not fail on frame-local client coordinates while React mounts the panel.
-    if (input.x !== undefined && input.y !== undefined && this.attachedView !== tab.view) {
+    if (input.x !== undefined && input.y !== undefined && background) {
       delete arm.x;
       delete arm.y;
     }
     if (
       input.x !== undefined &&
       input.y !== undefined &&
+      !background &&
       this.attachedView === tab.view &&
       tab.view &&
       win &&
@@ -2214,9 +3915,200 @@ export class BrowserManager {
       arm.screenX = contentBounds.x + viewBounds.x + Math.round(inputPoint.x);
       arm.screenY = contentBounds.y + viewBounds.y + Math.round(inputPoint.y);
     }
-    const expiry = setTimeout(() => this.automationGestureTokens.delete(token), AUTOMATION_GESTURE_ARM_MS);
+    const expiry = setTimeout(() => {
+      const pending = this.automationGestureTokens.get(token);
+      // A confirmed receipt remains available until the bounded input command
+      // consumes it. Otherwise a slow CDP response could turn ordinary token
+      // expiry into a false success.
+      if (pending && !pending.confirmed) this.revokeAutomationGestureToken(token);
+    }, AUTOMATION_GESTURE_ARM_MS);
     expiry.unref?.();
     return arm;
+  }
+
+  private publishAutomationGestureDisarm(contents: WebContents, token: string): void {
+    try {
+      for (const frame of contents.mainFrame.framesInSubtree) {
+        if (!frame.detached && !frame.isDestroyed()) {
+          frame.send('browser-page:disarm-automation-input', { token });
+        }
+      }
+    } catch {
+      // A closing/replaced frame has already discarded its isolated-world token.
+    }
+  }
+
+  private revokeAutomationGestureToken(token: string): PendingAutomationGesture | undefined {
+    const pending = this.automationGestureTokens.get(token);
+    this.automationGestureTokens.delete(token);
+    if (!pending) return undefined;
+    pending.settleConfirmation?.(false);
+    const tab = this.tabs.get(pending.tabId);
+    const contents = tab?.view?.webContents;
+    if (contents && !contents.isDestroyed() && contents.id === pending.contentsId) {
+      this.publishAutomationGestureDisarm(contents, token);
+    }
+    return pending;
+  }
+
+  private hasPendingBackgroundAutomationArm(tab: InternalTab, contents: WebContents): boolean {
+    for (const pending of this.automationGestureTokens.values()) {
+      if (pending.tabId === tab.shell.id && pending.contentsId === contents.id && pending.detachedArm === true) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasDispatchedSyntheticInput(tab: InternalTab, contents: WebContents): boolean {
+    const dispatched = this.dispatchedSyntheticInputs.get(contents.id);
+    return !!dispatched && dispatched.tabId === tab.shell?.id && dispatched.contents === contents;
+  }
+
+  private consumeAutomationGestureConfirmation(token: string): boolean {
+    const pending = this.automationGestureTokens.get(token);
+    if (pending?.confirmed) this.clearDispatchedSyntheticInput(pending.contentsId, token);
+    this.revokeAutomationGestureToken(token);
+    return pending?.confirmed === true;
+  }
+
+  private clearDispatchedSyntheticInput(contentsId: number, token?: string): DispatchedSyntheticInput | undefined {
+    const dispatched = this.dispatchedSyntheticInputs.get(contentsId);
+    if (!dispatched || (token !== undefined && dispatched.token !== token)) return undefined;
+    this.dispatchedSyntheticInputs.delete(contentsId);
+    if (dispatched.timer) clearTimeout(dispatched.timer);
+    return dispatched;
+  }
+
+  private confirmDispatchedSyntheticInput(contentsId: number, token: string): void {
+    const dispatched = this.dispatchedSyntheticInputs.get(contentsId);
+    if (!dispatched || dispatched.token !== token || !dispatched.timer) return;
+    clearTimeout(dispatched.timer);
+    dispatched.timer = null;
+  }
+
+  private reclaimDispatchedSyntheticInput(contentsId: number, token: string, reason: string): void {
+    const dispatched = this.dispatchedSyntheticInputs.get(contentsId);
+    if (!dispatched || dispatched.token !== token) return;
+    const tab = this.tabs.get(dispatched.tabId);
+    if (tab && tab.view?.webContents === dispatched.contents && !dispatched.contents.isDestroyed()) {
+      // Keep the attribution tombstone present until destroyView has detached
+      // and closed the exact WebContents. A late trusted DOM event can then
+      // never be reclassified as a real user gesture between timeout and close.
+      tab.generation++;
+      this.destroyView(tab);
+      tab.shell.discarded = true;
+      tab.shell.error = reason;
+      this.emitTabs(tab.shell.conversationId);
+      return;
+    }
+    // The original target is no longer reachable through its shell. Close that
+    // exact orphan before dropping the tombstone; never touch a replacement.
+    try {
+      if (!dispatched.contents.isDestroyed()) dispatched.contents.close({ waitForBeforeUnload: false });
+    } catch {
+      // Best-effort reclamation of an already-tearing-down target.
+    }
+    this.clearDispatchedSyntheticInput(contentsId, token);
+  }
+
+  private trackDispatchedSyntheticInput(tab: InternalTab, contents: WebContents, arm: BrowserAutomationInputArm): void {
+    if (this.dispatchedSyntheticInputs.has(contents.id)) {
+      throw new Error('Another attributed browser input is still awaiting Chromium confirmation.');
+    }
+    let dispatched!: DispatchedSyntheticInput;
+    const timer = setTimeout(
+      () =>
+        this.reclaimDispatchedSyntheticInput(
+          contents.id,
+          arm.token,
+          'Attributed browser input expired before Chromium confirmed it.',
+        ),
+      Math.max(1, arm.expiresAt - Date.now()),
+    );
+    timer.unref?.();
+    dispatched = {
+      tabId: tab.shell.id,
+      contents,
+      token: arm.token,
+      kind: arm.kind,
+      timer,
+    };
+    this.dispatchedSyntheticInputs.set(contents.id, dispatched);
+  }
+
+  private async waitForAutomationGestureConfirmation(
+    tab: InternalTab,
+    contents: WebContents,
+    token: string,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+  ): Promise<void> {
+    const pending = this.automationGestureTokens.get(token);
+    if (
+      !pending ||
+      pending.tabId !== tab.shell.id ||
+      pending.contentsId !== contents.id ||
+      (!pending.confirmed && !pending.confirmation)
+    ) {
+      throw new Error('Attributed browser input expired before Chromium confirmed it.');
+    }
+    throwIfBrowserAborted(abortSignal);
+    const confirmed = pending.confirmed
+      ? true
+      : await new Promise<boolean>((resolve, reject) => {
+          let settled = false;
+          const finish = (result: { confirmed: boolean } | { error: Error }): void => {
+            if (settled) return;
+            settled = true;
+            abortSignal?.removeEventListener('abort', onAbort);
+            if ('error' in result) reject(result.error);
+            else resolve(result.confirmed);
+          };
+          const onAbort = () => finish({ error: new Error('Browser action was cancelled.') });
+          abortSignal?.addEventListener('abort', onAbort, { once: true });
+          if (abortSignal?.aborted) onAbort();
+          void pending.confirmation!.then((value) => finish({ confirmed: value }));
+        });
+    throwIfBrowserAborted(abortSignal);
+    if (!confirmed || this.automationGestureTokens.get(token) !== pending || !pending.confirmed) {
+      throw new Error('Chromium did not confirm the attributed browser input before its bounded arm expired.');
+    }
+    if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+  }
+
+  private assertAutomationGestureReadyForDispatch(token: string): void {
+    const pending = this.automationGestureTokens.get(token);
+    if (!pending || pending.confirmed || pending.expiresAt < Date.now()) {
+      this.revokeAutomationGestureToken(token);
+      throw new Error('Attributed browser input expired before Chromium dispatch.');
+    }
+    if (pending.armedFrames) {
+      const tab = this.tabs.get(pending.tabId);
+      const contents = tab?.view?.webContents;
+      if (!tab || !contents || contents.isDestroyed() || contents.id !== pending.contentsId) {
+        this.revokeAutomationGestureToken(token);
+        throw new Error('The browser page changed before attributed background input could be dispatched.');
+      }
+      if (pending.detachedArm && this.isTargetViewPresented(tab, contents)) {
+        this.revokeAutomationGestureToken(token);
+        throw new Error('The Browser became visible while background input was being armed. Retry the action.');
+      }
+      let currentFrames: Map<number, string>;
+      try {
+        currentFrames = this.snapshotAutomationFrames(contents).identities;
+      } catch {
+        this.revokeAutomationGestureToken(token);
+        throw new Error('The browser page changed before attributed background input could be dispatched.');
+      }
+      if (
+        currentFrames.size !== pending.armedFrames.size ||
+        [...pending.armedFrames].some(([frameTreeNodeId, identity]) => currentFrames.get(frameTreeNodeId) !== identity)
+      ) {
+        this.revokeAutomationGestureToken(token);
+        throw new Error('A browser frame changed before attributed background input could be dispatched.');
+      }
+    }
   }
 
   private publishAutomationGestureArm(contents: WebContents, arm: BrowserAutomationInputArm): void {
@@ -2225,56 +4117,432 @@ export class BrowserManager {
         if (!frame.detached && !frame.isDestroyed()) frame.send('browser-page:arm-automation-input', arm);
       }
     } catch {
-      this.automationGestureTokens.delete(arm.token);
+      this.revokeAutomationGestureToken(arm.token);
       throw new Error('The browser page changed before assistant input could be attributed.');
     }
   }
 
-  private armAutomationGesture(
-    tab: InternalTab,
-    contents: WebContents,
-    input: Omit<BrowserAutomationInputArm, 'token' | 'expiresAt'>,
-  ): void {
-    const arm = this.createAutomationGestureArm(tab, contents, input);
-    this.publishAutomationGestureArm(contents, arm);
+  private automationFrameIdentity(frame: WebFrameMain): string {
+    return `${frame.processId}:${frame.routingId}:${frame.frameToken}`;
   }
 
-  /** Electron emits before-mouse-event / before-input-event synchronously inside
-   * sendInputEvent(). Arm the page only from that exact callback, so a physical
-   * user event at the same coordinates/key cannot consume a shape-matched token
-   * while the synthetic event is still queued. */
-  private sendAttributedInputEvent(
+  private snapshotAutomationFrames(contents: WebContents): {
+    frames: WebFrameMain[];
+    identities: Map<number, string>;
+  } {
+    try {
+      const seen = new Set<number>();
+      const frames: WebFrameMain[] = [];
+      const identities = new Map<number, string>();
+      for (const frame of contents.mainFrame.framesInSubtree) {
+        if (frame.detached || frame.isDestroyed() || seen.has(frame.frameTreeNodeId)) continue;
+        const identity = this.automationFrameIdentity(frame);
+        // Frame identity access can race OOPIF teardown. Exclude a frame that
+        // disappeared during the read instead of publishing a partial lease.
+        if (frame.detached || frame.isDestroyed()) continue;
+        seen.add(frame.frameTreeNodeId);
+        frames.push(frame);
+        identities.set(frame.frameTreeNodeId, identity);
+      }
+      if (frames.length === 0) throw new Error('no live frames');
+      return { frames, identities };
+    } catch {
+      throw new Error('The browser page changed before assistant input could be attributed.');
+    }
+  }
+
+  /** Main-to-renderer frame.send() is asynchronous. CDP input and native
+   * insertText can otherwise reach the page before its isolated preload has
+   * installed the one-shot provenance token. Wait for every currently live
+   * frame to confirm the exact document identity before either dispatch path. */
+  private async publishAutomationGestureArmAndWait(
     tab: InternalTab,
     contents: WebContents,
-    input: Omit<BrowserAutomationInputArm, 'token' | 'expiresAt'>,
-    event: Electron.MouseInputEvent | Electron.MouseWheelInputEvent | Electron.KeyboardInputEvent,
-  ): void {
-    if (this.pendingSyntheticInputs.has(contents.id)) {
-      throw new Error('Another attributed browser input is already being dispatched.');
+    arm: BrowserAutomationInputArm,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+    detached = true,
+  ): Promise<void> {
+    throwIfBrowserAborted(abortSignal);
+    if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+    let frames: WebFrameMain[];
+    let expectedFrames: Map<number, string>;
+    try {
+      const snapshot = this.snapshotAutomationFrames(contents);
+      frames = snapshot.frames;
+      expectedFrames = snapshot.identities;
+    } catch {
+      this.revokeAutomationGestureToken(arm.token);
+      throw new Error('The browser page changed before assistant input could be attributed.');
+    }
+    const pendingGesture = this.automationGestureTokens.get(arm.token);
+    if (
+      !pendingGesture ||
+      pendingGesture.tabId !== tab.shell.id ||
+      pendingGesture.contentsId !== contents.id ||
+      pendingGesture.confirmed
+    ) {
+      this.revokeAutomationGestureToken(arm.token);
+      throw new Error('Attributed background browser input expired before its frames were armed.');
+    }
+    pendingGesture.armedFrames = new Map(expectedFrames);
+    pendingGesture.detachedArm = detached;
+    // A background view may become presented while its kind-only arm is being
+    // prepared. Hide it before publication and keep it hidden until the arm is
+    // consumed/revoked so a later mount transition cannot let real user input
+    // steal the token.
+    if (detached && this.attachedView === tab.view) this.detachAttachedView();
+
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    let resolveAcknowledgement!: () => void;
+    let rejectAcknowledgement!: (error: Error) => void;
+    const acknowledgement = new Promise<void>((resolve, reject) => {
+      resolveAcknowledgement = resolve;
+      rejectAcknowledgement = reject;
+    });
+    const pending: PendingAutomationArmAcknowledgement = {
+      tabId: tab.shell.id,
+      contentsId: contents.id,
+      expectedFrames,
+      acknowledgedFrames: new Set(),
+      settle: (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (abortSignal && abortListener) abortSignal.removeEventListener('abort', abortListener);
+        if (this.pendingAutomationArmAcknowledgements.get(arm.token) === pending) {
+          this.pendingAutomationArmAcknowledgements.delete(arm.token);
+        }
+        if (error) rejectAcknowledgement(error);
+        else resolveAcknowledgement();
+      },
+    };
+    this.pendingAutomationArmAcknowledgements.set(arm.token, pending);
+    timer = setTimeout(
+      () => pending.settle(new Error('The browser page did not acknowledge attributed assistant input in time.')),
+      AUTOMATION_GESTURE_ACK_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    if (abortSignal) {
+      abortListener = () => pending.settle(new Error('Browser input was cancelled.'));
+      abortSignal.addEventListener('abort', abortListener, { once: true });
+      if (abortSignal.aborted) abortListener();
+    }
+
+    if (!settled) {
+      try {
+        for (const frame of frames) frame.send('browser-page:arm-automation-input', arm);
+      } catch {
+        pending.settle(new Error('The browser page changed before assistant input could be attributed.'));
+      }
+    }
+    await acknowledgement;
+    if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+  }
+
+  private isNativeBrowserPageFocused(contents: WebContents): boolean {
+    // Electron WebContents provides isFocused(). Keeping this probe tolerant of
+    // older/mocked hosts preserves safe background behavior in compatibility
+    // environments without making renderer focus a sidebar-mount dependency.
+    const isFocused = (contents as WebContents & { isFocused?: () => boolean }).isFocused;
+    return typeof isFocused !== 'function' || isFocused.call(contents);
+  }
+
+  private isTargetViewPresented(tab: InternalTab, contents: WebContents): boolean {
+    // Presentation is visual state, not an authority or focus prerequisite. An
+    // already-open sidebar may keep mirroring AI activity while Kai is blurred;
+    // this predicate never focuses Kai/page chrome, and an unmounted/hidden tab
+    // takes the deterministic background path in prepareAssistantOperationView.
+    return (
+      this.isHostWindowShown() &&
+      this.mountedConversationId === tab.shell.conversationId &&
+      this.mountedBounds !== null &&
+      this.activeTabs.get(tab.shell.conversationId) === tab.shell.id &&
+      this.attachedView === tab.view &&
+      tab.view?.webContents === contents &&
+      !contents.isDestroyed()
+    );
+  }
+
+  private isTargetViewInteractive(tab: InternalTab, contents: WebContents): boolean {
+    return (
+      !this.hasDispatchedSyntheticInput(tab, contents) &&
+      this.isHostWindowInteractive() &&
+      this.isTargetViewPresented(tab, contents) &&
+      this.isNativeBrowserPageFocused(contents)
+    );
+  }
+
+  /** Attribute an assistant gesture before dispatching it through CDP. This is
+   * deliberately the only automation input path, including when the sidebar is
+   * mounted and focused. */
+  private async sendAttributedInputEvent(
+    tab: InternalTab,
+    contents: WebContents,
+    input: Omit<BrowserAutomationInputArm, 'token' | 'expiresAt' | 'timestamp'>,
+    _event: Electron.MouseInputEvent | Electron.MouseWheelInputEvent | Electron.KeyboardInputEvent,
+    cdpCommand: BrowserCdpInputCommand,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+    beforeBackgroundDispatch?: () => Promise<void>,
+    onDispatchStarted?: () => void,
+  ): Promise<void> {
+    let dispatchStarted = false;
+    const markDispatchStarted = (): void => {
+      const assistantOwnerId = tab.aiControlOwnerId;
+      if (!assistantOwnerId) throw new Error('Assistant input lost ownership of this browser tab.');
+      const pending = this.automationGestureTokens.get(arm.token);
+      if (!pending || pending.confirmed || pending.expiresAt < Date.now()) {
+        throw new Error('Attributed browser input expired before Chromium dispatch.');
+      }
+      // This assignment is immediately adjacent to the CDP sendCommand call in
+      // dispatchCdpInputCommand. Before it flips, a matching trusted event is a
+      // concurrent user event and cannot consume the assistant's arm.
+      pending.dispatchStarted = true;
+      // Install the delayed-input tombstone before Chromium can deliver the
+      // trusted DOM event. A rejected or timed-out CDP command may still have
+      // reached the renderer, so only exact preload confirmation may clear it.
+      this.trackDispatchedSyntheticInput(tab, contents, arm);
+      dispatchStarted = true;
+      // Overwrite any recent real-user popup provenance before Chromium can
+      // invoke page handlers. Confirmation will refine this with the exact
+      // target frame, but a post-dispatch failure must never restore the stale
+      // user gesture and let a resulting popup escape assistant ownership.
+      this.rememberAssistantGesture(tab, assistantOwnerId, Date.now() + POPUP_GESTURE_PROVENANCE_MS, input.kind);
+    };
+    const attributedCommand = this.timestampCdpInputCommand(cdpCommand);
+    const timestamp = attributedCommand.params.timestamp;
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
+      throw new Error('Assistant browser input could not acquire a dispatch timestamp.');
     }
     const previousGesture = tab.popupGesture;
-    const arm = this.createAutomationGestureArm(tab, contents, input);
-    const pending: PendingSyntheticInput = {
-      tabId: tab.shell.id,
-      arm,
-      expectedType: event.type,
-    };
-    this.pendingSyntheticInputs.set(contents.id, pending);
+    const previousAssistantGesture = tab.assistantGesture;
+    const detached = !this.isTargetViewPresented(tab, contents);
+    const arm = this.createAutomationGestureArm(tab, contents, input, detached, timestamp);
     try {
-      contents.sendInputEvent(event);
-      if (pending.error) throw pending.error;
-      if (this.pendingSyntheticInputs.get(contents.id) === pending) {
-        throw new Error('Chromium did not confirm the attributed browser input before dispatch.');
+      await this.publishAutomationGestureArmAndWait(tab, contents, arm, abortSignal, documentLease, detached);
+      await beforeBackgroundDispatch?.();
+      if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+      this.assertAutomationGestureReadyForDispatch(arm.token);
+      await this.dispatchCdpInputCommand(
+        tab,
+        contents,
+        attributedCommand,
+        abortSignal,
+        documentLease,
+        markDispatchStarted,
+        onDispatchStarted,
+      );
+      await this.waitForAutomationGestureConfirmation(tab, contents, arm.token, abortSignal, documentLease);
+      if (!this.consumeAutomationGestureConfirmation(arm.token)) {
+        throw new Error('Chromium did not confirm the attributed background browser input.');
       }
     } catch (error) {
-      this.automationGestureTokens.delete(arm.token);
-      tab.popupGesture = previousGesture;
+      if (this.automationGestureTokens.get(arm.token)?.confirmed) {
+        this.clearDispatchedSyntheticInput(contents.id, arm.token);
+      }
+      this.revokeAutomationGestureToken(arm.token);
+      if (!dispatchStarted) {
+        tab.popupGesture = previousGesture;
+        tab.assistantGesture = previousAssistantGesture;
+      }
       throw error;
     } finally {
-      if (this.pendingSyntheticInputs.get(contents.id) === pending) {
-        this.pendingSyntheticInputs.delete(contents.id);
+      this.revokeAutomationGestureToken(arm.token);
+      if (this.tabs.get(tab.shell.id) === tab) this.attachActiveView(tab.shell.conversationId);
+    }
+  }
+
+  private async dispatchInputEvent(
+    tab: InternalTab,
+    contents: WebContents,
+    event: Electron.MouseInputEvent | Electron.MouseWheelInputEvent | Electron.KeyboardInputEvent,
+    cdpCommand: BrowserCdpInputCommand,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+  ): Promise<void> {
+    if (event.type === 'mouseMove' && tab.aiControlOwnerId) {
+      // mousemove is not a transient-activation gesture, so the page preload
+      // intentionally does not report it through the one-shot input-token path.
+      // It can still synchronously call window.open() from a move handler. Mark
+      // that popup as assistant-originated before CDP dispatch
+      // so it cannot inherit a recent real-user click's cached provenance and
+      // become a foreground, user-owned tab.
+      this.rememberAssistantGesture(tab, tab.aiControlOwnerId, Date.now() + POPUP_GESTURE_PROVENANCE_MS);
+    }
+    await this.dispatchCdpInputCommand(tab, contents, cdpCommand, abortSignal, documentLease);
+  }
+
+  private async releaseInputIfDocumentCurrent(
+    tab: InternalTab,
+    contents: WebContents,
+    event: Electron.MouseInputEvent | Electron.KeyboardInputEvent,
+    cdpCommand: BrowserCdpInputCommand,
+    documentLease: AssistantDocumentLease,
+  ): Promise<void> {
+    // A hash or History API transition changes shell.url but retains the exact
+    // renderer document and its pressed-input state. Release into that document
+    // even when the ordinary assistant lease was invalidated by the URL change
+    // or turn cancellation. A replacement document increments tab.generation
+    // synchronously at did-start-navigation and is never eligible.
+    if (
+      contents.isDestroyed() ||
+      this.tabs.get(tab.shell.id) !== tab ||
+      tab.view?.webContents !== contents ||
+      tab.generation !== documentLease.tabGeneration
+    )
+      return;
+    try {
+      // Ignore the operation's cancelled signal: this is bounded cleanup for an
+      // input-down event Chromium already accepted.
+      await this.dispatchInputEvent(tab, contents, event, cdpCommand);
+    } catch {
+      // Renderer teardown or debugger loss is itself sufficient to clear the
+      // target's input state.
+    }
+  }
+
+  private async insertAttributedText(
+    tab: InternalTab,
+    contents: WebContents,
+    text: string,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+    beforeDispatchAfterArm?: () => Promise<void>,
+  ): Promise<void> {
+    const detached = !this.isTargetViewPresented(tab, contents);
+    // Input.insertText is the only Chromium primitive that inserts arbitrary
+    // Unicode and paste-sized values atomically, but it has no timestamp
+    // parameter. Hidden input is quarantined from physical events. Presented
+    // paste-sized input is instead protected by exact full-value matching in
+    // main; a coincident physical event cannot consume the arm unless it carries
+    // the same complete payload. Ordinary visible typing retains timestamped
+    // single-code-point key events so pages receive natural keyboard behavior.
+    const textUnits = Array.from(text);
+    const useInsertText = detached || textUnits.length >= AUTOMATION_BULK_TEXT_THRESHOLD;
+    const units = useInsertText ? [text] : textUnits;
+    for (const unit of units) {
+      const input = useInsertText
+        ? {
+            kind: 'input' as const,
+            inputType: 'insertText',
+            data: unit,
+            timestampToleranceSeconds: AUTOMATION_GESTURE_ARM_MS / 1_000,
+          }
+        : { kind: 'keydown' as const, data: unit };
+      const attributedCommand: BrowserCdpInputCommand = useInsertText
+        ? { method: 'Input.insertText', params: { text: unit } }
+        : this.timestampCdpInputCommand({
+            method: 'Input.dispatchKeyEvent',
+            params: { type: 'keyDown', key: unit, text: unit, unmodifiedText: unit },
+          });
+      const releaseCommand: BrowserCdpInputCommand | null = useInsertText
+        ? null
+        : { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: unit } };
+      const timestamp = useInsertText ? Date.now() / 1_000 : attributedCommand.params.timestamp;
+      if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
+        throw new Error('Assistant browser text input could not acquire a dispatch timestamp.');
+      }
+      let dispatchStarted = false;
+      let keyPressed = false;
+      const previousGesture = tab.popupGesture;
+      const previousAssistantGesture = tab.assistantGesture;
+      const arm = this.createAutomationGestureArm(tab, contents, input, detached, timestamp);
+      const markDispatchStarted = (): void => {
+        const assistantOwnerId = tab.aiControlOwnerId;
+        if (!assistantOwnerId) throw new Error('Assistant input lost ownership of this browser tab.');
+        const pending = this.automationGestureTokens.get(arm.token);
+        if (!pending || pending.confirmed || pending.expiresAt < Date.now()) {
+          throw new Error('Attributed browser input expired before Chromium dispatch.');
+        }
+        pending.dispatchStarted = true;
+        // Either input primitive can mutate the page before its CDP promise
+        // settles. Retain attribution until the exact preload receipt or the
+        // bounded renderer-reclamation deadline.
+        this.trackDispatchedSyntheticInput(tab, contents, arm);
+        dispatchStarted = true;
+        this.rememberAssistantGesture(tab, assistantOwnerId, Date.now() + POPUP_GESTURE_PROVENANCE_MS, input.kind);
+      };
+      try {
+        await this.publishAutomationGestureArmAndWait(tab, contents, arm, abortSignal, documentLease, detached);
+        await beforeDispatchAfterArm?.();
+        if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+        this.assertAutomationGestureReadyForDispatch(arm.token);
+        await this.dispatchCdpInputCommand(
+          tab,
+          contents,
+          attributedCommand,
+          abortSignal,
+          documentLease,
+          markDispatchStarted,
+          () => {
+            keyPressed = releaseCommand !== null;
+          },
+        );
+        await this.waitForAutomationGestureConfirmation(tab, contents, arm.token, abortSignal, documentLease);
+        if (!this.consumeAutomationGestureConfirmation(arm.token)) {
+          throw new Error('Chromium did not confirm the attributed browser text input.');
+        }
+      } catch (error) {
+        if (this.automationGestureTokens.get(arm.token)?.confirmed) {
+          this.clearDispatchedSyntheticInput(contents.id, arm.token);
+        }
+        this.revokeAutomationGestureToken(arm.token);
+        if (!dispatchStarted) {
+          tab.popupGesture = previousGesture;
+          tab.assistantGesture = previousAssistantGesture;
+        }
+        throw error;
+      } finally {
+        this.revokeAutomationGestureToken(arm.token);
+        if (keyPressed && releaseCommand && documentLease) {
+          await this.releaseInputIfDocumentCurrent(
+            tab,
+            contents,
+            { type: 'keyUp', keyCode: unit },
+            releaseCommand,
+            documentLease,
+          );
+        }
+        if (this.tabs.get(tab.shell.id) === tab) this.attachActiveView(tab.shell.conversationId);
       }
     }
+  }
+
+  private async dispatchCdpInputCommand(
+    tab: InternalTab,
+    contents: WebContents,
+    command: BrowserCdpInputCommand,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+    beforeDispatch?: () => void,
+    onDispatchStarted?: () => void,
+  ): Promise<void> {
+    const timestampedCommand = this.timestampCdpInputCommand(command);
+    await this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser input',
+      BROWSER_INPUT_TIMEOUT_MS,
+      async () => {
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        try {
+          beforeDispatch?.();
+          // CDP can deliver a down event and still reject or time out its
+          // Promise. Mark it as potentially pressed immediately before invoking
+          // sendCommand so the caller's finally path always attempts the matching
+          // release in the surviving document.
+          onDispatchStarted?.();
+          await contents.debugger.sendCommand(timestampedCommand.method, timestampedCommand.params);
+        } finally {
+          releaseDebugger();
+        }
+      },
+      abortSignal,
+      documentLease,
+    );
   }
 
   private handlePendingSyntheticInput(
@@ -2300,7 +4568,12 @@ export class BrowserManager {
       clearTimeout(tab.aiNetworkReleaseTimer);
       tab.aiNetworkReleaseTimer = null;
     }
-    if (tab.scriptTainted || tab.privateNetworkNewDocumentGuard) {
+    if (
+      tab.scriptTainted ||
+      tab.privateNetworkNewDocumentGuard ||
+      tab.assistantNativeUiNewDocumentGuard ||
+      tab.assistantDialogsDisabledRunId
+    ) {
       tab.aiNetworkReleaseRequested = false;
       return;
     }
@@ -2325,15 +4598,28 @@ export class BrowserManager {
 
   private beginTrustedUserNavigation(tab: InternalTab, targetUrl: string): number {
     const lease = tab.trustedUserNavigationLease + 1;
+    if (tab.trustedUserNavigationTimer) clearTimeout(tab.trustedUserNavigationTimer);
     tab.trustedUserNavigationLease = lease;
     tab.trustedUserNavigation = true;
     tab.trustedUserNavigationTarget = targetUrl;
     tab.trustedUserNavigationRequestId = null;
+    tab.trustedUserNavigationTimer = setTimeout(() => {
+      if (this.tabs.get(tab.shell.id) !== tab || tab.trustedUserNavigationLease !== lease) return;
+      tab.trustedUserNavigationTimer = null;
+      // The deadline only bounds a chrome command that Chromium never claimed.
+      // Once the exact main-frame request exists, redirects/authentication can
+      // legitimately remain pending for much longer. Its commit, failure, or
+      // conversion into a download owns the remaining authority lifetime.
+      if (tab.trustedUserNavigationRequestId === null) this.clearTrustedUserNavigation(tab, lease);
+    }, TRUSTED_USER_NAVIGATION_AUTHORITY_MS);
+    tab.trustedUserNavigationTimer.unref?.();
     return lease;
   }
 
   private clearTrustedUserNavigation(tab: InternalTab, lease?: number): boolean {
     if (lease !== undefined && tab.trustedUserNavigationLease !== lease) return false;
+    if (tab.trustedUserNavigationTimer) clearTimeout(tab.trustedUserNavigationTimer);
+    tab.trustedUserNavigationTimer = null;
     tab.trustedUserNavigation = false;
     tab.trustedUserNavigationTarget = null;
     tab.trustedUserNavigationRequestId = null;
@@ -2367,9 +4653,350 @@ export class BrowserManager {
     return !!win && !win.isDestroyed() && win.isVisible() && !win.isMinimized();
   }
 
+  /** `activeTabs` is a remembered chrome selection, not proof that the user is
+   * currently viewing that tab. Headless/background automation must not be
+   * blocked by stale presentation state from an unmounted panel, another chat,
+   * or a minimized Kai window. */
+  private isTabPresentedToUser(tab: InternalTab): boolean {
+    return (
+      this.mountedConversationId === tab.shell.conversationId &&
+      this.mountedBounds !== null &&
+      this.activeTabs.get(tab.shell.conversationId) === tab.shell.id &&
+      this.isHostWindowShown()
+    );
+  }
+
   private isHostWindowInteractive(): boolean {
     const win = this.getWindow();
     return !!win && !win.isDestroyed() && win.isVisible() && !win.isMinimized() && win.isFocused();
+  }
+
+  /** Acquire manager ownership of the target debugger until the returned
+   * one-shot release is called. All manager CDP users share this counter so a
+   * panel mount may restore viewport metrics concurrently without detaching an
+   * assistant action, screenshot, sensitivity scan, or document guard. */
+  private acquireBrowserDebugger(contents: WebContents): () => void {
+    // Unit fixtures construct BrowserManager without its constructor. Lazily
+    // initialize this field as well as declaring it above so those focused
+    // tests exercise the same ownership behavior.
+    this.debuggerOwnership ??= new WeakMap<WebContents, BrowserDebuggerOwnership>();
+    let ownership = this.debuggerOwnership.get(contents);
+    if (!ownership) {
+      const detachWhenIdle = !contents.debugger.isAttached();
+      if (detachWhenIdle) contents.debugger.attach('1.3');
+      ownership = { references: 0, detachWhenIdle };
+      this.debuggerOwnership.set(contents, ownership);
+    } else if (!contents.debugger.isAttached()) {
+      // A target replacement or an external DevTools detach invalidates every
+      // in-flight CDP command. Reattach for subsequent work and reclaim the
+      // manager-owned connection once the shared count reaches zero.
+      contents.debugger.attach('1.3');
+      ownership.detachWhenIdle = true;
+    }
+    ownership.references++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      ownership!.references = Math.max(0, ownership!.references - 1);
+      if (ownership!.references !== 0) return;
+      this.debuggerOwnership.delete(contents);
+      if (ownership!.detachWhenIdle && !contents.isDestroyed() && contents.debugger.isAttached()) {
+        contents.debugger.detach();
+      }
+    };
+  }
+
+  /** Cancel a bounded presentation-only CDP operation without touching a
+   * debugger attachment that predates BrowserManager ownership (for example a
+   * developer-tools session). Detaching rejects outstanding manager commands. */
+  private cancelManagerOwnedDebugger(contents: WebContents): void {
+    const ownership = this.debuggerOwnership?.get(contents);
+    if (!ownership?.detachWhenIdle) return;
+    this.debuggerOwnership.delete(contents);
+    try {
+      if (!contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
+    } catch {
+      // The target may have closed concurrently with presentation cancellation.
+    }
+  }
+
+  /** JavaScript dialogs are native, modal UI and can otherwise make a hidden
+   * automation target wait for user intervention. Keep suppression scoped to
+   * assistant capability leases; releasing the final lease removes the CDP
+   * listener and restores ordinary Chromium behavior without recreating the
+   * user's page. Dialog text is deliberately never copied into errors or logs. */
+  private ensureAssistantRunDialogGuard(tab: InternalTab, runId: string): AssistantDialogGuard {
+    const existingToken = tab.assistantRunDialogGuardLease;
+    const existingGuard = tab.assistantDialogGuard;
+    if (
+      existingToken &&
+      existingGuard?.runId === runId &&
+      !existingGuard.settled &&
+      existingGuard.owners.has(existingToken)
+    ) {
+      return existingGuard;
+    }
+    // A settled/replaced guard disposes its own target registrations in
+    // acquireAssistantDialogGuard. Do not let a stale token masquerade as the
+    // new run-lifetime owner.
+    tab.assistantRunDialogGuardLease = undefined;
+    const lease = this.acquireAssistantDialogGuard(tab, runId);
+    tab.assistantRunDialogGuardLease = lease.token;
+    return lease.guard;
+  }
+
+  private acquireAssistantDialogGuard(tab: InternalTab, runId: string): { guard: AssistantDialogGuard; token: symbol } {
+    let guard = tab.assistantDialogGuard;
+    if (guard && (guard.runId !== runId || guard.settled)) {
+      // A replacement guard waits on the per-WebContents restoration promise
+      // before installing interception again. Observe the aggregate here; the
+      // restore path itself unloads a target that cannot be made safe.
+      void this.disposeAssistantDialogGuard(tab, guard).catch(() => undefined);
+      guard = undefined;
+    }
+    if (!guard) {
+      let reject!: (error: Error) => void;
+      const failure = new Promise<never>((_resolve, rejectPromise) => {
+        reject = rejectPromise;
+      });
+      // A popup bootstrap guard has no direct caller awaiting the failure. Keep
+      // its rejection observed while still returning the original promise to
+      // active assistant operations through Promise.race().
+      void failure.catch(() => undefined);
+      guard = {
+        runId,
+        owners: new Set(),
+        protectedContents: new Map(),
+        failure,
+        reject,
+        handlingDialog: false,
+        settled: false,
+      };
+      tab.assistantDialogGuard = guard;
+    }
+    const token = Symbol('assistant-dialog-guard');
+    guard.owners.add(token);
+    return { guard, token };
+  }
+
+  private failAssistantDialogGuard(tab: InternalTab, guard: AssistantDialogGuard, error: Error): void {
+    if (tab.assistantDialogGuard !== guard || guard.settled) return;
+    guard.settled = true;
+    tab.shell.error = error.message;
+    this.emitTabs(tab.shell.conversationId);
+    guard.reject(error);
+  }
+
+  private async protectAssistantDialogs(
+    tab: InternalTab,
+    contents: WebContents,
+    expectedGuard: AssistantDialogGuard = tab.assistantDialogGuard!,
+  ): Promise<void> {
+    const guard = tab.assistantDialogGuard;
+    if (guard === expectedGuard && guard.settled) return guard.failure;
+    if (!guard || guard !== expectedGuard) {
+      throw new Error('Assistant dialog protection expired before Browser control began.');
+    }
+    const existing = guard.protectedContents.get(contents);
+    if (existing) return existing.ready;
+    if (contents.isDestroyed()) throw new Error('The browser page closed before dialog protection began.');
+
+    const priorRestore = this.assistantDialogProtectionRestores?.get(contents.id);
+    const releaseDebugger = this.acquireBrowserDebugger(contents);
+    const onMessage = (_event: unknown, method: string, params: unknown): void => {
+      if (
+        method === 'Page.fileChooserOpened' &&
+        tab.assistantDialogGuard === guard &&
+        !guard.settled &&
+        !guard.handlingDialog
+      ) {
+        guard.handlingDialog = true;
+        this.failAssistantDialogGuard(
+          tab,
+          guard,
+          new Error('The page opened a native file chooser during assistant control; Kai cancelled it.'),
+        );
+        return;
+      }
+      if (
+        method !== 'Page.javascriptDialogOpening' ||
+        tab.assistantDialogGuard !== guard ||
+        guard.settled ||
+        guard.handlingDialog
+      )
+        return;
+      guard.handlingDialog = true;
+      const reportedType =
+        params && typeof params === 'object' && typeof (params as { type?: unknown }).type === 'string'
+          ? (params as { type: string }).type
+          : '';
+      const dialogType = ['alert', 'confirm', 'prompt', 'beforeunload'].includes(reportedType)
+        ? reportedType
+        : 'JavaScript';
+      const blocked = new Error(
+        `The page opened a blocking ${dialogType} dialog during assistant control; Kai blocked it and attempted to dismiss it.`,
+      );
+      // Revoke the operation synchronously. Waiting for the asynchronous CDP
+      // acknowledgement creates a window in which a fast operation can report
+      // success after the page has already opened modal native UI.
+      this.failAssistantDialogGuard(tab, guard, blocked);
+      void this.runRendererOperationWithDeadline(
+        tab,
+        contents,
+        'Browser JavaScript dialog dismissal',
+        ASSISTANT_DIALOG_CDP_TIMEOUT_MS,
+        () => contents.debugger.sendCommand('Page.handleJavaScriptDialog', { accept: false }).then(() => undefined),
+      ).then(
+        () => undefined,
+        () => {
+          if (this.tabs.get(tab.shell.id) === tab && tab.view?.webContents === contents && !contents.isDestroyed()) {
+            tab.generation++;
+            this.destroyView(tab);
+            tab.shell.discarded = true;
+            tab.shell.sensitive = false;
+            this.emitTabs(tab.shell.conversationId);
+          }
+        },
+      );
+    };
+    const protectedContents = {
+      onMessage,
+      ready: Promise.resolve(),
+      releaseDebugger,
+    };
+    guard.protectedContents.set(contents, protectedContents);
+    contents.debugger.on('message', onMessage);
+    protectedContents.ready = (async () => {
+      try {
+        if (priorRestore) await priorRestore;
+        if (tab.assistantDialogGuard !== guard || !guard.owners.size || contents.isDestroyed()) {
+          throw new Error('Assistant dialog protection expired while Browser control was being prepared.');
+        }
+        await this.runRendererOperationWithDeadline(
+          tab,
+          contents,
+          'Browser JavaScript dialog protection',
+          ASSISTANT_DIALOG_CDP_TIMEOUT_MS,
+          () => contents.debugger.sendCommand('Page.enable').then(() => undefined),
+        );
+        if (tab.assistantDialogGuard !== guard || !guard.owners.size || contents.isDestroyed()) {
+          throw new Error('Assistant dialog protection expired while Browser control was being prepared.');
+        }
+        await this.runRendererOperationWithDeadline(
+          tab,
+          contents,
+          'Browser native file chooser protection',
+          ASSISTANT_DIALOG_CDP_TIMEOUT_MS,
+          () =>
+            contents.debugger
+              .sendCommand('Page.setInterceptFileChooserDialog', { enabled: true, cancel: true })
+              .then(() => undefined),
+        );
+        if (guard.settled) return guard.failure;
+        if (tab.assistantDialogGuard !== guard || !guard.owners.size || contents.isDestroyed()) {
+          throw new Error('Assistant dialog protection expired while Browser control was being prepared.');
+        }
+      } catch (error) {
+        if (guard.protectedContents.get(contents) === protectedContents) {
+          guard.protectedContents.delete(contents);
+          try {
+            contents.debugger.off('message', onMessage);
+          } catch {
+            // The target may have closed while Page.enable was pending.
+          }
+          releaseDebugger();
+        }
+        if (error instanceof Error && /^Assistant dialog protection expired/.test(error.message)) throw error;
+        if (guard.settled) return guard.failure;
+        throw new Error('Kai could not enable fail-closed native dialog handling for this browser page.', {
+          cause: error,
+        });
+      }
+    })();
+    void protectedContents.ready.catch(() => undefined);
+    return protectedContents.ready;
+  }
+
+  private unprotectAssistantDialogs(tab: InternalTab, contents: WebContents): void {
+    const guard = tab.assistantDialogGuard;
+    const protectedContents = guard?.protectedContents.get(contents);
+    if (!guard || !protectedContents) return;
+    guard.protectedContents.delete(contents);
+    try {
+      contents.debugger.off('message', protectedContents.onMessage);
+    } catch {
+      // A destroyed WebContents may reject listener mutation during teardown.
+    }
+    void this.restoreAssistantDialogBehavior(tab, contents, protectedContents.releaseDebugger).catch(() => undefined);
+  }
+
+  private restoreAssistantDialogBehavior(
+    tab: InternalTab,
+    contents: WebContents,
+    releaseDebugger: () => void,
+  ): Promise<void> {
+    if (contents.isDestroyed()) {
+      releaseDebugger();
+      return Promise.resolve();
+    }
+    const restores = (this.assistantDialogProtectionRestores ??= new Map());
+    const previous = restores.get(contents.id) ?? Promise.resolve();
+    const restore = previous
+      .catch(() => undefined)
+      .then(() =>
+        this.runRendererOperationWithDeadline(
+          tab,
+          contents,
+          'Browser native file chooser restoration',
+          ASSISTANT_DIALOG_CDP_TIMEOUT_MS,
+          () =>
+            contents.debugger
+              .sendCommand('Page.setInterceptFileChooserDialog', { enabled: false })
+              .then(() => undefined),
+        ),
+      )
+      .catch((error: unknown) => {
+        if (this.tabs.get(tab.shell.id) === tab && tab.view?.webContents === contents && !contents.isDestroyed()) {
+          tab.generation++;
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+          tab.shell.sensitive = false;
+          tab.shell.error = 'Kai could not restore native file chooser behavior, so the page was unloaded.';
+          this.emitTabs(tab.shell.conversationId);
+        }
+        throw error;
+      })
+      .finally(() => {
+        releaseDebugger();
+        if (restores.get(contents.id) === restore) restores.delete(contents.id);
+      });
+    restores.set(contents.id, restore);
+    void restore.catch(() => undefined);
+    return restore;
+  }
+
+  private releaseAssistantDialogGuard(tab: InternalTab, token: symbol): Promise<void> {
+    const guard = tab.assistantDialogGuard;
+    if (!guard) return Promise.resolve();
+    guard.owners.delete(token);
+    return guard.owners.size === 0 ? this.disposeAssistantDialogGuard(tab, guard) : Promise.resolve();
+  }
+
+  private disposeAssistantDialogGuard(tab: InternalTab, guard: AssistantDialogGuard): Promise<void> {
+    if (tab.assistantDialogGuard === guard) tab.assistantDialogGuard = undefined;
+    guard.owners.clear();
+    const restores: Promise<void>[] = [];
+    for (const [contents, protectedContents] of guard.protectedContents) {
+      try {
+        contents.debugger.off('message', protectedContents.onMessage);
+      } catch {
+        // Best-effort cleanup during renderer teardown.
+      }
+      restores.push(this.restoreAssistantDialogBehavior(tab, contents, protectedContents.releaseDebugger));
+    }
+    guard.protectedContents.clear();
+    return Promise.all(restores).then(() => undefined);
   }
 
   private panelAuthorityGeneration(conversationId: string): number {
@@ -2388,107 +5015,105 @@ export class BrowserManager {
     this.panelLayoutGenerations.set(conversationId, this.panelLayoutGeneration(conversationId) + 1);
   }
 
+  private captureInputCoordinateLease(view: WebContentsView, lockZoom = true): BrowserInputCoordinateLease {
+    const lease = {
+      bounds: view.getBounds(),
+      zoomFactor: view.webContents.getZoomFactor(),
+      lockZoom,
+    };
+    const leases =
+      (this.inputCoordinateSurfaceLeases ??= new WeakMap<WebContentsView, Set<BrowserInputCoordinateLease>>()).get(
+        view,
+      ) ?? new Set<BrowserInputCoordinateLease>();
+    leases.add(lease);
+    this.inputCoordinateSurfaceLeases.set(view, leases);
+    return lease;
+  }
+
+  private assertInputCoordinateLease(view: WebContentsView, lease: BrowserInputCoordinateLease): void {
+    const bounds = view.getBounds();
+    if (
+      !this.inputCoordinateSurfaceLeases?.get(view)?.has(lease) ||
+      bounds.x !== lease.bounds.x ||
+      bounds.y !== lease.bounds.y ||
+      bounds.width !== lease.bounds.width ||
+      bounds.height !== lease.bounds.height ||
+      (lease.lockZoom && view.webContents.getZoomFactor() !== lease.zoomFactor)
+    ) {
+      // Raw coordinates name one exact viewport surface. Retargeting them after
+      // a real resize or zoom change could click an unrelated control. Pure
+      // presentation detach/switch transitions preserve the leased surface.
+      throw new Error('The Browser viewport or zoom changed before coordinate input. Retry the action.');
+    }
+  }
+
+  private hasInputCoordinateSurfaceLease(view: WebContentsView): boolean {
+    return (this.inputCoordinateSurfaceLeases?.get(view)?.size ?? 0) > 0;
+  }
+
+  private hasStableNativeSurfaceLease(view: WebContentsView): boolean {
+    return this.hasInputCoordinateSurfaceLease(view);
+  }
+
+  private releaseInputCoordinateLease(view: WebContentsView, lease: BrowserInputCoordinateLease | null): void {
+    if (!lease) return;
+    const leases = this.inputCoordinateSurfaceLeases?.get(view);
+    if (!leases?.delete(lease)) return;
+    if (leases.size > 0) return;
+    this.inputCoordinateSurfaceLeases?.delete(view);
+
+    const mappedTabId = this.webContentsToTab?.get(view.webContents.id);
+    const tab =
+      (mappedTabId ? this.tabs.get(mappedTabId) : undefined) ??
+      [...(this.tabs?.values() ?? [])].find((candidate) => candidate.view === view);
+    if (!tab || tab.view !== view || view.webContents.isDestroyed()) return;
+    const shouldPresent =
+      this.mountedConversationId === tab.shell.conversationId &&
+      this.mountedBounds !== null &&
+      this.activeTabs.get(tab.shell.conversationId) === tab.shell.id;
+    if (shouldPresent) {
+      this.attachActiveView(tab.shell.conversationId);
+      return;
+    }
+    if (this.attachedView === view) this.attachedView = null;
+    try {
+      view.setVisible(false);
+      view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+    } catch {
+      // The target can close while its final attributed input is unwinding.
+    }
+  }
+
   private notifyPanelStateChanged(conversationId: string): void {
     for (const waiter of [...(this.panelStateWaiters.get(conversationId) ?? [])]) waiter();
   }
 
-  private async waitForAssistantView(
+  private async prepareAssistantOperationView(
     tab: InternalTab,
     view: WebContentsView,
     abortSignal: AbortSignal | undefined,
     documentLease: AssistantDocumentLease,
-    assertOperationAuthority: () => void,
-    requireInteraction: boolean,
-  ): Promise<void> {
-    const conversationId = tab.shell.conversationId;
-    const attachIfVisible = (): boolean => {
-      if (this.disposed || this.shuttingDown) throw new Error('The in-app browser is unavailable.');
-      throwIfBrowserAborted(abortSignal);
-      this.assertAssistantDocumentLease(tab, documentLease);
-      assertOperationAuthority();
-      if (!this.isHostWindowShown()) return false;
-      if (
-        requireInteraction &&
-        (!this.isHostWindowInteractive() || this.chromeFocusConversationId === conversationId)
-      ) {
-        return false;
-      }
-      this.attachActiveView(conversationId, requireInteraction);
-      return (
-        this.isHostWindowShown() &&
-        (!requireInteraction ||
-          (this.isHostWindowInteractive() && this.chromeFocusConversationId !== conversationId)) &&
-        this.mountedConversationId === conversationId &&
-        this.mountedBounds !== null &&
-        this.activeTabs.get(conversationId) === tab.shell.id &&
-        tab.view === view &&
-        !view.webContents.isDestroyed() &&
-        this.attachedView === view
-      );
-    };
-
-    if (attachIfVisible()) return;
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      const waiters = this.panelStateWaiters.get(conversationId) ?? new Set<() => void>();
-      this.panelStateWaiters.set(conversationId, waiters);
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        abortSignal?.removeEventListener('abort', onAbort);
-        waiters.delete(check);
-        if (waiters.size === 0) this.panelStateWaiters.delete(conversationId);
-      };
-      const finish = (error?: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (error) reject(error);
-        else resolve();
-      };
-      const check = () => {
-        try {
-          if (attachIfVisible()) finish();
-        } catch (error) {
-          finish(error);
-        }
-      };
-      const onAbort = () => finish(new Error('Browser action was cancelled.'));
-      timer = setTimeout(
-        () =>
-          finish(
-            new Error(
-              requireInteraction
-                ? 'The Browser page did not become visible and interactive before assistant input was ready. Focus Browser and retry.'
-                : 'The Browser page did not become visible before the assistant operation was ready. Reopen Browser and retry.',
-            ),
-          ),
-        ASSISTANT_VIEW_ATTACH_TIMEOUT_MS,
-      );
-      timer.unref?.();
-      abortSignal?.addEventListener('abort', onAbort, { once: true });
-      waiters.add(check);
-      check();
-    });
-  }
-
-  private waitForPhysicalActionView(
-    tab: InternalTab,
-    view: WebContentsView,
-    abortSignal: AbortSignal | undefined,
-    documentLease: AssistantDocumentLease,
-    assertPhysicalActionAuthority: () => void,
-  ): Promise<void> {
-    return this.waitForAssistantView(tab, view, abortSignal, documentLease, assertPhysicalActionAuthority, true);
-  }
-
-  private waitForVisibleAssistantOperationView(
-    tab: InternalTab,
-    view: WebContentsView,
-    abortSignal: AbortSignal | undefined,
-    documentLease: AssistantDocumentLease,
-  ): Promise<void> {
-    return this.waitForAssistantView(tab, view, abortSignal, documentLease, () => undefined, false);
+    assertOperationAuthority: () => void = () => undefined,
+  ): Promise<boolean> {
+    if (this.disposed || this.shuttingDown) throw new Error('The in-app browser is unavailable.');
+    throwIfBrowserAborted(abortSignal);
+    this.assertAssistantDocumentLease(tab, documentLease);
+    assertOperationAuthority();
+    // Presentation never gates assistant work. Preserve an already-presented
+    // target so the user can watch its cursor, typing, and scrolling live; every
+    // hidden, unmounted, inactive, or never-mounted target instead uses the same
+    // deterministic background surface below.
+    const presented = this.isTargetViewPresented(tab, view.webContents);
+    if (presented) {
+      view.setBounds(this.mountedBounds!);
+      view.setVisible(true);
+      return true;
+    }
+    if (this.attachedView === view) this.detachAttachedView();
+    view.setVisible(false);
+    view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+    await this.enableAssistantBackgroundViewport(tab, view.webContents, abortSignal, documentLease);
+    return false;
   }
 
   private emit(event: BrowserEvent): void {
@@ -2548,6 +5173,17 @@ export class BrowserManager {
     }
   }
 
+  private emitDownloadHistoryChangedForScope(
+    scopeKey: string,
+    conversationId: string | undefined,
+    downloadId: string,
+    change: 'deleted' | 'unavailable',
+  ): void {
+    for (const candidate of this.conversationsForScope(scopeKey, conversationId)) {
+      this.emit({ type: 'download-history-changed', conversationId: candidate, downloadId, change });
+    }
+  }
+
   private emitProfileErrorForScope(scopeKey: string, area: BrowserProfilePersistenceArea, error: Error): void {
     const label =
       area === 'history' ? 'Browsing history' : area === 'downloads' ? 'Download history' : 'Browser profile';
@@ -2601,28 +5237,40 @@ export class BrowserManager {
     operation: string,
     abortSignal?: AbortSignal,
     documentLease?: AssistantDocumentLease,
+    totalTimeoutMs?: number,
+    reclaimTargetOnCancellation = true,
   ): Promise<void> {
     if (tab.shell.sensitive) {
       throw new Error(`${operation} is blocked while this tab contains password data.`);
     }
+    const deadlineAt = totalTimeoutMs === undefined ? null : Date.now() + Math.max(1, totalTimeoutMs);
+    const remainingTimeout = (): number => {
+      if (deadlineAt === null) return EVALUATE_TIMEOUT_MS;
+      const remaining = Math.ceil(deadlineAt - Date.now());
+      if (remaining <= 0) throw new BrowserRendererDeadlineError(operation, totalTimeoutMs!);
+      return remaining;
+    };
     let sensitive = (await this.evaluateWithDeadline(
       tab,
       contents,
       SENSITIVE_SCAN_SCRIPT,
       abortSignal,
       documentLease,
+      remainingTimeout(),
+      reclaimTargetOnCancellation,
     )) as boolean;
     if (!sensitive) {
       sensitive = await this.runRendererOperationWithDeadline(
         tab,
         contents,
         'Browser password-field scan',
-        EVALUATE_TIMEOUT_MS,
+        remainingTimeout(),
         async () =>
           (await this.hasPopulatedPasswordFieldInChildFrames(contents)) ||
           (await this.hasPopulatedPasswordFieldViaCdp(contents)),
         abortSignal,
         documentLease,
+        reclaimTargetOnCancellation,
       );
     }
     if (sensitive) this.setTabSensitive(tab, true);
@@ -2672,8 +5320,7 @@ export class BrowserManager {
    * into main. Both document size and operation time are bounded; oversized or
    * malformed results fail closed. */
   private async hasPopulatedPasswordFieldViaCdp(contents: WebContents): Promise<boolean> {
-    const wasAttached = contents.debugger.isAttached();
-    if (!wasAttached) contents.debugger.attach('1.3');
+    const releaseDebugger = this.acquireBrowserDebugger(contents);
     const budget: CdpSensitiveScanBudget = {
       elementsRemaining: MAX_DOM_ELEMENTS_FOR_CDP_SENSITIVE_SCAN,
       nodesRemaining: MAX_DOM_NODES_FOR_CDP_SENSITIVE_SCAN,
@@ -2688,7 +5335,7 @@ export class BrowserManager {
       if (oopifFrameTreeNodeIds.size > MAX_CDP_SENSITIVE_SCAN_TARGETS) return true;
       return await this.hasSensitiveRelatedOopifTarget(contents, budget, oopifFrameTreeNodeIds);
     } finally {
-      if (!wasAttached && !contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
+      releaseDebugger();
     }
   }
 
@@ -2950,8 +5597,14 @@ export class BrowserManager {
     return [...promptIdsByConversation].map(([conversationId, promptIds]) => ({ conversationId, promptIds }));
   }
 
-  captureDocumentApproval(conversationId: string, tabId?: string): BrowserDocumentApproval {
-    const tab = this.requireTab(conversationId, tabId);
+  captureDocumentApproval(
+    conversationId: string,
+    tabId?: string,
+    assistantRun?: BrowserAssistantRun,
+  ): BrowserDocumentApproval {
+    const tab = assistantRun
+      ? this.requireAssistantTab(conversationId, assistantRun, tabId, false)
+      : this.requireTab(conversationId, tabId);
     return {
       tabId: tab.shell.id,
       tabGeneration: tab.generation,
@@ -3006,7 +5659,7 @@ export class BrowserManager {
     credentialId: string | undefined,
     assistantRun: BrowserAssistantRun,
   ): Promise<BrowserAutofillApproval> {
-    const tab = this.requireTab(conversationId, tabId);
+    const tab = this.requireAssistantTab(conversationId, assistantRun, tabId, false);
     let approval: BrowserAutofillApproval | undefined;
     await this.runTabOperation(tab, async () => {
       throwIfBrowserAborted(assistantRun.abortSignal);
@@ -3043,7 +5696,12 @@ export class BrowserManager {
     return approval;
   }
 
-  captureTabsApproval(conversationId: string, action: BrowserTabsMutationAction, tabId?: string): BrowserTabsApproval {
+  captureTabsApproval(
+    conversationId: string,
+    action: BrowserTabsMutationAction,
+    tabId?: string,
+    assistantRun?: BrowserAssistantRun,
+  ): BrowserTabsApproval {
     if (action === 'open') return { action, conversationId };
     if (action === 'reopen_closed') {
       const closedTab = this.closedTabs.get(conversationId)?.[0] ?? null;
@@ -3061,7 +5719,9 @@ export class BrowserManager {
       };
     }
 
-    const tab = this.requireTab(conversationId, tabId);
+    const tab = assistantRun
+      ? this.requireAssistantTab(conversationId, assistantRun, tabId, false)
+      : this.requireTab(conversationId, tabId);
     const document = this.captureDocumentApproval(conversationId, tab.shell.id);
     const approval: BrowserTabsApproval = {
       action,
@@ -3185,6 +5845,8 @@ export class BrowserManager {
         let slotReserved = true;
         let createdTab: InternalTab | null = null;
         let published = false;
+        let assistantRenderingActive = false;
+        let initialDialogGuard: AssistantDialogGuard | null = null;
         try {
           const createdAt = now();
           const partition = browserPartition(dataScope, request.conversationId);
@@ -3250,12 +5912,16 @@ export class BrowserManager {
             aiNetworkReleaseRequested: false,
             aiNetworkReleaseTimer: null,
             assistantScriptDepth: 0,
+            assistantDialogsDisabledRunId: owner === 'assistant' ? assistantRun!.id : null,
             popupGesture: null,
+            assistantGesture: null,
             scriptTainted: false,
             trustedUserNavigation: false,
             trustedUserNavigationTarget: null,
             trustedUserNavigationRequestId: null,
             trustedUserNavigationLease: 0,
+            trustedUserNavigationTimer: null,
+            userSelectionGeneration: 0,
             trustedGestureGeneration: 0,
             visibleAssistantGeneration: 0,
             unrestrictedNetworkGeneration: 0,
@@ -3264,65 +5930,53 @@ export class BrowserManager {
             queue: new BrowserActionQueue(),
             overlayGeneration: 0,
             overlayTimer: null,
-            overlayCssKey: null,
-            overlayCssText: null,
+            automationOverlay: null,
+            networkRedactionKey: createBrowserNetworkRedactionKey(),
             isPopup: false,
           };
           createdTab = tab;
           this.tabs.set(id, tab);
           this.tabOrder.set(request.conversationId, [...order, id]);
+          if (owner === 'assistant') this.rememberAssistantTarget(request.conversationId, assistantRun!.id, tab);
           releaseSlot();
           slotReserved = false;
-          if (!request.background || !this.activeTabs.has(request.conversationId)) {
-            const previousActiveId = this.activeTabs.get(request.conversationId);
-            if (previousActiveId && previousActiveId !== id) {
-              this.invalidateVisibleAssistantOperations(this.tabs.get(previousActiveId));
-              if (owner === 'user') {
-                this.invalidatePhysicalAssistantActions(this.tabs.get(previousActiveId));
-              }
-            }
+          // Presentation selection is user-owned. Assistant tabs are fully
+          // usable through their returned ids and hidden native surfaces, but
+          // they must never replace (or manufacture) the tab shown in the
+          // sidebar merely because the tool omitted `background: true`.
+          const shouldPresentTab =
+            owner === 'user' && (!request.background || !this.activeTabs.has(request.conversationId));
+          if (shouldPresentTab) {
             this.activeTabs.set(request.conversationId, id);
             this.notifyPanelStateChanged(request.conversationId);
           }
 
-          // Start view creation synchronously so the tab owns its WebContents before
-          // the panel mounts, but publish the tab/panel before awaiting loadURL. HTTP
-          // auth and permission prompts can pause that load and need a mounted prompt
-          // surface to resolve it.
-          // Assistant tabs are first published as shells when their chat's
-          // Browser panel is not mounted. A restricted WebContents must verify
-          // its current-frame network membrane before loading, and Chromium
-          // does not reliably schedule that initial document while the native
-          // view is detached. The open-panel event below lets mount() create
-          // and attach the renderer before joining its load. User foreground
-          // tabs retain their existing detached-navigation behavior for direct
-          // toolbar/IPC calls made just before a panel mount.
-          const canCreateBeforePanelMount = owner === 'user' && !request.background;
-          const viewReady =
-            canCreateBeforePanelMount || this.mountedConversationId === request.conversationId
-              ? this.ensureView(
-                  tab,
-                  assistantRun?.abortSignal,
-                  owner === 'assistant' ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
-                )
-              : null;
-          // A background shell can exist before the Browser panel ever mounts.
-          // Publish that state as discarded so an ask-policy approval captured
-          // now explicitly authorizes the shell's one internal renderer restore.
-          if (!viewReady) shell.discarded = true;
+          // Create every tab's hidden native child immediately. Assistant tab
+          // creation temporarily disables Chromium throttling for the initial
+          // load; ordinary idle tabs return to the default throttleable state.
+          if (owner === 'assistant') {
+            tab.aiActionDepth++;
+            assistantRenderingActive = true;
+            initialDialogGuard = this.ensureAssistantRunDialogGuard(tab, assistantRun!.id);
+            tab.assistantDownloadAttribution = {
+              assistantOwnerId: assistantRun!.id,
+              trustedGestureGeneration: tab.trustedGestureGeneration,
+            };
+          }
+          const viewReady = this.ensureView(
+            tab,
+            assistantRun?.abortSignal,
+            owner === 'assistant' ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
+            owner === 'assistant' && url !== 'about:blank',
+          );
           this.emitTabs(request.conversationId);
           published = true;
-          if (shell.owner === 'assistant') {
-            this.emit({
-              type: 'open-panel',
-              conversationId: request.conversationId,
-              tabId: id,
-            });
-          }
-          if (viewReady) {
+          if (initialDialogGuard) {
+            await this.awaitAssistantDialogProtectedOperation(viewReady, initialDialogGuard);
+          } else {
             await viewReady;
-            if (!request.background) this.attachActiveView(request.conversationId);
           }
+          if (shouldPresentTab) this.attachActiveView(request.conversationId);
           return this.snapshotTab(tab, this.activeTabs.get(request.conversationId) === id);
         } catch (error) {
           // Roll back only failures that happen before the shell is visible. Once
@@ -3339,6 +5993,10 @@ export class BrowserManager {
           }
           throw error;
         } finally {
+          if (assistantRenderingActive && createdTab) {
+            createdTab.aiActionDepth = Math.max(0, createdTab.aiActionDepth - 1);
+            if (createdTab.aiActionDepth === 0) this.restoreAssistantBackgroundRendering(createdTab);
+          }
           if (slotReserved) releaseSlot();
         }
       });
@@ -3364,16 +6022,35 @@ export class BrowserManager {
   ): Promise<void> {
     const tab = this.requireTab(conversationId, tabId);
     if (source === 'assistant' && !assistantRun) throw new Error('Assistant browser commands require turn ownership.');
-    if (source === 'assistant') {
-      this.emit({ type: 'open-panel', conversationId, tabId });
+    if (source === 'assistant' && command === 'activate') {
+      throw new Error('Assistant browser tabs remain in the background until the user selects one.');
     }
     if (source === 'assistant' && (command === 'close-others' || command === 'close-right')) {
       return this.commandAssistantMultiTabClose(tab, command, assistantRun!, approvedTabs);
     }
+    if (source === 'assistant' && command === 'close') {
+      return this.commandAssistantSingleTabClose(tab, assistantRun!, approvedTabs);
+    }
+    if (
+      source === 'user' &&
+      ['activate', 'close', 'reload', 'hard-reload', 'stop', 'back', 'forward'].includes(command)
+    ) {
+      const previewPreemption = this.preemptMenuPreviewForTab(
+        tab,
+        command === 'activate'
+          ? 'Browser menu preview was cancelled because the user opened this tab.'
+          : 'Browser menu preview was cancelled because the user navigated this tab.',
+      );
+      if (previewPreemption) await previewPreemption;
+    }
     const operation = () =>
       source === 'assistant'
-        ? this.withAssistantControl(tab, assistantRun!, (documentLease) =>
-            this.commandTabWithinOperation(tab, command, source, assistantRun, documentLease, approvedTabs),
+        ? this.withAssistantControl(
+            tab,
+            assistantRun!,
+            (documentLease) =>
+              this.commandTabWithinOperation(tab, command, source, assistantRun, documentLease, approvedTabs),
+            approvedTabs,
           )
         : this.commandTabWithinOperation(tab, command, source);
     // User input remains concurrent by design, while assistant commands join
@@ -3390,17 +6067,89 @@ export class BrowserManager {
     approvedTabs?: BrowserTabsApproval,
   ): Promise<BrowserTab> {
     const tab = this.requireTab(conversationId, tabId);
-    return this.runTabOperation(tab, () =>
-      this.withAssistantControl(tab, assistantRun, async (documentLease) => {
-        this.assertAssistantDocumentLease(tab, documentLease);
-        this.assertBrowserTabsTargetApproval(conversationId, 'duplicate', tab, approvedTabs);
-        if (this.tabs.get(tabId) !== tab) throw new Error('This browser tab has been closed.');
-        if (tab.shell.sensitive) {
-          throw new Error('Duplicating a tab is blocked while it contains password data.');
-        }
-        return this.createTab({ conversationId, url: tab.shell.url, owner: 'assistant' }, assistantRun);
-      }),
+    const sourceUrl = await this.runTabOperation(tab, () =>
+      this.withAssistantControl(
+        tab,
+        assistantRun,
+        async (documentLease) => {
+          this.assertAssistantDocumentLease(tab, documentLease);
+          this.assertBrowserTabsTargetApproval(conversationId, 'duplicate', tab, approvedTabs);
+          if (this.tabs.get(tabId) !== tab) throw new Error('This browser tab has been closed.');
+          if (tab.shell.sensitive) {
+            throw new Error('Duplicating a tab is blocked while it contains password data.');
+          }
+          return tab.shell.url;
+        },
+        approvedTabs,
+      ),
     );
+    // Creating the destination may sanitize a script-tainted profile origin.
+    // That cleanup drains every same-origin tab queue, including the source.
+    // Leave the source queue before creating the new renderer so duplication
+    // cannot wait on the queue operation that is currently performing it.
+    return this.createTab({ conversationId, url: sourceUrl, owner: 'assistant' }, assistantRun);
+  }
+
+  private async commandAssistantSingleTabClose(
+    tab: InternalTab,
+    assistantRun: BrowserAssistantRun,
+    approvedTabs?: BrowserTabsApproval,
+  ): Promise<void> {
+    const { conversationId, id: tabId } = tab.shell;
+    this.assertAssistantRun(conversationId, assistantRun);
+    this.assertAssistantMayControlTab(tab, assistantRun);
+    const captured = {
+      generation: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      userSelectionGeneration: tab.userSelectionGeneration ?? 0,
+      trustedGestureGeneration: tab.trustedGestureGeneration ?? 0,
+      url: tab.shell.url,
+      keepOpen: tab.shell.keepOpen,
+    };
+    const lease = this.assistantRuns.acquire(conversationId, assistantRun.id);
+    const closureToken = Symbol('assistant-close');
+    const pendingClosures = (this.pendingAssistantTabClosures ??= new Map<string, symbol>());
+    if (pendingClosures.has(tabId)) {
+      lease.release();
+      throw new Error('This browser tab is already being closed by another assistant operation.');
+    }
+    // Fence successor work before draining already-admitted operations. Closing
+    // a shell never needs DNS authorization, renderer creation, or native page
+    // guards, and therefore must remain possible for a broken/background page.
+    pendingClosures.set(tabId, closureToken);
+    try {
+      await this.withScopeActivity(tab.scopeKey, async () => {
+        await tab.queue.whenIdle();
+        if (
+          this.tabs.get(tabId) !== tab ||
+          tab.generation !== captured.generation ||
+          tab.trustedUserNavigationLease !== captured.userNavigationLease ||
+          (tab.userSelectionGeneration ?? 0) !== captured.userSelectionGeneration ||
+          (tab.trustedGestureGeneration ?? 0) !== captured.trustedGestureGeneration ||
+          tab.shell.url !== captured.url ||
+          tab.shell.keepOpen !== captured.keepOpen
+        ) {
+          throw new Error('The browser tab changed while the close operation was waiting.');
+        }
+        if (!this.config().enabled) throw new Error('The in-app browser is disabled in Settings.');
+        this.assertScopeAvailable(tab.scopeKey);
+        this.assertAssistantMayControlTab(tab, assistantRun);
+        throwIfBrowserAborted(assistantRun.abortSignal);
+        if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
+          throw new Error('The assistant browser turn ended before the tab could be closed.');
+        }
+        if (approvedTabs) this.assertBrowserTabsTargetApproval(conversationId, 'close', tab, approvedTabs);
+        throwIfBrowserAborted(assistantRun.abortSignal);
+        if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
+          throw new Error('The assistant browser turn ended before the tab could be closed.');
+        }
+        if (approvedTabs) this.assertBrowserTabsTargetApproval(conversationId, 'close', tab, approvedTabs);
+        this.closeTab(tab, true, true, false);
+      });
+    } finally {
+      if (pendingClosures.get(tabId) === closureToken) pendingClosures.delete(tabId);
+      lease.release();
+    }
   }
 
   private async commandAssistantMultiTabClose(
@@ -3410,80 +6159,117 @@ export class BrowserManager {
     approvedTabs?: BrowserTabsApproval,
   ): Promise<void> {
     const { conversationId, id: tabId } = tab.shell;
+    const capturedOrder = [...(this.tabOrder.get(conversationId) ?? [])];
+    const order = approvedTabs?.tabOrder ?? capturedOrder;
+    const targetIds =
+      approvedTabs?.affectedTabIds ??
+      (command === 'close-others' ? order.filter((id) => id !== tabId) : order.slice(order.indexOf(tabId) + 1));
     const lease = this.assistantRuns.acquire(conversationId, assistantRun.id);
-    try {
-      // Validate and serialize against work on the retained target, then release
-      // its queue before waiting on other tab queues to avoid cross-tab deadlocks.
-      await this.runTabOperation(tab, () =>
-        this.withAssistantControl(tab, assistantRun, async () => {
-          if (approvedTabs) {
-            this.assertBrowserMultiTabApproval(
-              conversationId,
-              command === 'close-others' ? 'close_others' : 'close_right',
-              tab,
-              approvedTabs,
-            );
-          }
-        }),
-      );
-      const order = approvedTabs?.tabOrder ?? [...(this.tabOrder.get(conversationId) ?? [])];
-      const targetIds =
-        approvedTabs?.affectedTabIds ??
-        (command === 'close-others' ? order.filter((id) => id !== tabId) : order.slice(order.indexOf(tabId) + 1));
-      const targets = targetIds.map((id) => ({ id, tab: this.tabs.get(id) }));
-      for (const { tab: target } of targets) {
-        const ownerRunActive = target?.assistantOwnerId
-          ? this.assistantRuns.generationIfActive(conversationId, target.assistantOwnerId) !== null
-          : false;
+    const targets = targetIds.map((id) => ({ id, tab: this.tabs.get(id) }));
+    const queueTabs = [tab, ...targets.flatMap(({ tab: target }) => (target ? [target] : []))]
+      .filter((candidate, index, all) => all.indexOf(candidate) === index)
+      .sort((left, right) => left.shell.id.localeCompare(right.shell.id));
+    const capturedTabs = queueTabs.map((captured) => ({
+      tab: captured,
+      generation: captured.generation,
+      userNavigationLease: captured.trustedUserNavigationLease,
+      userSelectionGeneration: captured.userSelectionGeneration ?? 0,
+      trustedGestureGeneration: captured.trustedGestureGeneration ?? 0,
+      url: captured.shell.url,
+      keepOpen: captured.shell.keepOpen,
+    }));
+    const assertCapturedTabsUnchanged = (): void => {
+      const currentOrder = this.tabOrder.get(conversationId) ?? [];
+      if (
+        currentOrder.length !== capturedOrder.length ||
+        currentOrder.some((id, index) => id !== capturedOrder[index])
+      ) {
+        throw new Error('The browser tab order changed while the close operation was waiting.');
+      }
+      for (const captured of capturedTabs) {
         if (
-          target &&
-          !assistantMayControlTab(
-            target.shell.owner,
-            target.assistantOwnerId,
-            assistantRun.id,
-            target.shell.keepOpen,
-            ownerRunActive,
-          )
+          this.tabs.get(captured.tab.shell.id) !== captured.tab ||
+          captured.tab.generation !== captured.generation ||
+          captured.tab.trustedUserNavigationLease !== captured.userNavigationLease ||
+          (captured.tab.userSelectionGeneration ?? 0) !== captured.userSelectionGeneration ||
+          (captured.tab.trustedGestureGeneration ?? 0) !== captured.trustedGestureGeneration ||
+          captured.tab.shell.url !== captured.url ||
+          captured.tab.shell.keepOpen !== captured.keepOpen
         ) {
-          throw new Error('A temporary browser tab in this range belongs to another active assistant run.');
-        }
-      }
-      await Promise.all(
-        targets.map(async ({ tab: other }) => {
-          if (!other) return;
-          await this.runTabOperation(other, () =>
-            this.withAssistantControl(other, assistantRun, async () => {
-              throwIfBrowserAborted(assistantRun.abortSignal);
-              if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
-                throw new Error('The assistant browser turn ended before tabs could be closed.');
-              }
-            }),
-          );
-        }),
-      );
-      throwIfBrowserAborted(assistantRun.abortSignal);
-      if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
-        throw new Error('The assistant browser turn ended before tabs could be closed.');
-      }
-      if (approvedTabs) {
-        this.assertBrowserMultiTabApproval(
-          conversationId,
-          command === 'close-others' ? 'close_others' : 'close_right',
-          tab,
-          approvedTabs,
-        );
-      }
-      for (const { id, tab: other } of targets) {
-        if (!other || this.tabs.get(id) !== other) {
           throw new Error('A browser tab changed while the close operation was waiting.');
         }
       }
-      // All affected queues have drained and the approved order is still exact.
-      // Close the captured identities synchronously so a newly opened or moved
-      // tab can never be swept into the operation.
-      for (const { tab: other } of targets) this.closeTab(other!, false);
-      this.emitTabs(conversationId);
+    };
+    const closureToken = Symbol(`assistant-${command}`);
+    const pendingClosures = (this.pendingAssistantTabClosures ??= new Map<string, symbol>());
+    try {
+      await this.withScopeActivity(tab.scopeKey, async () => {
+        for (const controlled of queueTabs) {
+          if (pendingClosures.has(controlled.shell.id)) {
+            throw new Error('A browser tab is already being closed by another assistant operation.');
+          }
+        }
+        // Fence all captured identities synchronously, then drain only work that
+        // was already admitted. Holding an idle sibling queue while waiting for
+        // a busy same-origin operation can deadlock when that operation waits
+        // for the sibling to become idle during storage sanitization.
+        for (const controlled of queueTabs) pendingClosures.set(controlled.shell.id, closureToken);
+        await Promise.all(queueTabs.map((controlled) => controlled.queue.whenIdle()));
+        if (this.tabs.get(tabId) !== tab) throw new Error('This browser tab has been closed.');
+        for (const { id, tab: target } of targets) {
+          if (!target || this.tabs.get(id) !== target) {
+            throw new Error('A browser tab changed while the close operation was waiting.');
+          }
+        }
+        assertCapturedTabsUnchanged();
+        // Closing shells does not read, script, navigate, or dispatch input into
+        // any document. Validate the same run/tab capabilities directly instead
+        // of entering document control after every affected queue has drained.
+        if (!this.config().enabled) throw new Error('The in-app browser is disabled in Settings.');
+        for (const controlled of queueTabs) {
+          this.assertScopeAvailable(controlled.scopeKey);
+          this.assertAssistantMayControlTab(controlled, assistantRun);
+        }
+        throwIfBrowserAborted(assistantRun.abortSignal);
+        if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
+          throw new Error('The assistant browser turn ended before tabs could be closed.');
+        }
+        if (approvedTabs) {
+          this.assertBrowserMultiTabApproval(
+            conversationId,
+            command === 'close-others' ? 'close_others' : 'close_right',
+            tab,
+            approvedTabs,
+          );
+        }
+        throwIfBrowserAborted(assistantRun.abortSignal);
+        if (lease.generation !== this.assistantGeneration(conversationId, assistantRun.id)) {
+          throw new Error('The assistant browser turn ended before tabs could be closed.');
+        }
+        if (approvedTabs) {
+          this.assertBrowserMultiTabApproval(
+            conversationId,
+            command === 'close-others' ? 'close_others' : 'close_right',
+            tab,
+            approvedTabs,
+          );
+        }
+        assertCapturedTabsUnchanged();
+        for (const { id, tab: target } of targets) {
+          if (!target || this.tabs.get(id) !== target) {
+            throw new Error('A browser tab changed while the close operation was waiting.');
+          }
+        }
+        // All queue leases remain held through this synchronous commit. Only
+        // after every captured identity has been destroyed may successor work
+        // wake and observe that its tab is closed.
+        for (const { tab: target } of targets) this.closeTab(target!, false);
+        this.emitTabs(conversationId);
+      });
     } finally {
+      for (const controlled of queueTabs) {
+        if (pendingClosures.get(controlled.shell.id) === closureToken) pendingClosures.delete(controlled.shell.id);
+      }
       lease.release();
     }
   }
@@ -3656,7 +6442,7 @@ export class BrowserManager {
     if (this.tabs.get(tabId) !== tab) throw new Error('This browser tab has been closed.');
     if (approvedTabs) {
       const action = command === 'keep-open' ? 'keep_open' : command;
-      if (action !== 'activate' && action !== 'close' && action !== 'keep_open') {
+      if (action !== 'close' && action !== 'keep_open') {
         throw new Error('The approved browser tab command no longer matches this operation.');
       }
       this.assertBrowserTabsTargetApproval(conversationId, action, tab, approvedTabs);
@@ -3665,7 +6451,14 @@ export class BrowserManager {
     const ensureCommandView = () =>
       source === 'assistant' ? this.ensureAssistantView(tab, assistantRun!, documentLease!) : this.ensureView(tab);
     const recreateScriptedViewForUser = async (): Promise<boolean> => {
-      if (source !== 'user' || (!tab.scriptTainted && !tab.privateNetworkNewDocumentGuard)) return false;
+      if (
+        source !== 'user' ||
+        (!tab.scriptTainted &&
+          !tab.privateNetworkNewDocumentGuard &&
+          !tab.assistantNativeUiNewDocumentGuard &&
+          !tab.assistantDialogsDisabledRunId)
+      )
+        return false;
       const trustedNavigationLease = this.beginTrustedUserNavigation(tab, tab.shell.url);
       this.resetScriptedRendererForUser(tab);
       this.emitTabs(conversationId);
@@ -3679,29 +6472,43 @@ export class BrowserManager {
     };
     switch (command) {
       case 'activate':
-        this.cancelElementPickersForConversation(conversationId);
-        {
-          const previousActiveId = this.activeTabs.get(conversationId);
-          if (previousActiveId && previousActiveId !== tabId) {
-            this.invalidateVisibleAssistantOperations(this.tabs.get(previousActiveId));
-            if (source === 'user') {
-              this.invalidatePhysicalAssistantActions(this.tabs.get(previousActiveId));
-            }
-          }
+        if (source === 'assistant') {
+          throw new Error('Assistant browser tabs remain in the background until the user selects one.');
         }
+        this.cancelElementPickersForConversation(conversationId);
         this.activeTabs.set(conversationId, tabId);
-        tab.lastUsedAt = Date.now();
+        // Selecting a temporary AI tab is an explicit user takeover. Retain its
+        // shell at turn cleanup, then let the normal idle policy unload only
+        // the renderer if it is later hidden.
+        this.takeOverTabForUser(tab);
         // Publish the new active shell before a discarded tab begins its
         // potentially slow renderer/load restoration. The sidebar must switch
         // its toolbar state immediately even if that load later pauses on auth.
         this.emitTabs(conversationId);
         this.notifyPanelStateChanged(conversationId);
-        await ensureCommandView();
-        this.attachActiveView(conversationId, true);
+        const takeoverTransition = this.prepareTabForUserPresentation(tab);
+        if (takeoverTransition) {
+          // Do not leave the previously selected page visible under the new
+          // tab chrome while the selected assistant target crosses its native
+          // authority boundary.
+          this.detachAttachedView();
+          await takeoverTransition;
+        }
+        const viewReady = ensureCommandView();
+        if (tab.view && !tab.view.webContents.isDestroyed()) {
+          const presentationTransition = this.prepareTabForUserPresentation(tab);
+          if (presentationTransition) await presentationTransition;
+          this.attachActiveView(conversationId, true);
+          this.notifyPanelStateChanged(conversationId);
+        }
+        await viewReady;
+        const presentationTransition = this.prepareTabForUserPresentation(tab);
+        if (presentationTransition) await presentationTransition;
+        this.attachActiveView(conversationId, source === 'user');
         this.notifyPanelStateChanged(conversationId);
         break;
       case 'close':
-        this.closeTab(tab);
+        this.closeTab(tab, true, true, source === 'user');
         break;
       case 'duplicate':
         if (source === 'assistant' && tab.shell.sensitive) {
@@ -3720,7 +6527,9 @@ export class BrowserManager {
         if (await recreateScriptedViewForUser()) break;
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
-          await this.reloadAssistantTab(tab, contents, false, abortSignal);
+          await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
+            this.reloadAssistantTab(tab, contents, false, abortSignal),
+          );
           break;
         }
         const trustedNavigationLease = this.beginTrustedUserNavigation(tab, contents.getURL());
@@ -3736,7 +6545,9 @@ export class BrowserManager {
         if (await recreateScriptedViewForUser()) break;
         const contents = (await ensureCommandView()).webContents;
         if (source === 'assistant') {
-          await this.reloadAssistantTab(tab, contents, true, abortSignal);
+          await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
+            this.reloadAssistantTab(tab, contents, true, abortSignal),
+          );
           break;
         }
         const trustedNavigationLease = this.beginTrustedUserNavigation(tab, contents.getURL());
@@ -3758,8 +6569,11 @@ export class BrowserManager {
       case 'back': {
         if (await recreateScriptedViewForUser()) break;
         const contents = (await ensureCommandView()).webContents;
-        if (source === 'assistant') await this.navigateAssistantHistory(tab, contents, -1, abortSignal);
-        else if (contents.navigationHistory.canGoBack()) {
+        if (source === 'assistant') {
+          await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
+            this.navigateAssistantHistory(tab, contents, -1, abortSignal),
+          );
+        } else if (contents.navigationHistory.canGoBack()) {
           const target = contents.navigationHistory.getEntryAtIndex(contents.navigationHistory.getActiveIndex() - 1);
           if (!target?.url) throw new Error('The previous browser history entry is unavailable.');
           const trustedNavigationLease = this.beginTrustedUserNavigation(tab, target.url);
@@ -3775,8 +6589,11 @@ export class BrowserManager {
       case 'forward': {
         if (await recreateScriptedViewForUser()) break;
         const contents = (await ensureCommandView()).webContents;
-        if (source === 'assistant') await this.navigateAssistantHistory(tab, contents, 1, abortSignal);
-        else if (contents.navigationHistory.canGoForward()) {
+        if (source === 'assistant') {
+          await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
+            this.navigateAssistantHistory(tab, contents, 1, abortSignal),
+          );
+        } else if (contents.navigationHistory.canGoForward()) {
           const target = contents.navigationHistory.getEntryAtIndex(contents.navigationHistory.getActiveIndex() + 1);
           if (!target?.url) throw new Error('The next browser history entry is unavailable.');
           const trustedNavigationLease = this.beginTrustedUserNavigation(tab, target.url);
@@ -3819,10 +6636,17 @@ export class BrowserManager {
         break;
       }
     }
+    if (source === 'user' && (command === 'close-others' || command === 'close-right')) {
+      // A bulk close can remove the previously active user tab and expose an
+      // assistant-created neighbor. Treat that resulting presentation exactly
+      // like a direct user selection so turn cleanup cannot close what the user
+      // is now looking at.
+      await this.takeOverActiveAssistantPresentation(conversationId);
+    }
     this.emitTabs(conversationId);
   }
 
-  private closeTab(tab: InternalTab, emit = true, recordClosed = true): void {
+  private closeTab(tab: InternalTab, emit = true, recordClosed = true, userSelectedFallback = false): void {
     const { conversationId, id } = tab.shell;
     const previousOrder = this.tabOrder.get(conversationId) ?? [];
     const closedIndex = previousOrder.indexOf(id);
@@ -3845,16 +6669,24 @@ export class BrowserManager {
         ].slice(0, 20),
       );
     }
+    // Closing destroys the target immediately, so no user interaction can race
+    // the best-effort CDP restoration. Keep its rejection observed.
+    void this.releaseAssistantRunDialogGuard(tab).catch(() => undefined);
     this.destroyView(tab);
     this.tabs.delete(id);
+    // Run-local target mappings intentionally outlive the shell as tombstones.
+    // An omitted tabId must fail after close instead of selecting another tab.
     this.releaseScopeRuntimeWhenIdle(tab.scopeKey);
     const nextOrder = previousOrder.filter((candidate) => candidate !== id);
     this.tabOrder.set(conversationId, nextOrder);
     if (this.activeTabs.get(conversationId) === id) {
       const next = nextOrder[Math.min(Math.max(0, closedIndex), nextOrder.length - 1)];
-      if (next) this.activeTabs.set(conversationId, next);
-      else this.activeTabs.delete(conversationId);
-      this.restoreActiveViewAfterClose(conversationId, next);
+      if (next) {
+        this.activeTabs.set(conversationId, next);
+        const fallback = this.tabs.get(next);
+        if (fallback && userSelectedFallback) this.takeOverTabForUser(fallback);
+      } else this.activeTabs.delete(conversationId);
+      this.restoreActiveViewAfterClose(conversationId, next, userSelectedFallback);
     }
     if (emit) this.emitTabs(conversationId);
   }
@@ -3863,7 +6695,11 @@ export class BrowserManager {
    * no longer exists. Recreate that visible page before attaching it; otherwise
    * the native surface stays blank until the user activates the tab a second
    * time. Hidden panels defer restoration to mount(), preserving idle memory. */
-  private restoreActiveViewAfterClose(conversationId: string, tabId: string | undefined): void {
+  private restoreActiveViewAfterClose(
+    conversationId: string,
+    tabId: string | undefined,
+    userSelectedFallback = false,
+  ): void {
     const tab = tabId ? this.tabs.get(tabId) : undefined;
     if (
       !tab ||
@@ -3873,11 +6709,37 @@ export class BrowserManager {
       tab.scriptTainted ||
       tab.shell.reloadRequired
     ) {
-      this.attachActiveView(conversationId);
+      const presentationTransition = tab && userSelectedFallback ? this.prepareTabForUserPresentation(tab) : null;
+      if (presentationTransition) {
+        void presentationTransition.then(
+          () => this.attachActiveView(conversationId),
+          (error: unknown) => {
+            if (tab && this.tabs.get(tab.shell.id) === tab) {
+              tab.shell.error ??= error instanceof Error ? error.message : String(error);
+              tab.shell.discarded = !tab.view || tab.view.webContents.isDestroyed();
+              this.emitTabs(conversationId);
+            }
+            this.attachActiveView(conversationId);
+          },
+        );
+      } else {
+        this.attachActiveView(conversationId);
+      }
       return;
     }
 
-    void this.ensureView(tab)
+    const restore = (async () => {
+      if (userSelectedFallback) {
+        const presentationTransition = this.prepareTabForUserPresentation(tab);
+        if (presentationTransition) await presentationTransition;
+      }
+      await this.ensureView(tab);
+      if (userSelectedFallback) {
+        const presentationTransition = this.prepareTabForUserPresentation(tab);
+        if (presentationTransition) await presentationTransition;
+      }
+    })();
+    void restore
       .then(() => {
         if (this.tabs.get(tabId!) !== tab || this.activeTabs.get(conversationId) !== tabId) return;
         this.attachActiveView(conversationId);
@@ -3978,6 +6840,13 @@ export class BrowserManager {
   ): Promise<void> {
     const tab = this.requireTab(conversationId, tabId);
     if (source === 'assistant' && !assistantRun) throw new Error('Assistant navigation requires turn ownership.');
+    if (source === 'user') {
+      const previewPreemption = this.preemptMenuPreviewForTab(
+        tab,
+        'Browser menu preview was cancelled because the user navigated this tab.',
+      );
+      if (previewPreemption) await previewPreemption;
+    }
     const operation = async (documentLease?: AssistantDocumentLease) => {
       const url = normalizeOmniboxInput(input, this.config().searchProvider);
       const abortSignal = assistantRun?.abortSignal;
@@ -3986,7 +6855,13 @@ export class BrowserManager {
         this.assertAssistantDocumentLease(tab, documentLease);
       }
       throwIfBrowserAborted(abortSignal);
-      if (source === 'user' && (tab.scriptTainted || tab.privateNetworkNewDocumentGuard)) {
+      if (
+        source === 'user' &&
+        (tab.scriptTainted ||
+          tab.privateNetworkNewDocumentGuard ||
+          tab.assistantNativeUiNewDocumentGuard ||
+          tab.assistantDialogsDisabledRunId)
+      ) {
         const trustedNavigationLease = this.beginTrustedUserNavigation(tab, url);
         this.resetScriptedRendererForUser(tab);
         tab.shell.url = url;
@@ -4025,13 +6900,15 @@ export class BrowserManager {
       ).webContents;
       if (source === 'assistant') {
         this.assertAssistantDocumentLease(tab, documentLease!);
-        await this.runRendererOperationWithDeadline(
-          tab,
-          contents,
-          'Browser page load',
-          ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
-          () => contents.loadURL(url).then(() => undefined),
-          abortSignal,
+        await this.withAssistantDownloadAttribution(tab, assistantRun!.id, () =>
+          this.runRendererOperationWithDeadline(
+            tab,
+            contents,
+            'Browser page load',
+            ASSISTANT_PAGE_LOAD_TIMEOUT_MS,
+            () => contents.loadURL(url).then(() => undefined),
+            abortSignal,
+          ),
         );
         return;
       }
@@ -4064,6 +6941,12 @@ export class BrowserManager {
     this.clearTrustedUserNavigation(tab);
     tab.aiControlOwnerId = run.id;
     tab.aiControlGeneration = generation;
+    // A page load or promise that is already blocked on native UI must not make
+    // assistant control depend on mounting the Browser sidebar. Once AI control
+    // begins, fail every outstanding interactive permission/auth challenge for
+    // this tab closed; user browsing can request it again after control ends.
+    this.dismissPendingPermissionsForTab(tab.shell.id);
+    this.dismissPendingAuthForTab(tab.shell.id);
     let documentLease: AssistantDocumentLease = {
       runId: run.id,
       runGeneration: generation,
@@ -4223,7 +7106,7 @@ export class BrowserManager {
     run: BrowserAssistantRun,
     documentLease: AssistantDocumentLease,
   ): Promise<AssistantDocumentLease> {
-    if (this.config().aiAllowPrivateNetwork) return documentLease;
+    if (this.aiAllowPrivateNetwork) return documentLease;
     const currentDocumentValidationAvailable =
       tab.unrestrictedNetworkGeneration === documentLease.tabGeneration &&
       tab.unrestrictedNetworkValidations instanceof Map;
@@ -4436,7 +7319,7 @@ export class BrowserManager {
     url: string,
     partition: string,
     abortSignal?: AbortSignal,
-    allowPrivateNetwork = this.config().aiAllowPrivateNetwork,
+    allowPrivateNetwork = this.aiAllowPrivateNetwork,
   ): Promise<void> {
     const targetSession = session.fromPartition(partition);
     await assertAiNavigationAllowed(url, allowPrivateNetwork, async (hostname) => {
@@ -4475,17 +7358,14 @@ export class BrowserManager {
       // newer chat's native view. The incoming non-null mount owns that switch.
       // React StrictMode also performs setup -> cleanup -> setup before the
       // first animation-frame bounds report. With no native mount yet there is
-      // no visible input authority to revoke; the action remains gated on the
-      // subsequent non-null mount (or times out if the panel stays closed).
+      // no presentation state to tear down; background operations are
+      // independent of the later bounds report.
       if (this.mountedConversationId === null) {
         this.notifyPanelStateChanged(conversationId);
         return;
       }
       if (this.mountedConversationId !== conversationId) return;
       this.invalidatePanelAuthority(conversationId);
-      const activeTab = this.tabs.get(this.activeTabs.get(conversationId) ?? '');
-      this.invalidateVisibleAssistantOperations(activeTab);
-      this.invalidatePhysicalAssistantActions(activeTab);
       this.mountedConversationId = null;
       this.mountedBounds = null;
       this.cancelElementPickersForConversation(conversationId);
@@ -4513,9 +7393,6 @@ export class BrowserManager {
     const previousMountedConversationId = this.mountedConversationId;
     if (previousMountedConversationId && previousMountedConversationId !== conversationId) {
       this.invalidatePanelAuthority(previousMountedConversationId);
-      const previousActiveTab = this.tabs.get(this.activeTabs.get(previousMountedConversationId) ?? '');
-      this.invalidateVisibleAssistantOperations(previousActiveTab);
-      this.invalidatePhysicalAssistantActions(previousActiveTab);
       this.notifyPanelStateChanged(previousMountedConversationId);
     }
     if (
@@ -4543,15 +7420,25 @@ export class BrowserManager {
       this.notifyPanelStateChanged(conversationId);
       return;
     }
-    // An assistant-created tab can begin loading before its open-panel event
-    // reaches React. If mount joins that in-flight load without attaching the
-    // already-created native view, Chromium may never schedule the detached
-    // initial document and both sides wait until the assistant deadline. Attach
-    // whatever ensureView created synchronously, then attach again after any
-    // asynchronous cleanup/restoration finished.
+    // A menu preview is opportunistic and never changes renderer lifecycle.
+    // Preempt its short queue task before ensureView captures the same target;
+    // any uncancellable native image drain remains independently tracked.
+    const previewPreemption = this.preemptMenuPreviewForTab(
+      tab,
+      'Browser menu preview was cancelled because the user opened this tab.',
+    );
+    if (previewPreemption) await previewPreemption;
+    // Attach whatever ensureView created synchronously, then attach again after
+    // any asynchronous cleanup/restoration finished.
     const viewReady = this.ensureView(tab);
+    if (tab.view && !tab.view.webContents.isDestroyed()) {
+      const presentationTransition = this.prepareTabForUserPresentation(tab);
+      if (presentationTransition) await presentationTransition;
+    }
     this.attachActiveView(conversationId);
     await viewReady;
+    const presentationTransition = this.prepareTabForUserPresentation(tab);
+    if (presentationTransition) await presentationTransition;
     this.attachActiveView(conversationId);
     this.notifyPanelStateChanged(conversationId);
   }
@@ -4566,56 +7453,361 @@ export class BrowserManager {
       this.detachAttachedView();
       return;
     }
+    // A background screenshot owns this native view tree entry briefly. User
+    // presentation preempts that temporary ownership synchronously: CDP capture
+    // can finish against the now-visible compositor, while Browser chrome must
+    // never display a blank surface until the screenshot deadline expires.
+    if (this.captureHostedView === tab.view) {
+      const captureLease = this.captureHostedViewLease?.view === tab.view ? this.captureHostedViewLease : null;
+      if (this.attachedView === tab.view) this.attachedView = null;
+      this.releaseBackgroundCaptureHostedView(tab.view);
+      try {
+        win.contentView.addChildView(tab.view);
+        if (captureLease) captureLease.returnedToMain = true;
+      } catch (error) {
+        tab.shell.error = `Browser screenshot presentation recovery failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        this.emitTabs(conversationId);
+        return;
+      }
+    }
+    if (
+      tab.assistantBackgroundInitialLoadPending ||
+      tab.assistantBackgroundViewportContents?.has(tab.view.webContents) ||
+      this.hasPendingBackgroundAutomationArm(tab, tab.view.webContents) ||
+      this.hasDispatchedSyntheticInput(tab, tab.view.webContents)
+    ) {
+      // Authority, background viewport, and input-provenance transitions are
+      // intentionally hidden from real input. Mounting remains recorded and
+      // their cleanup paths retry attachment after the quarantine is removed.
+      this.detachAttachedView();
+      tab.view.setVisible(false);
+      if (!this.hasStableNativeSurfaceLease(tab.view)) {
+        tab.view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      }
+      return;
+    }
+    if (this.hasInputCoordinateSurfaceLease(tab.view)) {
+      const currentBounds = tab.view.getBounds();
+      const requestedBounds = this.mountedBounds;
+      if (
+        currentBounds.x !== requestedBounds.x ||
+        currentBounds.y !== requestedBounds.y ||
+        currentBounds.width !== requestedBounds.width ||
+        currentBounds.height !== requestedBounds.height
+      ) {
+        // Keep the exact input surface alive but hidden until dispatch finishes.
+        // The lease release remounts it at the latest sidebar bounds.
+        if (this.attachedView === tab.view) this.attachedView = null;
+        tab.view.setVisible(false);
+        return;
+      }
+    }
     const viewChanged = this.attachedView !== tab.view;
     if (viewChanged) {
       this.detachAttachedView();
-      win.contentView.addChildView(tab.view);
+      // createView hosts every live view exactly once. Attaching only changes
+      // presentation; re-adding an existing child can reorder or duplicate it
+      // in Electron's native view tree.
       this.attachedView = tab.view;
     }
     tab.view.setBounds(this.mountedBounds);
+    tab.view.setVisible(true);
     if (shouldFocusAttachedBrowserView(focusRequested)) tab.view.webContents.focus();
   }
 
   private detachAttachedView(): void {
     if (!this.attachedView) return;
-    const win = this.getWindow();
     try {
-      if (win && !win.isDestroyed()) win.contentView.removeChildView(this.attachedView);
+      // Keep the renderer hosted but hidden so background loading, automation,
+      // and capture continue without painting over React Browser chrome.
+      this.attachedView.setVisible(false);
+      if (!this.hasStableNativeSurfaceLease(this.attachedView)) {
+        this.attachedView.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      }
     } catch {
-      // Already detached during window teardown.
+      // The native view may already be tearing down with its window.
     }
     this.attachedView = null;
+  }
+
+  /** Release native ownership synchronously even when the screenshot Promise
+   * that moved this view never settles. Renderer deadlines reclaim the exact
+   * target without awaiting native/CDP work, so `destroyView()` must be able to
+   * clear this global slot independently from the operation's `finally`. */
+  private releaseBackgroundCaptureHostedView(view: WebContentsView): void {
+    if (this.captureHostedView !== view) return;
+    const lease = this.captureHostedViewLease?.view === view ? this.captureHostedViewLease : null;
+    // Publish availability before invoking Electron. A native removal failure
+    // must not permanently block unrelated hidden screenshots.
+    this.captureHostedView = null;
+    this.captureHostedViewLease = null;
+    try {
+      view.setVisible(false);
+    } catch {
+      // The renderer/native view may already be tearing down.
+    }
+    const captureHost = lease?.host ?? this.backgroundCaptureHost;
+    if (!captureHost || captureHost.isDestroyed()) return;
+    try {
+      captureHost.contentView.removeChildView(view);
+    } catch {
+      // Best effort after target loss or BaseWindow teardown.
+    }
+  }
+
+  private async withBackgroundCaptureHost<T>(
+    tab: InternalTab,
+    contents: WebContents,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const view = tab.view;
+    if (!view || view.webContents !== contents || contents.isDestroyed()) {
+      throw new Error('The browser page changed before its background screenshot could start.');
+    }
+    if (this.captureHostedView) {
+      throw new Error('Another background browser screenshot is already rendering.');
+    }
+    const mainWindow = this.requireLiveWindow();
+    const bounds = view.getBounds();
+    const captureBounds = {
+      x: 0,
+      y: 0,
+      width: Math.max(1, Math.round(bounds.width || DEFAULT_DETACHED_VIEW_BOUNDS.width)),
+      height: Math.max(1, Math.round(bounds.height || DEFAULT_DETACHED_VIEW_BOUNDS.height)),
+    };
+    let displayScaleFactor = 1;
+    try {
+      // BaseWindow and WebContentsView bounds are device-independent pixels,
+      // while Chromium allocates the hidden compositor surface in physical
+      // pixels. Use the largest attached-display scale before creating or
+      // resizing the host so a high-DPI/spanned target cannot exceed the same
+      // native allocation ceiling enforced for visible capturePage().
+      displayScaleFactor = Math.max(
+        1,
+        ...screen
+          .getAllDisplays()
+          .map((display) => display.scaleFactor)
+          .filter((scaleFactor) => Number.isFinite(scaleFactor) && scaleFactor > 0),
+      );
+    } catch {
+      // Production screenshot work runs after Electron's screen module is
+      // initialized. Unit-test and late-shutdown shims may not expose it; the
+      // capture itself retains its independent geometry/image validation.
+    }
+    validateScreenshotSize(captureBounds.width * displayScaleFactor, captureBounds.height * displayScaleFactor);
+    let captureHost = this.backgroundCaptureHost;
+    if (!captureHost || captureHost.isDestroyed()) {
+      captureHost = new BaseWindow({
+        show: false,
+        width: captureBounds.width,
+        height: captureBounds.height,
+        frame: false,
+        focusable: false,
+        skipTaskbar: true,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        backgroundColor: '#ffffff',
+      });
+      this.backgroundCaptureHost = captureHost;
+    } else {
+      captureHost.setContentSize(captureBounds.width, captureBounds.height);
+    }
+    const captureLease: BrowserBackgroundCaptureLease = {
+      view,
+      host: captureHost,
+      returnedToMain: false,
+    };
+    this.backgroundCaptureHost = captureHost;
+    this.captureHostedView = view;
+    this.captureHostedViewLease = captureLease;
+    if (this.attachedView === view) this.attachedView = null;
+    let removedFromMainHost = false;
+    try {
+      view.setVisible(false);
+      mainWindow.contentView.removeChildView(view);
+      removedFromMainHost = true;
+      captureHost.contentView.addChildView(view);
+      view.setBounds(captureBounds);
+      view.setVisible(true);
+      return await operation();
+    } finally {
+      // Publish the global capture slot on every failure path, including a
+      // successful main-host removal followed by a throwing capture-host add.
+      this.releaseBackgroundCaptureHostedView(view);
+      try {
+        const currentWindow = this.getWindow();
+        if (
+          this.tabs.get(tab.shell.id) === tab &&
+          tab.view === view &&
+          !contents.isDestroyed() &&
+          currentWindow &&
+          currentWindow !== this.closingHostWindow &&
+          !currentWindow.isDestroyed()
+        ) {
+          try {
+            if (!captureLease.returnedToMain) {
+              // Re-add only after the matching removal succeeded. If removal
+              // itself threw, Electron still owns the original main-tree child
+              // and adding it again can reorder or duplicate the native view.
+              if (removedFromMainHost && (currentWindow === mainWindow || this.detachedHostViews?.has(view))) {
+                currentWindow.contentView.addChildView(view);
+                this.detachedHostViews?.delete(view);
+              }
+              view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+              view.setVisible(false);
+            }
+          } finally {
+            this.attachActiveView(tab.shell.conversationId);
+          }
+        }
+      } finally {
+        // No global returned-to-main flag is reset here: a late finalizer owns
+        // only captureLease and cannot alter a successor capture.
+      }
+    }
+  }
+
+  /** BaseWindow participates in Electron's application-window count. Tear the
+   * hidden capture host down synchronously from the primary window's `close`
+   * event so `window-all-closed` remains reachable on Windows and Linux. */
+  handleHostWindowWillClose(): void {
+    const closingWindow = this.getWindow();
+    if (closingWindow && !closingWindow.isDestroyed()) this.closingHostWindow = closingWindow;
+    const mountedConversationId = this.mountedConversationId;
+    if (mountedConversationId) {
+      this.invalidatePanelAuthority(mountedConversationId);
+      this.invalidatePanelLayout(mountedConversationId);
+      this.cancelElementPickersForConversation(mountedConversationId);
+    }
+    this.mountedConversationId = null;
+    this.mountedBounds = null;
+    this.chromeFocusConversationId = null;
+    this.hostWindowShown = false;
+    this.hostWindowInteractive = false;
+    this.attachedView = null;
+    const view = this.captureHostedView;
+    const host = this.backgroundCaptureHost;
+    this.captureHostedView = null;
+    this.captureHostedViewLease = null;
+    this.backgroundCaptureHost = null;
+    if (view) {
+      try {
+        view.setVisible(false);
+      } catch {
+        // The view may already be tearing down with the primary window.
+      }
+      try {
+        if (host && !host.isDestroyed()) host.contentView.removeChildView(view);
+      } catch {
+        // Best effort during native window teardown.
+      }
+    }
+    if (host && !host.isDestroyed()) host.destroy();
+    const detached = (this.detachedHostViews ??= new Set<WebContentsView>());
+    for (const tab of this.tabs.values()) {
+      const retainedView = tab.view;
+      if (!retainedView || retainedView.webContents.isDestroyed()) continue;
+      try {
+        retainedView.setVisible(false);
+        if (!this.hasStableNativeSurfaceLease(retainedView)) retainedView.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      } catch {
+        // Native teardown can race the close event; ownership is still recorded
+        // so the replacement window can either rehost or discard it safely.
+      }
+      if (closingWindow && !closingWindow.isDestroyed()) {
+        try {
+          closingWindow.contentView.removeChildView(retainedView);
+        } catch {
+          // A capture-hosted view was already removed above.
+        }
+      }
+      detached.add(retainedView);
+    }
+    if (mountedConversationId) this.notifyPanelStateChanged(mountedConversationId);
+  }
+
+  /** Reparent retained renderers into a replacement primary BrowserWindow. This
+   * is presentation/lifecycle repair only: it never mounts, selects, focuses,
+   * reveals, or creates a tab, so headless assistant work remains independent
+   * from the React sidebar. */
+  handleHostWindowCreated(): void {
+    if (this.disposed || this.shuttingDown) return;
+    const win = this.getWindow();
+    if (!win || win.isDestroyed() || win.webContents?.isDestroyed?.()) return;
+    if (this.closingHostWindow === win) return;
+    this.closingHostWindow = null;
+    const detached = (this.detachedHostViews ??= new Set<WebContentsView>());
+    for (const retainedView of [...detached]) {
+      const tab = [...this.tabs.values()].find((candidate) => candidate.view === retainedView);
+      if (!tab || retainedView.webContents.isDestroyed()) {
+        detached.delete(retainedView);
+        continue;
+      }
+      try {
+        retainedView.setVisible(false);
+        if (!this.hasStableNativeSurfaceLease(retainedView)) retainedView.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+        win.contentView.addChildView(retainedView);
+        detached.delete(retainedView);
+      } catch (error) {
+        tab.shell.error = `Browser renderer rehosting failed: ${error instanceof Error ? error.message : String(error)}`;
+        this.emitTabs(tab.shell.conversationId);
+      }
+    }
   }
 
   private async ensureView(
     tab: InternalTab,
     abortSignal?: AbortSignal,
     timeoutMs = abortSignal ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
+    backgroundInitialLoad = false,
+    preserveExistingLoadingViewOnTimeout = false,
   ): Promise<WebContentsView> {
+    const deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+    const remainingRendererTimeout = (operation: string): number => {
+      if (deadlineAt === null) return 0;
+      const remaining = Math.ceil(deadlineAt - Date.now());
+      if (remaining <= 0) throw new BrowserRendererDeadlineError(operation, timeoutMs);
+      return remaining;
+    };
     this.assertHostRendererOperationCurrent();
     if (this.disposed) throw new Error('The in-app browser has been disposed.');
     if (!this.config().enabled) throw new Error('The in-app browser is disabled in Settings.');
     this.requireLiveWindow();
     this.assertScopeAvailable(tab.scopeKey);
     if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
+    throwIfBrowserAborted(abortSignal);
     const origin = normalizedOrigin(tab.shell.url);
     const originClearOwner = this.clearingOrigins.get(`${tab.scopeKey}\u0000${origin}`);
     if (originClearOwner && originClearOwner !== tab.shell.id) {
       throw new Error('This Browser origin is being prepared for assistant control.');
     }
     if (tab.view && !tab.view.webContents.isDestroyed()) {
+      const previewRecovery = this.preemptMenuPreviewForTab(tab, 'Browser menu preview was preempted by Browser work.');
+      if (previewRecovery) {
+        await previewRecovery;
+        throwIfBrowserAborted(abortSignal);
+        if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
+      }
+    }
+    if (tab.view && !tab.view.webContents.isDestroyed()) {
       if (!tab.viewLoadPromise) return tab.view;
       // A user may have started this restoration without a deadline. An
-      // assistant joining that shared load still needs its own abort/deadline;
-      // cancellation reclaims the renderer so the original load and its queue
-      // cannot retain the finished run indefinitely.
+      // assistant joining that shared load still needs its own abort/deadline.
+      // Most operations reclaim a wedged target; bounded network observation
+      // can instead leave an already-guarded user renderer loading and return a
+      // content-free timeout result.
       return await this.runRendererOperationWithDeadline(
         tab,
         tab.view.webContents,
         'Browser page load',
-        timeoutMs,
+        remainingRendererTimeout('Browser page load'),
         () => tab.viewLoadPromise!,
         abortSignal,
+        undefined,
+        !preserveExistingLoadingViewOnTimeout,
       );
     }
     throwIfBrowserAborted(abortSignal);
@@ -4626,7 +7818,35 @@ export class BrowserManager {
       this.assertScopeAvailable(tab.scopeKey);
       if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
     }
-    const view = this.createView(tab);
+    if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
+    // A hidden renderer bootstrap navigates through about:blank and therefore
+    // updates shell metadata before the requested navigation begins. Preserve
+    // the caller's target independently of those intermediate events.
+    const requestedInitialUrl = tab.shell.url || 'about:blank';
+    if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = true;
+    let view: WebContentsView;
+    try {
+      view = this.createView(tab);
+    } catch (error) {
+      if (backgroundInitialLoad) tab.assistantBackgroundInitialLoadPending = false;
+      throw error;
+    }
+    if (this.validatingProxy) {
+      const scopedSession = session.fromPartition(tab.partition);
+      try {
+        await this.validatingProxy.configureSession(scopedSession);
+      } catch (error) {
+        if (this.tabs.get(tab.shell.id) === tab && tab.view === view) {
+          this.destroyView(tab);
+          tab.shell.discarded = true;
+        }
+        throw new Error('The Browser connection-validation proxy could not start.', { cause: error });
+      }
+      throwIfBrowserAborted(abortSignal);
+      this.assertScopeAvailable(tab.scopeKey);
+      if (this.tabs.get(tab.shell.id) !== tab) throw new Error('This browser tab has been closed.');
+      if (deadlineAt !== null) remainingRendererTimeout('Browser page load');
+    }
     // createView installs the native surface synchronously. Attach an active
     // restored tab before waiting for a slow or auth-blocked load so the user
     // can see and stop it instead of staring at an empty Browser viewport.
@@ -4636,30 +7856,101 @@ export class BrowserManager {
     let initialGuardReady = !guardInitialLoad;
     const loadPromise = (async () => {
       try {
-        await this.runRendererOperationWithDeadline(
-          tab,
-          view.webContents,
-          'Browser page load',
-          timeoutMs,
-          async () => {
-            if (guardInitialLoad) {
-              await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents);
-              initialGuardReady = true;
+        try {
+          const initialUrl = typeof view.webContents.getURL === 'function' ? view.webContents.getURL() : undefined;
+          const activeDialogGuard =
+            tab.aiControlOwnerId && tab.assistantDialogGuard?.runId === tab.aiControlOwnerId
+              ? tab.assistantDialogGuard
+              : undefined;
+          if ((backgroundInitialLoad || activeDialogGuard) && initialUrl === '') {
+            // Electron 41 can crash if a debugger domain is enabled before a
+            // new WebContents owns its first renderer target. Bootstrap an
+            // inert, preload-restricted blank document before installing either
+            // hidden metrics or assistant dialog handling.
+            await this.runRendererOperationWithDeadline(
+              tab,
+              view.webContents,
+              'Browser background renderer bootstrap',
+              remainingRendererTimeout('Browser background renderer bootstrap'),
+              () => view.webContents.loadURL('about:blank'),
+              abortSignal,
+            );
+          }
+          const dialogGuard = activeDialogGuard;
+          if (dialogGuard) {
+            await this.protectAssistantDialogs(tab, view.webContents, dialogGuard);
+          }
+          if (backgroundInitialLoad) {
+            // The user may take over this tab while the inert bootstrap load is
+            // awaiting Chromium. Recheck the takeover marker immediately
+            // before installing hidden metrics so a late 1280x800 override can
+            // never replace the user's mounted sidebar viewport.
+            if (tab.assistantBackgroundInitialLoadPending) {
+              await this.enableAssistantBackgroundViewport(
+                tab,
+                view.webContents,
+                abortSignal,
+                undefined,
+                remainingRendererTimeout('Browser background viewport setup'),
+              );
             }
-            await view.webContents.loadURL(tab.shell.url || 'about:blank');
-          },
-          abortSignal,
-        );
-      } catch (error) {
-        // A preload-restricted renderer is safe but unusable if main could not
-        // verify its membrane and register the same guard for every future
-        // document. Reclaim it before exposing the failed shell so a retry
-        // starts from a known clean target.
-        if (!initialGuardReady && this.tabs.get(tab.shell.id) === tab && tab.view === view) {
-          this.destroyView(tab);
-          tab.shell.discarded = true;
+          }
+          await this.runRendererOperationWithDeadline(
+            tab,
+            view.webContents,
+            'Browser page load',
+            remainingRendererTimeout('Browser page load'),
+            async () => {
+              const initialUrl = typeof view.webContents.getURL === 'function' ? view.webContents.getURL() : undefined;
+              const guardAfterInitialLoad = guardInitialLoad && initialUrl === '';
+              if (guardInitialLoad && !guardAfterInitialLoad) {
+                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents, abortSignal);
+                initialGuardReady = true;
+              }
+              // A new restricted WebContents already owns an initial blank
+              // target, but Chromium does not expose its execution context or
+              // accept Page.addScriptToEvaluateOnNewDocument until the first
+              // navigation starts. The hardened frame preload is already
+              // configured with the blocking flag, so that first document is
+              // protected before page script; register and verify the durable
+              // CDP guard immediately after it becomes live.
+              const initialBlankReady =
+                guardInitialLoad && requestedInitialUrl === 'about:blank' && initialUrl === 'about:blank';
+              if (!initialBlankReady) {
+                await view.webContents.loadURL(requestedInitialUrl);
+              }
+              if (guardAfterInitialLoad) {
+                await this.installPrivateNetworkNewDocumentGuard(tab, view.webContents, abortSignal);
+                initialGuardReady = true;
+              }
+            },
+            abortSignal,
+          );
+        } catch (error) {
+          // A preload-restricted renderer is safe but unusable if main could not
+          // verify its membrane and register the same guard for every future
+          // document. Reclaim it before exposing the failed shell so a retry
+          // starts from a known clean target.
+          if (!initialGuardReady && this.tabs.get(tab.shell.id) === tab && tab.view === view) {
+            this.destroyView(tab);
+            tab.shell.discarded = true;
+          }
+          throw error;
         }
-        throw error;
+      } finally {
+        if (backgroundInitialLoad) {
+          await this.restoreAssistantBackgroundViewport(
+            tab,
+            view.webContents,
+            // Cleanup is a separate bounded renderer transition. Do not inherit
+            // a nearly exhausted page-load budget: a 1 ms clear-metrics timeout
+            // would leave the successful page permanently quarantined from a
+            // later user mount even though background loading itself completed.
+            BACKGROUND_VIEWPORT_TIMEOUT_MS,
+          );
+          tab.assistantBackgroundInitialLoadPending = false;
+          if (this.tabs.get(tab.shell.id) === tab) this.attachActiveView(tab.shell.conversationId);
+        }
       }
       if (this.tabs.get(tab.shell.id) !== tab || tab.view !== view || view.webContents.isDestroyed()) {
         throw new Error('The browser page was closed while it was loading.');
@@ -4676,7 +7967,7 @@ export class BrowserManager {
   }
 
   private createView(tab: InternalTab, inheritedOptions?: Electron.BrowserWindowConstructorOptions): WebContentsView {
-    this.requireLiveWindow();
+    const win = this.requireLiveWindow();
     this.assertScopeAvailable(tab.scopeKey);
     const ses = session.fromPartition(tab.partition);
     configureBrowserSession(ses);
@@ -4687,6 +7978,7 @@ export class BrowserManager {
     const viewOptions = inheritedOptions ?? {};
     const webPreferences = { ...(viewOptions.webPreferences ?? {}) } as Record<string, unknown>;
     hardenRemoteWebPreferences(webPreferences);
+    if (tab.assistantPopupDialogsDisabled || tab.assistantDialogsDisabledRunId) webPreferences.disableDialogs = true;
     // The opener already uses this profile, but explicitly pin the popup to the
     // tab's partition and Kai's sandboxed page preload instead of trusting any
     // window-feature preferences supplied by remote content.
@@ -4695,34 +7987,88 @@ export class BrowserManager {
     // frames without granting those pages Node integration.
     const activatePrivateNetworkGuard =
       tab.aiNetworkRestricted && !tab.trustedUserNavigation && this.aiAllowPrivateNetwork === false;
-    Object.assign(webPreferences, browserWebPreferences(tab.partition, undefined, activatePrivateNetworkGuard));
+    // Historical creator ownership may survive after a kept assistant tab has
+    // crossed its run boundary. Only live control authority may activate this
+    // irreversible renderer guard; ensureAssistantView installs it before every
+    // assistant operation even when a retained shell is restored later.
+    const activateNativeUiGuard = !!tab.aiControlOwnerId;
+    const nativeUiGuardToken = randomUUID();
+    tab.nativeUiGuardToken = nativeUiGuardToken;
+    Object.assign(
+      webPreferences,
+      browserWebPreferences(
+        tab.partition,
+        undefined,
+        activatePrivateNetworkGuard,
+        activateNativeUiGuard,
+        nativeUiGuardToken,
+      ),
+    );
     viewOptions.webPreferences = webPreferences as Electron.WebPreferences;
     const view = new WebContentsView(viewOptions);
-    configureBrowserWebContents(view.webContents, !activatePrivateNetworkGuard);
-    view.setBounds(
-      this.mountedConversationId === tab.shell.conversationId && this.mountedBounds
-        ? this.mountedBounds
-        : DEFAULT_DETACHED_VIEW_BOUNDS,
-    );
-    tab.view = view;
-    if (activatePrivateNetworkGuard) {
-      // WebPreferences requested an already-restricted preload. This marker is
-      // deliberately only "pending": installPrivateNetworkNewDocumentGuard()
-      // must verify every live frame's main-world membrane before assistant
-      // control can treat the renderer as guarded.
-      tab.privateNetworkNewDocumentGuard = {
-        contentsId: view.webContents.id,
-        identifier: PRELOAD_PRIVATE_NETWORK_GUARD_PENDING_IDENTIFIER,
-      };
+    let hosted = false;
+    try {
+      configureBrowserWebContents(view.webContents, !activatePrivateNetworkGuard);
+      view.setBounds(DEFAULT_DETACHED_VIEW_BOUNDS);
+      view.setVisible(false);
+      // A WebContentsView that is not in a native view tree may not schedule its
+      // first navigation or paint consistently. Host every live tab as a hidden
+      // child, then make only the active mounted tab visible.
+      win.contentView.addChildView(view);
+      hosted = true;
+      this.detachedHostViews?.delete(view);
+      tab.view = view;
+      this.enableAssistantBackgroundRendering(tab, view.webContents);
+      this.webContentsToTab.set(view.webContents.id, tab.shell.id);
+      this.wireWebContents(tab, view.webContents);
+      view.webContents.setUserAgent(getChromeUserAgent());
+      view.webContents.setZoomLevel(tab.shell.zoomLevel);
+      view.webContents.setAudioMuted(tab.shell.muted);
+      if (activatePrivateNetworkGuard) {
+        // WebPreferences requested an already-restricted preload. This marker
+        // remains pending until the current-frame membrane is verified.
+        tab.privateNetworkNewDocumentGuard = {
+          contentsId: view.webContents.id,
+          identifier: PRELOAD_PRIVATE_NETWORK_GUARD_PENDING_IDENTIFIER,
+        };
+      }
+      if (activateNativeUiGuard) {
+        // The frame preload blocks printing synchronously before the first page
+        // script. This pending marker is replaced after CDP registers the same
+        // guard for every future document and verifies each live frame.
+        tab.assistantNativeUiNewDocumentGuard = {
+          contentsId: view.webContents.id,
+          identifier: PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER,
+        };
+      }
+      tab.shell.discarded = false;
+      tab.lastUsedAt = Date.now();
+      return view;
+    } catch (error) {
+      this.restoreAssistantBackgroundRendering(tab, view.webContents);
+      this.webContentsToTab.delete(view.webContents.id);
+      if (tab.view === view) tab.view = null;
+      if (tab.privateNetworkNewDocumentGuard?.contentsId === view.webContents.id) {
+        tab.privateNetworkNewDocumentGuard = undefined;
+      }
+      if (tab.assistantNativeUiNewDocumentGuard?.contentsId === view.webContents.id) {
+        tab.assistantNativeUiNewDocumentGuard = undefined;
+      }
+      if (tab.nativeUiGuardToken === nativeUiGuardToken) tab.nativeUiGuardToken = undefined;
+      if (hosted) {
+        try {
+          if (!win.isDestroyed()) win.contentView.removeChildView(view);
+        } catch {
+          // Best-effort rollback of a partially initialized native child.
+        }
+      }
+      try {
+        if (!view.webContents.isDestroyed()) view.webContents.close({ waitForBeforeUnload: false });
+      } catch {
+        // Preserve the initialization failure after best-effort renderer cleanup.
+      }
+      throw error;
     }
-    tab.shell.discarded = false;
-    tab.lastUsedAt = Date.now();
-    this.webContentsToTab.set(view.webContents.id, tab.shell.id);
-    this.wireWebContents(tab, view.webContents);
-    view.webContents.setUserAgent(getChromeUserAgent());
-    view.webContents.setZoomLevel(tab.shell.zoomLevel);
-    view.webContents.setAudioMuted(tab.shell.muted);
-    return view;
   }
 
   private createPopupTab(
@@ -4746,11 +8092,27 @@ export class BrowserManager {
       : null;
     const candidatePopupGesture =
       opener.popupGesture?.expiresAt && opener.popupGesture.expiresAt >= Date.now() ? opener.popupGesture : null;
-    const popupGesture =
+    const candidateAssistantGesture =
+      opener.assistantGesture?.expiresAt && opener.assistantGesture.expiresAt >= Date.now()
+        ? opener.assistantGesture
+        : null;
+    const overlappingAssistantGesture =
+      candidateAssistantGesture?.assistantOwnerId === activeControlOwnerId &&
+      (initiatorFrameTreeNodeId === null ||
+        candidateAssistantGesture.frameTreeNodeId === undefined ||
+        candidateAssistantGesture.frameTreeNodeId === initiatorFrameTreeNodeId)
+        ? ({ source: 'assistant' as const, ...candidateAssistantGesture } satisfies InternalTab['popupGesture'])
+        : null;
+    const lastMatchingGesture =
       candidatePopupGesture?.source !== 'user' ||
       (initiatorFrameTreeNodeId !== null && candidatePopupGesture.frameTreeNodeId === initiatorFrameTreeNodeId)
         ? candidatePopupGesture
         : null;
+    // If an exact (or conservatively ambiguous) assistant activation overlaps a
+    // later real-user gesture, assistant ownership wins. A single mutable
+    // last-gesture record would otherwise let delayed AI window.open work mint
+    // a foreground, user-retained popup.
+    const popupGesture = overlappingAssistantGesture ?? lastMatchingGesture;
     if (
       opener.aiNetworkRestricted &&
       (!activeControlOwnerId || opener.aiControlGeneration !== assistantGeneration) &&
@@ -4761,6 +8123,7 @@ export class BrowserManager {
     // Chromium grants transient activation to one popup. Consume the matching
     // provenance too so a later timer-driven window.open cannot inherit it.
     opener.popupGesture = null;
+    opener.assistantGesture = null;
     // Arbitrary evaluated code can open about:blank synchronously or from a
     // retained timer. A new popup target would not inherit the opener's
     // target-scoped document-start WebRTC guard before script can run, so deny
@@ -4793,8 +8156,7 @@ export class BrowserManager {
     const popupUrl = url || 'about:blank';
     if (
       popupAiNetworkRestricted &&
-      (!/^https?:|^about:blank$/i.test(popupUrl) ||
-        (!this.config().aiAllowPrivateNetwork && isPrivateNetworkUrl(popupUrl)))
+      (!/^https?:|^about:blank$/i.test(popupUrl) || (!this.aiAllowPrivateNetwork && isPrivateNetworkUrl(popupUrl)))
     ) {
       return null;
     }
@@ -4822,6 +8184,12 @@ export class BrowserManager {
       security: securityForUrl(popupUrl),
       sensitive: false,
     };
+    let resolveAssistantPopupBootstrap: (() => void) | undefined;
+    const assistantPopupBootstrapDrain = assistantOwnerId
+      ? new Promise<void>((resolve) => {
+          resolveAssistantPopupBootstrap = resolve;
+        })
+      : undefined;
     const tab: InternalTab = {
       shell,
       view: null,
@@ -4834,17 +8202,20 @@ export class BrowserManager {
       aiNetworkRestricted: popupAiNetworkRestricted,
       aiControlOwnerId: popupAiNetworkRestricted ? activeControlOwnerId : null,
       aiControlGeneration: popupAiNetworkRestricted ? assistantGeneration : null,
-      aiActionDepth: 0,
+      aiActionDepth: assistantOwnerId ? 1 : 0,
       aiActionUntil: 0,
       aiNetworkReleaseRequested: false,
       aiNetworkReleaseTimer: null,
       assistantScriptDepth: 0,
       popupGesture: null,
+      assistantGesture: null,
       scriptTainted: scriptCreatedPopup,
       trustedUserNavigation: false,
       trustedUserNavigationTarget: null,
       trustedUserNavigationRequestId: null,
       trustedUserNavigationLease: 0,
+      trustedUserNavigationTimer: null,
+      userSelectionGeneration: 0,
       trustedGestureGeneration: 0,
       visibleAssistantGeneration: 0,
       unrestrictedNetworkGeneration: 0,
@@ -4853,25 +8224,61 @@ export class BrowserManager {
       queue: new BrowserActionQueue(),
       overlayGeneration: 0,
       overlayTimer: null,
-      overlayCssKey: null,
-      overlayCssText: null,
+      automationOverlay: null,
+      networkRedactionKey: createBrowserNetworkRedactionKey(),
+      assistantPopupBootstrapPending: assistantOwnerId !== null,
+      assistantPopupBootstrapDrain,
+      resolveAssistantPopupBootstrap,
+      assistantPopupDialogsDisabled: assistantOwnerId !== null,
+      assistantDialogsDisabledRunId: assistantOwnerId,
       isPopup: true,
     };
     this.tabs.set(id, tab);
     this.tabOrder.set(conversationId, [...order, id]);
-    const background = disposition === 'background-tab';
+    if (assistantOwnerId) this.rememberAssistantTarget(conversationId, assistantOwnerId, tab);
+    // Popup disposition is presentation state, not an automation capability.
+    // Chromium may label a trusted synthetic click's popup as foreground-tab,
+    // but assistant-attributed targets must remain fully operable offscreen and
+    // must never replace the tab the user chose to present.
+    const background = assistantOwnerId !== null || disposition === 'background-tab';
     if (!background) {
-      const previousActiveId = this.activeTabs.get(conversationId);
-      if (previousActiveId && previousActiveId !== id) {
-        this.invalidateVisibleAssistantOperations(this.tabs.get(previousActiveId));
-      }
       this.activeTabs.set(conversationId, id);
     }
     this.emitTabs(conversationId);
-    if (shell.owner === 'assistant') this.emit({ type: 'open-panel', conversationId, tabId: id });
     return (options) => {
       try {
+        if (assistantOwnerId) {
+          // This preference is applied before WebContents construction, closing
+          // the interval in which popup script could open native UI before the
+          // asynchronous CDP dialog/file-chooser interceptor becomes ready.
+          options.webPreferences = { ...(options.webPreferences ?? {}), disableDialogs: true };
+        }
         const view = this.createView(tab, options);
+        if (assistantOwnerId) {
+          const dialogGuard = this.ensureAssistantRunDialogGuard(tab, assistantOwnerId);
+          tab.assistantDownloadAttribution = {
+            assistantOwnerId,
+            trustedGestureGeneration: tab.trustedGestureGeneration,
+          };
+          void this.protectAssistantDialogs(tab, view.webContents, dialogGuard).catch((error: unknown) => {
+            if (
+              this.tabs.get(tab.shell.id) !== tab ||
+              tab.view?.webContents !== view.webContents ||
+              tab.assistantDialogGuard !== dialogGuard ||
+              !tab.assistantRunDialogGuardLease ||
+              !dialogGuard.owners.has(tab.assistantRunDialogGuardLease)
+            )
+              return;
+            this.failAssistantDialogGuard(tab, dialogGuard, error instanceof Error ? error : new Error(String(error)));
+            if (!view.webContents.isDestroyed()) {
+              tab.generation++;
+              this.destroyView(tab);
+              tab.shell.discarded = true;
+              tab.shell.sensitive = false;
+              this.emitTabs(tab.shell.conversationId);
+            }
+          });
+        }
         // attachActiveView also checks the quarantine, but avoiding this call
         // keeps an evaluation-created popup from flashing privileged pixels.
         if (!background && !scriptCreatedPopup) this.attachActiveView(conversationId);
@@ -4891,11 +8298,23 @@ export class BrowserManager {
 
   private destroyView(tab: InternalTab): void {
     const view = tab.view;
+    if (view) {
+      this.rejectMenuPreviewForContents(
+        view.webContents.id,
+        new Error('Browser menu preview was cancelled because the page closed.'),
+      );
+      this.clearContextMenuDownloadAuthority(view.webContents.id);
+    }
     // Page.addScriptToEvaluateOnNewDocument registrations are target-scoped and
     // disappear with the WebContents. Clear the bookkeeping before close so a
     // later clean renderer never inherits the quarantined target identity.
     tab.privateNetworkNewDocumentGuard = undefined;
+    tab.assistantNativeUiNewDocumentGuard = undefined;
+    tab.nativeUiGuardToken = undefined;
     tab.viewLoadPromise = null;
+    tab.assistantBackgroundInitialLoadPending = false;
+    if (view) this.finishAssistantPopupBootstrap(tab, view.webContents);
+    if (view) this.unprotectAssistantDialogs(tab, view.webContents);
     this.cancelFaviconFetch(tab.shell.id);
     if (tab.overlayTimer) {
       clearTimeout(tab.overlayTimer);
@@ -4908,16 +8327,53 @@ export class BrowserManager {
     tab.aiNetworkReleaseRequested = false;
     this.resetUnrestrictedDocumentNetworkState(tab);
     tab.overlayGeneration++;
-    tab.overlayCssKey = null;
-    tab.overlayCssText = null;
+    tab.automationOverlay?.releaseDebugger();
+    tab.automationOverlay = null;
     this.dropPendingForTab(tab.shell.id);
     tab.popupGesture = null;
-    if (view) this.pendingSyntheticInputs.delete(view.webContents.id);
+    tab.assistantGesture = null;
+    if (view) this.restoreAssistantBackgroundRendering(tab, view.webContents);
+    if (view) {
+      tab.assistantBackgroundViewportContents?.delete(view.webContents);
+      if (tab.assistantBackgroundViewportContents?.size === 0) {
+        tab.assistantBackgroundViewportContents = undefined;
+      }
+      tab.assistantBackgroundViewportSetups?.delete(view.webContents);
+      if (tab.assistantBackgroundViewportSetups?.size === 0) {
+        tab.assistantBackgroundViewportSetups = undefined;
+      }
+      tab.assistantBackgroundViewportRestores?.delete(view.webContents);
+      if (tab.assistantBackgroundViewportRestores?.size === 0) {
+        tab.assistantBackgroundViewportRestores = undefined;
+      }
+    }
+    this.resetBrowserNetworkDiagnostics(tab);
+    if (view) {
+      this.pendingSyntheticInputs.delete(view.webContents.id);
+      this.clearDispatchedSyntheticInput(view.webContents.id);
+    }
+    for (const pending of this.pendingAutomationArmAcknowledgements.values()) {
+      if (pending.tabId === tab.shell.id) {
+        pending.settle(new Error('The browser page changed before assistant input could be attributed.'));
+      }
+    }
     for (const [token, pending] of this.automationGestureTokens) {
-      if (pending.tabId === tab.shell.id) this.automationGestureTokens.delete(token);
+      if (pending.tabId === tab.shell.id) this.revokeAutomationGestureToken(token);
     }
     if (!view) return;
+    // A renderer deadline can reach this path while the uninterruptible
+    // screenshot Promise is still pending. Remove it from the renderer-free
+    // capture host and release the process-wide capture slot synchronously;
+    // the operation's eventual `finally` is idempotent.
+    this.releaseBackgroundCaptureHostedView(view);
+    this.detachedHostViews?.delete(view);
     if (this.attachedView === view) this.detachAttachedView();
+    const win = this.getWindow();
+    try {
+      if (win && !win.isDestroyed()) win.contentView.removeChildView(view);
+    } catch {
+      // Best-effort removal while the native window is tearing down.
+    }
     this.webContentsToTab.delete(view.webContents.id);
     // Clear our ownership before close() so the destroyed event can
     // distinguish an intentional teardown from an unexpected renderer loss.
@@ -4935,6 +8391,28 @@ export class BrowserManager {
       // A remote page must never move or resize Kai's containing window. The
       // BrowserPanel alone owns the child view's validated bounds.
       event.preventDefault();
+    });
+    contents.on('enter-html-full-screen', () => {
+      if (!ownsContents() || (tab.aiActionDepth <= 0 && !tab.aiControlOwnerId)) return;
+      // Built-in Chromium media controls can enter HTML fullscreen without
+      // calling the page-visible requestFullscreen methods blocked by the
+      // preload membrane. The immutable WebPreference keeps Kai's window from
+      // resizing; reclaim the exact assistant-controlled document immediately
+      // so no browser-owned fullscreen surface survives hidden automation.
+      const win = this.getWindow();
+      try {
+        if (win && !win.isDestroyed() && win.isFullScreen()) win.setFullScreen(false);
+      } catch {
+        // Closing the offending WebContents below also exits HTML fullscreen.
+      }
+      if (!ownsContents()) return;
+      tab.generation++;
+      this.destroyView(tab);
+      tab.shell.discarded = true;
+      tab.shell.loading = false;
+      tab.shell.sensitive = false;
+      tab.shell.error = 'Browser fullscreen was blocked during assistant control.';
+      this.emitTabs(tab.shell.conversationId);
     });
     const updateNavigation = (): void => {
       if (!ownsContents() || contents.isDestroyed()) return;
@@ -4969,6 +8447,7 @@ export class BrowserManager {
     });
     contents.on('did-stop-loading', () => {
       if (!ownsContents()) return;
+      this.finishAssistantPopupBootstrap(tab, contents);
       tab.shell.loading = false;
       tab.shell.title = boundedBrowserTitle(contents.getTitle(), tab.shell.url || 'New Tab');
       updateNavigation();
@@ -4987,6 +8466,16 @@ export class BrowserManager {
       // Revoke document-bound capabilities before any renderer or filesystem
       // side effect. Navigation continues even if those later operations fail.
       tab.generation++;
+      // The immutable preload will arm the replacement document before its page
+      // script, but a later assistant operation must verify that document's own
+      // non-callable marker instead of trusting the previous frame snapshot.
+      tab.assistantNativeUiNewDocumentGuard = undefined;
+      // Rotate document-visible diagnostics without forgetting requests that
+      // Chromium has already admitted. Keep the committed document snapshot
+      // until this provisional navigation commits or fails; an aborted
+      // navigation leaves the original page alive and must not erase its
+      // diagnostics.
+      this.beginBrowserNetworkNavigation(tab, url);
       this.resetUnrestrictedDocumentNetworkState(tab);
       this.clearOneTimePermissionsForTab(tab.shell.id);
       this.dismissPendingPermissionsForTab(tab.shell.id);
@@ -5012,8 +8501,13 @@ export class BrowserManager {
         }
       }
     });
+    contents.on('did-redirect-navigation', (_event, url, isInPlace, isMain) => {
+      if (!ownsContents() || !isMain || isInPlace) return;
+      this.recordBrowserNetworkNavigationUrl(tab, url);
+    });
     contents.on('did-navigate', (_event, url) => {
       if (!ownsContents()) return;
+      this.commitBrowserNetworkNavigation(tab);
       // Only a committed new document clears password-sensitive state. Starting
       // a navigation is insufficient: it can fail or be cancelled while the old
       // DOM (and its password value) remains live.
@@ -5038,6 +8532,7 @@ export class BrowserManager {
         tab.shell.reloadRequired = false;
       }
       tab.popupGesture = null;
+      tab.assistantGesture = null;
       this.completeTrustedUserNavigation(tab, url);
       updateNavigation();
     });
@@ -5073,10 +8568,25 @@ export class BrowserManager {
     contents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMain) => {
       if (!ownsContents()) return;
       if (!isMain) return;
+      this.finishAssistantPopupBootstrap(tab, contents);
       if (isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, validatedURL)) {
         this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
       }
-      if (errorCode === -3) return; // ERR_ABORTED during normal navigation/stop.
+      // A superseded main-frame request may report its terminal failure after a
+      // newer attempt has already started (or even committed). Electron does
+      // not expose a request id on did-fail-load, so consume the generation/url
+      // tombstone instead of rolling back or failing the newer document.
+      if (this.consumeSupersededBrowserNetworkNavigationFailure(tab, validatedURL)) return;
+      if (errorCode === -3) {
+        // ERR_ABORTED leaves the previously committed document alive. Restore
+        // its diagnostics and retain the failed attempt as additional bounded
+        // request history.
+        this.rollbackBrowserNetworkNavigation(tab);
+        return;
+      }
+      // A terminal navigation failure represents the attempted replacement
+      // (typically Chromium's error document), not the departed page.
+      this.commitBrowserNetworkNavigation(tab);
       tab.shell.loading = false;
       tab.shell.error = `${errorDescription} (${errorCode})`;
       tab.shell.url = validatedURL || tab.shell.url;
@@ -5096,10 +8606,29 @@ export class BrowserManager {
     });
     contents.on('destroyed', () => {
       this.webContentsToTab.delete(contents.id);
+      this.finishAssistantPopupBootstrap(tab, contents);
+      // Electron can destroy a popup or crashed target without routing through
+      // destroyView(). A native capturePage() promise may never settle after
+      // that loss, so release the global preview slot from the destruction
+      // event instead of waiting forever on the orphaned promise.
+      this.rejectMenuPreviewForContents(
+        contents.id,
+        new Error('Browser menu preview was cancelled because the page closed.'),
+      );
       const stillOwnsContents = tab.view?.webContents === contents;
       if (!stillOwnsContents) return;
+      // A stale destroyed event from a renderer replaced during navigation or
+      // sanitization must not erase diagnostics collected by the replacement.
+      this.resetBrowserNetworkDiagnostics(tab);
+      const destroyedView = tab.view;
       this.dropPendingForTab(tab.shell.id);
       if (this.attachedView === tab.view) this.detachAttachedView();
+      const win = this.getWindow();
+      try {
+        if (destroyedView && win && !win.isDestroyed()) win.contentView.removeChildView(destroyedView);
+      } catch {
+        // Best-effort native child cleanup after an unexpected renderer loss.
+      }
       tab.view = null;
       if (shouldCloseDestroyedPopupTab(tab.isPopup, stillOwnsContents) && this.tabs.get(tab.shell.id) === tab) {
         this.closeTab(tab);
@@ -5460,6 +8989,354 @@ export class BrowserManager {
     })();
   }
 
+  private trackBrowserNetworkRequest(
+    tab: InternalTab,
+    details: Pick<Electron.OnBeforeRequestListenerDetails, 'id' | 'method' | 'resourceType' | 'url'> & {
+      timestamp?: number;
+    },
+  ): boolean {
+    if (this.tabs.get(tab.shell.id) !== tab) return false;
+    const currentTime = browserNetworkEventTime(details.timestamp);
+    const requests = (tab.networkRequests ??= new Map());
+    const activeRequests = (tab.activeNetworkRequests ??= new Map());
+    const activeRequestUrls = (tab.activeNetworkRequestUrls ??= new Map());
+    const existing = requests.get(details.id) ?? tab.provisionalNetworkNavigation?.requests?.get(details.id);
+    const existingActive = activeRequests.has(details.id);
+    if (existingActive) {
+      // Chromium retains an admitted request id across redirects.
+      activeRequests.set(details.id, details.resourceType);
+      activeRequestUrls.set(details.id, details.url);
+    } else if (activeRequests.size >= MAX_BROWSER_ACTIVE_NETWORK_REQUESTS_PER_TAB) {
+      // Preserve exact identity for every admitted request. A hostile page that
+      // exceeds the cap is cancelled at onBeforeRequest rather than making an
+      // older request impossible to complete later.
+      const sequence = (tab.networkRequestSequence ?? 0) + 1;
+      tab.networkRequestSequence = sequence;
+      const sanitizedUrl = sanitizeBrowserNetworkUrl(details.url, this.networkRedactionKeyForTab(tab));
+      requests.delete(details.id);
+      requests.set(details.id, {
+        id: details.id,
+        sequence,
+        url: sanitizedUrl.url,
+        urlRedacted: sanitizedUrl.redacted,
+        method: details.method,
+        resourceType: details.resourceType,
+        startedAt: currentTime,
+        completedAt: currentTime,
+        error: 'Request cancelled because this tab reached its active-request limit.',
+      });
+      while (requests.size > MAX_BROWSER_NETWORK_REQUESTS_PER_TAB) {
+        const oldest = requests.keys().next().value;
+        if (oldest === undefined) break;
+        requests.delete(oldest);
+      }
+      return false;
+    } else {
+      activeRequests.set(details.id, details.resourceType);
+      activeRequestUrls.set(details.id, details.url);
+      (tab.diagnosticActiveNetworkRequestIds ??= new Set()).add(details.id);
+    }
+    const sanitizedUrl = sanitizeBrowserNetworkUrl(details.url, this.networkRedactionKeyForTab(tab));
+    if (existingActive && existing && existing.completedAt === undefined) {
+      // Chromium retains a request id across redirects. Preserve the original
+      // start time while recording only the final, query-free destination.
+      existing.url = sanitizedUrl.url;
+      existing.urlRedacted = existing.urlRedacted === true || sanitizedUrl.redacted;
+      existing.method = details.method;
+      existing.resourceType = details.resourceType;
+    } else if (!existingActive) {
+      const sequence = (tab.networkRequestSequence ?? 0) + 1;
+      tab.networkRequestSequence = sequence;
+      if (existing) requests.delete(details.id);
+      requests.set(details.id, {
+        id: details.id,
+        sequence,
+        url: sanitizedUrl.url,
+        urlRedacted: sanitizedUrl.redacted,
+        method: details.method,
+        resourceType: details.resourceType,
+        startedAt: currentTime,
+      });
+    }
+    if (
+      browserNetworkResourceBlocksIdle(details.resourceType) &&
+      (tab.diagnosticActiveNetworkRequestIds?.has(details.id) ?? true)
+    ) {
+      tab.networkLastBlockingActivityAt = currentTime;
+    }
+    // Diagnostic history is independently bounded. An active request can be
+    // absent here and still complete exactly through activeNetworkRequests.
+    while (requests.size > MAX_BROWSER_NETWORK_REQUESTS_PER_TAB) {
+      const oldest = requests.keys().next().value;
+      if (oldest === undefined) break;
+      requests.delete(oldest);
+    }
+    return true;
+  }
+
+  private trackBrowserNetworkResponseStarted(
+    tab: InternalTab,
+    details: Pick<Electron.OnResponseStartedListenerDetails, 'id' | 'timestamp'>,
+  ): void {
+    if (this.tabs.get(tab.shell.id) !== tab) return;
+    const request = tab.networkRequests?.get(details.id) ?? tab.provisionalNetworkNavigation?.requests?.get(details.id);
+    if (!request || request.completedAt !== undefined) return;
+    const responseStartedAt = browserNetworkEventTime(details.timestamp);
+    request.responseStartedAt = Math.max(request.startedAt, responseStartedAt);
+  }
+
+  private networkRedactionKeyForTab(tab: InternalTab): BrowserNetworkRedactionKey {
+    return (tab.networkRedactionKey ??= createBrowserNetworkRedactionKey());
+  }
+
+  private currentDocumentActiveNetworkRequests(tab: InternalTab): Array<[number, string]> {
+    const activeRequests = tab.activeNetworkRequests;
+    if (!activeRequests) return [];
+    const currentIds = tab.diagnosticActiveNetworkRequestIds;
+    // Existing tabs/tests created before the navigation-scoped set is needed
+    // treat every exact active identity as belonging to their current document.
+    if (!currentIds) return [...activeRequests];
+    const current: Array<[number, string]> = [];
+    for (const requestId of currentIds) {
+      const resourceType = activeRequests.get(requestId);
+      if (resourceType !== undefined) current.push([requestId, resourceType]);
+    }
+    return current;
+  }
+
+  private resetBrowserNetworkDiagnostics(tab: InternalTab, preserveActiveRequests = false): void {
+    tab.networkRequests?.clear();
+    tab.networkRequests = undefined;
+    tab.provisionalNetworkNavigation?.requests?.clear();
+    tab.provisionalNetworkNavigation?.activeRequestIds.clear();
+    tab.provisionalNetworkNavigation = undefined;
+    if (!preserveActiveRequests) {
+      tab.activeNetworkRequests?.clear();
+      tab.activeNetworkRequests = undefined;
+      tab.activeNetworkRequestUrls?.clear();
+      tab.activeNetworkRequestUrls = undefined;
+      tab.diagnosticActiveNetworkRequestIds = undefined;
+    } else {
+      // The surviving exact identities belong to a renderer/document that was
+      // just discarded. Keep them finishable, but invisible to any replacement.
+      tab.diagnosticActiveNetworkRequestIds = new Set();
+    }
+    tab.networkRequestSequence = 0;
+    tab.networkLastBlockingActivityAt = undefined;
+    tab.networkNavigationSequence = 0;
+    tab.supersededNetworkNavigations = undefined;
+    // A replacement document must not be comparable with origins observed by
+    // the previous document, even when it lives in the same tab shell.
+    tab.networkRedactionKey = createBrowserNetworkRedactionKey();
+  }
+
+  private beginBrowserNetworkNavigation(tab: InternalTab, url: string): void {
+    const previousProvisional = tab.provisionalNetworkNavigation;
+    const currentRedactionKey = this.networkRedactionKeyForTab(tab);
+    const currentRequests = new Map(tab.networkRequests ?? []);
+    const currentActiveRequestIds = new Set(
+      tab.diagnosticActiveNetworkRequestIds ?? tab.activeNetworkRequests?.keys() ?? [],
+    );
+    const expectedNavigationUrl = sanitizeBrowserNetworkUrl(url, currentRedactionKey).url;
+    const navigationRequest = [...currentRequests.values()]
+      .filter(
+        (request) =>
+          request.completedAt === undefined &&
+          tab.activeNetworkRequests?.get(request.id) === 'mainFrame' &&
+          sanitizeBrowserNetworkUrl(request.url, currentRedactionKey).url === expectedNavigationUrl,
+      )
+      .sort((left, right) => right.sequence - left.sequence)[0];
+    const generation = (tab.networkNavigationSequence ?? 0) + 1;
+    tab.networkNavigationSequence = generation;
+    const comparableUrl = comparablePopupReferrerUrl(url);
+    const superseded = previousProvisional
+      ? [
+          ...previousProvisional.superseded,
+          {
+            generation: previousProvisional.generation,
+            urls: new Set(previousProvisional.urls),
+          },
+        ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS)
+      : [];
+    const committedRequests = previousProvisional
+      ? new Map(previousProvisional.requests ?? [])
+      : new Map(currentRequests);
+    if (!previousProvisional && navigationRequest) committedRequests.delete(navigationRequest.id);
+    const committedActiveRequestIds = previousProvisional
+      ? new Set(previousProvisional.activeRequestIds)
+      : new Set([...currentActiveRequestIds].filter((requestId) => requestId !== navigationRequest?.id));
+    const committedLastBlockingActivityAt = previousProvisional
+      ? previousProvisional.lastBlockingActivityAt
+      : tab.networkLastBlockingActivityAt;
+    tab.provisionalNetworkNavigation = {
+      ...(committedRequests.size > 0 ? { requests: committedRequests } : {}),
+      activeRequestIds: committedActiveRequestIds,
+      requestSequence: previousProvisional?.requestSequence ?? tab.networkRequestSequence ?? 0,
+      ...(committedLastBlockingActivityAt !== undefined
+        ? { lastBlockingActivityAt: committedLastBlockingActivityAt }
+        : {}),
+      redactionKey: previousProvisional?.redactionKey ?? currentRedactionKey,
+      generation,
+      urls: new Set(comparableUrl ? [comparableUrl] : []),
+      superseded,
+    };
+    // Rotate the diagnostic subset immediately. Exact identities from the
+    // previous document stay in activeNetworkRequests until their real terminal
+    // events arrive, including identities whose metadata was already evicted.
+    tab.diagnosticActiveNetworkRequestIds = new Set(navigationRequest ? [navigationRequest.id] : []);
+    const nextRedactionKey = createBrowserNetworkRedactionKey();
+    tab.networkRedactionKey = nextRedactionKey;
+    if (navigationRequest) {
+      const sanitized = sanitizeBrowserNetworkUrl(url, nextRedactionKey);
+      tab.networkRequests = new Map([
+        [
+          navigationRequest.id,
+          {
+            ...navigationRequest,
+            sequence: 1,
+            url: sanitized.url,
+            urlRedacted: navigationRequest.urlRedacted === true || sanitized.redacted,
+          },
+        ],
+      ]);
+      tab.networkRequestSequence = 1;
+      tab.networkLastBlockingActivityAt = navigationRequest.startedAt;
+    } else {
+      tab.networkRequests = undefined;
+      tab.networkRequestSequence = 0;
+      tab.networkLastBlockingActivityAt = undefined;
+    }
+  }
+
+  private recordBrowserNetworkNavigationUrl(tab: InternalTab, url: string): void {
+    const comparableUrl = comparablePopupReferrerUrl(url);
+    if (comparableUrl) tab.provisionalNetworkNavigation?.urls.add(comparableUrl);
+  }
+
+  private retainSupersededBrowserNetworkNavigations(
+    tab: InternalTab,
+    attempts: Array<{ generation: number; urls: Set<string> }>,
+  ): void {
+    if (attempts.length === 0) return;
+    tab.supersededNetworkNavigations = [
+      ...(tab.supersededNetworkNavigations ?? []),
+      ...attempts.map((attempt) => ({ generation: attempt.generation, urls: new Set(attempt.urls) })),
+    ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS);
+  }
+
+  private consumeSupersededBrowserNetworkNavigationFailure(tab: InternalTab, url: string): boolean {
+    const comparableUrl = comparablePopupReferrerUrl(url);
+    const provisional = tab.provisionalNetworkNavigation;
+    const consumeMatching = (attempts: Array<{ generation: number; urls: Set<string> }>): boolean => {
+      const matchingIndex = comparableUrl ? attempts.findIndex((attempt) => attempt.urls.has(comparableUrl)) : -1;
+      if (matchingIndex < 0) return false;
+      attempts.splice(matchingIndex, 1);
+      return true;
+    };
+    // Prefer the oldest still-pending generation when two rapid attempts use
+    // the same URL. Chromium reports the superseded attempt's abort first.
+    if (provisional && consumeMatching(provisional.superseded)) return true;
+    if (tab.supersededNetworkNavigations && consumeMatching(tab.supersededNetworkNavigations)) {
+      if (tab.supersededNetworkNavigations.length === 0) tab.supersededNetworkNavigations = undefined;
+      return true;
+    }
+    const currentMatches = !!comparableUrl && provisional?.urls.has(comparableUrl) === true;
+    if (!currentMatches && provisional?.superseded.length) {
+      // Some Chromium failures omit or normalize validatedURL differently from
+      // did-start-navigation. Terminal events remain ordered, so consume the
+      // oldest superseded generation before allowing an unknown event to
+      // settle the current attempt.
+      provisional.superseded.shift();
+      return true;
+    }
+    return false;
+  }
+
+  private commitBrowserNetworkNavigation(tab: InternalTab): void {
+    if (tab.provisionalNetworkNavigation) {
+      this.retainSupersededBrowserNetworkNavigations(tab, tab.provisionalNetworkNavigation.superseded);
+    }
+    tab.provisionalNetworkNavigation = undefined;
+  }
+
+  private rollbackBrowserNetworkNavigation(tab: InternalTab): void {
+    const provisional = tab.provisionalNetworkNavigation;
+    if (!provisional) return;
+    const restored = new Map(provisional.requests ?? []);
+    let restoredSequence = provisional.requestSequence;
+    const attemptedRequests = [...(tab.networkRequests?.values() ?? [])].sort(
+      (left, right) => left.sequence - right.sequence,
+    );
+    for (const request of attemptedRequests) {
+      // ERR_ABORTED leaves the committed document alive, but the failed
+      // navigation is still useful request history. Its diagnostics were
+      // sanitized with the attempted document's independent redaction key, so
+      // retain that already-redacted value while rebasing its display sequence
+      // after the restored document's requests.
+      const retained = { ...request, sequence: ++restoredSequence };
+      restored.delete(retained.id);
+      restored.set(retained.id, retained);
+    }
+    while (restored.size > MAX_BROWSER_NETWORK_REQUESTS_PER_TAB) {
+      const oldest = restored.keys().next().value;
+      if (oldest === undefined) break;
+      restored.delete(oldest);
+    }
+    tab.networkRequests = restored.size > 0 ? restored : undefined;
+    tab.networkRequestSequence = restoredSequence;
+    const blockingActivity = [provisional.lastBlockingActivityAt, tab.networkLastBlockingActivityAt].filter(
+      (value): value is number => value !== undefined,
+    );
+    tab.networkLastBlockingActivityAt = blockingActivity.length > 0 ? Math.max(...blockingActivity) : undefined;
+    tab.networkRedactionKey = provisional.redactionKey;
+    tab.diagnosticActiveNetworkRequestIds = new Set(
+      [...provisional.activeRequestIds, ...attemptedRequests.map((request) => request.id)].filter((requestId) =>
+        tab.activeNetworkRequests?.has(requestId),
+      ),
+    );
+    this.retainSupersededBrowserNetworkNavigations(tab, provisional.superseded);
+    tab.provisionalNetworkNavigation = undefined;
+  }
+
+  private finishBrowserNetworkRequest(
+    tab: InternalTab,
+    details: {
+      id: number;
+      statusCode?: number;
+      fromCache?: boolean;
+      responseHeaders?: Record<string, string[]>;
+      resourceType?: string;
+      error?: unknown;
+      timestamp?: number;
+    },
+  ): void {
+    if (this.tabs.get(tab.shell.id) !== tab) return;
+    const request = tab.networkRequests?.get(details.id) ?? tab.provisionalNetworkNavigation?.requests?.get(details.id);
+    const activeResourceType = tab.activeNetworkRequests?.get(details.id);
+    const wasActive = tab.activeNetworkRequests?.delete(details.id) ?? false;
+    tab.activeNetworkRequestUrls?.delete(details.id);
+    const wasDiagnosticActive = tab.diagnosticActiveNetworkRequestIds?.delete(details.id) ?? wasActive;
+    const completedResourceType = activeResourceType ?? details.resourceType ?? request?.resourceType;
+    const completedBlockingRequest =
+      wasActive &&
+      wasDiagnosticActive &&
+      completedResourceType !== undefined &&
+      browserNetworkResourceBlocksIdle(completedResourceType);
+    if (!request || request.completedAt !== undefined) {
+      if (completedBlockingRequest) tab.networkLastBlockingActivityAt = browserNetworkEventTime(details.timestamp);
+      return;
+    }
+    request.completedAt = Math.max(request.startedAt, browserNetworkEventTime(details.timestamp));
+    if (Number.isInteger(details.statusCode) && details.statusCode! >= 0 && details.statusCode! <= 999) {
+      request.statusCode = details.statusCode;
+    }
+    if (typeof details.fromCache === 'boolean') request.fromCache = details.fromCache;
+    const responseBytes = responseContentLength(details.responseHeaders);
+    if (responseBytes !== undefined) request.responseBytes = responseBytes;
+    request.error = sanitizeBrowserNetworkError(details.error);
+    if (completedBlockingRequest) tab.networkLastBlockingActivityAt = request.completedAt;
+  }
+
   private wireSession(ses: Session, partition: string, scopeKey: string): void {
     this.wiredSessionsByScope?.set(scopeKey, ses);
     // A failed profile clear can leave a persistent service worker alive after
@@ -5471,6 +9348,16 @@ export class BrowserManager {
     if (this.wiredSessions.has(ses)) return;
     this.wiredSessions.add(ses);
     registerBrowserFramePreload(ses, this.pagePreloadPath);
+    const proxyReady =
+      this.validatingProxy &&
+      typeof (ses as Session & { setProxy?: unknown }).setProxy === 'function' &&
+      typeof (ses as Session & { closeAllConnections?: unknown }).closeAllConnections === 'function'
+        ? this.validatingProxy.configureSession(ses)
+        : Promise.resolve();
+    // onBeforeRequest awaits this same promise before admitting any traffic.
+    // Observe an early rejection now so a startup failure cannot become an
+    // unhandled promise while no Browser tab is loading yet.
+    void proxyReady.catch(() => undefined);
     const handleServiceWorkerRegistration = (
       _event: Electron.Event,
       details: Electron.RegistrationCompletedDetails,
@@ -5499,21 +9386,59 @@ export class BrowserManager {
           return;
         }
       }
+      const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
+      const tab = tabId ? this.tabs.get(tabId) : undefined;
       const scopeGeneration = this.currentScopeGeneration(scopeKey);
       let completed = false;
       const complete = (result: Electron.CallbackResponse): void => {
         if (completed) return;
         completed = true;
-        const stale = this.scopeUnavailable(scopeKey) || this.currentScopeGeneration(scopeKey) !== scopeGeneration;
-        const response = stale ? { cancel: true } : result;
-        callback(response);
-        // An admitted request owns its scope activity until Chromium reports a
-        // terminal network event. Cancelled/stale requests never enter the
-        // network stack, so release those immediately.
-        if (response.cancel) this.finishScopeRequestActivity(scopeKey, details.id);
+        const publishResponse = (): void => {
+          const stale = this.scopeUnavailable(scopeKey) || this.currentScopeGeneration(scopeKey) !== scopeGeneration;
+          const response = stale ? { cancel: true } : result;
+          callback(response);
+          // An admitted request owns its scope activity until Chromium reports
+          // a terminal network event. Cancelled/stale requests never enter the
+          // network stack, so release those immediately.
+          if (response.cancel) {
+            if (tab) {
+              this.finishBrowserNetworkRequest(tab, {
+                id: details.id,
+                resourceType: details.resourceType,
+                error: 'Request canceled before dispatch.',
+              });
+            }
+            this.finishScopeRequestActivity(scopeKey, details.id);
+          }
+        };
+        if (!this.validatingProxy) {
+          // Focused unit fixtures intentionally construct the manager without
+          // its constructor. Preserve their synchronous Electron callback seam
+          // while production always joins the real proxy readiness barrier.
+          publishResponse();
+          return;
+        }
+        void proxyReady.then(publishResponse, (error: unknown) => {
+          if (tab) {
+            this.finishBrowserNetworkRequest(tab, {
+              id: details.id,
+              resourceType: details.resourceType,
+              error: 'Browser connection validation is unavailable.',
+            });
+            if (details.resourceType === 'mainFrame') {
+              tab.shell.loading = false;
+              tab.shell.error = error instanceof Error ? error.message : String(error);
+              this.emitTabs(tab.shell.conversationId);
+            }
+          }
+          callback({ cancel: true });
+          this.finishScopeRequestActivity(scopeKey, details.id);
+        });
       };
-      const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
-      const tab = tabId ? this.tabs.get(tabId) : undefined;
+      if (tab && !this.trackBrowserNetworkRequest(tab, details)) {
+        complete({ cancel: true });
+        return;
+      }
       if (
         tab &&
         shouldBypassAiPolicyForTrustedUserNavigation(
@@ -5528,8 +9453,12 @@ export class BrowserManager {
         // The first exact target match claims Chromium's request id. Redirects
         // retain that id; unrelated main-frame requests from surviving
         // AI-injected scripts cannot reuse the user-navigation exemption.
-        if (tab.trustedUserNavigationRequestId === null) tab.trustedUserNavigationRequestId = details.id;
-        else tab.trustedUserNavigationTarget = details.url;
+        if (tab.trustedUserNavigationRequestId === null) {
+          tab.trustedUserNavigationRequestId = details.id;
+          if (tab.trustedUserNavigationTimer) clearTimeout(tab.trustedUserNavigationTimer);
+          tab.trustedUserNavigationTimer = null;
+        } else tab.trustedUserNavigationTarget = details.url;
+        this.validatingProxy?.releaseRequest(scopeKey, details.id);
         complete({});
         return;
       }
@@ -5539,6 +9468,7 @@ export class BrowserManager {
           this.restrictedBackgroundScopes.has(scopeKey) ||
           this.storeForScope(scopeKey).isBackgroundNetworkRestricted();
       if (!shouldApplyAiRequestPolicy(tab?.aiNetworkRestricted, unattributedScopeRestricted)) {
+        this.validatingProxy?.releaseRequest(scopeKey, details.id);
         if (tab) {
           let documentUrl = tab.shell.url;
           if (details.resourceType === 'mainFrame') documentUrl = details.url;
@@ -5565,23 +9495,71 @@ export class BrowserManager {
         complete({});
         return;
       }
+      if (this.aiAllowPrivateNetwork === false) {
+        try {
+          this.validatingProxy?.restrictRequest(scopeKey, details.id, details.url);
+        } catch (error) {
+          if (tab) this.finishBrowserNetworkRequest(tab, { id: details.id, resourceType: details.resourceType, error });
+          complete({ cancel: true });
+          return;
+        }
+      }
       void this.assertAssistantNavigationAllowed(aiRequestPolicyUrl(details.url), partition).then(
         () => complete({}),
         (error: unknown) => {
           if (tab && this.tabs.get(tab.shell.id) === tab) {
-            tab.shell.loading = false;
-            tab.shell.error = error instanceof Error ? error.message : String(error);
-            this.emitTabs(tab.shell.conversationId);
+            this.finishBrowserNetworkRequest(tab, { id: details.id, resourceType: details.resourceType, error });
+            // A blocked image/XHR/font is diagnostic request data, not a failed
+            // top-level navigation. Keep it in browser_network without replacing
+            // a successfully rendered page with the tab-wide error surface.
+            if (details.resourceType === 'mainFrame') {
+              tab.shell.loading = false;
+              tab.shell.error = error instanceof Error ? error.message : String(error);
+              this.emitTabs(tab.shell.conversationId);
+            }
           }
           complete({ cancel: true });
         },
       );
     });
-    const finishRequest = (details: { id: number }): void => {
+    const finishCompletedRequest = (details: Electron.OnCompletedListenerDetails): void => {
       this.finishScopeRequestActivity(scopeKey, details.id);
+      const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
+      const tab = tabId ? this.tabs.get(tabId) : undefined;
+      // Electron's successful completion payload also has an `error` field
+      // (commonly "net::OK"). Do not report that as a failed request.
+      if (tab) {
+        this.finishBrowserNetworkRequest(tab, {
+          id: details.id,
+          statusCode: details.statusCode,
+          fromCache: details.fromCache,
+          responseHeaders: details.responseHeaders,
+          resourceType: details.resourceType,
+        });
+      }
     };
-    ses.webRequest.onCompleted(requestFilter, finishRequest);
-    ses.webRequest.onErrorOccurred(requestFilter, finishRequest);
+    const recordResponseStarted = (details: Electron.OnResponseStartedListenerDetails): void => {
+      const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
+      const tab = tabId ? this.tabs.get(tabId) : undefined;
+      if (tab) this.trackBrowserNetworkResponseStarted(tab, details);
+    };
+    const finishFailedRequest = (details: Electron.OnErrorOccurredListenerDetails): void => {
+      this.finishScopeRequestActivity(scopeKey, details.id);
+      const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
+      const tab = tabId ? this.tabs.get(tabId) : undefined;
+      if (tab) {
+        this.finishBrowserNetworkRequest(tab, details);
+        // did-fail-load normally consumes this lease too, but webRequest is the
+        // authoritative terminal event for the exact request. Clear it here so
+        // an unusual Chromium failure path cannot leave an unbounded bypass.
+        if (details.resourceType === 'mainFrame' && tab.trustedUserNavigationRequestId === details.id) {
+          this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
+        }
+      }
+    };
+    ses.webRequest.onResponseStarted?.(requestFilter, recordResponseStarted);
+    ses.webRequest.onCompleted(requestFilter, finishCompletedRequest);
+    ses.webRequest.onErrorOccurred(requestFilter, finishFailedRequest);
     ses.setPermissionCheckHandler((contents, permission, requestingOrigin, details) => {
       const tabId = contents ? this.webContentsToTab.get(contents.id) : undefined;
       const tab = tabId ? this.tabs.get(tabId) : undefined;
@@ -5634,8 +9612,14 @@ export class BrowserManager {
         return;
       }
       const assistantTriggered = tab.aiNetworkRestricted;
+      if (assistantTriggered) {
+        // Native permission callbacks can suspend page promises indefinitely.
+        // Background assistant work has no presentation dependency, so it must
+        // fail closed immediately instead of waiting for the sidebar or a user.
+        callback(false);
+        return;
+      }
       if (
-        !assistantTriggered &&
         storageKeys.every(
           (storageKey, index) =>
             stored[index] === 'allow' ||
@@ -5712,13 +9696,58 @@ export class BrowserManager {
       const originatingTabId = tab.shell.id;
       // Only assistant-created tabs have turn-scoped downloads. A kept tab may
       // be controlled by a later run, so prefer that current control lease over
-      // its original creator. User-owned tabs always retain their downloads,
-      // even while the assistant concurrently operates the page.
+      // its original creator. User-owned tabs may retain a download only when
+      // current interactive user provenance is verified below.
       const assistantOwnerId = this.assistantDownloadOwner(tab);
+      const assistantTriggered = assistantOwnerId !== null;
+      if (assistantTriggered) this.clearContextMenuDownloadAuthority(contents.id);
+      if (!assistantTriggered) {
+        const current = Date.now();
+        const userGesture =
+          tab.popupGesture?.source === 'user' && tab.popupGesture.expiresAt >= current ? tab.popupGesture : null;
+        let trustedChromeNavigation = false;
+        let trustedContextMenuDownload = false;
+        try {
+          const downloadUrl = item.getURL();
+          trustedChromeNavigation =
+            tab.trustedUserNavigationRequestId !== null &&
+            isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, downloadUrl);
+          trustedContextMenuDownload = this.consumeContextMenuDownloadAuthority(tab, contents, downloadUrl);
+        } catch {
+          // A missing/tearing-down DownloadItem URL cannot inherit broad
+          // Browser-chrome navigation or context-menu authority.
+        }
+        const trustedInteractiveGesture = !!userGesture && this.isTargetViewInteractive(tab, contents);
+        if (!trustedContextMenuDownload && !trustedChromeNavigation && !trustedInteractiveGesture) {
+          // A hidden/background user-owned page can start downloads without an
+          // assistant lease (for example from a timer or service callback).
+          // Never let that surface an unseen native dialog. Assistant-owned
+          // downloads take the quarantine branch above; unattributed user-tab
+          // downloads fail closed until a fresh visible interaction retries.
+          try {
+            item.cancel();
+          } catch {
+            // The item may already have reached a terminal state.
+          }
+          tab.shell.error = 'Download blocked because it was not started by an active Browser interaction.';
+          this.emitTabs(tab.shell.conversationId);
+          return;
+        }
+        // Chromium transient activation is single-use. Consume Kai's matching
+        // provenance as well so one click cannot authorize later timer-driven
+        // downloads after this dialog has opened.
+        if (userGesture) tab.popupGesture = null;
+        // A Browser-chrome navigation may produce a download instead of a
+        // committed document. Consume its exact request-bound lease here so it
+        // cannot authorize an unrelated later page/timer download.
+        if (trustedChromeNavigation) this.clearTrustedUserNavigation(tab, tab.trustedUserNavigationLease);
+      }
       const scopeGeneration = this.currentScopeGeneration(scopeKey);
+      let quarantinePath: string | undefined;
       let lastPublishedAt = 0;
       let pendingPublish: ReturnType<typeof setTimeout> | null = null;
       let terminalWrite: Promise<void> | null = null;
+      let cancellationRequested = false;
       let resolveDone!: () => void;
       const done = new Promise<void>((resolve) => {
         resolveDone = resolve;
@@ -5730,9 +9759,50 @@ export class BrowserManager {
         }`;
         this.emitTabs(conversationId);
       };
-      item.setSaveDialogOptions({
-        defaultPath: join(app.getPath('downloads'), item.getFilename()),
-      });
+      try {
+        if (assistantTriggered) {
+          const declaredBytes = item.getTotalBytes();
+          const receivedBytes = item.getReceivedBytes();
+          if (
+            !Number.isSafeInteger(declaredBytes) ||
+            declaredBytes <= 0 ||
+            declaredBytes > MAX_ASSISTANT_DOWNLOAD_BYTES ||
+            !Number.isSafeInteger(receivedBytes) ||
+            receivedBytes < 0 ||
+            receivedBytes > declaredBytes
+          ) {
+            throw new Error(
+              declaredBytes <= 0
+                ? 'Assistant downloads require a declared positive content length so Kai can enforce its disk quota.'
+                : `Assistant download exceeds the ${MAX_ASSISTANT_DOWNLOAD_BYTES / (1024 * 1024)} MB limit.`,
+            );
+          }
+          // Background automation must never block on an unseen native dialog
+          // or place page-selected executable content in the user's Downloads
+          // folder. Use a private, bounded app-owned quarantine with a generated
+          // extension that the OS will not treat as the remote file type.
+          const protectedPaths = this.protectedAssistantDownloadPaths(scopeKey);
+          quarantinePath = prepareAssistantDownloadQuarantine(this.appHome, scopeKey, id, protectedPaths, (pruned) => {
+            void this.reconcilePrunedAssistantDownloads(scopeKey, pruned, conversationId).catch((error: unknown) => {
+              console.warn('[Browser] Could not reconcile pruned assistant downloads:', error);
+            });
+          });
+          item.setSavePath(quarantinePath);
+        } else {
+          item.setSaveDialogOptions({
+            defaultPath: join(app.getPath('downloads'), basename(item.getFilename())),
+          });
+        }
+      } catch (error) {
+        try {
+          item.cancel();
+        } catch {
+          // A synchronous path-selection failure may race a terminal item.
+        }
+        tab.shell.error = `Download could not start: ${error instanceof Error ? error.message : String(error)}`;
+        this.emitTabs(conversationId);
+        return;
+      }
       const publish = (state: BrowserDownload['state'], force = false, allowStaleGeneration = false): Promise<void> => {
         if (!allowStaleGeneration && this.currentScopeGeneration(scopeKey) !== scopeGeneration) {
           return Promise.resolve();
@@ -5759,7 +9829,8 @@ export class BrowserManager {
           receivedBytes: item.getReceivedBytes(),
           totalBytes: item.getTotalBytes(),
           state,
-          path: item.getSavePath() || undefined,
+          ...(assistantTriggered ? { quarantined: true } : {}),
+          path: assistantTriggered && state !== 'completed' ? undefined : item.getSavePath() || undefined,
           url: item.getURL() ? boundedBrowserUrl(item.getURL()) : undefined,
         };
         this.cacheDownload(scopeKey, download);
@@ -5784,9 +9855,6 @@ export class BrowserManager {
         this.emitDownloadForScope(scopeKey, conversationId, download);
         return Promise.resolve();
       };
-      const onUpdated = () => {
-        void publish('progressing');
-      };
       const removeListeners = (): void => {
         item.off('updated', onUpdated);
         item.off('done', onDone);
@@ -5796,15 +9864,77 @@ export class BrowserManager {
         if (pendingPublish) clearTimeout(pendingPublish);
         pendingPublish = null;
         removeListeners();
-        terminalWrite = publish(state, true, allowStaleGeneration).finally(() => {
+        terminalWrite = (async () => {
+          let terminalState = state;
+          if (quarantinePath) {
+            try {
+              if (state === 'completed') secureAssistantDownloadFile(quarantinePath);
+              else removeAssistantDownloadFile(quarantinePath);
+            } catch (error) {
+              terminalState = 'interrupted';
+              try {
+                removeAssistantDownloadFile(quarantinePath);
+              } catch {
+                // Preserve the first quarantine failure for the tab status.
+              }
+              if (this.tabs.get(originatingTabId) === tab) {
+                tab.shell.error = `Assistant download quarantine failed: ${
+                  error instanceof Error ? error.message : String(error)
+                }`;
+                this.emitTabs(conversationId);
+              }
+            }
+          }
+          await publish(terminalState, true, allowStaleGeneration);
+        })().finally(async () => {
           this.activeDownloads.delete(item);
+          if (assistantTriggered) {
+            try {
+              const protectedPaths = this.protectedAssistantDownloadPaths(scopeKey);
+              const reserveFiles = protectedPaths.size;
+              const pruned = pruneAssistantDownloadQuarantine(this.appHome, scopeKey, protectedPaths, {
+                reserveFiles,
+                reserveBytes: reserveFiles * MAX_ASSISTANT_DOWNLOAD_BYTES,
+                reservationsIncludeProtectedPaths: true,
+              });
+              await this.reconcilePrunedAssistantDownloads(scopeKey, pruned, conversationId);
+            } catch (error) {
+              console.warn('[Browser] Could not enforce assistant download retention:', error);
+            }
+          }
           this.releaseScopeRuntimeWhenIdle(scopeKey);
           resolveDone();
         });
         return terminalWrite;
       };
+      const onUpdated = () => {
+        if (
+          assistantTriggered &&
+          (item.getReceivedBytes() > MAX_ASSISTANT_DOWNLOAD_BYTES ||
+            item.getTotalBytes() > MAX_ASSISTANT_DOWNLOAD_BYTES)
+        ) {
+          if (this.tabs.get(originatingTabId) === tab) {
+            tab.shell.error = `Assistant download exceeded the ${MAX_ASSISTANT_DOWNLOAD_BYTES / (1024 * 1024)} MB limit.`;
+            this.emitTabs(conversationId);
+          }
+          if (!cancellationRequested) {
+            cancellationRequested = true;
+            try {
+              item.cancel();
+            } catch {
+              // Keep the terminal listener installed. If Chromium had already
+              // stopped the item, its queued `done` event still owns cleanup;
+              // otherwise a later update/lifecycle cancellation can retry.
+              cancellationRequested = false;
+            }
+          }
+          return;
+        }
+        void publish('progressing');
+      };
+      let persistTerminalAcrossGeneration = false;
       const onDone = (_doneEvent: Electron.Event, state: 'completed' | 'cancelled' | 'interrupted'): void => {
-        void finish(state);
+        void finish(state, persistTerminalAcrossGeneration);
       };
       const activeDownload: ActiveBrowserDownload = {
         id,
@@ -5813,23 +9943,51 @@ export class BrowserManager {
         tabId: originatingTabId,
         assistantOwnerId,
         keepOpen: tab.shell.keepOpen,
+        quarantinePath,
         item,
         done,
-        cancel: () => {
-          if (terminalWrite) return terminalWrite;
-          removeListeners();
-          try {
-            item.cancel();
-          } catch {
-            // Persist the terminal intent even if Chromium raced the cancellation.
+        cancel: (persistAcrossGeneration = false) => {
+          // Settings changes, data clearing, and shutdown intentionally bump a
+          // profile generation before they ask Chromium to cancel. Latch that
+          // lifecycle authority before item.cancel(), which may synchronously
+          // emit `done`, so its terminal shelf state is still durably written.
+          if (persistAcrossGeneration) persistTerminalAcrossGeneration = true;
+          const waitForTerminal = (): Promise<void> =>
+            waitForBrowserDownloadTerminal(done, `Browser download ${id} cancellation`);
+          if (terminalWrite) return waitForTerminal();
+          if (!cancellationRequested) {
+            cancellationRequested = true;
+            try {
+              item.cancel();
+            } catch (error) {
+              // Do not release the profile barrier without Electron's terminal
+              // event. A still-progressing item may continue to own its partial
+              // file even when the cancellation request itself throws. Leave the
+              // listeners, quarantine, and active-download entry intact so a later
+              // lifecycle retry can request cancellation again.
+              cancellationRequested = false;
+              return Promise.reject(new Error(`Browser download ${id} could not be cancelled.`, { cause: error }));
+            }
           }
-          return finish('cancelled', true);
+          return waitForTerminal().catch((error: unknown) => {
+            // Electron accepted cancel() but did not publish `done` inside the
+            // bounded lifecycle deadline. Do not synthesize a terminal state or
+            // release profile guards; make a subsequent lifecycle call retryable.
+            if (!terminalWrite) cancellationRequested = false;
+            throw error;
+          });
         },
       };
       this.activeDownloads.set(item, activeDownload);
       item.on('updated', onUpdated);
       item.on('done', onDone);
       void publish('progressing', true);
+      if (
+        assistantTriggered &&
+        (item.getReceivedBytes() > MAX_ASSISTANT_DOWNLOAD_BYTES || item.getTotalBytes() > MAX_ASSISTANT_DOWNLOAD_BYTES)
+      ) {
+        onUpdated();
+      }
     };
     ses.on('will-download', handleWillDownload);
     this.wiredSessionCleanups.set(scopeKey, () => {
@@ -5843,6 +10001,7 @@ export class BrowserManager {
       };
       safely(() => ses.serviceWorkers?.off?.('registration-completed', handleServiceWorkerRegistration));
       safely(() => ses.webRequest.onBeforeRequest(null));
+      safely(() => ses.webRequest.onResponseStarted?.(null));
       safely(() => ses.webRequest.onCompleted(null));
       safely(() => ses.webRequest.onErrorOccurred(null));
       safely(() => ses.setPermissionCheckHandler(null));
@@ -6092,7 +10251,13 @@ export class BrowserManager {
                 assertContextPageCurrent();
                 await this.assertTabNotSensitive(tab, contents, 'Saving the image');
                 assertContextPageCurrent();
-                contents.downloadURL(params.srcURL);
+                const authority = this.authorizeContextMenuDownload(tab, contents, params.srcURL);
+                try {
+                  contents.downloadURL(params.srcURL);
+                } catch (error) {
+                  this.clearContextMenuDownloadAuthority(contents.id, authority);
+                  throw error;
+                }
               }),
             ),
         }),
@@ -6143,7 +10308,7 @@ export class BrowserManager {
           runContextMenuTask(() =>
             this.screenshot(tab.shell.conversationId, {
               tabId: tab.shell.id,
-              mode: 'viewport',
+              mode: 'viewport' as const,
               documentToken: pageToken,
               exportToFile: true,
             }),
@@ -6181,6 +10346,30 @@ export class BrowserManager {
     // or type-toggle the input immediately after reporting it; only a committed
     // top-level navigation may declassify the tab.
     this.setTabSensitive(tab, true);
+  };
+
+  private handleMenuSensitivityProbeResult = (
+    event: IpcMainEvent,
+    payload?: { token?: unknown; sensitive?: unknown; complete?: unknown },
+  ): void => {
+    if (
+      typeof payload?.token !== 'string' ||
+      payload.token.length === 0 ||
+      payload.token.length > 128 ||
+      typeof payload.sensitive !== 'boolean' ||
+      typeof payload.complete !== 'boolean'
+    )
+      return;
+    const pending = this.pendingMenuSensitivityProbes.get(payload.token);
+    const frame = event.senderFrame;
+    if (!pending || event.sender.id !== pending.contentsId || !frame || frame.detached || frame.isDestroyed()) return;
+    const expectedIdentity = pending.expectedFrames.get(frame.frameTreeNodeId);
+    if (!expectedIdentity || expectedIdentity !== this.automationFrameIdentity(frame)) return;
+    pending.responses.set(frame.frameTreeNodeId, {
+      sensitive: payload.sensitive,
+      complete: payload.complete,
+    });
+    if (pending.responses.size === pending.expectedFrames.size) pending.settle();
   };
 
   private handlePageActivity = (event: IpcMainEvent): void => {
@@ -6312,9 +10501,26 @@ export class BrowserManager {
     this.finishElementPicker(binding.picker, { error: new Error(reason) });
   };
 
+  private acknowledgeAutomationInputArm(event: IpcMainEvent, payload?: { token?: unknown }): void {
+    if (typeof payload?.token !== 'string' || payload.token.length === 0 || payload.token.length > 128) return;
+    const pending = this.pendingAutomationArmAcknowledgements.get(payload.token);
+    if (!pending || event.sender.id !== pending.contentsId) return;
+    const tab = this.tabs.get(pending.tabId);
+    const frame = event.senderFrame;
+    if (!tab || tab.view?.webContents !== event.sender || !frame || frame.detached || frame.isDestroyed()) return;
+    const expectedIdentity = pending.expectedFrames.get(frame.frameTreeNodeId);
+    if (!expectedIdentity || expectedIdentity !== this.automationFrameIdentity(frame)) return;
+    pending.acknowledgedFrames.add(frame.frameTreeNodeId);
+    if (pending.acknowledgedFrames.size === pending.expectedFrames.size) pending.settle();
+  }
+
+  private handleAutomationInputArmed = (event: IpcMainEvent, payload?: { token?: unknown }): void => {
+    this.acknowledgeAutomationInputArm(event, payload);
+  };
+
   private handlePageGesture = (
     event: IpcMainEvent,
-    payload?: { token?: unknown; kind?: unknown; data?: unknown },
+    payload?: { token?: unknown; kind?: unknown; data?: unknown; key?: unknown },
   ): void => {
     const tabId = this.webContentsToTab.get(event.sender.id);
     const tab = tabId ? this.tabs.get(tabId) : undefined;
@@ -6330,31 +10536,110 @@ export class BrowserManager {
         : undefined;
     if (typeof payload?.token === 'string') {
       const pending = this.automationGestureTokens.get(payload.token);
-      if (
-        !pending ||
-        pending.expiresAt < at ||
-        pending.tabId !== tab.shell.id ||
-        pending.assistantOwnerId !== tab.aiControlOwnerId ||
-        (pending.inputData !== undefined &&
-          (typeof payload.data !== 'string' ||
-            payload.data.length > MAX_BROWSER_TYPED_VALUE_CHARS ||
-            payload.data !== pending.inputData))
-      ) {
-        if (pending?.expiresAt !== undefined && pending.expiresAt < at) {
-          this.automationGestureTokens.delete(payload.token);
-        }
+      if (!pending) {
+        this.publishAutomationGestureDisarm(event.sender, payload.token);
         event.returnValue = false;
         return;
       }
-      this.automationGestureTokens.delete(payload.token);
-      tab.popupGesture = {
-        source: 'assistant',
-        assistantOwnerId: pending.assistantOwnerId,
-        expiresAt: at + POPUP_GESTURE_PROVENANCE_MS,
-        frameTreeNodeId: event.senderFrame?.frameTreeNodeId,
+      if (
+        pending.confirmed ||
+        pending.dispatchStarted === false ||
+        pending.expiresAt < at ||
+        pending.tabId !== tab.shell.id ||
+        pending.contentsId !== event.sender.id ||
+        pending.assistantOwnerId !== tab.aiControlOwnerId
+      ) {
+        if (pending.expiresAt < at) this.revokeAutomationGestureToken(payload.token);
+        else if (pending.dispatchStarted) this.publishAutomationGestureDisarm(event.sender, payload.token);
+        event.returnValue = false;
+        return;
+      }
+      if (
+        pending.inputData !== undefined &&
+        (pending.kind === 'keydown'
+          ? typeof payload.key !== 'string' ||
+            payload.key.length > MAX_BROWSER_TYPED_VALUE_CHARS ||
+            payload.key !== pending.inputData
+          : typeof payload.data !== 'string' ||
+            payload.data.length > MAX_BROWSER_TYPED_VALUE_CHARS ||
+            payload.data !== pending.inputData)
+      ) {
+        event.returnValue = false;
+        return;
+      }
+      if (pending.armedFrames) {
+        const frame = event.senderFrame;
+        const expectedIdentity = frame ? pending.armedFrames.get(frame.frameTreeNodeId) : undefined;
+        if (
+          !frame ||
+          frame.detached ||
+          frame.isDestroyed() ||
+          !expectedIdentity ||
+          expectedIdentity !== this.automationFrameIdentity(frame)
+        ) {
+          // Keep the main token until the dispatching operation observes the
+          // missing confirmation. The preload immediately re-reports the event
+          // without a token; retaining this background marker makes that second
+          // report fail closed instead of manufacturing real-user provenance.
+          event.returnValue = false;
+          return;
+        }
+      }
+      pending.confirmed = true;
+      pending.settleConfirmation?.(true);
+      // The exact preload acknowledgement is authoritative even if the CDP
+      // command promise is slow to settle. Cancel the destructive attribution
+      // deadline now; otherwise its timer could reclaim a healthy hidden page
+      // after Chromium already delivered and attributed the input correctly.
+      this.confirmDispatchedSyntheticInput(event.sender.id, payload.token);
+      // Every frame receives a copy because Chromium chooses the eventual input
+      // target. Once the exact target confirms, revoke sibling copies before a
+      // later real gesture can mistake one for a current automation arm.
+      this.publishAutomationGestureDisarm(event.sender, payload.token);
+      this.rememberAssistantGesture(
+        tab,
+        pending.assistantOwnerId,
+        at + POPUP_GESTURE_PROVENANCE_MS,
         kind,
-      };
+        event.senderFrame?.frameTreeNodeId,
+      );
     } else {
+      const dispatchedSyntheticInput = this.dispatchedSyntheticInputs.get(event.sender.id);
+      if (
+        dispatchedSyntheticInput?.tabId === tab.shell.id &&
+        (kind === undefined || dispatchedSyntheticInput.kind === kind)
+      ) {
+        // A foreground sendInputEvent can reach the trusted DOM listener after
+        // its one-shot page token expires or after cancellation has begun.
+        // Preserve the tombstone until confirmation or WebContents teardown so
+        // that delayed automation can never manufacture user popup provenance.
+        event.returnValue = false;
+        return;
+      }
+      const unattributedBackgroundDispatch = [...this.automationGestureTokens.values()].some(
+        (pending) =>
+          pending.tabId === tab.shell.id &&
+          pending.contentsId === event.sender.id &&
+          pending.detachedArm === true &&
+          !pending.confirmed &&
+          pending.expiresAt >= at &&
+          (kind === undefined || pending.kind === kind),
+      );
+      if (unattributedBackgroundDispatch) {
+        // A detached page cannot receive genuine user input. This is an armed
+        // CDP event that landed in an unacknowledged replacement frame (or failed
+        // exact-data validation), so never upgrade it to user provenance.
+        event.returnValue = false;
+        return;
+      }
+      if (!this.isTargetViewInteractive(tab, event.sender)) {
+        // A detached, hidden, blurred, or background-throttled page cannot be
+        // the target of genuine user input. An expired automation token may be
+        // omitted by the preload's follow-up report, so surface interactivity
+        // is the final provenance boundary rather than absence of a live token.
+        event.returnValue = false;
+        return;
+      }
       // Exact automation events carry their one-shot token. Any other trusted
       // pointer/key/wheel/touch gesture is real user input, including input
       // concurrent with an active assistant operation. (The page preload
@@ -6464,8 +10749,30 @@ export class BrowserManager {
   ): void => {
     const tabId = this.webContentsToTab.get(contents.id);
     const tab = tabId ? this.tabs.get(tabId) : undefined;
+    if (this.validatingProxy?.isAuthenticationChallenge(authInfo)) {
+      event.preventDefault();
+      const trustedUserNavigationAuth = tab ? this.trustedUserNavigationAuthRequest(tab, details.url) : false;
+      // Proxy credentials are one-shot connection capabilities. A restricted
+      // credential marks the exact request, while BrowserValidatingProxy also
+      // elevates every same-host connection for the restriction's lifetime so
+      // an older unrestricted credential cannot reuse a tunnel around it.
+      const restrictPrivateNetwork =
+        this.aiAllowPrivateNetwork === false && (!tab || (tab.aiNetworkRestricted && !trustedUserNavigationAuth));
+      const credentials = this.validatingProxy.credentials(restrictPrivateNetwork);
+      callback(credentials.username, credentials.password);
+      return;
+    }
     if (!tab) return;
     event.preventDefault();
+    const trustedUserNavigationAuth = this.trustedUserNavigationAuthRequest(tab, details.url);
+    if (tab.aiNetworkRestricted && !trustedUserNavigationAuth) {
+      // HTTP-auth callbacks block navigation itself. Assistant-controlled loads
+      // must terminate without waiting for Browser chrome to mount; the user can
+      // authenticate only when this challenge belongs to the exact main-frame
+      // target (or redirect) claimed by an explicit user navigation.
+      callback();
+      return;
+    }
     const endpoint = browserAuthEndpoint(details, authInfo);
     const duplicate = [...this.pendingAuth.values()].some(
       (pending) =>
@@ -6488,7 +10795,7 @@ export class BrowserManager {
       authScheme: authInfo.scheme,
       realm: authInfo.realm,
       isProxy: authInfo.isProxy,
-      assistantTriggered: tab.aiNetworkRestricted,
+      assistantTriggered: tab.aiNetworkRestricted && !trustedUserNavigationAuth,
     };
     const timer = setTimeout(() => {
       this.finishPendingAuth(id);
@@ -6499,6 +10806,13 @@ export class BrowserManager {
       conversationId: tab.shell.conversationId,
       scopeKey: tab.scopeKey,
       tabGeneration: tab.generation,
+      ...(trustedUserNavigationAuth
+        ? {
+            trustedUserNavigationLease: tab.trustedUserNavigationLease,
+            trustedUserNavigationRequestId: trustedUserNavigationAuth.requestId,
+            trustedUserNavigationUrl: trustedUserNavigationAuth.url,
+          }
+        : {}),
       prompt,
       callback,
       timer,
@@ -6509,6 +10823,34 @@ export class BrowserManager {
       prompt,
     });
   };
+
+  /** Electron's app-level login event exposes a WebContents and URL but not the
+   * network request id. Admit the ordinary user-auth prompt only when the exact
+   * request claimed by Browser chrome is still the sole active request for that
+   * URL and is still a main-frame navigation. A delayed fetch from the previous
+   * document to the same URL therefore cannot inherit the user's credentials. */
+  private trustedUserNavigationAuthRequest(
+    tab: InternalTab,
+    challengedUrl: string,
+  ): { requestId: number; url: string } | null {
+    const requestId = tab.trustedUserNavigationRequestId;
+    if (
+      requestId === null ||
+      !isTrustedUserNavigationTarget(tab.trustedUserNavigation, tab.trustedUserNavigationTarget, challengedUrl) ||
+      tab.activeNetworkRequests?.get(requestId) !== 'mainFrame'
+    ) {
+      return null;
+    }
+    const activeUrl = tab.activeNetworkRequestUrls?.get(requestId);
+    const comparableChallenge = comparablePopupReferrerUrl(challengedUrl);
+    if (!activeUrl || !comparableChallenge || comparablePopupReferrerUrl(activeUrl) !== comparableChallenge) {
+      return null;
+    }
+    for (const [candidateId, candidateUrl] of tab.activeNetworkRequestUrls ?? []) {
+      if (candidateId !== requestId && comparablePopupReferrerUrl(candidateUrl) === comparableChallenge) return null;
+    }
+    return { requestId, url: activeUrl };
+  }
 
   private handleSelectClientCertificate = (
     event: Electron.Event,
@@ -6582,106 +10924,81 @@ export class BrowserManager {
     }
     const overlayGeneration = ++tab.overlayGeneration;
     const contents = tab.view?.webContents;
-    if (!contents || contents.isDestroyed()) return;
-    const payload = action
-      ? {
-          status: action.status,
-          summary: action.summary ?? action.kind,
-          x: action.x,
-          y: action.y,
-        }
-      : null;
-    const previousKey = tab.overlayCssKey;
-    const previousCssText = tab.overlayCssText;
-    tab.overlayCssKey = null;
-    tab.overlayCssText = null;
-    let previousOverlayRemoved = false;
+    const previousOverlay = tab.automationOverlay;
+    tab.automationOverlay = null;
     try {
-      if (previousKey) {
-        await this.runRendererOperationWithDeadline(
-          tab,
-          contents,
-          'Browser automation overlay',
-          AUTOMATION_OVERLAY_TIMEOUT_MS,
-          () => contents.removeInsertedCSS(previousKey),
-          abortSignal,
-          documentLease,
-        );
-        previousOverlayRemoved = true;
-      }
-      if (payload) {
-        const label = JSON.stringify(`Kai · ${String(payload.summary).slice(0, 256)}`);
-        const cursorVisible = Number.isFinite(payload.x) && Number.isFinite(payload.y);
-        const css = `
-html::before {
-  content: ${label} !important;
-  display: block !important;
-  position: fixed !important;
-  z-index: 2147483647 !important;
-  pointer-events: none !important;
-  right: 10px !important;
-  bottom: 10px !important;
-  max-width: 75% !important;
-  padding: 6px 9px !important;
-  border-radius: 8px !important;
-  color: white !important;
-  background: rgba(28,25,23,.88) !important;
-  box-shadow: 0 4px 18px rgba(0,0,0,.25) !important;
-  font: 12px -apple-system,BlinkMacSystemFont,sans-serif !important;
-  white-space: pre-wrap !important;
-}
-html::after {
-  content: '' !important;
-  display: ${cursorVisible ? 'block' : 'none'} !important;
-  position: fixed !important;
-  z-index: 2147483647 !important;
-  pointer-events: none !important;
-  left: ${cursorVisible ? payload.x : 0}px !important;
-  top: ${cursorVisible ? payload.y : 0}px !important;
-  width: 18px !important;
-  height: 18px !important;
-  border: 2px solid #8b5cf6 !important;
-  border-radius: 50% !important;
-  background: rgba(139,92,246,.18) !important;
-  transform: translate(-50%,-50%) !important;
-  transition: left 120ms linear, top 120ms linear !important;
-}`;
-        const key = await this.runRendererOperationWithDeadline(
-          tab,
-          contents,
-          'Browser automation overlay',
-          AUTOMATION_OVERLAY_TIMEOUT_MS,
-          () => contents.insertCSS(css, { cssOrigin: 'user' }),
-          abortSignal,
-          documentLease,
-        );
-        if (
-          typeof key !== 'string' ||
-          tab.overlayGeneration !== overlayGeneration ||
-          this.tabs.get(tab.shell.id) !== tab ||
-          tab.view?.webContents !== contents
-        ) {
-          if (typeof key === 'string') await contents.removeInsertedCSS(key).catch(() => undefined);
-          return;
+      if (previousOverlay) {
+        try {
+          if (
+            !previousOverlay.contents.isDestroyed() &&
+            previousOverlay.contents.debugger.isAttached() &&
+            tab.view?.webContents === previousOverlay.contents
+          ) {
+            await this.runRendererOperationWithDeadline(
+              tab,
+              previousOverlay.contents,
+              'Browser automation overlay',
+              AUTOMATION_OVERLAY_TIMEOUT_MS,
+              () => previousOverlay.contents.debugger.sendCommand('Overlay.hideHighlight'),
+              abortSignal,
+              documentLease,
+              false,
+            );
+          }
+        } finally {
+          previousOverlay.releaseDebugger();
         }
-        tab.overlayCssKey = key;
-        tab.overlayCssText = css;
       }
-    } catch (error) {
-      if (
-        previousKey &&
-        !previousOverlayRemoved &&
-        tab.overlayGeneration === overlayGeneration &&
-        this.tabs.get(tab.shell.id) === tab &&
-        tab.view?.webContents === contents &&
-        !tab.overlayCssKey
-      ) {
-        tab.overlayCssKey = previousKey;
-        tab.overlayCssText = previousCssText;
+      if (!contents || contents.isDestroyed()) return;
+      const renderCursor =
+        !!action &&
+        this.attachedView === tab.view &&
+        this.isHostWindowShown() &&
+        Number.isFinite(action.x) &&
+        Number.isFinite(action.y);
+      if (renderCursor) {
+        const overlay: BrowserAutomationOverlay = {
+          contents,
+          releaseDebugger: this.acquireBrowserDebugger(contents),
+          x: action.x!,
+          y: action.y!,
+        };
+        let retained = false;
+        try {
+          await this.runRendererOperationWithDeadline(
+            tab,
+            contents,
+            'Browser automation overlay',
+            AUTOMATION_OVERLAY_TIMEOUT_MS,
+            async () => {
+              await contents.debugger.sendCommand('DOM.enable');
+              await contents.debugger.sendCommand('Overlay.enable');
+              await this.showAutomationCursor(overlay);
+            },
+            abortSignal,
+            documentLease,
+            false,
+          );
+          if (
+            tab.overlayGeneration !== overlayGeneration ||
+            this.tabs.get(tab.shell.id) !== tab ||
+            tab.view?.webContents !== contents
+          ) {
+            if (!contents.isDestroyed() && contents.debugger.isAttached()) {
+              await contents.debugger.sendCommand('Overlay.hideHighlight').catch(() => undefined);
+            }
+            return;
+          }
+          tab.automationOverlay = overlay;
+          retained = true;
+        } finally {
+          if (!retained) overlay.releaseDebugger();
+        }
       }
-      // Running automation must never continue invisibly. Completion/failure
-      // labels and timer cleanup remain best-effort after the action has ended.
-      if (action?.status === 'running') throw error;
+    } catch {
+      // The compositor cursor is presentation only. A stalled or unavailable
+      // DevTools overlay must never fail automation or reclaim its healthy page;
+      // the Browser toolbar still carries the live action status.
     }
     if (action && action.status !== 'running' && this.tabs.get(tab.shell.id) === tab) {
       tab.overlayTimer = setTimeout(() => {
@@ -6693,13 +11010,24 @@ html::after {
     }
   }
 
+  private showAutomationCursor(overlay: BrowserAutomationOverlay): Promise<unknown> {
+    return overlay.contents.debugger.sendCommand('Overlay.highlightRect', {
+      x: Math.round(overlay.x - 9),
+      y: Math.round(overlay.y - 9),
+      width: 18,
+      height: 18,
+      color: { r: 139, g: 92, b: 246, a: 0.18 },
+      outlineColor: { r: 139, g: 92, b: 246, a: 1 },
+    });
+  }
+
   private serializeVisibleAssistantOperation<T>(
     conversationId: string,
     tab: InternalTab,
     assistantRun: BrowserAssistantRun,
     operation: () => Promise<T>,
   ): Promise<T> {
-    return this.visibleAssistantQueue.run(() => {
+    return Promise.resolve().then(() => {
       throwIfBrowserAborted(assistantRun.abortSignal);
       this.assertHostRendererOperationCurrent();
       this.assertScopeAvailable(tab.scopeKey);
@@ -6718,7 +11046,7 @@ html::after {
     conversationId: string,
     tab: InternalTab,
     assistantRun: BrowserAssistantRun,
-    kind: Extract<BrowserActionEvent['kind'], 'inspect' | 'evaluate' | 'screenshot' | 'autofill'>,
+    kind: Extract<BrowserActionEvent['kind'], 'inspect' | 'network' | 'evaluate' | 'screenshot' | 'autofill'>,
     summary: string,
     operation: (reveal: (contents: WebContents, documentLease: AssistantDocumentLease) => Promise<void>) => Promise<T>,
   ): Promise<T> {
@@ -6731,7 +11059,7 @@ html::after {
     conversationId: string,
     tab: InternalTab,
     assistantRun: BrowserAssistantRun,
-    kind: Extract<BrowserActionEvent['kind'], 'inspect' | 'evaluate' | 'screenshot' | 'autofill'>,
+    kind: Extract<BrowserActionEvent['kind'], 'inspect' | 'network' | 'evaluate' | 'screenshot' | 'autofill'>,
     summary: string,
     operation: (reveal: (contents: WebContents, documentLease: AssistantDocumentLease) => Promise<void>) => Promise<T>,
   ): Promise<T> {
@@ -6746,26 +11074,19 @@ html::after {
       summary,
     };
     this.runningActions.set(action.id, { conversationId, action });
-    const previousActiveId = this.activeTabs.get(conversationId);
-    if (previousActiveId && previousActiveId !== tab.shell.id) {
-      this.invalidateVisibleAssistantOperations(this.tabs.get(previousActiveId));
-    }
-    this.activeTabs.set(conversationId, tab.shell.id);
     tab.lastUsedAt = Date.now();
     this.emitTabs(conversationId);
-    this.emit({ type: 'open-panel', conversationId, tabId: tab.shell.id });
     this.emit({ type: 'action', conversationId, action: { ...action } });
 
     const reveal = async (contents: WebContents, documentLease: AssistantDocumentLease): Promise<void> => {
       throwIfBrowserAborted(abortSignal);
       this.assertAssistantDocumentLease(tab, documentLease);
       if (tab.view?.webContents !== contents || contents.isDestroyed()) {
-        throw new Error('The browser page changed before the assistant operation became visible.');
+        throw new Error('The browser page changed before the assistant operation was ready.');
       }
-      await this.waitForVisibleAssistantOperationView(tab, tab.view, abortSignal, documentLease);
-      documentLease.visibleAssistantGeneration = tab.visibleAssistantGeneration ?? 0;
+      const presented = await this.prepareAssistantOperationView(tab, tab.view, abortSignal, documentLease);
       this.assertAssistantDocumentLease(tab, documentLease);
-      await this.setAutomationOverlay(tab, action, abortSignal, documentLease);
+      if (presented) await this.setAutomationOverlay(tab, action, abortSignal, documentLease);
     };
 
     try {
@@ -6827,8 +11148,7 @@ html::after {
         const name = request.name ?? null;
         const text = request.kind === 'type' ? null : (request.text ?? null);
         const globalKey = `__kai_browser_target_${randomUUID().replaceAll('-', '')}`;
-        const wasAttached = contents.debugger.isAttached();
-        if (!wasAttached) contents.debugger.attach('1.3');
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
         let retained = false;
         try {
           const frameTree = (await contents.debugger.sendCommand('Page.getFrameTree')) as {
@@ -6921,13 +11241,11 @@ html::after {
             semanticLease: {
               contextId: isolatedWorld.executionContextId!,
               globalKey,
-              detachDebugger: !wasAttached,
+              releaseDebugger,
             },
           };
         } finally {
-          if (!retained && !wasAttached && !contents.isDestroyed() && contents.debugger.isAttached()) {
-            contents.debugger.detach();
-          }
+          if (!retained) releaseDebugger();
         }
       },
       abortSignal,
@@ -6946,8 +11264,7 @@ html::after {
     if (points.length > MAX_BROWSER_INSPECTION_OCCLUSION_POINTS) {
       throw new Error('Browser occlusion validation exceeded its safe point limit.');
     }
-    const wasAttached = contents.debugger.isAttached();
-    if (!wasAttached) contents.debugger.attach('1.3');
+    const releaseDebugger = this.acquireBrowserDebugger(contents);
     try {
       for (const point of points) {
         if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.y < 0) {
@@ -7023,7 +11340,7 @@ html::after {
         }
       }
     } finally {
-      if (!wasAttached && !contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
+      releaseDebugger();
     }
   }
 
@@ -7136,9 +11453,7 @@ html::after {
           .catch(() => undefined);
       }
     } finally {
-      if (lease.detachDebugger && !contents.isDestroyed() && contents.debugger.isAttached()) {
-        contents.debugger.detach();
-      }
+      lease.releaseDebugger?.();
     }
   }
 
@@ -7151,7 +11466,7 @@ html::after {
     request = parseBrowserActionRequest(request);
     const abortSignal = assistantRun.abortSignal;
     throwIfBrowserAborted(abortSignal);
-    const tab = this.requireTab(conversationId, request.tabId);
+    const tab = this.requireAssistantTab(conversationId, assistantRun, request.tabId);
     if (request.kind === 'press') {
       const keys = (request.keys?.length ? request.keys : [request.text ?? 'Enter']).map((key) => key.toLowerCase());
       if (isClipboardShortcutKeys(keys)) {
@@ -7172,358 +11487,621 @@ html::after {
       startedAt: now(),
       summary: request.kind,
     };
-    // Physical actions are intentionally allowed to run while the user can
-    // still interact with the page. Treat any trusted user gesture after this
-    // operation is requested as invalidating coordinates/focus that were
-    // resolved while waiting for the tab queue, renderer, or overlay.
-    const physicalActionGestureGeneration = [
-      'click',
-      'doubleClick',
-      'hover',
-      'focus',
-      'type',
-      'press',
-      'scroll',
-      'drag',
-    ].includes(request.kind)
-      ? tab.trustedGestureGeneration
-      : null;
-    const physicalActionPanelGeneration =
-      physicalActionGestureGeneration === null ? null : this.panelAuthorityGeneration(conversationId);
-    const physicalActionLayoutGeneration =
-      physicalActionGestureGeneration === null ? null : this.panelLayoutGeneration(conversationId);
-    const assertPhysicalActionGestureLease = (): void => {
-      if (
-        physicalActionPanelGeneration !== null &&
-        this.panelAuthorityGeneration(conversationId) !== physicalActionPanelGeneration
-      ) {
-        throw new Error(
-          'The Browser panel visibility changed while the assistant action was waiting. Retry the action.',
-        );
-      }
-      if (
-        physicalActionLayoutGeneration !== null &&
-        this.panelLayoutGeneration(conversationId) !== physicalActionLayoutGeneration
-      ) {
-        throw new Error(
-          'The Browser panel layout or page zoom changed while the assistant action was waiting. Retry the action.',
-        );
-      }
-      if (
-        physicalActionGestureGeneration !== null &&
-        tab.trustedGestureGeneration !== physicalActionGestureGeneration
-      ) {
-        throw new Error(
-          request.kind === 'type'
-            ? 'The user changed browser focus while assistant typing was waiting. Retry the action.'
-            : 'The user interacted with the browser while the assistant action was waiting. Retry the action.',
-        );
-      }
-    };
+    const emptyTypeAction = request.kind === 'type' && (request.value ?? request.text ?? '').length === 0;
+    const hasRawCoordinates =
+      request.x !== undefined || request.y !== undefined || request.endX !== undefined || request.endY !== undefined;
+    const hasTarget = browserActionHasTarget(request);
+    const needsStableTargetSurface =
+      hasTarget && ['click', 'doubleClick', 'hover', 'focus', 'type', 'drag', 'scroll'].includes(request.kind);
     this.runningActions.set(action.id, { conversationId, action });
+    if (emptyTypeAction) {
+      // Chromium does not emit an input event for an empty insertText payload.
+      // Treat it as a true no-op before resolving, focusing, arming, or mounting
+      // a target so background automation cannot wait forever for an event that
+      // will never exist.
+      this.emit({ type: 'action', conversationId, action: { ...action } });
+      action.status = 'completed';
+      action.completedAt = now();
+      this.runningActions.delete(action.id);
+      this.emit({ type: 'action', conversationId, action: { ...action } });
+      return {
+        ok: true,
+        tab: this.snapshotTab(tab, this.activeTabs.get(conversationId) === tab.shell.id),
+      };
+    }
     try {
       await this.serializeVisibleAssistantOperation(conversationId, tab, assistantRun, () =>
         this.runTabOperation(tab, () =>
-          this.withAssistantControl(tab, assistantRun, async (documentLease) => {
-            throwIfBrowserAborted(abortSignal);
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            assertPhysicalActionGestureLease();
-            // AI actions always become the visible tab before their running event,
-            // so cursor, typing, scrolling, and status updates are observable live.
-            const previousActiveId = this.activeTabs.get(conversationId);
-            if (previousActiveId && previousActiveId !== tab.shell.id) {
-              this.invalidateVisibleAssistantOperations(this.tabs.get(previousActiveId));
-            }
-            this.activeTabs.set(conversationId, tab.shell.id);
-            tab.lastUsedAt = Date.now();
-            this.emitTabs(conversationId);
-            this.emit({
-              type: 'open-panel',
-              conversationId,
-              tabId: tab.shell.id,
-            });
-            this.emit({ type: 'action', conversationId, action });
-            const view = await this.ensureAssistantView(tab, assistantRun, documentLease);
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            assertPhysicalActionGestureLease();
-            if (physicalActionGestureGeneration !== null) {
-              await this.waitForPhysicalActionView(
-                tab,
-                view,
-                abortSignal,
-                documentLease,
-                assertPhysicalActionGestureLease,
-              );
-            } else {
-              await this.waitForVisibleAssistantOperationView(tab, view, abortSignal, documentLease);
-            }
-            documentLease.visibleAssistantGeneration = tab.visibleAssistantGeneration ?? 0;
-            this.assertAssistantDocumentLease(tab, documentLease);
-            const contents = view.webContents;
-            let point: {
-              x: number;
-              y: number;
-              width: number;
-              height: number;
-              semanticLease?: BrowserSemanticTargetLease;
-            } | null = null;
-            try {
-              const hasTarget = browserActionHasTarget(request);
-              if (browserActionRequiresTarget(request.kind) && !hasTarget) {
-                throw new Error(`${request.kind} requires coordinates or a semantic target.`);
-              }
-              if (
-                ['click', 'doubleClick', 'hover', 'focus', 'type', 'drag'].includes(request.kind) ||
-                (request.kind === 'scroll' && hasTarget)
-              ) {
-                point = await this.locate(tab, contents, request, abortSignal, documentLease);
-                action.x = point.x;
-                action.y = point.y;
-                await this.setAutomationOverlay(tab, action, abortSignal, documentLease);
-              }
+          this.withAssistantControl(
+            tab,
+            assistantRun,
+            async (documentLease) => {
               throwIfBrowserAborted(abortSignal);
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              // Action events identify their target tab without changing the
+              // user's presentation-active tab. If the user is already watching
+              // this tab the input remains live; otherwise it uses the hidden
+              // deterministic surface and the tab strip shows its action status.
+              tab.lastUsedAt = Date.now();
+              this.emitTabs(conversationId);
+              this.emit({ type: 'action', conversationId, action });
+              const view = await this.ensureAssistantView(
+                tab,
+                assistantRun,
+                documentLease,
+                undefined,
+                approvedDocument,
+              );
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              const presented = await this.prepareAssistantOperationView(tab, view, abortSignal, documentLease);
               this.assertAssistantDocumentLease(tab, documentLease);
-              assertPhysicalActionGestureLease();
-              const zoomFactor = contents.getZoomFactor();
-              if (point) {
-                point = await this.validateLocatedTarget(tab, contents, point, {}, abortSignal, documentLease);
-                action.x = point.x;
-                action.y = point.y;
-              }
-              let inputPoint = point ? scaleBrowserPointForZoom(point, zoomFactor) : null;
-              const refreshLocatedTarget = async (options: { focus?: boolean; requireFocused?: boolean } = {}) => {
-                if (!point) return;
-                point = await this.validateLocatedTarget(tab, contents, point, options, abortSignal, documentLease);
-                inputPoint = scaleBrowserPointForZoom(point, zoomFactor);
-                action.x = point.x;
-                action.y = point.y;
-                this.assertAssistantDocumentLease(tab, documentLease);
-                assertPhysicalActionGestureLease();
+              const contents = view.webContents;
+              // Locate and dispatch against one native surface. Semantic targets
+              // can be revalidated after zoom, but sidebar unmount/minimize must
+              // not resize their viewport between location and attributed input.
+              const coordinateLease: BrowserInputCoordinateLease | null = needsStableTargetSurface
+                ? this.captureInputCoordinateLease(view, hasRawCoordinates)
+                : null;
+              const assertCoordinateLease = (): void => {
+                if (!coordinateLease) return;
+                this.assertInputCoordinateLease(view, coordinateLease);
               };
+              const assertInputContinuation = (): void => {
+                throwIfBrowserAborted(abortSignal);
+                this.assertAssistantDocumentLease(tab, documentLease);
+                assertCoordinateLease();
+              };
+              let point: {
+                x: number;
+                y: number;
+                width: number;
+                height: number;
+                semanticLease?: BrowserSemanticTargetLease;
+              } | null = null;
+              try {
+                assertCoordinateLease();
+                if (browserActionRequiresTarget(request.kind) && !hasTarget) {
+                  throw new Error(`${request.kind} requires coordinates or a semantic target.`);
+                }
+                if (
+                  ['click', 'doubleClick', 'hover', 'focus', 'type', 'drag'].includes(request.kind) ||
+                  (request.kind === 'scroll' && hasTarget)
+                ) {
+                  point = await this.locate(tab, contents, request, abortSignal, documentLease);
+                  action.x = point.x;
+                  action.y = point.y;
+                  if (presented) await this.setAutomationOverlay(tab, action, abortSignal, documentLease);
+                }
+                throwIfBrowserAborted(abortSignal);
+                this.assertAssistantDocumentLease(tab, documentLease);
+                assertCoordinateLease();
+                const validateInputTarget = async (
+                  target: BrowserLocatedTarget,
+                  options: { focus?: boolean; requireFocused?: boolean } = {},
+                ): Promise<BrowserLocatedTarget> =>
+                  // The live cursor is a compositor-owned DevTools highlight, not
+                  // a DOM hit-test participant. Author overlays remain visible to
+                  // the validation probes and are still rejected.
+                  this.validateLocatedTarget(tab, contents, target, options, abortSignal, documentLease);
+                if (point) {
+                  point = await validateInputTarget(point);
+                  action.x = point.x;
+                  action.y = point.y;
+                }
+                assertCoordinateLease();
+                let inputPoint = point ? scaleBrowserPointForZoom(point, contents.getZoomFactor()) : null;
+                const refreshLocatedTarget = async (options: { focus?: boolean; requireFocused?: boolean } = {}) => {
+                  if (!point) return;
+                  point = await validateInputTarget(point, options);
+                  assertCoordinateLease();
+                  inputPoint = scaleBrowserPointForZoom(point, contents.getZoomFactor());
+                  action.x = point.x;
+                  action.y = point.y;
+                  this.assertAssistantDocumentLease(tab, documentLease);
+                };
+                const refreshStationaryLocatedTarget = async (
+                  options: { focus?: boolean; requireFocused?: boolean } = {},
+                ): Promise<void> => {
+                  if (!point) {
+                    assertInputContinuation();
+                    return;
+                  }
+                  const armedGeometry = {
+                    x: point.x,
+                    y: point.y,
+                    width: point.width,
+                    height: point.height,
+                  };
+                  await refreshLocatedTarget(options);
+                  if (
+                    point.x !== armedGeometry.x ||
+                    point.y !== armedGeometry.y ||
+                    point.width !== armedGeometry.width ||
+                    point.height !== armedGeometry.height
+                  ) {
+                    throw new Error(
+                      'The requested browser target moved while background input was being armed. Retry the action.',
+                    );
+                  }
+                  assertInputContinuation();
+                };
 
-              switch (request.kind) {
-                case 'navigate':
-                  await this.navigate(
-                    conversationId,
-                    tab.shell.id,
-                    request.url ?? request.text ?? '',
-                    'assistant',
-                    assistantRun,
-                    documentLease.visibleAssistantGeneration,
-                  );
-                  break;
-                case 'back':
-                case 'forward':
-                case 'reload':
-                case 'stop':
-                  await this.commandTabWithinOperation(tab, request.kind, 'assistant', assistantRun, documentLease);
-                  break;
-                case 'click':
-                case 'doubleClick': {
-                  contents.sendInputEvent({
-                    type: 'mouseMove',
-                    x: Math.round(inputPoint!.x),
-                    y: Math.round(inputPoint!.y),
-                  });
-                  const clicks = request.kind === 'doubleClick' ? [1, 2] : [1];
-                  for (const clickCount of clicks) {
-                    await refreshLocatedTarget();
-                    this.sendAttributedInputEvent(
+                switch (request.kind) {
+                  case 'navigate':
+                    await this.navigate(
+                      conversationId,
+                      tab.shell.id,
+                      request.url ?? request.text ?? '',
+                      'assistant',
+                      assistantRun,
+                      documentLease.visibleAssistantGeneration,
+                    );
+                    break;
+                  case 'back':
+                  case 'forward':
+                  case 'reload':
+                  case 'stop':
+                    await this.commandTabWithinOperation(tab, request.kind, 'assistant', assistantRun, documentLease);
+                    break;
+                  case 'click':
+                  case 'doubleClick': {
+                    assertCoordinateLease();
+                    await this.dispatchInputEvent(
                       tab,
                       contents,
-                      { kind: 'pointerdown', x: point!.x, y: point!.y },
                       {
-                        type: 'mouseDown',
-                        button: 'left',
+                        type: 'mouseMove',
                         x: Math.round(inputPoint!.x),
                         y: Math.round(inputPoint!.y),
+                      },
+                      {
+                        method: 'Input.dispatchMouseEvent',
+                        params: { type: 'mouseMoved', x: point!.x, y: point!.y },
+                      },
+                      abortSignal,
+                      documentLease,
+                    );
+                    const clicks = request.kind === 'doubleClick' ? [1, 2] : [1];
+                    for (const clickCount of clicks) {
+                      await refreshLocatedTarget();
+                      const pressedPoint = { x: point!.x, y: point!.y };
+                      const releasePoint = scaleBrowserPointForZoom(pressedPoint, contents.getZoomFactor());
+                      const releaseEvent: Electron.MouseInputEvent = {
+                        type: 'mouseUp',
+                        button: 'left',
+                        x: Math.round(releasePoint.x),
+                        y: Math.round(releasePoint.y),
                         clickCount,
+                      };
+                      const releaseCommand: BrowserCdpInputCommand = {
+                        method: 'Input.dispatchMouseEvent',
+                        params: {
+                          type: 'mouseReleased',
+                          button: 'left',
+                          buttons: 0,
+                          x: pressedPoint.x,
+                          y: pressedPoint.y,
+                          clickCount,
+                        },
+                      };
+                      let pressed = false;
+                      try {
+                        await this.sendAttributedInputEvent(
+                          tab,
+                          contents,
+                          { kind: 'pointerdown', x: pressedPoint.x, y: pressedPoint.y },
+                          {
+                            type: 'mouseDown',
+                            button: 'left',
+                            x: Math.round(inputPoint!.x),
+                            y: Math.round(inputPoint!.y),
+                            clickCount,
+                          },
+                          {
+                            method: 'Input.dispatchMouseEvent',
+                            params: {
+                              type: 'mousePressed',
+                              button: 'left',
+                              buttons: 1,
+                              x: pressedPoint.x,
+                              y: pressedPoint.y,
+                              clickCount,
+                            },
+                          },
+                          abortSignal,
+                          documentLease,
+                          () => refreshStationaryLocatedTarget(),
+                          () => {
+                            pressed = true;
+                          },
+                        );
+                        // Page handlers run before CDP resolves and may navigate or
+                        // accept concurrent user input. Never release into a
+                        // replacement document or a changed coordinate surface.
+                        assertInputContinuation();
+                        await this.dispatchInputEvent(
+                          tab,
+                          contents,
+                          releaseEvent,
+                          releaseCommand,
+                          abortSignal,
+                          documentLease,
+                        );
+                        pressed = false;
+                      } finally {
+                        if (pressed) {
+                          await this.releaseInputIfDocumentCurrent(
+                            tab,
+                            contents,
+                            releaseEvent,
+                            releaseCommand,
+                            documentLease,
+                          );
+                        }
+                      }
+                    }
+                    break;
+                  }
+                  case 'hover':
+                    await refreshLocatedTarget();
+                    await this.dispatchInputEvent(
+                      tab,
+                      contents,
+                      {
+                        type: 'mouseMove',
+                        x: Math.round(inputPoint!.x),
+                        y: Math.round(inputPoint!.y),
+                      },
+                      {
+                        method: 'Input.dispatchMouseEvent',
+                        params: { type: 'mouseMoved', x: point!.x, y: point!.y },
+                      },
+                      abortSignal,
+                      documentLease,
+                    );
+                    break;
+                  case 'focus': {
+                    if (point!.semanticLease) {
+                      await refreshLocatedTarget({ focus: true, requireFocused: true });
+                    } else {
+                      const focused = await this.withAssistantScriptPopupAttribution(tab, () =>
+                        this.evaluateWithDeadline(
+                          tab,
+                          contents,
+                          browserFocusTargetScript(point!),
+                          abortSignal,
+                          documentLease,
+                        ),
+                      );
+                      if (!focused) {
+                        throw new Error('The requested browser target cannot receive focus.');
+                      }
+                    }
+                    break;
+                  }
+                  case 'type': {
+                    // Focus inside the document-bound isolated world. A synthetic
+                    // click can itself navigate, leaving a later insertText call to
+                    // target the replacement document before the final lease check.
+                    if (point!.semanticLease) {
+                      await refreshLocatedTarget({ focus: true, requireFocused: true });
+                    } else {
+                      const focused = await this.withAssistantScriptPopupAttribution(tab, () =>
+                        this.evaluateWithDeadline(
+                          tab,
+                          contents,
+                          browserFocusTargetScript(point!),
+                          abortSignal,
+                          documentLease,
+                        ),
+                      );
+                      if (!focused) throw new Error('The requested browser target cannot receive focus.');
+                    }
+                    this.assertAssistantDocumentLease(tab, documentLease);
+                    const insertedText = request.value ?? request.text ?? '';
+                    await refreshLocatedTarget({ requireFocused: true });
+                    assertInputContinuation();
+                    // A presented page remains open to concurrent user typing.
+                    // Bind the one-shot arm to the current trusted-input
+                    // generation and recheck it after every frame acknowledges
+                    // the arm, immediately before CDP inserts text. Hidden work
+                    // deliberately stays independent of foreground activity.
+                    const presentedGestureGeneration = this.isTargetViewPresented(tab, contents)
+                      ? (tab.trustedGestureGeneration ?? 0)
+                      : null;
+                    // Hidden text dispatch waits for every frame preload to arm.
+                    // Re-check the exact focused semantic target after that wait
+                    // so focus changes cannot redirect typed data.
+                    await this.insertAttributedText(
+                      tab,
+                      contents,
+                      insertedText,
+                      abortSignal,
+                      documentLease,
+                      async () => {
+                        if (
+                          presentedGestureGeneration !== null &&
+                          (tab.trustedGestureGeneration ?? 0) !== presentedGestureGeneration
+                        ) {
+                          throw new Error(
+                            'Browser input changed while assistant text input was being armed. Retry the action.',
+                          );
+                        }
+                        await refreshLocatedTarget({ requireFocused: true });
+                        assertInputContinuation();
                       },
                     );
-                    contents.sendInputEvent({
-                      type: 'mouseUp',
-                      button: 'left',
-                      x: Math.round(inputPoint!.x),
-                      y: Math.round(inputPoint!.y),
-                      clickCount,
-                    });
+                    break;
                   }
-                  break;
-                }
-                case 'hover':
-                  await refreshLocatedTarget();
-                  contents.sendInputEvent({
-                    type: 'mouseMove',
-                    x: Math.round(inputPoint!.x),
-                    y: Math.round(inputPoint!.y),
-                  });
-                  break;
-                case 'focus': {
-                  if (point!.semanticLease) {
-                    await refreshLocatedTarget({ focus: true, requireFocused: true });
-                  } else {
-                    const focused = await this.withAssistantScriptPopupAttribution(tab, () =>
-                      this.evaluateWithDeadline(
+                  case 'press': {
+                    const keys = request.keys?.length ? request.keys : [request.text ?? 'Enter'];
+                    const modifiers = keys
+                      .slice(0, -1)
+                      .map((key) => key.toLowerCase())
+                      .filter((key) => ['shift', 'control', 'ctrl', 'alt', 'meta', 'command', 'cmd'].includes(key))
+                      .map((key) =>
+                        key === 'ctrl' ? 'control' : key === 'command' || key === 'cmd' ? 'meta' : key,
+                      ) as Array<'shift' | 'control' | 'alt' | 'meta'>;
+                    const keyCode = keys.at(-1) ?? 'Enter';
+                    const keyDownParams = cdpKeyboardEventParams('keyDown', keyCode, modifiers);
+                    const attributedKey = typeof keyDownParams.key === 'string' ? keyDownParams.key : keyCode;
+                    const releaseEvent: Electron.KeyboardInputEvent = { type: 'keyUp', keyCode, modifiers };
+                    const releaseCommand: BrowserCdpInputCommand = {
+                      method: 'Input.dispatchKeyEvent',
+                      params: cdpKeyboardEventParams('keyUp', keyCode, modifiers),
+                    };
+                    // A key has no semantic/coordinate target to revalidate. If
+                    // this page is currently presented, bind the arm to the
+                    // real-user gesture generation immediately before arming so
+                    // a concurrent click/focus change cannot redirect the key to
+                    // a different control. Hidden work deliberately has no such
+                    // dependency: unrelated foreground activity must not cancel
+                    // a fully backgrounded browser operation.
+                    const presentedGestureGeneration = this.isTargetViewPresented(tab, contents)
+                      ? (tab.trustedGestureGeneration ?? 0)
+                      : null;
+                    let pressed = false;
+                    try {
+                      await this.sendAttributedInputEvent(
                         tab,
                         contents,
-                        browserFocusTargetScript(point!),
+                        // DOM KeyboardEvent.key reflects Chromium's normalized
+                        // value (for example Shift+1 => "!" and esc => "Escape").
+                        { kind: 'keydown', key: attributedKey },
+                        { type: 'keyDown', keyCode, modifiers },
+                        {
+                          method: 'Input.dispatchKeyEvent',
+                          params: keyDownParams,
+                        },
                         abortSignal,
                         documentLease,
-                      ),
-                    );
-                    if (!focused) {
-                      throw new Error('The requested browser target cannot receive focus.');
+                        async () => {
+                          assertInputContinuation();
+                          if (
+                            presentedGestureGeneration !== null &&
+                            (tab.trustedGestureGeneration ?? 0) !== presentedGestureGeneration
+                          ) {
+                            throw new Error(
+                              'Browser focus changed while assistant keyboard input was being armed. Retry the action.',
+                            );
+                          }
+                        },
+                        () => {
+                          pressed = true;
+                        },
+                      );
+                      assertInputContinuation();
+                      await this.dispatchInputEvent(
+                        tab,
+                        contents,
+                        releaseEvent,
+                        releaseCommand,
+                        abortSignal,
+                        documentLease,
+                      );
+                      pressed = false;
+                    } finally {
+                      if (pressed) {
+                        await this.releaseInputIfDocumentCurrent(
+                          tab,
+                          contents,
+                          releaseEvent,
+                          releaseCommand,
+                          documentLease,
+                        );
+                      }
                     }
+                    break;
                   }
-                  assertPhysicalActionGestureLease();
-                  break;
-                }
-                case 'type': {
-                  // Focus inside the document-bound isolated world. A synthetic
-                  // click can itself navigate, leaving a later insertText call to
-                  // target the replacement document before the final lease check.
-                  if (point!.semanticLease) {
-                    await refreshLocatedTarget({ focus: true, requireFocused: true });
-                  } else {
-                    const focused = await this.withAssistantScriptPopupAttribution(tab, () =>
-                      this.evaluateWithDeadline(
+                  case 'scroll': {
+                    await refreshLocatedTarget();
+                    assertCoordinateLease();
+                    const logicalScrollPoint = { x: point?.x ?? 10, y: point?.y ?? 10 };
+                    const scrollPoint = scaleBrowserPointForZoom(logicalScrollPoint, contents.getZoomFactor());
+                    await this.sendAttributedInputEvent(
+                      tab,
+                      contents,
+                      { kind: 'wheel', x: logicalScrollPoint.x, y: logicalScrollPoint.y },
+                      {
+                        type: 'mouseWheel',
+                        x: Math.round(scrollPoint.x),
+                        y: Math.round(scrollPoint.y),
+                        deltaX: request.deltaX ?? 0,
+                        deltaY: request.deltaY ?? 500,
+                      },
+                      {
+                        method: 'Input.dispatchMouseEvent',
+                        params: {
+                          type: 'mouseWheel',
+                          x: logicalScrollPoint.x,
+                          y: logicalScrollPoint.y,
+                          deltaX: request.deltaX ?? 0,
+                          deltaY: request.deltaY ?? 500,
+                        },
+                      },
+                      abortSignal,
+                      documentLease,
+                      () => refreshStationaryLocatedTarget(),
+                    );
+                    break;
+                  }
+                  case 'drag': {
+                    assertCoordinateLease();
+                    await this.dispatchInputEvent(
+                      tab,
+                      contents,
+                      {
+                        type: 'mouseMove',
+                        x: Math.round(inputPoint!.x),
+                        y: Math.round(inputPoint!.y),
+                      },
+                      {
+                        method: 'Input.dispatchMouseEvent',
+                        params: { type: 'mouseMoved', x: point!.x, y: point!.y },
+                      },
+                      abortSignal,
+                      documentLease,
+                    );
+                    await refreshLocatedTarget();
+                    const endX = request.endX ?? point!.x;
+                    const endY = request.endY ?? point!.y;
+                    if (!Number.isFinite(endX) || !Number.isFinite(endY)) {
+                      throw new Error('Drag endpoint coordinates must be finite.');
+                    }
+                    await this.validateLocatedTarget(
+                      tab,
+                      contents,
+                      { x: endX, y: endY, width: 1, height: 1 },
+                      {},
+                      abortSignal,
+                      documentLease,
+                    );
+                    assertCoordinateLease();
+                    let releaseLogicalPoint = { x: point!.x, y: point!.y };
+                    let pressed = false;
+                    const releaseDrag = async (cleanup: boolean): Promise<void> => {
+                      const releasePoint = scaleBrowserPointForZoom(releaseLogicalPoint, contents.getZoomFactor());
+                      const releaseEvent: Electron.MouseInputEvent = {
+                        type: 'mouseUp',
+                        button: 'left',
+                        x: Math.round(releasePoint.x),
+                        y: Math.round(releasePoint.y),
+                        clickCount: 1,
+                      };
+                      const releaseCommand: BrowserCdpInputCommand = {
+                        method: 'Input.dispatchMouseEvent',
+                        params: {
+                          type: 'mouseReleased',
+                          button: 'left',
+                          buttons: 0,
+                          x: releaseLogicalPoint.x,
+                          y: releaseLogicalPoint.y,
+                          clickCount: 1,
+                        },
+                      };
+                      if (cleanup) {
+                        await this.releaseInputIfDocumentCurrent(
+                          tab,
+                          contents,
+                          releaseEvent,
+                          releaseCommand,
+                          documentLease,
+                        );
+                      } else {
+                        await this.dispatchInputEvent(
+                          tab,
+                          contents,
+                          releaseEvent,
+                          releaseCommand,
+                          abortSignal,
+                          documentLease,
+                        );
+                      }
+                    };
+                    try {
+                      await this.sendAttributedInputEvent(
                         tab,
                         contents,
-                        browserFocusTargetScript(point!),
+                        { kind: 'pointerdown', x: point!.x, y: point!.y },
+                        {
+                          type: 'mouseDown',
+                          button: 'left',
+                          x: Math.round(inputPoint!.x),
+                          y: Math.round(inputPoint!.y),
+                          clickCount: 1,
+                        },
+                        {
+                          method: 'Input.dispatchMouseEvent',
+                          params: {
+                            type: 'mousePressed',
+                            button: 'left',
+                            buttons: 1,
+                            x: point!.x,
+                            y: point!.y,
+                            clickCount: 1,
+                          },
+                        },
                         abortSignal,
                         documentLease,
-                      ),
-                    );
-                    if (!focused) throw new Error('The requested browser target cannot receive focus.');
+                        () => refreshStationaryLocatedTarget(),
+                        () => {
+                          pressed = true;
+                        },
+                      );
+                      assertInputContinuation();
+                      const endPoint = scaleBrowserPointForZoom({ x: endX, y: endY }, contents.getZoomFactor());
+                      await this.dispatchInputEvent(
+                        tab,
+                        contents,
+                        {
+                          type: 'mouseMove',
+                          button: 'left',
+                          x: Math.round(endPoint.x),
+                          y: Math.round(endPoint.y),
+                        },
+                        {
+                          method: 'Input.dispatchMouseEvent',
+                          params: { type: 'mouseMoved', button: 'left', buttons: 1, x: endX, y: endY },
+                        },
+                        abortSignal,
+                        documentLease,
+                      );
+                      releaseLogicalPoint = { x: endX, y: endY };
+                      assertInputContinuation();
+                      await releaseDrag(false);
+                      pressed = false;
+                    } finally {
+                      if (pressed) await releaseDrag(true);
+                    }
+                    break;
                   }
+                  case 'wait':
+                    await abortableDelay(Math.max(0, Math.min(30_000, request.waitMs ?? 1_000)), abortSignal);
+                    break;
+                  case 'bookmark':
+                    this.addBookmark(conversationId, tab.shell.title, tab.shell.url);
+                    break;
+                  case 'unbookmark': {
+                    const match = this.storeForScope(tab.scopeKey)
+                      .listBookmarks()
+                      .find((item) => item.url === tab.shell.url);
+                    if (match) this.removeBookmark(conversationId, match.id);
+                    break;
+                  }
+                }
+                if (!['navigate', 'back', 'forward', 'reload'].includes(request.kind)) {
                   this.assertAssistantDocumentLease(tab, documentLease);
-                  assertPhysicalActionGestureLease();
-                  const insertedText = request.value ?? request.text ?? '';
-                  await refreshLocatedTarget({ requireFocused: true });
-                  this.armAutomationGesture(tab, contents, {
-                    kind: 'input',
-                    inputType: 'insertText',
-                    data: insertedText,
-                  });
-                  await this.runRendererOperationWithDeadline(
-                    tab,
-                    contents,
-                    'Browser typing',
-                    TARGET_LOCATION_TIMEOUT_MS,
-                    () => {
-                      assertPhysicalActionGestureLease();
-                      return contents.insertText(insertedText);
-                    },
-                    abortSignal,
-                    documentLease,
-                  );
-                  break;
                 }
-                case 'press': {
-                  const keys = request.keys?.length ? request.keys : [request.text ?? 'Enter'];
-                  const modifiers = keys
-                    .slice(0, -1)
-                    .map((key) => key.toLowerCase())
-                    .filter((key) => ['shift', 'control', 'ctrl', 'alt', 'meta', 'command'].includes(key))
-                    .map((key) => (key === 'ctrl' ? 'control' : key === 'command' ? 'meta' : key)) as Array<
-                    'shift' | 'control' | 'alt' | 'meta'
-                  >;
-                  const keyCode = keys.at(-1) ?? 'Enter';
-                  this.sendAttributedInputEvent(
-                    tab,
-                    contents,
-                    { kind: 'keydown', key: keyCode },
-                    { type: 'keyDown', keyCode, modifiers },
-                  );
-                  contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
-                  break;
-                }
-                case 'scroll': {
-                  await refreshLocatedTarget();
-                  const scrollPoint = scaleBrowserPointForZoom({ x: point?.x ?? 10, y: point?.y ?? 10 }, zoomFactor);
-                  this.sendAttributedInputEvent(
-                    tab,
-                    contents,
-                    { kind: 'wheel', x: point?.x ?? 10, y: point?.y ?? 10 },
-                    {
-                      type: 'mouseWheel',
-                      x: Math.round(scrollPoint.x),
-                      y: Math.round(scrollPoint.y),
-                      deltaX: request.deltaX ?? 0,
-                      deltaY: request.deltaY ?? 500,
-                    },
-                  );
-                  break;
-                }
-                case 'drag': {
-                  contents.sendInputEvent({
-                    type: 'mouseMove',
-                    x: Math.round(inputPoint!.x),
-                    y: Math.round(inputPoint!.y),
-                  });
-                  await refreshLocatedTarget();
-                  const endX = request.endX ?? point!.x;
-                  const endY = request.endY ?? point!.y;
-                  if (!Number.isFinite(endX) || !Number.isFinite(endY)) {
-                    throw new Error('Drag endpoint coordinates must be finite.');
-                  }
-                  await this.validateLocatedTarget(
-                    tab,
-                    contents,
-                    { x: endX, y: endY, width: 1, height: 1 },
-                    {},
-                    abortSignal,
-                    documentLease,
-                  );
-                  const endPoint = scaleBrowserPointForZoom({ x: endX, y: endY }, zoomFactor);
-                  this.sendAttributedInputEvent(
-                    tab,
-                    contents,
-                    { kind: 'pointerdown', x: point!.x, y: point!.y },
-                    {
-                      type: 'mouseDown',
-                      button: 'left',
-                      x: Math.round(inputPoint!.x),
-                      y: Math.round(inputPoint!.y),
-                      clickCount: 1,
-                    },
-                  );
-                  contents.sendInputEvent({
-                    type: 'mouseMove',
-                    button: 'left',
-                    x: Math.round(endPoint.x),
-                    y: Math.round(endPoint.y),
-                  });
-                  contents.sendInputEvent({
-                    type: 'mouseUp',
-                    button: 'left',
-                    x: Math.round(endPoint.x),
-                    y: Math.round(endPoint.y),
-                    clickCount: 1,
-                  });
-                  break;
-                }
-                case 'wait':
-                  await abortableDelay(Math.max(0, Math.min(30_000, request.waitMs ?? 1_000)), abortSignal);
-                  break;
-                case 'bookmark':
-                  this.addBookmark(conversationId, tab.shell.title, tab.shell.url);
-                  break;
-                case 'unbookmark': {
-                  const match = this.storeForScope(tab.scopeKey)
-                    .listBookmarks()
-                    .find((item) => item.url === tab.shell.url);
-                  if (match) this.removeBookmark(conversationId, match.id);
-                  break;
+              } finally {
+                try {
+                  await this.releaseLocatedTarget(contents, point);
+                } finally {
+                  this.releaseInputCoordinateLease(view, coordinateLease);
                 }
               }
-              if (!['navigate', 'back', 'forward', 'reload'].includes(request.kind)) {
-                this.assertAssistantDocumentLease(tab, documentLease);
-              }
-            } finally {
-              await this.releaseLocatedTarget(contents, point);
-            }
-          }),
+            },
+            approvedDocument,
+          ),
         ),
       );
       action.status = 'completed';
@@ -7554,7 +12132,7 @@ html::after {
   ): Promise<BrowserInspection> {
     const abortSignal = assistantRun.abortSignal;
     throwIfBrowserAborted(abortSignal);
-    const tab = this.requireTab(conversationId, tabId);
+    const tab = this.requireAssistantTab(conversationId, assistantRun, tabId);
     return this.withVisibleAssistantOperation(
       conversationId,
       tab,
@@ -7563,50 +12141,265 @@ html::after {
       'inspecting page',
       (reveal) =>
         this.runTabOperation(tab, () =>
-          this.withAssistantControl(tab, assistantRun, async (documentLease) => {
-            throwIfBrowserAborted(abortSignal);
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            const contents = (await this.ensureAssistantView(tab, assistantRun, documentLease)).webContents;
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            await reveal(contents, documentLease);
-            const result = await this.runRendererOperationWithDeadline(
-              tab,
-              contents,
-              'Browser inspection',
-              INSPECT_TIMEOUT_MS,
-              async () => {
-                await this.assertTabNotSensitive(tab, contents, 'Inspection', abortSignal, documentLease);
-                const inspectedWithOcclusionPoints = (await this.evaluateWithDeadline(
-                  tab,
-                  contents,
-                  browserInspectionExpression(),
-                  abortSignal,
-                  documentLease,
-                )) as Omit<BrowserInspection, 'tabId' | 'url' | 'title'> & {
-                  __kaiOcclusionPoints?: Array<{ x: number; y: number }>;
-                };
-                const occlusionPoints = inspectedWithOcclusionPoints.__kaiOcclusionPoints;
-                if (!Array.isArray(occlusionPoints)) {
-                  throw new Error('Browser inspection did not return occlusion evidence.');
+          this.withAssistantControl(
+            tab,
+            assistantRun,
+            async (documentLease) => {
+              throwIfBrowserAborted(abortSignal);
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              const contents = (
+                await this.ensureAssistantView(tab, assistantRun, documentLease, undefined, approvedDocument)
+              ).webContents;
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              await reveal(contents, documentLease);
+              const result = await this.runRendererOperationWithDeadline(
+                tab,
+                contents,
+                'Browser inspection',
+                INSPECT_TIMEOUT_MS,
+                async () => {
+                  await this.assertTabNotSensitive(tab, contents, 'Inspection', abortSignal, documentLease);
+                  const inspectedWithOcclusionPoints = (await this.evaluateWithDeadline(
+                    tab,
+                    contents,
+                    browserInspectionExpression(),
+                    abortSignal,
+                    documentLease,
+                  )) as Omit<BrowserInspection, 'tabId' | 'url' | 'title'> & {
+                    __kaiOcclusionPoints?: Array<{ x: number; y: number }>;
+                  };
+                  const occlusionPoints = inspectedWithOcclusionPoints.__kaiOcclusionPoints;
+                  if (!Array.isArray(occlusionPoints)) {
+                    throw new Error('Browser inspection did not return occlusion evidence.');
+                  }
+                  await this.assertNoClickThroughOverlayAtPoints(contents, occlusionPoints);
+                  const { __kaiOcclusionPoints: _privateOcclusionPoints, ...inspected } = inspectedWithOcclusionPoints;
+                  await this.assertTabNotSensitive(tab, contents, 'Inspection', abortSignal, documentLease);
+                  return inspected;
+                },
+                abortSignal,
+                documentLease,
+              );
+              throwIfBrowserAborted(abortSignal);
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              this.assertAssistantDocumentLease(tab, documentLease);
+              return {
+                tabId: tab.shell.id,
+                url: boundedBrowserUrl(tab.shell.url),
+                title: tab.shell.title,
+                ...result,
+              };
+            },
+            approvedDocument,
+          ),
+        ),
+    );
+  }
+
+  async networkDiagnostics(
+    conversationId: string,
+    request: BrowserNetworkDiagnosticsRequest,
+    assistantRun: BrowserAssistantRun,
+    approvedDocument?: BrowserDocumentApproval,
+  ): Promise<BrowserNetworkDiagnostics> {
+    const abortSignal = assistantRun.abortSignal;
+    throwIfBrowserAborted(abortSignal);
+    const tab = this.requireAssistantTab(conversationId, assistantRun, request.tabId);
+    if (tab.shell.sensitive) {
+      throw new Error('Network diagnostics is blocked while this tab contains password data.');
+    }
+    const waitFor: BrowserNetworkWaitMode =
+      request.waitFor === 'load' || request.waitFor === 'network-idle' ? request.waitFor : 'none';
+    const limit = Math.max(1, Math.min(MAX_BROWSER_NETWORK_DIAGNOSTIC_RESULTS, Math.floor(request.limit ?? 50)));
+    const timeoutMs = Math.max(100, Math.min(30_000, Math.floor(request.timeoutMs ?? 10_000)));
+    const idleMs = Math.max(100, Math.min(5_000, Math.floor(request.idleMs ?? 500)));
+    // Start the caller's wait budget before action publication or hidden page
+    // preparation. Private-network sanitation and password scans are bounded,
+    // sidebar-independent work and count against the requested wait deadline.
+    const startedAt = Date.now();
+    const deadlineAt = waitFor === 'none' ? Number.POSITIVE_INFINITY : startedAt + timeoutMs;
+    return this.withVisibleAssistantOperation(
+      conversationId,
+      tab,
+      assistantRun,
+      'network',
+      waitFor === 'none' ? 'checking network activity' : `waiting for ${waitFor}`,
+      () =>
+        this.runTabOperation(tab, () =>
+          this.withAssistantControl(
+            tab,
+            assistantRun,
+            async (documentLease) => {
+              throwIfBrowserAborted(abortSignal);
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              const timedOutBeforeInspection = (): BrowserNetworkDiagnostics => {
+                this.assertAssistantDocumentLease(tab, documentLease);
+                this.assertBrowserDocumentApproval(tab, approvedDocument);
+                if (tab.shell.sensitive) {
+                  throw new Error('Network diagnostics is blocked while this tab contains password data.');
                 }
-                await this.assertNoClickThroughOverlayAtPoints(contents, occlusionPoints);
-                const { __kaiOcclusionPoints: _privateOcclusionPoints, ...inspected } = inspectedWithOcclusionPoints;
-                await this.assertTabNotSensitive(tab, contents, 'Inspection', abortSignal, documentLease);
-                return inspected;
-              },
-              abortSignal,
-              documentLease,
-            );
-            throwIfBrowserAborted(abortSignal);
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            this.assertAssistantDocumentLease(tab, documentLease);
-            return {
-              tabId: tab.shell.id,
-              url: boundedBrowserUrl(tab.shell.url),
-              title: tab.shell.title,
-              ...result,
-            };
-          }),
+                const redactionKey = this.networkRedactionKeyForTab(tab);
+                const requestCount = Math.max(tab.networkRequests?.size ?? 0, tab.networkRequestSequence ?? 0);
+                const inFlight = this.currentDocumentActiveNetworkRequests(tab).length;
+                // No renderer inspection is allowed after the caller's budget
+                // expires. Return only manager-owned, content-free state; exact
+                // request metadata remains withheld until a later successful
+                // sensitivity scan.
+                return {
+                  tabId: tab.shell.id,
+                  url: browserNetworkPageIdentity(tab.shell.url, redactionKey),
+                  loading: tab.shell.loading,
+                  waitFor,
+                  waitTimedOut: true,
+                  inFlight,
+                  requestCount,
+                  requestsTruncated: requestCount > 0,
+                  loadTiming: {},
+                  requests: [],
+                };
+              };
+              const remainingBeforeView = Math.ceil(deadlineAt - Date.now());
+              if (waitFor !== 'none' && remainingBeforeView <= 0) return timedOutBeforeInspection();
+              let contents: WebContents;
+              try {
+                contents = (
+                  await this.ensureAssistantView(
+                    tab,
+                    assistantRun,
+                    documentLease,
+                    waitFor === 'none' ? undefined : remainingBeforeView,
+                    approvedDocument,
+                    true,
+                  )
+                ).webContents;
+              } catch (error) {
+                if (waitFor !== 'none' && error instanceof BrowserRendererDeadlineError) {
+                  return timedOutBeforeInspection();
+                }
+                throw error;
+              }
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              const target = {
+                tabGeneration: tab.generation,
+                userNavigationLease: tab.trustedUserNavigationLease,
+                networkNavigationSequence: tab.networkNavigationSequence ?? 0,
+                redactionKey: this.networkRedactionKeyForTab(tab),
+                scopeGeneration: this.currentScopeGeneration(tab.scopeKey),
+                scopeKey: tab.scopeKey,
+                url: tab.shell.url,
+              };
+              const assertNotSensitiveWithinBudget = async (): Promise<boolean> => {
+                if (waitFor !== 'none' && Date.now() >= deadlineAt) return false;
+                const remaining = waitFor === 'none' ? undefined : Math.max(1, Math.ceil(deadlineAt - Date.now()));
+                try {
+                  await this.assertTabNotSensitive(
+                    tab,
+                    contents,
+                    'Network diagnostics',
+                    abortSignal,
+                    documentLease,
+                    remaining,
+                    false,
+                  );
+                } catch (error) {
+                  if (waitFor === 'none' || !(error instanceof BrowserRendererDeadlineError)) throw error;
+                  // A diagnostic timeout must not discard an authenticated user
+                  // page. Detach only a debugger connection that BrowserManager
+                  // itself owns so its late CDP command cannot block later work.
+                  this.cancelManagerOwnedDebugger(contents);
+                  return false;
+                }
+                return waitFor === 'none' || Date.now() < deadlineAt;
+              };
+              const assertTargetCurrent = (): void => {
+                throwIfBrowserAborted(abortSignal);
+                this.assertAssistantRun(conversationId, assistantRun);
+                this.assertAssistantDocumentLease(tab, documentLease);
+                this.assertBrowserDocumentApproval(tab, approvedDocument);
+                if (tab.shell.sensitive) {
+                  throw new Error('Network diagnostics is blocked while this tab contains password data.');
+                }
+                if (
+                  this.tabs.get(tab.shell.id) !== tab ||
+                  tab.shell.conversationId !== conversationId ||
+                  tab.generation !== target.tabGeneration ||
+                  tab.trustedUserNavigationLease !== target.userNavigationLease ||
+                  (tab.networkNavigationSequence ?? 0) !== target.networkNavigationSequence ||
+                  tab.networkRedactionKey !== target.redactionKey ||
+                  tab.shell.url !== target.url
+                ) {
+                  throw new Error('The page navigated while Browser network diagnostics were waiting.');
+                }
+                if (
+                  tab.scopeKey !== target.scopeKey ||
+                  this.currentScopeGeneration(target.scopeKey) !== target.scopeGeneration ||
+                  this.scopeUnavailable(target.scopeKey)
+                ) {
+                  throw new Error('The Browser profile changed while network diagnostics were waiting.');
+                }
+              };
+
+              assertTargetCurrent();
+              let waitTimedOut = waitFor !== 'none' && Date.now() >= deadlineAt;
+              let idleSince: number | null = null;
+              while (waitFor !== 'none' && !waitTimedOut) {
+                assertTargetCurrent();
+                const currentTime = Date.now();
+                const loaded = !tab.shell.loading;
+                const currentActiveRequests = this.currentDocumentActiveNetworkRequests(tab);
+                const hasBlockingRequests = tab.activeNetworkRequests
+                  ? currentActiveRequests.some(([, resourceType]) => browserNetworkResourceBlocksIdle(resourceType))
+                  : [...(tab.networkRequests?.values() ?? [])].some(
+                      (tracked) =>
+                        tracked.completedAt === undefined && browserNetworkResourceBlocksIdle(tracked.resourceType),
+                    );
+                if (waitFor === 'load' ? loaded : !hasBlockingRequests) {
+                  if (waitFor === 'load') break;
+                  idleSince = Math.max(idleSince ?? startedAt, tab.networkLastBlockingActivityAt ?? startedAt);
+                  if (currentTime - idleSince >= idleMs) break;
+                } else {
+                  idleSince = null;
+                }
+                if (currentTime >= deadlineAt) {
+                  waitTimedOut = true;
+                  break;
+                }
+                // This cancellable main-process poll reads manager-owned request
+                // bookkeeping. It never mounts, selects, focuses, or evaluates the
+                // Browser page, and a concurrent user navigation invalidates it.
+                await abortableDelay(Math.min(50, Math.max(1, deadlineAt - currentTime)), abortSignal);
+              }
+
+              assertTargetCurrent();
+              if (waitFor !== 'none' && (waitTimedOut || Date.now() >= deadlineAt)) {
+                return timedOutBeforeInspection();
+              }
+              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection();
+              assertTargetCurrent();
+              const trackedRequests = [...(tab.networkRequests?.values() ?? [])];
+              const network = snapshotBrowserNetworkRequests(trackedRequests, limit, target.redactionKey);
+              const activeRequestCount = tab.activeNetworkRequests
+                ? this.currentDocumentActiveNetworkRequests(tab).length
+                : network.inFlight;
+              const requestCount = Math.max(network.requestCount, tab.networkRequestSequence ?? 0);
+              const result = {
+                tabId: tab.shell.id,
+                url: browserNetworkPageIdentity(tab.shell.url, target.redactionKey),
+                loading: tab.shell.loading,
+                waitFor,
+                waitTimedOut,
+                inFlight: activeRequestCount,
+                requestCount,
+                requestsTruncated: network.truncated || requestCount > network.requestCount,
+                loadTiming: browserLoadTimingFromNetworkRequests(trackedRequests),
+                requests: network.entries,
+              } satisfies BrowserNetworkDiagnostics;
+              if (!(await assertNotSensitiveWithinBudget())) return timedOutBeforeInspection();
+              assertTargetCurrent();
+              return result;
+            },
+            approvedDocument,
+          ),
         ),
     );
   }
@@ -7619,9 +12412,18 @@ html::after {
     task: () => Promise<T>,
     abortSignal?: AbortSignal,
     documentLease?: AssistantDocumentLease,
+    reclaimTargetOnCancellation = true,
   ): Promise<T> {
     if (abortSignal?.aborted) throw new Error(`${operation} was cancelled.`);
     if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
+    const targetGeneration = tab.generation;
+    const targetUserNavigationLease = tab.trustedUserNavigationLease;
+    const targetDocumentIsCurrent = (): boolean =>
+      this.tabs.get(tab.shell.id) === tab &&
+      tab.view?.webContents === contents &&
+      !contents.isDestroyed() &&
+      tab.generation === targetGeneration &&
+      tab.trustedUserNavigationLease === targetUserNavigationLease;
     let cancellation: 'timeout' | 'abort' | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortListener: (() => void) | undefined;
@@ -7629,7 +12431,7 @@ html::after {
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           cancellation = 'timeout';
-          reject(new Error(`${operation} exceeded ${timeoutMs / 1_000} seconds.`));
+          reject(new BrowserRendererDeadlineError(operation, timeoutMs));
         }, timeoutMs);
         timer.unref?.();
       }
@@ -7646,7 +12448,7 @@ html::after {
       if (documentLease) this.assertAssistantDocumentLease(tab, documentLease);
       return result;
     } catch (error) {
-      if (cancellation) {
+      if (cancellation && reclaimTargetOnCancellation) {
         // The Electron executeJavaScript/capture APIs have no cancellation
         // primitive. Terminate target-scoped script execution when CDP is
         // available, then reclaim only this WebContentsView so the queue and
@@ -7654,10 +12456,17 @@ html::after {
         // call forcefullyCrashRenderer(): Chromium may place sibling tabs in
         // the same renderer process, and crashing it would discard unrelated
         // user page state.
-        if (contents.debugger.isAttached()) {
-          void contents.debugger.sendCommand('Runtime.terminateExecution').catch(() => undefined);
+        try {
+          if (targetDocumentIsCurrent() && contents.debugger.isAttached()) {
+            void contents.debugger.sendCommand('Runtime.terminateExecution').catch(() => undefined);
+          }
+        } catch {
+          // The timed-out target may already be tearing down.
         }
-        if (this.tabs.get(tab.shell.id) === tab) {
+        // The tab shell can survive a concurrent user navigation that replaces
+        // its WebContents. Reclaim only the exact target whose operation timed
+        // out; destroying a replacement would discard unrelated user state.
+        if (targetDocumentIsCurrent()) {
           this.destroyView(tab);
           tab.shell.discarded = true;
           tab.shell.error = cancellation === 'timeout' ? `${operation} timed out.` : `${operation} was cancelled.`;
@@ -7677,15 +12486,16 @@ html::after {
     script: string,
     abortSignal?: AbortSignal,
     documentLease?: AssistantDocumentLease,
+    timeoutMs = EVALUATE_TIMEOUT_MS,
+    reclaimTargetOnCancellation = true,
   ): Promise<unknown> {
     return this.runRendererOperationWithDeadline(
       tab,
       contents,
       'Browser script evaluation',
-      EVALUATE_TIMEOUT_MS,
+      timeoutMs,
       async () => {
-        const wasAttached = contents.debugger.isAttached();
-        if (!wasAttached) contents.debugger.attach('1.3');
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
         try {
           const frameTree = (await contents.debugger.sendCommand('Page.getFrameTree')) as {
             frameTree?: { frame?: { id?: string } };
@@ -7727,13 +12537,12 @@ html::after {
           }
           return response.result?.value;
         } finally {
-          if (!wasAttached && !contents.isDestroyed() && contents.debugger.isAttached()) {
-            contents.debugger.detach();
-          }
+          releaseDebugger();
         }
       },
       abortSignal,
       documentLease,
+      reclaimTargetOnCancellation,
     );
   }
 
@@ -7751,7 +12560,23 @@ html::after {
    * removed every durable service-worker registration and a new document
    * commits successfully. */
   private resetScriptedRendererForUser(tab: InternalTab): boolean {
-    if (!tab.scriptTainted && !tab.privateNetworkNewDocumentGuard) return false;
+    if (
+      !tab.scriptTainted &&
+      !tab.privateNetworkNewDocumentGuard &&
+      !tab.assistantNativeUiNewDocumentGuard &&
+      !tab.assistantDialogsDisabledRunId
+    ) {
+      return false;
+    }
+    // Explicit user navigation replaces the assistant-controlled document.
+    // Revoke active control before createView() inspects the shell so the fresh
+    // renderer cannot inherit assistant-only preload/native-UI restrictions.
+    // The run-lifetime dialog guard may remain dormant for later AI work, but
+    // ensureView only applies it while this control capability is live.
+    tab.aiControlOwnerId = null;
+    tab.aiControlGeneration = null;
+    tab.assistantDialogsDisabledRunId = null;
+    tab.assistantDownloadAttribution = undefined;
     tab.generation++;
     this.destroyView(tab);
     tab.shell.discarded = true;
@@ -7759,7 +12584,12 @@ html::after {
     return true;
   }
 
-  private async installPrivateNetworkNewDocumentGuard(tab: InternalTab, contents: WebContents): Promise<void> {
+  private async installPrivateNetworkNewDocumentGuard(
+    tab: InternalTab,
+    contents: WebContents,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+  ): Promise<void> {
     if (this.aiAllowPrivateNetwork ?? false) return;
     const existing = tab.privateNetworkNewDocumentGuard;
     if (
@@ -7770,47 +12600,211 @@ html::after {
     if (existing && existing.contentsId !== contents.id) {
       throw new Error('The browser page changed before its private-network script guard could be installed.');
     }
-    const wasAttached = contents.debugger.isAttached();
-    try {
-      if (!wasAttached) contents.debugger.attach('1.3');
-      const result = (await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
-        source: BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD,
-        runImmediately: true,
-      })) as { identifier?: unknown };
-      if (typeof result.identifier !== 'string' || result.identifier.length === 0) {
-        throw new Error('Chromium did not return a private-network script guard identifier.');
-      }
-      const frames = [contents.mainFrame, ...contents.mainFrame.framesInSubtree];
-      const verifiedFrames = new Set<number>();
-      for (const frame of frames) {
-        if (frame.detached || frame.isDestroyed() || verifiedFrames.has(frame.frameTreeNodeId)) continue;
-        const activated = await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE);
-        if (activated !== true) {
-          throw new Error('The browser page preload could not install its private-network WebRTC guard.');
+    // Chromium has no page execution context before a new WebContents begins
+    // its first navigation. CDP's Page.addScriptToEvaluateOnNewDocument can
+    // remain pending forever in that state, especially for a hidden target.
+    // The restricted frame preload is already armed in WebPreferences; defer
+    // this durable CDP registration until ensureView has made the first
+    // document live.
+    if (typeof contents.getURL === 'function' && contents.getURL() === '') return;
+    // Publish a fail-closed marker before the first asynchronous CDP step. A
+    // concurrent Settings transition that relaxes private-network access must
+    // enqueue behind this tab and reclaim the renderer after installation;
+    // otherwise this operation could finish installing the irreversible old
+    // membrane after the relaxed policy had already committed.
+    tab.privateNetworkNewDocumentGuard = {
+      contentsId: contents.id,
+      identifier: PRELOAD_PRIVATE_NETWORK_GUARD_PENDING_IDENTIFIER,
+    };
+    await this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser private-network guard installation',
+      PRIVATE_NETWORK_GUARD_TIMEOUT_MS,
+      async () => {
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        try {
+          const result = (await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+            source: BROWSER_PRIVATE_NETWORK_NEW_DOCUMENT_GUARD,
+            runImmediately: true,
+          })) as { identifier?: unknown };
+          if (typeof result.identifier !== 'string' || result.identifier.length === 0) {
+            throw new Error('Chromium did not return a private-network script guard identifier.');
+          }
+          // A brand-new WebContents has an internal empty document whose sandboxed
+          // preload realm is not scheduled until its first navigation. It contains
+          // no remote/page script, and the document-start CDP registration above is
+          // already installed for that first navigation, so there is no live
+          // untrusted realm to activate yet. Waiting on executeJavaScript here can
+          // deadlock a completely hidden target and make background tab creation
+          // depend on mounting the sidebar.
+          const frames = [contents.mainFrame, ...contents.mainFrame.framesInSubtree];
+          const verifiedFrames = new Set<number>();
+          for (const frame of frames) {
+            if (frame.detached || frame.isDestroyed() || verifiedFrames.has(frame.frameTreeNodeId)) continue;
+            const activated = await frame.executeJavaScript(BROWSER_PRIVATE_NETWORK_GUARD_ACTIVATION_PROBE);
+            if (activated !== true) {
+              throw new Error('The browser page preload could not install its private-network WebRTC guard.');
+            }
+            verifiedFrames.add(frame.frameTreeNodeId);
+          }
+          if (verifiedFrames.size === 0) {
+            throw new Error('The browser page had no live frame in which to verify its private-network WebRTC guard.');
+          }
+          tab.privateNetworkNewDocumentGuard = {
+            contentsId: contents.id,
+            identifier: result.identifier,
+          };
+        } finally {
+          try {
+            releaseDebugger();
+          } catch {
+            // The target may have closed while the guard was being installed.
+          }
         }
-        verifiedFrames.add(frame.frameTreeNodeId);
-      }
-      if (verifiedFrames.size === 0) {
-        throw new Error('The browser page had no live frame in which to verify its private-network WebRTC guard.');
-      }
-      tab.privateNetworkNewDocumentGuard = {
-        contentsId: contents.id,
-        identifier: result.identifier,
-      };
-    } catch (error) {
+      },
+      abortSignal,
+      documentLease,
+    ).catch((error: unknown) => {
       throw new Error(
         `Browser script evaluation could not guard newly navigated frames: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
-    } finally {
-      if (!wasAttached && !contents.isDestroyed() && contents.debugger.isAttached()) {
+    });
+  }
+
+  /** Prevent remote content from opening native UI while the assistant owns
+   * this renderer. Every Browser frame installs inert preload trampolines at
+   * document start; main activates them with a per-renderer capability and
+   * registers the same activation for future documents. */
+  private async installAssistantNativeUiGuard(
+    tab: InternalTab,
+    contents: WebContents,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+  ): Promise<void> {
+    const existing = tab.assistantNativeUiNewDocumentGuard;
+    if (existing?.contentsId === contents.id && existing.identifier !== PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER)
+      return;
+    if (existing && existing.contentsId !== contents.id) {
+      throw new Error('The browser page changed before its native-UI guard could be installed.');
+    }
+    const token = tab.nativeUiGuardToken;
+    if (!token) throw new Error('The browser page has no native-UI guard capability.');
+    // A brand-new WebContents has no renderer execution context. createView
+    // arms its preload with the guard argument, and ensureView performs an inert
+    // first load before assistant work reaches this method.
+    if (typeof contents.getURL === 'function' && contents.getURL() === '') return;
+    // Publish target-scoped pending state before the first asynchronous frame
+    // probe. User navigation treats even this marker as irreversible and
+    // reclaims the renderer, so a late verification cannot bless a replacement.
+    tab.assistantNativeUiNewDocumentGuard = {
+      contentsId: contents.id,
+      identifier: PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER,
+    };
+    await this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser native-UI guard installation',
+      NATIVE_UI_GUARD_TIMEOUT_MS,
+      async () => {
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
         try {
-          contents.debugger.detach();
-        } catch {
-          // The target may have closed while the guard was being installed.
+          const result = (await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+            source: browserNativeUiNewDocumentGuard(token),
+            runImmediately: false,
+          })) as { identifier?: unknown };
+          if (typeof result.identifier !== 'string' || result.identifier.length === 0) {
+            throw new Error('Chromium did not return a native-UI script guard identifier.');
+          }
+          const frames = [contents.mainFrame, ...contents.mainFrame.framesInSubtree];
+          const verifiedFrames = new Set<number>();
+          for (const frame of frames) {
+            if (frame.detached || frame.isDestroyed() || verifiedFrames.has(frame.frameTreeNodeId)) continue;
+            const installed = await frame.executeJavaScript(browserNativeUiGuardActivationProbe(token, true));
+            if (installed !== true) {
+              throw new Error('The browser page preload could not activate its native-UI guard.');
+            }
+            verifiedFrames.add(frame.frameTreeNodeId);
+          }
+          if (verifiedFrames.size === 0) {
+            throw new Error('The browser page had no live frame in which to verify its native-UI guard.');
+          }
+          tab.assistantNativeUiNewDocumentGuard = {
+            contentsId: contents.id,
+            identifier: result.identifier,
+          };
+        } finally {
+          try {
+            releaseDebugger();
+          } catch {
+            // The target may have closed while the guard was being installed.
+          }
         }
-      }
+      },
+      abortSignal,
+      documentLease,
+    ).catch((error: unknown) => {
+      throw new Error(
+        `Browser control could not block native page UI safely: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+
+  /** Remove future-document activation and return the current live document's
+   * preload trampolines to pass-through behavior. If CDP's fail-closed fallback
+   * ever ran, the deactivation probe rejects and cleanup unloads that renderer
+   * rather than exposing a partially guarded page to the user. */
+  private async releaseAssistantNativeUiGuard(tab: InternalTab): Promise<void> {
+    const guard = tab.assistantNativeUiNewDocumentGuard;
+    const view = tab.view;
+    const contents = view?.webContents;
+    const token = tab.nativeUiGuardToken;
+    if (!guard) return;
+    if (!contents || contents.isDestroyed() || guard.contentsId !== contents.id || !token) {
+      throw new Error('The browser page changed before its native-UI guard could be restored.');
+    }
+    if (guard.identifier === PRELOAD_NATIVE_UI_GUARD_PENDING_IDENTIFIER) {
+      throw new Error('The browser native-UI guard was still being installed during cleanup.');
+    }
+    await this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser native-UI guard restoration',
+      NATIVE_UI_GUARD_TIMEOUT_MS,
+      async () => {
+        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        try {
+          // Stop arming replacement documents before inspecting the live frame
+          // tree. Any document that already ran the guard has an execution
+          // context and is included below; a document created after this CDP
+          // acknowledgement is never guarded. Reversing this order leaves a
+          // navigation/frame-creation window in which a newly guarded document
+          // is absent from the restoration snapshot.
+          await contents.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {
+            identifier: guard.identifier,
+          });
+          const frames = [contents.mainFrame, ...contents.mainFrame.framesInSubtree];
+          const restoredFrames = new Set<number>();
+          for (const frame of frames) {
+            if (frame.detached || frame.isDestroyed() || restoredFrames.has(frame.frameTreeNodeId)) continue;
+            const restored = await frame.executeJavaScript(browserNativeUiGuardActivationProbe(token, false));
+            if (restored !== true) {
+              throw new Error('The browser page preload could not restore ordinary native-UI behavior.');
+            }
+            restoredFrames.add(frame.frameTreeNodeId);
+          }
+          if (restoredFrames.size === 0) {
+            throw new Error('The browser page had no live frame in which to restore native-UI behavior.');
+          }
+        } finally {
+          releaseDebugger();
+        }
+      },
+    );
+    if (tab.view?.webContents === contents && tab.assistantNativeUiNewDocumentGuard === guard) {
+      tab.assistantNativeUiNewDocumentGuard = undefined;
     }
   }
 
@@ -7822,7 +12816,7 @@ html::after {
     approvedDocument?: BrowserDocumentApproval,
   ): Promise<unknown> {
     const abortSignal = assistantRun.abortSignal;
-    const tab = this.requireTab(conversationId, tabId);
+    const tab = this.requireAssistantTab(conversationId, assistantRun, tabId);
     return this.withVisibleAssistantOperation(
       conversationId,
       tab,
@@ -7831,37 +12825,44 @@ html::after {
       'evaluating script',
       (reveal) =>
         this.runTabOperation(tab, () =>
-          this.withAssistantControl(tab, assistantRun, async (documentLease) => {
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            const contents = (await this.ensureAssistantView(tab, assistantRun, documentLease)).webContents;
-            this.assertBrowserDocumentApproval(tab, approvedDocument);
-            await reveal(contents, documentLease);
-            await this.assertTabNotSensitive(tab, contents, 'Script evaluation', abortSignal, documentLease);
-            // Arbitrary page JS can install long-lived input listeners. Detach the
-            // native page before executing it so those listeners cannot observe
-            // secrets typed by the user. A committed navigation/reload clears the
-            // quarantine; failures leave it in place.
-            await this.installPrivateNetworkNewDocumentGuard(tab, contents);
-            const evaluationOrigin = normalizedOrigin(tab.shell.url);
-            if (evaluationOrigin === 'unknown') {
-              throw new Error('Browser script evaluation requires an HTTP(S) page origin.');
-            }
-            this.storeForScope(tab.scopeKey).markScriptCleanupOrigin(evaluationOrigin);
-            this.quarantineScriptedTab(tab);
-            const serialized = await this.withAssistantScriptPopupAttribution(tab, () =>
-              this.evaluateWithDeadline(
-                tab,
-                contents,
-                boundedBrowserEvaluationExpression(script, undefined, this.aiAllowPrivateNetwork ?? false),
-                abortSignal,
-                documentLease,
-              ),
-            );
-            await this.assertTabNotSensitive(tab, contents, 'Script evaluation', abortSignal, documentLease);
-            this.assertAssistantDocumentLease(tab, documentLease);
-            if (typeof serialized !== 'string') throw new Error('The script result was not serialized safely.');
-            return JSON.parse(serialized) as unknown;
-          }),
+          this.withAssistantControl(
+            tab,
+            assistantRun,
+            async (documentLease) => {
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              const contents = (
+                await this.ensureAssistantView(tab, assistantRun, documentLease, undefined, approvedDocument)
+              ).webContents;
+              this.assertBrowserDocumentApproval(tab, approvedDocument);
+              await reveal(contents, documentLease);
+              await this.assertTabNotSensitive(tab, contents, 'Script evaluation', abortSignal, documentLease);
+              // Arbitrary page JS can install long-lived input listeners. Detach the
+              // native page before executing it so those listeners cannot observe
+              // secrets typed by the user. A committed navigation/reload clears the
+              // quarantine; failures leave it in place.
+              await this.installPrivateNetworkNewDocumentGuard(tab, contents, abortSignal, documentLease);
+              const evaluationOrigin = normalizedOrigin(tab.shell.url);
+              if (evaluationOrigin === 'unknown') {
+                throw new Error('Browser script evaluation requires an HTTP(S) page origin.');
+              }
+              this.storeForScope(tab.scopeKey).markScriptCleanupOrigin(evaluationOrigin);
+              this.quarantineScriptedTab(tab);
+              const serialized = await this.withAssistantScriptPopupAttribution(tab, () =>
+                this.evaluateWithDeadline(
+                  tab,
+                  contents,
+                  boundedBrowserEvaluationExpression(script, undefined, this.aiAllowPrivateNetwork ?? false),
+                  abortSignal,
+                  documentLease,
+                ),
+              );
+              await this.assertTabNotSensitive(tab, contents, 'Script evaluation', abortSignal, documentLease);
+              this.assertAssistantDocumentLease(tab, documentLease);
+              if (typeof serialized !== 'string') throw new Error('The script result was not serialized safely.');
+              return JSON.parse(serialized) as unknown;
+            },
+            approvedDocument,
+          ),
         ),
     );
   }
@@ -7869,45 +12870,646 @@ html::after {
   private async hideAutomationOverlay(
     tab: InternalTab,
     contents: WebContents,
-  ): Promise<{ cssText: string; generation: number } | null> {
-    const key = tab.overlayCssKey;
-    const cssText = tab.overlayCssText;
-    if (!key || !cssText) return null;
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
+  ): Promise<{ overlay: BrowserAutomationOverlay; generation: number } | null> {
+    const overlay = tab.automationOverlay;
+    if (!overlay || overlay.contents !== contents) return null;
     const generation = tab.overlayGeneration;
-    tab.overlayCssKey = null;
-    tab.overlayCssText = null;
+    tab.automationOverlay = null;
     try {
-      await contents.removeInsertedCSS(key);
+      await this.runRendererOperationWithDeadline(
+        tab,
+        contents,
+        'Browser automation overlay',
+        AUTOMATION_OVERLAY_TIMEOUT_MS,
+        () => contents.debugger.sendCommand('Overlay.hideHighlight'),
+        abortSignal,
+        documentLease,
+      );
     } catch (error) {
-      if (tab.overlayGeneration === generation && tab.view?.webContents === contents) {
-        tab.overlayCssKey = key;
-        tab.overlayCssText = cssText;
+      if (
+        tab.overlayGeneration === generation &&
+        tab.view?.webContents === contents &&
+        !contents.isDestroyed() &&
+        !tab.automationOverlay
+      ) {
+        tab.automationOverlay = overlay;
+      } else {
+        overlay.releaseDebugger();
       }
       throw error;
     }
-    return { cssText, generation };
+    return { overlay, generation };
   }
 
   private async restoreAutomationOverlay(
     tab: InternalTab,
     contents: WebContents,
-    hidden: { cssText: string; generation: number } | null,
+    hidden: { overlay: BrowserAutomationOverlay; generation: number } | null,
+    abortSignal?: AbortSignal,
+    documentLease?: AssistantDocumentLease,
   ): Promise<void> {
+    if (!hidden) return;
     if (
-      !hidden ||
       contents.isDestroyed() ||
       tab.overlayGeneration !== hidden.generation ||
       tab.view?.webContents !== contents ||
-      tab.overlayCssKey
-    )
+      tab.automationOverlay
+    ) {
+      hidden.overlay.releaseDebugger();
       return;
-    const key = await contents.insertCSS(hidden.cssText, { cssOrigin: 'user' });
-    if (tab.overlayGeneration === hidden.generation && tab.view?.webContents === contents && !tab.overlayCssKey) {
-      tab.overlayCssKey = key;
-      tab.overlayCssText = hidden.cssText;
-    } else {
-      await contents.removeInsertedCSS(key).catch(() => undefined);
     }
+    let retained = false;
+    try {
+      await this.runRendererOperationWithDeadline(
+        tab,
+        contents,
+        'Browser automation overlay',
+        AUTOMATION_OVERLAY_TIMEOUT_MS,
+        () => this.showAutomationCursor(hidden.overlay),
+        abortSignal,
+        documentLease,
+      );
+      if (tab.overlayGeneration === hidden.generation && tab.view?.webContents === contents && !tab.automationOverlay) {
+        tab.automationOverlay = hidden.overlay;
+        retained = true;
+      } else if (!contents.isDestroyed() && contents.debugger.isAttached()) {
+        await contents.debugger.sendCommand('Overlay.hideHighlight').catch(() => undefined);
+      }
+    } finally {
+      if (!retained) hidden.overlay.releaseDebugger();
+    }
+  }
+
+  cancelMenuPreview(requestId: string): void {
+    if (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 128) return;
+    const active = this.menuPreviewCapture;
+    const subscriber = active?.subscribers.get(requestId);
+    if (!active || !subscriber) return;
+    active.subscribers.delete(requestId);
+    if (!subscriber.settled) {
+      subscriber.settled = true;
+      subscriber.reject(new Error('Browser menu preview was cancelled.'));
+    }
+    // The preview uses manager-owned CDP work. Aborting the final subscriber
+    // detaches that private debugger lease, so no hidden native capture can keep
+    // the global slot or renderer alive indefinitely.
+    if (active.subscribers.size === 0) active.controller.abort();
+  }
+
+  private settleMenuPreviewCapture(
+    active: BrowserMenuPreviewCapture,
+    outcome: { result: BrowserScreenshotResult } | { error: Error },
+  ): void {
+    if (active.outcome) return;
+    active.outcome = outcome;
+    for (const subscriber of active.subscribers.values()) {
+      if (subscriber.settled) continue;
+      subscriber.settled = true;
+      if ('error' in outcome) subscriber.reject(outcome.error);
+      else subscriber.resolve(outcome.result);
+    }
+    active.subscribers.clear();
+  }
+
+  private rejectMenuPreviewForContents(contentsId: number, error: Error): void {
+    const active = this.menuPreviewCapture;
+    if (!active || active.contentsId !== contentsId) return;
+    active.controller.abort();
+    this.settleMenuPreviewCapture(active, { error });
+    // The WebContents is already being destroyed, so release lifecycle waiters.
+    active.teardownController.abort();
+  }
+
+  /** Destroy a preview target only as part of an explicit lifecycle teardown.
+   * Ordinary cancellation preserves the user's unsaved DOM/SPA state. */
+  private reclaimMenuPreviewTarget(active: BrowserMenuPreviewCapture, error?: string): void {
+    const tab = this.tabs.get(active.tabId);
+    if (!tab || tab.view?.webContents.id !== active.contentsId) {
+      active.teardownController.abort();
+      return;
+    }
+    this.destroyView(tab);
+    tab.shell.discarded = true;
+    tab.shell.loading = false;
+    if (error) tab.shell.error = error;
+    this.emitTabs(tab.shell.conversationId);
+    active.teardownController.abort();
+  }
+
+  /** User navigation/presentation is concurrent with assistant work. A menu
+   * preview never freezes or mutates the target, so preemption only needs to
+   * abort its caller-facing work and drain the short opportunistic queue task. */
+  private preemptMenuPreviewForTab(tab: InternalTab, reason: string): Promise<void> | null {
+    const active = this.menuPreviewCapture;
+    if (
+      !active ||
+      active.tabId !== tab.shell.id ||
+      tab.view?.webContents.id !== active.contentsId ||
+      active.teardownController.signal.aborted
+    ) {
+      return null;
+    }
+    this.settleMenuPreviewCapture(active, { error: new Error(reason) });
+    active.controller.abort();
+    const operationSettled = active.operation
+      ? active.operation.then(
+          () => undefined,
+          () => undefined,
+        )
+      : Promise.resolve();
+    return operationSettled.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
+  private async drainMenuPreviewCapture(
+    scopeKeys?: ReadonlySet<string>,
+    error?: Error,
+    surfaceTargetError = true,
+  ): Promise<void> {
+    const active = this.menuPreviewCapture;
+    if (!active || (scopeKeys && !scopeKeys.has(active.scopeKey))) return;
+    const failure = error ?? new Error('Browser menu preview was cancelled because its profile is closing.');
+    active.controller.abort();
+    this.settleMenuPreviewCapture(active, { error: failure });
+    // capturePage has no cancellation API. Destroy the exact target before
+    // releasing the barrier so no late native work can access a clearing or
+    // closing Chromium profile, or retain resources after its host disappears.
+    this.reclaimMenuPreviewTarget(active, surfaceTargetError ? failure.message : undefined);
+    await active.completion?.catch(() => undefined);
+  }
+
+  private addMenuPreviewSubscriber(
+    active: BrowserMenuPreviewCapture,
+    requestId: string,
+  ): Promise<BrowserScreenshotResult> {
+    const existing = active.subscribers.get(requestId);
+    if (existing) return existing.promise;
+    if (active.outcome) {
+      const settled =
+        'error' in active.outcome
+          ? Promise.reject<BrowserScreenshotResult>(active.outcome.error)
+          : Promise.resolve(active.outcome.result);
+      void settled.catch(() => undefined);
+      return settled;
+    }
+    let resolve!: (result: BrowserScreenshotResult) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<BrowserScreenshotResult>((subscriberResolve, subscriberReject) => {
+      resolve = subscriberResolve;
+      reject = subscriberReject;
+    });
+    // Cancellation can race IPC promise adoption. Attach a handler now while
+    // returning the original rejecting promise to the requesting renderer.
+    void promise.catch(() => undefined);
+    active.subscribers.set(requestId, { promise, resolve, reject, settled: false });
+    return promise;
+  }
+
+  private sameMenuSensitivityFrameSnapshot(
+    contents: WebContents,
+    expectedFrames: ReadonlyMap<number, string>,
+  ): boolean {
+    try {
+      const current = this.snapshotAutomationFrames(contents).identities;
+      if (current.size !== expectedFrames.size) return false;
+      for (const [frameTreeNodeId, identity] of expectedFrames) {
+        if (current.get(frameTreeNodeId) !== identity) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Ask every exact live preload realm for a bounded boolean-only sensitivity
+   * result. Missing, malformed, incomplete, or frame-raced responses are unsafe
+   * for presentation but never destroy or reload the page. */
+  private async probeMenuPreviewSensitivity(
+    tab: InternalTab,
+    contents: WebContents,
+    abortSignal: AbortSignal,
+  ): Promise<{ sensitive: boolean; complete: boolean }> {
+    throwIfBrowserAborted(abortSignal);
+    let frames: WebFrameMain[];
+    let expectedFrames: Map<number, string>;
+    try {
+      const snapshot = this.snapshotAutomationFrames(contents);
+      frames = snapshot.frames;
+      expectedFrames = snapshot.identities;
+    } catch {
+      return { sensitive: false, complete: false };
+    }
+    if (frames.length > MAX_CDP_SENSITIVE_SCAN_TARGETS) return { sensitive: false, complete: false };
+
+    const token = randomUUID();
+    let settled = false;
+    let receivedEveryResponse = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    let resolveProbe!: () => void;
+    let rejectProbe!: (error: Error) => void;
+    const probe = new Promise<void>((resolve, reject) => {
+      resolveProbe = resolve;
+      rejectProbe = reject;
+    });
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      abortSignal.removeEventListener('abort', abortListener!);
+      this.pendingMenuSensitivityProbes.delete(token);
+      if (error) rejectProbe(error);
+      else resolveProbe();
+    };
+    const pending: PendingMenuSensitivityProbe = {
+      contentsId: contents.id,
+      expectedFrames,
+      responses: new Map(),
+      settle: () => {
+        receivedEveryResponse = true;
+        finish();
+      },
+    };
+    this.pendingMenuSensitivityProbes.set(token, pending);
+    timer = setTimeout(() => finish(), MENU_PREVIEW_SENSITIVITY_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+    abortListener = () => finish(new Error('Browser menu preview was cancelled.'));
+    abortSignal.addEventListener('abort', abortListener, { once: true });
+    if (abortSignal.aborted) abortListener();
+
+    if (!settled) {
+      try {
+        for (const frame of frames) frame.send('browser-page:probe-sensitive', { token });
+      } catch {
+        finish();
+      }
+    }
+    await probe;
+    throwIfBrowserAborted(abortSignal);
+    if (
+      !receivedEveryResponse ||
+      pending.responses.size !== expectedFrames.size ||
+      tab.view?.webContents !== contents ||
+      contents.isDestroyed() ||
+      !this.sameMenuSensitivityFrameSnapshot(contents, expectedFrames)
+    ) {
+      return { sensitive: false, complete: false };
+    }
+    const sensitive = [...pending.responses.values()].some((response) => response.sensitive);
+    const complete = [...pending.responses.values()].every((response) => response.complete);
+    if (sensitive) this.setTabSensitive(tab, true);
+    return { sensitive, complete };
+  }
+
+  private async assertMenuPreviewNotSensitive(
+    active: BrowserMenuPreviewCapture,
+    tab: InternalTab,
+    readyView: WebContentsView,
+    pageLease: BrowserPageLease,
+    pageIdentity: string,
+    abortSignal: AbortSignal,
+  ): Promise<void> {
+    throwIfBrowserAborted(abortSignal);
+    if (tab.view !== readyView || readyView.webContents.isDestroyed() || tab.viewLoadPromise || tab.shell.loading) {
+      throw new Error('Browser menu preview is unavailable because the page changed or began loading.');
+    }
+    this.assertBrowserPageLease(tab, pageLease, 'Browser menu preview');
+    this.assertBrowserMenuPreviewIdentity(tab, pageIdentity);
+    const sensitivity = await this.probeMenuPreviewSensitivity(tab, readyView.webContents, abortSignal);
+    throwIfBrowserAborted(abortSignal);
+    if (sensitivity.sensitive || tab.shell.sensitive) {
+      throw new Error('Browser menu previews are blocked while this tab contains password data.');
+    }
+    if (!sensitivity.complete) {
+      throw new Error('Browser menu preview is unavailable because page sensitivity could not be verified.');
+    }
+    // The isolated preload cannot discover parser-created declarative closed
+    // shadow roots because attachShadow is never called and shadowRoot stays
+    // null. CDP's flattened, piercing scan covers those roots and related
+    // OOPIF targets without returning DOM values to main.
+    let cdpSensitive: boolean;
+    try {
+      cdpSensitive = await this.waitForMenuPreviewTarget(
+        active,
+        this.scanMenuPreviewSensitivityViaCdp(active, tab, readyView.webContents),
+      );
+    } catch (error) {
+      if (active.teardownController.signal.aborted) throw error;
+      throw new Error('Browser menu preview is unavailable because page sensitivity could not be verified.');
+    }
+    throwIfBrowserAborted(abortSignal);
+    if (cdpSensitive) this.setTabSensitive(tab, true);
+    if (cdpSensitive || tab.shell.sensitive) {
+      throw new Error('Browser menu previews are blocked while this tab contains password data.');
+    }
+    this.assertBrowserPageLease(tab, pageLease, 'Browser menu preview');
+    this.assertBrowserMenuPreviewIdentity(tab, pageIdentity);
+  }
+
+  private waitForMenuPreviewTarget<T>(active: BrowserMenuPreviewCapture, operation: Promise<T>): Promise<T> {
+    if (active.teardownController.signal.aborted) {
+      return Promise.reject(new Error('Browser menu preview target was reclaimed.'));
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (result: { value: T } | { error: unknown }): void => {
+        if (settled) return;
+        settled = true;
+        active.teardownController.signal.removeEventListener('abort', onTeardown);
+        if ('error' in result) reject(result.error);
+        else resolve(result.value);
+      };
+      const onTeardown = () => finish({ error: new Error('Browser menu preview target was reclaimed.') });
+      active.teardownController.signal.addEventListener('abort', onTeardown, { once: true });
+      void operation.then(
+        (value) => finish({ value }),
+        (error: unknown) => finish({ error }),
+      );
+      if (active.teardownController.signal.aborted) onTeardown();
+    });
+  }
+
+  /** Stop awaiting a bounded preview probe/capture as soon as presentation is
+   * cancelled. The caller separately detaches manager-owned CDP work. */
+  private waitForMenuPreviewCancellation<T>(operation: Promise<T>, abortSignal: AbortSignal): Promise<T> {
+    if (abortSignal.aborted) return Promise.reject(new Error('Browser menu preview was cancelled.'));
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (result: { value: T } | { error: unknown }): void => {
+        if (settled) return;
+        settled = true;
+        abortSignal.removeEventListener('abort', onAbort);
+        if ('error' in result) reject(result.error);
+        else resolve(result.value);
+      };
+      const onAbort = () => finish({ error: new Error('Browser menu preview was cancelled.') });
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+      void operation.then(
+        (value) => finish({ value }),
+        (error: unknown) => finish({ error }),
+      );
+      if (abortSignal.aborted) onAbort();
+    });
+  }
+
+  /** CDP sensitivity scans have no cancellation primitive. Bound every menu
+   * preview scan independently from presentation cancellation and fail the
+   * preview closed without reclaiming a live user page on timeout. */
+  private scanMenuPreviewSensitivityViaCdp(
+    active: BrowserMenuPreviewCapture,
+    tab: InternalTab,
+    contents: WebContents,
+  ): Promise<boolean> {
+    const signal = AbortSignal.any([active.controller.signal, active.teardownController.signal]);
+    return this.runRendererOperationWithDeadline(
+      tab,
+      contents,
+      'Browser menu preview password-field scan',
+      MENU_PREVIEW_CDP_SENSITIVITY_TIMEOUT_MS,
+      () => this.hasPopulatedPasswordFieldViaCdp(contents),
+      signal,
+      undefined,
+      false,
+    ).catch((error: unknown) => {
+      // The preview is admitted only when the tab queue is idle and refuses a
+      // pre-existing external debugger. Detach our private target connection to
+      // make the native command deadline real without discarding page state.
+      this.cancelManagerOwnedDebugger(contents);
+      throw error;
+    });
+  }
+
+  /** Capture a presentation-only viewport through a manager-owned CDP lease.
+   * Detaching that lease is the cancellation primitive Chromium's native
+   * capturePage API does not provide, so a wedged compositor cannot retain the
+   * global preview slot or force us to destroy the user's live page. */
+  private async captureMenuPreviewImage(
+    active: BrowserMenuPreviewCapture,
+    contents: WebContents,
+    abortSignal: AbortSignal,
+  ): Promise<NativeImage> {
+    const onCancelled = () => this.cancelManagerOwnedDebugger(contents);
+    abortSignal.addEventListener('abort', onCancelled, { once: true });
+    try {
+      throwIfBrowserAborted(abortSignal);
+      const releaseDebugger = this.acquireBrowserDebugger(contents);
+      let encoded: string;
+      try {
+        const metrics = (await this.waitForMenuPreviewCancellation(
+          this.waitForMenuPreviewTarget(active, contents.debugger.sendCommand('Page.getLayoutMetrics')),
+          abortSignal,
+        )) as Parameters<typeof browserScreenshotViewportGeometry>[0];
+        const clip = browserScreenshotViewportGeometry(metrics);
+        validateMenuPreviewNativeSize(clip.width, clip.height);
+        const capture = (await this.waitForMenuPreviewCancellation(
+          this.waitForMenuPreviewTarget(
+            active,
+            contents.debugger.sendCommand('Page.captureScreenshot', {
+              format: 'png',
+              captureBeyondViewport: true,
+              fromSurface: true,
+              optimizeForSpeed: true,
+              clip,
+            }),
+          ),
+          abortSignal,
+        )) as { data?: unknown };
+        if (typeof capture.data !== 'string') throw new Error('Browser menu preview did not produce an image.');
+        encoded = capture.data;
+      } finally {
+        releaseDebugger();
+      }
+      throwIfBrowserAborted(abortSignal);
+      const capturedPng = Buffer.from(encoded, 'base64');
+      validateScreenshotEncodedBytes(capturedPng.byteLength);
+      const image = nativeImage.createFromBuffer(capturedPng);
+      if (image.isEmpty()) throw new Error('Browser menu preview did not produce a valid image.');
+      return image;
+    } catch (error) {
+      if (abortSignal.aborted) this.cancelManagerOwnedDebugger(contents);
+      throw error;
+    } finally {
+      abortSignal.removeEventListener('abort', onCancelled);
+    }
+  }
+
+  async captureMenuPreview(
+    conversationId: string,
+    tabId: string,
+    requestId: string = randomUUID(),
+  ): Promise<BrowserScreenshotResult> {
+    if (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 128) {
+      throw new Error('Browser menu preview request id is invalid.');
+    }
+    const tab = this.requireTab(conversationId, tabId);
+    if (tab.shell.sensitive) {
+      throw new Error('Browser menu previews are blocked while this tab contains password data.');
+    }
+    const pageIdentity = this.browserMenuPreviewIdentity(tab);
+    const key = pageIdentity;
+    if (this.menuPreviewCapture) {
+      if (this.menuPreviewCapture.key === key) {
+        if (
+          this.menuPreviewCapture.controller.signal.aborted ||
+          this.menuPreviewCapture.teardownController.signal.aborted
+        ) {
+          throw new Error('Browser menu preview is unavailable while a cancelled capture finishes.');
+        }
+        return this.addMenuPreviewSubscriber(this.menuPreviewCapture, requestId);
+      }
+      throw new Error('Another Browser menu preview is already being captured.');
+    }
+
+    // A chrome-only preview must never restore a discarded/auth-blocked page or
+    // queue behind real tab work. The menu can show its protected placeholder
+    // immediately when no already-ready renderer is opportunistically available.
+    const readyView = tab.view;
+    if (!readyView || readyView.webContents.isDestroyed() || tab.viewLoadPromise || tab.shell.loading) {
+      throw new Error('Browser menu preview is unavailable while the page is loading or discarded.');
+    }
+
+    const contents = readyView.webContents;
+    if (contents.debugger?.isAttached?.()) {
+      throw new Error('Browser menu preview is unavailable while page debugging or automation overlay is active.');
+    }
+    const pageLease = this.captureBrowserPageLease(tab, contents);
+    const active: BrowserMenuPreviewCapture = {
+      key,
+      tabId: tab.shell.id,
+      contentsId: contents.id,
+      scopeKey: tab.scopeKey,
+      controller: new AbortController(),
+      teardownController: new AbortController(),
+      subscribers: new Map(),
+      operation: null,
+      completion: null,
+    };
+    this.menuPreviewCapture = active;
+    const subscriberPromise = this.addMenuPreviewSubscriber(active, requestId);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const admitted = tab.queue.runOpportunistic(async (preemptionSignal): Promise<BrowserScreenshotResult> => {
+      const signal = AbortSignal.any([active.controller.signal, active.teardownController.signal, preemptionSignal]);
+      const onPreempted = () => {
+        const failure = new Error('Browser menu preview was preempted by Browser work.');
+        this.settleMenuPreviewCapture(active, { error: failure });
+        active.controller.abort();
+      };
+      preemptionSignal.addEventListener('abort', onPreempted, { once: true });
+      if (preemptionSignal.aborted) onPreempted();
+      try {
+        await this.waitForMenuPreviewCancellation(
+          this.waitForMenuPreviewTarget(
+            active,
+            this.assertMenuPreviewNotSensitive(active, tab, readyView, pageLease, pageIdentity, signal),
+          ),
+          signal,
+        );
+        const allocation = this.screenshotQueue.runOpportunistic(async (allocationPreemptionSignal) => {
+          const captureSignal = AbortSignal.any([signal, allocationPreemptionSignal]);
+          const onAllocationPreempted = () => {
+            const failure = new Error('Browser menu preview was preempted by screenshot work.');
+            this.settleMenuPreviewCapture(active, { error: failure });
+            active.controller.abort();
+          };
+          allocationPreemptionSignal.addEventListener('abort', onAllocationPreempted, { once: true });
+          if (allocationPreemptionSignal.aborted) onAllocationPreempted();
+          try {
+            throwIfBrowserAborted(captureSignal);
+            const image = await this.waitForMenuPreviewCancellation(
+              this.waitForMenuPreviewTarget(active, this.captureMenuPreviewImage(active, contents, captureSignal)),
+              captureSignal,
+            );
+            const capturedSize = validateMenuPreviewNativeSize(image.getSize().width, image.getSize().height);
+            const previewScale = Math.min(
+              1,
+              MENU_PREVIEW_MAX_WIDTH / capturedSize.width,
+              MENU_PREVIEW_MAX_HEIGHT / capturedSize.height,
+            );
+            const previewImage =
+              previewScale < 1
+                ? image.resize({
+                    width: Math.max(1, Math.round(capturedSize.width * previewScale)),
+                    height: Math.max(1, Math.round(capturedSize.height * previewScale)),
+                    quality: 'good',
+                  })
+                : image;
+            const { width, height } = validateScreenshotSize(
+              previewImage.getSize().width,
+              previewImage.getSize().height,
+            );
+            await this.waitForMenuPreviewCancellation(
+              this.assertMenuPreviewNotSensitive(active, tab, readyView, pageLease, pageIdentity, captureSignal),
+              captureSignal,
+            );
+            const png = previewImage.toPNG();
+            validateScreenshotEncodedBytes(png.byteLength);
+            return {
+              tabId: tab.shell.id,
+              mode: 'viewport' as const,
+              mimeType: 'image/png' as const,
+              dataUrl: `data:image/png;base64,${png.toString('base64')}`,
+              width,
+              height,
+            };
+          } finally {
+            allocationPreemptionSignal.removeEventListener('abort', onAllocationPreempted);
+          }
+        });
+        if (!allocation) {
+          throw new Error('Browser menu preview is unavailable while screenshot capture is busy.');
+        }
+        return await this.waitForMenuPreviewCancellation(this.waitForMenuPreviewTarget(active, allocation), signal);
+      } finally {
+        preemptionSignal.removeEventListener('abort', onPreempted);
+      }
+    });
+    const operation =
+      admitted ??
+      Promise.reject<BrowserScreenshotResult>(new Error('Browser menu preview is unavailable while this tab is busy.'));
+    active.operation = operation;
+    void operation.catch(() => undefined);
+    timeout = setTimeout(() => {
+      if (this.menuPreviewCapture !== active || active.teardownController.signal.aborted) return;
+      const failure = new Error(
+        `Browser menu preview capture exceeded ${MENU_PREVIEW_CAPTURE_TIMEOUT_MS / 1_000} seconds.`,
+      );
+      this.settleMenuPreviewCapture(active, { error: failure });
+      active.controller.abort();
+      // The abort listener detaches only BrowserManager's private debugger
+      // connection. CDP capture is cancelled without reclaiming the user's page
+      // or retaining this global preview slot.
+    }, MENU_PREVIEW_CAPTURE_TIMEOUT_MS);
+    timeout.unref?.();
+    const teardown = new Promise<void>((resolve) => {
+      const onTeardown = () => resolve();
+      active.teardownController.signal.addEventListener('abort', onTeardown, { once: true });
+      if (active.teardownController.signal.aborted) onTeardown();
+    });
+    const operationSettled = operation
+      .then(
+        (result) => {
+          this.settleMenuPreviewCapture(active, { result });
+        },
+        (error: unknown) => {
+          const failure = error instanceof Error ? error : new Error(String(error));
+          this.settleMenuPreviewCapture(active, { error: failure });
+        },
+      )
+      .then(() => undefined);
+    active.completion = Promise.race([operationSettled, teardown])
+      .finally(() => {
+        if (timeout) clearTimeout(timeout);
+        if (this.menuPreviewCapture === active) this.menuPreviewCapture = null;
+      })
+      .then(
+        () => undefined,
+        () => undefined,
+      );
+    return subscriberPromise;
   }
 
   async screenshot(
@@ -7936,7 +13538,10 @@ html::after {
     if (source === 'assistant' && !assistantRun) throw new Error('Assistant screenshots require turn ownership.');
     const abortSignal = assistantRun?.abortSignal;
     throwIfBrowserAborted(abortSignal);
-    const tab = this.requireTab(conversationId, request.tabId);
+    const tab =
+      source === 'assistant'
+        ? this.requireAssistantTab(conversationId, assistantRun!, request.tabId)
+        : this.requireTab(conversationId, request.tabId);
     let exportFilePath: string | undefined;
     let exportPageLease: BrowserPageLease | undefined;
     const prepareExportSelection = async (
@@ -7947,7 +13552,7 @@ html::after {
         if (documentLease) this.assertBrowserDocumentApproval(tab, approvedDocument);
         const contents = (
           source === 'assistant'
-            ? await this.ensureAssistantView(tab, assistantRun!, documentLease!)
+            ? await this.ensureAssistantView(tab, assistantRun!, documentLease!, undefined, approvedDocument)
             : await this.ensureView(tab)
         ).webContents;
         if (documentLease) this.assertBrowserDocumentApproval(tab, approvedDocument);
@@ -7961,7 +13566,7 @@ html::after {
       // discard, or renderer replacement invalidates the retained page lease.
       exportPageLease = await this.runTabOperation(tab, () =>
         source === 'assistant'
-          ? this.withAssistantControl(tab, assistantRun!, captureExportPageLease)
+          ? this.withAssistantControl(tab, assistantRun!, captureExportPageLease, approvedDocument)
           : captureExportPageLease(),
       );
       const win = this.getWindow();
@@ -8001,7 +13606,7 @@ html::after {
       if (documentLease) this.assertBrowserDocumentApproval(tab, approvedDocument);
       const contents = (
         source === 'assistant'
-          ? await this.ensureAssistantView(tab, assistantRun!, documentLease!)
+          ? await this.ensureAssistantView(tab, assistantRun!, documentLease!, undefined, approvedDocument)
           : await this.ensureView(tab)
       ).webContents;
       if (documentLease) this.assertBrowserDocumentApproval(tab, approvedDocument);
@@ -8023,9 +13628,9 @@ html::after {
           assertPageCurrent();
           const hidden = await this.hideAutomationOverlay(tab, contents);
           assertPageCurrent();
-          let capturedPng: Buffer;
-          let capturedWidth: number;
-          let capturedHeight: number;
+          let capturedPng: Buffer | undefined;
+          let capturedWidth: number | undefined;
+          let capturedHeight: number | undefined;
           let capturedEncodedBytes = 0;
           const decodeCapture = (data: string): Buffer => {
             capturedEncodedBytes += Buffer.byteLength(data, 'base64');
@@ -8033,13 +13638,13 @@ html::after {
             return Buffer.from(data, 'base64');
           };
           try {
-            if (request.mode === 'full-page' || request.mode === 'element') {
-              const attached = contents.debugger.isAttached();
-              if (!attached) contents.debugger.attach('1.3');
-              try {
-                if (request.mode === 'element') {
-                  if (!request.selector) throw new Error('A CSS selector is required for component screenshots.');
-                  const rect = (await contents.executeJavaScript(`(() => {
+            // Resolve element geometry against the live page. Screenshot work
+            // never changes the renderer lifecycle state: a user may select and
+            // interact with this tab while a hidden/background capture runs.
+            let elementRect: { x: number; y: number; width: number; height: number } | null | undefined;
+            if (request.mode === 'element') {
+              if (!request.selector) throw new Error('A CSS selector is required for component screenshots.');
+              elementRect = (await contents.executeJavaScript(`(() => {
               let element;
               try { element = document.querySelector(${JSON.stringify(request.selector)}); }
               catch { throw new Error('Invalid CSS selector'); }
@@ -8051,115 +13656,129 @@ html::after {
               // every edge against the document; clamping first would retain
               // the original width/height and capture neighboring pixels.
               return { x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height };
-            })()`)) as {
-                    x: number;
-                    y: number;
-                    width: number;
-                    height: number;
-                  } | null;
-                  if (!rect) throw new Error('No visible element matched the screenshot selector.');
-                  const metrics = (await contents.debugger.sendCommand('Page.getLayoutMetrics')) as {
-                    cssContentSize?: { width: number; height: number };
-                    contentSize?: { width: number; height: number };
-                  };
-                  const documentSize = metrics.cssContentSize ?? metrics.contentSize;
-                  const clip = elementCaptureRect(rect, {
-                    width: documentSize?.width ?? 0,
-                    height: documentSize?.height ?? 0,
-                  });
+            })()`)) as typeof elementRect;
+              if (!elementRect) throw new Error('No visible element matched the screenshot selector.');
+            }
+            assertPageCurrent();
+            const captureHidden = this.attachedView !== tab.view || !this.isHostWindowShown();
+            const capturePixels = async (): Promise<void> => {
+              if (request.mode === 'full-page' || request.mode === 'element') {
+                const releaseDebugger = this.acquireBrowserDebugger(contents);
+                try {
+                  if (request.mode === 'element') {
+                    if (!elementRect) throw new Error('No visible element matched the screenshot selector.');
+                    const metrics = (await contents.debugger.sendCommand('Page.getLayoutMetrics')) as {
+                      cssContentSize?: { width: number; height: number };
+                      contentSize?: { width: number; height: number };
+                    };
+                    const captureGeometry = browserScreenshotCaptureGeometry(metrics);
+                    const clip = elementCaptureRect(elementRect, {
+                      width: captureGeometry.width,
+                      height: captureGeometry.height,
+                    });
+                    capturedWidth = clip.width;
+                    capturedHeight = clip.height;
+                    const capture = (await contents.debugger.sendCommand('Page.captureScreenshot', {
+                      format: 'png',
+                      captureBeyondViewport: true,
+                      fromSurface: true,
+                      clip: { ...clip, scale: captureGeometry.scale },
+                    })) as { data: string };
+                    capturedPng = decodeCapture(capture.data);
+                  } else {
+                    const metrics = (await contents.debugger.sendCommand('Page.getLayoutMetrics')) as {
+                      cssContentSize?: { width: number; height: number };
+                      contentSize?: { width: number; height: number };
+                    };
+                    const captureGeometry = browserScreenshotCaptureGeometry(metrics);
+                    ({ width: capturedWidth, height: capturedHeight } = captureGeometry);
+                    const tiles = browserScreenshotTiles(capturedWidth, capturedHeight);
+                    const captured: Array<{
+                      input: Buffer;
+                      left: number;
+                      top: number;
+                    }> = [];
+                    for (const tile of tiles) {
+                      const capture = (await contents.debugger.sendCommand('Page.captureScreenshot', {
+                        format: 'png',
+                        captureBeyondViewport: true,
+                        fromSurface: true,
+                        clip: { ...tile, scale: captureGeometry.scale },
+                      })) as { data: string };
+                      captured.push({
+                        input: decodeCapture(capture.data),
+                        left: tile.x,
+                        top: tile.y,
+                      });
+                    }
+                    if (captured.length === 1) capturedPng = captured[0].input;
+                    else {
+                      const sharp = (await import('sharp')).default;
+                      capturedPng = await sharp({
+                        create: {
+                          width: capturedWidth,
+                          height: capturedHeight,
+                          channels: 4,
+                          background: { r: 255, g: 255, b: 255, alpha: 0 },
+                        },
+                      })
+                        .composite(captured)
+                        .png()
+                        .toBuffer();
+                    }
+                  }
+                } finally {
+                  releaseDebugger();
+                }
+              } else {
+                // Always use the cancellable debugger path for viewport capture.
+                // Native capturePage() can remain pending when a visible Kai
+                // window is minimized or hidden mid-capture, forcing the generic
+                // renderer deadline to reclaim a live user page. CDP works for
+                // both presented and fully headless/background tabs; the hidden
+                // capture host below is only a compositor host, never an
+                // authority or sidebar-mount prerequisite.
+                const releaseDebugger = this.acquireBrowserDebugger(contents);
+                try {
+                  const metrics = (await contents.debugger.sendCommand('Page.getLayoutMetrics')) as Parameters<
+                    typeof browserScreenshotViewportGeometry
+                  >[0];
+                  const clip = browserScreenshotViewportGeometry(metrics);
                   capturedWidth = clip.width;
                   capturedHeight = clip.height;
                   const capture = (await contents.debugger.sendCommand('Page.captureScreenshot', {
                     format: 'png',
                     captureBeyondViewport: true,
                     fromSurface: true,
-                    clip: { ...clip, scale: 1 },
+                    clip,
                   })) as { data: string };
                   capturedPng = decodeCapture(capture.data);
-                } else {
-                  const metrics = (await contents.debugger.sendCommand('Page.getLayoutMetrics')) as {
-                    cssContentSize?: { width: number; height: number };
-                    contentSize?: { width: number; height: number };
-                  };
-                  const size = metrics.cssContentSize ?? metrics.contentSize;
-                  ({ width: capturedWidth, height: capturedHeight } = validateScreenshotSize(
-                    size?.width ?? 0,
-                    size?.height ?? 0,
-                  ));
-                  const tiles = browserScreenshotTiles(capturedWidth, capturedHeight);
-                  const captured: Array<{
-                    input: Buffer;
-                    left: number;
-                    top: number;
-                  }> = [];
-                  for (const tile of tiles) {
-                    const capture = (await contents.debugger.sendCommand('Page.captureScreenshot', {
-                      format: 'png',
-                      captureBeyondViewport: true,
-                      fromSurface: true,
-                      clip: { ...tile, scale: 1 },
-                    })) as { data: string };
-                    captured.push({
-                      input: decodeCapture(capture.data),
-                      left: tile.x,
-                      top: tile.y,
-                    });
-                  }
-                  if (captured.length === 1) capturedPng = captured[0].input;
-                  else {
-                    const sharp = (await import('sharp')).default;
-                    capturedPng = await sharp({
-                      create: {
-                        width: capturedWidth,
-                        height: capturedHeight,
-                        channels: 4,
-                        background: { r: 255, g: 255, b: 255, alpha: 0 },
-                      },
-                    })
-                      .composite(captured)
-                      .png()
-                      .toBuffer();
-                  }
+                } finally {
+                  releaseDebugger();
                 }
-              } finally {
-                if (!attached && contents.debugger.isAttached()) contents.debugger.detach();
               }
-            } else {
-              // capturePage() allocates the NativeImage before returning it.
-              // Reject an oversized/spanned sidebar surface from its native
-              // view bounds first so validation cannot happen only after the
-              // dangerous allocation has already occurred.
-              const viewportBounds = tab.view?.getBounds?.() ?? this.mountedBounds ?? DEFAULT_DETACHED_VIEW_BOUNDS;
-              let displayScaleFactor = 1;
-              try {
-                // WebContentsView bounds are device-independent pixels, while
-                // capturePage() allocates its NativeImage at the display's
-                // device scale. Use the largest attached-display scale so a
-                // spanned/moving window cannot exceed the pixel ceiling before
-                // the returned NativeImage is available for post-validation.
-                displayScaleFactor = Math.max(
-                  1,
-                  ...screen
-                    .getAllDisplays()
-                    .map((display) => display.scaleFactor)
-                    .filter((scaleFactor) => Number.isFinite(scaleFactor) && scaleFactor > 0),
-                );
-              } catch {
-                // Unit-test and early-shutdown Electron shims may not expose
-                // display metadata. The returned NativeImage is still checked
-                // below; production capture paths always have an initialized
-                // screen module.
+              if (!capturedPng || capturedWidth === undefined || capturedHeight === undefined) {
+                throw new Error('The browser screenshot did not produce an image.');
               }
-              validateScreenshotSize(
-                viewportBounds.width * displayScaleFactor,
-                viewportBounds.height * displayScaleFactor,
-              );
-              const image = await contents.capturePage();
-              const size = image.getSize();
-              ({ width: capturedWidth, height: capturedHeight } = validateScreenshotSize(size.width, size.height));
-              capturedPng = image.toPNG();
+              validateScreenshotEncodedBytes(capturedPng.byteLength);
+            };
+            if (captureHidden) await this.withBackgroundCaptureHost(tab, contents, capturePixels);
+            else await capturePixels();
+            if (!capturedPng || capturedWidth === undefined || capturedHeight === undefined) {
+              throw new Error('The browser screenshot did not produce an image.');
             }
-            validateScreenshotEncodedBytes(capturedPng.byteLength);
+            assertPageCurrent();
+            // Re-run both the preload and piercing CDP sensitivity checks after
+            // pixels are captured. The sensitive latch is monotonic for the
+            // document, so user-entered/vault-filled password data that appears
+            // while capture is in flight causes the pixels to be discarded.
+            await this.assertTabNotSensitive(tab, contents, 'Screenshots', abortSignal, documentLease);
+            assertPageCurrent();
+            return {
+              png: capturedPng,
+              width: capturedWidth,
+              height: capturedHeight,
+            };
           } finally {
             // Never run overlay restoration in a replacement document that
             // happened to reuse Kai's internal element id.
@@ -8167,14 +13786,6 @@ html::after {
               await this.restoreAutomationOverlay(tab, contents, hidden);
             }
           }
-          assertPageCurrent();
-          await this.assertTabNotSensitive(tab, contents, 'Screenshots', abortSignal, documentLease);
-          assertPageCurrent();
-          return {
-            png: capturedPng,
-            width: capturedWidth,
-            height: capturedHeight,
-          };
         },
         abortSignal,
         documentLease,
@@ -8230,6 +13841,7 @@ html::after {
       pending.persist();
       return processed;
     };
+    const queueCapture = () => this.runScreenshotAllocation(() => captureAndProcess());
     if (source === 'assistant') {
       return this.withVisibleAssistantOperation(
         conversationId,
@@ -8240,9 +13852,12 @@ html::after {
         async (reveal) => {
           if (await prepareExportSelection(reveal)) return finishCanceledExport();
           return this.runTabOperation(tab, () =>
-            this.screenshotQueue.run(() =>
-              this.withAssistantControl(tab, assistantRun!, (documentLease) =>
-                captureAndProcess(documentLease, reveal),
+            this.runScreenshotAllocation(() =>
+              this.withAssistantControl(
+                tab,
+                assistantRun!,
+                (documentLease) => captureAndProcess(documentLease, reveal),
+                approvedDocument,
               ),
             ),
           );
@@ -8250,7 +13865,19 @@ html::after {
       );
     }
     if (await prepareExportSelection()) return finishCanceledExport();
-    return this.runTabOperation(tab, () => this.screenshotQueue.run(() => captureAndProcess()));
+    return this.runTabOperation(tab, queueCapture);
+  }
+
+  private runScreenshotAllocation<T>(operation: () => Promise<T>): Promise<T> {
+    const preview = this.menuPreviewCapture;
+    if (!preview) return this.screenshotQueue.run(operation);
+
+    const failure = new Error('Browser menu preview was preempted by screenshot work.');
+    this.settleMenuPreviewCapture(preview, { error: failure });
+    preview.controller.abort();
+    // The preview's abort listener detaches manager-owned CDP work, releasing
+    // the opportunistic permit without discarding unsaved DOM/SPA state.
+    return this.screenshotQueue.run(operation);
   }
 
   async pickElement(conversationId: string, tabId: string): Promise<BrowserElementPickResult> {
@@ -8467,17 +14094,186 @@ html::after {
     for (const staleId of scopeIds.slice(0, -MAX_CACHED_DOWNLOADS_PER_SCOPE)) this.downloads.delete(staleId);
   }
 
+  private protectedAssistantDownloadPaths(scopeKey: string): Set<string> {
+    const protectedPaths = new Set(
+      [...this.activeDownloads.values()]
+        .filter((download) => download.scopeKey === scopeKey && download.quarantinePath)
+        .map((download) => download.quarantinePath!),
+    );
+    for (const [path, leases] of this.downloadExportLeases.get(scopeKey) ?? []) {
+      if (leases > 0) protectedPaths.add(path);
+    }
+    return protectedPaths;
+  }
+
+  private acquireDownloadExportLease(scopeKey: string, path: string): () => void {
+    const leases = this.downloadExportLeases.get(scopeKey) ?? new Map<string, number>();
+    leases.set(path, (leases.get(path) ?? 0) + 1);
+    this.downloadExportLeases.set(scopeKey, leases);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.downloadExportLeases.get(scopeKey);
+      if (!current) return;
+      const remaining = (current.get(path) ?? 1) - 1;
+      if (remaining > 0) current.set(path, remaining);
+      else current.delete(path);
+      if (current.size === 0) this.downloadExportLeases.delete(scopeKey);
+    };
+  }
+
+  private isDownloadExportLeased(scopeKey: string, path: string): boolean {
+    return (this.downloadExportLeases.get(scopeKey)?.get(path) ?? 0) > 0;
+  }
+
   private purgeCachedDownloadsForScope(scopeKey: string): void {
     for (const [id, download] of this.downloads) {
       if (download.scopeKey === scopeKey) this.downloads.delete(id);
     }
   }
 
+  private async reconcilePrunedAssistantDownloads(
+    scopeKey: string,
+    pruned: readonly PrunedAssistantDownload[],
+    conversationId?: string,
+  ): Promise<void> {
+    if (pruned.length === 0) return;
+    const store = this.storeForScope(scopeKey);
+    const changedIds: string[] = [];
+    for (const download of pruned) {
+      const updated = store.clearQuarantinedDownloadPath(download.id, download.path);
+      if (!updated) continue;
+      if (this.downloads.get(download.id)?.scopeKey === scopeKey) this.downloads.delete(download.id);
+      changedIds.push(download.id);
+    }
+    if (changedIds.length === 0) return;
+    try {
+      await store.flushDownloads();
+    } finally {
+      // A persistence failure is reported separately by BrowserProfileStore,
+      // but the current app session must immediately stop advertising a file
+      // that the quarantine has already removed.
+      for (const downloadId of changedIds) {
+        this.emitDownloadHistoryChangedForScope(scopeKey, conversationId, downloadId, 'unavailable');
+      }
+    }
+  }
+
+  /** Prune physical artifacts and audit every persisted quarantined shelf
+   * entry. The latter catches a crash after an earlier process removed the
+   * file but before it flushed the matching metadata mutation. */
+  private async reconcileAssistantDownloadQuarantineAtStartup(): Promise<void> {
+    const scopeKeys = new Set<string>();
+    const failures: unknown[] = [];
+    try {
+      await reconcileAssistantDownloadExportJournal(this.appHome);
+    } catch (error) {
+      failures.push(new Error('Assistant download export recovery failed.', { cause: error }));
+    }
+    for (const discover of [
+      () => listStoredBrowserScopeKeys(this.appHome),
+      () => listAssistantDownloadQuarantineScopeKeys(this.appHome),
+    ]) {
+      try {
+        for (const scopeKey of discover()) scopeKeys.add(scopeKey);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    for (const scopeKey of scopeKeys) {
+      try {
+        const pruned = pruneAssistantDownloadQuarantine(
+          this.appHome,
+          scopeKey,
+          this.protectedAssistantDownloadPaths(scopeKey),
+        );
+        const persistedDownloads = await readStoredBrowserDownloadsAsync(this.appHome, scopeKey);
+        const activeIds = new Set(
+          [...this.activeDownloads.values()]
+            .filter((download) => download.scopeKey === scopeKey)
+            .map((download) => download.id),
+        );
+        const prunedById = new Map(pruned.map((download) => [download.id, download]));
+        const needsMetadataRepair = persistedDownloads.some((download) => {
+          if (!download.quarantined) return false;
+          if (download.state === 'progressing' && !activeIds.has(download.id)) return true;
+          const prunedDownload = prunedById.get(download.id);
+          if (prunedDownload && (!download.path || download.path === prunedDownload.path)) return true;
+          return !!(
+            download.path &&
+            !isAssistantDownloadQuarantineFileAvailable(this.appHome, scopeKey, download.id, download.path)
+          );
+        });
+        // Most historical profiles have no quarantined shelf entries. Avoid
+        // synchronously constructing and permanently caching their complete
+        // history/bookmark/permission stores during app startup.
+        if (!needsMetadataRepair) continue;
+
+        const store = this.storeForScope(scopeKey, true);
+        const unavailable = new Map<string, PrunedAssistantDownload>();
+        const changedIds = new Set<string>();
+        try {
+          for (const download of pruned) unavailable.set(download.id, download);
+          for (const download of store.listDownloads()) {
+            if (!download.quarantined) continue;
+            if (download.state === 'progressing') {
+              const active = [...this.activeDownloads.values()].some(
+                (candidate) => candidate.scopeKey === scopeKey && candidate.id === download.id,
+              );
+              if (active) continue;
+              let partialPath: string | null = null;
+              try {
+                partialPath = assistantDownloadQuarantinePath(this.appHome, scopeKey, download.id);
+              } catch {
+                // Persisted metadata may predate strict UUID validation. No file
+                // in the owned quarantine can correspond to an invalid id.
+              }
+              if (partialPath) removeAssistantDownloadFile(partialPath);
+              const updated = store.markQuarantinedDownloadInterrupted(download.id);
+              if (updated) changedIds.add(download.id);
+              continue;
+            }
+            if (
+              download.path &&
+              !isAssistantDownloadQuarantineFileAvailable(this.appHome, scopeKey, download.id, download.path)
+            ) {
+              unavailable.set(download.id, { id: download.id, path: download.path });
+            }
+          }
+          for (const download of unavailable.values()) {
+            const updated = store.clearQuarantinedDownloadPath(download.id, download.path);
+            if (updated) changedIds.add(download.id);
+          }
+          if (changedIds.size > 0) {
+            try {
+              await store.flushDownloads();
+            } finally {
+              for (const downloadId of changedIds) {
+                if (this.downloads.get(downloadId)?.scopeKey === scopeKey) this.downloads.delete(downloadId);
+                this.emitDownloadHistoryChangedForScope(scopeKey, undefined, downloadId, 'unavailable');
+              }
+            }
+          }
+        } finally {
+          this.releaseStartupOnlyStore(scopeKey, store);
+        }
+      } catch (error) {
+        failures.push(
+          new Error(`Assistant download recovery failed for Browser profile ${scopeKey}.`, { cause: error }),
+        );
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'One or more Browser profiles could not reconcile assistant downloads.');
+    }
+  }
+
   private cancelActiveDownloadsForScopes(scopeKeys: ReadonlySet<string>): Promise<void> {
     const cancellations = [...(this.activeDownloads?.values() ?? [])]
       .filter((download) => scopeKeys.has(download.scopeKey))
-      .map((download) => download.cancel());
-    return Promise.allSettled(cancellations).then(() => undefined);
+      .map((download) => download.cancel(true));
+    return Promise.all(cancellations).then(() => undefined);
   }
 
   private cancelActiveDownloadsForAssistantRun(conversationId: string, runId: string): Promise<void> {
@@ -8487,33 +14283,35 @@ html::after {
           download.conversationId === conversationId && download.assistantOwnerId === runId && !download.keepOpen,
       )
       .map((download) => download.cancel());
-    return Promise.allSettled(cancellations).then(() => undefined);
+    return Promise.all(cancellations).then(() => undefined);
   }
 
   private cancelActiveAssistantDownloads(): Promise<void> {
     const cancellations = [...(this.activeDownloads?.values() ?? [])]
       .filter((download) => download.assistantOwnerId !== null && !download.keepOpen)
       .map((download) => download.cancel());
-    return Promise.allSettled(cancellations).then(() => undefined);
+    return Promise.all(cancellations).then(() => undefined);
   }
 
   private cancelActiveDownloadsForConversation(conversationId: string): Promise<void> {
     const cancellations = [...(this.activeDownloads?.values() ?? [])]
       .filter((download) => download.conversationId === conversationId)
       .map((download) => download.cancel());
-    return Promise.allSettled(cancellations).then(() => undefined);
+    return Promise.all(cancellations).then(() => undefined);
   }
 
   private waitForActiveDownloads(scopeKeys?: ReadonlySet<string>): Promise<void> {
     const downloads = [...(this.activeDownloads?.values() ?? [])].filter(
       (download) => !scopeKeys || scopeKeys.has(download.scopeKey),
     );
-    return Promise.allSettled(downloads.map((download) => download.done)).then(() => undefined);
+    return Promise.all(
+      downloads.map((download) =>
+        waitForBrowserDownloadTerminal(download.done, `Browser download ${download.id} completion`),
+      ),
+    ).then(() => undefined);
   }
 
-  showDownload(conversationId: string, downloadId: string): void {
-    const scopeKey = this.scopeKey(conversationId);
-    this.assertScopeAvailable(scopeKey);
+  private requireDownloadForScope(scopeKey: string, downloadId: string): BrowserDownload {
     const download =
       ([...this.downloads.values()].find((item) => item.id === downloadId && item.scopeKey === scopeKey) as
         | CachedBrowserDownload
@@ -8522,8 +14320,101 @@ html::after {
         .listDownloads()
         .find((item) => item.id === downloadId);
     if (!download) throw new Error('This download is no longer available.');
+    return download;
+  }
+
+  showDownload(conversationId: string, downloadId: string): void {
+    const scopeKey = this.scopeKey(conversationId);
+    this.assertScopeAvailable(scopeKey);
+    const download = this.requireDownloadForScope(scopeKey, downloadId);
     if (!download.path) throw new Error('The downloaded file is unavailable because no saved path was recorded.');
+    if (download.quarantined) {
+      throw new Error('Assistant downloads must be explicitly exported before they can be opened.');
+    }
     shell.showItemInFolder(download.path);
+  }
+
+  async exportDownload(conversationId: string, downloadId: string): Promise<{ canceled?: boolean; filePath?: string }> {
+    const scopeKey = this.scopeKey(conversationId);
+    return this.withScopeActivity(scopeKey, async () => {
+      // Startup reconciliation owns every crash-left export journal until it
+      // completes. Do not let a fresh export race that recovery pass.
+      // Recovery is best-effort: a malformed or temporarily unreadable
+      // crash-left journal must not permanently poison every later export in
+      // this app process. The constructor already reports the failure through
+      // profileMutationTail; wait for settlement here, then validate the exact
+      // requested quarantine file independently below.
+      await this.startupDownloadReconciliation.catch(() => undefined);
+      const download = this.requireDownloadForScope(scopeKey, downloadId);
+      if (!download.quarantined || download.state !== 'completed' || !download.path) {
+        throw new Error('Only completed assistant downloads can be exported.');
+      }
+      if (!isAssistantDownloadQuarantinePath(this.appHome, scopeKey, download.id, download.path)) {
+        throw new Error('The assistant download quarantine path is invalid.');
+      }
+      // Startup reconciliation may have delayed this click long enough for Kai
+      // to become hidden/minimized, lose focus, or switch away from this
+      // Browser panel. Native dialogs require fresh focused Browser-chrome
+      // authority; background automation never opens one. The Downloads
+      // manager deliberately detaches the page WebContentsView, so its focused
+      // Browser chrome -- not mounted page bounds -- is the authority signal.
+      this.assertHostRendererOperationCurrent();
+      if (!this.isHostWindowInteractive() || this.chromeFocusConversationId !== conversationId) {
+        return { canceled: true };
+      }
+      // The save dialog can remain open while another download completes and
+      // enforces quarantine quotas. Protect this exact source until copying (or
+      // cancellation/failure) finishes so pruning cannot invalidate the user's
+      // already-visible export operation.
+      const releaseExportLease = this.acquireDownloadExportLease(scopeKey, download.path);
+      try {
+        const win = this.getWindow();
+        const options: Electron.SaveDialogOptions = {
+          title: 'Export assistant download',
+          defaultPath: join(app.getPath('downloads'), basename(download.filename) || 'Kai-download'),
+        };
+        const selected =
+          win && !win.isDestroyed() ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+        this.assertHostRendererOperationCurrent();
+        this.assertScopeAvailable(scopeKey);
+        if (selected.canceled || !selected.filePath) return { canceled: true };
+        await exportAssistantDownloadFile(this.appHome, download.path, selected.filePath);
+        return { filePath: selected.filePath };
+      } finally {
+        releaseExportLease();
+      }
+    });
+  }
+
+  async deleteDownload(conversationId: string, downloadId: string): Promise<void> {
+    const scopeKey = this.scopeKey(conversationId);
+    await this.withScopeActivity(scopeKey, async () => {
+      this.requireDownloadForScope(scopeKey, downloadId);
+      const active = [...this.activeDownloads.values()].find(
+        (candidate) => candidate.id === downloadId && candidate.scopeKey === scopeKey,
+      );
+      if (active) await active.cancel();
+      // Cancellation can synchronously publish a terminal DownloadItem update,
+      // including the final quarantine path. Re-read after it settles so a
+      // completion/cancel race cannot orphan the physical file while deleting
+      // only its shelf metadata.
+      const download = this.requireDownloadForScope(scopeKey, downloadId);
+      if (
+        download.quarantined &&
+        download.path &&
+        isAssistantDownloadQuarantinePath(this.appHome, scopeKey, download.id, download.path)
+      ) {
+        if (this.isDownloadExportLeased(scopeKey, download.path)) {
+          throw new Error('This assistant download is currently being exported.');
+        }
+        removeAssistantDownloadFile(download.path);
+      }
+      this.downloads.delete(downloadId);
+      const store = this.storeForScope(scopeKey);
+      store.removeDownload(downloadId);
+      await store.flushDownloads();
+      this.emitDownloadHistoryChangedForScope(scopeKey, conversationId, downloadId, 'deleted');
+    });
   }
 
   async cancelDownload(conversationId: string, downloadId: string): Promise<void> {
@@ -8650,13 +14541,13 @@ html::after {
   }
 
   private dismissPendingPermissionsForTab(tabId: string): void {
-    for (const [promptId, pending] of this.pendingPermissions) {
+    for (const [promptId, pending] of this.pendingPermissions ?? []) {
       if (pending.tabId === tabId) this.finishPendingPermission(promptId, false);
     }
   }
 
   private dismissPendingAuthForTab(tabId: string): void {
-    for (const [promptId, pending] of this.pendingAuth) {
+    for (const [promptId, pending] of this.pendingAuth ?? []) {
       if (pending.tabId === tabId) this.finishPendingAuth(promptId);
     }
   }
@@ -8743,13 +14634,25 @@ html::after {
       !tab ||
       tab.generation !== pending.tabGeneration ||
       tab.scopeKey !== pending.scopeKey ||
-      tab.shell.conversationId !== pending.conversationId
+      tab.shell.conversationId !== pending.conversationId ||
+      (pending.trustedUserNavigationLease !== undefined &&
+        (!tab.trustedUserNavigation ||
+          tab.trustedUserNavigationLease !== pending.trustedUserNavigationLease ||
+          pending.trustedUserNavigationRequestId === undefined ||
+          pending.trustedUserNavigationUrl === undefined ||
+          this.trustedUserNavigationAuthRequest(tab, pending.trustedUserNavigationUrl)?.requestId !==
+            pending.trustedUserNavigationRequestId))
     ) {
       this.finishPendingAuth(id);
       throw new Error('This HTTP authentication prompt expired after the page navigated.');
     }
     const submittingCredentials = username !== undefined || password !== undefined;
-    if (submittingCredentials && !pending.prompt.assistantTriggered && tab.aiNetworkRestricted) {
+    if (
+      submittingCredentials &&
+      !pending.prompt.assistantTriggered &&
+      tab.aiNetworkRestricted &&
+      pending.trustedUserNavigationLease === undefined
+    ) {
       // The page entered assistant control after this prompt first appeared.
       // Keep Chromium's callback pending and require a second decision made
       // with the AI-specific credential warning visible.
@@ -8864,7 +14767,7 @@ html::after {
 
   async autofill(
     conversationId: string,
-    tabId: string,
+    tabId: string | undefined,
     credentialId?: string,
     source: 'user' | 'assistant' = 'user',
     assistantRun?: BrowserAssistantRun,
@@ -8873,7 +14776,10 @@ html::after {
     if (source === 'assistant' && !assistantRun) throw new Error('Assistant autofill requires turn ownership.');
     const abortSignal = assistantRun?.abortSignal;
     throwIfBrowserAborted(abortSignal);
-    const tab = this.requireTab(conversationId, tabId);
+    const tab =
+      source === 'assistant'
+        ? this.requireAssistantTab(conversationId, assistantRun!, tabId)
+        : this.requireTab(conversationId, tabId);
     const operation = async (
       documentLease?: AssistantDocumentLease,
       reveal?: (contents: WebContents, documentLease: AssistantDocumentLease) => Promise<void>,
@@ -8882,7 +14788,7 @@ html::after {
       this.assertBrowserDocumentApproval(tab, approvedDocument);
       const contents = (
         source === 'assistant'
-          ? await this.ensureAssistantView(tab, assistantRun!, documentLease!)
+          ? await this.ensureAssistantView(tab, assistantRun!, documentLease!, undefined, approvedDocument)
           : await this.ensureView(tab)
       ).webContents;
       this.assertBrowserDocumentApproval(tab, approvedDocument);
@@ -9001,7 +14907,12 @@ html::after {
         'autofilling saved password',
         (reveal) =>
           this.runTabOperation(tab, () =>
-            this.withAssistantControl(tab, assistantRun!, (documentLease) => operation(documentLease, reveal)),
+            this.withAssistantControl(
+              tab,
+              assistantRun!,
+              (documentLease) => operation(documentLease, reveal),
+              approvedDocument,
+            ),
           ),
       );
       return;
@@ -9061,6 +14972,7 @@ html::after {
     const keys = new Set([
       ...readScopeKeys('Browser profile metadata', () => listStoredBrowserScopeKeys(this.appHome)),
       ...readScopeKeys('Saved-password metadata', () => listStoredCredentialScopeKeys(this.appHome)),
+      ...readScopeKeys('Assistant download quarantine', () => listAssistantDownloadQuarantineScopeKeys(this.appHome)),
       ...pendingCleanupScopeKeys,
       ...readScopeKeys('Chromium Browser profiles', () =>
         listStoredChromiumBrowserScopeKeys(this.appHome, app.getPath('sessionData')),
@@ -9128,6 +15040,7 @@ html::after {
     };
     add(listStoredBrowserScopeKeys(this.appHome));
     add(listStoredCredentialScopeKeys(this.appHome));
+    add(listAssistantDownloadQuarantineScopeKeys(this.appHome));
     add(listStoredChromiumBrowserScopeKeys(this.appHome, app.getPath('sessionData')));
     try {
       add(listPendingBrowserCleanupScopeKeys(this.appHome));
@@ -9178,6 +15091,7 @@ html::after {
     const affectedConversations = new Set<string>();
     const browserSessions = new Map<string, Session>();
     const networkQuiescedScopeKeys = new Set<string>();
+    const downloadQuiescedScopeKeys = new Set<string>();
     const chromiumStorageClearedScopeKeys = new Set<string>();
     const clearedScopeKeys = new Set<string>();
     let shellStateFinalized = false;
@@ -9205,6 +15119,7 @@ html::after {
         affectedConversations.add(options.conversationId);
       }
       const downloadDrain = this.cancelActiveDownloadsForScopes(scopeKeys);
+      void downloadDrain.catch(() => undefined);
       // Tear down live renderers first to abort navigations/cookie writes, then
       // drain every queued/active tool operation before clearing persistent
       // storage. New activity fails at the scope gate until the clear completes.
@@ -9213,6 +15128,10 @@ html::after {
         tab.shell.discarded = true;
         tab.shell.sensitive = false;
       }
+      const menuPreviewDrain = this.drainMenuPreviewCapture(
+        scopeKeys,
+        new Error('Browser menu preview was cancelled because its Browser data is being cleared.'),
+      );
       // Fail closed before any asynchronous storage operation can reject. Once
       // Chromium data clearing begins, neither a live shell nor reopen-closed
       // history may retain a URL that could silently repopulate that profile.
@@ -9262,6 +15181,11 @@ html::after {
             throw new Error('Chromium clearing was skipped because background network activity could not be stopped.');
           }
         };
+        const requireDownloadQuiescence = (): void => {
+          if (!downloadQuiescedScopeKeys.has(scopeKey)) {
+            throw new Error('Browser profile clearing was skipped because an active download could not be stopped.');
+          }
+        };
         try {
           await runBrowserDataClearOperations(`Browser profile ${scopeKey}`, [
             {
@@ -9299,12 +15223,22 @@ html::after {
               label: 'queued browser operations',
               run: async () => {
                 await Promise.all([
-                  this.visibleAssistantQueue.whenIdle(),
                   ...tabsForScope.map((tab) => tab.queue.whenIdle()),
+                  this.screenshotQueue.whenIdle(),
+                  menuPreviewDrain,
                 ]);
               },
             },
-            { label: 'active downloads', run: () => downloadDrain },
+            {
+              label: 'active downloads',
+              run: async () => {
+                await downloadDrain;
+                if ([...this.activeDownloads.values()].some((download) => download.scopeKey === scopeKey)) {
+                  throw new Error('An active Browser download remained after cancellation completed.');
+                }
+                downloadQuiescedScopeKeys.add(scopeKey);
+              },
+            },
             {
               label: 'active profile operations',
               run: () => {
@@ -9316,6 +15250,7 @@ html::after {
               label: 'Chromium storage',
               run: async () => {
                 requireNetworkQuiescence();
+                requireDownloadQuiescence();
                 await getBrowserSession(scopeKey).clearStorageData();
                 chromiumStorageClearedScopeKeys.add(scopeKey);
               },
@@ -9324,6 +15259,7 @@ html::after {
               label: 'Chromium cache',
               run: () => {
                 requireNetworkQuiescence();
+                requireDownloadQuiescence();
                 return getBrowserSession(scopeKey).clearCache();
               },
             },
@@ -9331,26 +15267,42 @@ html::after {
               label: 'HTTP authentication cache',
               run: () => {
                 requireNetworkQuiescence();
+                requireDownloadQuiescence();
                 return getBrowserSession(scopeKey).clearAuthCache();
               },
             },
             {
               label: 'download path cache',
               run: () => {
+                requireDownloadQuiescence();
                 this.purgeCachedDownloadsForScope(scopeKey);
               },
             },
             {
+              label: 'assistant download quarantine',
+              run: () => {
+                requireDownloadQuiescence();
+                removeAssistantDownloadQuarantineForScope(this.appHome, scopeKey);
+              },
+            },
+            {
               label: 'history, bookmarks, permissions, and downloads',
-              run: () => this.storeForScope(scopeKey).clear(),
+              run: () => {
+                requireDownloadQuiescence();
+                return this.storeForScope(scopeKey).clear();
+              },
             },
             {
               label: 'retained Browser screenshots',
-              run: () => removeBrowserScreenshotsForScopeKey(this.appHome, scopeKey),
+              run: () => {
+                requireDownloadQuiescence();
+                removeBrowserScreenshotsForScopeKey(this.appHome, scopeKey);
+              },
             },
             {
               label: 'runtime profile state',
               run: () => {
+                requireDownloadQuiescence();
                 // Keep the in-process request guard and worker provenance when
                 // Chromium could not prove that persistent workers/storage are
                 // gone. The catch path below restores the durable store bit.
@@ -9359,7 +15311,13 @@ html::after {
                 this.assistantControlledOrigins.delete(scopeKey);
               },
             },
-            { label: 'saved passwords', run: () => this.vaultForScope(scopeKey).clear() },
+            {
+              label: 'saved passwords',
+              run: () => {
+                requireDownloadQuiescence();
+                return this.vaultForScope(scopeKey).clear();
+              },
+            },
           ]);
           // A Chromium tombstone and removal of the retry marker are commit
           // records, not cleanup categories. Publish them only after every
@@ -9496,10 +15454,11 @@ html::after {
     const pending = this.pendingAssistantContinuations?.get(key);
     if (pending) {
       this.pendingAssistantContinuations.delete(key);
-      this.assistantContinuationLeases.delete(key);
       clearTimeout(pending.timer);
-      await pending.drain;
-    } else await this.assistantRuns.end(conversationId, runId);
+      await this.finishAssistantContinuations([pending], true);
+      return;
+    }
+    await this.assistantRuns.end(conversationId, runId);
     await this.cleanupAssistantStateOwnedByRun(conversationId, runId);
     this.emitTabs(conversationId);
   }
@@ -9509,6 +15468,7 @@ html::after {
     // Conversation ids are immutable, so this remains valid for the manager's
     // lifetime and also blocks tab creations already waiting on DNS/scope I/O.
     this.fenceRemovedConversation(conversationId);
+    this.forgetAssistantTargetsForConversation(conversationId);
     this.invalidatePanelAuthority(conversationId);
     this.invalidatePhysicalAssistantActions(this.tabs.get(this.activeTabs.get(conversationId) ?? ''));
     this.notifyPanelStateChanged(conversationId);
@@ -9577,8 +15537,17 @@ html::after {
     this.hostRendererAuthorityGeneration++;
     for (const controller of this.hostRendererOperationControllers ?? []) controller.abort();
     this.chromeFocusConversationId = null;
-    void this.cancelAssistantContinuations();
+    void this.cancelAssistantContinuations().catch((error: unknown) => {
+      console.warn('[Browser] Assistant continuation renderer teardown will be retried:', error);
+    });
+    // DownloadItems outlive their initiating WebContents. Invoke every
+    // non-retained assistant cancellation synchronously while its run ownership
+    // is still intact, before clearing leases and destroying page renderers.
+    void this.cancelActiveAssistantDownloads().catch((error: unknown) => {
+      console.warn('[Browser] Assistant download cancellation did not reach a terminal state:', error);
+    });
     this.assistantRuns.clear();
+    this.assistantTargetTabs?.clear();
     this.mountedConversationId = null;
     this.mountedBounds = null;
     this.detachAttachedView();
@@ -9671,13 +15640,13 @@ html::after {
     ipcMain.off('browser-page:login-submitted', this.handleLoginSubmitted);
     ipcMain.off('browser-page:activity', this.handlePageActivity);
     ipcMain.off('browser-page:gesture', this.handlePageGesture);
+    ipcMain.off('browser-page:automation-input-armed', this.handleAutomationInputArmed);
+    ipcMain.off('browser-page:sensitivity-probe-result', this.handleMenuSensitivityProbeResult);
     ipcMain.off('browser-page:element-picker-click', this.handleElementPickerClick);
     ipcMain.off('browser-page:element-picker-result', this.handleElementPickerResult);
     ipcMain.off('browser-page:element-picker-cancel', this.handleElementPickerCancel);
     app.off('login', this.handleLogin);
     app.off('select-client-certificate', this.handleSelectClientCertificate);
-    for (const cleanupSession of this.wiredSessionCleanups.values()) cleanupSession();
-    this.wiredSessionCleanups.clear();
     for (const pending of this.pendingCredentials.values()) {
       clearTimeout(pending.timer);
       pending.password = '';
@@ -9695,12 +15664,39 @@ html::after {
     this.pendingAuth.clear();
     this.runningActions.clear();
     for (const conversationId of [...this.panelStateWaiters.keys()]) this.notifyPanelStateChanged(conversationId);
+    // Persistent-session request guards remain authoritative until every live
+    // remote renderer has been destroyed. Removing them first creates a small
+    // but real interval in which page script can dispatch an unfiltered request
+    // (including to a private-network destination) while shutdown is closing
+    // sibling views.
     for (const tab of this.tabs.values()) this.destroyView(tab);
+    for (const contentsId of [...(this.contextMenuDownloadAuthorities?.keys() ?? [])]) {
+      this.clearContextMenuDownloadAuthority(contentsId);
+    }
+    for (const cleanupSession of this.wiredSessionCleanups.values()) cleanupSession();
+    this.wiredSessionCleanups.clear();
     this.assistantRuns.clear();
-    this.automationGestureTokens.clear();
+    this.assistantTargetTabs?.clear();
+    for (const pending of this.pendingAutomationArmAcknowledgements.values()) {
+      pending.settle(new Error('The in-app browser is shutting down.'));
+    }
+    this.pendingAutomationArmAcknowledgements.clear();
+    for (const pending of this.pendingMenuSensitivityProbes.values()) pending.settle();
+    this.pendingMenuSensitivityProbes.clear();
+    for (const token of [...this.automationGestureTokens.keys()]) this.revokeAutomationGestureToken(token);
     this.pendingSyntheticInputs.clear();
+    for (const contentsId of [...this.dispatchedSyntheticInputs.keys()]) {
+      this.clearDispatchedSyntheticInput(contentsId);
+    }
     for (const tabId of this.faviconFetches.keys()) this.cancelFaviconFetch(tabId);
     this.detachAttachedView();
+    const backgroundCaptureHost = this.backgroundCaptureHost;
+    this.backgroundCaptureHost = null;
+    this.captureHostedView = null;
+    this.captureHostedViewLease = null;
+    this.detachedHostViews?.clear();
+    this.closingHostWindow = null;
+    if (backgroundCaptureHost && !backgroundCaptureHost.isDestroyed()) backgroundCaptureHost.destroy();
     return true;
   }
 
@@ -9712,6 +15708,7 @@ html::after {
     this.removedConversations.clear();
     this.scopeGenerations.clear();
     this.scopeRuntimeReleaseTokens.clear();
+    this.pendingAssistantTabClosures.clear();
     this.clearingOrigins.clear();
     this.panelAuthorityGenerations.clear();
     this.panelLayoutGenerations.clear();
@@ -9729,15 +15726,20 @@ html::after {
       // A user may quit while a data clear or settings-driven scope transition
       // is already running. Stop admitting new work, then join the shared
       // mutation tail before destroying sessions or performing the final flush.
-      await Promise.allSettled([this.profileMutationTail]);
+      await Promise.allSettled([this.startupDownloadReconciliation, this.profileMutationTail]);
       if (this.disposed) return;
       const tabs = [...this.tabs.values()];
-      const queues = [this.visibleAssistantQueue.whenIdle(), ...tabs.map((tab) => tab.queue.whenIdle())];
+      const queues = tabs.map((tab) => tab.queue.whenIdle());
+      const screenshotDrain = this.screenshotQueue.whenIdle();
       const scopeKeys = new Set([
         ...tabs.map((tab) => tab.scopeKey),
         ...[...this.activeDownloads.values()].map((download) => download.scopeKey),
         ...this.wiredSessionsByScope.keys(),
       ]);
+      const menuPreviewDrain = this.drainMenuPreviewCapture(
+        scopeKeys,
+        new Error('Browser menu preview was cancelled because the in-app browser is shutting down.'),
+      );
       const sessions = new Map(this.wiredSessionsByScope);
       for (const scopeKey of scopeKeys) {
         if (!this.suspendedScopes.has(scopeKey)) suspendedByAttempt.add(scopeKey);
@@ -9754,6 +15756,7 @@ html::after {
         ),
       );
       const downloadDrain = this.cancelActiveDownloadsForScopes(scopeKeys);
+      void downloadDrain.catch(() => undefined);
       // Keep the scoped request guards and any live CDP targets installed until
       // workers have stopped and existing connections are closed. Removing the
       // hooks or destroying the views first creates a shutdown window in which
@@ -9776,6 +15779,8 @@ html::after {
         const earlyFlush = Promise.allSettled([this.flushProfileData()]);
         const drainResults = await Promise.allSettled([
           ...queues,
+          screenshotDrain,
+          menuPreviewDrain,
           downloadDrain,
           this.waitForActiveDownloads(scopeKeys),
         ]);
@@ -9790,12 +15795,22 @@ html::after {
         );
       }
       for (const scopeKey of scopeKeys) this.finishAllScopeRequestActivities(scopeKey);
+      // A dismissed menu can release its tab queue while Chromium's native
+      // capturePage call is still using the renderer and profile. Join both
+      // process-wide allocations before removing session hooks or live views.
+      await Promise.all([screenshotDrain, menuPreviewDrain]);
+      // Keep every request guard and native view owned until all work admitted
+      // before the shutdown fence has drained. A page operation can execute
+      // renderer script or dispatch input after network quiescence; tearing down
+      // the session hooks before that queue settles would make its final network
+      // side effects unfiltered.
+      await Promise.allSettled(queues);
+      await downloadDrain;
+      await this.waitForActiveDownloads(scopeKeys);
+      await Promise.all([...scopeKeys].map((scopeKey) => this.waitForScopeIdle(scopeKey)));
+      await (this.validatingProxy?.close() ?? Promise.resolve());
       if (!this.beginTeardown()) return;
       try {
-        await Promise.allSettled(queues);
-        await downloadDrain;
-        await this.waitForActiveDownloads(scopeKeys);
-        await Promise.all([...scopeKeys].map((scopeKey) => this.waitForScopeIdle(scopeKey)));
         // No renderer, download, request, or profile callback can enqueue a write
         // after this point, so this is the final durable shutdown barrier.
         await this.flushProfileData();

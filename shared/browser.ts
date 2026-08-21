@@ -81,6 +81,7 @@ export type BrowserActionRequest = {
 const BROWSER_TOOL_NAMES = [
   'browser_tabs',
   'browser_inspect',
+  'browser_network',
   'browser_action',
   'browser_screenshot',
   'browser_evaluate',
@@ -90,7 +91,6 @@ const BROWSER_TOOL_NAMES = [
 const BROWSER_TAB_ACTION_NAMES = new Set([
   'list',
   'open',
-  'activate',
   'close',
   'duplicate',
   'reopen_closed',
@@ -117,6 +117,7 @@ const BROWSER_ACTION_KIND_NAMES = new Set<BrowserActionKind>([
   'unbookmark',
 ]);
 const BROWSER_SCREENSHOT_MODES = new Set(['viewport', 'full-page', 'element']);
+const BROWSER_NETWORK_WAIT_MODES = new Set(['none', 'load', 'network-idle']);
 const BROWSER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function invalidBrowserToolArguments(): { redacted: true; reason: string } {
@@ -277,7 +278,6 @@ export function redactBrowserToolArgsForExposure(toolName: string | undefined, a
         if (typeof record.url === 'string') output.url = redactLocation(record.url);
         includeBoolean(output, 'background');
         break;
-      case 'activate':
       case 'close':
       case 'duplicate':
       case 'keep_open':
@@ -292,6 +292,22 @@ export function redactBrowserToolArgsForExposure(toolName: string | undefined, a
   if (matchesBrowserTool('browser_inspect')) {
     const output: Record<string, unknown> = {};
     if (!includeUuid(output, 'tabId')) return invalidBrowserToolArguments();
+    return output;
+  }
+
+  if (matchesBrowserTool('browser_network')) {
+    const output: Record<string, unknown> = {};
+    if (!includeUuid(output, 'tabId')) return invalidBrowserToolArguments();
+    if (
+      record.waitFor !== undefined &&
+      (typeof record.waitFor !== 'string' || !BROWSER_NETWORK_WAIT_MODES.has(record.waitFor))
+    ) {
+      return invalidBrowserToolArguments();
+    }
+    if (record.waitFor !== undefined) output.waitFor = record.waitFor;
+    includeNumber(output, 'limit');
+    includeNumber(output, 'timeoutMs');
+    includeNumber(output, 'idleMs');
     return output;
   }
 
@@ -353,7 +369,7 @@ export function redactBrowserToolArgsForExposure(toolName: string | undefined, a
   // only their lengths just like typed text and injected scripts.
   if (record.kind === 'press') {
     const safeNonTextKey =
-      /^(?:alt|backspace|command|control|ctrl|delete|end|enter|esc|escape|f(?:[1-9]|1\d|2[0-4])|home|insert|meta|page(?:down|up)|shift|tab|arrow(?:down|left|right|up))$/i;
+      /^(?:alt|backspace|cmd|command|control|ctrl|delete|end|enter|esc|escape|f(?:[1-9]|1\d|2[0-4])|home|insert|meta|page(?:down|up)|shift|tab|arrow(?:down|left|right|up))$/i;
     if (Array.isArray(record.keys)) {
       if (!record.keys.every((key): key is string => typeof key === 'string')) {
         return invalidBrowserToolArguments();
@@ -412,7 +428,7 @@ export function redactBrowserToolArgsForExposure(toolName: string | undefined, a
 export type BrowserActionEvent = {
   id: string;
   tabId: string;
-  kind: BrowserActionKind | 'evaluate' | 'inspect' | 'screenshot' | 'autofill';
+  kind: BrowserActionKind | 'evaluate' | 'inspect' | 'network' | 'screenshot' | 'autofill';
   status: 'running' | 'completed' | 'failed';
   startedAt: string;
   completedAt?: string;
@@ -445,6 +461,62 @@ export type BrowserInspection = {
   viewportWidth: number;
   viewportHeight: number;
   elements: BrowserInteractiveElement[];
+};
+
+export type BrowserNetworkWaitMode = 'none' | 'load' | 'network-idle';
+
+export type BrowserNetworkDiagnosticsRequest = {
+  tabId?: string;
+  waitFor?: BrowserNetworkWaitMode;
+  /** Maximum recent requests returned, newest first. */
+  limit?: number;
+  /** Maximum time spent waiting for load or idle state. */
+  timeoutMs?: number;
+  /** Quiet period required by network-idle. */
+  idleMs?: number;
+};
+
+export type BrowserLoadTiming = {
+  navigationType?: 'navigate' | 'reload' | 'back_forward' | 'prerender' | 'unknown';
+  timeToFirstByteMs?: number;
+  responseEndMs?: number;
+  domContentLoadedMs?: number;
+  loadEventMs?: number;
+  durationMs?: number;
+  firstContentfulPaintMs?: number;
+  transferSizeBytes?: number;
+  encodedBodySizeBytes?: number;
+  decodedBodySizeBytes?: number;
+};
+
+export type BrowserNetworkEntry = {
+  sequence: number;
+  /** A stable per-process opaque origin token; hostnames, credentials, paths,
+   * queries, and fragments are removed. */
+  url: string;
+  urlRedacted: boolean;
+  method: string;
+  resourceType: string;
+  statusCode?: number;
+  fromCache?: boolean;
+  responseBytes?: number;
+  error?: string;
+  durationMs: number;
+  pending: boolean;
+};
+
+export type BrowserNetworkDiagnostics = {
+  tabId: string;
+  /** Opaque current-page origin identity. */
+  url: string;
+  loading: boolean;
+  waitFor: BrowserNetworkWaitMode;
+  waitTimedOut: boolean;
+  inFlight: number;
+  requestCount: number;
+  requestsTruncated: boolean;
+  loadTiming: BrowserLoadTiming;
+  requests: BrowserNetworkEntry[];
 };
 
 export type BrowserScreenshotMode = 'viewport' | 'full-page' | 'element';
@@ -512,6 +584,9 @@ export type BrowserDownload = {
   receivedBytes: number;
   totalBytes: number;
   state: 'progressing' | 'completed' | 'cancelled' | 'interrupted';
+  /** App-owned, bounded assistant download that must be explicitly exported
+   * before another application can use the remote file type. */
+  quarantined?: boolean;
   path?: string;
   url?: string;
 };
@@ -616,6 +691,12 @@ export type BrowserEvent =
       result: BrowserFindResult;
     }
   | { type: 'download'; conversationId: string; download: BrowserDownload }
+  | {
+      type: 'download-history-changed';
+      conversationId: string;
+      downloadId: string;
+      change: 'deleted' | 'unavailable';
+    }
   | { type: 'auth-prompt'; conversationId: string; prompt: BrowserAuthPrompt }
   | {
       type: 'permission-prompt';
@@ -749,6 +830,11 @@ export type BrowserBridge = {
   ) => Promise<void>;
   stopFind: (conversationId: string, tabId: string) => Promise<void>;
   setZoom: (conversationId: string, tabId: string, level: number) => Promise<number>;
+  /** Presentation-only capture used to preserve the native page behind Browser
+   * chrome. It shares the bounded screenshot allocation queue and is coalesced
+   * per document in main. */
+  captureMenuPreview: (conversationId: string, tabId: string, requestId: string) => Promise<BrowserScreenshotResult>;
+  cancelMenuPreview: (requestId: string) => Promise<void>;
   screenshot: (conversationId: string, request: BrowserScreenshotRequest) => Promise<BrowserScreenshotResult>;
   pickElement: (conversationId: string, tabId: string) => Promise<BrowserElementPickResult>;
   listHistory: (conversationId: string, query?: string) => Promise<BrowserHistoryEntry[]>;
@@ -762,6 +848,8 @@ export type BrowserBridge = {
   exportBookmarks: (conversationId: string) => Promise<{ exported: number; canceled?: boolean; filePath?: string }>;
   listDownloads: (conversationId: string) => Promise<BrowserDownload[]>;
   showDownload: (conversationId: string, downloadId: string) => Promise<void>;
+  exportDownload: (conversationId: string, downloadId: string) => Promise<{ canceled?: boolean; filePath?: string }>;
+  deleteDownload: (conversationId: string, downloadId: string) => Promise<void>;
   cancelDownload: (conversationId: string, downloadId: string) => Promise<void>;
   listSitePermissions: (conversationId: string, origin: string) => Promise<BrowserSitePermission[]>;
   resetSitePermissions: (conversationId: string, origin: string, permission?: string) => Promise<void>;

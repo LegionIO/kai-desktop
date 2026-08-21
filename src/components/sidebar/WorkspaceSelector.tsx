@@ -20,7 +20,7 @@ const SelectorButton = forwardRef<
         ref={ref}
         type="button"
         className={cn(
-          'titlebar-no-drag flex items-center gap-2 rounded-full',
+          'titlebar-no-drag flex min-w-0 max-w-full items-center gap-2 rounded-full',
           'border border-dashed border-border/60',
           'px-3 py-1.5 text-sm text-muted-foreground/50',
           'transition-colors hover:border-border hover:text-muted-foreground/70',
@@ -39,7 +39,7 @@ const SelectorButton = forwardRef<
       ref={ref}
       type="button"
       className={cn(
-        'titlebar-no-drag flex items-center gap-2 rounded-full',
+        'titlebar-no-drag flex min-w-0 max-w-full items-center gap-2 rounded-full',
         'border border-border/70 px-3 py-1.5 text-sm',
         'transition-colors hover:bg-muted/40',
         className,
@@ -56,9 +56,7 @@ const SelectorButton = forwardRef<
           <rect x="1" y="7.5" width="6" height="1.2" rx="0.6" fill="rgba(255,255,255,0.85)" />
         </svg>
       </div>
-      <span className="truncate text-xs font-medium text-foreground">
-        {workspace.name}
-      </span>
+      <span className="truncate text-xs font-medium text-foreground">{workspace.name}</span>
       <ChevronDownIcon size={12} className="shrink-0 text-muted-foreground/50" />
     </button>
   );
@@ -73,11 +71,7 @@ interface WorkspaceSelectorProps {
   activeWorkspace: Workspace | null;
 }
 
-export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
-  workspaces,
-  activeWorkspaceId,
-  activeWorkspace,
-}) => {
+export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({ workspaces, activeWorkspaceId, activeWorkspace }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -119,15 +113,8 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         onRequestDelete={handleRequestDelete}
         trigger={<SelectorButton workspace={activeWorkspace} />}
       />
-      <CreateWorkspaceDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-      />
-      <DeleteWorkspaceDialog
-        workspace={deleteTarget}
-        open={deleteOpen}
-        onOpenChange={handleDeleteOpenChange}
-      />
+      <CreateWorkspaceDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <DeleteWorkspaceDialog workspace={deleteTarget} open={deleteOpen} onOpenChange={handleDeleteOpenChange} />
     </>
   );
 };

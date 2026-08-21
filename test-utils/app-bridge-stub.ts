@@ -129,6 +129,10 @@ function buildDefaultStub(): AppLike {
       find: async () => undefined,
       stopFind: async () => undefined,
       setZoom: async (_conversationId: string, _tabId: string, level: number) => level,
+      captureMenuPreview: async () => {
+        throw new Error('Browser unavailable in test stub');
+      },
+      cancelMenuPreview: async () => undefined,
       screenshot: async () => {
         throw new Error('Browser unavailable in test stub');
       },
@@ -151,6 +155,8 @@ function buildDefaultStub(): AppLike {
       exportBookmarks: async () => ({ exported: 0, canceled: true }),
       listDownloads: async () => [],
       showDownload: async () => undefined,
+      exportDownload: async () => ({ canceled: true }),
+      deleteDownload: async () => undefined,
       cancelDownload: async () => undefined,
       listSitePermissions: async () => [],
       resetSitePermissions: async () => undefined,

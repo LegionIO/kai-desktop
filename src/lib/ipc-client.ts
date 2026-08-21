@@ -99,7 +99,10 @@ type AppAPI = {
     ) => Promise<{ ok: boolean; cooperative?: boolean; id?: string; error?: string }>;
     listInjects: (conversationId: string) => Promise<Array<{ id: string; text: string; at: number }>>;
     cancelInject: (conversationId: string, id: string) => Promise<{ ok: boolean; text?: string }>;
-    getToolApprovalPrivateDetails?: (toolCallId: string) => Promise<{ browserInput: unknown } | null>;
+    getToolApprovalPrivateDetails?: (toolCallId: string) => Promise<{
+      browserInput: unknown;
+      browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
+    } | null>;
     approveToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     rejectToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;
     dismissToolCall: (toolCallId: string) => Promise<{ ok: boolean }>;

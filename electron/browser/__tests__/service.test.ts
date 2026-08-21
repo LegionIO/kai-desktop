@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   chromiumScopeClearedMark: vi.fn(),
   profileExists: vi.fn(() => true),
   screenshotClear: vi.fn(),
+  quarantineClear: vi.fn(),
   managerDispose: vi.fn(),
   managerShutdown: vi.fn<() => Promise<void>>(async () => undefined),
   managerFenceConversation: vi.fn(),
@@ -77,6 +78,9 @@ vi.mock('../profile-data.js', () => ({
 vi.mock('../screenshot-store.js', () => ({
   removeBrowserScreenshotsForConversation: mocks.screenshotClear,
 }));
+vi.mock('../download-quarantine.js', () => ({
+  removeAssistantDownloadQuarantineForScope: mocks.quarantineClear,
+}));
 
 const {
   BROWSER_FORCE_EXIT_GRACE_MS,
@@ -120,6 +124,10 @@ describe('headless browser profile cleanup', () => {
     expect(mocks.onBeforeRequest).toHaveBeenLastCalledWith(null);
     expect(mocks.profileClear).toHaveBeenCalledOnce();
     expect(mocks.credentialClear).toHaveBeenCalledOnce();
+    expect(mocks.quarantineClear).toHaveBeenCalledWith(
+      '/tmp/kai-home',
+      expect.stringMatching(/^conversation-[a-f0-9]{24}$/),
+    );
     expect(mocks.screenshotClear).toHaveBeenCalledWith('/tmp/kai-home', 'conversation-123');
     expect(mocks.chromiumScopeClearedMark).toHaveBeenCalledWith(
       '/tmp/kai-home',

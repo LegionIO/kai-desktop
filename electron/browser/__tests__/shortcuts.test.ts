@@ -56,6 +56,7 @@ describe('resolveBrowserShortcut', () => {
     expect(isClipboardShortcutKeys(['Meta', 'c'], true)).toBe(true);
     expect(resolveClipboardShortcutCommand(['Meta', 'c'], true)).toBe('copy');
     expect(resolveClipboardShortcutCommand(['Command', 'x'], true)).toBe('cut');
+    expect(resolveClipboardShortcutCommand(['cmd', 'c'], true)).toBe('copy');
     expect(resolveClipboardShortcutCommand(['Meta', 'v'], true)).toBe('paste');
     expect(resolveClipboardShortcutCommand(['Meta', 'Shift', 'v'], true)).toBe('paste');
     expect(resolveClipboardShortcutCommand(['Meta', 'Shift', 'c'], true)).toBeNull();
@@ -83,6 +84,7 @@ describe('resolveBrowserShortcut', () => {
 
   it('recognizes synthetic keys that would be intercepted as browser chrome shortcuts', () => {
     expect(isReservedBrowserShortcutKeys(['Meta', 't'])).toBe(true);
+    expect(isReservedBrowserShortcutKeys(['cmd', 't'])).toBe(true);
     expect(isReservedBrowserShortcutKeys(['Control', 'w'])).toBe(true);
     expect(isReservedBrowserShortcutKeys(['Alt', 'ArrowLeft'])).toBe(true);
     expect(isReservedBrowserShortcutKeys(['Alt', 'Shift', 'ArrowLeft'])).toBe(false);
@@ -93,6 +95,7 @@ describe('resolveBrowserShortcut', () => {
 
   it('blocks assistant input that can reach application-menu accelerators', () => {
     expect(isApplicationAcceleratorShortcutKeys(['Meta', 'q'])).toBe(true);
+    expect(isApplicationAcceleratorShortcutKeys(['cmd', 'Enter'])).toBe(true);
     expect(isApplicationAcceleratorShortcutKeys(['Control', ','])).toBe(true);
     expect(isApplicationAcceleratorShortcutKeys(['Meta', 'Alt', 'i'])).toBe(true);
     expect(isApplicationAcceleratorShortcutKeys(['F11'])).toBe(true);

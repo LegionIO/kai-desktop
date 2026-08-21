@@ -128,7 +128,7 @@ export const BrowserSettings: FC<SettingsProps & { conversationId: string | null
         <legend className="px-1 text-xs font-semibold">AI control</legend>
         <PolicySelect
           id="browser.readAccess"
-          label="Tab listing, page inspection, and screenshots"
+          label="Tab listing, page inspection, screenshots, and network diagnostics"
           value={browser.readAccess ?? 'allow'}
           onChange={(value) => void updateConfig('browser.readAccess', value)}
         />
@@ -245,8 +245,8 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
     if (
       !window.confirm(
         recoveryRequired
-          ? 'Browser cleanup metadata is unreadable. Recover by clearing cookies, storage, permissions, history, bookmarks, saved passwords, and retained Browser screenshots for every discoverable Browser profile? Downloaded files will not be deleted.'
-          : `Clear cookies, storage, permissions, history, bookmarks, saved passwords, and retained Browser screenshots for ${summary.scopeKey}? Downloaded files will not be deleted.`,
+          ? 'Browser cleanup metadata is unreadable. Recover by clearing cookies, storage, permissions, history, bookmarks, saved passwords, retained Browser screenshots, and unexported assistant download quarantine copies for every discoverable Browser profile? Files you already exported or saved remain on disk.'
+          : `Clear cookies, storage, permissions, history, bookmarks, saved passwords, retained Browser screenshots, and unexported assistant download quarantine copies for ${summary.scopeKey}? Files you already exported or saved remain on disk.`,
       )
     )
       return;
@@ -279,7 +279,8 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
       </legend>
       <p className="text-[10px] text-muted-foreground">
         Clear a live profile safely: its page views close first, then cookies, cache, storage, permissions, history,
-        bookmarks, scoped credentials, and retained Browser screenshots are removed. Downloaded files remain on disk.
+        bookmarks, scoped credentials, retained Browser screenshots, and unexported assistant download quarantine copies
+        are removed. Files you already exported or saved remain on disk.
       </p>
       {error && (
         <p
