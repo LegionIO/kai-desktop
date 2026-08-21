@@ -24,6 +24,10 @@ export type NotificationWindowItem =
       /** The pending approval / ask_user id (the tool-approval-required toolCallId). */
       id: string;
       conversationId: string;
+      /** R252: the emitting run's nonce (streamToken/runGeneration). Two OVERLAPPING runs in the same
+       *  conversation can each mint `call_1`; without the nonce they'd share one pop-out window and the later
+       *  request would overwrite the earlier's payload / settling either would close the shared surface. */
+      runNonce?: string;
       toolName: string;
       /** Tool args — carries a `reason` (generic) or `questions` (ask_user). */
       args?: unknown;
@@ -39,6 +43,7 @@ export type NotificationWindowItem =
 export type ApprovalWindowRequest = {
   approvalId: string;
   conversationId: string;
+  runNonce?: string;
   toolName: string;
   args?: unknown;
 };
@@ -64,15 +69,18 @@ const notificationWindows = new Map<string, BrowserWindow>();
 // left the window spinning forever).
 const notificationItems = new Map<string, NotificationWindowItem>();
 
-/** Registry key for the pop-out maps (R193). A `tool-approval` item's `id` is the provider tool-call id
- *  (e.g. `call_1`), unique only WITHIN one conversation — two concurrent conversations can share it — so
- *  scope it by conversationId. An `alert` item's id is a globally-unique alert id, used as-is. Mirrors the
- *  `conversationId::toolCallId` scheme used for the pending-approval map (approvalKey). */
+/** Registry key for the pop-out maps (R193/R252). A `tool-approval` item's `id` is the provider tool-call id
+ *  (e.g. `call_1`), unique only WITHIN one provider response — two concurrent conversations, OR two OVERLAPPING
+ *  runs in the same conversation, can share it — so scope it by conversationId AND the run nonce when present.
+ *  An `alert` item's id is a globally-unique alert id, used as-is. Mirrors the run-scoped key used for the
+ *  pending-approval map (approvalKey). */
 function notifKey(item: NotificationWindowItem): string {
-  return item.source === 'tool-approval' ? `${item.conversationId}::${item.id}` : item.id;
+  if (item.source !== 'tool-approval') return item.id;
+  return notifKeyFromParts(item.id, item.conversationId, item.runNonce);
 }
-/** Compose the same key from raw parts, for lookups that only have the id (+ optional conversationId). */
-function notifKeyFromParts(id: string, conversationId?: string): string {
+/** Compose the same key from raw parts, for lookups that only have the id (+ optional conversationId/runNonce). */
+function notifKeyFromParts(id: string, conversationId?: string, runNonce?: string): string {
+  if (conversationId && runNonce) return `${conversationId}::${runNonce}::${id}`;
   return conversationId ? `${conversationId}::${id}` : id;
 }
 
@@ -297,13 +305,44 @@ function restorePriorFocus(id: string): void {
   }, 0);
 }
 
+/** R252: resolve the ACTUAL registry key for a tool-approval close/has, honoring the run-scoped key:
+ *  run-scoped (conversationId + runNonce) → conversation-scoped → an UNAMBIGUOUS
+ *  `${conversationId}::<nonce>::${id}` scan (so a nonce-less close still hits the single matching run-scoped
+ *  window). Returns undefined when nothing matches. Only for tool-approval (conversationId present); an alert
+ *  close passes no conversationId and uses the raw id directly. */
+function resolveNotifKey(id: string, conversationId?: string, runNonce?: string): string | undefined {
+  if (!conversationId) return notificationWindows.has(id) ? id : undefined;
+  if (runNonce) {
+    const k = notifKeyFromParts(id, conversationId, runNonce);
+    if (notificationWindows.has(k)) return k;
+  }
+  const conv = notifKeyFromParts(id, conversationId);
+  if (notificationWindows.has(conv)) return conv;
+  const prefix = `${conversationId}::`;
+  const suffix = `::${id}`;
+  let match: string | undefined;
+  let ambiguous = false;
+  for (const key of notificationWindows.keys()) {
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    const middle = key.slice(prefix.length, key.length - suffix.length);
+    if (middle.length === 0 || middle.includes('::')) continue;
+    if (match !== undefined) {
+      ambiguous = true;
+      break;
+    }
+    match = key;
+  }
+  return ambiguous ? undefined : match;
+}
+
 /** Close the notification window for an id once it's resolved/aborted. Idempotent. For a tool-approval
- *  pass the `conversationId` so the conversation-scoped key resolves (R193). When conversationId is
- *  provided the key is EXACT (no raw fallback) — a scoped tool-approval close must never fall back to the
- *  raw namespace and match an unrelated ALERT whose UUID happens to equal the tool-call id (R195). The raw
+ *  pass the `conversationId` (+ optional runNonce, R252) so the run-scoped key resolves. When conversationId is
+ *  provided the key is EXACT / scoped (no raw fallback) — a scoped tool-approval close must never fall back to
+ *  the raw namespace and match an unrelated ALERT whose UUID happens to equal the tool-call id (R195). The raw
  *  key is used only for a call WITHOUT conversationId (alerts, whose id is globally unique; legacy). */
-export function closeNotificationWindow(id: string, conversationId?: string): void {
-  const key = conversationId ? notifKeyFromParts(id, conversationId) : id;
+export function closeNotificationWindow(id: string, conversationId?: string, runNonce?: string): void {
+  const key = conversationId ? resolveNotifKey(id, conversationId, runNonce) : id;
+  if (!key) return;
   const win = notificationWindows.get(key);
   // Only manage focus if the POP-OUT WINDOW was actually the focused surface at
   // close time. When the user answers the INLINE card in the main GUI (which also
@@ -332,10 +371,11 @@ export function closeAllNotificationWindows(): void {
   notificationItems.clear();
 }
 
-export function hasNotificationWindow(id: string, conversationId?: string): boolean {
-  // Exact key when scoped (no raw fallback) so a scoped query can't match an unrelated raw/alert entry (R195).
-  const key = conversationId ? notifKeyFromParts(id, conversationId) : id;
-  const win = notificationWindows.get(key);
+export function hasNotificationWindow(id: string, conversationId?: string, runNonce?: string): boolean {
+  // Scoped (no raw fallback) so a scoped query can't match an unrelated raw/alert entry (R195); run-scoped
+  // resolution with an unambiguous scan for a nonce-less caller (R252).
+  const key = conversationId ? resolveNotifKey(id, conversationId, runNonce) : id;
+  const win = key ? notificationWindows.get(key) : undefined;
   return Boolean(win && !win.isDestroyed());
 }
 
@@ -350,6 +390,7 @@ export function openApprovalWindow(request: ApprovalWindowRequest): BrowserWindo
     source: 'tool-approval',
     id: request.approvalId,
     conversationId: request.conversationId,
+    runNonce: request.runNonce,
     toolName: request.toolName,
     args: request.args,
   });

@@ -1814,12 +1814,12 @@ function recoveryTombstoneConversation(answerKey: string): string | undefined {
   return t.conversationId;
 }
 
-/** R251: recover the run nonce for a `${convId}::<nonce>::${toolCallId}` key by scanning the run-scoped
- *  raced-answer RECOVERY state (handoff answerKeys + tombstone keys). This is the ONLY server-side place the
- *  nonce reliably survives a post-abort settle of an ORDINARY `any-renderer` approval (no durable authority
- *  record exists for those — R251 finding). Returns the nonce ONLY on an UNAMBIGUOUS single match so a
- *  reject/dismiss/answer can purge/stash under the SAME run-scoped key the handoff/tombstone holds; undefined
- *  otherwise (caller falls back to the conversation-only key). */
+/** R251/R252: recover the run nonce for a `${convId}::<nonce>::${toolCallId}` key by scanning the run-scoped
+ *  raced-answer RECOVERY state (handoff answerKeys + LIVE claimant answerKeys + tombstone keys). This is the
+ *  ONLY server-side place the nonce reliably survives a post-abort settle of an ORDINARY `any-renderer`
+ *  approval (no durable authority record exists for those). R252: include the live claimant — once a successor
+ *  transfers a handoff into liveRacedAnswerClaimant, the handoff map no longer holds the key. Returns the nonce
+ *  ONLY on an UNAMBIGUOUS single match; undefined otherwise (caller falls back to the conversation-only key). */
 function recoverRunNonceFromRecoveryState(convId: string | undefined, toolCallId: string): string | undefined {
   if (!convId) return undefined;
   const prefix = `${convId}::`;
@@ -1834,6 +1834,10 @@ function recoverRunNonceFromRecoveryState(convId: string | undefined, toolCallId
   const state = racedAnswerHandoffs.get(convId);
   if (state) {
     for (const k of state.answerKeys) consider(k);
+  }
+  const claimant = liveRacedAnswerClaimant.get(convId);
+  if (claimant) {
+    for (const k of claimant.state.answerKeys) consider(k);
   }
   for (const [k, t] of recoveryTombstones) {
     if (t.conversationId === convId) consider(k);
@@ -2440,6 +2444,7 @@ function maybeOpenDedicatedApprovalWindow(event: StreamEvent): void {
   const win = openApprovalWindow({
     approvalId: event.toolCallId,
     conversationId: event.conversationId,
+    runNonce: event.runGeneration, // R252: run-scope the pop-out registry so overlapping runs don't share a window
     toolName: event.toolName ?? 'tool',
     args: event.args,
   });
@@ -10567,8 +10572,8 @@ export function registerAgentHandlers(
     const rejNonce =
       runNonce ??
       extractRunNonceFromApprovalKey(resolved?.key, rejConv, toolCallId) ??
-      findRunNonceForAuthorityRecord(rejConv, toolCallId) ??
-      recoverRunNonceFromRecoveryState(rejConv, toolCallId);
+      recoverRunNonceFromRecoveryState(rejConv, toolCallId) ??
+      findRunNonceForAuthorityRecord(rejConv, toolCallId);
     purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId, rejNonce));
     if (rejNonce) purgeRacedAnswerForKey(makeAnswerKey(rejConv, toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
@@ -10596,8 +10601,8 @@ export function registerAgentHandlers(
     const disNonce =
       runNonce ??
       extractRunNonceFromApprovalKey(resolved?.key, disConv, toolCallId) ??
-      findRunNonceForAuthorityRecord(disConv, toolCallId) ??
-      recoverRunNonceFromRecoveryState(disConv, toolCallId);
+      recoverRunNonceFromRecoveryState(disConv, toolCallId) ??
+      findRunNonceForAuthorityRecord(disConv, toolCallId);
     purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId, disNonce));
     if (disNonce) purgeRacedAnswerForKey(makeAnswerKey(disConv, toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
@@ -10646,11 +10651,14 @@ export function registerAgentHandlers(
       // (R250: the pending entry was already deleted by an abort — the raced-answer path) the nonce from the
       // DURABLE authority record's key, so the stash key we write matches EXACTLY the run-scoped key the
       // handoff/tombstone recovery reads. Undefined → keys fall back to conversation-only (pre-R249 behavior).
+      // R252: consult the ACTIVE recovery state (handoff/claimant/tombstone) BEFORE the durable authority
+      // record — authority records survive settlement and a reused call_1 must not recover an OLDER run's nonce
+      // over the current handoff (which would stash under the wrong run / reject under stale Browser authority).
       const effectiveNonce =
         runNonce ??
         extractRunNonceFromApprovalKey(pendingResolved?.key, convId, toolCallId) ??
-        findRunNonceForAuthorityRecord(convId, toolCallId) ??
-        recoverRunNonceFromRecoveryState(convId, toolCallId);
+        recoverRunNonceFromRecoveryState(convId, toolCallId) ??
+        findRunNonceForAuthorityRecord(convId, toolCallId);
       const answerKey = makeAnswerKey(convId, toolCallId, effectiveNonce);
       const approvalMapKey = approvalKey(convId, toolCallId, effectiveNonce);
       // A Browser-authorized approval may only be answered by the authorized surface (main's authority
