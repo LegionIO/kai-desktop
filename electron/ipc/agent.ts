@@ -2620,9 +2620,10 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     if (event.type === 'tool-approval-required' && event.toolCallId) {
       maybeOpenDedicatedApprovalWindow(event);
     } else if (event.type === 'tool-result' && event.toolCallId) {
-      // R259: pass the emitting run's nonce so the close targets THIS run's pop-out exactly — a delayed
-      // superseded-run tool-result would otherwise nonce-lessly scan and destroy a newer run's same-id pop-out.
-      closeApprovalWindow(event.toolCallId, event.conversationId, event.runGeneration);
+      // R259/R260: run-scope the close with the emitting run's token. `event.runGeneration` isn't stamped until
+      // later in this function, so use `emittingToken` (the function param) — the run that produced this result.
+      // A delayed superseded-run tool-result thus closes only ITS own pop-out, never a newer run's same-id one.
+      closeApprovalWindow(event.toolCallId, event.conversationId, emittingToken);
       // The tool-result committed — an ask_user answer consumed by execute() is now
       // on the branch, so drop its in-flight ledger entry (no recovery needed). No-op
       // for non-ask_user ids (the ledger only holds ask_user answers) (R100 finding-7).
