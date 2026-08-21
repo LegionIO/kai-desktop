@@ -1357,21 +1357,45 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       /* best-effort — treat as not-yet-persisted, keep polling */
     }
     if (rendererPersisted) {
-      pendingRemoteReplace.delete(conversationId);
-      pendingLocalReplace.delete(conversationId);
       if (remoteOrigin) {
         // REMOTE-originated: the web client persisted a FRAME-CAPPED assistant under the run's
         // responseMessageId. Main holds the FULL events — REPLACE that node's content in place
         // (upsert by id) with main's full copy, rather than appending a duplicate sibling variant.
+        // R268: do NOT delete the pending markers until the upsert CONFIRMS success. finalizeInterruptedTurnReplacing
+        // can return null (retaining the accumulator) on a transient read/write failure; there is NO local renderer
+        // to re-persist the full content for a remote-origin turn, so deleting the pending marker first would let a
+        // new turn discard the accumulator and leave ONLY the frame-capped web copy. Keep the marker + accumulator
+        // so the next poll retries the replace; clear only once it lands.
+        let replacedHead: string | null = null;
         try {
-          finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
+          replacedHead = finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
         } catch {
           discardPersistenceAccumulator(conversationId);
+          pendingRemoteReplace.delete(conversationId);
+          pendingLocalReplace.delete(conversationId);
+          return;
         }
+        if (replacedHead) {
+          pendingRemoteReplace.delete(conversationId);
+          pendingLocalReplace.delete(conversationId);
+          return;
+        }
+        // R268: replacedHead === null → transient read/write failure, accumulator RETAINED. Keep the markers and
+        // CONTINUE POLLING so a later iteration retries the replace (until the budget runs out, whose branch then
+        // does a final replace attempt). Do NOT return here — that would end the poll and strand the accumulator
+        // for a new turn to discard, leaving only the frame-capped web copy.
+        if (remaining > 0) {
+          setTimeout(() => pollGuiFallback(remaining - 1), 100);
+          return;
+        }
+        // Budget exhausted with the replace still failing — fall through to the remaining<=0 branch below, which
+        // makes a final finalizeInterruptedTurnReplacing attempt and settles runStatus.
+      } else {
+        pendingRemoteReplace.delete(conversationId);
+        pendingLocalReplace.delete(conversationId);
+        discardPersistenceAccumulator(conversationId); // local renderer owns the (full) write — no double-persist
         return;
       }
-      discardPersistenceAccumulator(conversationId); // local renderer owns the (full) write — no double-persist
-      return;
     }
     if (remaining <= 0) {
       pendingRemoteReplace.delete(conversationId);
