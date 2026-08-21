@@ -1839,8 +1839,12 @@ function recoverRunNonceFromRecoveryState(convId: string | undefined, toolCallId
   if (claimant) {
     for (const k of claimant.state.answerKeys) consider(k);
   }
-  for (const [k, t] of recoveryTombstones) {
-    if (t.conversationId === convId) consider(k);
+  // R267: only consider VALID tombstones. recoveryTombstones caches entries lazily — an EXPIRED or
+  // Stop-invalidated tombstone lingers until read, and counting its nonce alongside a newer same-id handoff
+  // makes inference AMBIGUOUS (→ undefined → the answer stashes conversation-only and is never delivered).
+  // recoveryTombstoneConversation applies the TTL + cancel-gen validity check AND purges an invalid entry.
+  for (const k of [...recoveryTombstones.keys()]) {
+    if (recoveryTombstoneConversation(k) === convId) consider(k);
   }
   return seen.size === 1 ? [...seen][0] : undefined;
 }
