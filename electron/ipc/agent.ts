@@ -42,6 +42,7 @@ import { gateMessagesThroughUserPromptSubmit } from '../agent/hooks/prompt-submi
 import {
   accumulateForPersistence,
   discardPersistenceAccumulator,
+  purgeConversationPersistence,
   hasPersistenceAccumulator,
   persistenceAccumulatorHasContent,
   finalizeInterruptedTurn,
@@ -2006,6 +2007,10 @@ export function invalidateConversationRecovery(conversationId: string): void {
   // invisible to the tombstone/handoff/claimant scan). Otherwise the predecessor's later cleanup
   // would start a recovery delivery for the deleted chat (R139 f-3).
   dropInFlightAnswersForConversation(conversationId);
+  // R243: this runs on confirmed conversation DELETE/clear (see conversations:delete/deleteMany/clear). Hard-purge
+  // all persistence state for the gone conversation — unlike a Stop, a deleted chat can never flush a retained
+  // orphaned inject-prefix (reads return null forever), so retaining it would leak text/tool payloads until exit.
+  purgeConversationPersistence(conversationId);
 }
 
 /** Tear down a successor's raced-answer state for this token: clear its claimant
