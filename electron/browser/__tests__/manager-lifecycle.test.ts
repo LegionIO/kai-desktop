@@ -13499,6 +13499,80 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('does not start a debugger scan after a timed-out child-frame sensitivity probe settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const childScan = deferred<boolean>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+        if (args[0] === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+        if (args[0] === 'Page.createIsolatedWorld') return { executionContextId: 1 };
+        if (args[0] === 'Runtime.evaluate') return { result: { value: false } };
+        return {};
+      });
+      const childFrame = {
+        detached: false,
+        executeJavaScript: vi.fn(() => childScan.promise),
+        frameTreeNodeId: 2,
+        isDestroyed: () => false,
+      };
+      const contents = {
+        id: 42,
+        debugger: debuggerApi,
+        isDestroyed: () => false,
+        mainFrame: {
+          frameTreeNodeId: 1,
+          framesInSubtree: [childFrame],
+        },
+      };
+      const tab = {
+        shell: {
+          id: 'tab-network-child-scan-timeout',
+          conversationId: 'chat-1',
+          url: 'https://example.com/account',
+          loading: false,
+          sensitive: false,
+        },
+        scopeKey: 'global',
+        generation: 1,
+        trustedUserNavigationLease: 0,
+        networkNavigationSequence: 0,
+        networkRequests: new Map(),
+        queue: new BrowserActionQueue(),
+        view: { webContents: contents },
+      };
+      const manager = managerWithoutConstructor({
+        assistantRuns: { assertActive: () => 1 },
+        assertAssistantDocumentLease: vi.fn(),
+        assertAssistantRun: vi.fn(),
+        assertBrowserDocumentApproval: vi.fn(),
+        ensureAssistantView: vi.fn(async () => tab.view),
+        requireAssistantTab: () => tab,
+        tabs: new Map([[tab.shell.id, tab]]),
+        withAssistantControl: async (_tab: unknown, _run: unknown, operation: (lease: object) => Promise<unknown>) =>
+          operation({}),
+        withVisibleAssistantOperation: async (...args: unknown[]) =>
+          (args[5] as (reveal: () => Promise<void>) => Promise<unknown>)(async () => undefined),
+      });
+
+      const diagnostics = manager.networkDiagnostics('chat-1', { waitFor: 'load', timeoutMs: 100 }, { id: 'run-1' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(childFrame.executeJavaScript).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(diagnostics).resolves.toMatchObject({ waitTimedOut: true, requests: [] });
+      expect(debuggerApi.attach).toHaveBeenCalledOnce();
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+
+      childScan.resolve(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(debuggerApi.sendCommand).not.toHaveBeenCalledWith('DOM.enable');
+      expect(debuggerApi.attach).toHaveBeenCalledOnce();
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('cancels a network wait without routing the main-process poll through a destructive renderer deadline', async () => {
     const controller = new AbortController();
     const tab = {

@@ -5477,18 +5477,29 @@ export class BrowserManager {
       captureDebuggerLease,
     )) as boolean;
     if (!sensitive) {
-      sensitive = await this.runRendererOperationWithDeadline(
-        tab,
-        contents,
-        'Browser password-field scan',
-        remainingTimeout(),
-        async () =>
-          (await this.hasPopulatedPasswordFieldInChildFrames(contents)) ||
-          (await this.hasPopulatedPasswordFieldViaCdp(contents, captureDebuggerLease)),
-        abortSignal,
-        documentLease,
-        reclaimTargetOnCancellation,
-      );
+      // executeJavaScript has no cancellation primitive. If the enclosing
+      // deadline wins while a child-frame probe is pending, that abandoned
+      // continuation must not subsequently acquire a fresh debugger lease and
+      // start an OOPIF scan after its caller has already returned.
+      let passwordFieldScanCurrent = true;
+      try {
+        sensitive = await this.runRendererOperationWithDeadline(
+          tab,
+          contents,
+          'Browser password-field scan',
+          remainingTimeout(),
+          async () => {
+            if (await this.hasPopulatedPasswordFieldInChildFrames(contents)) return true;
+            if (!passwordFieldScanCurrent) return true;
+            return this.hasPopulatedPasswordFieldViaCdp(contents, captureDebuggerLease);
+          },
+          abortSignal,
+          documentLease,
+          reclaimTargetOnCancellation,
+        );
+      } finally {
+        passwordFieldScanCurrent = false;
+      }
     }
     if (sensitive) this.setTabSensitive(tab, true);
     if (tab.shell.sensitive) throw new Error(`${operation} is blocked while this tab contains password data.`);
@@ -12654,11 +12665,15 @@ export class BrowserManager {
                     },
                   );
                 } catch (error) {
+                  // Abort and deadline paths both leave native CDP promises
+                  // running. Cancel the exact captured lease before returning
+                  // or rethrowing; the scan-level fence prevents a late child
+                  // frame continuation from acquiring a replacement lease.
+                  debuggerLease?.cancel();
                   if (waitFor === 'none' || !(error instanceof BrowserRendererDeadlineError)) throw error;
                   // A diagnostic timeout must not discard an authenticated user
                   // page. Detach only a debugger connection that BrowserManager
                   // itself owns so its late CDP command cannot block later work.
-                  debuggerLease?.cancel();
                   return false;
                 }
                 return waitFor === 'none' || Date.now() < deadlineAt;
