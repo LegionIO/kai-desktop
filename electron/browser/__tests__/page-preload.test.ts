@@ -739,6 +739,43 @@ describe('sandboxed browser page preload', () => {
     );
   });
 
+  it('keeps picker method assignments isolated to the receiving input element', async () => {
+    const nativeShowPicker = vi.fn();
+    const firstShowPicker = vi.fn();
+    const secondShowPicker = vi.fn();
+    await runPreload(
+      (document) => {
+        Object.defineProperty(document.defaultView!.HTMLInputElement.prototype, 'showPicker', {
+          configurable: true,
+          writable: true,
+          value: nativeShowPicker,
+        });
+      },
+      (window) => {
+        const first = window.document.createElement('input');
+        const second = window.document.createElement('input');
+        const untouched = window.document.createElement('input');
+        first.showPicker = firstShowPicker;
+        second.showPicker = secondShowPicker;
+
+        expect(() => first.showPicker()).toThrow(/Native pickers are blocked during assistant browser control/);
+        const activate = (window as unknown as Record<string, unknown>)[BROWSER_NATIVE_UI_GUARD_ACTIVATOR] as (
+          token: string,
+          blocked: boolean,
+        ) => boolean;
+        expect(activate(nativeUiGuardToken, false)).toBe(true);
+
+        first.showPicker();
+        second.showPicker();
+        untouched.showPicker();
+        expect(firstShowPicker).toHaveBeenCalledOnce();
+        expect(secondShowPicker).toHaveBeenCalledOnce();
+        expect(nativeShowPicker).toHaveBeenCalledOnce();
+      },
+      [BROWSER_NATIVE_UI_GUARD_ARGUMENT],
+    );
+  });
+
   it('blocks picker methods before the first page script in an assistant-controlled renderer', async () => {
     const nativeShowPicker = vi.fn();
     await runPreload(

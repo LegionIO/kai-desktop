@@ -14705,6 +14705,73 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
+  it('bounds and cancels a stale compositor cursor cleanup without withholding the action result', async () => {
+    vi.useFakeTimers();
+    try {
+      let debuggerAttached = false;
+      let tab!: {
+        shell: { id: string; conversationId: string; discarded: boolean };
+        view: { webContents: typeof contents };
+        overlayGeneration: number;
+        overlayTimer: ReturnType<typeof setTimeout> | null;
+        automationOverlay: unknown;
+      };
+      const stalledHide = new Promise<never>(() => undefined);
+      const sendCommand = vi.fn((method: string) => {
+        if (method === 'Overlay.highlightRect') {
+          tab.overlayGeneration += 1;
+          return Promise.resolve({});
+        }
+        if (method === 'Overlay.hideHighlight') return stalledHide;
+        return Promise.resolve({});
+      });
+      const contents = {
+        debugger: {
+          isAttached: () => debuggerAttached,
+          attach: vi.fn(() => {
+            debuggerAttached = true;
+          }),
+          detach: vi.fn(() => {
+            debuggerAttached = false;
+          }),
+          sendCommand,
+        },
+        isDestroyed: () => false,
+      };
+      tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        view: { webContents: contents },
+        overlayGeneration: 0,
+        overlayTimer: null,
+        automationOverlay: null,
+      };
+      const manager = managerWithoutConstructor({
+        attachedView: tab.view,
+        isHostWindowShown: () => true,
+        tabs: new Map([['tab-1', tab]]),
+      });
+
+      const update = invokePrivate(manager, 'setAutomationOverlay', tab, {
+        id: 'action-1',
+        tabId: 'tab-1',
+        kind: 'click',
+        status: 'running',
+        startedAt: new Date().toISOString(),
+        x: 40,
+        y: 60,
+      }) as Promise<void>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sendCommand).toHaveBeenCalledWith('Overlay.hideHighlight');
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(update).resolves.toBeUndefined();
+      expect(contents.debugger.detach).toHaveBeenCalledOnce();
+      expect(tab.automationOverlay).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('renders the automation cursor through Chromium outside the page DOM', async () => {
     let debuggerAttached = false;
     const sendCommand = vi.fn(async () => ({}));
@@ -14756,6 +14823,69 @@ describe('browser manager renderer lifecycle', () => {
       outlineColor: { r: 139, g: 92, b: 246, a: 1 },
     });
     expect(tab.automationOverlay).toMatchObject({ contents, x: 40, y: 60 });
+  });
+
+  it('bounds and cancels stale screenshot overlay restoration cleanup', async () => {
+    vi.useFakeTimers();
+    try {
+      let debuggerAttached = false;
+      let tab!: {
+        shell: { id: string; conversationId: string };
+        view: { webContents: typeof contents };
+        overlayGeneration: number;
+        automationOverlay: unknown;
+      };
+      const stalledHide = new Promise<never>(() => undefined);
+      const sendCommand = vi.fn((method: string) => {
+        if (method === 'Overlay.highlightRect') {
+          tab.overlayGeneration += 1;
+          return Promise.resolve({});
+        }
+        if (method === 'Overlay.hideHighlight') return stalledHide;
+        return Promise.resolve({});
+      });
+      const contents = {
+        debugger: {
+          isAttached: () => debuggerAttached,
+          attach: vi.fn(() => {
+            debuggerAttached = true;
+          }),
+          detach: vi.fn(() => {
+            debuggerAttached = false;
+          }),
+          sendCommand,
+        },
+        isDestroyed: () => false,
+      };
+      tab = {
+        shell: { id: 'tab-1', conversationId: 'chat-1' },
+        view: { webContents: contents },
+        overlayGeneration: 7,
+        automationOverlay: null,
+      };
+      const manager = managerWithoutConstructor({ tabs: new Map([['tab-1', tab]]) });
+      const debuggerLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+        cancel: () => void;
+        release: () => void;
+      };
+      const cancelDebugger = vi.fn(debuggerLease.cancel);
+      const releaseDebugger = vi.fn(debuggerLease.release);
+      const restore = invokePrivate(manager, 'restoreAutomationOverlay', tab, contents, {
+        generation: tab.overlayGeneration,
+        overlay: { contents, cancelDebugger, releaseDebugger, x: 10, y: 20 },
+      }) as Promise<void>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sendCommand).toHaveBeenCalledWith('Overlay.hideHighlight');
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(restore).resolves.toBeUndefined();
+      expect(cancelDebugger).toHaveBeenCalledOnce();
+      expect(releaseDebugger).toHaveBeenCalledOnce();
+      expect(contents.debugger.detach).toHaveBeenCalledOnce();
+      expect(tab.automationOverlay).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('releases the prior compositor cursor when cancellation prevents its cleanup command', async () => {

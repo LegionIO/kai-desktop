@@ -391,14 +391,22 @@ export class BrowserValidatingProxy {
     if (existing) return existing;
     const configured = this.start().then(async (port) => {
       if (this.closed) throw new Error('The Browser validating proxy is closed.');
-      await session.setProxy({
-        mode: 'fixed_servers',
-        proxyRules: `http://127.0.0.1:${port}`,
-        // Chromium otherwise bypasses proxies for loopback/private literal
-        // targets before Kai can apply the assistant policy.
-        proxyBypassRules: '<-loopback>',
-      });
-      await session.closeAllConnections();
+      await withOperationTimeout(
+        session.setProxy({
+          mode: 'fixed_servers',
+          proxyRules: `http://127.0.0.1:${port}`,
+          // Chromium otherwise bypasses proxies for loopback/private literal
+          // targets before Kai can apply the assistant policy.
+          proxyBypassRules: '<-loopback>',
+        }),
+        this.operationTimeoutMs,
+        'Browser session proxy configuration timed out.',
+      );
+      await withOperationTimeout(
+        session.closeAllConnections(),
+        this.operationTimeoutMs,
+        'Browser session connection reset timed out.',
+      );
     });
     this.configuredSessions.set(session, configured);
     // Cache only a successful configuration (or its in-flight attempt). A

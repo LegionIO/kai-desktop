@@ -180,6 +180,41 @@ describe('Browser validating proxy', () => {
     expect(closeAllConnections).toHaveBeenCalledOnce();
   });
 
+  it.each(['setProxy', 'closeAllConnections'] as const)(
+    'bounds a stalled session %s call, releases the shared setup, and allows retry',
+    async (stalledOperation) => {
+      vi.useFakeTimers();
+      try {
+        const proxy = new BrowserValidatingProxy(undefined, { operationTimeoutMs: 25 });
+        proxies.push(proxy);
+        vi.spyOn(proxy as unknown as { start(): Promise<number> }, 'start').mockResolvedValue(43123);
+        const stalled = new Promise<void>(() => undefined);
+        const setProxy =
+          stalledOperation === 'setProxy'
+            ? vi.fn().mockReturnValueOnce(stalled).mockResolvedValue(undefined)
+            : vi.fn(async () => undefined);
+        const closeAllConnections =
+          stalledOperation === 'closeAllConnections'
+            ? vi.fn().mockReturnValueOnce(stalled).mockResolvedValue(undefined)
+            : vi.fn(async () => undefined);
+        const session = { setProxy, closeAllConnections } as never;
+
+        const first = proxy.configureSession(session);
+        const concurrent = proxy.configureSession(session);
+        expect(concurrent).toBe(first);
+        const timedOut = expect(Promise.all([first, concurrent])).rejects.toThrow(/timed out/i);
+        await vi.advanceTimersByTimeAsync(25);
+        await timedOut;
+
+        await expect(proxy.configureSession(session)).resolves.toBeUndefined();
+        expect(setProxy).toHaveBeenCalledTimes(2);
+        expect(closeAllConnections).toHaveBeenCalledTimes(stalledOperation === 'setProxy' ? 1 : 2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it('closes a listener whose startup races proxy shutdown', async () => {
     const proxy = new BrowserValidatingProxy();
     proxies.push(proxy);

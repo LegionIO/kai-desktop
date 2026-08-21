@@ -523,6 +523,7 @@ function browserClipboardFocusFingerprintScript(stateKey: string, token: string,
 
 type BrowserAutomationOverlay = {
   contents: WebContents;
+  cancelDebugger: () => void;
   releaseDebugger: () => void;
   x: number;
   y: number;
@@ -11371,9 +11372,11 @@ export class BrowserManager {
         Number.isFinite(action.x) &&
         Number.isFinite(action.y);
       if (renderCursor) {
+        const debuggerLease = this.acquireBrowserDebuggerLease(contents);
         const overlay: BrowserAutomationOverlay = {
           contents,
-          releaseDebugger: this.acquireBrowserDebugger(contents),
+          cancelDebugger: debuggerLease.cancel,
+          releaseDebugger: debuggerLease.release,
           x: action.x!,
           y: action.y!,
         };
@@ -11399,7 +11402,23 @@ export class BrowserManager {
             tab.view?.webContents !== contents
           ) {
             if (!contents.isDestroyed() && contents.debugger.isAttached()) {
-              await contents.debugger.sendCommand('Overlay.hideHighlight').catch(() => undefined);
+              try {
+                await this.runRendererOperationWithDeadline(
+                  tab,
+                  contents,
+                  'Browser automation overlay cleanup',
+                  AUTOMATION_OVERLAY_TIMEOUT_MS,
+                  () => contents.debugger.sendCommand('Overlay.hideHighlight'),
+                  undefined,
+                  undefined,
+                  false,
+                );
+              } catch {
+                // Detach only the exact manager-owned overlay lease. The stale
+                // cleanup is presentation-only and must not withhold an action
+                // result or reclaim an otherwise healthy authenticated page.
+                overlay.cancelDebugger();
+              }
             }
             return;
           }
@@ -13370,7 +13389,23 @@ export class BrowserManager {
         tab.automationOverlay = hidden.overlay;
         retained = true;
       } else if (!contents.isDestroyed() && contents.debugger.isAttached()) {
-        await contents.debugger.sendCommand('Overlay.hideHighlight').catch(() => undefined);
+        try {
+          await this.runRendererOperationWithDeadline(
+            tab,
+            contents,
+            'Browser automation overlay cleanup',
+            AUTOMATION_OVERLAY_TIMEOUT_MS,
+            () => contents.debugger.sendCommand('Overlay.hideHighlight'),
+            undefined,
+            undefined,
+            false,
+          );
+        } catch {
+          // Screenshot restoration raced a newer overlay/document. Cancel only
+          // this hidden overlay's lease so cleanup cannot retain the screenshot
+          // queue or the stale compositor command indefinitely.
+          hidden.overlay.cancelDebugger();
+        }
       }
     } finally {
       if (!retained) hidden.overlay.releaseDebugger();

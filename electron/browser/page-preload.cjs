@@ -185,6 +185,7 @@ function installMainWorldNativeUiMembrane(stateName, activatorName, token, initi
   const safeStringToLowerCase = SafeString.prototype.toLowerCase;
   const NativeMap = Map;
   const NativeSet = Set;
+  const NativeWeakMap = WeakMap;
   const NativeMutationObserver = root.MutationObserver;
   const safeApply = Reflect.apply;
   const safeGetPrototypeOf = Object.getPrototypeOf;
@@ -196,6 +197,8 @@ function installMainWorldNativeUiMembrane(stateName, activatorName, token, initi
   const safeSetClear = NativeSet.prototype.clear;
   const safeSetForEach = NativeSet.prototype.forEach;
   const safeSetHas = NativeSet.prototype.has;
+  const safeWeakMapGet = NativeWeakMap.prototype.get;
+  const safeWeakMapSet = NativeWeakMap.prototype.set;
   const eventPrototype = root.Event?.prototype;
   const safeAddEventListener = root.EventTarget?.prototype?.addEventListener;
   const safeComposedPath = eventPrototype?.composedPath;
@@ -244,9 +247,23 @@ function installMainWorldNativeUiMembrane(stateName, activatorName, token, initi
   const guardMethod = (holder, name, message, required = false) => {
     const original = holder?.[name];
     if (typeof original !== 'function') return !required;
-    let delegate = original;
+    const holderConstructor = holder?.constructor;
+    // WindowProxy and singleton platform objects are not identity-stable with
+    // their main-world global receiver. Only prototype methods need per-instance
+    // assignment semantics; direct global/singleton assignment remains shared.
+    const receiverScoped = typeof holderConstructor === 'function' && holderConstructor.prototype === holder;
+    let sharedDelegate = original;
+    const receiverDelegates = new NativeWeakMap();
     const guarded = function (...args) {
       if (blocked) throw new SafeError(message);
+      const receiverDelegate =
+        receiverScoped &&
+        this !== holder &&
+        (typeof this === 'object' || typeof this === 'function') &&
+        this !== null
+          ? safeApply(safeWeakMapGet, receiverDelegates, [this])
+          : undefined;
+      const delegate = typeof receiverDelegate === 'function' ? receiverDelegate : sharedDelegate;
       return safeApply(delegate, this, args);
     };
     const descriptor = safeGetOwnPropertyDescriptor(holder, name);
@@ -254,9 +271,14 @@ function installMainWorldNativeUiMembrane(stateName, activatorName, token, initi
       configurable: false,
       enumerable: descriptor?.enumerable ?? false,
       get: () => guarded,
-      set: (next) => {
-        if (next === guarded) delegate = original;
-        else if (typeof next === 'function') delegate = next;
+      set(next) {
+        const delegate = next === guarded ? original : next;
+        if (typeof delegate !== 'function') return;
+        if (!receiverScoped || this === holder) {
+          sharedDelegate = delegate;
+        } else if ((typeof this === 'object' || typeof this === 'function') && this !== null) {
+          safeApply(safeWeakMapSet, receiverDelegates, [this, delegate]);
+        }
       },
     });
     return true;
