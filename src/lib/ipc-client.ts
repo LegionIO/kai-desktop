@@ -107,13 +107,14 @@ type AppAPI = {
       browserInput: unknown;
       browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
     } | null>;
-    approveToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
-    rejectToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
-    dismissToolCall: (toolCallId: string, conversationId?: string) => Promise<{ ok: boolean }>;
+    approveToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) => Promise<{ ok: boolean }>;
+    rejectToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) => Promise<{ ok: boolean }>;
+    dismissToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) => Promise<{ ok: boolean }>;
     answerToolQuestion: (
       toolCallId: string,
       answers: Record<string, string>,
       conversationId?: string,
+      runNonce?: string,
     ) => Promise<{ ok: boolean }>;
     generateTitle: (
       messages: unknown[],
@@ -134,8 +135,8 @@ type AppAPI = {
   };
   notification: {
     onRequest: (callback: (item: unknown) => void) => () => void;
-    get: (id: string, conversationId?: string) => Promise<unknown>;
-    close: (id: string, conversationId?: string) => void;
+    get: (id: string, conversationId?: string, runNonce?: string) => Promise<unknown>;
+    close: (id: string, conversationId?: string, runNonce?: string) => void;
     reportSize: (height: number) => void;
   };
   conversations: {

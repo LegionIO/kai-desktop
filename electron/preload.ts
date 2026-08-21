@@ -103,14 +103,18 @@ const appAPI = {
         browserInput: unknown;
         browserTarget?: { tabId: string; origin: string; destinationOrigin?: string };
       } | null>,
-    approveToolCall: (toolCallId: string, conversationId?: string) =>
-      ipcRenderer.invoke('agent:approve-tool', toolCallId, conversationId),
-    rejectToolCall: (toolCallId: string, conversationId?: string) =>
-      ipcRenderer.invoke('agent:reject-tool', toolCallId, conversationId),
-    dismissToolCall: (toolCallId: string, conversationId?: string) =>
-      ipcRenderer.invoke('agent:dismiss-tool', toolCallId, conversationId),
-    answerToolQuestion: (toolCallId: string, answers: Record<string, string>, conversationId?: string) =>
-      ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers, conversationId),
+    approveToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.invoke('agent:approve-tool', toolCallId, conversationId, runNonce),
+    rejectToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.invoke('agent:reject-tool', toolCallId, conversationId, runNonce),
+    dismissToolCall: (toolCallId: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.invoke('agent:dismiss-tool', toolCallId, conversationId, runNonce),
+    answerToolQuestion: (
+      toolCallId: string,
+      answers: Record<string, string>,
+      conversationId?: string,
+      runNonce?: string,
+    ) => ipcRenderer.invoke('agent:answer-tool-question', toolCallId, answers, conversationId, runNonce),
     generateTitle: (messages: unknown[], modelKey?: string, hint?: string, conversationId?: string) =>
       ipcRenderer.invoke('agent:generate-title', messages, modelKey, hint, conversationId),
     onStreamEvent: (callback: (event: unknown) => void) => {
@@ -147,8 +151,10 @@ const appAPI = {
       ipcRenderer.on('notif:request', handler);
       return () => ipcRenderer.removeListener('notif:request', handler);
     },
-    get: (id: string, conversationId?: string) => ipcRenderer.invoke('notif:get', id, conversationId),
-    close: (id: string, conversationId?: string) => ipcRenderer.send('notif:close', id, conversationId),
+    get: (id: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.invoke('notif:get', id, conversationId, runNonce),
+    close: (id: string, conversationId?: string, runNonce?: string) =>
+      ipcRenderer.send('notif:close', id, conversationId, runNonce),
     reportSize: (height: number) => ipcRenderer.send('notif:resize', height),
   },
 

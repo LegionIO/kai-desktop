@@ -221,6 +221,10 @@ export function openNotificationWindow(item: NotificationWindowItem): BrowserWin
     notif: '1',
     notifId: item.id,
     ...(item.source === 'tool-approval' ? { notifConv: item.conversationId } : {}),
+    // R253: carry the run nonce into the pop-out route so the renderer echoes it back on notif:get / close /
+    // approval-resolve — the registry key is conversationId::runNonce::id, and with TWO overlapping windows the
+    // nonce-less scan is ambiguous, so the renderer MUST supply the nonce to target its own window.
+    ...(item.source === 'tool-approval' && item.runNonce ? { notifNonce: item.runNonce } : {}),
   });
 
   win.once('ready-to-show', () => {
@@ -408,9 +412,13 @@ let closeIpcRegistered = false;
 export function registerNotificationWindowIpc(): void {
   if (closeIpcRegistered) return;
   closeIpcRegistered = true;
-  const closeHandler = (_event: unknown, id: unknown, conversationId?: unknown): void => {
+  const closeHandler = (_event: unknown, id: unknown, conversationId?: unknown, runNonce?: unknown): void => {
     if (typeof id === 'string' && id) {
-      closeNotificationWindow(id, typeof conversationId === 'string' ? conversationId : undefined);
+      closeNotificationWindow(
+        id,
+        typeof conversationId === 'string' ? conversationId : undefined,
+        typeof runNonce === 'string' ? runNonce : undefined,
+      );
     }
   };
   ipcMain.on('notif:close', closeHandler);
@@ -418,14 +426,16 @@ export function registerNotificationWindowIpc(): void {
   ipcMain.on('approval:close', closeHandler);
   // Renderer pulls its item on mount — avoids the ready-to-show push racing the
   // renderer's not-yet-mounted subscription (which left the window spinning). The
-  // pop-out route carries notifId + (for tool-approvals) notifConv so we resolve the
-  // conversation-scoped key, falling back to the raw id (alerts / legacy) (R193).
-  ipcMain.handle('notif:get', (_event, id: unknown, conversationId?: unknown) => {
+  // pop-out route carries notifId + (for tool-approvals) notifConv + notifNonce so we resolve the
+  // run-scoped key, falling back to conversation-scoped / raw (alerts / legacy) (R193/R253).
+  ipcMain.handle('notif:get', (_event, id: unknown, conversationId?: unknown, runNonce?: unknown) => {
     if (typeof id !== 'string') return null;
-    // Exact key when scoped: a scoped tool-approval pull must not fall back to the raw namespace and
-    // return an unrelated alert whose id equals the tool-call id (R195).
-    const key = typeof conversationId === 'string' && conversationId ? notifKeyFromParts(id, conversationId) : id;
-    return notificationItems.get(key) ?? null;
+    // Scoped (no raw fallback) so a scoped tool-approval pull can't return an unrelated alert whose id equals
+    // the tool-call id (R195); run-scoped resolution with an unambiguous scan for a nonce-less caller (R253).
+    const convId = typeof conversationId === 'string' && conversationId ? conversationId : undefined;
+    const nonce = typeof runNonce === 'string' && runNonce ? runNonce : undefined;
+    const key = convId ? resolveNotifKey(id, convId, nonce) : id;
+    return key ? (notificationItems.get(key) ?? null) : null;
   });
   // Renderer reports its laid-out content height (ResizeObserver on #notif-root);
   // size the reporting window to it, clamped. Map sender → its BrowserWindow.
