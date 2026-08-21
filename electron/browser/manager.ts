@@ -950,6 +950,7 @@ type BrowserApprovalRendererResetLease = {
   sourceGeneration: number;
   sourceContents: WebContents | null;
   preparedGeneration?: number;
+  replacementContents?: WebContents;
 };
 
 /** Password approval also binds the exact saved record and the frame origin
@@ -3595,6 +3596,44 @@ export class BrowserManager {
     lease.preparedGeneration = tab.generation;
   }
 
+  /** A discarded tab restore advances generation from did-start-navigation,
+   * potentially once for the inert about:blank bootstrap and again for the
+   * requested page. Rebind the one-shot lease only after ensureView has
+   * completed that exact replacement renderer and URL. Any subsequent
+   * navigation still advances generation and is rejected by consume below. */
+  private advanceBrowserApprovalRendererResetAfterRestore(
+    tab: InternalTab,
+    run: BrowserAssistantRun,
+    approval: BrowserApprovalWithDocument | undefined,
+    view: WebContentsView,
+    expectedGeneration: number | undefined,
+  ): void {
+    if (!approval) return;
+    const lease = this.approvalRendererResetLeases?.get(approval);
+    if (!lease) return;
+    const replacementIsExact =
+      lease.preparedGeneration !== undefined &&
+      lease.tab === tab &&
+      lease.runId === run.id &&
+      this.tabs.get(tab.shell.id) === tab &&
+      expectedGeneration !== undefined &&
+      expectedGeneration >= lease.preparedGeneration &&
+      tab.generation === expectedGeneration &&
+      tab.view === view &&
+      !view.webContents.isDestroyed() &&
+      view.webContents !== lease.sourceContents &&
+      !tab.viewLoadPromise &&
+      tab.trustedUserNavigationLease === lease.userNavigationLease &&
+      tab.shell.url === lease.url &&
+      normalizedOrigin(tab.shell.url) === lease.origin;
+    if (!replacementIsExact) {
+      this.approvalRendererResetLeases.delete(approval);
+      throw new Error('The browser page changed while approval was pending. Review the new page and try again.');
+    }
+    lease.preparedGeneration = tab.generation;
+    lease.replacementContents = view.webContents;
+  }
+
   /** Consume the one-shot lease only after ensureView has completed the exact
    * replacement load. Redirects, user navigation, a reused tab id, or the old
    * renderer all invalidate consent instead of being papered over by a numeric
@@ -3617,6 +3656,7 @@ export class BrowserManager {
       tab.view === view &&
       !view.webContents.isDestroyed() &&
       view.webContents !== lease.sourceContents &&
+      view.webContents === lease.replacementContents &&
       !tab.viewLoadPromise &&
       tab.trustedUserNavigationLease === lease.userNavigationLease &&
       tab.shell.url === lease.url &&
@@ -3738,6 +3778,7 @@ export class BrowserManager {
     preserveExistingLoadingViewOnTimeout = false,
   ): Promise<WebContentsView> {
     const hadReadyView = !!tab.view && !tab.view.webContents.isDestroyed() && !tab.viewLoadPromise;
+    let expectedRestoreGeneration: number | undefined;
     // A discarded assistant target must be recreated under the deterministic
     // hidden viewport before its requested page begins loading. Presentation
     // state may never determine responsive layout, document visibility, or
@@ -3748,6 +3789,9 @@ export class BrowserManager {
       timeoutMs,
       !hadReadyView,
       preserveExistingLoadingViewOnTimeout,
+      (generation) => {
+        expectedRestoreGeneration = generation;
+      },
     );
     try {
       this.assertAssistantDocumentLease(tab, lease);
@@ -3762,6 +3806,7 @@ export class BrowserManager {
       Object.assign(lease, refreshed);
       this.assertAssistantDocumentLease(tab, lease);
     }
+    this.advanceBrowserApprovalRendererResetAfterRestore(tab, run, approvedDocument, view, expectedRestoreGeneration);
     // webRequest cannot observe WebRTC ICE/TURN traffic. Before any assistant
     // operation can inspect or dispatch input to the page, activate the
     // preload membrane in every existing frame and register the same guard for
@@ -7793,6 +7838,7 @@ export class BrowserManager {
     timeoutMs = abortSignal ? ASSISTANT_PAGE_LOAD_TIMEOUT_MS : 0,
     backgroundInitialLoad = false,
     preserveExistingLoadingViewOnTimeout = false,
+    recordExpectedInitialLoadGeneration?: (generation: number) => void,
   ): Promise<WebContentsView> {
     const deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : null;
     const remainingRendererTimeout = (operation: string): number => {
@@ -7883,6 +7929,10 @@ export class BrowserManager {
     const guardInitialLoad =
       tab.aiNetworkRestricted && !tab.trustedUserNavigation && this.aiAllowPrivateNetwork === false;
     let initialGuardReady = !guardInitialLoad;
+    // Only manager-issued loadURL calls may advance an approved discarded-tab
+    // restoration lease. A page/user navigation interleaved with those calls
+    // produces an extra generation and is rejected after ensureView returns.
+    let expectedInitialLoadGeneration = tab.generation;
     const loadPromise = (async () => {
       try {
         try {
@@ -7901,7 +7951,10 @@ export class BrowserManager {
               view.webContents,
               'Browser background renderer bootstrap',
               remainingRendererTimeout('Browser background renderer bootstrap'),
-              () => view.webContents.loadURL('about:blank'),
+              () => {
+                expectedInitialLoadGeneration += 1;
+                return view.webContents.loadURL('about:blank');
+              },
               abortSignal,
             );
           }
@@ -7946,6 +7999,7 @@ export class BrowserManager {
               const initialBlankReady =
                 guardInitialLoad && requestedInitialUrl === 'about:blank' && initialUrl === 'about:blank';
               if (!initialBlankReady) {
+                expectedInitialLoadGeneration += 1;
                 await view.webContents.loadURL(requestedInitialUrl);
               }
               if (guardAfterInitialLoad) {
@@ -7985,6 +8039,7 @@ export class BrowserManager {
         throw new Error('The browser page was closed while it was loading.');
       }
       this.assertHostRendererOperationCurrent();
+      recordExpectedInitialLoadGeneration?.(expectedInitialLoadGeneration);
       return view;
     })();
     tab.viewLoadPromise = loadPromise;

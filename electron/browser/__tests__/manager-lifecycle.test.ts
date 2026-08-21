@@ -6865,7 +6865,7 @@ describe('browser manager renderer lifecycle', () => {
     expect(emitTabs).not.toHaveBeenCalled();
   });
 
-  it('consumes ask-policy approval only for the exact discarded-tab restoration renderer', () => {
+  it('consumes ask-policy approval after the exact discarded-tab restoration advances generation', () => {
     const replacementContents = { id: 42, isDestroyed: () => false };
     const replacementView = { webContents: replacementContents };
     const tab = {
@@ -6891,55 +6891,96 @@ describe('browser manager renderer lifecycle', () => {
     const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
     invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
     tab.view = replacementView;
+    // ensureView can navigate through an inert bootstrap before restoring the
+    // requested page. Both are manager-owned document replacements.
+    tab.generation += 2;
+    invokePrivate(
+      manager,
+      'advanceBrowserApprovalRendererResetAfterRestore',
+      tab,
+      { id: 'run-1' },
+      approval,
+      replacementView,
+      6,
+    );
     invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval, replacementView);
 
-    expect(approval).toMatchObject({ tabGeneration: 4, allowInternalRestore: false });
+    expect(approval).toMatchObject({ tabGeneration: 6, allowInternalRestore: false });
   });
 
-  it.each(['generation', 'url', 'origin', 'navigation lease', 'different renderer', 'another run'] as const)(
-    'invalidates ask-policy approval when the replacement changes its %s',
-    (change) => {
-      const sourceContents = { id: 41, isDestroyed: () => false };
-      const replacementContents = { id: 42, isDestroyed: () => false };
-      const sourceView = { webContents: sourceContents };
-      const replacementView = { webContents: replacementContents };
-      const tab = {
-        assistantDialogsDisabledRunId: null as string | null,
-        generation: 4,
-        shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
-        trustedUserNavigationLease: 2,
-        view: null as typeof sourceView | typeof replacementView | null,
-        viewLoadPromise: null as Promise<unknown> | null,
-      };
-      const approval = {
-        tabId: tab.shell.id,
-        tabGeneration: tab.generation,
-        origin: 'https://example.com',
-        url: tab.shell.url,
-        userNavigationLease: tab.trustedUserNavigationLease,
-      };
-      const manager = managerWithoutConstructor({
-        assertBrowserDocumentApproval: vi.fn(),
-        tabs: new Map([[tab.shell.id, tab]]),
-      });
-      const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
-      invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
-      tab.view = replacementView;
-
-      let run = { id: 'run-1' };
-      let consumedView = replacementView;
-      if (change === 'generation') tab.generation += 1;
-      if (change === 'url') tab.shell.url = 'https://example.com/other';
-      if (change === 'origin') tab.shell.url = 'https://other.example/account';
-      if (change === 'navigation lease') tab.trustedUserNavigationLease += 1;
-      if (change === 'different renderer') consumedView = sourceView;
-      if (change === 'another run') run = { id: 'run-2' };
-
+  it.each([
+    'restore generation',
+    'generation',
+    'url',
+    'origin',
+    'navigation lease',
+    'different renderer',
+    'another run',
+  ] as const)('invalidates ask-policy approval when the replacement changes its %s', (change) => {
+    const sourceContents = { id: 41, isDestroyed: () => false };
+    const replacementContents = { id: 42, isDestroyed: () => false };
+    const sourceView = { webContents: sourceContents };
+    const replacementView = { webContents: replacementContents };
+    const tab = {
+      assistantDialogsDisabledRunId: null as string | null,
+      generation: 4,
+      shell: { id: 'tab-1', conversationId: 'chat-1', url: 'https://example.com/account', discarded: true },
+      trustedUserNavigationLease: 2,
+      view: null as typeof sourceView | typeof replacementView | null,
+      viewLoadPromise: null as Promise<unknown> | null,
+    };
+    const approval = {
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      origin: 'https://example.com',
+      url: tab.shell.url,
+      userNavigationLease: tab.trustedUserNavigationLease,
+    };
+    const manager = managerWithoutConstructor({
+      assertBrowserDocumentApproval: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, { id: 'run-1' }, approval);
+    invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
+    tab.view = replacementView;
+    if (change === 'restore generation') {
+      tab.generation++;
       expect(() =>
-        invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, run, approval, consumedView),
+        invokePrivate(
+          manager,
+          'advanceBrowserApprovalRendererResetAfterRestore',
+          tab,
+          { id: 'run-1' },
+          approval,
+          replacementView,
+          4,
+        ),
       ).toThrow(/page changed while approval was pending/i);
-    },
-  );
+      return;
+    }
+    invokePrivate(
+      manager,
+      'advanceBrowserApprovalRendererResetAfterRestore',
+      tab,
+      { id: 'run-1' },
+      approval,
+      replacementView,
+      4,
+    );
+
+    let run = { id: 'run-1' };
+    let consumedView = replacementView;
+    if (change === 'generation') tab.generation += 1;
+    if (change === 'url') tab.shell.url = 'https://example.com/other';
+    if (change === 'origin') tab.shell.url = 'https://other.example/account';
+    if (change === 'navigation lease') tab.trustedUserNavigationLease += 1;
+    if (change === 'different renderer') consumedView = sourceView;
+    if (change === 'another run') run = { id: 'run-2' };
+
+    expect(() =>
+      invokePrivate(manager, 'consumeBrowserApprovalRendererReset', tab, run, approval, consumedView),
+    ).toThrow(/page changed while approval was pending/i);
+  });
 
   it('restores an active user tab normally when authorization fails after synchronous dialog-safe reclamation', async () => {
     const release = vi.fn();
@@ -9777,7 +9818,7 @@ describe('browser manager renderer lifecycle', () => {
 
     await expect(invokePrivate(manager, 'ensureAssistantView', tab, { id: 'run-1' }, lease)).resolves.toBe(view);
 
-    expect(ensureView).toHaveBeenCalledWith(tab, undefined, 30_000, true, false);
+    expect(ensureView).toHaveBeenCalledWith(tab, undefined, 30_000, true, false, expect.any(Function));
   });
 
   it('autofills a saved credential only in its matching top-level frame', async () => {
@@ -17043,6 +17084,7 @@ describe('browser manager renderer lifecycle', () => {
     const loadURL = vi.fn(async (url: string) => {
       currentUrl = url;
       tab.shell.url = url;
+      tab.generation++;
     });
     const view = {
       setBounds: vi.fn(),
@@ -17063,6 +17105,7 @@ describe('browser manager renderer lifecycle', () => {
       aiNetworkRestricted: false,
       trustedUserNavigation: false,
       assistantBackgroundInitialLoadPending: false,
+      generation: 0,
       view: null as typeof view | null,
       viewLoadPromise: null as Promise<typeof view> | null,
     };
@@ -17089,11 +17132,22 @@ describe('browser manager renderer lifecycle', () => {
       tabs: new Map([[tab.shell.id, tab]]),
     });
 
-    await expect(invokePrivate(manager, 'ensureView', tab, undefined, 30_000, true) as Promise<unknown>).resolves.toBe(
-      view,
-    );
+    const recordExpectedInitialLoadGeneration = vi.fn();
+    await expect(
+      invokePrivate(
+        manager,
+        'ensureView',
+        tab,
+        undefined,
+        30_000,
+        true,
+        false,
+        recordExpectedInitialLoadGeneration,
+      ) as Promise<unknown>,
+    ).resolves.toBe(view);
 
     expect(loadURL.mock.calls.map(([url]) => url)).toEqual(['about:blank', 'https://assistant.example/requested']);
+    expect(recordExpectedInitialLoadGeneration).toHaveBeenCalledWith(2);
     expect(restoreAssistantBackgroundViewport).toHaveBeenCalledWith(tab, view.webContents, 5_000);
     expect(tab.assistantBackgroundInitialLoadPending).toBe(false);
   });
