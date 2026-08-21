@@ -898,33 +898,50 @@ export function splitFailedPrefixIntoOrphan(
   });
 }
 
-/** R233/R234/R236: persist orphaned prefixes (from failed inject-boundary persists) as their own assistant
+/** R233/R234/R236/R237: persist orphaned prefixes (from failed inject-boundary persists) as their own assistant
  *  nodes under their pre-inject parent, THEN reparent the injected user onto the flushed prefix so the active
- *  chain is `pre → prefix → inject → continuation`. R236 robustness:
+ *  chain is `pre → prefix → inject → continuation`. Robustness:
  *   • UPSERT by responseMessageId — if the renderer (or an earlier flush) already wrote a node with this id,
- *     REUSE it instead of appending, so appendConversationMessages doesn't collision-rename to an auto-msg-*
- *     duplicate and reparent the inject onto the dup.
+ *     REUSE it, and RESTORE its content + parent from the orphan's full copy (R237: a renderer node may be
+ *     frame-capped/mis-parented) rather than appending a collision-renamed auto-msg-* duplicate.
+ *   • makeHead only when the inject has NO persisted continuation child yet (R237): a retry AFTER continuation
+ *     persisted must not rewind the head back over the continuation.
  *   • An orphan is removed ONLY when its prefix is on disk AND the inject reparent succeeded — a null/throwing
- *     persist OR reparent RETAINS it for the next attempt (leaving the prefix a sibling outside the active chain
- *     omits it from branch history, which is data loss, not just "ordering"). */
+ *     persist OR reparent RETAINS it for the next attempt (a sibling prefix omitted from the active chain is
+ *     data loss, not just "ordering").
+ *  ACCEPTED LIMITATION (R237): the orphan store is in-memory. A prefix whose write keeps failing until the app
+ *  exits (or a server-owned Stop with no renderer copy that never reaches another finalize) is lost on exit. This
+ *  requires a disk write to fail at the exact mid-turn-inject instant AND stay failing — an extreme tail not worth
+ *  a disk-backed orphan store (which would add its own load/replay/GC surface). The common transient case recovers
+ *  on the next finalize. */
 export function flushOrphanedPrefixes(appHome: string, conversationId: string): void {
   const list = orphanedPrefixes.get(conversationId);
   if (!list || list.length === 0) return;
   const remaining: OrphanedPrefix[] = [];
   for (const orphan of list) {
     try {
-      // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior
-      // flush that persisted but failed to reparent)? If so REUSE that node rather than appending a duplicate.
+      const conv = readConversation(appHome, conversationId);
+      const tree = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
+      // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior flush
+      // that persisted but failed to reparent)?
+      const existingNode = orphan.responseMessageId ? tree.find((m) => m?.id === orphan.responseMessageId) : undefined;
       let prefixNodeId: string | null = null;
-      if (orphan.responseMessageId) {
-        const conv = readConversation(appHome, conversationId);
-        const existing =
-          conv && Array.isArray(conv.messageTree)
-            ? (conv.messageTree as Array<{ id?: unknown }>).some((m) => m?.id === orphan.responseMessageId)
-            : false;
-        if (existing) prefixNodeId = orphan.responseMessageId;
-      }
-      if (!prefixNodeId) {
+      if (existingNode) {
+        // R237: REUSE but RESTORE — a renderer-written node may be frame-capped (truncated) or wrongly parented
+        // (e.g. temporarily under the inject via the debounce). Overwrite its content with the orphan's full copy
+        // and set its parent to the pre-inject parent, so consuming it can't leave a truncated or cyclic node.
+        try {
+          const nextTree = tree.map((m) =>
+            m.id === orphan.responseMessageId ? { ...m, content: orphan.parts, parentId: orphan.parentId } : m,
+          );
+          const written = writeConversation(appHome, { ...conv!, messageTree: nextTree });
+          broadcastUpsert(appHome, written);
+          prefixNodeId = orphan.responseMessageId!;
+        } catch {
+          remaining.push(orphan);
+          continue;
+        }
+      } else {
         const updated = appendConversationMessages(
           appHome,
           conversationId,
@@ -944,11 +961,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         prefixNodeId = updated.headId;
       }
       // Splice the prefix INTO the chain: reparent the injected user (and its continuation subtree) onto the
-      // prefix node. makeHead:true so the INJECT is head if continuation is empty (a non-empty continuation
-      // re-advances head to itself, since flush runs before the continuation persist). RETAIN the orphan if the
-      // reparent fails — otherwise the prefix stays a sibling and is dropped from branch history (R236).
+      // prefix node. R237: makeHead ONLY when the inject has NO persisted continuation child yet — otherwise a
+      // continuation that already landed (a retry AFTER continuation persisted) would be HIDDEN by rewinding the
+      // head back to the inject. When continuation is still empty, making the inject head keeps it visible. RETAIN
+      // the orphan if the reparent fails — a sibling prefix omitted from the active branch is data loss (R236).
+      const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
       const reparented = reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, prefixNodeId, {
-        makeHead: true,
+        makeHead: !injectHasContinuation,
       });
       if (!reparented) {
         remaining.push(orphan);
