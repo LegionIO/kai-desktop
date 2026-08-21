@@ -922,6 +922,12 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
     try {
       const conv = readConversation(appHome, conversationId);
       const tree = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
+      const headBeforeFlush = conv?.headId ?? null;
+      // R238: the injected user has a persisted continuation subtree iff some node parents on it (directly or
+      // transitively). If so, the ACTIVE tip is the pre-flush head — appending/upserting the prefix and any
+      // reparent below must NOT leave the head on the prefix (which would hide the inject+continuation). We
+      // restore the pre-flush head explicitly after splicing in that case.
+      const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
       // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior flush
       // that persisted but failed to reparent)?
       const existingNode = orphan.responseMessageId ? tree.find((m) => m?.id === orphan.responseMessageId) : undefined;
@@ -961,17 +967,30 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         prefixNodeId = updated.headId;
       }
       // Splice the prefix INTO the chain: reparent the injected user (and its continuation subtree) onto the
-      // prefix node. R237: makeHead ONLY when the inject has NO persisted continuation child yet — otherwise a
-      // continuation that already landed (a retry AFTER continuation persisted) would be HIDDEN by rewinding the
-      // head back to the inject. When continuation is still empty, making the inject head keeps it visible. RETAIN
-      // the orphan if the reparent fails — a sibling prefix omitted from the active branch is data loss (R236).
-      const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
+      // prefix node. RETAIN the orphan if the reparent fails — a sibling prefix omitted from the active branch is
+      // data loss (R236). makeHead when the inject has no persisted continuation yet (the inject is the tip);
+      // otherwise leave head-move to the explicit restore below.
       const reparented = reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, prefixNodeId, {
         makeHead: !injectHasContinuation,
       });
       if (!reparented) {
         remaining.push(orphan);
         continue;
+      }
+      // R238: appending/upserting the prefix moved the head ONTO the prefix. When the inject already has a
+      // persisted continuation, that prefix-head hides the inject+continuation — restore the head to the tip it
+      // was at BEFORE this flush (the continuation). (When there's no continuation, the reparent's makeHead put
+      // the head on the inject, which is correct — nothing to restore.)
+      if (injectHasContinuation && headBeforeFlush) {
+        try {
+          const after = readConversation(appHome, conversationId);
+          if (after && after.headId !== headBeforeFlush) {
+            const withHead = writeConversation(appHome, { ...after, headId: headBeforeFlush });
+            broadcastUpsert(appHome, withHead);
+          }
+        } catch {
+          // Best-effort head restore; the prefix + reparent already landed.
+        }
       }
     } catch {
       remaining.push(orphan);
