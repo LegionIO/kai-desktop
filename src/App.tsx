@@ -157,6 +157,10 @@ function AppRoot() {
   // Conversation-scoped pop-out key (R193): tool-approval pop-outs carry notifConv so the shell can
   // resolve/close its item under the conversationId::id key (alerts omit it — their id is unique).
   const notifConv = isNotifWindow ? (search?.get('notifConv') ?? null) : null;
+  // R253: the run nonce (streamToken) — the registry key is conversationId::runNonce::id, and with two
+  // overlapping runs both using the same tool-call id the shell MUST echo the nonce back so its own window
+  // resolves (the nonce-less scan is ambiguous with two windows).
+  const notifNonce = isNotifWindow ? (search?.get('notifNonce') ?? null) : null;
   if (typeof window !== 'undefined' && (isApprovalWindow || isNotifWindow)) {
     // TEMP debug: is the pop-out window rendering the standalone shell?
     console.warn(`[APPROVAL] window search="${window.location.search}" approvalId=${approvalId} notifId=${notifId}`);
@@ -172,7 +176,9 @@ function AppRoot() {
 
   // Unified dedicated pop-out window (approvals · questions · alerts).
   if (notifId) {
-    return <NotificationShell id={notifId} conversationId={notifConv ?? undefined} />;
+    return (
+      <NotificationShell id={notifId} conversationId={notifConv ?? undefined} runNonce={notifNonce ?? undefined} />
+    );
   }
 
   // Back-compat: legacy approval-only route.

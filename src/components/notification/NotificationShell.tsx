@@ -163,7 +163,11 @@ const NotificationChrome: FC<{ title: string; onClose: () => void; children: Rea
   );
 };
 
-export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({ id, conversationId }) => {
+export const NotificationShell: FC<{ id: string; conversationId?: string; runNonce?: string }> = ({
+  id,
+  conversationId,
+  runNonce,
+}) => {
   const [item, setItem] = useState<NotificationItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -173,9 +177,9 @@ export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({
       if (it && it.id === id) setItem(it);
     });
     let cancelled = false;
-    // Resolve under the conversation-scoped key (R193): pass conversationId so a tool-approval pop-out
-    // pulls the right item when two conversations share a raw tool-call id.
-    void app.notification.get(id, conversationId).then((raw) => {
+    // Resolve under the run-scoped key (R193/R253): pass conversationId + runNonce so a tool-approval pop-out
+    // pulls the RIGHT item even when two OVERLAPPING runs in one conversation share a raw tool-call id.
+    void app.notification.get(id, conversationId, runNonce).then((raw) => {
       const it = raw as NotificationItem | null;
       if (!cancelled && it && it.id === id) setItem(it);
     });
@@ -183,9 +187,9 @@ export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({
       cancelled = true;
       off();
     };
-  }, [id, conversationId]);
+  }, [id, conversationId, runNonce]);
 
-  const close = useCallback(() => app.notification.close(id, conversationId), [id, conversationId]);
+  const close = useCallback(() => app.notification.close(id, conversationId, runNonce), [id, conversationId, runNonce]);
 
   if (!item) {
     return (
@@ -220,7 +224,7 @@ export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({
       if (submitting) return;
       setSubmitting(true);
       try {
-        await app.agent.answerToolQuestion(item.id, answers, item.conversationId);
+        await app.agent.answerToolQuestion(item.id, answers, item.conversationId, runNonce);
       } catch {
         /* main-side resolve is idempotent; close regardless */
       }
@@ -248,8 +252,8 @@ export const NotificationShell: FC<{ id: string; conversationId?: string }> = ({
     if (submitting) return;
     setSubmitting(true);
     try {
-      if (decision === 'approve') await app.agent.approveToolCall(item.id, item.conversationId);
-      else await app.agent.rejectToolCall(item.id, item.conversationId);
+      if (decision === 'approve') await app.agent.approveToolCall(item.id, item.conversationId, runNonce);
+      else await app.agent.rejectToolCall(item.id, item.conversationId, runNonce);
     } catch {
       /* idempotent */
     }
