@@ -911,6 +911,11 @@ export function discardPersistenceAccumulator(conversationId: string): void {
 export function purgeConversationPersistence(conversationId: string): void {
   accumulators.delete(conversationId);
   orphanedPrefixes.delete(conversationId);
+  const snaps = supersededSnapshots.get(conversationId);
+  if (snaps) {
+    supersededSnapshotBytes -= snaps.reduce((n, s) => n + s.bytes, 0); // R271: keep the byte accountant in sync
+    if (supersededSnapshotBytes < 0) supersededSnapshotBytes = 0;
+  }
   supersededSnapshots.delete(conversationId);
   finalizedResponseIds.delete(conversationId);
 }
@@ -920,8 +925,40 @@ export function purgeConversationPersistence(conversationId: string): void {
  *  accumulator and would merge the prior turn's parts under the prior id). Instead we snapshot the retained parts
  *  here and discard the live accumulator, then re-attempt the upsert on the next finalize via
  *  flushSupersededSnapshots — recovering the prior turn's full reply without contaminating the fresh turn. */
-type SupersededSnapshot = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string };
+type SupersededSnapshot = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string; bytes: number };
 const supersededSnapshots = new Map<string, SupersededSnapshot[]>();
+// R271 f-3: the snapshot store is memory-only; under a PERSISTENT I/O failure with continued submissions the retry
+// keeps failing and the queue would grow without bound → main-process OOM. Cap total retained bytes across ALL
+// conversations and evict the OLDEST snapshots first (a stale superseded reply is the most disposable). Rough
+// byte estimate via JSON length of the parts (tool args/results dominate; text is counted too).
+const SUPERSEDED_SNAPSHOT_BYTES_CAP = 24 * 1024 * 1024; // 24 MiB — generous for text, bounds pathological growth
+let supersededSnapshotBytes = 0;
+
+function estimateSnapshotBytes(parts: ContentPart[]): number {
+  try {
+    return JSON.stringify(parts).length;
+  } catch {
+    return 0; // unserializable (shouldn't happen for stored parts) — don't let accounting throw
+  }
+}
+
+/** R271: evict the OLDEST superseded snapshots (across all conversations, insertion order) until the total retained
+ *  bytes fit under the cap. Called after admitting a new snapshot. A dropped snapshot is an accepted data loss under
+ *  sustained disk failure — bounded memory is the higher priority (the alternative is crashing main, losing ALL
+ *  conversations). */
+function evictSupersededSnapshotsToCap(): void {
+  if (supersededSnapshotBytes <= SUPERSEDED_SNAPSHOT_BYTES_CAP) return;
+  // Iterate conversations in Map insertion order (oldest first); within a conversation, oldest snapshot first.
+  for (const [convId, list] of supersededSnapshots) {
+    while (list.length > 0 && supersededSnapshotBytes > SUPERSEDED_SNAPSHOT_BYTES_CAP) {
+      const dropped = list.shift()!;
+      supersededSnapshotBytes -= dropped.bytes;
+    }
+    if (list.length === 0) supersededSnapshots.delete(convId);
+    if (supersededSnapshotBytes <= SUPERSEDED_SNAPSHOT_BYTES_CAP) break;
+  }
+  if (supersededSnapshotBytes < 0) supersededSnapshotBytes = 0; // guard against accounting drift
+}
 
 /** R269: snapshot the currently-held accumulator's content for a conversation whose superseding-turn fallback flush
  *  FAILED, then clear the live accumulator so the fresh turn starts clean. No-op if there's no accumulator content.
@@ -935,8 +972,11 @@ export function snapshotSupersededAccumulatorForRetry(conversationId: string): b
   const list = supersededSnapshots.get(conversationId) ?? [];
   // Don't double-record the same responseMessageId (idempotent across repeated failed takeovers).
   if (!list.some((s) => s.responseMessageId === acc.responseMessageId)) {
-    list.push({ parts: acc.parts, parentId: acc.parentId ?? null, responseMessageId: acc.responseMessageId });
+    const bytes = estimateSnapshotBytes(acc.parts);
+    list.push({ parts: acc.parts, parentId: acc.parentId ?? null, responseMessageId: acc.responseMessageId, bytes });
     supersededSnapshots.set(conversationId, list);
+    supersededSnapshotBytes += bytes;
+    evictSupersededSnapshotsToCap(); // R271 f-3: bound total retained memory
   }
   accumulators.delete(conversationId);
   return true;
@@ -1015,6 +1055,12 @@ export function flushSupersededSnapshots(appHome: string, conversationId: string
       remaining.push(snap); // transient read/write failure → retain
     }
   }
+  // R271: reconcile the global byte accountant — subtract the bytes of snapshots that were dropped (recovered or
+  // genuinely absent) this pass. Recompute from the delta of this conversation's list so accounting can't drift.
+  const beforeBytes = list.reduce((n, s) => n + s.bytes, 0);
+  const afterBytes = remaining.reduce((n, s) => n + s.bytes, 0);
+  supersededSnapshotBytes -= beforeBytes - afterBytes;
+  if (supersededSnapshotBytes < 0) supersededSnapshotBytes = 0;
   if (remaining.length > 0) supersededSnapshots.set(conversationId, remaining);
   else supersededSnapshots.delete(conversationId);
 }

@@ -353,6 +353,50 @@ describe('stream persistence accumulator', () => {
     clearFinalizedResponseIds('sup2');
   });
 
+  it('superseded-snapshot store is BOUNDED — oldest snapshots evict under sustained I/O failure (R271 f-3)', () => {
+    // R271 f-3: under a PERSISTENT disk failure with continued submissions the snapshot queue must not grow without
+    // bound (main-process OOM). Snapshot many LARGE superseded turns across distinct conversations while every
+    // flush fails (strict read throws), then assert the OLDEST recovered content is evicted (its flush now finds
+    // nothing to write) while a RECENT one still flushes when the disk recovers.
+    const BIG = 'x'.repeat(3 * 1024 * 1024); // 3 MiB per snapshot; cap is 24 MiB → ~8 fit, older evicted
+    const convIds: string[] = [];
+    for (let i = 0; i < 16; i++) {
+      const cid = `cap-${i}`;
+      convIds.push(cid);
+      clearFinalizedResponseIds(cid);
+      feedWithParent(
+        { conversationId: cid, type: 'text-delta', text: BIG, responseMessageId: `resp-${cid}` },
+        `u-${cid}`,
+      );
+      expect(snapshotSupersededAccumulatorForRetry(cid)).toBe(true);
+    }
+    writeMock.mockClear();
+    // The OLDEST conversation (cap-0) should have been evicted → its flush writes nothing even with a good read.
+    readStrictMock.mockReturnValue({
+      id: 'cap-0',
+      headId: 'u-cap-0',
+      runStatus: 'idle',
+      messageTree: [{ id: 'u-cap-0', parentId: null, role: 'user', content: [] }],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'cap-0');
+    expect(writeMock).not.toHaveBeenCalled(); // evicted → nothing to recover
+    // A RECENT conversation (cap-15) should still be retained → its flush writes the recovered node.
+    writeMock.mockClear();
+    readStrictMock.mockReturnValue({
+      id: 'cap-15',
+      headId: 'u-cap-15',
+      runStatus: 'idle',
+      messageTree: [{ id: 'u-cap-15', parentId: null, role: 'user', content: [] }],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'cap-15');
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    readStrictMock.mockReset();
+    readStrictMock.mockImplementation((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
+    for (const cid of convIds) clearFinalizedResponseIds(cid);
+  });
+
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
     // finalize deletes the accumulator, so a second finalize with nothing newly
     // accumulated hits the empty guard and does not append.

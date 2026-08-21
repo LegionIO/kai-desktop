@@ -1399,6 +1399,11 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
         // takeover on an EARLIER turn may have parked a superseded-turn snapshot (snapshotSupersededAccumulatorForRetry)
         // that no finalizer runs on this renderer-persisted branch; retry flushing it here (no-op when there are none)
         // so it isn't stranded until process exit. Recover BEFORE discarding this turn's own accumulator.
+        // R271 f-2: flushSupersededSnapshots RETAINS (does not drop) a snapshot whose write fails here, so this is
+        // not a one-shot: the same store is re-flushed by EVERY finalizeInterruptedTurn*/finalizeTurn(settle)/
+        // budget-expiry path on any later turn of this conversation, and it is BOUNDED (R271 f-3) so a persistent
+        // failure can't grow memory. The residual "process exits before any later flush" window is the same
+        // accepted memory-only durability limit as the live accumulator itself (also lost on exit).
         flushSupersededSnapshots(fbAppHome, conversationId);
         discardPersistenceAccumulator(conversationId); // local renderer owns the (full) write — no double-persist
         return;
@@ -1411,17 +1416,28 @@ function finalizeGuiFallbackIfOwned(conversationId: string, streamToken: string)
       // main's accumulated reply, reset runStatus, settle. For a REMOTE origin use the REPLACE
       // variant (it replaces a capped node by id if one exists, else appends) so we never leave a
       // duplicate sibling should the web client have persisted a capped node; finalize* no-ops if
-      // the accumulator is empty.
+      // the accumulator is empty. (finalizeInterruptedTurn*Replacing/Upsert also flush any parked
+      // superseded snapshot at their top — R270.)
+      let finalHead: string | null = null;
       try {
-        if (remoteOrigin) finalizeInterruptedTurnReplacing(fbAppHome, conversationId);
-        // LOCAL origin: upsert-by-id, not a plain append. The renderer's debounced
-        // persist may have landed the assistant node under this run's responseMessageId
-        // just before it reloaded/crashed (disk still 'running'); a plain append would
-        // id-collision-rename it to a bogus `auto-msg-*` sibling. replaceById upserts in
-        // place (falls back to append when no such node exists).
-        else finalizeInterruptedTurnUpsert(fbAppHome, conversationId);
+        finalHead = remoteOrigin
+          ? finalizeInterruptedTurnReplacing(fbAppHome, conversationId)
+          : // LOCAL origin: upsert-by-id, not a plain append. The renderer's debounced
+            // persist may have landed the assistant node under this run's responseMessageId
+            // just before it reloaded/crashed (disk still 'running'); a plain append would
+            // id-collision-rename it to a bogus `auto-msg-*` sibling. replaceById upserts in
+            // place (falls back to append when no such node exists).
+            finalizeInterruptedTurnUpsert(fbAppHome, conversationId);
       } catch {
-        discardPersistenceAccumulator(conversationId);
+        finalHead = null;
+      }
+      // R271 f-1: the markers were already deleted above, so a null finalize (every bounded retry failed →
+      // accumulator RETAINED) would leave the accumulator with no owner — the next turn's admission discards it,
+      // losing the full copy. Since the poll budget is exhausted (no more retries here), SNAPSHOT the retained
+      // accumulator into the superseded-snapshot store (bounded, retried by every later finalize/settle) instead
+      // of leaving it stranded. No-op when the finalize succeeded (accumulator already deleted) or was empty.
+      if (finalHead === null && hasPersistenceAccumulator(conversationId)) {
+        snapshotSupersededAccumulatorForRetry(conversationId);
       }
       try {
         const conv = readConversation(fbAppHome, conversationId);
