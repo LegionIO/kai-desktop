@@ -5,6 +5,7 @@ import {
   broadcastUpsert,
   ensureConversationTree,
   getConversationBranch,
+  reparentConversationMessage,
 } from '../ipc/conversations.js';
 import type { StoredTreeMessage } from '../ipc/conversations.js';
 import { readConversation, writeConversation, nextCompactionRevision } from '../ipc/conversation-store.js';
@@ -94,7 +95,12 @@ const accumulators = new Map<string, Accumulator>();
  * parent, so both prefix (before inject) and continuation (after inject) end up correctly ordered. Keyed by
  * conversationId → list (a run can cross multiple failed boundaries before one flush).
  */
-type OrphanedPrefix = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string };
+type OrphanedPrefix = {
+  parts: ContentPart[];
+  parentId: string | null;
+  responseMessageId?: string;
+  injectedUserId: string;
+};
 const orphanedPrefixes = new Map<string, OrphanedPrefix[]>();
 
 /**
@@ -427,6 +433,7 @@ function finalizeTurn(appHome: string, conversationId: string): 'done' | 'failed
  * there was nothing to persist.
  */
 export function finalizeInterruptedTurn(appHome: string, conversationId: string): string | null {
+  flushOrphanedPrefixes(appHome, conversationId); // R234: GUI terminal handling uses these finalizers, not finalizeTurn
   return persistAccumulatedReturningHead(appHome, conversationId);
 }
 
@@ -434,6 +441,7 @@ export function finalizeInterruptedTurn(appHome: string, conversationId: string)
 // frame-capped assistant node under the same responseMessageId, so REPLACE that node's content with
 // main's full copy (upsert by id) rather than appending a duplicate sibling variant.
 export function finalizeInterruptedTurnReplacing(appHome: string, conversationId: string): string | null {
+  flushOrphanedPrefixes(appHome, conversationId); // R234
   return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
 }
 
@@ -445,6 +453,7 @@ export function finalizeInterruptedTurnReplacing(appHome: string, conversationId
 // `auto-msg-*` duplicate sibling; replaceById upserts the existing node in place (and falls through
 // to a normal append when no such node exists yet).
 export function finalizeInterruptedTurnUpsert(appHome: string, conversationId: string): string | null {
+  flushOrphanedPrefixes(appHome, conversationId); // R234
   return persistAccumulatedReturningHead(appHome, conversationId, { replaceById: true });
 }
 
@@ -867,7 +876,7 @@ export function splitFailedPrefixIntoOrphan(
   const acc = accumulators.get(conversationId);
   if (!acc || !acc.sawContent || acc.parts.length === 0) return;
   const list = orphanedPrefixes.get(conversationId) ?? [];
-  list.push({ parts: acc.parts, parentId: preInjectParent, responseMessageId: acc.responseMessageId });
+  list.push({ parts: acc.parts, parentId: preInjectParent, responseMessageId: acc.responseMessageId, injectedUserId });
   orphanedPrefixes.set(conversationId, list);
   // Fresh continuation accumulator parented on the inject; a deterministic `-cont` id so a renderer-crash
   // fallback finalize targets the same node (mirrors finalizeGuiFallbackPrefixAtInject's re-seed).
@@ -880,9 +889,12 @@ export function splitFailedPrefixIntoOrphan(
   });
 }
 
-/** R233: attempt to persist any orphaned prefixes (from failed inject-boundary persists) as their own assistant
- *  nodes under their recorded pre-inject parent. Called on a later finalize/`done` when a write is more likely to
- *  succeed. Entries that persist are removed; entries that fail again are retained for the next attempt. */
+/** R233/R234: attempt to persist any orphaned prefixes (from failed inject-boundary persists) as their own
+ *  assistant nodes under their recorded pre-inject parent, THEN reparent the injected user onto the flushed
+ *  prefix so the active chain is `pre → prefix → inject → continuation` (R234: without the reparent the prefix
+ *  and inject were siblings under the pre-inject head, so the recovered prefix was omitted from the active
+ *  branch). Called on a later finalize when a write is more likely to succeed. Entries that persist+reparent are
+ *  removed; entries that fail again are retained for the next attempt. */
 export function flushOrphanedPrefixes(appHome: string, conversationId: string): void {
   const list = orphanedPrefixes.get(conversationId);
   if (!list || list.length === 0) return;
@@ -901,7 +913,18 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
         ],
         { runStatus: 'running', ...(orphan.parentId !== null ? { parentId: orphan.parentId } : {}) },
       );
-      if (!updated?.headId) remaining.push(orphan); // still failing — keep for next attempt
+      if (!updated?.headId) {
+        remaining.push(orphan); // still failing — keep for next attempt
+        continue;
+      }
+      // R234: splice the flushed prefix INTO the chain — reparent the injected user (and thus its continuation
+      // subtree) onto the just-persisted prefix node, so the active branch is pre → prefix → inject → continuation
+      // instead of leaving prefix and inject as siblings under the pre-inject head (which omitted the prefix).
+      try {
+        reparentConversationMessage(appHome, conversationId, orphan.injectedUserId, updated.headId);
+      } catch {
+        // Best-effort: the prefix is persisted either way; a reparent failure only affects branch ordering.
+      }
     } catch {
       remaining.push(orphan);
     }
