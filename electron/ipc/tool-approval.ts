@@ -291,22 +291,16 @@ export function authorizePendingApprovalWindow(
   return true;
 }
 
-/** Look up a pending approval from a stream EVENT, honoring the run-scoped key (R192/R249):
- *  compose conversationId::runNonce::toolCallId (the run nonce is the event's `runGeneration`, i.e.
- *  the emitting run's streamToken), falling back to the conversation-only key and then the raw id.
- *  Used by the broadcast-routing guards, which only have the event (whose toolCallId is the
- *  renderer-facing raw id). */
+/** Look up a pending approval from a stream EVENT, honoring the run-scoped key (R192/R249/R251):
+ *  run-scoped (event.runGeneration = the run nonce) → conversation-scoped → an UNAMBIGUOUS
+ *  `${conversationId}::<nonce>::${toolCallId}` scan (R251: so a broadcast whose event has NOT yet had
+ *  runGeneration stamped still resolves the single matching run-scoped entry — otherwise a browser-owned
+ *  generic approval would be missed and over-broadcast to unrelated surfaces) → raw id. Used by the
+ *  broadcast-routing guards, which only have the event (whose toolCallId is the renderer-facing raw id). */
 function lookupPendingByEvent(event: StreamEvent): PendingToolApproval | undefined {
   if (!event.toolCallId) return undefined;
-  if (event.conversationId) {
-    const runScoped = event.runGeneration
-      ? pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId, event.runGeneration))
-      : undefined;
-    if (runScoped) return runScoped;
-    const convScoped = pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId));
-    if (convScoped) return convScoped;
-  }
-  return pendingToolApprovals.get(event.toolCallId);
+  const key = resolvePendingApprovalKey(event.conversationId, event.toolCallId, event.runGeneration);
+  return key ? pendingToolApprovals.get(key) : undefined;
 }
 
 /** Web clients cannot own the native Browser sidebar. Hide both Browser tool
