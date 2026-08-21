@@ -760,63 +760,79 @@ function persistAccumulatedReturningHead(
     // variant. Instead, REPLACE that node's content in place with main's FULL parts. Only when a
     // node with that id actually exists on disk; else fall through to the normal append.
     if (opts?.replaceById && effectiveId) {
-      try {
-        const conv = readConversation(appHome, conversationId);
-        const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
-        const nodeIdx = treeArr ? treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant') : -1;
-        if (conv && treeArr && nodeIdx >= 0) {
-          const nextTree = treeArr.slice();
-          // Overwrite content; drop the cached token count/sig so writeConversation's backfill
-          // recomputes them for the new (full) content.
-          const replaced = { ...nextTree[nodeIdx], content: acc.parts };
-          delete (replaced as { tokenCount?: unknown }).tokenCount;
-          delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
-          // restoreParentFromAcc: at a cooperative-inject boundary the renderer's
-          // debounce may have TEMPORARILY persisted this prefix parented UNDER the
-          // injected user (before inject-consumed reordered it). Replacing only the
-          // content would keep that wrong parent, and the caller's later attempt to
-          // parent the user ONTO the prefix would be a cycle. Restore the prefix's
-          // parent to the accumulator's (the pre-inject head) so the boundary tree
-          // is `pre → prefix → user`.
-          if (opts?.restoreParentFromAcc && acc.parentId !== undefined) {
-            (replaced as { parentId?: string | null }).parentId = acc.parentId;
+      // R264: attempt the replace with a BOUNDED INLINE RETRY. R263 returned null to "retain for a later
+      // finalize", but terminal callers have already consumed their retry marker and new-turn admission discards
+      // the accumulator unconditionally — so a "later finalize" may never come and the uncapped response would be
+      // lost. Retrying a few times inside THIS call resolves the transient read/write failure without depending
+      // on a future finalize. If EVERY attempt fails we retain the accumulator (return null) as the last resort;
+      // the renderer (authoritative for a local-origin upsert) also re-persists the full content on its next
+      // debounce, so the on-disk node isn't permanently truncated in the common case.
+      let lastReplaceThrew = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        lastReplaceThrew = false;
+        try {
+          const conv = readConversation(appHome, conversationId);
+          const treeArr = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : null;
+          const nodeIdx = treeArr ? treeArr.findIndex((m) => m.id === effectiveId && m.role === 'assistant') : -1;
+          if (conv && treeArr && nodeIdx >= 0) {
+            const nextTree = treeArr.slice();
+            // Overwrite content; drop the cached token count/sig so writeConversation's backfill
+            // recomputes them for the new (full) content.
+            const replaced = { ...nextTree[nodeIdx], content: acc.parts };
+            delete (replaced as { tokenCount?: unknown }).tokenCount;
+            delete (replaced as { tokenCountSig?: unknown }).tokenCountSig;
+            // restoreParentFromAcc: at a cooperative-inject boundary the renderer's
+            // debounce may have TEMPORARILY persisted this prefix parented UNDER the
+            // injected user (before inject-consumed reordered it). Replacing only the
+            // content would keep that wrong parent, and the caller's later attempt to
+            // parent the user ONTO the prefix would be a cycle. Restore the prefix's
+            // parent to the accumulator's (the pre-inject head) so the boundary tree
+            // is `pre → prefix → user`.
+            if (opts?.restoreParentFromAcc && acc.parentId !== undefined) {
+              (replaced as { parentId?: string | null }).parentId = acc.parentId;
+            }
+            nextTree[nodeIdx] = replaced;
+            // Also refresh the LEGACY FLAT `messages` array's matching node — search + Markdown export
+            // read from `messages`, so leaving the web client's frame-capped copy there would make
+            // them permanently show truncated output. Overwrite its content with main's full parts.
+            const nextMessages = Array.isArray(conv.messages)
+              ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
+                  m && typeof m === 'object' && m.id === effectiveId ? { ...m, content: acc.parts } : m,
+                )
+              : conv.messages;
+            // Preserve the CURRENT head + runStatus if they've moved PAST this node — a newer user
+            // turn / branch-nav / replacement run may have advanced the head and set 'running' since
+            // this (now-superseded) turn ended. Only when the head still points AT this node (the
+            // normal terminal case) do we finalize it to idle. Never rewind the head to this node or
+            // force 'idle' over a live newer turn.
+            const headStillHere = conv.headId === effectiveId || conv.headId == null;
+            const nextConv = {
+              ...conv,
+              messageTree: nextTree,
+              messages: nextMessages,
+              headId: headStillHere && !opts?.keepRunning ? effectiveId : conv.headId,
+              runStatus: headStillHere && !opts?.keepRunning ? 'idle' : conv.runStatus,
+            } as typeof conv;
+            const written = writeConversation(appHome, nextConv);
+            markResponseFinalized(conversationId, acc.responseMessageId);
+            broadcastUpsert(appHome, written);
+            accumulators.delete(conversationId); // persisted — safe to clear (R168)
+            return effectiveId;
           }
-          nextTree[nodeIdx] = replaced;
-          // Also refresh the LEGACY FLAT `messages` array's matching node — search + Markdown export
-          // read from `messages`, so leaving the web client's frame-capped copy there would make
-          // them permanently show truncated output. Overwrite its content with main's full parts.
-          const nextMessages = Array.isArray(conv.messages)
-            ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
-                m && typeof m === 'object' && m.id === effectiveId ? { ...m, content: acc.parts } : m,
-              )
-            : conv.messages;
-          // Preserve the CURRENT head + runStatus if they've moved PAST this node — a newer user
-          // turn / branch-nav / replacement run may have advanced the head and set 'running' since
-          // this (now-superseded) turn ended. Only when the head still points AT this node (the
-          // normal terminal case) do we finalize it to idle. Never rewind the head to this node or
-          // force 'idle' over a live newer turn.
-          const headStillHere = conv.headId === effectiveId || conv.headId == null;
-          const nextConv = {
-            ...conv,
-            messageTree: nextTree,
-            messages: nextMessages,
-            headId: headStillHere && !opts?.keepRunning ? effectiveId : conv.headId,
-            runStatus: headStillHere && !opts?.keepRunning ? 'idle' : conv.runStatus,
-          } as typeof conv;
-          const written = writeConversation(appHome, nextConv);
-          markResponseFinalized(conversationId, acc.responseMessageId);
-          broadcastUpsert(appHome, written);
-          accumulators.delete(conversationId); // persisted — safe to clear (R168)
-          return effectiveId;
+          // Node did NOT exist on disk (read succeeded, nodeIdx < 0) → the renderer hasn't persisted it yet;
+          // stop retrying and fall through to the normal append (uses effectiveId, no collision since it's absent).
+          break;
+        } catch {
+          // Transient read/write failure — retry (R264). Do NOT fall through to append (the renderer may already
+          // hold a node under effectiveId, so appending would collision-rename to a bogus auto-msg-* duplicate
+          // and bypass R173's failed-write protection).
+          lastReplaceThrew = true;
         }
-        // Node did NOT exist on disk (read succeeded, nodeIdx < 0) → the renderer hasn't persisted it yet;
-        // fall through to the normal append (which uses effectiveId, no collision since it's absent).
-      } catch {
-        // R263: a read/write FAILURE in the replaceById path must NOT fall through to append — the renderer
-        // may already have persisted a node under effectiveId, so appending would collision-rename to a bogus
-        // `auto-msg-*` duplicate variant AND bypass R173's failed-write protection. RETAIN the accumulator and
-        // return null so a later finalize retries the replace (idempotent). (Distinct from the read-succeeded /
-        // node-absent case above, which correctly appends.)
+      }
+      if (lastReplaceThrew) {
+        // R264: every bounded retry of the replace failed → RETAIN the accumulator (return null) as the last
+        // resort rather than append a duplicate. The renderer (authoritative for a local upsert) re-persists the
+        // full content on its next debounce, so the on-disk node isn't permanently truncated in the common case.
         return null;
       }
     }

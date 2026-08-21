@@ -632,37 +632,25 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       streamId: string,
     ) => {
       const prev = submittedPayloadRef.current.get(taskId);
-      let parkedPrev = false;
-      if (prev) {
-        // R263: `prev` may be a STILL-LIVE in-flight submission for the SAME task (A1→B→A2: the user returned to
-        // task A and submitted A2 while A1 was still streaming — the composer's busy gate only tracks the
-        // displayed task B, so it doesn't block this). Overwriting A1's ownership means A1's later
-        // superseded-error terminal (stamped A1's streamId) no longer matches this entry (now A2's), so A1 would
-        // be neither persisted nor recovered. PARK A1's payload as recovery before overwriting so its draft
-        // isn't silently lost. (parkRecovery takes ownership of prev.bytes — already committed — rather than
-        // releasing then re-committing.)
-        parkRecovery(taskId, prev.text, prev.attachments, prev.bytes);
-        parkedPrev = true;
-      }
+      // R264: refineTaskPlan now REFUSES a concurrent same-task submit while a prior stream is in flight, so a
+      // LIVE prev can no longer reach here (the A1→B→A2 race is blocked at the source). A `prev` we still see is
+      // therefore a not-yet-cleared TERMINAL entry — release its (committed) bytes.
+      if (prev && prev.bytes > 0) onAttachmentsReleased(prev.bytes);
       const bytes = computePayloadBytes(text, attachments);
       if (bytes > 0) onAttachmentsCommitted(bytes);
       // R226: streamId is minted by the caller and stored HERE, synchronously, before streamPlan is awaited —
       // no pending-admission window (streamId is known before streamPlan is awaited).
       submittedPayloadRef.current.set(taskId, { text, attachments, producedText: false, bytes, streamId });
-      // R221: a fresh submission supersedes a STALE recovery entry from a prior FAILED attempt — clear it so a
-      // subsequent failure of THIS submission isn't confused with the old one AND its byte charge is released.
-      // BUT do NOT clear when we JUST parked a live prev above (that IS the recovery we want to keep, R263). When
-      // clearing, release the recoveryBytesRef charge (R226) too.
-      if (!parkedPrev) {
-        const staleRecovery = recoveryBytesRef.current.get(taskId);
-        if (staleRecovery !== undefined) {
-          recoveryBytesRef.current.delete(taskId);
-          if (staleRecovery > 0) onAttachmentsReleased(staleRecovery);
-        }
-        dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
+      // R221: a fresh submission supersedes a STALE recovery entry from a prior FAILED attempt — clear it (release
+      // its recoveryBytesRef charge too, R226) so a subsequent failure of THIS submission isn't confused with it.
+      const staleRecovery = recoveryBytesRef.current.get(taskId);
+      if (staleRecovery !== undefined) {
+        recoveryBytesRef.current.delete(taskId);
+        if (staleRecovery > 0) onAttachmentsReleased(staleRecovery);
       }
+      dispatch({ type: 'SET_FAILED_SUBMISSION', taskId, failed: null });
     },
-    [computePayloadBytes, parkRecovery],
+    [computePayloadBytes],
   );
   const dropSubmission = useCallback((taskId: string) => {
     const p = submittedPayloadRef.current.get(taskId);
@@ -914,6 +902,14 @@ export const TaskProvider: FC<PropsWithChildren> = ({ children }) => {
       userMessage: string,
       attachments?: Array<{ image: string; mimeType?: string }>,
     ): Promise<{ ok: boolean; droppedImages?: number }> => {
+      // R264: refuse a concurrent re-submit for a task whose PRIOR plan stream is still in flight (its
+      // submittedPayloadRef entry hasn't been resolved by a terminal). The composer busy-gate only tracks the
+      // DISPLAYED task, so A1→(switch away)→A2 on the same task A slips through; overwriting A1's ownership loses
+      // it (R263) and a second failure would evict A1's parked recovery before restore (R264). Blocking the
+      // concurrent same-task submit at the source is the terminal fix — the user retries once A1 settles.
+      if (submittedPayloadRef.current.has(taskId)) {
+        return { ok: false };
+      }
       try {
         // Fetch fresh task from IPC to avoid stale closure over state.tasks
         const task = await app.tasks.get(taskId);
