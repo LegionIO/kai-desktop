@@ -9179,7 +9179,12 @@ export class BrowserManager {
     contents?: WebContents,
     requireSuccess = false,
   ): Promise<void> {
-    await stopRunningBrowserServiceWorkers(scopedSession, contents, requireSuccess);
+    // Shutdown and profile clearing may reuse a tab target while bounded page
+    // work has a deferred debugger cancellation. Join the same lease set so the
+    // transport cannot detach between ServiceWorker.enable and stopWorker.
+    await stopRunningBrowserServiceWorkers(scopedSession, contents, requireSuccess, undefined, (target) =>
+      this.acquireBrowserDebuggerLease(target),
+    );
   }
 
   private scopeHasActiveAiNetworkRestriction(scopeKey: string): boolean {

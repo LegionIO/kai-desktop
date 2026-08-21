@@ -20672,6 +20672,52 @@ describe('browser manager renderer lifecycle', () => {
     });
   });
 
+  it('leases a live tab debugger until service-worker shutdown commands drain', async () => {
+    const workerStop = deferred<void>();
+    const debuggerApi = browserDebuggerMock();
+    debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+      const method = args[0];
+      if (method === 'ServiceWorker.stopWorker') await workerStop.promise;
+      return {};
+    });
+    const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+    const scopedSession = {
+      serviceWorkers: { getAllRunning: () => ({ 'worker-version-1': {} }) },
+    };
+    const manager = managerWithoutConstructor({});
+    const cancelledLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      cancel: () => void;
+      release: () => void;
+    };
+    const concurrentLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+      release: () => void;
+    };
+    cancelledLease.cancel();
+
+    const stopping = invokePrivate(
+      manager,
+      'stopRunningServiceWorkers',
+      scopedSession,
+      contents,
+      true,
+    ) as Promise<void>;
+    await vi.waitFor(() =>
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('ServiceWorker.stopWorker', {
+        versionId: 'worker-version-1',
+      }),
+    );
+    concurrentLease.release();
+    expect(debuggerApi.detach).not.toHaveBeenCalled();
+
+    workerStop.resolve();
+    await expect(stopping).resolves.toBeUndefined();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+    expect(debuggerApi.isAttached()).toBe(false);
+
+    cancelledLease.release();
+    expect(debuggerApi.detach).toHaveBeenCalledOnce();
+  });
+
   it('fails a required service-worker stop when CDP cannot stop every worker', async () => {
     let attached = false;
     const debuggerApi = {

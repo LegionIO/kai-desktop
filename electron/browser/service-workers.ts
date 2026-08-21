@@ -33,6 +33,7 @@ export async function stopRunningBrowserServiceWorkers(
   contents?: WebContents,
   requireSuccess = false,
   commandTimeoutMs = BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS,
+  acquireDebuggerLease?: (target: WebContents) => { release: () => void },
 ): Promise<void> {
   let versionIds: string[];
   try {
@@ -47,6 +48,7 @@ export async function stopRunningBrowserServiceWorkers(
   let temporaryView: WebContentsView | null = null;
   let target = contents;
   let wasAttached = false;
+  let debuggerLease: { release: () => void } | undefined;
   try {
     if (!target || target.isDestroyed()) {
       const webPreferences: Record<string, unknown> = { session: scopedSession };
@@ -54,6 +56,10 @@ export async function stopRunningBrowserServiceWorkers(
       temporaryView = new WebContentsView({ webPreferences: webPreferences as Electron.WebPreferences });
       target = temporaryView.webContents;
     }
+    // A manager-owned live tab may share this debugger with bounded Browser
+    // work. Join its ownership set only after worker inventory proves CDP is
+    // needed; the helper's private temporary target has no outside consumers.
+    if (!temporaryView && acquireDebuggerLease) debuggerLease = acquireDebuggerLease(target);
     wasAttached = target.debugger.isAttached();
     if (!wasAttached) target.debugger.attach('1.3');
     await runServiceWorkerCommandWithDeadline(
@@ -81,6 +87,7 @@ export async function stopRunningBrowserServiceWorkers(
     if (requireSuccess) throw error;
   } finally {
     if (target && !wasAttached && !target.isDestroyed() && target.debugger.isAttached()) target.debugger.detach();
+    debuggerLease?.release();
     if (temporaryView) {
       try {
         if (!temporaryView.webContents.isDestroyed()) temporaryView.webContents.close({ waitForBeforeUnload: false });
