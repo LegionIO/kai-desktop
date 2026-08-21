@@ -48,6 +48,7 @@ import {
   finalizeInterruptedTurnUpsert,
   snapshotSupersededAccumulatorForRetry,
   flushSupersededSnapshots,
+  purgeConversationPersistence,
   persistCooperativeInjectedUserTurn,
   finalizeGuiFallbackPrefixAtInject,
   clearFinalizedResponseIds,
@@ -394,7 +395,79 @@ describe('stream persistence accumulator', () => {
     expect(writeMock).toHaveBeenCalledTimes(1);
     readStrictMock.mockReset();
     readStrictMock.mockImplementation((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
-    for (const cid of convIds) clearFinalizedResponseIds(cid);
+    for (const cid of convIds) {
+      purgeConversationPersistence(cid); // R272: clear residual retained snapshots so the byte accountant doesn't leak
+      clearFinalizedResponseIds(cid);
+    }
+  });
+
+  it('two id-less superseded snapshots are BOTH recorded — undefined ids are not deduplicated (R272 f-1)', () => {
+    // R272 f-1: non-Mastra runtimes emit id-less events, so two distinct failed turns both carry
+    // responseMessageId === undefined. Deduping by that would silently drop the second turn's reply.
+    clearFinalizedResponseIds('anon');
+    writeMock.mockClear();
+    // First id-less superseded turn.
+    feedWithParent({ conversationId: 'anon', type: 'text-delta', text: 'first anon reply' }, 'uAnon');
+    expect(snapshotSupersededAccumulatorForRetry('anon')).toBe(true);
+    // Second id-less superseded turn (same conversation, still no responseMessageId).
+    feedWithParent({ conversationId: 'anon', type: 'text-delta', text: 'second anon reply' }, 'uAnon');
+    expect(snapshotSupersededAccumulatorForRetry('anon')).toBe(true);
+    // Flush with a good read → BOTH snapshots must be written (two appends, not one — the second wasn't deduped).
+    readStrictMock.mockReturnValue({
+      id: 'anon',
+      headId: 'uAnon',
+      runStatus: 'idle',
+      messageTree: [{ id: 'uAnon', parentId: null, role: 'user', content: [] }],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'anon');
+    expect(writeMock).toHaveBeenCalledTimes(2); // both recovered, neither dropped as a "duplicate"
+    readStrictMock.mockReset();
+    readStrictMock.mockImplementation((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
+    clearFinalizedResponseIds('anon');
+  });
+
+  it('eviction is GLOBALLY oldest-first across conversations (R272 f-3)', () => {
+    // R272 f-3: draining one conversation's list before considering another could evict a NEWER reply while keeping
+    // an OLDER one elsewhere. Interleave admissions across two conversations so the oldest are split between them,
+    // then overflow the cap and assert the globally-OLDEST are evicted while the NEWEST survive — regardless of
+    // which conversation they belong to.
+    const BIG = 'y'.repeat(3 * 1024 * 1024); // 3 MiB each; cap 24 MiB → ~8 survive
+    const ids: string[] = [];
+    for (let i = 0; i < 16; i++) {
+      const cid = i % 2 === 0 ? 'evA' : 'evB'; // interleave so seq order is NOT grouped by conversation
+      const rid = `ev-${i}`;
+      ids.push(rid);
+      feedWithParent({ conversationId: cid, type: 'text-delta', text: BIG, responseMessageId: rid }, `u-${cid}`);
+      expect(snapshotSupersededAccumulatorForRetry(cid)).toBe(true);
+    }
+    // Flush each conversation once with a good read; collect the rids that actually got written (i.e. survived).
+    const written = new Set<string>();
+    for (const cid of ['evA', 'evB']) {
+      readStrictMock.mockReturnValue({
+        id: cid,
+        headId: `u-${cid}`,
+        runStatus: 'idle',
+        messageTree: [{ id: `u-${cid}`, parentId: null, role: 'user', content: [] }],
+        messages: [],
+      } as unknown as { headId?: string | null });
+      writeMock.mockClear();
+      flushSupersededSnapshots(APP_HOME, cid);
+      for (const c of writeMock.mock.calls) {
+        const conv = c[1] as { messageTree?: Array<{ id: string }> };
+        conv.messageTree?.forEach((m) => written.add(m.id));
+      }
+    }
+    // The globally-OLDEST admissions (ev-0 convA, ev-1 convB) must be evicted → NOT written.
+    expect(written.has('ev-0')).toBe(false);
+    expect(written.has('ev-1')).toBe(false);
+    // The globally-NEWEST admissions (ev-14 convA, ev-15 convB) must survive → written.
+    expect(written.has('ev-14')).toBe(true);
+    expect(written.has('ev-15')).toBe(true);
+    readStrictMock.mockReset();
+    readStrictMock.mockImplementation((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
+    for (const cid of ['evA', 'evB']) purgeConversationPersistence(cid);
+    for (const rid of ids) clearFinalizedResponseIds(rid);
   });
 
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {

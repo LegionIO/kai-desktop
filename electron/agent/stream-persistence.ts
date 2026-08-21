@@ -925,37 +925,58 @@ export function purgeConversationPersistence(conversationId: string): void {
  *  accumulator and would merge the prior turn's parts under the prior id). Instead we snapshot the retained parts
  *  here and discard the live accumulator, then re-attempt the upsert on the next finalize via
  *  flushSupersededSnapshots — recovering the prior turn's full reply without contaminating the fresh turn. */
-type SupersededSnapshot = { parts: ContentPart[]; parentId: string | null; responseMessageId?: string; bytes: number };
+type SupersededSnapshot = {
+  parts: ContentPart[];
+  parentId: string | null;
+  responseMessageId?: string;
+  bytes: number;
+  /** R272: monotonic admission sequence — lets eviction pick the globally-oldest snapshot across ALL
+   *  conversations (not just the oldest within the first conversation in Map order). */
+  seq: number;
+};
 const supersededSnapshots = new Map<string, SupersededSnapshot[]>();
 // R271 f-3: the snapshot store is memory-only; under a PERSISTENT I/O failure with continued submissions the retry
 // keeps failing and the queue would grow without bound → main-process OOM. Cap total retained bytes across ALL
-// conversations and evict the OLDEST snapshots first (a stale superseded reply is the most disposable). Rough
-// byte estimate via JSON length of the parts (tool args/results dominate; text is counted too).
+// conversations and evict the globally-OLDEST snapshots first (a stale superseded reply is the most disposable).
+// Rough byte estimate via JSON length of the parts (tool args/results dominate; text is counted too).
 const SUPERSEDED_SNAPSHOT_BYTES_CAP = 24 * 1024 * 1024; // 24 MiB — generous for text, bounds pathological growth
 let supersededSnapshotBytes = 0;
+let supersededSnapshotSeq = 0;
 
 function estimateSnapshotBytes(parts: ContentPart[]): number {
   try {
-    return JSON.stringify(parts).length;
+    const n = JSON.stringify(parts)?.length;
+    if (typeof n === 'number' && n > 0) return n;
   } catch {
-    return 0; // unserializable (shouldn't happen for stored parts) — don't let accounting throw
+    /* unserializable (cyclic / BigInt tool result) — fall through to the non-zero fallback below */
   }
+  // R272 f-2: NEVER return 0 for content that exists — a 0-byte charge lets an unserializable snapshot bypass the
+  // cap and grow memory without bound. Charge a conservative floor per part so it still counts toward the cap.
+  return Math.max(1, parts.length) * 4096;
 }
 
-/** R271: evict the OLDEST superseded snapshots (across all conversations, insertion order) until the total retained
- *  bytes fit under the cap. Called after admitting a new snapshot. A dropped snapshot is an accepted data loss under
- *  sustained disk failure — bounded memory is the higher priority (the alternative is crashing main, losing ALL
- *  conversations). */
+/** R271/R272: evict the globally-OLDEST superseded snapshots (across ALL conversations, by admission seq) until the
+ *  total retained bytes fit under the cap. Called after admitting a new snapshot. A dropped snapshot is an accepted
+ *  data loss under sustained disk failure — bounded memory is the higher priority (the alternative is crashing main,
+ *  losing ALL conversations). */
 function evictSupersededSnapshotsToCap(): void {
   if (supersededSnapshotBytes <= SUPERSEDED_SNAPSHOT_BYTES_CAP) return;
-  // Iterate conversations in Map insertion order (oldest first); within a conversation, oldest snapshot first.
+  // R272 f-3: flatten to (convId, snapshot) pairs and sort by seq so we drop the globally-oldest first — draining a
+  // single conversation's list in Map order could evict a NEWER reply while keeping an OLDER one elsewhere.
+  const all: Array<{ convId: string; snap: SupersededSnapshot }> = [];
   for (const [convId, list] of supersededSnapshots) {
-    while (list.length > 0 && supersededSnapshotBytes > SUPERSEDED_SNAPSHOT_BYTES_CAP) {
-      const dropped = list.shift()!;
-      supersededSnapshotBytes -= dropped.bytes;
-    }
-    if (list.length === 0) supersededSnapshots.delete(convId);
+    for (const snap of list) all.push({ convId, snap });
+  }
+  all.sort((a, b) => a.snap.seq - b.snap.seq); // oldest first
+  for (const { convId, snap } of all) {
     if (supersededSnapshotBytes <= SUPERSEDED_SNAPSHOT_BYTES_CAP) break;
+    const list = supersededSnapshots.get(convId);
+    if (!list) continue;
+    const i = list.indexOf(snap);
+    if (i < 0) continue;
+    list.splice(i, 1);
+    supersededSnapshotBytes -= snap.bytes;
+    if (list.length === 0) supersededSnapshots.delete(convId);
   }
   if (supersededSnapshotBytes < 0) supersededSnapshotBytes = 0; // guard against accounting drift
 }
@@ -970,10 +991,20 @@ export function snapshotSupersededAccumulatorForRetry(conversationId: string): b
     return false;
   }
   const list = supersededSnapshots.get(conversationId) ?? [];
-  // Don't double-record the same responseMessageId (idempotent across repeated failed takeovers).
-  if (!list.some((s) => s.responseMessageId === acc.responseMessageId)) {
+  // R272 f-1: only deduplicate by a DEFINED responseMessageId. Non-Mastra runtimes emit id-less events, so two
+  // distinct failed turns both carry responseMessageId === undefined — treating those as "the same" would silently
+  // drop the second turn's reply. An undefined id therefore always records a new snapshot.
+  const isDuplicate =
+    acc.responseMessageId !== undefined && list.some((s) => s.responseMessageId === acc.responseMessageId);
+  if (!isDuplicate) {
     const bytes = estimateSnapshotBytes(acc.parts);
-    list.push({ parts: acc.parts, parentId: acc.parentId ?? null, responseMessageId: acc.responseMessageId, bytes });
+    list.push({
+      parts: acc.parts,
+      parentId: acc.parentId ?? null,
+      responseMessageId: acc.responseMessageId,
+      bytes,
+      seq: supersededSnapshotSeq++,
+    });
     supersededSnapshots.set(conversationId, list);
     supersededSnapshotBytes += bytes;
     evictSupersededSnapshotsToCap(); // R271 f-3: bound total retained memory
