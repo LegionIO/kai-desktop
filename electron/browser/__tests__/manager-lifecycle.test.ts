@@ -17079,6 +17079,113 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.viewLoadPromise).toBeNull();
   });
 
+  it('preserves ask-policy approval when Browser mounting owns a discarded-tab restore', async () => {
+    const pageLoad = deferred<void>();
+    let currentUrl = '';
+    const view = {
+      webContents: {
+        getURL: () => currentUrl,
+        isDestroyed: () => false,
+        loadURL: vi.fn(async (url: string) => {
+          currentUrl = url;
+          tab.generation++;
+          await pageLoad.promise;
+        }),
+      },
+    };
+    const tab = {
+      shell: {
+        id: 'tab-1',
+        conversationId: 'chat-1',
+        url: 'https://approved.example/account',
+        discarded: true,
+      },
+      scopeKey: 'global',
+      view: null as typeof view | null,
+      viewLoadPromise: null as Promise<typeof view> | null,
+      generation: 4,
+      trustedUserNavigation: false,
+      trustedUserNavigationLease: 2,
+      aiNetworkRestricted: false,
+      aiControlOwnerId: 'run-1',
+      aiControlGeneration: 7,
+      assistantDialogsDisabledRunId: 'run-1',
+    };
+    const approval = {
+      tabId: tab.shell.id,
+      tabGeneration: tab.generation,
+      origin: 'https://approved.example',
+      url: tab.shell.url,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      tabRef: tab,
+    };
+    const guardAssistantTab = vi.fn(async () => ({
+      runId: 'run-1',
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: tab.generation,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    }));
+    const installAssistantNativeUiGuard = vi.fn(async () => undefined);
+    const manager = managerWithoutConstructor({
+      aiAllowPrivateNetwork: true,
+      assertScopeAvailable: vi.fn(),
+      attachActiveView: vi.fn(),
+      clearPendingScriptedOriginsBeforeRenderer: vi.fn(() => null),
+      createView: vi.fn(() => {
+        tab.view = view;
+        return view;
+      }),
+      getConfig: () => ({ browser: { enabled: true } }),
+      guardAssistantTab,
+      installAssistantNativeUiGuard,
+      requireLiveWindow: vi.fn(),
+      runRendererOperationWithDeadline: async (
+        _tab: unknown,
+        _contents: unknown,
+        _operation: string,
+        _timeoutMs: number,
+        task: () => Promise<unknown>,
+      ) => task(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+    const run = { id: 'run-1' };
+    const resetLease = invokePrivate(manager, 'beginBrowserApprovalRendererReset', tab, run, approval);
+    invokePrivate(manager, 'prepareBrowserApprovalRendererReset', tab, approval, resetLease, false);
+
+    // BrowserPanel.mount() reaches ensureView first and owns the shared native
+    // restoration. The approved assistant operation joins only after creation.
+    const mounting = invokePrivate(manager, 'ensureView', tab) as Promise<unknown>;
+    await vi.waitFor(() => expect(view.webContents.loadURL).toHaveBeenCalledOnce());
+    const documentLease = {
+      runId: run.id,
+      runGeneration: 7,
+      hostRendererAuthorityGeneration: 0,
+      tabGeneration: 4,
+      userNavigationLease: tab.trustedUserNavigationLease,
+      url: tab.shell.url,
+    };
+    const controlling = invokePrivate(
+      manager,
+      'ensureAssistantView',
+      tab,
+      run,
+      documentLease,
+      30_000,
+      approval,
+    ) as Promise<unknown>;
+
+    pageLoad.resolve();
+    await expect(Promise.all([mounting, controlling])).resolves.toEqual([view, view]);
+
+    expect(guardAssistantTab).toHaveBeenCalledOnce();
+    expect(installAssistantNativeUiGuard).toHaveBeenCalledWith(tab, view.webContents, undefined, documentLease);
+    expect(approval).toMatchObject({ tabGeneration: 5, allowInternalRestore: false });
+    expect(tab.viewLoadPromise).toBeNull();
+    expect(Reflect.get(tab, 'viewLoadState')).toBeUndefined();
+  });
+
   it('preserves the requested URL across a hidden assistant renderer bootstrap', async () => {
     let currentUrl = '';
     const loadURL = vi.fn(async (url: string) => {

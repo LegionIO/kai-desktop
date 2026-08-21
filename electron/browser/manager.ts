@@ -533,10 +533,19 @@ type BrowserBackgroundCaptureLease = {
   returnedToMain: boolean;
 };
 
+type BrowserViewLoadState = {
+  promise: Promise<WebContentsView> | null;
+  /** Generation produced only by manager-issued loadURL calls for this exact
+   * renderer restoration. Every caller joining the shared load uses the same
+   * value, regardless of whether Browser chrome or an assistant created it. */
+  expectedInitialLoadGeneration?: number;
+};
+
 type InternalTab = {
   shell: BrowserTab;
   view: WebContentsView | null;
   viewLoadPromise: Promise<WebContentsView> | null;
+  viewLoadState?: BrowserViewLoadState;
   partition: string;
   scopeKey: string;
   generation: number;
@@ -7874,16 +7883,22 @@ export class BrowserManager {
       // Most operations reclaim a wedged target; bounded network observation
       // can instead leave an already-guarded user renderer loading and return a
       // content-free timeout result.
-      return await this.runRendererOperationWithDeadline(
+      const sharedLoadPromise = tab.viewLoadPromise;
+      const sharedLoadState = tab.viewLoadState?.promise === sharedLoadPromise ? tab.viewLoadState : undefined;
+      const restoredView = await this.runRendererOperationWithDeadline(
         tab,
         tab.view.webContents,
         'Browser page load',
         remainingRendererTimeout('Browser page load'),
-        () => tab.viewLoadPromise!,
+        () => sharedLoadPromise,
         abortSignal,
         undefined,
         !preserveExistingLoadingViewOnTimeout,
       );
+      if (sharedLoadState?.expectedInitialLoadGeneration !== undefined) {
+        recordExpectedInitialLoadGeneration?.(sharedLoadState.expectedInitialLoadGeneration);
+      }
+      return restoredView;
     }
     throwIfBrowserAborted(abortSignal);
     const pendingScriptCleanup = this.clearPendingScriptedOriginsBeforeRenderer(tab);
@@ -7933,6 +7948,7 @@ export class BrowserManager {
     // restoration lease. A page/user navigation interleaved with those calls
     // produces an extra generation and is rejected after ensureView returns.
     let expectedInitialLoadGeneration = tab.generation;
+    const loadState: BrowserViewLoadState = { promise: null };
     const loadPromise = (async () => {
       try {
         try {
@@ -8039,14 +8055,18 @@ export class BrowserManager {
         throw new Error('The browser page was closed while it was loading.');
       }
       this.assertHostRendererOperationCurrent();
+      loadState.expectedInitialLoadGeneration = expectedInitialLoadGeneration;
       recordExpectedInitialLoadGeneration?.(expectedInitialLoadGeneration);
       return view;
     })();
+    loadState.promise = loadPromise;
     tab.viewLoadPromise = loadPromise;
+    tab.viewLoadState = loadState;
     try {
       return await loadPromise;
     } finally {
       if (tab.viewLoadPromise === loadPromise) tab.viewLoadPromise = null;
+      if (tab.viewLoadState === loadState) tab.viewLoadState = undefined;
     }
   }
 
@@ -8396,6 +8416,7 @@ export class BrowserManager {
     tab.assistantNativeUiNewDocumentGuard = undefined;
     tab.nativeUiGuardToken = undefined;
     tab.viewLoadPromise = null;
+    tab.viewLoadState = undefined;
     tab.assistantBackgroundInitialLoadPending = false;
     if (view) this.finishAssistantPopupBootstrap(tab, view.webContents);
     if (view) this.unprotectAssistantDialogs(tab, view.webContents);
