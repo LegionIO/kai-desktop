@@ -958,8 +958,26 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
   const orphanPrefixIds = new Set(
     list.map((o) => o.responseMessageId).filter((id): id is string => typeof id === 'string'),
   );
+  // R247: capture the authoritative continuation head ONCE, BEFORE the loop mutates any head. Within the loop an
+  // earlier orphan's append/failed-splice makes ITS prefix the disk head, so a per-orphan re-read (R244-R246)
+  // could capture that internal mutation instead of the real, user-selected continuation. The pre-loop head — when
+  // it's a real node that is neither an orphan prefix nor an orphan's inject — is the shared restore target for
+  // every orphan in this batch. Refreshed each flush call (a later finalize re-reads the current branch), so a
+  // user branch change between finalizes is still honored.
+  const preLoopConv = readConversation(appHome, conversationId);
+  const injectIds = new Set(list.map((o) => o.injectedUserId));
+  const sharedContinuationHead =
+    preLoopConv &&
+    typeof preLoopConv.headId === 'string' &&
+    !orphanPrefixIds.has(preLoopConv.headId) &&
+    !injectIds.has(preLoopConv.headId)
+      ? preLoopConv.headId
+      : null;
   const remaining: OrphanedPrefix[] = [];
   for (const orphan of list) {
+    // Persist the shared pre-loop continuation head onto each orphan so a retry across a later finalize (whose
+    // live head may be an internal prefix) still restores the correct branch.
+    if (sharedContinuationHead) orphan.continuationHead = sharedContinuationHead;
     try {
       const conv = readConversation(appHome, conversationId);
       // R241: readConversation FAILS OPEN (returns null on a read/parse error, doesn't throw). A null here would
@@ -971,25 +989,9 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       }
       const tree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
       // R238: the injected user has a persisted continuation subtree iff some node parents on it. If so, splicing
-      // the prefix must NOT leave the head on the prefix (which would hide the inject+continuation); the head is
-      // restored to the continuation head below.
+      // the prefix must NOT leave the head on the prefix; the head is restored to orphan.continuationHead (the
+      // shared pre-loop head captured above, R247) below.
       const injectHasContinuation = tree.some((m) => m?.parentId === orphan.injectedUserId);
-      // R244/R245: capture the authoritative continuation head BEFORE any write in this iteration overwrites
-      // headId. Refresh it on EVERY attempt (not just the first, R245) to the LATEST pre-write non-prefix head —
-      // a retained orphan outlives branch changes, so between a failed flush and a successful retry the user may
-      // have selected a DIFFERENT branch; recording only the first head would restore a stale branch and discard
-      // the user's current selection. Skip when the live head is the prefix (a retry after a prior failed append)
-      // or the inject — those aren't a continuation tip to preserve; keep whatever we last recorded. R246: also
-      // skip when the head is ANOTHER orphan's prefix node (an earlier failed splice left it as the disk head) —
-      // that's an internal mutation from this loop, not a user-selected branch.
-      if (
-        typeof conv.headId === 'string' &&
-        conv.headId !== orphan.responseMessageId &&
-        conv.headId !== orphan.injectedUserId &&
-        !orphanPrefixIds.has(conv.headId)
-      ) {
-        orphan.continuationHead = conv.headId;
-      }
       // Is the prefix already on disk under its responseMessageId (renderer-authoritative write or a prior flush
       // that persisted but failed to reparent)?
       const existingNode = orphan.responseMessageId ? tree.find((m) => m?.id === orphan.responseMessageId) : undefined;

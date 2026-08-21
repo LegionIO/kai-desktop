@@ -2539,16 +2539,17 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
           const prefixHead = finalizeGuiFallbackPrefixAtInject(serverPersistAppHome, event.conversationId, en.id);
           if (prefixHead) chainParent = prefixHead;
           if (chainParent) {
-            const spliced = reparentConversationMessage(
-              serverPersistAppHome,
-              event.conversationId,
-              en.id,
-              chainParent,
-              {
+            // R247: reparentConversationMessage can THROW (write failure), not just return falsy — treat both as
+            // a failed splice so recordSpliceOnlyOrphan always runs and flushOrphanedPrefixes can retry.
+            let spliced: unknown = null;
+            try {
+              spliced = reparentConversationMessage(serverPersistAppHome, event.conversationId, en.id, chainParent, {
                 makeHead: true,
-              },
-            );
-            // R246: if the prefix persisted (prefixHead) but this SPLICE transiently failed, record a
+              });
+            } catch {
+              spliced = null;
+            }
+            // R246: if the prefix persisted (prefixHead) but this SPLICE failed (falsy OR threw), record a
             // splice-only orphan so flushOrphanedPrefixes retries the reparent on the next finalize — otherwise
             // the continuation persists under the inject's sibling branch and hides the prefix permanently.
             if (!spliced && prefixHead && chainParent === prefixHead) {
