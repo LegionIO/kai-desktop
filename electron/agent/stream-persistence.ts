@@ -921,8 +921,15 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
   for (const orphan of list) {
     try {
       const conv = readConversation(appHome, conversationId);
-      const tree = conv && Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
-      const headBeforeFlush = conv?.headId ?? null;
+      // R241: readConversation FAILS OPEN (returns null on a read/parse error, doesn't throw). A null here would
+      // make tree=[] / injectHasContinuation=false / headBeforeFlush=null and proceed on false assumptions —
+      // treat it as a transient failure and RETAIN the orphan for the next finalize instead.
+      if (!conv) {
+        remaining.push(orphan);
+        continue;
+      }
+      const tree = Array.isArray(conv.messageTree) ? (conv.messageTree as StoredTreeMessage[]) : [];
+      const headBeforeFlush = conv.headId ?? null;
       // R238: the injected user has a persisted continuation subtree iff some node parents on it (directly or
       // transitively). If so, the ACTIVE tip is the pre-flush head — appending/upserting the prefix and any
       // reparent below must NOT leave the head on the prefix (which would hide the inject+continuation). We
@@ -943,12 +950,12 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
           // R239: ALSO refresh the LEGACY FLAT `messages` array — search, Markdown export, plugins, and media
           // indexing read from `messages`, so leaving a frame-capped renderer copy there would permanently show
           // the truncated prefix even though messageTree carries the full parts. (Mirrors the remote-replace path.)
-          const nextMessages = Array.isArray(conv!.messages)
-            ? (conv!.messages as Array<Record<string, unknown>>).map((m) =>
+          const nextMessages = Array.isArray(conv.messages)
+            ? (conv.messages as Array<Record<string, unknown>>).map((m) =>
                 m && typeof m === 'object' && m.id === orphan.responseMessageId ? { ...m, content: orphan.parts } : m,
               )
-            : conv!.messages;
-          const written = writeConversation(appHome, { ...conv!, messageTree: nextTree, messages: nextMessages });
+            : conv.messages;
+          const written = writeConversation(appHome, { ...conv, messageTree: nextTree, messages: nextMessages });
           broadcastUpsert(appHome, written);
           prefixNodeId = orphan.responseMessageId!;
         } catch {
@@ -994,7 +1001,13 @@ export function flushOrphanedPrefixes(appHome: string, conversationId: string): 
       if (injectHasContinuation && headBeforeFlush) {
         try {
           const after = readConversation(appHome, conversationId);
-          if (after && after.headId !== headBeforeFlush) {
+          // R241: a null read is a transient FAILURE (readConversation fails open), NOT "nothing to restore" —
+          // skipping restoration here would leave the head on the prefix with the orphan gone. Retain + retry.
+          if (!after) {
+            remaining.push(orphan);
+            continue;
+          }
+          if (after.headId !== headBeforeFlush) {
             const withHead = writeConversation(appHome, { ...after, headId: headBeforeFlush });
             broadcastUpsert(appHome, withHead);
           }
