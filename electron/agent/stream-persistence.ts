@@ -943,16 +943,21 @@ const SUPERSEDED_SNAPSHOT_BYTES_CAP = 24 * 1024 * 1024; // 24 MiB — generous f
 let supersededSnapshotBytes = 0;
 let supersededSnapshotSeq = 0;
 
-function estimateSnapshotBytes(parts: ContentPart[]): number {
+/** Byte size of a snapshot's parts for the memory accountant, or null when the parts are NOT JSON-serializable
+ *  (cyclic reference / BigInt tool result). R273: a serializability failure means the parts can never be written
+ *  back to disk (writeConversation JSON-stringifies the whole tree — the same failure would abort that write), so
+ *  the snapshot is unrecoverable AND unmeasurable. Returning null tells the caller to DISCARD it rather than retain
+ *  an arbitrarily-large object graph charged as a tiny placeholder (which R272's per-part floor did — it bounded
+ *  snapshot COUNT, not retained MEMORY, so a huge cyclic payload could still blow past the cap and OOM main). */
+function estimateSnapshotBytes(parts: ContentPart[]): number | null {
   try {
     const n = JSON.stringify(parts)?.length;
     if (typeof n === 'number' && n > 0) return n;
+    // A serializable-but-empty result (n === 0 / undefined) is genuinely tiny content; charge a small floor.
+    return Math.max(1, parts.length) * 64;
   } catch {
-    /* unserializable (cyclic / BigInt tool result) — fall through to the non-zero fallback below */
+    return null; // unserializable → cannot persist, cannot measure → discard
   }
-  // R272 f-2: NEVER return 0 for content that exists — a 0-byte charge lets an unserializable snapshot bypass the
-  // cap and grow memory without bound. Charge a conservative floor per part so it still counts toward the cap.
-  return Math.max(1, parts.length) * 4096;
 }
 
 /** R271/R272: evict the globally-OLDEST superseded snapshots (across ALL conversations, by admission seq) until the
@@ -996,19 +1001,27 @@ export function snapshotSupersededAccumulatorForRetry(conversationId: string): b
   // drop the second turn's reply. An undefined id therefore always records a new snapshot.
   const isDuplicate =
     acc.responseMessageId !== undefined && list.some((s) => s.responseMessageId === acc.responseMessageId);
-  if (!isDuplicate) {
-    const bytes = estimateSnapshotBytes(acc.parts);
-    list.push({
-      parts: acc.parts,
-      parentId: acc.parentId ?? null,
-      responseMessageId: acc.responseMessageId,
-      bytes,
-      seq: supersededSnapshotSeq++,
-    });
-    supersededSnapshots.set(conversationId, list);
-    supersededSnapshotBytes += bytes;
-    evictSupersededSnapshotsToCap(); // R271 f-3: bound total retained memory
+  if (isDuplicate) {
+    accumulators.delete(conversationId);
+    return true; // already recorded — idempotent
   }
+  const bytes = estimateSnapshotBytes(acc.parts);
+  if (bytes === null) {
+    // R273: parts are not JSON-serializable → they can never be written back to disk (writeConversation would
+    // fail the same way) and their retained memory is unmeasurable/unbounded. DISCARD rather than retain.
+    accumulators.delete(conversationId);
+    return false;
+  }
+  list.push({
+    parts: acc.parts,
+    parentId: acc.parentId ?? null,
+    responseMessageId: acc.responseMessageId,
+    bytes,
+    seq: supersededSnapshotSeq++,
+  });
+  supersededSnapshots.set(conversationId, list);
+  supersededSnapshotBytes += bytes;
+  evictSupersededSnapshotsToCap(); // R271 f-3: bound total retained memory
   accumulators.delete(conversationId);
   return true;
 }

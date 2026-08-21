@@ -470,6 +470,34 @@ describe('stream persistence accumulator', () => {
     for (const rid of ids) clearFinalizedResponseIds(rid);
   });
 
+  it('a superseded snapshot with UNSERIALIZABLE parts is DISCARDED, not retained (R273)', () => {
+    // R273: a cyclic/BigInt tool result can't be JSON-stringified — it can never be written back to disk
+    // (writeConversation would fail the same way) and its retained memory is unmeasurable/unbounded. So the
+    // snapshot must be DISCARDED (return false, record nothing), not retained under a tiny placeholder charge.
+    clearFinalizedResponseIds('unser');
+    writeMock.mockClear();
+    feedWithParent(
+      { conversationId: 'unser', type: 'tool-call', toolCallId: 'tU', toolName: 'read_file', args: { path: 'a' } },
+      'uU',
+    );
+    // BigInt is not JSON-serializable → JSON.stringify throws.
+    feed({ conversationId: 'unser', type: 'tool-result', toolCallId: 'tU', result: { big: 10n } });
+    // Not recorded → returns false; a subsequent flush has nothing to write.
+    expect(snapshotSupersededAccumulatorForRetry('unser')).toBe(false);
+    readStrictMock.mockReturnValue({
+      id: 'unser',
+      headId: 'uU',
+      runStatus: 'idle',
+      messageTree: [{ id: 'uU', parentId: null, role: 'user', content: [] }],
+      messages: [],
+    } as unknown as { headId?: string | null });
+    flushSupersededSnapshots(APP_HOME, 'unser');
+    expect(writeMock).not.toHaveBeenCalled(); // discarded → nothing recovered
+    readStrictMock.mockReset();
+    readStrictMock.mockImplementation((appHome?: string, conversationId?: string) => readMock(appHome, conversationId));
+    clearFinalizedResponseIds('unser');
+  });
+
   it('a true empty re-finalize (accumulator already flushed) is a no-op', () => {
     // finalize deletes the accumulator, so a second finalize with nothing newly
     // accumulated hits the empty guard and does not append.
