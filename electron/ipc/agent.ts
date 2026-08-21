@@ -2620,7 +2620,9 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
     if (event.type === 'tool-approval-required' && event.toolCallId) {
       maybeOpenDedicatedApprovalWindow(event);
     } else if (event.type === 'tool-result' && event.toolCallId) {
-      closeApprovalWindow(event.toolCallId, event.conversationId);
+      // R259: pass the emitting run's nonce so the close targets THIS run's pop-out exactly — a delayed
+      // superseded-run tool-result would otherwise nonce-lessly scan and destroy a newer run's same-id pop-out.
+      closeApprovalWindow(event.toolCallId, event.conversationId, event.runGeneration);
       // The tool-result committed — an ask_user answer consumed by execute() is now
       // on the branch, so drop its in-flight ledger entry (no recovery needed). No-op
       // for non-ask_user ids (the ledger only holds ask_user answers) (R100 finding-7).
@@ -10538,7 +10540,12 @@ export function registerAgentHandlers(
     // Sync dismissal: if the user answered the INLINE card, close the dedicated
     // approval window too. (Approve normally emits a tool-result that also closes
     // it, but reject/dismiss may not — close here so the surfaces never diverge.)
-    closeApprovalWindow(toolCallId, conversationId);
+    // R259: use the caller's nonce, else the one embedded in the resolved key, so the close targets THIS run's
+    // pop-out exactly and can't destroy an overlapping run's same-id window.
+    const apvNonce =
+      runNonce ??
+      extractRunNonceFromApprovalKey(resolved?.key, sanitizeAnswerConversationId(conversationId), toolCallId);
+    closeApprovalWindow(toolCallId, conversationId, apvNonce);
     return { ok: true };
   });
 

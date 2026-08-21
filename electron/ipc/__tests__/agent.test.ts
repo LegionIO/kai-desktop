@@ -668,7 +668,7 @@ describe('agent IPC: tool approval channels', () => {
     expect(decisions).toEqual([true]);
     expect(pendingToolApprovals.has('tc-approve')).toBe(false);
     // Answering inline must also close the dedicated approval window (sync dismissal).
-    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve', undefined);
+    expect(closeApprovalWindow).toHaveBeenCalledWith('tc-approve', undefined, undefined);
   });
 
   it('resolves the pending approval promise with false on agent:reject-tool', async () => {
