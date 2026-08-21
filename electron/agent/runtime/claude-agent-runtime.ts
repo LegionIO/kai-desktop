@@ -1312,9 +1312,13 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
     debugLog(`[ASK_USER] settled non-approve toolCallId=${toolCallId} source=${settleSource ?? 'unknown'}`);
     if (settleSource === 'abort') {
       try {
-        // Recovery is keyed by the conversation-scoped answerKey (R191), matching how
-        // agent:answer-tool-question stashes the answer.
-        getAskUserRecoveryRouter()?.(conversationId, makeAnswerKey(conversationId, toolCallId), owningStreamToken);
+        // Recovery is keyed by the run-scoped answerKey (R191 conversation + R249 run), matching how
+        // agent:answer-tool-question stashes the answer (R250: include this run's browserOwnerId nonce).
+        getAskUserRecoveryRouter()?.(
+          conversationId,
+          makeAnswerKey(conversationId, toolCallId, browserOwnerId),
+          owningStreamToken,
+        );
       } catch {
         /* best-effort — the bounded stash copy remains as the last resort */
       }
@@ -1322,11 +1326,14 @@ async function executeAskUserTool(args: unknown, context: ClaudeToolExecutionCon
     return { error: 'User dismissed the question.' };
   }
 
-  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler under the
-  //    conversation-scoped answerKey — R191)
-  const answerKey = makeAnswerKey(conversationId, toolCallId);
-  const answers = pendingQuestionAnswers.get(answerKey);
+  // 3. Retrieve answers (stored by agent:answer-tool-question IPC handler under the run-scoped answerKey —
+  //    R191 conversation + R249 run). The run nonce is this run's browserOwnerId (the SAME value passed to
+  //    registerPendingApproval above), so the handler's stash key and this read key agree (R250).
+  const answerKey = makeAnswerKey(conversationId, toolCallId, browserOwnerId);
+  const answers =
+    pendingQuestionAnswers.get(answerKey) ?? pendingQuestionAnswers.get(makeAnswerKey(conversationId, toolCallId));
   pendingQuestionAnswers.delete(answerKey);
+  pendingQuestionAnswers.delete(makeAnswerKey(conversationId, toolCallId));
 
   debugLog(`[ASK_USER] Got answers answerCount=${answers ? Object.keys(answers).length : 0}`);
 

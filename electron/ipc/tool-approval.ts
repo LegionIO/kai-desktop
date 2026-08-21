@@ -126,6 +126,32 @@ const APPROVAL_AUTHORITY_MAP_MAX = 500;
 export function getRecordedApprovalAuthority(toolCallId: string): ApprovalAuthorityRecord | undefined {
   return approvalAuthorityById.get(toolCallId);
 }
+
+/** R250: recover the run nonce for a `${convId}::<nonce>::${toolCallId}` durable AUTHORITY record when the
+ *  PENDING entry is already gone (abort) — so the pendingless answer-stash path can compose the SAME
+ *  run-scoped key the handoff/tombstone recovery reads. Returns the nonce ONLY when exactly one authority
+ *  record matches (unambiguous); undefined otherwise so the caller falls back to the conversation-only key. */
+export function findRunNonceForAuthorityRecord(
+  conversationId: string | undefined,
+  toolCallId: string,
+): string | undefined {
+  if (!conversationId) return undefined;
+  const prefix = `${conversationId}::`;
+  const suffix = `::${toolCallId}`;
+  let match: string | undefined;
+  let ambiguous = false;
+  for (const key of approvalAuthorityById.keys()) {
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    const middle = key.slice(prefix.length, key.length - suffix.length);
+    if (middle.length === 0 || middle.includes('::')) continue;
+    if (match !== undefined) {
+      ambiguous = true;
+      break;
+    }
+    match = middle;
+  }
+  return ambiguous ? undefined : match;
+}
 function recordApprovalAuthority(toolCallId: string, record: ApprovalAuthorityRecord): void {
   // ALWAYS drop any prior record for this id FIRST (R175): tool-call ids are only unique within one
   // provider response — a custom/local provider can reuse `call_1`, so a NEW approval under a reused
@@ -211,15 +237,51 @@ export function setPrimaryApprovalWindowResolver(resolver: (() => BrowserWindow 
 /** Grant the dedicated window created for this exact pending request authority
  * to resolve it. Returns false if registration has not happened yet, making a
  * broadcast-before-register regression fail closed. */
+/** R250: resolve a pending approval's ACTUAL map key by the renderer-facing raw toolCallId, honoring the
+ *  run-scoped key: run-scoped (when a nonce is given) → conversation-scoped → an UNAMBIGUOUS
+ *  `${conversationId}::<nonce>::${toolCallId}` scan (so a caller that lacks the nonce — e.g. the pop-out
+ *  authorize that runs before token stamping — still binds the single matching run-scoped entry) → raw id.
+ *  Returns the map key (not the entry) so both pendingToolApprovals and approvalAuthorityById can be keyed. */
+function resolvePendingApprovalKey(
+  conversationId: string | undefined,
+  toolCallId: string,
+  runNonce?: string,
+): string | undefined {
+  if (conversationId && runNonce) {
+    const k = approvalKey(conversationId, toolCallId, runNonce);
+    if (pendingToolApprovals.has(k)) return k;
+  }
+  if (conversationId) {
+    const k = approvalKey(conversationId, toolCallId);
+    if (pendingToolApprovals.has(k)) return k;
+    const prefix = `${conversationId}::`;
+    const suffix = `::${toolCallId}`;
+    let match: string | undefined;
+    let ambiguous = false;
+    for (const key of pendingToolApprovals.keys()) {
+      if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+      const middle = key.slice(prefix.length, key.length - suffix.length);
+      if (middle.length === 0 || middle.includes('::')) continue;
+      if (match !== undefined) {
+        ambiguous = true;
+        break;
+      }
+      match = key;
+    }
+    if (match && !ambiguous) return match;
+  }
+  return pendingToolApprovals.has(toolCallId) ? toolCallId : undefined;
+}
+
 export function authorizePendingApprovalWindow(
   toolCallId: string,
   webContentsId: number,
   conversationId?: string,
   runNonce?: string,
 ): boolean {
-  const key = approvalKey(conversationId, toolCallId, runNonce);
-  const pending = pendingToolApprovals.get(key);
-  if (!pending || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
+  const key = resolvePendingApprovalKey(conversationId, toolCallId, runNonce);
+  const pending = key ? pendingToolApprovals.get(key) : undefined;
+  if (!pending || !key || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
   pending.approvalWindowWebContentsId = webContentsId;
   // Mirror onto the DURABLE authority record (R175) so a raced answer from the authorized pop-out is
   // still accepted after abort deletes the pending entry (the pendingless branch would otherwise only

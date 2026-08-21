@@ -597,6 +597,7 @@ import {
   registerPendingApproval,
   broadcastStreamEventRaw,
   getRecordedApprovalAuthority,
+  findRunNonceForAuthorityRecord,
   approvalKey,
   type PendingToolApproval,
   type ToolApprovalAuthority,
@@ -2417,7 +2418,10 @@ function maybeOpenDedicatedApprovalWindow(event: StreamEvent): void {
   });
   const webContentsId = win?.webContents?.id;
   if (typeof webContentsId === 'number') {
-    authorizePendingApprovalWindow(event.toolCallId, webContentsId, event.conversationId);
+    // R250: pass the emitting run's nonce so the pop-out binds to the RUN-SCOPED pending entry
+    // (conversationId::runNonce::toolCallId). authorizePendingApprovalWindow falls back to the
+    // conversation-scoped / raw key when the nonce is absent (legacy), matching registration.
+    authorizePendingApprovalWindow(event.toolCallId, webContentsId, event.conversationId, event.runGeneration);
   }
 }
 
@@ -10592,10 +10596,14 @@ export function registerAgentHandlers(
       const pendingResolved = resolvePendingApproval(toolCallId, conversationId, runNonce);
       const pending = pendingResolved?.pending;
       // The EFFECTIVE run nonce for the answer/authority keys: the caller's runNonce when provided, else
-      // the nonce recovered from the pending entry's ACTUAL map key (`convId::<nonce>::toolCallId`) so the
-      // stash key we write matches EXACTLY the key the ask_user gate/execute reads. Undefined → keys fall
-      // back to conversation-only (legacy), still byte-identical to the pre-R249 behavior.
-      const effectiveNonce = runNonce ?? extractRunNonceFromApprovalKey(pendingResolved?.key, convId, toolCallId);
+      // the nonce recovered from the pending entry's ACTUAL map key (`convId::<nonce>::toolCallId`), else
+      // (R250: the pending entry was already deleted by an abort — the raced-answer path) the nonce from the
+      // DURABLE authority record's key, so the stash key we write matches EXACTLY the run-scoped key the
+      // handoff/tombstone recovery reads. Undefined → keys fall back to conversation-only (pre-R249 behavior).
+      const effectiveNonce =
+        runNonce ??
+        extractRunNonceFromApprovalKey(pendingResolved?.key, convId, toolCallId) ??
+        findRunNonceForAuthorityRecord(convId, toolCallId);
       const answerKey = makeAnswerKey(convId, toolCallId, effectiveNonce);
       const approvalMapKey = approvalKey(convId, toolCallId, effectiveNonce);
       // A Browser-authorized approval may only be answered by the authorized surface (main's authority
