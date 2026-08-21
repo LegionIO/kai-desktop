@@ -330,11 +330,13 @@ describe('startup tool registration', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    expect(pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval'))?.streamOwner).toMatchObject({
+    expect(
+      pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval', 'run-1'))?.streamOwner,
+    ).toMatchObject({
       conversationId: 'chat-1',
       streamToken: 'run-1',
     });
-    pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval'))!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'late-text-generic-approval', 'run-1'))!.resolve(false);
     void genericAfterRevocation;
     setToolApprovalOwnerResolver(null);
   });

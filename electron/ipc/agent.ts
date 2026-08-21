@@ -2601,12 +2601,16 @@ function broadcastStreamEvent(event: StreamEvent, emittingToken?: string): void 
       // nothing (R107 finding-1). A live/owning run's tool-result IS persisted, so
       // clearing is correct then; anything else leaves recovery to A's cleanup.
       const activeTok = event.conversationId ? activeStreams.get(event.conversationId)?.token : undefined;
-      // The in-flight ledger is keyed by the conversation-scoped answerKey (R191/R192). For ask_user,
-      // exec id == stream id (pairing is by id-identity), so the event's toolCallId composes the same
-      // key execute() ledgered under. Clear the composite key AND the raw key defensively (R193): the
-      // clear is idempotent, and the raw key covers any path where the ledger entry was keyed without a
-      // conversationId (headless/legacy) — otherwise a committed answer lingers and teardown re-delivers it.
+      // The in-flight ledger is keyed by the run-scoped answerKey (R191/R192 conversation + R249 run).
+      // For ask_user, exec id == stream id (pairing is by id-identity), so the event's toolCallId composes
+      // the same key execute() ledgered under. execute keyed with THIS run's token as the nonce, and only
+      // the OWNING run's tool-result reaches here (same-token guard below), so emittingToken IS that nonce.
+      // Clear the run-scoped, conversation-scoped, AND raw keys defensively (R193/R249): the clear is
+      // idempotent, and the fallbacks cover any path where the ledger entry was keyed with fewer parts
+      // (no run token, or headless/legacy no conversationId) — otherwise a committed answer lingers and
+      // teardown re-delivers it.
       if (emittingToken !== undefined && emittingToken === activeTok) {
+        clearInFlightAnswer(makeAnswerKey(event.conversationId, event.toolCallId, emittingToken));
         clearInFlightAnswer(makeAnswerKey(event.conversationId, event.toolCallId));
         clearInFlightAnswer(event.toolCallId);
       }
@@ -7480,10 +7484,13 @@ export function registerAgentHandlers(
             // Gate ask_user behind user response — blocks until user submits answers
             if (state.toolName === 'ask_user') {
               const streamId = streamToolCallIdByExecId.get(state.toolCallId) ?? state.toolCallId;
-              // The stash + raced-recovery key is conversation-scoped (R191) so a provider that reuses
-              // `call_1` across conversations can't cross-route an answer. The APPROVAL id stays the raw
-              // streamId (the renderer/browser-authority key); only the answer/recovery routing composes.
-              const answerKey = makeAnswerKey(conversationId, streamId);
+              // The stash + raced-recovery key is run-scoped (R191 conversation + R249 run) so neither a
+              // provider that reuses `call_1` across conversations NOR two overlapping runs in the SAME
+              // conversation can cross-route an answer. The run nonce is this run's streamToken (the SAME
+              // value threaded to execute as browserOwnerId, so the gate key and execute key agree). The
+              // APPROVAL id stays the raw streamId (the renderer/browser-authority key); only the
+              // answer/recovery routing composes.
+              const answerKey = makeAnswerKey(conversationId, streamId, streamToken);
               const approvalDecision = registerPendingApproval(
                 streamId,
                 controller.signal,
@@ -7595,9 +7602,9 @@ export function registerAgentHandlers(
               }
               if (raced) {
                 // Happy path (approved === true): the answer is already stashed
-                // under the key execute() reads. Both keys are conversation-scoped
-                // (R191); rekey is a no-op for equal ids.
-                rekeyRacedAnswer(answerKey, makeAnswerKey(conversationId, state.toolCallId), raced);
+                // under the key execute() reads. Both keys are run-scoped (R191
+                // conversation + R249 run, same streamToken nonce); rekey is a no-op for equal ids.
+                rekeyRacedAnswer(answerKey, makeAnswerKey(conversationId, state.toolCallId, streamToken), raced);
               }
             }
           },
@@ -10398,26 +10405,75 @@ export function registerAgentHandlers(
   }
   cancelConversationStreamImpl = cancelConversationStreamInner;
 
-  // Resolve a pending approval by the renderer-facing raw toolCallId, honoring the conversation-scoped
-  // key (R192). Tries the composite key first (when conversationId is provided), then falls back to the
-  // raw key so a caller that hasn't threaded conversationId (or a legacy/headless registration) still
-  // resolves. Returns the entry + the ACTUAL map key it was found under so the caller deletes the right one.
+  // Recover the run nonce embedded in a pending-approval / answer-stash map key (R249). A run-scoped key
+  // is `${convId}::${runNonce}::${toolCallId}`; the middle segment is the nonce. Returns undefined when
+  // the key is absent, was composed WITHOUT a run nonce (`${convId}::${toolCallId}` or the raw id), or its
+  // shape doesn't match — so callers fall back to the conversation-only key (pre-R249 behavior). Used by
+  // agent:answer-tool-question when the client didn't thread the nonce, so the answer is stashed under the
+  // EXACT key the ask_user gate/execute reads.
+  const extractRunNonceFromApprovalKey = (
+    key: string | undefined,
+    convId: string | undefined,
+    toolCallId: string,
+  ): string | undefined => {
+    if (!key || !convId) return undefined;
+    const prefix = `${convId}::`;
+    const suffix = `::${toolCallId}`;
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) return undefined;
+    const middle = key.slice(prefix.length, key.length - suffix.length);
+    if (middle.length === 0 || middle.includes('::')) return undefined;
+    return middle;
+  };
+
+  // Resolve a pending approval by the renderer-facing raw toolCallId, honoring the run-scoped key
+  // (R192 conversation + R249 run). Tries the run-scoped composite key first (conversationId + runNonce,
+  // the run's streamToken echoed to the renderer as runGeneration), then the conversation-only composite,
+  // then — for a nonce-less resolve (older client / legacy test) whose approval was nonetheless STORED
+  // run-scoped — a UNAMBIGUOUS suffix scan for the single pending `${convId}::<anyNonce>::${toolCallId}`,
+  // and finally the raw key. The suffix scan fires ONLY when exactly one candidate matches: if two
+  // OVERLAPPING runs both hold `call_1` in this conversation, a nonce-less caller can't say which it
+  // means (that's the collision R249 fixes), so we refuse rather than resolve the wrong run's card.
+  // Returns the entry + the ACTUAL map key it was found under so the caller deletes the right one.
   const resolvePendingApproval = (
     toolCallId: string,
     conversationId?: string,
+    runNonce?: string,
   ): { pending: PendingToolApproval; key: string } | undefined => {
     const convId = sanitizeAnswerConversationId(conversationId);
+    if (convId && runNonce) {
+      const runScoped = approvalKey(convId, toolCallId, runNonce);
+      const p = pendingToolApprovals.get(runScoped);
+      if (p) return { pending: p, key: runScoped };
+    }
     if (convId) {
       const composite = approvalKey(convId, toolCallId);
       const p = pendingToolApprovals.get(composite);
       if (p) return { pending: p, key: composite };
+      // Nonce-less resolve of a run-scoped-stored approval: find the single pending entry keyed
+      // `${convId}::<nonce>::${toolCallId}`. Only accept an UNAMBIGUOUS match (exactly one).
+      const suffix = `::${toolCallId}`;
+      const prefix = `${convId}::`;
+      let match: { pending: PendingToolApproval; key: string } | undefined;
+      let ambiguous = false;
+      for (const [k, pend] of pendingToolApprovals) {
+        if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
+        // Middle segment (the run nonce) must be present + non-empty: `${convId}::<nonce>::${toolCallId}`.
+        const middle = k.slice(prefix.length, k.length - suffix.length);
+        if (middle.length === 0 || middle.includes('::')) continue;
+        if (match) {
+          ambiguous = true;
+          break;
+        }
+        match = { pending: pend, key: k };
+      }
+      if (match && !ambiguous) return match;
     }
     const raw = pendingToolApprovals.get(toolCallId);
     return raw ? { pending: raw, key: toolCallId } : undefined;
   };
 
-  ipcMain.handle('agent:approve-tool', (event, toolCallId: string, conversationId?: string) => {
-    const resolved = resolvePendingApproval(toolCallId, conversationId);
+  ipcMain.handle('agent:approve-tool', (event, toolCallId: string, conversationId?: string, runNonce?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId, runNonce);
     const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
@@ -10438,18 +10494,21 @@ export function registerAgentHandlers(
     return { ok: true };
   });
 
-  ipcMain.handle('agent:get-tool-approval-private-details', (event, toolCallId: string, conversationId?: string) => {
-    if (typeof toolCallId !== 'string' || !toolCallId) return null;
-    const pending = resolvePendingApproval(toolCallId, conversationId)?.pending;
-    if (!pending?.privateDetails || !mayResolveToolApproval(event, pending, getPrimaryWindow)) return null;
-    // This is intentionally the only path that returns exact Browser approval
-    // input. It is restricted to the primary renderer or the exact one-shot
-    // approval pop-out, and the pending map drops it on every settle path.
-    return { ...pending.privateDetails };
-  });
+  ipcMain.handle(
+    'agent:get-tool-approval-private-details',
+    (event, toolCallId: string, conversationId?: string, runNonce?: string) => {
+      if (typeof toolCallId !== 'string' || !toolCallId) return null;
+      const pending = resolvePendingApproval(toolCallId, conversationId, runNonce)?.pending;
+      if (!pending?.privateDetails || !mayResolveToolApproval(event, pending, getPrimaryWindow)) return null;
+      // This is intentionally the only path that returns exact Browser approval
+      // input. It is restricted to the primary renderer or the exact one-shot
+      // approval pop-out, and the pending map drops it on every settle path.
+      return { ...pending.privateDetails };
+    },
+  );
 
-  ipcMain.handle('agent:reject-tool', (event, toolCallId: string, conversationId?: string) => {
-    const resolved = resolvePendingApproval(toolCallId, conversationId);
+  ipcMain.handle('agent:reject-tool', (event, toolCallId: string, conversationId?: string, runNonce?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId, runNonce);
     const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
@@ -10466,14 +10525,16 @@ export function registerAgentHandlers(
     // If the turn already aborted + registered a raced-answer handoff for this
     // question, an explicit reject must purge it so a delayed answer from another
     // surface can't still be delivered to the successor. The handoff/tombstone keys are
-    // conversation-scoped (R192), so purge under the composite key.
-    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
+    // run-scoped (R192/R249), so purge under the run-scoped key (with a
+    // conversation-only fallback for a client that threaded no run nonce).
+    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId, runNonce));
+    if (runNonce) purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
 
-  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string, conversationId?: string) => {
-    const resolved = resolvePendingApproval(toolCallId, conversationId);
+  ipcMain.handle('agent:dismiss-tool', (event, toolCallId: string, conversationId?: string, runNonce?: string) => {
+    const resolved = resolvePendingApproval(toolCallId, conversationId, runNonce);
     const pending = resolved?.pending;
     const approvalError = pending ? toolApprovalResolutionError(event, pending, getPrimaryWindow) : null;
     if (pending && approvalError) {
@@ -10487,14 +10548,15 @@ export function registerAgentHandlers(
       pending.resolve('dismiss');
       pendingToolApprovals.delete(resolved.key);
     }
-    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
+    purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId, runNonce));
+    if (runNonce) purgeRacedAnswerForKey(makeAnswerKey(sanitizeAnswerConversationId(conversationId), toolCallId));
     closeApprovalWindow(toolCallId, conversationId);
     return { ok: true };
   });
 
   ipcMain.handle(
     'agent:answer-tool-question',
-    (event, toolCallId: string, answers: Record<string, string>, conversationId?: string) => {
+    (event, toolCallId: string, answers: Record<string, string>, conversationId?: string, runNonce?: string) => {
       // Runtime type-guard (R132 finding-2): the web/WebSocket boundary is UNTYPED, so a client
       // can send a non-string toolCallId (e.g. a ~4 MiB object used as the Map key, whose bulk
       // slips past a length-based byte measure) or non-string answer values. Coerce/reject here
@@ -10517,18 +10579,25 @@ export function registerAgentHandlers(
       for (const v of Object.values(answers)) {
         if (typeof v !== 'string') return { ok: false, error: 'invalid-answers' };
       }
-      // Conversation-scoped keys (R191/R192): the stash + raced-recovery AND the pending-approval map
-      // are keyed by conversationId::toolCallId so a provider that reuses `call_1` across conversations
-      // can't cross-route an answer NOR fail-close a foreign conversation's live approval. conversationId
-      // is optional/untrusted here — validate it; when absent (legacy/headless client) the keys fall back
-      // to the raw id (unchanged behavior). The window-close map stays keyed by the raw wire id.
+      // Run-scoped keys (R191/R192 conversation + R249 run): the stash + raced-recovery AND the
+      // pending-approval map are keyed by conversationId::runNonce::toolCallId so neither a provider that
+      // reuses `call_1` across conversations NOR two OVERLAPPING runs in the same conversation can
+      // cross-route an answer / fail-close a foreign run's live approval. conversationId + runNonce are
+      // optional/untrusted here — validate the conversationId; when a part is absent (older client, or a
+      // legacy/headless registration) the keys fall back to conversation-only then raw (unchanged behavior).
+      // The window-close map stays keyed by the raw wire id.
       const convId = sanitizeAnswerConversationId(conversationId);
-      const answerKey = makeAnswerKey(convId, toolCallId);
-      const approvalMapKey = approvalKey(convId, toolCallId);
-      // Resolve the pending entry under the composite key, falling back to the raw key so a legacy
-      // caller that didn't thread conversationId still resolves a raw-keyed registration.
-      const pendingResolved = resolvePendingApproval(toolCallId, conversationId);
+      // Resolve the pending entry first (run-scoped → conversation-scoped → unambiguous suffix scan → raw)
+      // so a caller that didn't thread the run nonce still lands on a run-scoped-stored approval.
+      const pendingResolved = resolvePendingApproval(toolCallId, conversationId, runNonce);
       const pending = pendingResolved?.pending;
+      // The EFFECTIVE run nonce for the answer/authority keys: the caller's runNonce when provided, else
+      // the nonce recovered from the pending entry's ACTUAL map key (`convId::<nonce>::toolCallId`) so the
+      // stash key we write matches EXACTLY the key the ask_user gate/execute reads. Undefined → keys fall
+      // back to conversation-only (legacy), still byte-identical to the pre-R249 behavior.
+      const effectiveNonce = runNonce ?? extractRunNonceFromApprovalKey(pendingResolved?.key, convId, toolCallId);
+      const answerKey = makeAnswerKey(convId, toolCallId, effectiveNonce);
+      const approvalMapKey = approvalKey(convId, toolCallId, effectiveNonce);
       // A Browser-authorized approval may only be answered by the authorized surface (main's authority
       // routing). A stale-browser-stream answer resolves the approval closed (dismiss) + closes the
       // pop-out; other authority errors reject the answer without touching the pending entry.
@@ -10547,10 +10616,13 @@ export function registerAgentHandlers(
       // into the successor/recovery turn that still holds authenticated Browser authority. Consult the
       // DURABLE authority record (survives the pending deletion) and reject an unauthorized late answer.
       if (!pending) {
-        // Authority record is keyed the same way registration keyed it (composite when the turn had a
-        // conversationId); fall back to the raw key for a legacy raw-keyed registration (R192).
+        // Authority record is keyed the same way registration keyed it (run-scoped when the turn had a
+        // conversationId + run nonce); fall back to the conversation-scoped then raw key for a legacy
+        // registration (R192/R249).
         const recordedAuthority =
-          getRecordedApprovalAuthority(approvalMapKey) ?? getRecordedApprovalAuthority(toolCallId);
+          getRecordedApprovalAuthority(approvalMapKey) ??
+          (effectiveNonce ? getRecordedApprovalAuthority(approvalKey(convId, toolCallId)) : undefined) ??
+          getRecordedApprovalAuthority(toolCallId);
         const requiresNativeAuthority =
           recordedAuthority?.authority === 'native-browser' || Boolean(recordedAuthority?.streamOwner);
         if (requiresNativeAuthority) {

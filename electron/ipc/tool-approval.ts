@@ -72,15 +72,21 @@ export type PendingToolApproval = {
 
 export const pendingToolApprovals = new Map<string, PendingToolApproval>();
 
-/** Compose the conversation-scoped key for {@link pendingToolApprovals} and {@link approvalAuthorityById}
- *  (R192). Provider tool-call ids (e.g. `call_1`) are unique only WITHIN one provider response — a
- *  custom/local provider reuses `call_1` across conversations — so two concurrent conversations would
- *  collide in a globally raw-id-keyed map and the second registration would fail-close-evict the first's
- *  LIVE approval. Prefixing with the conversationId disambiguates. Falls back to the raw id when
- *  conversationId is absent (headless/legacy) so behavior is unchanged there. The renderer-facing WIRE id
- *  stays the raw toolCallId; each IPC/authority lookup composes this key from the conversationId at hand.
- *  Mirrors makeAnswerKey in ask-user.ts (same `::` scheme). */
-export function approvalKey(conversationId: string | undefined, toolCallId: string): string {
+/** Compose the run-scoped key for {@link pendingToolApprovals} and {@link approvalAuthorityById}
+ *  (R192 conversation scope; R249 run scope). Provider tool-call ids (e.g. `call_1`) are unique only
+ *  WITHIN one provider response — a custom/local provider reuses `call_1` across conversations, AND two
+ *  OVERLAPPING assistant runs in the SAME conversation can each mint `call_1` — so a conversation-only
+ *  key still COLLIDES between concurrent runs: run A's approval card could resolve run B's approval, or
+ *  the duplicate-evict below could fail-close a foreign run's LIVE approval. Fold in the per-RUN nonce
+ *  (the run's `browserOwnerId`/streamToken) to disambiguate. Three cases, chosen so behavior is
+ *  byte-identical to before whenever no run nonce is threaded:
+ *    - conversationId AND runNonce  → `${conversationId}::${runNonce}::${toolCallId}` (run-scoped)
+ *    - conversationId only          → `${conversationId}::${toolCallId}` (UNCHANGED; backward-compatible)
+ *    - neither                      → raw `toolCallId` (headless / legacy)
+ *  The renderer-facing WIRE id stays the raw toolCallId; each IPC/authority lookup composes this key from
+ *  the conversationId + run nonce at hand. Mirrors makeAnswerKey in ask-user.ts (same `::` scheme). */
+export function approvalKey(conversationId: string | undefined, toolCallId: string, runNonce?: string): string {
+  if (conversationId && runNonce) return `${conversationId}::${runNonce}::${toolCallId}`;
   return conversationId ? `${conversationId}::${toolCallId}` : toolCallId;
 }
 
@@ -209,8 +215,9 @@ export function authorizePendingApprovalWindow(
   toolCallId: string,
   webContentsId: number,
   conversationId?: string,
+  runNonce?: string,
 ): boolean {
-  const key = approvalKey(conversationId, toolCallId);
+  const key = approvalKey(conversationId, toolCallId, runNonce);
   const pending = pendingToolApprovals.get(key);
   if (!pending || !Number.isSafeInteger(webContentsId) || webContentsId <= 0) return false;
   pending.approvalWindowWebContentsId = webContentsId;
@@ -222,15 +229,22 @@ export function authorizePendingApprovalWindow(
   return true;
 }
 
-/** Look up a pending approval from a stream EVENT, honoring the conversation-scoped key (R192):
- *  compose conversationId::toolCallId, falling back to the raw id. Used by the broadcast-routing
- *  guards, which only have the event (whose toolCallId is the renderer-facing raw id). */
+/** Look up a pending approval from a stream EVENT, honoring the run-scoped key (R192/R249):
+ *  compose conversationId::runNonce::toolCallId (the run nonce is the event's `runGeneration`, i.e.
+ *  the emitting run's streamToken), falling back to the conversation-only key and then the raw id.
+ *  Used by the broadcast-routing guards, which only have the event (whose toolCallId is the
+ *  renderer-facing raw id). */
 function lookupPendingByEvent(event: StreamEvent): PendingToolApproval | undefined {
   if (!event.toolCallId) return undefined;
-  const composite = event.conversationId
-    ? pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId))
-    : undefined;
-  return composite ?? pendingToolApprovals.get(event.toolCallId);
+  if (event.conversationId) {
+    const runScoped = event.runGeneration
+      ? pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId, event.runGeneration))
+      : undefined;
+    if (runScoped) return runScoped;
+    const convScoped = pendingToolApprovals.get(approvalKey(event.conversationId, event.toolCallId));
+    if (convScoped) return convScoped;
+  }
+  return pendingToolApprovals.get(event.toolCallId);
 }
 
 /** Web clients cannot own the native Browser sidebar. Hide both Browser tool
@@ -280,6 +294,11 @@ export function resolveApprovalBroadcastWindowIds(event: StreamEvent): Set<numbe
 export type ToolApprovalRegistrationContext = {
   conversationId?: string;
   browserOwnerId?: string;
+  /** Per-RUN nonce folded into the composite map key (R249) so two OVERLAPPING runs in the same
+   *  conversation reusing the same provider tool-call id (call_1) don't collide. It is the owning
+   *  run's streamToken — the SAME value as `browserOwnerId` at every current call site — so the
+   *  approval key agrees with the ask_user answer key (makeAnswerKey, which uses the run's token). */
+  runNonce?: string;
   privateDetails?: ToolApprovalPrivateDetails;
 };
 
@@ -336,11 +355,15 @@ export function registerPendingApproval(
   if (authority === 'native-browser' && hasExplicitBrowserOwner && !streamOwner) {
     throw new Error('Browser approval is no longer authorized for this assistant turn.');
   }
-  // The pending map is CONVERSATION-SCOPED (R192): key by conversationId::toolCallId so two concurrent
-  // conversations reusing the same provider tool-call id (call_1) don't collide — the duplicate-evict
-  // below would otherwise fail-close a FOREIGN conversation's live approval. The renderer-facing wire id
-  // stays the raw toolCallId; every IPC/authority lookup composes this same key from its conversationId.
-  const key = approvalKey(context?.conversationId, toolCallId);
+  // The pending map is RUN-SCOPED (R192 conversation + R249 run): key by conversationId::runNonce::toolCallId
+  // so two concurrent runs — in different conversations OR two OVERLAPPING runs in the SAME conversation —
+  // reusing the same provider tool-call id (call_1) don't collide. Without the run nonce the duplicate-evict
+  // below would fail-close a FOREIGN run's live approval, and a resolve could settle the wrong run's card.
+  // The run nonce is the owning run's token; every current caller passes it as browserOwnerId, so accept
+  // either field (they agree). The renderer-facing wire id stays the raw toolCallId; every IPC/authority
+  // lookup composes this same key from its conversationId + run nonce.
+  const runNonce = context?.runNonce ?? context?.browserOwnerId;
+  const key = approvalKey(context?.conversationId, toolCallId, runNonce);
   // A duplicate key would overwrite the map entry and orphan the prior
   // waiter's resolver forever (its Promise never settles → the earlier tool
   // call hangs). Settle any existing entry fail-closed (deny) before replacing.

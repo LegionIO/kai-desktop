@@ -68,7 +68,7 @@ describe('registerPendingApproval', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live'))).toBeDefined();
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live', 'run-1'))).toBeDefined();
     // Flood with 600 later browser-owned records (each also records authority), all settled so they
     // are evictable. The live-pending record must survive despite exceeding the 500 FIFO cap.
     for (let i = 0; i < 600; i++) {
@@ -76,13 +76,13 @@ describe('registerPendingApproval', () => {
         conversationId: 'chat-2',
         browserOwnerId: `r-${i}`,
       });
-      pendingToolApprovals.get(approvalKey('chat-2', `flood-${i}`))!.resolve(false);
+      pendingToolApprovals.get(approvalKey('chat-2', `flood-${i}`, `r-${i}`))!.resolve(false);
       await p;
     }
-    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live'))).toMatchObject({
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-live', 'run-1'))).toMatchObject({
       authority: 'native-browser',
     });
-    pendingToolApprovals.get(approvalKey('chat-1', 'browser-live'))!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'browser-live', 'run-1'))!.resolve(false);
     await live;
     setToolApprovalOwnerResolver(null);
   });
@@ -98,8 +98,8 @@ describe('registerPendingApproval', () => {
     // pendingless raced-answer recovery path can still enforce browser authority.
     ctrl.abort();
     await p;
-    expect(pendingToolApprovals.has(approvalKey('chat-1', 'browser-ask'))).toBe(false);
-    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-ask'))).toMatchObject({
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'browser-ask', 'run-1'))).toBe(false);
+    expect(getRecordedApprovalAuthority(approvalKey('chat-1', 'browser-ask', 'run-1'))).toMatchObject({
       authority: 'native-browser',
       streamOwner: { conversationId: 'chat-1', streamToken: 'run-1' },
     });
@@ -153,11 +153,11 @@ describe('registerPendingApproval', () => {
       }),
     ).toThrow(/no longer authorized/);
 
-    expect(pendingToolApprovals.get(approvalKey('chat-1', 'owned'))?.streamOwner).toEqual({
+    expect(pendingToolApprovals.get(approvalKey('chat-1', 'owned', 'run-1'))?.streamOwner).toEqual({
       conversationId: 'chat-1',
       streamToken: 'run-1',
     });
-    expect(pendingToolApprovals.has(approvalKey('chat-1', 'realtime'))).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'realtime', 'realtime-owner'))).toBe(false);
   });
 
   it.each(['text', 'Realtime'])('rejects a late %s Browser approval after its owner is revoked', async (modality) => {
@@ -175,7 +175,7 @@ describe('registerPendingApproval', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    pendingToolApprovals.get(approvalKey('chat-1', `${modality}-live`))!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', `${modality}-live`, 'run-1'))!.resolve(false);
     await expect(live).resolves.toBe(false);
 
     authorized = false;
@@ -185,7 +185,7 @@ describe('registerPendingApproval', () => {
         browserOwnerId: 'run-1',
       }),
     ).toThrow(/no longer authorized/);
-    expect(pendingToolApprovals.has(approvalKey('chat-1', `${modality}-late`))).toBe(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', `${modality}-late`, 'run-1'))).toBe(false);
   });
 
   it('grants a one-shot dedicated-window capability only after registration', () => {
@@ -330,10 +330,10 @@ describe('registerPendingApproval', () => {
     dismissPendingNativeBrowserApprovalsForOwner('chat-1', 'run-1');
 
     await expect(native).resolves.toBe('dismiss');
-    expect(pendingToolApprovals.has(approvalKey('chat-1', 'generic-owned'))).toBe(true);
-    expect(pendingToolApprovals.has(approvalKey('chat-1', 'native-other'))).toBe(true);
-    pendingToolApprovals.get(approvalKey('chat-1', 'generic-owned'))!.resolve(false);
-    pendingToolApprovals.get(approvalKey('chat-1', 'native-other'))!.resolve(false);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'generic-owned', 'run-1'))).toBe(true);
+    expect(pendingToolApprovals.has(approvalKey('chat-1', 'native-other', 'run-2'))).toBe(true);
+    pendingToolApprovals.get(approvalKey('chat-1', 'generic-owned', 'run-1'))!.resolve(false);
+    pendingToolApprovals.get(approvalKey('chat-1', 'native-other', 'run-2'))!.resolve(false);
     await expect(generic).resolves.toBe(false);
     await expect(other).resolves.toBe(false);
   });
@@ -454,17 +454,21 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
       conversationId: 'chat-1',
       browserOwnerId: 'run-1',
     });
-    const opener = vi.fn((event: { toolCallId?: string; conversationId?: string }) => {
-      // The pending entry is conversation-scoped (R192); look it up under the composite key and
-      // authorize the window with the same conversationId maybeOpenDedicatedApprovalWindow uses.
-      expect(pendingToolApprovals.has(approvalKey(event.conversationId, event.toolCallId ?? ''))).toBe(true);
-      authorizePendingApprovalWindow(event.toolCallId ?? '', 91, event.conversationId);
+    const opener = vi.fn((event: { toolCallId?: string; conversationId?: string; runGeneration?: string }) => {
+      // The pending entry is run-scoped (R192 conversation + R249 run); look it up under the composite
+      // key (the event's runGeneration IS the run nonce) and authorize the window with the same
+      // conversationId + run nonce maybeOpenDedicatedApprovalWindow uses.
+      expect(
+        pendingToolApprovals.has(approvalKey(event.conversationId, event.toolCallId ?? '', event.runGeneration)),
+      ).toBe(true);
+      authorizePendingApprovalWindow(event.toolCallId ?? '', 91, event.conversationId, event.runGeneration);
     });
     setRawApprovalWindowOpener(opener as never);
     const approval = {
       type: 'tool-approval-required',
       conversationId: 'chat-1',
       toolCallId: 'owned-question',
+      runGeneration: 'run-1',
       toolName: 'ask_user',
       args: { questions: [] },
     } as never;
@@ -472,7 +476,9 @@ describe('broadcastStreamEventRaw + setServerPersistTagger', () => {
     broadcastStreamEventRaw(approval);
 
     expect(opener).toHaveBeenCalledWith(approval);
-    expect(pendingToolApprovals.get(approvalKey('chat-1', 'owned-question'))?.approvalWindowWebContentsId).toBe(91);
+    expect(
+      pendingToolApprovals.get(approvalKey('chat-1', 'owned-question', 'run-1'))?.approvalWindowWebContentsId,
+    ).toBe(91);
     expect(sentWindowIds).toEqual([primaryWindow.webContents.id, approvalWindow.webContents.id]);
     expect(sentWindowIds).not.toContain(unrelatedWindow.webContents.id);
     expect(webSent).toEqual([]);

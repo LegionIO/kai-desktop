@@ -10,14 +10,21 @@ import { traceDiagnostic } from '../diagnostics/debug-trace.js';
  */
 export const pendingQuestionAnswers = new Map<string, Record<string, string>>();
 
-/** Compose the globally-unique answer-stash / raced-recovery key (R191). Provider tool-call ids
- *  (e.g. `call_1`) are unique only WITHIN one provider response — a custom/local provider reuses
- *  `call_1` across different conversations — so two concurrent conversations can collide on the raw
- *  id and one's answer can route into the other. Prefixing with the conversationId disambiguates.
- *  Falls back to the raw id when conversationId is absent (headless / legacy callers) so behavior is
- *  unchanged there. The `::` separator is safe: conversationIds are uuids and tool-call ids don't
- *  contain `::` in practice (and a collision is harmless — same conversation, same id). */
-export function makeAnswerKey(conversationId: string | undefined, toolCallId: string): string {
+/** Compose the globally-unique answer-stash / raced-recovery key (R191 conversation; R249 run). Provider
+ *  tool-call ids (e.g. `call_1`) are unique only WITHIN one provider response — a custom/local provider
+ *  reuses `call_1` across different conversations, AND two OVERLAPPING assistant runs in the SAME
+ *  conversation can each mint `call_1` — so a conversation-only key still COLLIDES between concurrent runs
+ *  and one run's answer ledger can be overwritten/cleared by the other. Fold in the per-RUN nonce (the
+ *  owning run's stream token, the SAME value stamped as `owningToken` on the in-flight ledger, so the two
+ *  agree) to disambiguate. Three cases, chosen so behavior is byte-identical to before whenever no run
+ *  nonce is threaded:
+ *    - conversationId AND runNonce → `${conversationId}::${runNonce}::${toolCallId}` (run-scoped)
+ *    - conversationId only         → `${conversationId}::${toolCallId}` (UNCHANGED; backward-compatible)
+ *    - neither                     → raw `toolCallId` (headless / legacy)
+ *  The `::` separator is safe: conversationIds/tokens are uuid-like and tool-call ids don't contain `::`
+ *  in practice (and a collision is harmless — same conversation, same run, same id). */
+export function makeAnswerKey(conversationId: string | undefined, toolCallId: string, runNonce?: string): string {
+  if (conversationId && runNonce) return `${conversationId}::${runNonce}::${toolCallId}`;
   return conversationId ? `${conversationId}::${toolCallId}` : toolCallId;
 }
 
@@ -423,9 +430,13 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
       // Move (don't hard-delete) into the in-flight ledger so the answer survives a
       // supersession/abort during the window before the tool-result commits (e.g. a
       // slow PostToolUse hook). agent.ts clears it on tool-result emit and recovers
-      // it on a non-terminal abort (R100 finding-7). The stash key is conversation-scoped
-      // (R191) so a provider that reuses `call_1` across conversations can't cross-route.
-      const answerKey = makeAnswerKey(context.conversationId, context.toolCallId);
+      // it on a non-terminal abort (R100 finding-7). The stash key is run-scoped
+      // (R191 conversation + R249 run) so a provider that reuses `call_1` across
+      // conversations OR two overlapping runs in the same conversation can't cross-route.
+      // The run nonce is this run's token, threaded as browserOwnerId (see ToolExecutionContext);
+      // it MUST match the gate's dest key in agent.ts (which composes with the same run token).
+      const runNonce = context.browserOwnerId;
+      const answerKey = makeAnswerKey(context.conversationId, context.toolCallId, runNonce);
       const answers = pendingQuestionAnswers.get(answerKey);
       pendingQuestionAnswers.delete(answerKey);
       if (answers)
@@ -433,9 +444,12 @@ export function createAskUserTool(appHome?: string): ToolDefinition {
           answerKey,
           answers,
           context.conversationId,
-          // Stamp the OWNING run's token so drain/drop is token-scoped (R101 f-2).
-          // execute runs INSIDE the live run, so the current active token is ours.
-          context.conversationId ? getActiveStreamTokenForConversation(context.conversationId) : undefined,
+          // Stamp the OWNING run's token so drain/drop is token-scoped (R101 f-2). Prefer this run's
+          // browserOwnerId (the run's own token, stable across a later supersession) so it agrees with
+          // the run nonce in answerKey above; fall back to the current active token for a legacy caller
+          // that threaded no browserOwnerId. execute runs INSIDE the live run.
+          runNonce ??
+            (context.conversationId ? getActiveStreamTokenForConversation(context.conversationId) : undefined),
         );
 
       if (!answers) {
