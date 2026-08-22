@@ -19917,6 +19917,73 @@ describe('browser manager renderer lifecycle', () => {
     },
   );
 
+  it('retains an unmounted idle tab while user operations are queued or running', async () => {
+    const firstGate = deferred<void>();
+    const secondGate = deferred<void>();
+    const firstStarted = vi.fn();
+    const secondStarted = vi.fn();
+    const tab = {
+      shell: {
+        id: 'busy-user-tab',
+        conversationId: 'chat-1',
+        owner: 'user' as const,
+        keepOpen: false,
+        audible: false,
+      },
+      assistantOwnerId: null,
+      aiControlOwnerId: null,
+      aiActionDepth: 0,
+      operationDepth: 0,
+      lastUsedAt: 0,
+      trustedUserNavigation: false,
+      scopeKey: 'global',
+      queue: new BrowserActionQueue(),
+      view: {
+        webContents: {
+          isDestroyed: () => false,
+          isDevToolsOpened: () => false,
+        },
+      },
+    };
+    const destroyView = vi.fn();
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', 'another-tab']]),
+      destroyView,
+      getConfig: () => ({ browser: { idleDiscardMinutes: 10 } }),
+      mountedConversationId: null,
+      tabs: new Map([[tab.shell.id, tab]]),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    const first = invokePrivate(manager, 'runTabOperation', tab, async () => {
+      firstStarted();
+      await firstGate.promise;
+    }) as Promise<void>;
+    const second = invokePrivate(manager, 'runTabOperation', tab, async () => {
+      secondStarted();
+      await secondGate.promise;
+    }) as Promise<void>;
+
+    expect(tab.operationDepth).toBe(2);
+    invokePrivate(manager, 'discardIdleTabs');
+    expect(destroyView).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(firstStarted).toHaveBeenCalledOnce());
+
+    firstGate.resolve();
+    await first;
+    await vi.waitFor(() => expect(secondStarted).toHaveBeenCalledOnce());
+    expect(tab.operationDepth).toBe(1);
+    invokePrivate(manager, 'discardIdleTabs');
+    expect(destroyView).not.toHaveBeenCalled();
+
+    secondGate.resolve();
+    await second;
+    expect(tab.operationDepth).toBe(0);
+    invokePrivate(manager, 'discardIdleTabs');
+    expect(destroyView).toHaveBeenCalledOnce();
+    expect(destroyView).toHaveBeenCalledWith(tab);
+  });
+
   it('binds assistant document leases to the host realm and assistant run', () => {
     const tab = {
       shell: { id: 'tab-1', url: 'https://example.com' },

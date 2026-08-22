@@ -567,6 +567,10 @@ type InternalTab = {
   aiControlOwnerId: string | null;
   aiControlGeneration: number | null;
   aiActionDepth: number;
+  /** User and assistant work owns this lease from queue admission through
+   * settlement. Idle reclamation must not destroy a hidden or background tab
+   * while its queued/running operation still depends on the renderer. */
+  operationDepth: number;
   aiActionUntil: number;
   aiNetworkReleaseRequested: boolean;
   aiNetworkReleaseTimer: ReturnType<typeof setTimeout> | null;
@@ -2506,17 +2510,27 @@ export class BrowserManager {
     if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
       return Promise.reject(new Error('This browser tab is being closed by another assistant operation.'));
     }
-    return tab.queue.run(() => {
-      // A close transaction can begin after this operation was admitted but
-      // before its queue turn starts. Reject that not-yet-running work so the
-      // transaction drains only operations that were already executing.
-      if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
-        throw new Error('This browser tab is being closed by another assistant operation.');
-      }
-      return this.withScopeActivity(tab.scopeKey, async () => {
-        return operation();
-      });
-    });
+    tab.operationDepth = (tab.operationDepth ?? 0) + 1;
+    try {
+      return tab.queue
+        .run(() => {
+          // A close transaction can begin after this operation was admitted but
+          // before its queue turn starts. Reject that not-yet-running work so the
+          // transaction drains only operations that were already executing.
+          if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+            throw new Error('This browser tab is being closed by another assistant operation.');
+          }
+          return this.withScopeActivity(tab.scopeKey, async () => {
+            return operation();
+          });
+        })
+        .finally(() => {
+          tab.operationDepth = Math.max(0, (tab.operationDepth ?? 1) - 1);
+        });
+    } catch (error) {
+      tab.operationDepth = Math.max(0, (tab.operationDepth ?? 1) - 1);
+      throw error;
+    }
   }
 
   /** Bound how long caller-facing work can wait to enter a busy tab queue.
@@ -2537,17 +2551,28 @@ export class BrowserManager {
       return Promise.reject(new Error('This browser tab is being closed by another assistant operation.'));
     }
 
-    const queued = tab.queue.run(() => {
-      queueTurnStarted = true;
-      if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
-        throw new Error('This browser tab is being closed by another assistant operation.');
-      }
-      if (deadlineReached || Date.now() >= deadlineAt) {
-        deadlineReached = true;
-        return resolveDeadline();
-      }
-      return this.withScopeActivity(tab.scopeKey, operation);
-    });
+    tab.operationDepth = (tab.operationDepth ?? 0) + 1;
+    let queued: Promise<T>;
+    try {
+      queued = tab.queue
+        .run(() => {
+          queueTurnStarted = true;
+          if (this.pendingAssistantTabClosures?.has(tab.shell.id)) {
+            throw new Error('This browser tab is being closed by another assistant operation.');
+          }
+          if (deadlineReached || Date.now() >= deadlineAt) {
+            deadlineReached = true;
+            return resolveDeadline();
+          }
+          return this.withScopeActivity(tab.scopeKey, operation);
+        })
+        .finally(() => {
+          tab.operationDepth = Math.max(0, (tab.operationDepth ?? 1) - 1);
+        });
+    } catch (error) {
+      tab.operationDepth = Math.max(0, (tab.operationDepth ?? 1) - 1);
+      throw error;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const admissionDeadline = new Promise<T>((resolve, reject) => {
       timer = setTimeout(
@@ -6229,6 +6254,7 @@ export class BrowserManager {
             aiControlOwnerId: owner === 'assistant' ? assistantRun!.id : null,
             aiControlGeneration: assistantGeneration,
             aiActionDepth: 0,
+            operationDepth: 0,
             aiActionUntil: 0,
             aiNetworkReleaseRequested: false,
             aiNetworkReleaseTimer: null,
@@ -8645,6 +8671,7 @@ export class BrowserManager {
       aiControlOwnerId: popupAiNetworkRestricted ? activeControlOwnerId : null,
       aiControlGeneration: popupAiNetworkRestricted ? assistantGeneration : null,
       aiActionDepth: assistantOwnerId ? 1 : 0,
+      operationDepth: 0,
       aiActionUntil: 0,
       aiNetworkReleaseRequested: false,
       aiNetworkReleaseTimer: null,
@@ -16258,7 +16285,11 @@ export class BrowserManager {
         [...(this.pendingAuth?.values() ?? [])].some((prompt) => prompt.tabId === tab.shell.id) ||
         [...(this.pendingCredentials?.values() ?? [])].some((prompt) => prompt.tabId === tab.shell.id);
       const lifecycleActivityActive =
-        tab.aiActionDepth > 0 || assistantRunActive || tab.trustedUserNavigation || pendingPrompt;
+        tab.aiActionDepth > 0 ||
+        (tab.operationDepth ?? 0) > 0 ||
+        assistantRunActive ||
+        tab.trustedUserNavigation ||
+        pendingPrompt;
       if (
         shouldCloseIdleAssistantTab(
           tab.shell,

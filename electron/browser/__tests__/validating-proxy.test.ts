@@ -238,14 +238,17 @@ describe('Browser validating proxy', () => {
   });
 
   it.each(['setProxy', 'closeAllConnections'] as const)(
-    'bounds a stalled session %s call, releases the shared setup, and allows retry',
+    'bounds a stalled session %s call and keeps retries behind the native operation',
     async (stalledOperation) => {
       vi.useFakeTimers();
       try {
         const proxy = new BrowserValidatingProxy(undefined, { operationTimeoutMs: 25 });
         proxies.push(proxy);
         vi.spyOn(proxy as unknown as { start(): Promise<number> }, 'start').mockResolvedValue(43123);
-        const stalled = new Promise<void>(() => undefined);
+        let releaseStalled!: () => void;
+        const stalled = new Promise<void>((resolve) => {
+          releaseStalled = resolve;
+        });
         const setProxy =
           stalledOperation === 'setProxy'
             ? vi.fn().mockReturnValueOnce(stalled).mockResolvedValue(undefined)
@@ -263,6 +266,15 @@ describe('Browser validating proxy', () => {
         await vi.advanceTimersByTimeAsync(25);
         await timedOut;
 
+        const retry = proxy.configureSession(session);
+        const retryTimedOut = expect(retry).rejects.toThrow(/timed out/i);
+        await vi.advanceTimersByTimeAsync(25);
+        await retryTimedOut;
+        expect(setProxy).toHaveBeenCalledTimes(1);
+        expect(closeAllConnections).toHaveBeenCalledTimes(stalledOperation === 'setProxy' ? 0 : 1);
+
+        releaseStalled();
+        await vi.advanceTimersByTimeAsync(0);
         await expect(proxy.configureSession(session)).resolves.toBeUndefined();
         expect(setProxy).toHaveBeenCalledTimes(2);
         expect(closeAllConnections).toHaveBeenCalledTimes(stalledOperation === 'setProxy' ? 1 : 2);
@@ -271,6 +283,92 @@ describe('Browser validating proxy', () => {
       }
     },
   );
+
+  it('reapplies a replacement listener only after a timed-out setProxy settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const proxy = new BrowserValidatingProxy(undefined, { operationTimeoutMs: 25 });
+      proxies.push(proxy);
+      vi.spyOn(proxy as unknown as { start(): Promise<number> }, 'start')
+        .mockResolvedValueOnce(43123)
+        .mockResolvedValueOnce(43124);
+      let releaseStaleSet!: () => void;
+      const staleSet = new Promise<void>((resolve) => {
+        releaseStaleSet = resolve;
+      });
+      const appliedRules: string[] = [];
+      const setProxy = vi.fn((config: { proxyRules: string }) => {
+        if (setProxy.mock.calls.length === 1) {
+          return staleSet.then(() => {
+            appliedRules.push(config.proxyRules);
+          });
+        }
+        appliedRules.push(config.proxyRules);
+        return Promise.resolve();
+      });
+      const closeAllConnections = vi.fn(async () => undefined);
+      const session = { setProxy, closeAllConnections } as never;
+
+      const first = proxy.configureSession(session);
+      const firstTimedOut = expect(first).rejects.toThrow(/configuration timed out/i);
+      await vi.advanceTimersByTimeAsync(25);
+      await firstTimedOut;
+      Reflect.set(proxy, 'listenerGeneration', 1);
+
+      const replacement = proxy.configureSession(session);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(setProxy).toHaveBeenCalledOnce();
+      releaseStaleSet();
+      await expect(replacement).resolves.toBeUndefined();
+
+      expect(appliedRules).toEqual(['http://127.0.0.1:43123', 'http://127.0.0.1:43124']);
+      expect(closeAllConnections).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not open newer session connections before a timed-out reset settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const proxy = new BrowserValidatingProxy(undefined, { operationTimeoutMs: 25 });
+      proxies.push(proxy);
+      vi.spyOn(proxy as unknown as { start(): Promise<number> }, 'start').mockResolvedValue(43123);
+      let releaseStaleReset!: () => void;
+      const staleReset = new Promise<void>((resolve) => {
+        releaseStaleReset = resolve;
+      });
+      const events: string[] = [];
+      const setProxy = vi.fn(async () => {
+        events.push('set');
+      });
+      const closeAllConnections = vi.fn(() => {
+        if (closeAllConnections.mock.calls.length === 1) {
+          return staleReset.then(() => {
+            events.push('stale reset');
+          });
+        }
+        events.push('current reset');
+        return Promise.resolve();
+      });
+      const session = { setProxy, closeAllConnections } as never;
+
+      const first = proxy.configureSession(session);
+      const firstTimedOut = expect(first).rejects.toThrow(/reset timed out/i);
+      await vi.advanceTimersByTimeAsync(25);
+      await firstTimedOut;
+
+      const retry = proxy.configureSession(session);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(['set']);
+      releaseStaleReset();
+      await expect(retry).resolves.toBeUndefined();
+
+      expect(events).toEqual(['set', 'stale reset', 'set', 'current reset']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('closes a listener whose startup races proxy shutdown', async () => {
     const proxy = new BrowserValidatingProxy();
