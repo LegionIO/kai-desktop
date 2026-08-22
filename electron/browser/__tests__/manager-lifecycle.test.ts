@@ -18057,22 +18057,112 @@ describe('browser manager renderer lifecycle', () => {
       withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
     });
 
-    await expect(
-      manager.createTab({
-        conversationId: 'chat-1',
-        owner: 'user',
-        url: 'https://unresolvable.invalid',
-      }),
-    ).rejects.toThrow(/ERR_NAME_NOT_RESOLVED/);
+    const created = await manager.createTab({
+      conversationId: 'chat-1',
+      owner: 'user',
+      url: 'https://unresolvable.invalid',
+    });
 
     expect(tabs).toHaveLength(1);
     expect(tabOrder.get('chat-1')).toHaveLength(1);
     expect(emitTabs).toHaveBeenCalled();
+    expect(created).toMatchObject({
+      active: true,
+      discarded: true,
+      error: expect.stringMatching(/ERR_NAME_NOT_RESOLVED/),
+    });
     const retained = [...tabs.values()][0] as {
       shell: { discarded: boolean; error?: string };
     };
     expect(retained.shell.discarded).toBe(true);
     expect(retained.shell.error).toMatch(/ERR_NAME_NOT_RESOLVED/);
+  });
+
+  it('hides the previous native page before publishing new foreground-tab chrome', async () => {
+    const pageLoad = deferred<void>();
+    const events: string[] = [];
+    const oldView = {
+      setBounds: vi.fn(),
+      setVisible: vi.fn((visible: boolean) => events.push(`old-visible:${visible}`)),
+      webContents: { isDestroyed: () => false },
+    };
+    const tabs = new Map<string, unknown>([
+      [
+        'old-tab',
+        {
+          shell: { id: 'old-tab', conversationId: 'chat-1' },
+          view: oldView,
+        },
+      ],
+    ]);
+    const activeTabs = new Map([['chat-1', 'old-tab']]);
+    const manager = managerWithoutConstructor({
+      activeTabs,
+      attachedView: oldView,
+      clearingScopes: new Set(),
+      emitTabs: vi.fn(),
+      ensureView: vi.fn(() => pageLoad.promise),
+      getConfig: () => ({
+        browser: {
+          dataScope: 'global',
+          enabled: true,
+          maxTabsPerConversation: 20,
+          searchProvider: 'duckduckgo',
+        },
+      }),
+      mountedConversationId: 'chat-1',
+      notifyPanelStateChanged: vi.fn(() => events.push(`chrome:${activeTabs.get('chat-1')}`)),
+      pendingTabCreations: new Map(),
+      requireLiveWindow: vi.fn(),
+      stores: new Map([['global', { getZoomLevel: () => 0 }]]),
+      tabOrder: new Map([['chat-1', ['old-tab']]]),
+      tabs,
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    const opening = manager.createTab({
+      conversationId: 'chat-1',
+      owner: 'user',
+      url: 'https://slow.example',
+    });
+
+    await vi.waitFor(() => expect(events.some((event) => event.startsWith('chrome:'))).toBe(true));
+    expect(events[0]).toBe('old-visible:false');
+    expect(events[1]).toMatch(/^chrome:/);
+    expect(oldView.setBounds).toHaveBeenCalled();
+    expect(Reflect.get(manager, 'attachedView')).toBeNull();
+
+    pageLoad.resolve();
+    await expect(opening).resolves.toMatchObject({ active: true, url: 'https://slow.example' });
+  });
+
+  it('consumes closed-tab history once when the reopened page load fails after publication', async () => {
+    const closed = {
+      id: 'closed-tab',
+      url: 'https://unresolvable.invalid',
+      title: 'Closed',
+      owner: 'user' as const,
+      keepOpen: false,
+      sensitive: false,
+      scopeKey: 'global',
+    };
+    const manager = managerWithoutConstructor({
+      closedTabs: new Map([['chat-1', [closed]]]),
+      createTab: vi.fn(async () => ({
+        id: 'retained-error-tab',
+        conversationId: 'chat-1',
+        url: closed.url,
+        discarded: true,
+        error: 'net::ERR_NAME_NOT_RESOLVED',
+      })),
+    });
+
+    await expect(manager.reopenClosedTab('chat-1')).resolves.toMatchObject({
+      id: 'retained-error-tab',
+      error: expect.stringMatching(/ERR_NAME_NOT_RESOLVED/),
+    });
+    await expect(manager.reopenClosedTab('chat-1')).resolves.toBeNull();
+    expect(Reflect.get(manager, 'createTab')).toHaveBeenCalledOnce();
   });
 
   it('loads an unmounted background tab immediately in a hidden renderer', async () => {
@@ -18193,6 +18283,56 @@ describe('browser manager renderer lifecycle', () => {
     expect(manager.resolveAssistantTabId('chat-1', undefined, { id: 'run-1' })).toBe(created.id);
     expect(attachActiveView).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'open-panel' }));
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('returns an assistant-owned tab whose initial navigation failed after publication', async () => {
+    const tabs = new Map<string, unknown>();
+    const release = vi.fn();
+    const manager = managerWithoutConstructor({
+      assistantRuns: {
+        acquire: vi.fn(() => ({ generation: 3, release })),
+        assertActive: vi.fn(() => 3),
+        generationIfActive: vi.fn(() => 3),
+      },
+      assertAssistantNavigationAllowed: vi.fn(async () => undefined),
+      assertScopeAvailable: vi.fn(),
+      emitTabs: vi.fn(),
+      ensureView: vi.fn(async () => {
+        throw new Error('net::ERR_CONNECTION_REFUSED');
+      }),
+      getConfig: () => ({
+        browser: {
+          dataScope: 'global',
+          enabled: true,
+          maxTabsPerConversation: 20,
+          searchProvider: 'duckduckgo',
+        },
+      }),
+      pendingTabCreations: new Map(),
+      requireLiveWindow: vi.fn(),
+      stores: new Map([['global', { getZoomLevel: () => 0 }]]),
+      tabOrder: new Map<string, string[]>(),
+      tabs,
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    const created = await manager.createTab(
+      {
+        conversationId: 'chat-1',
+        owner: 'assistant',
+        url: 'https://offline.example',
+      },
+      { id: 'run-1' },
+    );
+
+    expect(created).toMatchObject({
+      active: false,
+      discarded: true,
+      error: expect.stringMatching(/ERR_CONNECTION_REFUSED/),
+      owner: 'assistant',
+    });
+    expect(tabs).toHaveLength(1);
     expect(release).toHaveBeenCalledOnce();
   });
 

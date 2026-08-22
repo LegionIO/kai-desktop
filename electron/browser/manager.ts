@@ -6507,6 +6507,12 @@ export class BrowserManager {
           const shouldPresentTab =
             owner === 'user' && (!request.background || !this.activeTabs.has(request.conversationId));
           if (shouldPresentTab) {
+            // Hide the previously selected native surface before publishing
+            // chrome for the new tab. Renderer creation may wait on proxy
+            // setup or another asynchronous bootstrap step; leaving the old
+            // page attached during that gap would make it interactive beneath
+            // the new tab title and omnibox URL.
+            if (this.mountedConversationId === request.conversationId) this.detachAttachedView();
             this.activeTabs.set(request.conversationId, id);
             this.notifyPanelStateChanged(request.conversationId);
           }
@@ -6549,6 +6555,11 @@ export class BrowserManager {
             createdTab.shell.discarded = !createdTab.view || createdTab.view.webContents.isDestroyed();
             createdTab.shell.error ??= error instanceof Error ? error.message : String(error);
             this.emitTabs(request.conversationId);
+            // Publishing the shell commits tab creation and consumes its slot.
+            // Report that retained error tab as the operation result so reopen
+            // history is consumed exactly once and assistant callers do not
+            // retry an open/duplicate that already created a visible tab.
+            return this.snapshotTab(createdTab, this.activeTabs.get(request.conversationId) === createdTab.shell.id);
           }
           throw error;
         } finally {
