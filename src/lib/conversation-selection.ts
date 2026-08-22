@@ -120,18 +120,55 @@ export type WorkspaceObservationWait = {
   cancel: () => void;
 };
 
+export type ActiveWorkspaceCasResult = {
+  ok: boolean;
+  error?: 'active-workspace-changed';
+  activeWorkspaceId?: string | null;
+};
+
+const MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS = 4;
+
+/** A newer Browser-attention request may observe a workspace CAS failure after
+ * an older request commits first. Rebase only while this exact request still
+ * owns navigation; user workspace/view/chat intent invalidates it immediately. */
+export async function setActiveBrowserWorkspaceWithRebase(options: {
+  workspaceId: string;
+  expectedCurrentWorkspaceId: string | null;
+  setActiveWorkspace: (
+    workspaceId: string,
+    expectedCurrentWorkspaceId: string | null,
+  ) => Promise<ActiveWorkspaceCasResult>;
+  isCurrent: () => boolean;
+}): Promise<boolean> {
+  let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
+  for (let attempt = 0; attempt < MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
+    const result = await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId);
+    if (result.ok) return true;
+    if (!options.isCurrent() || result.activeWorkspaceId === undefined) return false;
+    expectedCurrentWorkspaceId = result.activeWorkspaceId;
+  }
+  return false;
+}
+
 export async function openBrowserConversationInWorkspace(options: {
   conversationId: string;
   selectionGeneration: number;
   getConversation: (conversationId: string) => Promise<{ workspaceId?: string | null } | null>;
   getActiveConversationId: () => string | null;
+  getBackendActiveConversationId: () => Promise<string | null>;
   getSelectionGeneration: () => number;
   getActiveWorkspaceId: () => string | null | undefined;
   getKnownWorkspaceIds: () => Iterable<string>;
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
   getWorkspaceSelectionGeneration: () => number;
   workspaceSelectionGeneration: number;
-  setActiveWorkspace: (workspaceId: string | null, expectedCurrentWorkspaceId?: string | null) => Promise<boolean>;
+  getBrowserAttentionGeneration: () => number;
+  browserAttentionGeneration: number;
+  setActiveWorkspace: (
+    workspaceId: string | null,
+    expectedCurrentWorkspaceId: string | null,
+    operation: 'navigate' | 'rollback',
+  ) => Promise<boolean>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   switchConversation: (
     conversationId: string,
@@ -147,7 +184,10 @@ export async function openBrowserConversationInWorkspace(options: {
     options.getSelectionGeneration() === options.selectionGeneration &&
     (options.getActiveConversationId() === selectionWhenStarted ||
       options.getActiveConversationId() === options.conversationId);
-  const conversation = await options.getConversation(options.conversationId);
+  const [conversation, backendSelectionWhenStarted] = await Promise.all([
+    options.getConversation(options.conversationId),
+    options.getBackendActiveConversationId(),
+  ]);
   if (!conversation) return false;
 
   // A Browser-attention click is navigation intent, but it must not become a
@@ -172,12 +212,14 @@ export async function openBrowserConversationInWorkspace(options: {
     createWorkspaceObservationWait: options.createWorkspaceObservationWait,
     isCurrent: () => selectionIsCurrent() && options.getActiveWorkspaceId() === activeWorkspaceAtPreparation,
     isCurrentAfterSwitch: selectionIsCompatibleAfterWorkspaceSwitch,
-    canRollbackStaleSwitch: () => options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration,
+    canRollbackStaleSwitch: () =>
+      options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
+      options.getBrowserAttentionGeneration() === options.browserAttentionGeneration,
   });
   if (!workspaceReady) return false;
   if (options.getActiveConversationId() === options.conversationId) return true;
   if (!selectionIsCurrent()) return false;
-  return options.switchConversation(options.conversationId, selectionWhenStarted, options.selectionGeneration);
+  return options.switchConversation(options.conversationId, backendSelectionWhenStarted, options.selectionGeneration);
 }
 
 /** Prepare cross-workspace navigation initiated by Browser attention. Saving
@@ -191,7 +233,11 @@ export async function prepareConversationWorkspaceSwitch(options: {
   activeWorkspaceId?: string | null;
   knownWorkspaceIds: Iterable<string>;
   saveLastConversation: (args: { workspaceId: string; conversationId: string }) => Promise<void>;
-  setActiveWorkspace: (workspaceId: string | null, expectedCurrentWorkspaceId?: string | null) => Promise<boolean>;
+  setActiveWorkspace: (
+    workspaceId: string | null,
+    expectedCurrentWorkspaceId: string | null,
+    operation: 'navigate' | 'rollback',
+  ) => Promise<boolean>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
@@ -208,11 +254,15 @@ export async function prepareConversationWorkspaceSwitch(options: {
         conversationId: options.conversationId,
       });
       if (options.isCurrent && !options.isCurrent()) return false;
-      const switched = await options.setActiveWorkspace(targetWorkspaceId, options.activeWorkspaceId ?? null);
+      const switched = await options.setActiveWorkspace(
+        targetWorkspaceId,
+        options.activeWorkspaceId ?? null,
+        'navigate',
+      );
       if (!switched) return false;
       if (options.isCurrentAfterSwitch && !options.isCurrentAfterSwitch()) {
         if (options.canRollbackStaleSwitch?.()) {
-          await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId);
+          await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId, 'rollback');
         }
         return false;
       }
@@ -221,7 +271,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
     if (!observed) return false;
     if (targetWorkspaceId !== options.activeWorkspaceId && options.isCurrentAfterSwitch?.() === false) {
       if (options.canRollbackStaleSwitch?.()) {
-        await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId);
+        await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId, 'rollback');
       }
       return false;
     }

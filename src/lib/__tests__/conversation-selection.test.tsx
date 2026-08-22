@@ -14,6 +14,7 @@ import {
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
   selectConversationDeleteFallback,
+  setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
@@ -64,6 +65,50 @@ describe('filterConversationDeleteFallbackCandidates', () => {
   });
 });
 
+describe('setActiveBrowserWorkspaceWithRebase', () => {
+  it('rebases the current Browser request onto the authoritative workspace after a CAS conflict', async () => {
+    const setActiveWorkspace = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        error: 'active-workspace-changed',
+        activeWorkspaceId: 'workspace-authoritative',
+      })
+      .mockResolvedValueOnce({ ok: true });
+
+    await expect(
+      setActiveBrowserWorkspaceWithRebase({
+        workspaceId: 'workspace-browser',
+        expectedCurrentWorkspaceId: 'workspace-stale',
+        setActiveWorkspace,
+        isCurrent: () => true,
+      }),
+    ).resolves.toBe(true);
+
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-browser', 'workspace-stale');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-browser', 'workspace-authoritative');
+  });
+
+  it('does not retry a CAS conflict after the Browser request loses ownership', async () => {
+    const setActiveWorkspace = vi.fn(async () => ({
+      ok: false,
+      error: 'active-workspace-changed' as const,
+      activeWorkspaceId: 'workspace-authoritative',
+    }));
+
+    await expect(
+      setActiveBrowserWorkspaceWithRebase({
+        workspaceId: 'workspace-browser',
+        expectedCurrentWorkspaceId: 'workspace-stale',
+        setActiveWorkspace,
+        isCurrent: () => false,
+      }),
+    ).resolves.toBe(false);
+
+    expect(setActiveWorkspace).toHaveBeenCalledOnce();
+  });
+});
+
 describe('prepareConversationWorkspaceSwitch', () => {
   it('uses workspace state observed after the conversation lookup resolves', async () => {
     let activeWorkspaceId = 'workspace-a';
@@ -86,12 +131,15 @@ describe('prepareConversationWorkspaceSwitch', () => {
       selectionGeneration,
       getConversation,
       getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
       getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
       saveLastConversation,
       getWorkspaceSelectionGeneration: () => 1,
       workspaceSelectionGeneration: 1,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
       setActiveWorkspace,
       createWorkspaceObservationWait: () => ({
         promise: Promise.resolve(true),
@@ -108,6 +156,33 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(setActiveWorkspace).not.toHaveBeenCalled();
     expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration);
     expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('uses the backend active conversation as the selection compare-and-set snapshot', async () => {
+    const switchConversation = vi.fn(async () => true);
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-browser',
+        selectionGeneration: 1,
+        getConversation: async () => ({ workspaceId: 'workspace-a' }),
+        getActiveConversationId: () => 'chat-renderer',
+        getBackendActiveConversationId: async () => 'chat-backend',
+        getSelectionGeneration: () => 1,
+        getActiveWorkspaceId: () => 'workspace-a',
+        getKnownWorkspaceIds: () => ['workspace-a'],
+        saveLastConversation: async () => undefined,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 1,
+        browserAttentionGeneration: 1,
+        setActiveWorkspace: async () => true,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        switchConversation,
+      }),
+    ).resolves.toBe(true);
+
+    expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1);
   });
 
   it('does not let delayed Browser attention override a newer user selection', async () => {
@@ -127,12 +202,15 @@ describe('prepareConversationWorkspaceSwitch', () => {
       selectionGeneration,
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
       getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
       saveLastConversation: async () => undefined,
       getWorkspaceSelectionGeneration: () => workspaceSelectionGeneration,
       workspaceSelectionGeneration,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
       setActiveWorkspace,
       createWorkspaceObservationWait: () => ({
         promise: new Promise<boolean>((resolve) => {
@@ -143,14 +221,14 @@ describe('prepareConversationWorkspaceSwitch', () => {
       switchConversation,
     });
 
-    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a'));
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
     activeConversationId = 'chat-user-choice';
     selectionGeneration++;
     resolveObservation(true);
 
     await expect(opening).resolves.toBe(false);
     expect(switchConversation).not.toHaveBeenCalled();
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -177,23 +255,26 @@ describe('prepareConversationWorkspaceSwitch', () => {
       selectionGeneration,
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
       getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
       saveLastConversation: async () => undefined,
       getWorkspaceSelectionGeneration: () => 1,
       workspaceSelectionGeneration: 1,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
       setActiveWorkspace,
       createWorkspaceObservationWait: () => ({ promise: new Promise<boolean>(() => undefined), cancel: vi.fn() }),
       switchConversation: vi.fn(async () => true),
     });
 
-    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a'));
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
     selectionGeneration++;
     resolveWorkspaceSwitch();
 
     await expect(opening).resolves.toBe(false);
-    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b');
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
     expect(activeWorkspaceId).toBe('workspace-a');
   });
 
@@ -217,12 +298,15 @@ describe('prepareConversationWorkspaceSwitch', () => {
     const common = {
       getConversation,
       getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
       getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => 'workspace-a',
       getKnownWorkspaceIds: () => ['workspace-a'],
       saveLastConversation: async () => undefined,
       getWorkspaceSelectionGeneration: () => 0,
       workspaceSelectionGeneration: 0,
+      getBrowserAttentionGeneration: () => selectionGeneration,
+      browserAttentionGeneration: 0,
       setActiveWorkspace: async () => true,
       createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
       switchConversation,
@@ -232,11 +316,13 @@ describe('prepareConversationWorkspaceSwitch', () => {
       ...common,
       conversationId: 'chat-b',
       selectionGeneration: ++selectionGeneration,
+      browserAttentionGeneration: selectionGeneration,
     });
     const second = openBrowserConversationInWorkspace({
       ...common,
       conversationId: 'chat-c',
       selectionGeneration: ++selectionGeneration,
+      browserAttentionGeneration: selectionGeneration,
     });
 
     await expect(second).resolves.toBe(true);
@@ -244,6 +330,76 @@ describe('prepareConversationWorkspaceSwitch', () => {
     await expect(first).resolves.toBe(false);
     expect(switchConversation).toHaveBeenCalledOnce();
     expect(switchConversation).toHaveBeenCalledWith('chat-c', 'chat-a', 2);
+  });
+
+  it('does not let an older Browser-attention request roll back the newer request workspace', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let activeConversationId = 'chat-a';
+    let selectionGeneration = 1;
+    let browserAttentionGeneration = 1;
+    let resolveOldObservation: (observed: boolean) => void = () => {};
+    let resolveNewConversation: (conversation: { workspaceId: string }) => void = () => {};
+    const setActiveWorkspace = vi.fn(
+      async (workspaceId: string | null, _expected: string | null, _operation: 'navigate' | 'rollback') => {
+        activeWorkspaceId = workspaceId ?? '';
+        return true;
+      },
+    );
+    const common = {
+      getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
+      getSelectionGeneration: () => selectionGeneration,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b', 'workspace-c'],
+      saveLastConversation: async () => undefined,
+      getWorkspaceSelectionGeneration: () => 1,
+      workspaceSelectionGeneration: 1,
+      getBrowserAttentionGeneration: () => browserAttentionGeneration,
+      setActiveWorkspace,
+      switchConversation: vi.fn(async (conversationId: string) => {
+        activeConversationId = conversationId;
+        return true;
+      }),
+    };
+
+    const oldOpening = openBrowserConversationInWorkspace({
+      ...common,
+      conversationId: 'chat-b',
+      selectionGeneration,
+      browserAttentionGeneration,
+      getConversation: async () => ({ workspaceId: 'workspace-b' }),
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveOldObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+    });
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
+
+    selectionGeneration = 2;
+    browserAttentionGeneration = 2;
+    const newOpening = openBrowserConversationInWorkspace({
+      ...common,
+      conversationId: 'chat-c',
+      selectionGeneration,
+      browserAttentionGeneration,
+      getConversation: () =>
+        new Promise<{ workspaceId: string }>((resolve) => {
+          resolveNewConversation = resolve;
+        }),
+      createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+    });
+
+    resolveOldObservation(true);
+    await expect(oldOpening).resolves.toBe(false);
+    expect(setActiveWorkspace).toHaveBeenCalledTimes(1);
+    expect(activeWorkspaceId).toBe('workspace-b');
+
+    resolveNewConversation({ workspaceId: 'workspace-c' });
+    await expect(newOpening).resolves.toBe(true);
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-c', 'workspace-b', 'navigate');
+    expect(activeWorkspaceId).toBe('workspace-c');
   });
 
   it('accepts the target selected by the requested workspace restoration', async () => {
@@ -263,12 +419,15 @@ describe('prepareConversationWorkspaceSwitch', () => {
       selectionGeneration,
       getConversation: async () => ({ workspaceId: 'workspace-b' }),
       getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
       getSelectionGeneration: () => selectionGeneration,
       getActiveWorkspaceId: () => activeWorkspaceId,
       getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
       saveLastConversation: async () => undefined,
       getWorkspaceSelectionGeneration: () => workspaceSelectionGeneration,
       workspaceSelectionGeneration,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
       setActiveWorkspace,
       createWorkspaceObservationWait: () => ({
         promise: new Promise<boolean>((resolve) => {
@@ -279,7 +438,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       switchConversation,
     });
 
-    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a'));
+    await vi.waitFor(() => expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-a', 'navigate'));
     activeConversationId = 'chat-b';
     resolveObservation(true);
 

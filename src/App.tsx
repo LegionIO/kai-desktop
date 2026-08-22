@@ -90,6 +90,7 @@ import {
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   selectConversationDeleteFallback,
+  setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
@@ -711,6 +712,7 @@ function AppShell() {
   // cannot reopen Chat or replace a newer conversation/workspace choice.
   const navigationIntentGenerationRef = useRef(0);
   const workspaceSelectionIntentGenerationRef = useRef(0);
+  const browserAttentionIntentGenerationRef = useRef(0);
   const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>((next) => {
     navigationIntentGenerationRef.current++;
     setActiveViewState(next);
@@ -846,7 +848,9 @@ function AppShell() {
         // conversation choice must win in the backend as well as this window,
         // otherwise a stale restoration can silently replace that choice
         // before the renderer-side sequence guard observes it.
-        const activation = await app.conversations.setActiveId(restoredId, selectionWhenStarted);
+        const backendSelectionWhenStarted = await app.conversations.getActiveId();
+        if (!isCurrent()) return;
+        const activation = await app.conversations.setActiveId(restoredId, backendSelectionWhenStarted);
         if (!isCurrent()) return;
         if (!activation.ok) {
           if (activation.error === 'conversation-not-found') {
@@ -1386,37 +1390,53 @@ function AppShell() {
     async (id: string): Promise<boolean> => {
       const selectionGeneration = ++navigationIntentGenerationRef.current;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
+      const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
       const opened = await openBrowserConversationInWorkspace({
         conversationId: id,
         selectionGeneration,
         getConversation: (conversationId) =>
           app.conversations.get(conversationId) as Promise<ConversationRecord | null>,
         getActiveConversationId: () => activeConversationIdRef.current,
+        getBackendActiveConversationId: () => app.conversations.getActiveId(),
         getSelectionGeneration: () => navigationIntentGenerationRef.current,
         getActiveWorkspaceId: () => configuredWorkspaceIdRef.current,
         getKnownWorkspaceIds: () => knownWorkspaceIdsRef.current,
         saveLastConversation: (args) => app.workspaces.saveLastConversation(args),
         getWorkspaceSelectionGeneration: () => workspaceSelectionIntentGenerationRef.current,
         workspaceSelectionGeneration,
-        setActiveWorkspace: async (workspaceId, expectedCurrentWorkspaceId) => {
-          const transitionKey = workspaceId ?? '';
-          const transition = { navigationGeneration: selectionGeneration, workspaceSelectionGeneration };
-          browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
-          try {
-            const result = await app.workspaces.setActive({
-              id: workspaceId,
-              expectedCurrentId: expectedCurrentWorkspaceId ?? null,
-            });
-            if (!result.ok && browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
-              browserWorkspaceTransitionsRef.current.delete(transitionKey);
+        getBrowserAttentionGeneration: () => browserAttentionIntentGenerationRef.current,
+        browserAttentionGeneration,
+        setActiveWorkspace: async (workspaceId, expectedCurrentWorkspaceId, operation) => {
+          const setActiveWorkspaceOnce = async (id: string | null, expectedCurrentId: string | null) => {
+            const transitionKey = id ?? '';
+            const transition = { navigationGeneration: selectionGeneration, workspaceSelectionGeneration };
+            browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
+            try {
+              const result = await app.workspaces.setActive({ id, expectedCurrentId });
+              if (!result.ok && browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
+                browserWorkspaceTransitionsRef.current.delete(transitionKey);
+              }
+              return result;
+            } catch (error) {
+              if (browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
+                browserWorkspaceTransitionsRef.current.delete(transitionKey);
+              }
+              throw error;
             }
-            return result.ok;
-          } catch (error) {
-            if (browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
-              browserWorkspaceTransitionsRef.current.delete(transitionKey);
-            }
-            throw error;
+          };
+          if (operation === 'rollback') {
+            return (await setActiveWorkspaceOnce(workspaceId, expectedCurrentWorkspaceId)).ok;
           }
+          if (workspaceId === null) return false;
+          return setActiveBrowserWorkspaceWithRebase({
+            workspaceId,
+            expectedCurrentWorkspaceId,
+            setActiveWorkspace: setActiveWorkspaceOnce,
+            isCurrent: () =>
+              navigationIntentGenerationRef.current === selectionGeneration &&
+              workspaceSelectionIntentGenerationRef.current === workspaceSelectionGeneration &&
+              browserAttentionIntentGenerationRef.current === browserAttentionGeneration,
+          });
         },
         createWorkspaceObservationWait,
         switchConversation: (conversationId, expectedCurrentConversationId, navigationGeneration) =>
