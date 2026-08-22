@@ -133,6 +133,52 @@ describe('resolveConversationWorkspaceTransition', () => {
     });
   });
 
+  it('advances the workspace cursor after a newer destination chat retains a stale switch', () => {
+    const retained = resolveConversationWorkspaceTransition({
+      previousWorkspaceId: 'workspace-a',
+      activeWorkspaceId: 'workspace-b',
+      currentConversationId: 'chat-b-newer',
+      browserTransition: {
+        navigationGeneration: 2,
+        browserAttentionGeneration: 1,
+        workspaceSelectionGeneration: 7,
+        suppressArrivingWorkspaceRestoration: true,
+        operation: 'navigate',
+        departingWorkspaceId: 'workspace-a',
+        destinationWorkspaceId: 'workspace-b',
+        departingConversationId: 'chat-a',
+      },
+      currentNavigationGeneration: 2,
+      currentBrowserAttentionGeneration: 1,
+      currentWorkspaceSelectionGeneration: 7,
+    });
+
+    expect(retained).toEqual({
+      staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: true,
+      departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
+      nextPreviousWorkspaceId: 'workspace-b',
+    });
+
+    expect(
+      resolveConversationWorkspaceTransition({
+        previousWorkspaceId: retained.nextPreviousWorkspaceId,
+        activeWorkspaceId: 'workspace-c',
+        currentConversationId: 'chat-b-newer',
+        currentNavigationGeneration: 3,
+        currentBrowserAttentionGeneration: 1,
+        currentWorkspaceSelectionGeneration: 8,
+      }),
+    ).toEqual({
+      staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: false,
+      departingWorkspaceId: 'workspace-b',
+      departingConversationId: 'chat-b-newer',
+      nextPreviousWorkspaceId: 'workspace-c',
+    });
+  });
+
   it('reconciles a committed transition when a newer Browser request supersedes its rollback owner', () => {
     expect(
       resolveConversationWorkspaceTransition({
@@ -536,14 +582,20 @@ describe('setActiveUserWorkspaceWithRebase', () => {
       setActiveUserWorkspaceWithRebase({
         workspaceId: 'workspace-user',
         expectedCurrentWorkspaceId: 'workspace-a',
+        mutationToken: 'local-user_request-1',
         setActiveWorkspace,
         isCurrent: () => true,
         canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
       }),
     ).resolves.toEqual({ ok: true, activeWorkspaceId: 'workspace-user' });
 
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-user', 'workspace-a');
-    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-user', 'workspace-browser');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-user', 'workspace-a', 'local-user_request-1');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(
+      2,
+      'workspace-user',
+      'workspace-browser',
+      'local-user_request-1',
+    );
   });
 
   it('does not rebase after a newer user intent or across another renderer mutation', async () => {
@@ -560,6 +612,7 @@ describe('setActiveUserWorkspaceWithRebase', () => {
     await setActiveUserWorkspaceWithRebase({
       workspaceId: 'workspace-user',
       expectedCurrentWorkspaceId: 'workspace-a',
+      mutationToken: 'local-user_request-2',
       setActiveWorkspace: localConflict,
       isCurrent: () => current,
       canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
@@ -575,6 +628,7 @@ describe('setActiveUserWorkspaceWithRebase', () => {
     await setActiveUserWorkspaceWithRebase({
       workspaceId: 'workspace-user',
       expectedCurrentWorkspaceId: 'workspace-a',
+      mutationToken: 'local-user_request-3',
       setActiveWorkspace: foreignConflict,
       isCurrent: () => true,
       canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
@@ -888,6 +942,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
       return true;
     });
     const switchConversation = vi.fn(async () => true);
+    const retainActiveWorkspaceTransition = vi.fn();
 
     const opening = openBrowserConversationInWorkspace({
       conversationId: 'chat-b',
@@ -912,6 +967,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         }),
         cancel: vi.fn(),
       }),
+      retainActiveWorkspaceTransition,
       switchConversation,
     });
 
@@ -925,6 +981,8 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(switchConversation).not.toHaveBeenCalled();
     expect(setActiveWorkspace).toHaveBeenCalledOnce();
     expect(activeWorkspaceId).toBe('workspace-b');
+    expect(retainActiveWorkspaceTransition).toHaveBeenCalledOnce();
+    expect(retainActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
   });
 
   it('rolls back after a newer source-workspace conversation selection', async () => {
@@ -1450,7 +1508,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         setActiveWorkspace,
         createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
         isCurrentAfterSwitch: () => false,
-        canRollbackStaleSwitch: () => false,
+        resolveStaleSwitchDisposition: () => 'superseded',
         discardActiveWorkspaceTransition,
       }),
     ).resolves.toBe(false);
@@ -1477,7 +1535,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
         createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
         isCurrent: () => true,
         isCurrentAfterSwitch: () => false,
-        canRollbackStaleSwitch: () => true,
+        resolveStaleSwitchDisposition: () => 'rollback',
       }),
     ).resolves.toBe(false);
 

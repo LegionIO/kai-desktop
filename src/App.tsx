@@ -728,7 +728,7 @@ function AppShell() {
   const workspaceSelectionIntentGenerationRef = useRef(0);
   const browserAttentionIntentGenerationRef = useRef(0);
   const browserWorkspaceTransitionsRef = useRef<Map<string, BrowserWorkspaceTransitionMarker>>(new Map());
-  const browserWorkspaceMutationTokenPrefixRef = useRef(generateId());
+  const workspaceMutationTokenPrefixRef = useRef(generateId());
   const [workspaceRestorationRetryGeneration, setWorkspaceRestorationRetryGeneration] = useState(0);
   const handledWorkspaceRestorationRetryGenerationRef = useRef(0);
   const configuredWorkspaceIdRef = useRef<string | null>(null);
@@ -740,9 +740,13 @@ function AppShell() {
     workspaceObservationWaitersRef.current.clear();
     for (const settle of pending) settle(false);
   }, []);
-  const isLocalBrowserWorkspaceMutationToken = useCallback(
+  const createLocalWorkspaceMutationToken = useCallback(
+    (): string => `${workspaceMutationTokenPrefixRef.current}_${generateId()}`,
+    [],
+  );
+  const isLocalWorkspaceMutationToken = useCallback(
     (token: string | null | undefined): boolean =>
-      typeof token === 'string' && token.startsWith(`${browserWorkspaceMutationTokenPrefixRef.current}_`),
+      typeof token === 'string' && token.startsWith(`${workspaceMutationTokenPrefixRef.current}_`),
     [],
   );
   const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>(
@@ -849,13 +853,13 @@ function AppShell() {
     }
     const retryingCurrentWorkspace = prevWorkspaceIdRef.current === activeWorkspaceId;
     const browserTransitionKey = activeWorkspaceId ?? '';
-    const browserTransition = retryingCurrentWorkspace
-      ? undefined
-      : browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
-    if (browserTransition) browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
+    const browserTransition = browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
     // Consume markers even when a successful no-op/rollback was coalesced back
     // to the workspace React already knows. Such a marker must never classify a
     // later unrelated transition into this destination.
+    if (retryingCurrentWorkspace && browserTransition) {
+      browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
+    }
     if (retryingCurrentWorkspace && !retryRequested) return;
 
     const transition = retryingCurrentWorkspace
@@ -869,6 +873,18 @@ function AppShell() {
           currentBrowserAttentionGeneration: browserAttentionIntentGenerationRef.current,
           currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
         });
+
+    // A stale forward marker must survive until its owner decides whether the
+    // destination will be rolled back or retained by a newer destination-chat
+    // selection. Every other observed transition consumes its exact marker now.
+    if (
+      browserTransition &&
+      !retryingCurrentWorkspace &&
+      !transition?.staleBrowserTransition &&
+      browserWorkspaceTransitionsRef.current.get(browserTransitionKey) === browserTransition
+    ) {
+      browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
+    }
 
     // A Browser-attention request can lose to a newer local navigation while
     // its workspace IPC is in flight. Its compare-and-set rollback will restore
@@ -1497,7 +1513,7 @@ function AppShell() {
       const conversationSelectionGeneration = ++conversationSelectionIntentGenerationRef.current;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
       const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
-      const workspaceMutationToken = `${browserWorkspaceMutationTokenPrefixRef.current}_${generateId()}`;
+      const workspaceMutationToken = createLocalWorkspaceMutationToken();
       const opened = await openBrowserConversationInWorkspace({
         conversationId: id,
         selectionGeneration,
@@ -1563,12 +1579,13 @@ function AppShell() {
               if (
                 result.ok &&
                 transition &&
-                configuredWorkspaceIdRef.current === id &&
-                observedWorkspaceIdRef.current === id &&
+                ((operation === 'rollback' && prevWorkspaceIdRef.current === id) ||
+                  (configuredWorkspaceIdRef.current === id && observedWorkspaceIdRef.current === id)) &&
                 browserWorkspaceTransitionsRef.current.get(transitionKey) === transition
               ) {
-                // The destination was already fully observed (a successful
-                // no-op/coalesced rollback), so no future effect can consume it.
+                // The destination was already fully observed, or the rollback
+                // returned to the renderer cursor before React could observe
+                // the transient destination. No future effect needs this marker.
                 browserWorkspaceTransitionsRef.current.delete(transitionKey);
               }
               return result;
@@ -1592,7 +1609,7 @@ function AppShell() {
               navigationIntentGenerationRef.current === selectionGeneration &&
               workspaceSelectionIntentGenerationRef.current === workspaceSelectionGeneration &&
               browserAttentionIntentGenerationRef.current === browserAttentionGeneration,
-            canRebase: (result) => isLocalBrowserWorkspaceMutationToken(result.activeWorkspaceMutationToken),
+            canRebase: (result) => isLocalWorkspaceMutationToken(result.activeWorkspaceMutationToken),
           });
         },
         createWorkspaceObservationWait,
@@ -1611,6 +1628,30 @@ function AppShell() {
             browserWorkspaceTransitionsRef.current.set(transitionKey, adopted);
           }
         },
+        retainActiveWorkspaceTransition: (workspaceId) => {
+          const transitionKey = workspaceId ?? '';
+          const transition = browserWorkspaceTransitionsRef.current.get(transitionKey);
+          if (
+            transition?.operation !== 'navigate' ||
+            transition.navigationGeneration !== selectionGeneration ||
+            transition.browserAttentionGeneration !== browserAttentionGeneration ||
+            transition.workspaceSelectionGeneration !== workspaceSelectionGeneration ||
+            transition.departingWorkspaceId !== prevWorkspaceIdRef.current ||
+            transition.destinationWorkspaceId !== workspaceId
+          ) {
+            return;
+          }
+          browserWorkspaceTransitionsRef.current.set(transitionKey, {
+            ...transition,
+            navigationGeneration: navigationIntentGenerationRef.current,
+            browserAttentionGeneration: browserAttentionIntentGenerationRef.current,
+            suppressArrivingWorkspaceRestoration: true,
+          });
+          // activeWorkspaceId is unchanged, so explicitly rerun reconciliation
+          // to advance the renderer cursor from the source to the retained
+          // destination without restoring that destination's prior chat.
+          setWorkspaceRestorationRetryGeneration((generation) => generation + 1);
+        },
         discardActiveWorkspaceTransition: (workspaceId) => {
           const transitionKey = workspaceId ?? '';
           const transition = browserWorkspaceTransitionsRef.current.get(transitionKey);
@@ -1628,9 +1669,10 @@ function AppShell() {
     },
     [
       cancelWorkspaceObservationWaits,
+      createLocalWorkspaceMutationToken,
       createWorkspaceObservationWait,
       handleSwitchConversation,
-      isLocalBrowserWorkspaceMutationToken,
+      isLocalWorkspaceMutationToken,
     ],
   );
 
@@ -3449,7 +3491,8 @@ function AppShell() {
                           activeWorkspace={activeWorkspace}
                           onWorkspaceNavigationIntent={recordWorkspaceNavigationIntent}
                           isWorkspaceNavigationIntentCurrent={isWorkspaceNavigationIntentCurrent}
-                          isLocalBrowserWorkspaceMutationToken={isLocalBrowserWorkspaceMutationToken}
+                          createLocalWorkspaceMutationToken={createLocalWorkspaceMutationToken}
+                          isLocalWorkspaceMutationToken={isLocalWorkspaceMutationToken}
                           onWorkspaceNavigationFailure={retryWorkspaceConversationRestoration}
                         />
                       </div>

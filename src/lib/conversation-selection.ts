@@ -405,6 +405,8 @@ export type BrowserWorkspaceSwitchResult = {
   previousWorkspaceId?: string | null;
 };
 
+export type StaleWorkspaceSwitchDisposition = 'rollback' | 'retain' | 'superseded';
+
 export type WorkspaceLastConversationCasResult = {
   ok: boolean;
   error?: 'workspace-not-found' | 'last-conversation-changed';
@@ -420,15 +422,18 @@ type SaveWorkspaceLastConversation = (args: {
 
 const MAX_WORKSPACE_CAS_ATTEMPTS = 4;
 
-/** A user workspace click may race an older Browser-attention mutation from
- * this renderer. Rebase only across that locally attributable mutation and
- * only while this exact user intent remains current. */
+/** A user workspace click may race an older Browser-attention or user mutation
+ * from this renderer. Rebase only across that locally attributable mutation,
+ * reuse one provenance token for every attempt, and stop as soon as a newer
+ * user intent takes ownership. */
 export async function setActiveUserWorkspaceWithRebase(options: {
   workspaceId: string;
   expectedCurrentWorkspaceId: string | null;
+  mutationToken: string;
   setActiveWorkspace: (
     workspaceId: string,
     expectedCurrentWorkspaceId: string | null,
+    mutationToken: string,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
   canRebase: (result: ActiveWorkspaceCasResult) => boolean;
@@ -437,7 +442,11 @@ export async function setActiveUserWorkspaceWithRebase(options: {
   let lastResult: ActiveWorkspaceCasResult = { ok: false };
   for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
     if (!options.isCurrent()) return lastResult;
-    const result = await options.setActiveWorkspace(options.workspaceId, expectedCurrentWorkspaceId);
+    const result = await options.setActiveWorkspace(
+      options.workspaceId,
+      expectedCurrentWorkspaceId,
+      options.mutationToken,
+    );
     if (result.ok) return result;
     lastResult = result;
     if (!options.isCurrent() || !options.canRebase(result) || result.activeWorkspaceId === undefined) return result;
@@ -506,6 +515,7 @@ export async function openBrowserConversationInWorkspace(options: {
   ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
+  retainActiveWorkspaceTransition?: (workspaceId: string) => void;
   discardActiveWorkspaceTransition?: (workspaceId: string) => void;
   switchConversation: (
     conversationId: string,
@@ -563,12 +573,15 @@ export async function openBrowserConversationInWorkspace(options: {
     isCurrentAfterSwitch: targetWorkspaceId
       ? () => selectionIsCompatibleAfterWorkspaceSwitch(targetWorkspaceId)
       : undefined,
-    canRollbackStaleSwitch: async () => {
+    resolveStaleSwitchDisposition: async () => {
+      if (!targetWorkspaceId) return 'superseded';
       const workspaceAndBrowserIntentStillCurrent = (): boolean =>
         options.getWorkspaceSelectionGeneration() === options.workspaceSelectionGeneration &&
         options.getBrowserAttentionGeneration() === options.browserAttentionGeneration;
-      if (!workspaceAndBrowserIntentStillCurrent()) return false;
-      if (options.getConversationSelectionGeneration() === options.conversationSelectionGeneration) return true;
+      if (!workspaceAndBrowserIntentStillCurrent()) return 'superseded';
+      if (options.getConversationSelectionGeneration() === options.conversationSelectionGeneration) {
+        return 'rollback';
+      }
 
       // A newer chat choice should keep the Browser-selected workspace only
       // when that chat actually belongs to the destination. In particular, the
@@ -580,7 +593,7 @@ export async function openBrowserConversationInWorkspace(options: {
       // selection keeps changing, instead of risking a rollback underneath it.
       for (let attempt = 0; attempt < MAX_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
         const selectedConversationId = options.getActiveConversationId();
-        if (!selectedConversationId) return true;
+        if (!selectedConversationId) return 'rollback';
         const selectedConversationGeneration = options.getConversationSelectionGeneration();
         let selectedConversation: { workspaceId?: string | null } | null = null;
         try {
@@ -588,16 +601,23 @@ export async function openBrowserConversationInWorkspace(options: {
         } catch {
           // Only a positively identified destination chat suppresses rollback.
         }
-        if (!workspaceAndBrowserIntentStillCurrent()) return false;
+        if (!workspaceAndBrowserIntentStillCurrent()) return 'superseded';
         if (
           options.getConversationSelectionGeneration() !== selectedConversationGeneration ||
           options.getActiveConversationId() !== selectedConversationId
         ) {
           continue;
         }
-        return selectedConversation?.workspaceId !== targetWorkspaceId;
+        if (selectedConversation?.workspaceId !== targetWorkspaceId) return 'rollback';
+        if (options.getActiveWorkspaceId() !== targetWorkspaceId) return 'superseded';
+        // Transfer the pending marker while the stable conversation/workspace
+        // snapshot above is still current. The generic finalizer awaits this
+        // result and would otherwise introduce a gap in which newer intent
+        // could be incorrectly adopted by the old Browser request.
+        options.retainActiveWorkspaceTransition?.(targetWorkspaceId);
+        return 'retain';
       }
-      return false;
+      return 'superseded';
     },
     discardActiveWorkspaceTransition: options.discardActiveWorkspaceTransition,
     commitConversationSelection: targetWorkspaceId ? selectTargetConversation : undefined,
@@ -625,7 +645,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
-  canRollbackStaleSwitch?: () => boolean | Promise<boolean>;
+  resolveStaleSwitchDisposition?: () => StaleWorkspaceSwitchDisposition | Promise<StaleWorkspaceSwitchDisposition>;
   discardActiveWorkspaceTransition?: (workspaceId: string) => void;
   commitConversationSelection?: () => Promise<boolean>;
 }): Promise<boolean> {
@@ -687,8 +707,11 @@ export async function prepareConversationWorkspaceSwitch(options: {
     observation.cancel();
     if (!committed) {
       try {
-        if (switchedWorkspace && (await options.canRollbackStaleSwitch?.())) {
-          await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
+        if (switchedWorkspace) {
+          const disposition = (await options.resolveStaleSwitchDisposition?.()) ?? 'superseded';
+          if (disposition === 'rollback') {
+            await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
+          }
         }
       } finally {
         try {

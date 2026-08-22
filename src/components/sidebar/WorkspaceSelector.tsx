@@ -72,7 +72,8 @@ interface WorkspaceSelectorProps {
   activeWorkspace: Workspace | null;
   onWorkspaceNavigationIntent: () => number;
   isWorkspaceNavigationIntentCurrent: (navigationGeneration: number) => boolean;
-  isLocalBrowserWorkspaceMutationToken: (token: string | null | undefined) => boolean;
+  createLocalWorkspaceMutationToken: () => string;
+  isLocalWorkspaceMutationToken: (token: string | null | undefined) => boolean;
   onWorkspaceNavigationFailure: (workspaceId: string | null, navigationGeneration: number) => void;
 }
 
@@ -82,7 +83,8 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
   activeWorkspace,
   onWorkspaceNavigationIntent,
   isWorkspaceNavigationIntentCurrent,
-  isLocalBrowserWorkspaceMutationToken,
+  createLocalWorkspaceMutationToken,
+  isLocalWorkspaceMutationToken,
   onWorkspaceNavigationFailure,
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -97,13 +99,19 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     // while the unchanged workspace id gives the effect no chance to restart it.
     if (workspaceId === activeWorkspaceId) return;
     const navigationGeneration = onWorkspaceNavigationIntent();
+    // One opaque token owns this user intent across every compare-and-set
+    // rebase. A newer click can then recognize and safely overtake an older
+    // local click that committed while this renderer still showed stale state.
+    const mutationToken = createLocalWorkspaceMutationToken();
     try {
       const result = await setActiveUserWorkspaceWithRebase({
         workspaceId,
         expectedCurrentWorkspaceId: activeWorkspaceId,
-        setActiveWorkspace: (id, expectedCurrentId) => app.workspaces.setActive({ id, expectedCurrentId }),
+        mutationToken,
+        setActiveWorkspace: (id, expectedCurrentId, token) =>
+          app.workspaces.setActive({ id, expectedCurrentId, mutationToken: token }),
         isCurrent: () => isWorkspaceNavigationIntentCurrent(navigationGeneration),
-        canRebase: (conflict) => isLocalBrowserWorkspaceMutationToken(conflict.activeWorkspaceMutationToken),
+        canRebase: (conflict) => isLocalWorkspaceMutationToken(conflict.activeWorkspaceMutationToken),
       });
       if (!result.ok && (result.activeWorkspaceId === undefined || result.activeWorkspaceId === activeWorkspaceId)) {
         onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);

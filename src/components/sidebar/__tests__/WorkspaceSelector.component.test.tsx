@@ -15,7 +15,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={null}
         onWorkspaceNavigationIntent={() => 1}
         isWorkspaceNavigationIntentCurrent={() => true}
-        isLocalBrowserWorkspaceMutationToken={() => false}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-empty'}
+        isLocalWorkspaceMutationToken={() => false}
         onWorkspaceNavigationFailure={() => undefined}
       />,
     );
@@ -47,7 +48,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={workspace}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
         isWorkspaceNavigationIntentCurrent={() => true}
-        isLocalBrowserWorkspaceMutationToken={() => false}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-same'}
+        isLocalWorkspaceMutationToken={() => false}
         onWorkspaceNavigationFailure={() => undefined}
       />,
     );
@@ -93,7 +95,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={workspaceA}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
         isWorkspaceNavigationIntentCurrent={() => true}
-        isLocalBrowserWorkspaceMutationToken={() => false}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-failed'}
+        isLocalWorkspaceMutationToken={() => false}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
@@ -102,7 +105,11 @@ describe('WorkspaceSelector', () => {
     await user.click(await screen.findByRole('menuitem', { name: /workspace b/i }));
 
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
-    expect(setActive).toHaveBeenCalledWith({ id: 'workspace-b', expectedCurrentId: 'workspace-a' });
+    expect(setActive).toHaveBeenCalledWith({
+      id: 'workspace-b',
+      expectedCurrentId: 'workspace-a',
+      mutationToken: 'local-user_request-failed',
+    });
     expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith('workspace-a', 11);
   });
 
@@ -143,7 +150,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={workspaceA}
         onWorkspaceNavigationIntent={() => 12}
         isWorkspaceNavigationIntentCurrent={() => true}
-        isLocalBrowserWorkspaceMutationToken={(token) => token?.startsWith('local-browser_') === true}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-rebase'}
+        isLocalWorkspaceMutationToken={(token) => token?.startsWith('local-') === true}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
@@ -151,8 +159,108 @@ describe('WorkspaceSelector', () => {
     await user.click(screen.getByRole('button', { name: /workspace a/i }));
     await user.click(await screen.findByRole('menuitem', { name: /workspace b/i }));
 
-    expect(setActive).toHaveBeenNthCalledWith(1, { id: 'workspace-b', expectedCurrentId: 'workspace-a' });
-    expect(setActive).toHaveBeenNthCalledWith(2, { id: 'workspace-b', expectedCurrentId: 'workspace-browser' });
+    expect(setActive).toHaveBeenNthCalledWith(1, {
+      id: 'workspace-b',
+      expectedCurrentId: 'workspace-a',
+      mutationToken: 'local-user_request-rebase',
+    });
+    expect(setActive).toHaveBeenNthCalledWith(2, {
+      id: 'workspace-b',
+      expectedCurrentId: 'workspace-browser',
+      mutationToken: 'local-user_request-rebase',
+    });
+    expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
+  });
+
+  it('rebases a rapid newer click over an older local user selection with one stable token', async () => {
+    const user = userEvent.setup();
+    let navigationGeneration = 0;
+    let backendWorkspaceId = 'workspace-a';
+    let backendMutationToken: string | null = null;
+    let resolveFirstSelection: (result: { ok: true; activeWorkspaceId: string }) => void = () => {};
+    const setActive = vi.fn(async (args: { id: string; expectedCurrentId: string | null; mutationToken?: string }) => {
+      if (args.id === 'workspace-b') {
+        backendWorkspaceId = args.id;
+        backendMutationToken = args.mutationToken ?? null;
+        return new Promise<{ ok: true; activeWorkspaceId: string }>((resolve) => {
+          resolveFirstSelection = resolve;
+        });
+      }
+      if (args.expectedCurrentId !== backendWorkspaceId) {
+        return {
+          ok: false,
+          error: 'active-workspace-changed' as const,
+          activeWorkspaceId: backendWorkspaceId,
+          activeWorkspaceMutationToken: backendMutationToken,
+        };
+      }
+      backendWorkspaceId = args.id;
+      backendMutationToken = args.mutationToken ?? null;
+      return { ok: true, activeWorkspaceId: backendWorkspaceId };
+    });
+    installAppBridgeStub({ workspaces: { setActive } });
+    const onWorkspaceNavigationFailure = vi.fn();
+    const workspaceA = {
+      id: 'workspace-a',
+      name: 'Workspace A',
+      directory: '/work/a',
+      color: '#123456',
+      lastActiveAt: 3,
+      createdAt: 1,
+      lastActiveConversationId: 'chat-a',
+    };
+    const workspaceB = {
+      ...workspaceA,
+      id: 'workspace-b',
+      name: 'Workspace B',
+      directory: '/work/b',
+      lastActiveAt: 2,
+    };
+    const workspaceC = {
+      ...workspaceA,
+      id: 'workspace-c',
+      name: 'Workspace C',
+      directory: '/work/c',
+      lastActiveAt: 1,
+    };
+
+    render(
+      <WorkspaceSelector
+        workspaces={[workspaceA, workspaceB, workspaceC]}
+        activeWorkspaceId={workspaceA.id}
+        activeWorkspace={workspaceA}
+        onWorkspaceNavigationIntent={() => ++navigationGeneration}
+        isWorkspaceNavigationIntentCurrent={(generation) => generation === navigationGeneration}
+        createLocalWorkspaceMutationToken={() => `local-user_request-${navigationGeneration}`}
+        isLocalWorkspaceMutationToken={(token) => token?.startsWith('local-user_') === true}
+        onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /workspace a/i }));
+    await user.click(await screen.findByRole('menuitem', { name: /workspace b/i }));
+    await vi.waitFor(() => expect(setActive).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: /workspace a/i }));
+    await user.click(await screen.findByRole('menuitem', { name: /workspace c/i }));
+    await vi.waitFor(() => expect(setActive).toHaveBeenCalledTimes(3));
+    resolveFirstSelection({ ok: true, activeWorkspaceId: 'workspace-b' });
+
+    expect(setActive).toHaveBeenNthCalledWith(1, {
+      id: 'workspace-b',
+      expectedCurrentId: 'workspace-a',
+      mutationToken: 'local-user_request-1',
+    });
+    expect(setActive).toHaveBeenNthCalledWith(2, {
+      id: 'workspace-c',
+      expectedCurrentId: 'workspace-a',
+      mutationToken: 'local-user_request-2',
+    });
+    expect(setActive).toHaveBeenNthCalledWith(3, {
+      id: 'workspace-c',
+      expectedCurrentId: 'workspace-b',
+      mutationToken: 'local-user_request-2',
+    });
     expect(onWorkspaceNavigationFailure).not.toHaveBeenCalled();
   });
 
@@ -190,7 +298,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={workspaceA}
         onWorkspaceNavigationIntent={() => 13}
         isWorkspaceNavigationIntentCurrent={isWorkspaceNavigationIntentCurrent}
-        isLocalBrowserWorkspaceMutationToken={(token) => token?.startsWith('local-browser_') === true}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-superseded'}
+        isLocalWorkspaceMutationToken={(token) => token?.startsWith('local-') === true}
         onWorkspaceNavigationFailure={() => undefined}
       />,
     );
@@ -235,7 +344,8 @@ describe('WorkspaceSelector', () => {
         activeWorkspace={workspaceA}
         onWorkspaceNavigationIntent={() => 14}
         isWorkspaceNavigationIntentCurrent={() => true}
-        isLocalBrowserWorkspaceMutationToken={(token) => token?.startsWith('local-browser_') === true}
+        createLocalWorkspaceMutationToken={() => 'local-user_request-foreign'}
+        isLocalWorkspaceMutationToken={(token) => token?.startsWith('local-') === true}
         onWorkspaceNavigationFailure={onWorkspaceNavigationFailure}
       />,
     );
