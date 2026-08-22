@@ -13,6 +13,7 @@ import {
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
+  resolveConversationWorkspaceTransition,
   selectConversationDeleteFallback,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
@@ -24,6 +25,8 @@ describe('isConversationWorkspaceRestorationCurrent', () => {
   const current = {
     workspaceId: 'workspace-b',
     currentWorkspaceId: 'workspace-b',
+    navigationGeneration: 3,
+    currentNavigationGeneration: 3,
     selectionSequence: 4,
     currentSelectionSequence: 4,
     selectionWhenStarted: 'conv-a',
@@ -33,8 +36,39 @@ describe('isConversationWorkspaceRestorationCurrent', () => {
   it('accepts only an unchanged workspace and selection attempt', () => {
     expect(isConversationWorkspaceRestorationCurrent(current)).toBe(true);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentWorkspaceId: 'workspace-c' })).toBe(false);
+    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentNavigationGeneration: 4 })).toBe(false);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelectionSequence: 5 })).toBe(false);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelection: 'conv-user-choice' })).toBe(false);
+  });
+});
+
+describe('resolveConversationWorkspaceTransition', () => {
+  it('retains the real previous workspace when a superseded Browser transition is skipped', () => {
+    const stale = resolveConversationWorkspaceTransition({
+      previousWorkspaceId: 'workspace-a',
+      activeWorkspaceId: 'workspace-b',
+      browserTransition: { navigationGeneration: 1, workspaceSelectionGeneration: 7 },
+      currentNavigationGeneration: 2,
+      currentWorkspaceSelectionGeneration: 7,
+    });
+
+    expect(stale).toEqual({
+      staleBrowserTransition: true,
+      departingWorkspaceId: 'workspace-a',
+      nextPreviousWorkspaceId: 'workspace-a',
+    });
+
+    const next = resolveConversationWorkspaceTransition({
+      previousWorkspaceId: stale.nextPreviousWorkspaceId,
+      activeWorkspaceId: 'workspace-c',
+      currentNavigationGeneration: 2,
+      currentWorkspaceSelectionGeneration: 7,
+    });
+    expect(next).toEqual({
+      staleBrowserTransition: false,
+      departingWorkspaceId: 'workspace-a',
+      nextPreviousWorkspaceId: 'workspace-c',
+    });
   });
 });
 

@@ -89,6 +89,7 @@ import {
   filterConversationDeleteFallbackCandidates,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
+  resolveConversationWorkspaceTransition,
   selectConversationDeleteFallback,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
@@ -802,26 +803,28 @@ function AppShell() {
     }
     if (prevWorkspaceIdRef.current === activeWorkspaceId) return;
 
-    const departingId = prevWorkspaceIdRef.current;
-    prevWorkspaceIdRef.current = activeWorkspaceId;
     const browserTransitionKey = activeWorkspaceId ?? '';
     const browserTransition = browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
     if (browserTransition) browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
-    const staleBrowserTransition =
-      browserTransition !== undefined &&
-      browserTransition.navigationGeneration !== navigationIntentGenerationRef.current &&
-      browserTransition.workspaceSelectionGeneration === workspaceSelectionIntentGenerationRef.current;
+    const transition = resolveConversationWorkspaceTransition({
+      previousWorkspaceId: prevWorkspaceIdRef.current,
+      activeWorkspaceId,
+      browserTransition,
+      currentNavigationGeneration: navigationIntentGenerationRef.current,
+      currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
+    });
 
     // A Browser-attention request can lose to a newer local navigation while
     // its workspace IPC is in flight. Its compare-and-set rollback will restore
     // the prior workspace; do not let this transient stale config event launch
     // an arriving-workspace conversation restoration in the meantime.
-    if (staleBrowserTransition) return;
+    if (transition.staleBrowserTransition) return;
+    prevWorkspaceIdRef.current = transition.nextPreviousWorkspaceId;
 
     // Save the current conversation to the departing workspace
-    if (departingId && activeConversationId) {
+    if (transition.departingWorkspaceId && activeConversationId) {
       void app.workspaces.saveLastConversation({
-        workspaceId: departingId,
+        workspaceId: transition.departingWorkspaceId,
         conversationId: activeConversationId,
       });
     }
@@ -832,6 +835,7 @@ function AppShell() {
     if (activeWorkspace?.lastActiveConversationId) {
       const restoredId = activeWorkspace.lastActiveConversationId;
       const restoringWorkspaceId = activeWorkspace.id;
+      const navigationGeneration = navigationIntentGenerationRef.current;
       const selectionSequence = ++activeSyncSeqRef.current;
       const selectionWhenStarted = activeConversationIdRef.current;
       void (async () => {
@@ -839,6 +843,8 @@ function AppShell() {
           isConversationWorkspaceRestorationCurrent({
             workspaceId: restoringWorkspaceId,
             currentWorkspaceId: prevWorkspaceIdRef.current,
+            navigationGeneration,
+            currentNavigationGeneration: navigationIntentGenerationRef.current,
             selectionSequence,
             currentSelectionSequence: activeSyncSeqRef.current,
             selectionWhenStarted,

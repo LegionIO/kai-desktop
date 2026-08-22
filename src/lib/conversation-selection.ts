@@ -61,12 +61,46 @@ export function commitLocalConversationSelection(
   setSelection(conversationId);
 }
 
+export type BrowserWorkspaceTransitionMarker = {
+  navigationGeneration: number;
+  workspaceSelectionGeneration: number;
+};
+
+/** Decide whether an observed workspace change belongs to a Browser request
+ * that has already lost navigation ownership. A stale transient must retain the
+ * real previous-workspace cursor so a subsequent rebase/rollback cannot record
+ * the current conversation against a workspace the window never entered. */
+export function resolveConversationWorkspaceTransition(options: {
+  previousWorkspaceId: string | null;
+  activeWorkspaceId: string | null;
+  browserTransition?: BrowserWorkspaceTransitionMarker;
+  currentNavigationGeneration: number;
+  currentWorkspaceSelectionGeneration: number;
+}): {
+  staleBrowserTransition: boolean;
+  departingWorkspaceId: string | null;
+  nextPreviousWorkspaceId: string | null;
+} {
+  const staleBrowserTransition =
+    options.browserTransition !== undefined &&
+    options.browserTransition.navigationGeneration !== options.currentNavigationGeneration &&
+    options.browserTransition.workspaceSelectionGeneration === options.currentWorkspaceSelectionGeneration;
+  return {
+    staleBrowserTransition,
+    departingWorkspaceId: options.previousWorkspaceId,
+    nextPreviousWorkspaceId: staleBrowserTransition ? options.previousWorkspaceId : options.activeWorkspaceId,
+  };
+}
+
 /** Workspace restoration is an asynchronous selection intent. It may commit
- * only while both the destination workspace and the renderer selection state
- * still match the snapshot captured before its backend activation began. */
+ * only while the destination workspace, navigation intent, and renderer
+ * selection state still match the snapshot captured before its backend
+ * activation began. */
 export function isConversationWorkspaceRestorationCurrent(options: {
   workspaceId: string;
   currentWorkspaceId: string | null | undefined;
+  navigationGeneration: number;
+  currentNavigationGeneration: number;
   selectionSequence: number;
   currentSelectionSequence: number;
   selectionWhenStarted: string | null;
@@ -74,6 +108,7 @@ export function isConversationWorkspaceRestorationCurrent(options: {
 }): boolean {
   return (
     options.currentWorkspaceId === options.workspaceId &&
+    options.currentNavigationGeneration === options.navigationGeneration &&
     options.currentSelectionSequence === options.selectionSequence &&
     options.currentSelection === options.selectionWhenStarted
   );
