@@ -556,6 +556,18 @@ type BrowserViewLoadState = {
   expectedInitialLoadGeneration?: number;
 };
 
+type BrowserNetworkNavigationAttempt = {
+  generation: number;
+  urls: Set<string>;
+  requestId?: number;
+};
+
+type BrowserNetworkNavigationFailure = {
+  generation: number;
+  requestId: number;
+  aborted: boolean;
+};
+
 type InternalTab = {
   shell: BrowserTab;
   view: WebContentsView | null;
@@ -670,12 +682,17 @@ type InternalTab = {
     redactionKey: BrowserNetworkRedactionKey;
     generation: number;
     urls: Set<string>;
-    superseded: Array<{ generation: number; urls: Set<string> }>;
+    requestId?: number;
+    superseded: BrowserNetworkNavigationAttempt[];
   };
   /** Bounded terminal-event tombstones for attempts superseded before the
    * current document committed. Electron's did-fail-load event has no request
    * id, so these prevent a late failure from settling a newer navigation. */
-  supersededNetworkNavigations?: Array<{ generation: number; urls: Set<string> }>;
+  supersededNetworkNavigations?: BrowserNetworkNavigationAttempt[];
+  /** Exact main-frame request failures observed by webRequest before the
+   * corresponding did-fail-load callback. The latter omits request ids, so this
+   * bounded bridge disambiguates rapid same-URL navigation generations. */
+  networkNavigationFailures?: BrowserNetworkNavigationFailure[];
   /** Renderers temporarily exempted from Chromium background throttling while
    * this tab has active assistant work. A tab can replace its renderer during
    * sanitization, so retain all live targets until the outermost action ends. */
@@ -9904,6 +9921,26 @@ export class BrowserManager {
         startedAt: currentTime,
       });
     }
+    if (details.resourceType === 'mainFrame') {
+      const provisional = tab.provisionalNetworkNavigation;
+      const comparableUrl = comparablePopupReferrerUrl(details.url);
+      const requestAlreadyBelongsToOlderAttempt = [
+        ...(provisional?.superseded ?? []),
+        ...(tab.supersededNetworkNavigations ?? []),
+      ].some((attempt) => attempt.requestId === details.id);
+      if (
+        provisional &&
+        provisional.requestId === undefined &&
+        !requestAlreadyBelongsToOlderAttempt &&
+        comparableUrl &&
+        provisional.urls.has(comparableUrl)
+      ) {
+        // onBeforeRequest normally precedes did-start-navigation, but retain an
+        // exact identity when Electron delivers those callbacks in the reverse
+        // order as well. Redirects keep the same request id.
+        provisional.requestId = details.id;
+      }
+    }
     if (
       browserNetworkResourceBlocksIdle(details.resourceType) &&
       (tab.diagnosticActiveNetworkRequestIds?.has(details.id) ?? true)
@@ -9971,6 +10008,7 @@ export class BrowserManager {
     tab.networkLastBlockingActivityAt = undefined;
     tab.networkNavigationSequence = 0;
     tab.supersededNetworkNavigations = undefined;
+    tab.networkNavigationFailures = undefined;
     // A replacement document must not be comparable with origins observed by
     // the previous document, even when it lives in the same tab shell.
     tab.networkRedactionKey = createBrowserNetworkRedactionKey();
@@ -10001,6 +10039,7 @@ export class BrowserManager {
           {
             generation: previousProvisional.generation,
             urls: new Set(previousProvisional.urls),
+            ...(previousProvisional.requestId !== undefined ? { requestId: previousProvisional.requestId } : {}),
           },
         ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS)
       : [];
@@ -10024,6 +10063,7 @@ export class BrowserManager {
       redactionKey: previousProvisional?.redactionKey ?? currentRedactionKey,
       generation,
       urls: new Set(comparableUrl ? [comparableUrl] : []),
+      ...(navigationRequest ? { requestId: navigationRequest.id } : {}),
       superseded,
     };
     // Rotate the diagnostic subset immediately. Exact identities from the
@@ -10061,12 +10101,39 @@ export class BrowserManager {
 
   private retainSupersededBrowserNetworkNavigations(
     tab: InternalTab,
-    attempts: Array<{ generation: number; urls: Set<string> }>,
+    attempts: BrowserNetworkNavigationAttempt[],
   ): void {
     if (attempts.length === 0) return;
     tab.supersededNetworkNavigations = [
       ...(tab.supersededNetworkNavigations ?? []),
-      ...attempts.map((attempt) => ({ generation: attempt.generation, urls: new Set(attempt.urls) })),
+      ...attempts.map((attempt) => ({
+        generation: attempt.generation,
+        urls: new Set(attempt.urls),
+        ...(attempt.requestId !== undefined ? { requestId: attempt.requestId } : {}),
+      })),
+    ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS);
+  }
+
+  private recordBrowserNetworkNavigationFailure(
+    tab: InternalTab,
+    details: Pick<Electron.OnErrorOccurredListenerDetails, 'id' | 'resourceType' | 'error'>,
+  ): void {
+    if (details.resourceType !== 'mainFrame') return;
+    const attempts = [
+      ...(tab.provisionalNetworkNavigation ? [tab.provisionalNetworkNavigation] : []),
+      ...(tab.provisionalNetworkNavigation?.superseded ?? []),
+      ...(tab.supersededNetworkNavigations ?? []),
+    ];
+    const attempt = attempts.find((candidate) => candidate.requestId === details.id);
+    if (!attempt) return;
+    const failures = tab.networkNavigationFailures ?? [];
+    tab.networkNavigationFailures = [
+      ...failures.filter((failure) => failure.requestId !== details.id),
+      {
+        generation: attempt.generation,
+        requestId: details.id,
+        aborted: /(?:^|::)ERR_ABORTED$/i.test(details.error),
+      },
     ].slice(-MAX_SUPERSEDED_NETWORK_NAVIGATIONS);
   }
 
@@ -10074,12 +10141,7 @@ export class BrowserManager {
     const comparableUrl = comparablePopupReferrerUrl(url);
     const provisional = tab.provisionalNetworkNavigation;
     const currentMatches = !!comparableUrl && provisional?.urls.has(comparableUrl) === true;
-    // A non-aborted failure matching the live provisional generation belongs
-    // to that generation. An older same-URL tombstone may never receive its
-    // own terminal event and must not hide this genuine failure.
-    if (errorCode !== -3 && currentMatches) return false;
-
-    type SupersededAttempt = { generation: number; urls: Set<string> };
+    type SupersededAttempt = BrowserNetworkNavigationAttempt;
     type SupersededBucket = {
       attempts: SupersededAttempt[];
       retained: boolean;
@@ -10105,6 +10167,42 @@ export class BrowserManager {
       }
       return true;
     };
+
+    const attemptsByGeneration = new Map<number, SupersededAttempt>();
+    if (provisional) attemptsByGeneration.set(provisional.generation, provisional);
+    for (const bucket of buckets) {
+      for (const attempt of bucket.attempts) attemptsByGeneration.set(attempt.generation, attempt);
+    }
+    const exactFailures = tab.networkNavigationFailures;
+    if (exactFailures?.length) {
+      const aborted = errorCode === -3;
+      let exactFailureIndex = -1;
+      // webRequest is the only Electron event in this path that carries the
+      // main-frame request id. Choose the newest matching terminal event so a
+      // missing did-fail-load for an older same-URL attempt cannot steal the
+      // current generation's later failure.
+      for (let index = exactFailures.length - 1; index >= 0; index--) {
+        const failure = exactFailures[index];
+        if (failure.aborted !== aborted) continue;
+        const attempt = attemptsByGeneration.get(failure.generation);
+        if (!attempt || (comparableUrl && !attempt.urls.has(comparableUrl))) continue;
+        exactFailureIndex = index;
+        break;
+      }
+      if (exactFailureIndex >= 0) {
+        const [failure] = exactFailures.splice(exactFailureIndex, 1);
+        if (exactFailures.length === 0) tab.networkNavigationFailures = undefined;
+        if (failure.generation === provisional?.generation) return false;
+        return consumeOldest((attempt) => attempt.generation === failure.generation);
+      }
+    }
+
+    // A non-aborted failure matching the live provisional generation belongs
+    // to that generation. An older same-URL tombstone may never receive its
+    // own terminal event and must not hide this genuine failure. Perform this
+    // fallback only after exact correlation so the current request's bounded
+    // bridge record is consumed when webRequest supplied one.
+    if (errorCode !== -3 && currentMatches) return false;
 
     // Tombstones can span a prior committed generation and the current
     // provisional chain. Select by generation rather than bucket so the oldest
@@ -10416,6 +10514,7 @@ export class BrowserManager {
       const tabId = details.webContentsId === undefined ? undefined : this.webContentsToTab.get(details.webContentsId);
       const tab = tabId ? this.tabs.get(tabId) : undefined;
       if (tab) {
+        this.recordBrowserNetworkNavigationFailure(tab, details);
         this.finishBrowserNetworkRequest(tab, details);
         // did-fail-load normally consumes this lease too, but webRequest is the
         // authoritative terminal event for the exact request. Clear it here so

@@ -236,11 +236,18 @@ const BrowserDataManager: FC<{ dataScope: 'global' | 'conversation'; conversatio
     }
   }, [browser, conversationId, dataScope]);
   useEffect(() => {
+    // Config persistence reaches React before the serialized native profile
+    // migration necessarily commits. Subscribe before the initial read so the
+    // authoritative completion/clear events always supersede an early summary.
+    const unsubscribe = browser?.onEvent((event) => {
+      if (event.type === 'profile-scope-changed' || event.type === 'profile-data-cleared') void load();
+    });
     void load();
     return () => {
       loadRequestRef.current++;
+      unsubscribe?.();
     };
-  }, [load]);
+  }, [browser, load]);
   const clear = async (summary: BrowserDataSummary) => {
     if (!browser) return;
     const requestedContext = { dataScope, conversationId };

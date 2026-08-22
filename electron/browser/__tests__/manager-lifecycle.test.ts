@@ -5236,6 +5236,160 @@ describe('browser manager renderer lifecycle', () => {
     expect(tab.trustedUserNavigation).toBe(false);
   });
 
+  it('uses wired exact failures to settle the current same-URL navigation', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    let requestPolicy:
+      | ((
+          details: {
+            id: number;
+            method: string;
+            webContentsId?: number;
+            resourceType: string;
+            url: string;
+          },
+          callback: (result: { cancel?: boolean }) => void,
+        ) => void)
+      | undefined;
+    let failedRequest:
+      | ((details: { id: number; webContentsId?: number; resourceType: string; error: string }) => void)
+      | undefined;
+    const navigationUrl = 'https://same.example/private';
+    const committedUrl = 'https://committed.example';
+    let currentUrl = committedUrl;
+    const tab = {
+      shell: {
+        id: 'tab-current-same-url-abort',
+        conversationId: 'chat-1',
+        url: committedUrl,
+        title: 'Committed',
+        loading: true,
+        error: undefined as string | undefined,
+        sensitive: false,
+        reloadRequired: false,
+      },
+      scopeKey: 'global',
+      generation: 1,
+      aiNetworkRestricted: false,
+      scriptTainted: false,
+      trustedUserNavigation: false,
+      trustedUserNavigationTarget: null,
+      trustedUserNavigationRequestId: null,
+      trustedUserNavigationPanelGeneration: null,
+      trustedUserNavigationLease: 0,
+      trustedUserNavigationTimer: null,
+      networkRequests: new Map(),
+      activeNetworkRequests: new Map(),
+      networkRequestSequence: 0,
+    };
+    const manager = managerWithoutConstructor({
+      cancelFaviconFetch: vi.fn(),
+      clearingScopes: new Set(),
+      emitTabs: vi.fn(),
+      getConfig: () => ({ browser: { aiAllowPrivateNetwork: false } }),
+      getWindow: () => null,
+      oneTimePermissions: new Set(),
+      pagePreloadPath: '/tmp/browser-page.cjs',
+      pendingAuth: new Map(),
+      pendingCredentials: new Map(),
+      pendingPermissions: new Map(),
+      scopeActivityCounts: new Map(),
+      scopeGenerations: new Map([['global', 0]]),
+      scopeIdleWaiters: new Map(),
+      scopeRequestActivities: new Map(),
+      tabs: new Map([[tab.shell.id, tab]]),
+      webContentsToTab: new Map([[42, tab.shell.id]]),
+      wiredSessions: new WeakSet(),
+    });
+    const contents = {
+      id: 42,
+      getTitle: () => 'Current',
+      getURL: () => currentUrl,
+      isCurrentlyAudible: () => false,
+      isDestroyed: () => false,
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false, clear: vi.fn() },
+      on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+      setWindowOpenHandler: vi.fn(),
+    };
+    Object.assign(tab, { view: { webContents: contents } });
+    invokePrivate(manager, 'wireWebContents', tab, contents);
+    const fakeSession = {
+      getPreloadScripts: () => [],
+      on: vi.fn(),
+      registerPreloadScript: vi.fn(),
+      setPermissionCheckHandler: vi.fn(),
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: (_filter: unknown, listener: typeof requestPolicy) => {
+          requestPolicy = listener;
+        },
+        onCompleted: vi.fn(),
+        onErrorOccurred: (_filter: unknown, listener: typeof failedRequest) => {
+          failedRequest = listener;
+        },
+      },
+    };
+    invokePrivate(manager, 'wireSession', fakeSession, 'persist:kai-browser-global', 'global');
+
+    requestPolicy?.(
+      { id: 10, method: 'GET', webContentsId: 42, resourceType: 'mainFrame', url: navigationUrl },
+      vi.fn(),
+    );
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+    requestPolicy?.(
+      { id: 11, method: 'GET', webContentsId: 42, resourceType: 'mainFrame', url: navigationUrl },
+      vi.fn(),
+    );
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+    const provisional = Reflect.get(tab, 'provisionalNetworkNavigation') as {
+      generation: number;
+      redactionKey: unknown;
+    };
+    const currentGeneration = provisional.generation;
+    const committedRedactionKey = provisional.redactionKey;
+
+    // The older attempt never receives did-fail-load. webRequest still gives
+    // the current failure an exact request id before Electron's URL-only event.
+    failedRequest?.({
+      id: 11,
+      webContentsId: 42,
+      resourceType: 'mainFrame',
+      error: 'net::ERR_ABORTED',
+    });
+    listeners.get('did-fail-load')?.({}, -3, 'ERR_ABORTED', navigationUrl, true);
+
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(Reflect.get(tab, 'networkRedactionKey')).toBe(committedRedactionKey);
+    expect(Reflect.get(tab, 'supersededNetworkNavigations')).toEqual([
+      expect.objectContaining({ generation: expect.any(Number), requestId: 10 }),
+    ]);
+    expect(
+      (Reflect.get(tab, 'supersededNetworkNavigations') as Array<{ generation: number }>)[0]?.generation,
+    ).toBeLessThan(currentGeneration);
+    expect(tab.shell.url).toBe(committedUrl);
+    expect(tab.shell.error).toBeUndefined();
+
+    // A non-aborted current failure is surfaced even though the older request
+    // targets the same URL, and its exact bridge record is consumed rather
+    // than leaking into a later navigation.
+    requestPolicy?.(
+      { id: 12, method: 'GET', webContentsId: 42, resourceType: 'mainFrame', url: navigationUrl },
+      vi.fn(),
+    );
+    listeners.get('did-start-navigation')?.({}, navigationUrl, false, true);
+    failedRequest?.({
+      id: 12,
+      webContentsId: 42,
+      resourceType: 'mainFrame',
+      error: 'net::ERR_NAME_NOT_RESOLVED',
+    });
+    listeners.get('did-fail-load')?.({}, -105, 'ERR_NAME_NOT_RESOLVED', navigationUrl, true);
+
+    expect(Reflect.get(tab, 'networkNavigationFailures')).toBeUndefined();
+    expect(Reflect.get(tab, 'provisionalNetworkNavigation')).toBeUndefined();
+    expect(tab.shell.url).toBe(navigationUrl);
+    expect(tab.shell.error).toBe('ERR_NAME_NOT_RESOLVED (-105)');
+  });
+
   it('retires an empty-URL abort tombstone and surfaces a later genuine same-URL failure', () => {
     const listeners = new Map<string, (...args: unknown[]) => void>();
     let currentUrl = 'https://committed.example';

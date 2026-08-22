@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { BrowserDataSummary } from '../../../../shared/browser';
+import type { BrowserDataSummary, BrowserEvent } from '../../../../shared/browser';
 import { installAppBridgeStub, uninstallAppBridgeStub } from '../../../../test-utils/app-bridge-stub';
 import { BrowserSettings } from '../BrowserSettings';
 
@@ -334,6 +334,57 @@ describe('BrowserSettings data management', () => {
     ).toBeInTheDocument();
     expect(screen.queryByText('App-wide browser profile')).not.toBeInTheDocument();
     expect(dataSummary).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes Browser Data after the native profile migration or an external clear commits', async () => {
+    let emit: ((event: BrowserEvent) => void) | undefined;
+    const summary = (activeTabCount: number): BrowserDataSummary => ({
+      scopeKey: 'conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+      partition: 'persist:kai-browser-conversation-aaaaaaaaaaaaaaaaaaaaaaaa',
+      cleanupPending: false,
+      historyCount: 0,
+      bookmarkCount: 0,
+      downloadCount: 0,
+      credentialCount: 0,
+      activeTabCount,
+    });
+    const dataSummary = vi
+      .fn()
+      .mockResolvedValueOnce([summary(0)])
+      .mockResolvedValueOnce([summary(1)])
+      .mockResolvedValueOnce([summary(0)]);
+    installAppBridgeStub({
+      browser: {
+        dataSummary,
+        onEvent: (callback: (event: BrowserEvent) => void) => {
+          emit = callback;
+          return vi.fn();
+        },
+      },
+      partitions: { list: async () => [] },
+    });
+
+    render(
+      <BrowserSettings
+        config={{ browser: { dataScope: 'conversation' } }}
+        updateConfig={vi.fn()}
+        conversationId="chat-1"
+      />,
+    );
+    expect(await screen.findByText(/0 passwords · 0 tabs/)).toBeInTheDocument();
+
+    act(() => emit?.({ type: 'profile-scope-changed', dataScope: 'conversation' }));
+    expect(await screen.findByText(/0 passwords · 1 tabs/)).toBeInTheDocument();
+
+    act(() =>
+      emit?.({
+        type: 'profile-data-cleared',
+        conversationId: 'chat-1',
+        scopeKeys: ['conversation-aaaaaaaaaaaaaaaaaaaaaaaa'],
+      }),
+    );
+    expect(await screen.findByText(/0 passwords · 0 tabs/)).toBeInTheDocument();
+    expect(dataSummary).toHaveBeenCalledTimes(3);
   });
 
   it('ignores a stale Browser Data load after the configured scope changes', async () => {
