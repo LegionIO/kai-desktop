@@ -1724,7 +1724,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     const setActiveWorkspace = vi
       .fn()
       .mockResolvedValueOnce({ ok: true, previousWorkspaceId: 'workspace-a' })
-      .mockResolvedValueOnce({ ok: false });
+      .mockResolvedValueOnce({ ok: false, activeWorkspaceId: 'workspace-b' });
 
     await expect(
       prepareConversationWorkspaceSwitch({
@@ -1743,6 +1743,33 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
     expect(discardActiveWorkspaceTransition).not.toHaveBeenCalled();
+  });
+
+  it('discards the Browser transition when a rejected rollback reports another authoritative workspace', async () => {
+    const discardActiveWorkspaceTransition = vi.fn();
+    const setActiveWorkspace = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, previousWorkspaceId: 'workspace-a' })
+      .mockResolvedValueOnce({ ok: false, activeWorkspaceId: 'workspace-c' });
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-b',
+        conversationWorkspaceId: 'workspace-b',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a', 'workspace-b', 'workspace-c'],
+        saveLastConversation: async () => undefined,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrentAfterSwitch: () => false,
+        resolveStaleSwitchDisposition: () => 'rollback',
+        discardActiveWorkspaceTransition,
+      }),
+    ).resolves.toBe(false);
+
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-a', 'workspace-b', 'rollback');
+    expect(discardActiveWorkspaceTransition).toHaveBeenCalledOnce();
+    expect(discardActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
   });
 
   it('retains the Browser transition when a stale workspace rollback throws', async () => {

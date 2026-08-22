@@ -1597,7 +1597,7 @@ function AppShell() {
             }
           };
           if (operation === 'rollback') {
-            return (await setActiveWorkspaceOnce(workspaceId, expectedCurrentWorkspaceId)).ok;
+            return setActiveWorkspaceOnce(workspaceId, expectedCurrentWorkspaceId);
           }
           if (workspaceId === null) return false;
           return setActiveBrowserWorkspaceWithRebase({

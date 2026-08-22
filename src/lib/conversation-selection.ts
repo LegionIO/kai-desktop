@@ -403,6 +403,8 @@ export type BrowserWorkspaceSwitchResult = {
   ok: boolean;
   /** Authoritative workspace replaced by the successful compare-and-set. */
   previousWorkspaceId?: string | null;
+  /** Current authoritative workspace when a compare-and-set is rejected. */
+  activeWorkspaceId?: string | null;
 };
 
 export type StaleWorkspaceSwitchDisposition = 'rollback' | 'retain' | 'superseded';
@@ -736,10 +738,15 @@ export async function prepareConversationWorkspaceSwitch(options: {
                 'rollback',
               );
               const rolledBack = typeof rollbackResult === 'boolean' ? rollbackResult : rollbackResult.ok;
-              // A failed rollback leaves the destination workspace authoritative.
-              // Keep its navigation marker so the renderer effect can reconcile
-              // its lagging workspace cursor instead of restoring stale state.
-              if (!rolledBack) shouldDiscardTransition = false;
+              if (!rolledBack) {
+                const authoritativeWorkspaceId =
+                  typeof rollbackResult === 'boolean' ? undefined : rollbackResult.activeWorkspaceId;
+                // Preserve the marker only when the failed rollback may have
+                // left the destination authoritative. A rejected CAS that names
+                // another workspace proves its owner will reconcile that edge.
+                shouldDiscardTransition =
+                  authoritativeWorkspaceId !== undefined && authoritativeWorkspaceId !== targetWorkspaceId;
+              }
             }
           } catch (error) {
             shouldDiscardTransition = false;
