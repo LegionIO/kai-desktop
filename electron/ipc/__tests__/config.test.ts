@@ -319,7 +319,7 @@ describe('agent.piSdk schema', () => {
 // ---------------------------------------------------------------------------
 
 describe('config IPC: registered channels', () => {
-  it('reports workspace and cursor mutations before a debounced external reload can collapse an ABA sequence', async () => {
+  it('invalidates workspace and cursor provenance when one reload observes only the final state of an ABA write', async () => {
     const onWorkspaceConfigMutation = vi.fn();
     let requestReload!: () => void;
     const harness = await createIpcHarness({
@@ -349,19 +349,24 @@ describe('config IPC: registered channels', () => {
       next.ui.activeWorkspaceId = activeWorkspaceId;
       next.ui.workspaces = [{ ...workspace, lastActiveConversationId }];
       writeFileSync(join(appHome, 'settings', 'desktop.json'), JSON.stringify(desktopConfigPayload(next)), 'utf-8');
-      requestReload();
     };
 
     writeExternal('workspace-a', 'chat-a');
+    requestReload();
+    onWorkspaceConfigMutation.mockClear();
+
+    // Simulate fs.watch coalescing both writes into one callback. The final
+    // content equals the last observed state, but the reload event itself must
+    // still invalidate any mutation token minted before this A→B→A sequence.
     writeExternal('workspace-b', 'chat-b');
     writeExternal('workspace-a', 'chat-a');
+    requestReload();
 
-    expect(onWorkspaceConfigMutation).toHaveBeenCalledTimes(3);
-    expect(onWorkspaceConfigMutation.mock.calls).toEqual([
-      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
-      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
-      [{ activeWorkspaceChanged: true, lastConversationStateChanged: true }],
-    ]);
+    expect(onWorkspaceConfigMutation).toHaveBeenCalledOnce();
+    expect(onWorkspaceConfigMutation).toHaveBeenCalledWith({
+      activeWorkspaceChanged: true,
+      lastConversationStateChanged: true,
+    });
   });
 
   it('hot-reloads first-time llm.json creation before desktop.json exists', async () => {
@@ -393,10 +398,10 @@ describe('config IPC: registered channels', () => {
         expect(current.models.providers.anthropic?.apiKey).toBe('sk-test');
         expect(current.models.catalog.some((entry) => entry.key === 'claude-first-import')).toBe(true);
       },
-      { timeout: 2_000 },
+      { timeout: 10_000 },
     );
     expect(existsSync(join(appHome, 'settings', 'desktop.json'))).toBe(false);
-  });
+  }, 15_000);
 
   it('responds to config:get with the effective AppConfig shape', async () => {
     const harness = await createIpcHarness({

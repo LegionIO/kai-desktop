@@ -16,6 +16,10 @@ globalThis.window = globalThis.window || ({} as Window & typeof globalThis);
   },
   conversations: {
     getActiveId: vi.fn().mockResolvedValue('test-conversation'),
+    getActiveState: vi
+      .fn()
+      .mockResolvedValue({ activeConversationId: 'test-conversation', activeConversationRevision: 0 }),
+    setActiveId: vi.fn().mockResolvedValue({ ok: true, activeConversationRevision: 1 }),
     onChanged: vi.fn(() => () => {}),
     list: vi.fn().mockResolvedValue([]),
     get: vi.fn(),

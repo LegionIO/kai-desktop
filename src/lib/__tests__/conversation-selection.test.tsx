@@ -366,13 +366,14 @@ describe('rollbackUnavailableWorkspaceRestoration', () => {
     await expect(
       rollbackUnavailableWorkspaceRestoration({
         restoredConversationId: 'chat-b',
+        restoredConversationRevision: 12,
         previousConversationId: 'chat-a',
         isCurrent: () => true,
         setActiveId,
       }),
     ).resolves.toBe(true);
 
-    expect(setActiveId).toHaveBeenCalledWith('chat-a', 'chat-b');
+    expect(setActiveId).toHaveBeenCalledWith('chat-a', 'chat-b', 12);
   });
 
   it('does not overwrite a newer renderer selection', async () => {
@@ -381,6 +382,7 @@ describe('rollbackUnavailableWorkspaceRestoration', () => {
     await expect(
       rollbackUnavailableWorkspaceRestoration({
         restoredConversationId: 'chat-b',
+        restoredConversationRevision: 12,
         previousConversationId: 'chat-a',
         isCurrent: () => false,
         setActiveId,
@@ -397,18 +399,40 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
       ok: false,
       error: 'active-conversation-changed' as const,
       activeConversationId: 'chat-b',
+      activeConversationRevision: 9,
     }));
 
     await expect(
       setActiveConversationForWorkspaceRestoration({
         conversationId: 'chat-b',
         expectedCurrentConversationId: 'chat-a',
+        expectedCurrentConversationRevision: 8,
         isCurrent: () => true,
         setActiveId,
       }),
-    ).resolves.toEqual({ ok: true, activeConversationId: 'chat-b' });
+    ).resolves.toEqual({ ok: true, activeConversationId: 'chat-b', activeConversationRevision: 9 });
 
     expect(setActiveId).toHaveBeenCalledOnce();
+    expect(setActiveId).toHaveBeenCalledWith('chat-b', 'chat-a', 8);
+  });
+
+  it('does not coalesce a target-id match without an authoritative revision', async () => {
+    const stale = {
+      ok: false,
+      error: 'active-conversation-changed' as const,
+      activeConversationId: 'chat-b',
+    };
+    const setActiveId = vi.fn(async () => stale);
+
+    await expect(
+      setActiveConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        expectedCurrentConversationId: 'chat-a',
+        expectedCurrentConversationRevision: 8,
+        isCurrent: () => true,
+        setActiveId,
+      }),
+    ).resolves.toBe(stale);
   });
 
   it('retries transient unavailable reads within a bounded budget', async () => {
@@ -423,6 +447,7 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
       setActiveConversationForWorkspaceRestoration({
         conversationId: 'chat-b',
         expectedCurrentConversationId: 'chat-a',
+        expectedCurrentConversationRevision: 8,
         isCurrent: () => true,
         setActiveId,
         waitForRetry,
@@ -430,7 +455,7 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
     ).resolves.toEqual({ ok: true });
 
     expect(setActiveId).toHaveBeenCalledTimes(3);
-    expect(setActiveId).toHaveBeenNthCalledWith(3, 'chat-b', 'chat-a');
+    expect(setActiveId).toHaveBeenNthCalledWith(3, 'chat-b', 'chat-a', 8);
     expect(waitForRetry.mock.calls).toEqual([[25], [75]]);
   });
 
@@ -442,6 +467,7 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
       setActiveConversationForWorkspaceRestoration({
         conversationId: 'chat-b',
         expectedCurrentConversationId: 'chat-a',
+        expectedCurrentConversationRevision: 8,
         isCurrent: () => current,
         setActiveId,
         waitForRetry: async () => {
@@ -461,6 +487,7 @@ describe('setActiveConversationForWorkspaceRestoration', () => {
       setActiveConversationForWorkspaceRestoration({
         conversationId: 'chat-b',
         expectedCurrentConversationId: 'chat-a',
+        expectedCurrentConversationRevision: 8,
         isCurrent: () => true,
         setActiveId,
         waitForRetry: async () => undefined,

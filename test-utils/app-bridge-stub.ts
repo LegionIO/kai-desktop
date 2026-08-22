@@ -74,7 +74,7 @@ function buildDefaultStub(): AppLike {
       clear: async () => ({ ok: true }),
       getActiveId: async () => null,
       getActiveState: async () => ({ activeConversationId: null, activeConversationRevision: 0 }),
-      setActiveId: async () => ({ ok: true }),
+      setActiveId: async () => ({ ok: true, activeConversationRevision: 1 }),
       onChanged: (_cb: (s: unknown) => void): UnsubFn => noopUnsub(),
     },
     platform: {

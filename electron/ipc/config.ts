@@ -1,5 +1,5 @@
 import type { IpcMain } from 'electron';
-import { readFileSync, existsSync, watch, mkdirSync, chmodSync } from 'fs';
+import { readFileSync, existsSync, watch, mkdirSync, chmodSync, statSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
@@ -1130,6 +1130,18 @@ function workspaceConfigState(config: AppConfig): {
   };
 }
 
+function desktopConfigFileIdentity(configPath: string): string | null {
+  try {
+    const metadata = statSync(configPath, { bigint: true });
+    return [metadata.dev, metadata.ino, metadata.size, metadata.mtimeNs, metadata.ctimeNs]
+      .map((value) => value.toString())
+      .join(':');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return 'missing';
+    return null;
+  }
+}
+
 function failClosedBrowserConfig(config: AppConfig): AppConfig {
   return {
     ...config,
@@ -1317,6 +1329,27 @@ export function registerConfigHandlers(
   let lastBroadcastSnapshot = JSON.stringify(currentConfig);
   let lastBrowserSnapshot = JSON.stringify(currentConfig.browser);
   let lastObservedWorkspaceState = workspaceConfigState(currentConfig);
+  const configPath = getDesktopSettingsPath(appHome);
+  let lastObservedDesktopFileIdentity = desktopConfigFileIdentity(configPath);
+  let workspaceProvenanceAlreadyInvalidated = false;
+
+  const invalidateWorkspaceMutationProvenance = (): void => {
+    if (workspaceProvenanceAlreadyInvalidated) return;
+    workspaceProvenanceAlreadyInvalidated = true;
+    onWorkspaceConfigMutation?.({ activeWorkspaceChanged: true, lastConversationStateChanged: true });
+  };
+
+  const observeDesktopFileIdentity = (forceInvalidation: boolean): void => {
+    const nextIdentity = desktopConfigFileIdentity(configPath);
+    const changed = nextIdentity === null || nextIdentity !== lastObservedDesktopFileIdentity;
+    if (nextIdentity !== null) lastObservedDesktopFileIdentity = nextIdentity;
+    if (forceInvalidation || changed) invalidateWorkspaceMutationProvenance();
+  };
+
+  const rememberInternalDesktopWrite = (): void => {
+    const nextIdentity = desktopConfigFileIdentity(configPath);
+    if (nextIdentity !== null) lastObservedDesktopFileIdentity = nextIdentity;
+  };
 
   const observeWorkspaceConfig = (nextConfig: AppConfig): void => {
     const next = workspaceConfigState(nextConfig);
@@ -1326,13 +1359,16 @@ export function registerConfigHandlers(
         next.lastConversationFingerprint !== lastObservedWorkspaceState.lastConversationFingerprint,
     };
     lastObservedWorkspaceState = next;
-    if (mutation.activeWorkspaceChanged || mutation.lastConversationStateChanged) {
+    if (
+      (mutation.activeWorkspaceChanged || mutation.lastConversationStateChanged) &&
+      !workspaceProvenanceAlreadyInvalidated
+    ) {
       onWorkspaceConfigMutation?.(mutation);
     }
+    workspaceProvenanceAlreadyInvalidated = false;
   };
 
   // Watch for external config changes
-  const configPath = getDesktopSettingsPath(appHome);
   const desktopSettingsDir = dirname(configPath);
   const desktopSettingsBasename = basename(configPath);
   // Once desktop.json has existed, a missing file during an external reload is
@@ -1390,6 +1426,12 @@ export function registerConfigHandlers(
   };
 
   const applyReload = (): boolean => {
+    // A directory watcher can coalesce A→B→A into one callback whose content
+    // equals our last snapshot. File identity still changes for an atomic
+    // replace (inode) or in-place rewrite (mtime/ctime), so invalidate Browser
+    // workspace CAS provenance before trusting the reread. Internal atomic
+    // writes record their new identity synchronously before fs.watch can run.
+    observeDesktopFileIdentity(false);
     try {
       currentConfig = readWatchedConfig();
       observeWorkspaceConfig(currentConfig);
@@ -1407,8 +1449,13 @@ export function registerConfigHandlers(
     }
   };
 
-  const reloadConfig = () => {
+  const reloadConfig = (forceWorkspaceInvalidation = true) => {
     watchedConfigReadPending = true;
+    // The exported no-argument entry point represents an out-of-band reload
+    // request and therefore invalidates even when the final bytes equal the
+    // previous snapshot. Filesystem watcher calls pass false and rely on the
+    // metadata identity comparison above to suppress echoes of our own writes.
+    observeDesktopFileIdentity(forceWorkspaceInvalidation);
     // Do not put Browser lifecycle changes behind the general file-watch
     // debounce. Atomic external edits normally emit more than one fs event;
     // snapshot deduplication makes those cheap while preserving a disable that
@@ -1494,7 +1541,7 @@ export function registerConfigHandlers(
           ) {
             desktopSettingsEstablished = true;
           }
-          reloadConfig();
+          reloadConfig(false);
         }
       });
       // Native watcher setup can fail asynchronously (for example if an
@@ -1557,6 +1604,7 @@ export function registerConfigHandlers(
       setNestedValue(currentConfig as unknown as Record<string, unknown>, path, value);
       validateOrRollback();
       writeDesktopConfig(appHome, currentConfig);
+      rememberInternalDesktopWrite();
       desktopSettingsEstablished = true;
 
       // Also persist to llm.json for built-in provider paths
@@ -1598,6 +1646,7 @@ export function registerConfigHandlers(
       }
       validateOrRollback();
       writeDesktopConfig(appHome, currentConfig);
+      rememberInternalDesktopWrite();
     } catch (error) {
       // Roll back every failure after mutation, including transformation and
       // persistence errors that happen before/after schema validation.

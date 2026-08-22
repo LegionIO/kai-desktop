@@ -225,15 +225,21 @@ export function isConversationWorkspaceRestorationCurrent(options: {
  * still owns the renderer intent, and use a CAS so a newer selection wins. */
 export async function rollbackUnavailableWorkspaceRestoration(options: {
   restoredConversationId: string;
+  restoredConversationRevision: number;
   previousConversationId: string | null;
   isCurrent: () => boolean;
   setActiveId: (
     conversationId: string | null,
     expectedCurrentConversationId: string | null,
+    expectedCurrentRevision: number,
   ) => Promise<{ ok: boolean }>;
 }): Promise<boolean> {
   if (!options.isCurrent()) return false;
-  const result = await options.setActiveId(options.previousConversationId, options.restoredConversationId);
+  const result = await options.setActiveId(
+    options.previousConversationId,
+    options.restoredConversationId,
+    options.restoredConversationRevision,
+  );
   return result.ok && options.isCurrent();
 }
 
@@ -289,10 +295,12 @@ const WORKSPACE_RESTORATION_RETRY_DELAYS_MS = [25, 75, 150] as const;
 export async function setActiveConversationForWorkspaceRestoration(options: {
   conversationId: string;
   expectedCurrentConversationId: string | null;
+  expectedCurrentConversationRevision: number;
   isCurrent: () => boolean;
   setActiveId: (
     conversationId: string,
     expectedCurrentConversationId: string | null,
+    expectedCurrentConversationRevision: number,
   ) => Promise<ActiveConversationCasResult>;
   waitForRetry?: (delayMs: number) => Promise<void>;
 }): Promise<ActiveConversationCasResult | null> {
@@ -304,10 +312,19 @@ export async function setActiveConversationForWorkspaceRestoration(options: {
       }));
   for (let attempt = 0; ; attempt += 1) {
     if (!options.isCurrent()) return null;
-    const result = await options.setActiveId(options.conversationId, options.expectedCurrentConversationId);
+    const result = await options.setActiveId(
+      options.conversationId,
+      options.expectedCurrentConversationId,
+      options.expectedCurrentConversationRevision,
+    );
     if (!options.isCurrent()) return null;
     if (result.error === 'active-conversation-changed' && result.activeConversationId === options.conversationId) {
-      return { ok: true, activeConversationId: result.activeConversationId };
+      if (result.activeConversationRevision === undefined) return result;
+      return {
+        ok: true,
+        activeConversationId: result.activeConversationId,
+        activeConversationRevision: result.activeConversationRevision,
+      };
     }
     if (result.error !== 'conversation-unavailable') return result;
     const delayMs = WORKSPACE_RESTORATION_RETRY_DELAYS_MS[attempt];

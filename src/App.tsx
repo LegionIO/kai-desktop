@@ -930,14 +930,19 @@ function AppShell() {
         // conversation choice must win in the backend as well as this window,
         // otherwise a stale restoration can silently replace that choice
         // before the renderer-side sequence guard observes it.
-        const backendSelectionWhenStarted = await app.conversations.getActiveId();
+        const backendSelectionWhenStarted = await app.conversations.getActiveState();
         if (!isCurrent()) return;
         const activation = await setActiveConversationForWorkspaceRestoration({
           conversationId: restoredId,
-          expectedCurrentConversationId: backendSelectionWhenStarted,
+          expectedCurrentConversationId: backendSelectionWhenStarted.activeConversationId,
+          expectedCurrentConversationRevision: backendSelectionWhenStarted.activeConversationRevision,
           isCurrent,
-          setActiveId: (conversationId, expectedCurrentConversationId) =>
-            app.conversations.setActiveId(conversationId, expectedCurrentConversationId),
+          setActiveId: (conversationId, expectedCurrentConversationId, expectedCurrentConversationRevision) =>
+            app.conversations.setActiveId(
+              conversationId,
+              expectedCurrentConversationId,
+              expectedCurrentConversationRevision,
+            ),
         });
         if (!isCurrent()) return;
         if (!activation) return;
@@ -958,17 +963,24 @@ function AppShell() {
         });
         if (!restoration) return;
         if (restoration.status === 'unavailable') {
+          if (activation.activeConversationRevision === undefined) return;
           await rollbackUnavailableWorkspaceRestoration({
             restoredConversationId: restoredId,
-            previousConversationId: backendSelectionWhenStarted,
+            restoredConversationRevision: activation.activeConversationRevision,
+            previousConversationId: backendSelectionWhenStarted.activeConversationId,
             isCurrent,
-            setActiveId: (conversationId, expectedCurrentConversationId) =>
-              app.conversations.setActiveId(conversationId, expectedCurrentConversationId),
+            setActiveId: (conversationId, expectedCurrentConversationId, expectedCurrentConversationRevision) =>
+              app.conversations.setActiveId(
+                conversationId,
+                expectedCurrentConversationId,
+                expectedCurrentConversationRevision,
+              ),
           });
           return;
         }
         if (restoration.status === 'missing') {
-          const cleared = await app.conversations.setActiveId(null, restoredId);
+          if (activation.activeConversationRevision === undefined) return;
+          const cleared = await app.conversations.setActiveId(null, restoredId, activation.activeConversationRevision);
           if (cleared.ok && isCurrent()) {
             await app.workspaces.saveLastConversation({
               workspaceId: restoringWorkspaceId,

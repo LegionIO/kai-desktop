@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'node:fs';
 import type { BrowserBookmark } from '../../shared/browser.js';
 
 export type ImportedBrowserBookmark = Pick<BrowserBookmark, 'title' | 'url' | 'folder'>;
@@ -9,13 +9,19 @@ export const MAX_IMPORTED_BOOKMARK_FOLDER_CHARS = 2_048;
 export const MAX_BOOKMARK_IMPORT_BYTES = 10 * 1024 * 1024;
 
 const BOOKMARK_READ_CHUNK_BYTES = 64 * 1024;
+export const BOOKMARK_IMPORT_OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
 
 /** Read from one already-open file description and stop after one byte beyond
  * the budget. A selected path can be replaced or grown after the native dialog
  * returns, so a separate stat(path) followed by readFile(path) is not a bound. */
 export function readBoundedBookmarksHtmlFileSync(filePath: string, maxBytes = MAX_BOOKMARK_IMPORT_BYTES): string {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Bookmark import size limit is invalid.');
-  const descriptor = openSync(filePath, 'r');
+  // Open nonblocking before checking the descriptor type. A path selected in
+  // the native dialog can be replaced with a FIFO before this call; a blocking
+  // read-only open would freeze Electron's main process waiting for a writer.
+  // O_NOFOLLOW also keeps the type check bound to the selected path itself.
+  const descriptor = openSync(filePath, BOOKMARK_IMPORT_OPEN_FLAGS);
   try {
     const metadata = fstatSync(descriptor);
     if (!metadata.isFile()) throw new Error('Bookmark import must be a regular file.');

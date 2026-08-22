@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  BOOKMARK_IMPORT_OPEN_FLAGS,
   MAX_IMPORTED_BOOKMARKS,
   MAX_IMPORTED_BOOKMARK_FOLDER_CHARS,
   MAX_IMPORTED_BOOKMARK_FOLDER_DEPTH,
@@ -13,6 +14,15 @@ import {
 import type { BrowserBookmark } from '../../../shared/browser.js';
 
 describe('bookmark HTML import/export', () => {
+  it('opens imports without blocking on special files', () => {
+    if (fsConstants.O_NONBLOCK !== undefined) {
+      expect(BOOKMARK_IMPORT_OPEN_FLAGS & fsConstants.O_NONBLOCK).toBe(fsConstants.O_NONBLOCK);
+    }
+    if (fsConstants.O_NOFOLLOW !== undefined) {
+      expect(BOOKMARK_IMPORT_OPEN_FLAGS & fsConstants.O_NOFOLLOW).toBe(fsConstants.O_NOFOLLOW);
+    }
+  });
+
   it('preserves nested folders and ignores non-web URLs', () => {
     const imported = parseBookmarksHtml(`
       <DL><p>
