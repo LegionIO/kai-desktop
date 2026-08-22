@@ -185,6 +185,43 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1);
   });
 
+  it('switches workspaces when Browser attention targets the already-selected conversation', async () => {
+    let activeWorkspaceId = 'workspace-b';
+    const saveLastConversation = vi.fn(async () => undefined);
+    const setActiveWorkspace = vi.fn(async (workspaceId: string | null) => {
+      activeWorkspaceId = workspaceId ?? '';
+      return true;
+    });
+    const switchConversation = vi.fn(async () => true);
+    const cancelObservation = vi.fn();
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-a',
+        selectionGeneration: 1,
+        getConversation: async () => ({ workspaceId: 'workspace-a' }),
+        getActiveConversationId: () => 'chat-a',
+        getBackendActiveConversationId: async () => 'chat-a',
+        getSelectionGeneration: () => 1,
+        getActiveWorkspaceId: () => activeWorkspaceId,
+        getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+        saveLastConversation,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 1,
+        browserAttentionGeneration: 1,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: cancelObservation }),
+        switchConversation,
+      }),
+    ).resolves.toBe(true);
+
+    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-a', conversationId: 'chat-a' });
+    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-a', 'workspace-b', 'navigate');
+    expect(switchConversation).not.toHaveBeenCalled();
+    expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
   it('does not let delayed Browser attention override a newer user selection', async () => {
     let activeWorkspaceId = 'workspace-a';
     let activeConversationId = 'chat-a';

@@ -6,6 +6,8 @@ vi.mock('electron', () => ({
 }));
 
 const { clearPluginBrowserPartitions } = await import('../plugin-partitions.js');
+const { BROWSER_SESSION_OPERATION_TIMEOUT_MS, waitForBrowserSessionOperations } =
+  await import('../session-operations.js');
 const { beginPluginBrowserPartitionOperation, trackPluginBrowserWindow } =
   await import('../../plugins/browser-window/lifecycle.js');
 
@@ -159,4 +161,55 @@ describe('plugin browser partition clearing', () => {
       expect(reopenedWindow.destroy).not.toHaveBeenCalled();
     },
   );
+
+  it('keeps the creation fence until a timed-out native mutation really settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const partitionName = 'plugin-native-timeout';
+      const persistent = pluginSession();
+      const inMemory = pluginSession();
+      let releaseNativeMutation!: () => void;
+      persistent.closeAllConnections.mockImplementationOnce(
+        () =>
+          new Promise<undefined>((resolve) => {
+            releaseNativeMutation = () => resolve(undefined);
+          }),
+      );
+      const sessions = new Map<string, ReturnType<typeof pluginSession>>([
+        [`persist:${partitionName}`, persistent],
+        [partitionName, inMemory],
+      ]);
+      const options = {
+        getSession: (partition: string) => sessions.get(partition)! as unknown as Session,
+        stopServiceWorkers: async (_scopedSession: Session) => undefined,
+      };
+
+      const clearing = clearPluginBrowserPartitions([partitionName], options);
+      const rejected = expect(clearing).rejects.toThrow(/could not be completely cleared/);
+      await vi.advanceTimersByTimeAsync(BROWSER_SESSION_OPERATION_TIMEOUT_MS);
+      await rejected;
+
+      const duringNativeDrain = { isDestroyed: () => false, destroy: vi.fn() };
+      expect(() => trackPluginBrowserWindow(duringNativeDrain, `persist:${partitionName}`)).toThrow(
+        /currently being cleared/,
+      );
+      expect(duringNativeDrain.destroy).toHaveBeenCalledOnce();
+
+      releaseNativeMutation();
+      await waitForBrowserSessionOperations(persistent as unknown as Session);
+      await Promise.resolve();
+
+      const quarantined = { isDestroyed: () => false, destroy: vi.fn() };
+      expect(() => trackPluginBrowserWindow(quarantined, `persist:${partitionName}`)).toThrow(/remains quarantined/);
+      expect(quarantined.destroy).toHaveBeenCalledOnce();
+
+      await clearPluginBrowserPartitions([partitionName], options);
+      const reopened = { isDestroyed: () => false, destroy: vi.fn() };
+      const stopTracking = trackPluginBrowserWindow(reopened, `persist:${partitionName}`);
+      stopTracking();
+      expect(reopened.destroy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

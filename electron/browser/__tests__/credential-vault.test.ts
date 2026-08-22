@@ -10,6 +10,8 @@ vi.mock('electron', () => ({
 }));
 
 import {
+  BROWSER_CREDENTIAL_AUTHENTICATION_TIMEOUT_MS,
+  BrowserCredentialAuthenticationInterruptedError,
   BrowserCredentialVault,
   listStoredCredentialScopeKeys,
   MAX_BROWSER_CREDENTIALS,
@@ -289,6 +291,55 @@ describe('BrowserCredentialVault', () => {
 
     await expect(copyPending).rejects.toThrow(/authority expired/);
     expect(clipboardValue()).toBe('');
+  });
+
+  it('bounds native authentication and ignores a late successful replacement', async () => {
+    vi.useFakeTimers();
+    const { vault, authenticate } = setup();
+    const created = vault.upsert('https://example.com', 'user', 'original-secret');
+    let releaseAuthentication!: () => void;
+    authenticate.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseAuthentication = resolve;
+        }),
+    );
+
+    const replacement = vault.updateWithAuthentication(created.id, 'user', 'replacement-secret');
+    const rejected = expect(replacement).rejects.toBeInstanceOf(BrowserCredentialAuthenticationInterruptedError);
+    await vi.advanceTimersByTimeAsync(BROWSER_CREDENTIAL_AUTHENTICATION_TIMEOUT_MS);
+    await rejected;
+
+    releaseAuthentication();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vault.decrypt(created.id).password).toBe('original-secret');
+  });
+
+  it('abandons native authentication when renderer authority is revoked', async () => {
+    const { vault, authenticate } = setup();
+    const created = vault.upsert('https://example.com', 'user', 'original-secret');
+    let releaseAuthentication!: () => void;
+    authenticate.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseAuthentication = resolve;
+        }),
+    );
+    const controller = new AbortController();
+
+    const replacement = vault.updateWithAuthentication(
+      created.id,
+      'user',
+      'replacement-secret',
+      () => undefined,
+      controller.signal,
+    );
+    controller.abort();
+    await expect(replacement).rejects.toBeInstanceOf(BrowserCredentialAuthenticationInterruptedError);
+
+    releaseAuthentication();
+    await Promise.resolve();
+    expect(vault.decrypt(created.id).password).toBe('original-secret');
   });
 
   it('clears an unchanged copied password immediately when the vault is cleared or disposed', async () => {

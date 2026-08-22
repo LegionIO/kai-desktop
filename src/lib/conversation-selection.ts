@@ -194,9 +194,15 @@ export async function openBrowserConversationInWorkspace(options: {
   // newer intent merely because its record/workspace lookup was slow. If the
   // target was selected by the workspace restoration we initiated, the request
   // already succeeded and must not issue a second selection CAS.
-  if (options.getActiveConversationId() === options.conversationId) return true;
+  const activeWorkspaceAfterLookup = options.getActiveWorkspaceId();
+  if (
+    options.getActiveConversationId() === options.conversationId &&
+    (!conversation.workspaceId || conversation.workspaceId === activeWorkspaceAfterLookup)
+  ) {
+    return true;
+  }
   if (!selectionIsCurrent()) return false;
-  const activeWorkspaceAtPreparation = options.getActiveWorkspaceId();
+  const activeWorkspaceAtPreparation = activeWorkspaceAfterLookup;
 
   // Read workspace state only after the async record lookup. Browser attention
   // can arrive while the user is changing workspaces, and render-captured state

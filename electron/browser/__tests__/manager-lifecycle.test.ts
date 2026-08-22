@@ -88,6 +88,9 @@ const {
 } = await import('../session.js');
 const { BrowserActionQueue } = await import('../action-queue.js');
 const { BROWSER_SERVICE_WORKER_COMMAND_TIMEOUT_MS } = await import('../service-workers.js');
+const { BrowserCredentialAuthenticationInterruptedError } = await import('../credential-vault.js');
+const { BROWSER_SESSION_OPERATION_TIMEOUT_MS, waitForBrowserSessionOperations } =
+  await import('../session-operations.js');
 const { trackPluginBrowserWindow } = await import('../../plugins/browser-window/lifecycle.js');
 const {
   clearPendingBrowserCleanupScopeKey,
@@ -3795,6 +3798,7 @@ describe('browser manager renderer lifecycle', () => {
       'alice',
       'replacement-secret',
       expect.any(Function),
+      undefined,
     );
     expect(pending.password).toBe('');
     expect(Reflect.get(manager, 'pendingCredentials')).toHaveLength(0);
@@ -3840,6 +3844,78 @@ describe('browser manager renderer lifecycle', () => {
     });
     expect(emit).not.toHaveBeenCalled();
     clearTimeout(pending.timer);
+  });
+
+  it('wipes a password-save prompt when bounded native authentication is interrupted', async () => {
+    const pending = {
+      tabId: 'tab-1',
+      conversationId: 'chat-1',
+      origin: 'https://example.com',
+      username: 'alice',
+      password: 'replacement-secret',
+      scopeKey: 'global',
+      timer: setTimeout(() => undefined, 60_000),
+    };
+    const upsertWithAuthentication = vi.fn(async () => {
+      throw new BrowserCredentialAuthenticationInterruptedError('Password authentication timed out.');
+    });
+    const emit = vi.fn();
+    const manager = managerWithoutConstructor({
+      assertScopeAvailable: vi.fn(),
+      emit,
+      pendingCredentials: new Map([['credential-1', pending]]),
+      tabs: new Map([
+        ['tab-1', { generation: 4, scopeKey: 'global', shell: { id: 'tab-1', conversationId: 'chat-1' } }],
+      ]),
+      vaultForScope: vi.fn(() => ({ upsertWithAuthentication })),
+      withScopeActivity: (_scopeKey: string, operation: () => Promise<unknown>) => operation(),
+    });
+
+    await expect(manager.respondCredentialPrompt('credential-1', true)).rejects.toThrow(/timed out/i);
+
+    expect(Reflect.get(manager, 'pendingCredentials')).toHaveLength(0);
+    expect(pending.password).toBe('');
+    expect(emit).toHaveBeenCalledWith({
+      type: 'prompt-dismissed',
+      conversationId: 'chat-1',
+      promptId: 'credential-1',
+      promptKind: 'credential',
+    });
+  });
+
+  it('keeps a profile unavailable until a timed-out native Session mutation really settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const nativeGate = deferred<void>();
+      const nativeMutation = vi.fn(() => nativeGate.promise);
+      const scopedSession = {} as never;
+      const manager = managerWithoutConstructor({
+        browserEnabled: true,
+        pendingSessionMutationScopes: new Map<string, number>(),
+      });
+
+      const operation = invokePrivate(
+        manager,
+        'runBrowserSessionMutation',
+        'global',
+        scopedSession,
+        'Browser test mutation',
+        nativeMutation,
+      ) as Promise<void>;
+      const rejected = expect(operation).rejects.toThrow(/deadline/i);
+      await vi.advanceTimersByTimeAsync(BROWSER_SESSION_OPERATION_TIMEOUT_MS);
+      await rejected;
+
+      expect(nativeMutation).toHaveBeenCalledOnce();
+      expect(() => invokePrivate(manager, 'assertScopeAvailable', 'global')).toThrow(/timed-out Chromium operation/i);
+
+      nativeGate.resolve();
+      await waitForBrowserSessionOperations(scopedSession);
+      await Promise.resolve();
+      expect(() => invokePrivate(manager, 'assertScopeAvailable', 'global')).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not persist a captured password when its page changes during native authentication', async () => {
@@ -21490,6 +21566,7 @@ describe('browser manager renderer lifecycle', () => {
       undefined,
       true,
     );
+    await Promise.resolve();
     expect(closeAllConnections).toHaveBeenCalledOnce();
     expect(cancelActiveDownloadsForScopes).toHaveBeenCalledWith(new Set(['global']));
     expect(destroyView).toHaveBeenCalledWith(tab);

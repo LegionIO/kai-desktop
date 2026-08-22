@@ -61,11 +61,13 @@ import { BrowserValidatingProxy } from './validating-proxy.js';
 import { BrowserAssistantRunRegistry, type BrowserAssistantModality } from './assistant-runs.js';
 import { parseBookmarksHtml, readBoundedBookmarksHtmlFileSync, renderBookmarksHtml } from './bookmarks-html.js';
 import {
+  BrowserCredentialAuthenticationInterruptedError,
   BrowserCredentialVault,
   listStoredCredentialScopeKeys,
   readStoredCredentialCountAsync,
 } from './credential-vault.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
+import { runBrowserSessionOperation } from './session-operations.js';
 import {
   assistantDownloadQuarantinePath,
   exportAssistantDownloadFile,
@@ -1416,6 +1418,10 @@ export class BrowserManager {
   private readonly scopeGenerations = new Map<string, number>();
   private scopeGenerationSerial = 0;
   private readonly scopeRequestActivities = new Map<string, Map<number, () => void>>();
+  /** A timed-out Electron Session mutation continues natively because Electron
+   * cannot cancel it. Keep that profile unavailable until the shared native
+   * queue reports the real operation settled. */
+  private readonly pendingSessionMutationScopes = new Map<string, number>();
   private readonly scopeRuntimeReleaseTokens = new Map<string, object>();
   private readonly restrictedBackgroundScopes = new Set<string>();
   private readonly assistantControlledOrigins = new Map<string, Set<string>>();
@@ -1659,7 +1665,11 @@ export class BrowserManager {
     // to close every connection, matching the normal transition barrier.
     const connectionDrain = Promise.allSettled([
       ...serviceWorkerStops,
-      ...[...sessions.values()].map((scopedSession) => scopedSession.closeAllConnections()),
+      ...[...sessions].map(([scopeKey, scopedSession]) =>
+        this.runBrowserSessionMutation(scopeKey, scopedSession, 'Browser network connection reset', () =>
+          scopedSession.closeAllConnections(),
+        ),
+      ),
     ]).then((results) => {
       const failures = results
         .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -2035,6 +2045,10 @@ export class BrowserManager {
     }
   }
 
+  private hostRendererOperationAbortSignal(): AbortSignal | undefined {
+    return this.hostRendererOperationContext?.getStore()?.abortSignal;
+  }
+
   /** The preload sends this only after the replacement realm has installed its
    * context bridge. Until then the persistent WebContents identity is not proof
    * that any Browser IPC originated from the new renderer realm. */
@@ -2097,7 +2111,11 @@ export class BrowserManager {
       const networkQuiescence = await Promise.allSettled([
         ...(preemption ? [preemption.connectionDrain] : []),
         ...serviceWorkerStops,
-        ...[...sessions.values()].map((scopedSession) => scopedSession.closeAllConnections()),
+        ...[...sessions].map(([scopeKey, scopedSession]) =>
+          this.runBrowserSessionMutation(scopeKey, scopedSession, 'Browser network connection reset', () =>
+            scopedSession.closeAllConnections(),
+          ),
+        ),
       ]);
       const networkFailures = networkQuiescence
         .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -2409,6 +2427,9 @@ export class BrowserManager {
     if (this.pendingCleanupQuarantineUnreadable || this.clearQuarantinedScopes?.has(scopeKey)) {
       throw new Error('Browser data for this profile is quarantined until its pending clear succeeds.');
     }
+    if ((this.pendingSessionMutationScopes?.get(scopeKey) ?? 0) > 0) {
+      throw new Error('Browser data for this profile is waiting for a timed-out Chromium operation to settle.');
+    }
     if (this.suspendedScopes?.has(scopeKey)) {
       throw new Error('Browser data for this profile is currently unavailable.');
     }
@@ -2420,8 +2441,38 @@ export class BrowserManager {
       this.clearingScopes.has(scopeKey) ||
       this.pendingCleanupQuarantineUnreadable === true ||
       this.clearQuarantinedScopes?.has(scopeKey) === true ||
+      (this.pendingSessionMutationScopes?.get(scopeKey) ?? 0) > 0 ||
       this.suspendedScopes?.has(scopeKey) === true
     );
+  }
+
+  private runBrowserSessionMutation<T>(
+    scopeKey: string,
+    targetSession: Session,
+    label: string,
+    operation: () => Promise<T>,
+    abortSignal?: AbortSignal,
+    onSettledAfterInterruption?: () => void,
+  ): Promise<T> {
+    let interruptedLeaseHeld = false;
+    return runBrowserSessionOperation(targetSession, label, operation, {
+      abortSignal,
+      onInterrupted: () => {
+        if (interruptedLeaseHeld) return;
+        interruptedLeaseHeld = true;
+        const pending = this.pendingSessionMutationScopes;
+        pending.set(scopeKey, (pending.get(scopeKey) ?? 0) + 1);
+      },
+      onSettledAfterInterruption: () => {
+        if (!interruptedLeaseHeld) return;
+        interruptedLeaseHeld = false;
+        const pending = this.pendingSessionMutationScopes;
+        const remaining = (pending.get(scopeKey) ?? 1) - 1;
+        if (remaining > 0) pending.set(scopeKey, remaining);
+        else pending.delete(scopeKey);
+        onSettledAfterInterruption?.();
+      },
+    });
   }
 
   /** Scope generations are globally monotonic for this manager lifetime. A
@@ -7546,12 +7597,25 @@ export class BrowserManager {
       const scopedSession = session.fromPartition(tab.partition);
       await this.stopRunningServiceWorkers(scopedSession, undefined, true);
       assertControlCurrent();
-      await scopedSession.closeAllConnections();
+      await this.runBrowserSessionMutation(
+        tab.scopeKey,
+        scopedSession,
+        'Browser origin network connection reset',
+        () => scopedSession.closeAllConnections(),
+        run.abortSignal,
+      );
       assertControlCurrent();
-      await scopedSession.clearStorageData({
-        origin,
-        storages: UNSAFE_ORIGIN_STORAGE_TYPES,
-      });
+      await this.runBrowserSessionMutation(
+        tab.scopeKey,
+        scopedSession,
+        'Browser origin storage clear',
+        () =>
+          scopedSession.clearStorageData({
+            origin,
+            storages: UNSAFE_ORIGIN_STORAGE_TYPES,
+          }),
+        run.abortSignal,
+      );
       storageCleared = true;
       // Commit the durable provenance removal only after Chromium confirms that
       // every non-cookie storage category for this origin was cleared.
@@ -7627,12 +7691,19 @@ export class BrowserManager {
         const scopedSession = session.fromPartition(tab.partition);
         await this.stopRunningServiceWorkers(scopedSession, undefined, true);
         this.assertScopeAvailable(tab.scopeKey);
-        await scopedSession.closeAllConnections();
+        await this.runBrowserSessionMutation(
+          tab.scopeKey,
+          scopedSession,
+          'Browser scripted-origin connection reset',
+          () => scopedSession.closeAllConnections(),
+        );
         this.assertScopeAvailable(tab.scopeKey);
-        await scopedSession.clearStorageData({
-          origin,
-          storages: SCRIPTED_ORIGIN_STORAGE_TYPES,
-        });
+        await this.runBrowserSessionMutation(tab.scopeKey, scopedSession, 'Browser scripted-origin storage clear', () =>
+          scopedSession.clearStorageData({
+            origin,
+            storages: SCRIPTED_ORIGIN_STORAGE_TYPES,
+          }),
+        );
         // Commit the provenance removal only after Chromium confirms that the
         // persistent registration is gone. A metadata write failure therefore
         // remains fail closed even though the native cleanup already succeeded.
@@ -9450,7 +9521,14 @@ export class BrowserManager {
           // count nonzero forever and prevent the cleanup needed to terminate it.
           await this.stopRunningServiceWorkers(scopedSession, undefined, true);
           if (!remainsReleasable()) return;
-          await scopedSession.closeAllConnections();
+          await this.runBrowserSessionMutation(
+            scopeKey,
+            scopedSession,
+            'Idle Browser profile connection reset',
+            () => scopedSession.closeAllConnections(),
+            undefined,
+            () => this.releaseScopeRuntimeWhenIdle(scopeKey),
+          );
           this.finishAllScopeRequestActivities(scopeKey);
         }
         await this.waitForScopeIdle(scopeKey);
@@ -15078,8 +15156,12 @@ export class BrowserManager {
     }
     const scopeKey = this.scopeKey(conversationId);
     await this.withScopeActivity(scopeKey, () =>
-      this.vaultForScope(scopeKey).upsertWithAuthentication(parsed.origin, username, password, () =>
-        this.assertHostRendererOperationCurrent(),
+      this.vaultForScope(scopeKey).upsertWithAuthentication(
+        parsed.origin,
+        username,
+        password,
+        () => this.assertHostRendererOperationCurrent(),
+        this.hostRendererOperationAbortSignal(),
       ),
     );
   }
@@ -15102,8 +15184,12 @@ export class BrowserManager {
     }
     const scopeKey = this.scopeKey(conversationId);
     await this.withScopeActivity(scopeKey, () =>
-      this.vaultForScope(scopeKey).updateWithAuthentication(credentialId, username, password, () =>
-        this.assertHostRendererOperationCurrent(),
+      this.vaultForScope(scopeKey).updateWithAuthentication(
+        credentialId,
+        username,
+        password,
+        () => this.assertHostRendererOperationCurrent(),
+        this.hostRendererOperationAbortSignal(),
       ),
     );
   }
@@ -15111,21 +15197,33 @@ export class BrowserManager {
   async deleteCredential(conversationId: string, credentialId: string): Promise<void> {
     const scopeKey = this.scopeKey(conversationId);
     await this.withScopeActivity(scopeKey, () =>
-      this.vaultForScope(scopeKey).delete(credentialId, () => this.assertHostRendererOperationCurrent()),
+      this.vaultForScope(scopeKey).delete(
+        credentialId,
+        () => this.assertHostRendererOperationCurrent(),
+        this.hostRendererOperationAbortSignal(),
+      ),
     );
   }
 
   revealCredential(conversationId: string, credentialId: string): Promise<string> {
     const scopeKey = this.scopeKey(conversationId);
     return this.withScopeActivity(scopeKey, () =>
-      this.vaultForScope(scopeKey).reveal(credentialId, () => this.assertHostRendererOperationCurrent()),
+      this.vaultForScope(scopeKey).reveal(
+        credentialId,
+        () => this.assertHostRendererOperationCurrent(),
+        this.hostRendererOperationAbortSignal(),
+      ),
     );
   }
 
   copyCredential(conversationId: string, credentialId: string): Promise<void> {
     const scopeKey = this.scopeKey(conversationId);
     return this.withScopeActivity(scopeKey, () =>
-      this.vaultForScope(scopeKey).copy(credentialId, () => this.assertHostRendererOperationCurrent()),
+      this.vaultForScope(scopeKey).copy(
+        credentialId,
+        () => this.assertHostRendererOperationCurrent(),
+        this.hostRendererOperationAbortSignal(),
+      ),
     );
   }
 
@@ -15209,6 +15307,7 @@ export class BrowserManager {
           pending.username,
           pending.password,
           assertResponseLeaseCurrent,
+          this.hostRendererOperationAbortSignal(),
         ),
       );
       if (this.pendingCredentials.get(id) === pending) this.dropPendingCredential(id);
@@ -15216,7 +15315,10 @@ export class BrowserManager {
       // Native authentication can be cancelled. Restore the prompt timeout only
       // while this exact pending secret still belongs to the prompt; tab/profile
       // teardown may have dismissed and wiped it while authentication was open.
-      if (responseLeaseInvalid && this.pendingCredentials.get(id) === pending) {
+      if (
+        (responseLeaseInvalid || error instanceof BrowserCredentialAuthenticationInterruptedError) &&
+        this.pendingCredentials.get(id) === pending
+      ) {
         this.dropPendingCredential(id);
       } else if (this.pendingCredentials.get(id) === pending) {
         pending.responding = false;
@@ -15832,7 +15934,13 @@ export class BrowserManager {
                   failures.push(error);
                 }
                 try {
-                  await getBrowserSession(scopeKey).closeAllConnections();
+                  const scopedSession = getBrowserSession(scopeKey);
+                  await this.runBrowserSessionMutation(
+                    scopeKey,
+                    scopedSession,
+                    'Browser data-clear connection reset',
+                    () => scopedSession.closeAllConnections(),
+                  );
                 } catch (error) {
                   failures.push(error);
                 }
@@ -15875,7 +15983,10 @@ export class BrowserManager {
               run: async () => {
                 requireNetworkQuiescence();
                 requireDownloadQuiescence();
-                await getBrowserSession(scopeKey).clearStorageData();
+                const scopedSession = getBrowserSession(scopeKey);
+                await this.runBrowserSessionMutation(scopeKey, scopedSession, 'Browser Chromium storage clear', () =>
+                  scopedSession.clearStorageData(),
+                );
                 chromiumStorageClearedScopeKeys.add(scopeKey);
               },
             },
@@ -15884,7 +15995,10 @@ export class BrowserManager {
               run: () => {
                 requireNetworkQuiescence();
                 requireDownloadQuiescence();
-                return getBrowserSession(scopeKey).clearCache();
+                const scopedSession = getBrowserSession(scopeKey);
+                return this.runBrowserSessionMutation(scopeKey, scopedSession, 'Browser Chromium cache clear', () =>
+                  scopedSession.clearCache(),
+                );
               },
             },
             {
@@ -15892,7 +16006,13 @@ export class BrowserManager {
               run: () => {
                 requireNetworkQuiescence();
                 requireDownloadQuiescence();
-                return getBrowserSession(scopeKey).clearAuthCache();
+                const scopedSession = getBrowserSession(scopeKey);
+                return this.runBrowserSessionMutation(
+                  scopeKey,
+                  scopedSession,
+                  'Browser HTTP authentication cache clear',
+                  () => scopedSession.clearAuthCache(),
+                );
               },
             },
             {
@@ -16425,6 +16545,7 @@ export class BrowserManager {
     this.activeDownloads.clear();
     this.removedConversations.clear();
     this.scopeGenerations.clear();
+    this.pendingSessionMutationScopes?.clear();
     this.scopeRuntimeReleaseTokens.clear();
     this.pendingAssistantTabClosures.clear();
     this.assistantTabCleanups?.clear();
@@ -16483,7 +16604,11 @@ export class BrowserManager {
       // a worker can continue under the unguarded persistent session.
       const networkQuiescence = await Promise.allSettled([
         ...serviceWorkerStops,
-        ...[...sessions.values()].map((scopedSession) => scopedSession.closeAllConnections()),
+        ...[...sessions].map(([scopeKey, scopedSession]) =>
+          this.runBrowserSessionMutation(scopeKey, scopedSession, 'Browser shutdown connection reset', () =>
+            scopedSession.closeAllConnections(),
+          ),
+        ),
       ]);
       const networkFailures = networkQuiescence
         .filter((result): result is PromiseRejectedResult => result.status === 'rejected')

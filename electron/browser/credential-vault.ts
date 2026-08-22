@@ -29,6 +29,14 @@ const clipboardPasswordOwners = new WeakMap<ClipboardAdapter, symbol>();
 
 export const MAX_BROWSER_CREDENTIALS = 1_000;
 export const MAX_CREDENTIAL_VAULT_BYTES = 32 * 1024 * 1024;
+export const BROWSER_CREDENTIAL_AUTHENTICATION_TIMEOUT_MS = 30_000;
+
+export class BrowserCredentialAuthenticationInterruptedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BrowserCredentialAuthenticationInterruptedError';
+  }
+}
 
 function safeScopeKey(value: string): string {
   if (!/^(global|conversation-[a-f0-9]{24})$/.test(value)) throw new Error('Invalid browser profile key.');
@@ -197,6 +205,42 @@ export class BrowserCredentialVault {
     }
   }
 
+  private async authenticateWithDeadline(
+    reason: string,
+    checkpoint: () => void,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    checkpoint();
+    if (abortSignal?.aborted) {
+      throw new BrowserCredentialAuthenticationInterruptedError('Password authentication was cancelled.');
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new BrowserCredentialAuthenticationInterruptedError('Password authentication timed out.'));
+      }, BROWSER_CREDENTIAL_AUTHENTICATION_TIMEOUT_MS);
+      timer.unref?.();
+      if (abortSignal) {
+        onAbort = () => {
+          reject(new BrowserCredentialAuthenticationInterruptedError('Password authentication was cancelled.'));
+        };
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+    try {
+      // Electron cannot cancel an already-visible Touch ID sheet. Stop retaining
+      // the calling operation and any plaintext arguments at our own deadline;
+      // Promise.race keeps the abandoned native rejection observed, and the
+      // post-authentication checkpoint prevents a late success from mutating.
+      await Promise.race([this.authenticate(reason), interrupted]);
+      checkpoint();
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abortSignal && onAbort) abortSignal.removeEventListener('abort', onAbort);
+    }
+  }
+
   private saveFile(credentials: StoredCredential[]): void {
     if (credentials.length > MAX_BROWSER_CREDENTIALS) {
       throw new Error(`The browser password vault is limited to ${MAX_BROWSER_CREDENTIALS} credentials.`);
@@ -227,10 +271,15 @@ export class BrowserCredentialVault {
     username: string,
     password: string,
     checkpoint: () => void = () => undefined,
+    abortSignal?: AbortSignal,
   ): Promise<BrowserCredentialSummary> {
     checkpoint();
     if (this.has(origin, username)) {
-      await this.authenticate(`Replace a saved ${__BRAND_PRODUCT_NAME} browser password`);
+      await this.authenticateWithDeadline(
+        `Replace a saved ${__BRAND_PRODUCT_NAME} browser password`,
+        checkpoint,
+        abortSignal,
+      );
     }
     checkpoint();
     return this.upsert(origin, username, password);
@@ -303,19 +352,28 @@ export class BrowserCredentialVault {
     username: string,
     password: string,
     checkpoint: () => void = () => undefined,
+    abortSignal?: AbortSignal,
   ): Promise<BrowserCredentialSummary> {
     checkpoint();
     if (!this.credentials.some((item) => item.id === id)) throw new Error('Credential not found.');
-    await this.authenticate(`Replace a saved ${__BRAND_PRODUCT_NAME} browser password`);
+    await this.authenticateWithDeadline(
+      `Replace a saved ${__BRAND_PRODUCT_NAME} browser password`,
+      checkpoint,
+      abortSignal,
+    );
     checkpoint();
     return this.update(id, username, password);
   }
 
-  async delete(id: string, checkpoint: () => void = () => undefined): Promise<void> {
+  async delete(id: string, checkpoint: () => void = () => undefined, abortSignal?: AbortSignal): Promise<void> {
     checkpoint();
     this.assertWritable();
     if (!this.credentials.some((item) => item.id === id)) throw new Error('Credential not found.');
-    await this.authenticate(`Delete a saved ${__BRAND_PRODUCT_NAME} browser password`);
+    await this.authenticateWithDeadline(
+      `Delete a saved ${__BRAND_PRODUCT_NAME} browser password`,
+      checkpoint,
+      abortSignal,
+    );
     checkpoint();
     this.assertWritable();
     if (!this.credentials.some((item) => item.id === id)) throw new Error('Credential not found.');
@@ -347,16 +405,22 @@ export class BrowserCredentialVault {
     return { ...summary };
   }
 
-  async reveal(id: string, checkpoint: () => void = () => undefined): Promise<string> {
-    checkpoint();
-    await this.authenticate(`Reveal a saved ${__BRAND_PRODUCT_NAME} browser password`);
+  async reveal(id: string, checkpoint: () => void = () => undefined, abortSignal?: AbortSignal): Promise<string> {
+    await this.authenticateWithDeadline(
+      `Reveal a saved ${__BRAND_PRODUCT_NAME} browser password`,
+      checkpoint,
+      abortSignal,
+    );
     checkpoint();
     return this.decrypt(id).password;
   }
 
-  async copy(id: string, checkpoint: () => void = () => undefined): Promise<void> {
-    checkpoint();
-    await this.authenticate(`Copy a saved ${__BRAND_PRODUCT_NAME} browser password`);
+  async copy(id: string, checkpoint: () => void = () => undefined, abortSignal?: AbortSignal): Promise<void> {
+    await this.authenticateWithDeadline(
+      `Copy a saved ${__BRAND_PRODUCT_NAME} browser password`,
+      checkpoint,
+      abortSignal,
+    );
     checkpoint();
     const value = this.decrypt(id).password;
     this.clearCopiedPassword();

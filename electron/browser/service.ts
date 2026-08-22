@@ -4,6 +4,7 @@ import { conversationExistenceState } from '../ipc/conversation-store.js';
 import { BrowserManager } from './manager.js';
 import { BrowserCredentialVault } from './credential-vault.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
+import { runBrowserSessionOperation } from './session-operations.js';
 import { removeAssistantDownloadQuarantineForScope } from './download-quarantine.js';
 import { browserPartitionForScopeKey, browserScopeKey } from './session.js';
 import { BrowserProfileStore } from './store.js';
@@ -111,11 +112,31 @@ export async function removeBrowserConversationData(appHome: string, conversatio
         // Quiesce both before clearing storage so background code cannot race the
         // clear or immediately repopulate it. Failure leaves the retry marker.
         await stopRunningBrowserServiceWorkers(scopedSession, undefined, true);
-        await scopedSession.closeAllConnections();
+        await runBrowserSessionOperation(scopedSession, 'Browser conversation connection reset', () =>
+          scopedSession.closeAllConnections(),
+        );
         await runBrowserDataClearOperations(`Browser profile ${scopeKey}`, [
-          { label: 'Chromium storage', run: () => scopedSession.clearStorageData() },
-          { label: 'Chromium cache', run: () => scopedSession.clearCache() },
-          { label: 'HTTP authentication cache', run: () => scopedSession.clearAuthCache() },
+          {
+            label: 'Chromium storage',
+            run: () =>
+              runBrowserSessionOperation(scopedSession, 'Browser conversation Chromium storage clear', () =>
+                scopedSession.clearStorageData(),
+              ),
+          },
+          {
+            label: 'Chromium cache',
+            run: () =>
+              runBrowserSessionOperation(scopedSession, 'Browser conversation Chromium cache clear', () =>
+                scopedSession.clearCache(),
+              ),
+          },
+          {
+            label: 'HTTP authentication cache',
+            run: () =>
+              runBrowserSessionOperation(scopedSession, 'Browser conversation HTTP authentication cache clear', () =>
+                scopedSession.clearAuthCache(),
+              ),
+          },
           {
             label: 'assistant download quarantine',
             run: () => removeAssistantDownloadQuarantineForScope(appHome, scopeKey),

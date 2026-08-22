@@ -6,6 +6,7 @@ import {
   waitForPluginBrowserPartitionOperations,
 } from '../plugins/browser-window/lifecycle.js';
 import { runBrowserDataClearOperations } from './data-clear.js';
+import { runBrowserSessionOperation, waitForBrowserSessionOperations } from './session-operations.js';
 import { stopRunningBrowserServiceWorkers } from './service-workers.js';
 
 export type PluginPartitionClearOptions = {
@@ -67,11 +68,12 @@ export async function clearPluginBrowserPartitions(
       // Preserve the previous implementation's per-call ordering while the
       // partition queue serializes overlapping calls for the same profile.
       await priorPartitionInCall.catch(() => undefined);
+      const sessions = new Map<string, Session>();
+      let releaseAfterNativeDrain = false;
       try {
         // The fence above rejects new Session users. Drain operations admitted
         // before it before constructing a Session or mutating Chromium state.
         await waitForPluginBrowserPartitionOperations([partitionName]);
-        const sessions = new Map<string, Session>();
         const scopedSession = (electronPartition: string): Session => {
           let current = sessions.get(electronPartition);
           if (!current) {
@@ -97,7 +99,12 @@ export async function clearPluginBrowserPartitions(
             },
             {
               label: `${label} network connections`,
-              run: () => scopedSession(electronPartition).closeAllConnections(),
+              run: () => {
+                const current = scopedSession(electronPartition);
+                return runBrowserSessionOperation(current, `${label} plugin Browser connection reset`, () =>
+                  current.closeAllConnections(),
+                );
+              },
             },
           ]),
         );
@@ -105,15 +112,32 @@ export async function clearPluginBrowserPartitions(
           ...variants.flatMap(({ label, electronPartition }) => [
             {
               label: `${label} Chromium storage`,
-              run: () => scopedSession(electronPartition).clearStorageData(),
+              run: () => {
+                const current = scopedSession(electronPartition);
+                return runBrowserSessionOperation(current, `${label} plugin Browser Chromium storage clear`, () =>
+                  current.clearStorageData(),
+                );
+              },
             },
             {
               label: `${label} Chromium cache`,
-              run: () => scopedSession(electronPartition).clearCache(),
+              run: () => {
+                const current = scopedSession(electronPartition);
+                return runBrowserSessionOperation(current, `${label} plugin Browser Chromium cache clear`, () =>
+                  current.clearCache(),
+                );
+              },
             },
             {
               label: `${label} HTTP authentication cache`,
-              run: () => scopedSession(electronPartition).clearAuthCache(),
+              run: () => {
+                const current = scopedSession(electronPartition);
+                return runBrowserSessionOperation(
+                  current,
+                  `${label} plugin Browser HTTP authentication cache clear`,
+                  () => current.clearAuthCache(),
+                );
+              },
             },
           ]),
           ...(options.removePersistentData
@@ -126,8 +150,19 @@ export async function clearPluginBrowserPartitions(
             : []),
         ]);
         completePluginBrowserPartitionClear(partitionName);
+      } catch (error) {
+        // A timed-out Electron mutation still owns the native Session queue.
+        // Return the error to Settings now, but keep the plugin creation fence
+        // until every already-admitted native mutation has really settled.
+        if (sessions.size > 0) {
+          releaseAfterNativeDrain = true;
+          void Promise.allSettled([...sessions.values()].map(waitForBrowserSessionOperations)).finally(() =>
+            releasePartitionClear(),
+          );
+        }
+        throw error;
       } finally {
-        releasePartitionClear();
+        if (!releaseAfterNativeDrain) releasePartitionClear();
       }
     });
     operations.push(operation);

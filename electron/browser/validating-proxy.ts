@@ -12,6 +12,7 @@ import { Agent as HttpsAgent, request as requestHttps } from 'node:https';
 import { connect, isIP, type Socket } from 'node:net';
 import { connect as connectTls } from 'node:tls';
 import type { AuthInfo, Session } from 'electron';
+import { runBrowserSessionOperation } from './session-operations.js';
 import { isPrivateResolvedAddress } from './session.js';
 
 type ResolvedEndpoint = { address: string; family: 4 | 6 };
@@ -237,18 +238,10 @@ async function readSocketHeaderBlock(socket: Socket): Promise<Buffer> {
   });
 }
 
-async function withOperationTimeout<T>(
-  operation: Promise<T>,
-  timeoutMs: number,
-  message: string,
-  onTimeout?: () => void,
-): Promise<T> {
+async function withOperationTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      onTimeout?.();
-      reject(new Error(message));
-    }, timeoutMs);
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
     timer.unref?.();
   });
   try {
@@ -366,11 +359,6 @@ export class BrowserValidatingProxy {
    * with the internal challenge and receive a one-shot guard credential. */
   private readonly authenticationRealm = `Kai Browser Network Guard ${randomBytes(16).toString('hex')}`;
   private readonly configuredSessions = new WeakMap<Session, { generation: number; promise: Promise<void> }>();
-  /** Electron does not provide cancellation for setProxy() or
-   * closeAllConnections(). Keep every native mutation ordered even after its
-   * caller times out so a late stale completion cannot overwrite a replacement
-   * listener or tear down connections opened by a newer configuration. */
-  private readonly sessionOperationTails = new WeakMap<Session, Promise<void>>();
   private readonly restrictedRequests = new Map<string, string>();
   private readonly restrictedHostCounts = new Map<string, number>();
   private readonly authorities = new Map<string, ProxyAuthority>();
@@ -416,31 +404,30 @@ export class BrowserValidatingProxy {
       if (this.closed || this.listenerGeneration !== generation) {
         throw new Error('The Browser validating proxy changed while the session was being configured.');
       }
-      await this.runSessionOperation(
+      await runBrowserSessionOperation(
         session,
-        generation,
-        () =>
-          session.setProxy({
+        'Browser session proxy configuration',
+        async () => {
+          if (this.closed || this.listenerGeneration !== generation) {
+            throw new Error('The Browser validating proxy changed while the session was being configured.');
+          }
+          await session.setProxy({
             mode: 'fixed_servers',
             proxyRules: `http://127.0.0.1:${port}`,
             // Chromium otherwise bypasses proxies for loopback/private literal
             // targets before Kai can apply the assistant policy.
             proxyBypassRules: '<-loopback>',
-          }),
-        'Browser session proxy configuration timed out.',
+          });
+          if (this.closed || this.listenerGeneration !== generation) {
+            throw new Error('The Browser validating proxy changed while the session was being configured.');
+          }
+          await session.closeAllConnections();
+          if (this.closed || this.listenerGeneration !== generation) {
+            throw new Error('The Browser validating proxy changed while the session was being configured.');
+          }
+        },
+        { timeoutMs: this.operationTimeoutMs },
       );
-      if (this.closed || this.listenerGeneration !== generation) {
-        throw new Error('The Browser validating proxy changed while the session was being configured.');
-      }
-      await this.runSessionOperation(
-        session,
-        generation,
-        () => session.closeAllConnections(),
-        'Browser session connection reset timed out.',
-      );
-      if (this.closed || this.listenerGeneration !== generation) {
-        throw new Error('The Browser validating proxy changed while the session was being configured.');
-      }
     });
     const entry = { generation, promise: configured };
     this.configuredSessions.set(session, entry);
@@ -453,39 +440,6 @@ export class BrowserValidatingProxy {
       }
     });
     return configured;
-  }
-
-  private runSessionOperation<T>(
-    session: Session,
-    generation: number,
-    operation: () => Promise<T>,
-    timeoutMessage: string,
-  ): Promise<T> {
-    let callerTimedOut = false;
-    const prior = this.sessionOperationTails.get(session) ?? Promise.resolve();
-    const queued = prior
-      .catch(() => undefined)
-      .then(() => {
-        // A timeout while waiting in the native queue withdraws this operation.
-        // The uncancellable operation at the head still owns the queue until it
-        // really settles; a later retry can then safely apply current state.
-        if (callerTimedOut) throw new Error(timeoutMessage);
-        if (this.closed || this.listenerGeneration !== generation) {
-          throw new Error('The Browser validating proxy changed while the session was being configured.');
-        }
-        return operation();
-      });
-    const tail = queued.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.sessionOperationTails.set(session, tail);
-    void tail.finally(() => {
-      if (this.sessionOperationTails.get(session) === tail) this.sessionOperationTails.delete(session);
-    });
-    return withOperationTimeout(queued, this.operationTimeoutMs, timeoutMessage, () => {
-      callerTimedOut = true;
-    });
   }
 
   isAuthenticationChallenge(authInfo: AuthInfo): boolean {
