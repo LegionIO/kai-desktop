@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
+  createBoundedWorkspaceObservationWait,
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
@@ -21,6 +22,7 @@ import {
   selectConversationDeleteFallback,
   setActiveConversationForWorkspaceRestoration,
   setActiveBrowserWorkspaceWithRebase,
+  setActiveUserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
@@ -435,6 +437,113 @@ describe('filterConversationDeleteFallbackCandidates', () => {
   });
 });
 
+describe('createBoundedWorkspaceObservationWait', () => {
+  it('times out and removes a waiter when the config transition is never observed', async () => {
+    vi.useFakeTimers();
+    try {
+      const waiters = new Map<string, Set<(observed: boolean) => void>>();
+      const observation = createBoundedWorkspaceObservationWait({
+        workspaceId: 'workspace-b',
+        configuredWorkspaceId: 'workspace-a',
+        observedWorkspaceId: 'workspace-a',
+        waiters,
+        timeoutMs: 5_000,
+      });
+
+      expect(waiters.get('workspace-b')?.size).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(observation.promise).resolves.toBe(false);
+      expect(waiters.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels promptly and clears its timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const waiters = new Map<string, Set<(observed: boolean) => void>>();
+      const observation = createBoundedWorkspaceObservationWait({
+        workspaceId: 'workspace-b',
+        configuredWorkspaceId: 'workspace-a',
+        observedWorkspaceId: 'workspace-a',
+        waiters,
+        timeoutMs: 5_000,
+      });
+
+      observation.cancel();
+      await expect(observation.promise).resolves.toBe(false);
+      expect(waiters.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('setActiveUserWorkspaceWithRebase', () => {
+  it('rebases over an older local Browser mutation', async () => {
+    const setActiveWorkspace = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        error: 'active-workspace-changed' as const,
+        activeWorkspaceId: 'workspace-browser',
+        activeWorkspaceMutationToken: 'local-browser_request-1',
+      })
+      .mockResolvedValueOnce({ ok: true, activeWorkspaceId: 'workspace-user' });
+
+    await expect(
+      setActiveUserWorkspaceWithRebase({
+        workspaceId: 'workspace-user',
+        expectedCurrentWorkspaceId: 'workspace-a',
+        setActiveWorkspace,
+        isCurrent: () => true,
+        canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
+      }),
+    ).resolves.toEqual({ ok: true, activeWorkspaceId: 'workspace-user' });
+
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-user', 'workspace-a');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-user', 'workspace-browser');
+  });
+
+  it('does not rebase after a newer user intent or across another renderer mutation', async () => {
+    let current = true;
+    const localConflict = vi.fn(async () => {
+      current = false;
+      return {
+        ok: false,
+        error: 'active-workspace-changed' as const,
+        activeWorkspaceId: 'workspace-browser',
+        activeWorkspaceMutationToken: 'local-browser_request-1',
+      };
+    });
+    await setActiveUserWorkspaceWithRebase({
+      workspaceId: 'workspace-user',
+      expectedCurrentWorkspaceId: 'workspace-a',
+      setActiveWorkspace: localConflict,
+      isCurrent: () => current,
+      canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
+    });
+    expect(localConflict).toHaveBeenCalledOnce();
+
+    const foreignConflict = vi.fn(async () => ({
+      ok: false,
+      error: 'active-workspace-changed' as const,
+      activeWorkspaceId: 'workspace-foreign',
+      activeWorkspaceMutationToken: 'foreign-browser_request-1',
+    }));
+    await setActiveUserWorkspaceWithRebase({
+      workspaceId: 'workspace-user',
+      expectedCurrentWorkspaceId: 'workspace-a',
+      setActiveWorkspace: foreignConflict,
+      isCurrent: () => true,
+      canRebase: (result) => result.activeWorkspaceMutationToken?.startsWith('local-browser_') === true,
+    });
+    expect(foreignConflict).toHaveBeenCalledOnce();
+  });
+});
+
 describe('setActiveBrowserWorkspaceWithRebase', () => {
   it('rebases the current Browser request onto the authoritative workspace after a CAS conflict', async () => {
     const setActiveWorkspace = vi
@@ -761,6 +870,115 @@ describe('prepareConversationWorkspaceSwitch', () => {
     expect(switchConversation).not.toHaveBeenCalled();
     expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
     expect(activeWorkspaceId).toBe('workspace-a');
+  });
+
+  it('does not select a destination conversation after another window leaves its workspace', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    const activeConversationId = 'chat-a';
+    let resolveObservation: (observed: boolean) => void = () => {};
+    const setActiveWorkspace = vi.fn(
+      async (workspaceId: string | null, expectedWorkspaceId: string | null, operation: 'navigate' | 'rollback') => {
+        if (activeWorkspaceId !== expectedWorkspaceId) {
+          return { ok: false, activeWorkspaceId };
+        }
+        const previousWorkspaceId = activeWorkspaceId;
+        activeWorkspaceId = workspaceId ?? '';
+        return operation === 'navigate' ? { ok: true, previousWorkspaceId } : true;
+      },
+    );
+    const switchConversation = vi.fn(async () => true);
+
+    const opening = openBrowserConversationInWorkspace({
+      conversationId: 'chat-b',
+      selectionGeneration: 1,
+      getConversation: async () => ({ workspaceId: 'workspace-b' }),
+      getActiveConversationId: () => activeConversationId,
+      getBackendActiveConversationId: async () => activeConversationId,
+      getSelectionGeneration: () => 1,
+      getActiveWorkspaceId: () => activeWorkspaceId,
+      getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b', 'workspace-c'],
+      saveLastConversation: async () => undefined,
+      getWorkspaceSelectionGeneration: () => 1,
+      workspaceSelectionGeneration: 1,
+      getBrowserAttentionGeneration: () => 1,
+      browserAttentionGeneration: 1,
+      setActiveWorkspace,
+      createWorkspaceObservationWait: () => ({
+        promise: new Promise<boolean>((resolve) => {
+          resolveObservation = resolve;
+        }),
+        cancel: vi.fn(),
+      }),
+      switchConversation,
+    });
+
+    await vi.waitFor(() => expect(activeWorkspaceId).toBe('workspace-b'));
+    activeWorkspaceId = 'workspace-c';
+    resolveObservation(true);
+
+    await expect(opening).resolves.toBe(false);
+    expect(switchConversation).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(activeWorkspaceId).toBe('workspace-c');
+  });
+
+  it('rolls back workspace and destination metadata when conversation activation fails', async () => {
+    let activeWorkspaceId = 'workspace-a';
+    let destinationConversationId: string | null = 'chat-b-previous';
+    const saveLastConversation = vi.fn(
+      async ({
+        conversationId,
+        expectedCurrentConversationId,
+      }: {
+        conversationId: string | null;
+        expectedCurrentConversationId?: string | null;
+      }) => {
+        if (
+          expectedCurrentConversationId !== undefined &&
+          expectedCurrentConversationId !== destinationConversationId
+        ) {
+          return { ok: false, error: 'last-conversation-changed' as const };
+        }
+        const previousConversationId = destinationConversationId;
+        destinationConversationId = conversationId;
+        return { ok: true, previousConversationId, lastActiveConversationId: conversationId };
+      },
+    );
+    const setActiveWorkspace = vi.fn(
+      async (workspaceId: string | null, expectedWorkspaceId: string | null, operation: 'navigate' | 'rollback') => {
+        if (activeWorkspaceId !== expectedWorkspaceId) return { ok: false, activeWorkspaceId };
+        const previousWorkspaceId = activeWorkspaceId;
+        activeWorkspaceId = workspaceId ?? '';
+        return operation === 'navigate' ? { ok: true, previousWorkspaceId } : true;
+      },
+    );
+    const switchConversation = vi.fn(async () => false);
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-b',
+        selectionGeneration: 1,
+        getConversation: async () => ({ workspaceId: 'workspace-b' }),
+        getActiveConversationId: () => 'chat-a',
+        getBackendActiveConversationId: async () => 'chat-a',
+        getSelectionGeneration: () => 1,
+        getActiveWorkspaceId: () => activeWorkspaceId,
+        getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+        saveLastConversation,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 1,
+        browserAttentionGeneration: 1,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        switchConversation,
+      }),
+    ).resolves.toBe(false);
+
+    expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', 1);
+    expect(setActiveWorkspace).toHaveBeenLastCalledWith('workspace-a', 'workspace-b', 'rollback');
+    expect(activeWorkspaceId).toBe('workspace-a');
+    expect(destinationConversationId).toBe('chat-b-previous');
   });
 
   it('rolls back a workspace switch that commits after a newer navigation intent', async () => {

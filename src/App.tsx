@@ -87,6 +87,7 @@ import { cn, generateId } from '@/lib/utils';
 import {
   adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
+  createBoundedWorkspaceObservationWait,
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
@@ -520,6 +521,7 @@ const TASKS_VIEW = 'tasks';
 const AGENTS_VIEW = 'agents';
 const ALERTS_VIEW = 'alerts';
 const PLUGIN_ERROR_VIEW_PREFIX = 'plugin-error:';
+const WORKSPACE_OBSERVATION_TIMEOUT_MS = 5_000;
 
 function isPluginView(view: string): boolean {
   return (
@@ -726,19 +728,43 @@ function AppShell() {
   const workspaceSelectionIntentGenerationRef = useRef(0);
   const browserAttentionIntentGenerationRef = useRef(0);
   const browserWorkspaceTransitionsRef = useRef<Map<string, BrowserWorkspaceTransitionMarker>>(new Map());
-  const lastBrowserWorkspaceMutationTokenRef = useRef<string | null>(null);
+  const browserWorkspaceMutationTokenPrefixRef = useRef(generateId());
   const [workspaceRestorationRetryGeneration, setWorkspaceRestorationRetryGeneration] = useState(0);
   const handledWorkspaceRestorationRetryGenerationRef = useRef(0);
-  const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>((next) => {
-    navigationIntentGenerationRef.current++;
-    setActiveViewState(next);
+  const configuredWorkspaceIdRef = useRef<string | null>(null);
+  const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
+  const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
+  const workspaceObservationWaitersRef = useRef<Map<string, Set<(observed: boolean) => void>>>(new Map());
+  const cancelWorkspaceObservationWaits = useCallback(() => {
+    const pending = [...workspaceObservationWaitersRef.current.values()].flatMap((waiters) => [...waiters]);
+    workspaceObservationWaitersRef.current.clear();
+    for (const settle of pending) settle(false);
   }, []);
+  const isLocalBrowserWorkspaceMutationToken = useCallback(
+    (token: string | null | undefined): boolean =>
+      typeof token === 'string' && token.startsWith(`${browserWorkspaceMutationTokenPrefixRef.current}_`),
+    [],
+  );
+  const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>(
+    (next) => {
+      cancelWorkspaceObservationWaits();
+      navigationIntentGenerationRef.current++;
+      setActiveViewState(next);
+    },
+    [cancelWorkspaceObservationWaits],
+  );
   const recordWorkspaceNavigationIntent = useCallback((): number => {
+    cancelWorkspaceObservationWaits();
     workspaceSelectionIntentGenerationRef.current++;
     navigationIntentGenerationRef.current++;
     conversationSelectionIntentGenerationRef.current++;
     return conversationSelectionIntentGenerationRef.current;
-  }, []);
+  }, [cancelWorkspaceObservationWaits]);
+  const isWorkspaceNavigationIntentCurrent = useCallback(
+    (navigationGeneration: number): boolean =>
+      conversationSelectionIntentGenerationRef.current === navigationGeneration,
+    [],
+  );
   const retryWorkspaceConversationRestoration = useCallback(
     (workspaceId: string | null, selectionIntentGeneration: number) => {
       // A concurrent successful workspace mutation will run the normal
@@ -758,33 +784,17 @@ function AppShell() {
     },
     [],
   );
-  const configuredWorkspaceIdRef = useRef<string | null>(null);
-  const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
-  const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
-  const workspaceObservationWaitersRef = useRef<Map<string, Set<(observed: boolean) => void>>>(new Map());
-  const createWorkspaceObservationWait = useCallback((workspaceId: string): WorkspaceObservationWait => {
-    if (configuredWorkspaceIdRef.current === workspaceId && observedWorkspaceIdRef.current === workspaceId) {
-      return { promise: Promise.resolve(true), cancel: () => {} };
-    }
-
-    let settle: (observed: boolean) => void = () => {};
-    const promise = new Promise<boolean>((resolve) => {
-      const waiters = workspaceObservationWaitersRef.current.get(workspaceId) ?? new Set();
-      let settled = false;
-      settle = (observed) => {
-        if (settled) return;
-        settled = true;
-        waiters.delete(settle);
-        if (waiters.size === 0 && workspaceObservationWaitersRef.current.get(workspaceId) === waiters) {
-          workspaceObservationWaitersRef.current.delete(workspaceId);
-        }
-        resolve(observed);
-      };
-      waiters.add(settle);
-      workspaceObservationWaitersRef.current.set(workspaceId, waiters);
-    });
-    return { promise, cancel: () => settle(false) };
-  }, []);
+  const createWorkspaceObservationWait = useCallback(
+    (workspaceId: string): WorkspaceObservationWait =>
+      createBoundedWorkspaceObservationWait({
+        workspaceId,
+        configuredWorkspaceId: configuredWorkspaceIdRef.current,
+        observedWorkspaceId: observedWorkspaceIdRef.current,
+        waiters: workspaceObservationWaitersRef.current,
+        timeoutMs: WORKSPACE_OBSERVATION_TIMEOUT_MS,
+      }),
+    [],
+  );
   const { config, updateConfig } = useConfig();
   const fullWidth = useFullWidthContent();
   const { title: themeTitle, Icon: ThemeIcon, toggle: toggleTheme } = useThemeToggleControl();
@@ -1204,6 +1214,7 @@ function AppShell() {
   const handleDeleteConversation = useCallback(
     async (id: string, fallbackCandidateIds?: string[]): Promise<ConversationDeleteResult> => {
       if (activeConversationIdRef.current === id) {
+        cancelWorkspaceObservationWaits();
         navigationIntentGenerationRef.current++;
         conversationSelectionIntentGenerationRef.current++;
       }
@@ -1283,7 +1294,7 @@ function AppShell() {
       }
       return delRes;
     },
-    [activeWorkspaceId, cuSessionsByConversation],
+    [activeWorkspaceId, cancelWorkspaceObservationWaits, cuSessionsByConversation],
   );
 
   const handleDeleteConversations = useCallback(
@@ -1292,6 +1303,7 @@ function AppShell() {
       if (requestedIds.length === 0) return { ok: true, deleted: 0, removedIds: [] };
       const requested = new Set(requestedIds);
       if (activeConversationIdRef.current && requested.has(activeConversationIdRef.current)) {
+        cancelWorkspaceObservationWaits();
         navigationIntentGenerationRef.current++;
         conversationSelectionIntentGenerationRef.current++;
       }
@@ -1379,7 +1391,7 @@ function AppShell() {
       }
       return result;
     },
-    [activeWorkspaceId, cuSessionsByConversation],
+    [activeWorkspaceId, cancelWorkspaceObservationWaits, cuSessionsByConversation],
   );
 
   const handleArchiveConversation = useCallback(async (id: string) => {
@@ -1422,7 +1434,10 @@ function AppShell() {
   const handleSwitchConversation = useCallback(
     async (id: string, expectedCurrentId?: string | null, inheritedNavigationGeneration?: number): Promise<boolean> => {
       const navigationGeneration = inheritedNavigationGeneration ?? ++navigationIntentGenerationRef.current;
-      if (inheritedNavigationGeneration === undefined) conversationSelectionIntentGenerationRef.current++;
+      if (inheritedNavigationGeneration === undefined) {
+        cancelWorkspaceObservationWaits();
+        conversationSelectionIntentGenerationRef.current++;
+      }
       if (navigationIntentGenerationRef.current !== navigationGeneration) return false;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
@@ -1472,16 +1487,17 @@ function AppShell() {
       setActiveConversationTitle(getConversationDisplayTitle(conv, cuSessionsByConversation.get(id)));
       return true;
     },
-    [cuSessionsByConversation, isMobile],
+    [cancelWorkspaceObservationWaits, cuSessionsByConversation, isMobile],
   );
 
   const handleOpenBrowserConversation = useCallback(
     async (id: string): Promise<boolean> => {
+      cancelWorkspaceObservationWaits();
       const selectionGeneration = ++navigationIntentGenerationRef.current;
       conversationSelectionIntentGenerationRef.current++;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
       const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
-      const workspaceMutationToken = generateId();
+      const workspaceMutationToken = `${browserWorkspaceMutationTokenPrefixRef.current}_${generateId()}`;
       const opened = await openBrowserConversationInWorkspace({
         conversationId: id,
         selectionGeneration,
@@ -1520,7 +1536,6 @@ function AppShell() {
                 expectedCurrentId,
                 mutationToken: workspaceMutationToken,
               });
-              if (result.ok) lastBrowserWorkspaceMutationTokenRef.current = workspaceMutationToken;
               if (
                 !result.ok &&
                 transition &&
@@ -1575,9 +1590,7 @@ function AppShell() {
               navigationIntentGenerationRef.current === selectionGeneration &&
               workspaceSelectionIntentGenerationRef.current === workspaceSelectionGeneration &&
               browserAttentionIntentGenerationRef.current === browserAttentionGeneration,
-            canRebase: (result) =>
-              lastBrowserWorkspaceMutationTokenRef.current !== null &&
-              result.activeWorkspaceMutationToken === lastBrowserWorkspaceMutationTokenRef.current,
+            canRebase: (result) => isLocalBrowserWorkspaceMutationToken(result.activeWorkspaceMutationToken),
           });
         },
         createWorkspaceObservationWait,
@@ -1611,11 +1624,17 @@ function AppShell() {
       });
       return opened && navigationIntentGenerationRef.current === selectionGeneration;
     },
-    [createWorkspaceObservationWait, handleSwitchConversation],
+    [
+      cancelWorkspaceObservationWaits,
+      createWorkspaceObservationWait,
+      handleSwitchConversation,
+      isLocalBrowserWorkspaceMutationToken,
+    ],
   );
 
   const handleNewConversation = useCallback(
     async (expectedCurrentId?: string | null) => {
+      cancelWorkspaceObservationWaits();
       navigationIntentGenerationRef.current++;
       conversationSelectionIntentGenerationRef.current++;
       if (isMobile) setSidebarOpen(false);
@@ -1671,7 +1690,7 @@ function AppShell() {
         suppressStoreSync.current = false;
       }
     },
-    [isMobile, activeWorkspace, activeWorkspaceId],
+    [activeWorkspace, activeWorkspaceId, cancelWorkspaceObservationWaits, isMobile],
   );
 
   const [preSettingsView, setPreSettingsView] = useState<string>(CHAT_VIEW);
@@ -3427,6 +3446,8 @@ function AppShell() {
                           activeWorkspaceId={activeWorkspaceId}
                           activeWorkspace={activeWorkspace}
                           onWorkspaceNavigationIntent={recordWorkspaceNavigationIntent}
+                          isWorkspaceNavigationIntentCurrent={isWorkspaceNavigationIntentCurrent}
+                          isLocalBrowserWorkspaceMutationToken={isLocalBrowserWorkspaceMutationToken}
                           onWorkspaceNavigationFailure={retryWorkspaceConversationRestoration}
                         />
                       </div>

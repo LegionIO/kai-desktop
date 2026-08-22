@@ -2,6 +2,7 @@ import { useState, forwardRef, type FC } from 'react';
 import { ChevronDownIcon, FolderPlusIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { app } from '@/lib/ipc-client';
+import { setActiveUserWorkspaceWithRebase } from '@/lib/conversation-selection';
 import { WorkspaceDropdown } from './WorkspaceDropdown';
 import { CreateWorkspaceDialog } from './CreateWorkspaceDialog';
 import { DeleteWorkspaceDialog } from './DeleteWorkspaceDialog';
@@ -70,6 +71,8 @@ interface WorkspaceSelectorProps {
   activeWorkspaceId: string | null;
   activeWorkspace: Workspace | null;
   onWorkspaceNavigationIntent: () => number;
+  isWorkspaceNavigationIntentCurrent: (navigationGeneration: number) => boolean;
+  isLocalBrowserWorkspaceMutationToken: (token: string | null | undefined) => boolean;
   onWorkspaceNavigationFailure: (workspaceId: string | null, navigationGeneration: number) => void;
 }
 
@@ -78,6 +81,8 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
   activeWorkspaceId,
   activeWorkspace,
   onWorkspaceNavigationIntent,
+  isWorkspaceNavigationIntentCurrent,
+  isLocalBrowserWorkspaceMutationToken,
   onWorkspaceNavigationFailure,
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -93,7 +98,13 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     if (workspaceId === activeWorkspaceId) return;
     const navigationGeneration = onWorkspaceNavigationIntent();
     try {
-      const result = await app.workspaces.setActive({ id: workspaceId, expectedCurrentId: activeWorkspaceId });
+      const result = await setActiveUserWorkspaceWithRebase({
+        workspaceId,
+        expectedCurrentWorkspaceId: activeWorkspaceId,
+        setActiveWorkspace: (id, expectedCurrentId) => app.workspaces.setActive({ id, expectedCurrentId }),
+        isCurrent: () => isWorkspaceNavigationIntentCurrent(navigationGeneration),
+        canRebase: (conflict) => isLocalBrowserWorkspaceMutationToken(conflict.activeWorkspaceMutationToken),
+      });
       if (!result.ok && (result.activeWorkspaceId === undefined || result.activeWorkspaceId === activeWorkspaceId)) {
         onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
       }
