@@ -4093,7 +4093,7 @@ describe('browser manager renderer lifecycle', () => {
     }
   });
 
-  it('keeps relayed enterprise-proxy authentication bounded and usable while the Browser panel is hidden', () => {
+  it('fails relayed enterprise-proxy authentication without waiting for a hidden Browser panel', () => {
     const manager = new BrowserManager(
       '/tmp/kai-browser-ai-upstream-proxy-auth-test',
       () => ({ browser: { dataScope: 'global', idleDiscardMinutes: 10 } }) as never,
@@ -4141,19 +4141,9 @@ describe('browser manager renderer lifecycle', () => {
       );
 
       expect(event.preventDefault).toHaveBeenCalledOnce();
-      expect(callback).not.toHaveBeenCalled();
-      const prompts = manager.getState('chat-1').authPrompts ?? [];
-      expect(prompts).toMatchObject([
-        {
-          tabId: 'tab-1',
-          realm: 'Enterprise Proxy',
-          isProxy: true,
-          assistantTriggered: true,
-        },
-      ]);
-      manager.respondAuthPrompt(prompts[0]!.id, 'enterprise-user', 'enterprise-secret');
+      expect(manager.getState('chat-1').authPrompts).toEqual([]);
       expect(callback).toHaveBeenCalledOnce();
-      expect(callback).toHaveBeenCalledWith('enterprise-user', 'enterprise-secret');
+      expect(callback).toHaveBeenCalledWith();
     } finally {
       manager.dispose();
     }
@@ -5853,6 +5843,67 @@ describe('browser manager renderer lifecycle', () => {
     ).rejects.toThrow(/moved, was replaced, or became obscured/i);
     expect(sendInputEvent).not.toHaveBeenCalled();
     expect(releaseLocatedTarget).toHaveBeenCalledOnce();
+  });
+
+  it('bounds semantic target cleanup and cancels its exact debugger lease', async () => {
+    vi.useFakeTimers();
+    try {
+      const wedgedCleanup = deferred<unknown>();
+      const debuggerApi = browserDebuggerMock();
+      debuggerApi.sendCommand.mockImplementation(async (...args: unknown[]) => {
+        if (args[0] === 'Runtime.evaluate') return wedgedCleanup.promise;
+        return {};
+      });
+      const contents = { id: 42, debugger: debuggerApi, isDestroyed: () => false };
+      const tab = {
+        generation: 1,
+        trustedUserNavigationLease: 0,
+        shell: { id: 'tab-1', conversationId: 'chat-1', discarded: false },
+        view: { webContents: contents },
+      };
+      const manager = managerWithoutConstructor({
+        destroyView: vi.fn(),
+        emitTabs: vi.fn(),
+        tabs: new Map([[tab.shell.id, tab]]),
+      });
+      const debuggerLease = invokePrivate(manager, 'acquireBrowserDebuggerLease', contents) as {
+        cancel: () => void;
+        release: () => void;
+      };
+      const target = {
+        x: 20,
+        y: 30,
+        width: 100,
+        height: 20,
+        semanticLease: {
+          contextId: 7,
+          globalKey: '__target',
+          cancelDebugger: debuggerLease.cancel,
+          releaseDebugger: debuggerLease.release,
+        },
+      };
+
+      const release = invokePrivate(manager, 'releaseLocatedTarget', tab, contents, target) as Promise<void>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(debuggerApi.sendCommand).toHaveBeenCalledWith('Runtime.evaluate', {
+        expression: 'delete globalThis["__target"]',
+        returnByValue: true,
+        contextId: 7,
+      });
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(release).resolves.toBeUndefined();
+
+      expect(debuggerApi.detach).toHaveBeenCalledOnce();
+      expect(debuggerApi.isAttached()).toBe(false);
+      expect(tab.view.webContents).toBe(contents);
+      expect(tab.shell.discarded).toBe(false);
+
+      wedgedCleanup.resolve({});
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([
@@ -20732,6 +20783,53 @@ describe('browser manager renderer lifecycle', () => {
       expect(closeAllConnections).toHaveBeenCalledTimes(3);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(closeAllConnections).toHaveBeenCalledTimes(4);
+      expect(releaseScopeRuntime).toHaveBeenCalledOnce();
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryAttempts')).toHaveLength(0);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryTimers')).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not spend idle retry attempts while a timed-out native reset still owns the Session queue', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const scopeKey = 'conversation-cccccccccccccccccccccccc';
+    const nativeReset = deferred<void>();
+    const releaseScopeRuntime = vi.fn();
+    const closeAllConnections = vi
+      .fn()
+      .mockImplementationOnce(() => nativeReset.promise)
+      .mockResolvedValue(undefined);
+    const scopedSession = { closeAllConnections };
+    const manager = managerWithoutConstructor({
+      pendingSessionMutationScopes: new Map<string, number>(),
+      releaseScopeRuntime,
+      stopRunningServiceWorkers: vi.fn(async () => undefined),
+      stores: new Map([[scopeKey, { flush: vi.fn(async () => undefined) }]]),
+      tabs: new Map(),
+      wiredSessionsByScope: new Map([[scopeKey, scopedSession]]),
+    });
+
+    try {
+      invokePrivate(manager, 'releaseScopeRuntimeWhenIdle', scopeKey);
+      await vi.advanceTimersByTimeAsync(BROWSER_SESSION_OPERATION_TIMEOUT_MS);
+      expect(closeAllConnections).toHaveBeenCalledOnce();
+      expect((Reflect.get(manager, 'pendingSessionMutationScopes') as Map<string, number>).get(scopeKey)).toBe(1);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryAttempts')).toHaveLength(0);
+      expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryTimers')).toHaveLength(0);
+
+      // Even enough wall time for every normal backoff must not enqueue work
+      // that cannot run until the original native operation leaves the queue.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(closeAllConnections).toHaveBeenCalledOnce();
+
+      nativeReset.resolve();
+      await waitForBrowserSessionOperations(scopedSession as never);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(closeAllConnections).toHaveBeenCalledTimes(2);
       expect(releaseScopeRuntime).toHaveBeenCalledOnce();
       expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryAttempts')).toHaveLength(0);
       expect(Reflect.get(manager, 'scopeRuntimeReleaseRetryTimers')).toHaveLength(0);

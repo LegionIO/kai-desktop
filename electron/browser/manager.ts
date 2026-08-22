@@ -913,6 +913,7 @@ type AssistantDocumentLease = {
 type BrowserSemanticTargetLease = {
   contextId: number;
   globalKey: string;
+  cancelDebugger?: () => void;
   releaseDebugger?: () => void;
 };
 
@@ -2674,6 +2675,11 @@ export class BrowserManager {
 
   private scheduleScopeRuntimeReleaseRetry(scopeKey: string): void {
     if (this.scopeRuntimeReleaseRetryTimers.has(scopeKey)) return;
+    // A timed-out Electron Session mutation still owns the native queue. Do
+    // not spend the bounded retry budget on replacements that can only queue
+    // behind it and expire before they execute. The mutation's late-settlement
+    // callback re-arms one cleanup attempt after the native boundary unwinds.
+    if ((this.pendingSessionMutationScopes?.get(scopeKey) ?? 0) > 0) return;
     const attempt = this.scopeRuntimeReleaseRetryAttempts.get(scopeKey) ?? 0;
     const delay = IDLE_RUNTIME_RELEASE_RETRY_DELAYS_MS[attempt];
     if (delay === undefined) return;
@@ -9709,7 +9715,11 @@ export class BrowserManager {
             'Idle Browser profile connection reset',
             () => scopedSession.closeAllConnections(),
             undefined,
-            () => this.releaseScopeRuntimeWhenIdle(scopeKey),
+            // A retry timer is intentionally not armed while the non-cancellable
+            // native reset remains in flight. Once it really settles, bypass a
+            // previously consumed retry budget for the one cleanup continuation
+            // that can now make progress.
+            () => this.releaseScopeRuntimeWhenIdle(scopeKey, true),
           );
           // Only the requests that existed when the reset began were terminated
           // by that reset. A new request can invalidate the release token while
@@ -11544,18 +11554,16 @@ export class BrowserManager {
       callback(credentials.username, credentials.password);
       return;
     }
-    const upstreamProxyAuthentication = this.validatingProxy?.isUpstreamAuthenticationChallenge(authInfo) === true;
     if (!tab) return;
     event.preventDefault();
     const trustedUserNavigationAuth = this.trustedUserNavigationRequest(tab, details.url);
-    if (tab.aiNetworkRestricted && !trustedUserNavigationAuth && !upstreamProxyAuthentication) {
+    if (tab.aiNetworkRestricted && !trustedUserNavigationAuth) {
       // HTTP-auth callbacks block navigation itself. Assistant-controlled loads
       // must terminate without waiting for Browser chrome to mount; the user can
       // authenticate only when this challenge belongs to the exact main-frame
-      // target (or redirect) claimed by an explicit user navigation. Relayed
-      // enterprise-proxy challenges are different: the local validating proxy
-      // has already bound them to this request/connection, and the bounded
-      // prompt can remain pending while the Browser sidebar is hidden.
+      // target (or redirect) claimed by an explicit user navigation. This also
+      // applies to relayed enterprise-proxy challenges: a hidden AI operation
+      // must never wait for an interactive credential prompt.
       callback();
       return;
     }
@@ -11952,7 +11960,7 @@ export class BrowserManager {
         const name = request.name ?? null;
         const text = request.kind === 'type' ? null : (request.text ?? null);
         const globalKey = `__kai_browser_target_${randomUUID().replaceAll('-', '')}`;
-        const releaseDebugger = this.acquireBrowserDebugger(contents);
+        const debuggerLease = this.acquireBrowserDebuggerLease(contents);
         let retained = false;
         try {
           const frameTree = (await contents.debugger.sendCommand('Page.getFrameTree')) as {
@@ -12045,11 +12053,12 @@ export class BrowserManager {
             semanticLease: {
               contextId: isolatedWorld.executionContextId!,
               globalKey,
-              releaseDebugger,
+              cancelDebugger: debuggerLease.cancel,
+              releaseDebugger: debuggerLease.release,
             },
           };
         } finally {
-          if (!retained) releaseDebugger();
+          if (!retained) debuggerLease.release();
         }
       },
       abortSignal,
@@ -12243,18 +12252,38 @@ export class BrowserManager {
     return { ...result, semanticLease: lease };
   }
 
-  private async releaseLocatedTarget(contents: WebContents, target: BrowserLocatedTarget | null): Promise<void> {
+  private async releaseLocatedTarget(
+    tab: InternalTab,
+    contents: WebContents,
+    target: BrowserLocatedTarget | null,
+  ): Promise<void> {
     const lease = target?.semanticLease;
     if (!lease) return;
     try {
       if (!contents.isDestroyed() && contents.debugger.isAttached()) {
-        await contents.debugger
-          .sendCommand('Runtime.evaluate', {
-            expression: `delete globalThis[${JSON.stringify(lease.globalKey)}]`,
-            returnByValue: true,
-            contextId: lease.contextId,
-          })
-          .catch(() => undefined);
+        try {
+          await this.runRendererOperationWithDeadline(
+            tab,
+            contents,
+            'Browser target cleanup',
+            TARGET_LOCATION_TIMEOUT_MS,
+            () =>
+              contents.debugger.sendCommand('Runtime.evaluate', {
+                expression: `delete globalThis[${JSON.stringify(lease.globalKey)}]`,
+                returnByValue: true,
+                contextId: lease.contextId,
+              }),
+            undefined,
+            undefined,
+            false,
+          );
+        } catch {
+          // Target cleanup is best-effort and must not overwrite the outcome of
+          // an action that already dispatched. Cancel only this manager-owned
+          // debugger generation so a wedged CDP command cannot retain the tab
+          // queue or its lease indefinitely.
+          lease.cancelDebugger?.();
+        }
       }
     } finally {
       lease.releaseDebugger?.();
@@ -12898,7 +12927,7 @@ export class BrowserManager {
                 }
               } finally {
                 try {
-                  await this.releaseLocatedTarget(contents, point);
+                  await this.releaseLocatedTarget(tab, contents, point);
                 } finally {
                   this.releaseInputCoordinateLease(view, coordinateLease);
                 }
