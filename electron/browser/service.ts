@@ -89,23 +89,58 @@ export function getExistingBrowserManager(): BrowserManager | null {
   return manager;
 }
 
-/** Remove a conversation-owned tab set and its persistent browser profile even
- * when Kai is running headlessly and no BrowserManager/window was initialized. */
-export async function removeBrowserConversationData(appHome: string, conversationId: string): Promise<void> {
+type PreparedBrowserConversationRemoval = {
+  conversationId: string;
+  scopeKey: string;
+  finish: () => void;
+  managerRemoval?: Promise<void>;
+  scopedSession?: Session;
+  preparationError?: unknown;
+};
+
+/** Establish the deletion fence synchronously. Bulk callers prepare every
+ * target before awaiting any profile clear, so a slow first clear cannot leave
+ * later deleted conversations with live renderers or unrestricted workers. */
+function prepareBrowserConversationRemoval(
+  appHome: string,
+  conversationId: string,
+): PreparedBrowserConversationRemoval {
   const scopeKey = browserScopeKey('conversation', conversationId);
-  const finishConversationRemoval = beginConversationRemoval(conversationId);
+  const finish = beginConversationRemoval(conversationId);
   try {
     if (manager) {
-      await manager.removeConversation(conversationId);
-    } else if (hasStoredBrowserScopeData(appHome, app.getPath('sessionData'), scopeKey)) {
-      let targetSession: Session | undefined;
-      const getTargetSession = () => {
-        targetSession ??= session.fromPartition(browserPartitionForScopeKey(scopeKey));
-        return targetSession;
-      };
-      const scopedSession = getTargetSession();
+      // removeConversation fences the id and destroys its views synchronously
+      // before its first await. Attach a rejection observer immediately because
+      // a later entry may be awaited only after an earlier cleanup completes.
+      const managerRemoval = manager.removeConversation(conversationId);
+      void managerRemoval.catch(() => undefined);
+      return { conversationId, scopeKey, finish, managerRemoval };
+    }
+    if (hasStoredBrowserScopeData(appHome, app.getPath('sessionData'), scopeKey)) {
+      const scopedSession = session.fromPartition(browserPartitionForScopeKey(scopeKey));
       const requestFilter = { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] };
+      // Installing the deny-all hook is the headless equivalent of destroying
+      // a live view: service workers and pooled connections cannot reach the
+      // network while this profile waits behind earlier sequential clears.
       scopedSession.webRequest.onBeforeRequest(requestFilter, (_details, callback) => callback({ cancel: true }));
+      return { conversationId, scopeKey, finish, scopedSession };
+    }
+    return { conversationId, scopeKey, finish };
+  } catch (preparationError) {
+    return { conversationId, scopeKey, finish, preparationError };
+  }
+}
+
+async function completeBrowserConversationRemoval(
+  appHome: string,
+  prepared: PreparedBrowserConversationRemoval,
+): Promise<void> {
+  const { conversationId, scopeKey, finish, managerRemoval, scopedSession, preparationError } = prepared;
+  try {
+    if (preparationError) throw preparationError;
+    if (managerRemoval) {
+      await managerRemoval;
+    } else if (scopedSession) {
       let cleanupSucceeded = false;
       try {
         // A headless profile can still own service workers and pooled sockets.
@@ -177,8 +212,14 @@ export async function removeBrowserConversationData(appHome: string, conversatio
     }
     throw error;
   } finally {
-    finishConversationRemoval();
+    finish();
   }
+}
+
+/** Remove a conversation-owned tab set and its persistent browser profile even
+ * when Kai is running headlessly and no BrowserManager/window was initialized. */
+export async function removeBrowserConversationData(appHome: string, conversationId: string): Promise<void> {
+  await completeBrowserConversationRemoval(appHome, prepareBrowserConversationRemoval(appHome, conversationId));
 }
 
 /** Bounded bulk cleanup used by delete-many/clear-all. It deliberately runs
@@ -189,13 +230,19 @@ export async function removeBrowserConversationsData(
   appHome: string,
   conversationIds: Iterable<string>,
 ): Promise<string[]> {
+  // Preparation is synchronous up to the manager's first await. Consequently
+  // every target is fenced and every live view is destroyed before any one
+  // profile can wait on downloads, workers, Chromium, or persistent storage.
+  const removals = [...new Set(conversationIds)].map((conversationId) =>
+    prepareBrowserConversationRemoval(appHome, conversationId),
+  );
   const failures: string[] = [];
-  for (const conversationId of new Set(conversationIds)) {
+  for (const removal of removals) {
     try {
-      await removeBrowserConversationData(appHome, conversationId);
+      await completeBrowserConversationRemoval(appHome, removal);
     } catch (error) {
-      console.warn('[Browser] Conversation profile cleanup failed:', conversationId, error);
-      failures.push(conversationId);
+      console.warn('[Browser] Conversation profile cleanup failed:', removal.conversationId, error);
+      failures.push(removal.conversationId);
     }
   }
   return failures;

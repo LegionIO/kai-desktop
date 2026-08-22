@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   managerDispose: vi.fn(),
   managerShutdown: vi.fn<() => Promise<void>>(async () => undefined),
   managerFenceConversation: vi.fn(),
+  managerRemoveConversation: vi.fn<(conversationId: string) => Promise<void>>(async () => undefined),
 }));
 
 vi.mock('electron', () => ({
@@ -57,6 +58,7 @@ vi.mock('../manager.js', () => ({
     dispose = mocks.managerDispose;
     shutdown = mocks.managerShutdown;
     fenceRemovedConversation = mocks.managerFenceConversation;
+    removeConversation = mocks.managerRemoveConversation;
   },
 }));
 vi.mock('../store.js', () => ({
@@ -99,6 +101,8 @@ describe('headless browser profile cleanup', () => {
     mocks.profileExists.mockReturnValue(true);
     mocks.pendingCleanupClear.mockReturnValue(true);
     mocks.pendingCleanupMark.mockReturnValue(true);
+    mocks.managerRemoveConversation.mockReset();
+    mocks.managerRemoveConversation.mockResolvedValue(undefined);
   });
 
   it('leaves hard-exit fallbacks enough time for the graceful Browser flush', () => {
@@ -232,6 +236,61 @@ describe('headless browser profile cleanup', () => {
 
     expect(mocks.fromPartition).toHaveBeenCalledTimes(2);
     expect(maxActive).toBe(1);
+  });
+
+  it('quarantines every headless profile before the first bulk clear can wait', async () => {
+    let finishFirstClear!: () => void;
+    mocks.clearStorageData
+      .mockImplementationOnce(
+        () =>
+          new Promise<undefined>((resolve) => {
+            finishFirstClear = () => resolve(undefined);
+          }),
+      )
+      .mockResolvedValueOnce(undefined);
+
+    const cleanup = removeBrowserConversationsData('/tmp/kai-home', ['deleted-a', 'deleted-b']);
+    await vi.waitFor(() => expect(mocks.clearStorageData).toHaveBeenCalledOnce());
+
+    expect(mocks.fromPartition).toHaveBeenCalledTimes(2);
+    const denyHookOrders = mocks.onBeforeRequest.mock.invocationCallOrder.slice(0, 2);
+    expect(denyHookOrders).toHaveLength(2);
+    expect(denyHookOrders.every((order) => order < mocks.clearStorageData.mock.invocationCallOrder[0])).toBe(true);
+
+    finishFirstClear();
+    await expect(cleanup).resolves.toEqual([]);
+    expect(mocks.clearStorageData).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts every manager removal before awaiting the first bulk cleanup', async () => {
+    let finishFirstRemoval!: () => void;
+    mocks.managerRemoveConversation
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishFirstRemoval = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(undefined);
+    initializeBrowserManager(
+      '/tmp/kai-home',
+      () => ({}) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+
+    try {
+      const cleanup = removeBrowserConversationsData('/tmp/kai-home', ['deleted-a', 'deleted-b']);
+      expect(mocks.managerRemoveConversation.mock.calls.map(([conversationId]) => conversationId)).toEqual([
+        'deleted-a',
+        'deleted-b',
+      ]);
+
+      finishFirstRemoval();
+      await expect(cleanup).resolves.toEqual([]);
+    } finally {
+      await shutdownBrowserManager();
+    }
   });
 
   it('retains a failed cleanup scope so Settings can retry it after chat deletion', async () => {
