@@ -1439,6 +1439,7 @@ describe('browser manager renderer lifecycle', () => {
     const cancel = vi.fn(async () => undefined);
     const download = {
       tabId: tab.shell.id,
+      conversationId: tab.shell.conversationId,
       keepOpen: true,
       assistantOwnerId: 'completed-run',
       cancel,
@@ -1456,12 +1457,64 @@ describe('browser manager renderer lifecycle', () => {
     expect(cancel).toHaveBeenCalledOnce();
   });
 
+  it('does not cancel an active-run download when the user enables automatic cleanup', async () => {
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true },
+    };
+    const cancel = vi.fn(async () => undefined);
+    const download = {
+      tabId: tab.shell.id,
+      conversationId: tab.shell.conversationId,
+      keepOpen: true,
+      assistantOwnerId: 'active-run',
+      cancel,
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      assistantRuns: { generationIfActive: () => 2 },
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'commandTabWithinOperation', tab, 'keep-open', 'user');
+
+    expect(tab.shell.keepOpen).toBe(false);
+    expect(download.keepOpen).toBe(false);
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel a download retained for an assistant continuation', async () => {
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true },
+    };
+    const cancel = vi.fn(async () => undefined);
+    const download = {
+      tabId: tab.shell.id,
+      conversationId: tab.shell.conversationId,
+      keepOpen: true,
+      assistantOwnerId: 'predecessor-run',
+      cancel,
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      assistantContinuationLeases: new Set(['chat-1\u0000predecessor-run']),
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'commandTabWithinOperation', tab, 'keep-open', 'user');
+
+    expect(download.keepOpen).toBe(false);
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
   it('retains retry ownership when automatic-cleanup download cancellation fails', async () => {
     const tab = {
       shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true },
     };
     const download = {
       tabId: tab.shell.id,
+      conversationId: tab.shell.conversationId,
       keepOpen: true,
       assistantOwnerId: 'completed-run',
       cancel: vi.fn(async () => {
@@ -1479,7 +1532,7 @@ describe('browser manager renderer lifecycle', () => {
 
     try {
       await invokePrivate(manager, 'commandTabWithinOperation', tab, 'keep-open', 'user');
-      await vi.waitFor(() => expect(scheduleAssistantDownloadCleanupRetry).toHaveBeenCalledWith([download]));
+      await vi.waitFor(() => expect(scheduleAssistantDownloadCleanupRetry).toHaveBeenCalledWith([download], true));
     } finally {
       warn.mockRestore();
     }
@@ -11811,6 +11864,37 @@ describe('browser manager renderer lifecycle', () => {
       expect(cancelDownload).not.toHaveBeenCalled();
       expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).toBeNull();
       expect((Reflect.get(manager, 'assistantDownloadCleanupRetryTargets') as Set<unknown>).size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops an automatic-cleanup retry after a successor adopts the download', async () => {
+    vi.useFakeTimers();
+    try {
+      const cancelDownload = vi.fn(async () => undefined);
+      const download = {
+        assistantOwnerId: 'completed-run',
+        conversationId: 'chat-1',
+        keepOpen: false,
+        cancel: cancelDownload,
+      };
+      const generationIfActive = vi.fn((_conversationId: string, runId: string) =>
+        runId === 'successor-run' ? 3 : null,
+      );
+      const manager = managerWithoutConstructor({
+        activeDownloads: new Map([[{}, download]]),
+        assistantRuns: { generationIfActive },
+      });
+
+      invokePrivate(manager, 'scheduleAssistantDownloadCleanupRetry', [download], true);
+      download.assistantOwnerId = 'successor-run';
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(cancelDownload).not.toHaveBeenCalled();
+      expect(Reflect.get(manager, 'assistantDownloadCleanupRetryTimer')).toBeNull();
+      expect((Reflect.get(manager, 'assistantDownloadCleanupRetryTargets') as Map<unknown, unknown>).size).toBe(0);
+      expect(generationIfActive).toHaveBeenCalledWith('chat-1', 'successor-run');
     } finally {
       vi.useRealTimers();
     }

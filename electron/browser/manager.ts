@@ -1412,9 +1412,10 @@ export class BrowserManager {
    * run must never become adoptable by a future logical-turn continuation. */
   private assistantTabCleanupRetries?: Map<string, PendingAssistantTabCleanupRetry>;
   private assistantDownloadCleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Exact downloads captured at a global Browser-authority revocation. A retry
-   * must never re-enumerate downloads that a later authorized run started. */
-  private assistantDownloadCleanupRetryTargets?: Set<ActiveBrowserDownload>;
+  /** Exact downloads captured at a Browser-authority revocation. Automatic
+   * cleanup retries additionally remember that a live/adopted owner must win
+   * over an earlier keep-open revocation. */
+  private assistantDownloadCleanupRetryTargets?: Map<ActiveBrowserDownload, boolean>;
   /** Run ids whose temporary tabs are retained across the gap between a
    * completed stream and its authorized continuation. */
   private readonly assistantContinuationLeases = new Set<string>();
@@ -7220,7 +7221,7 @@ export class BrowserManager {
         for (const download of this.activeDownloads.values()) {
           if (download.tabId !== tab.shell.id) continue;
           download.keepOpen = tab.shell.keepOpen;
-          if (!download.keepOpen && download.assistantOwnerId !== null) revokedAssistantDownloads.push(download);
+          if (this.isAssistantDownloadReadyForAutomaticCleanup(download)) revokedAssistantDownloads.push(download);
         }
         if (revokedAssistantDownloads.length > 0) {
           // A run that ended while this tab was retained will not cross another
@@ -7229,7 +7230,7 @@ export class BrowserManager {
           // if Chromium does not acknowledge cancellation promptly.
           void this.cancelActiveAssistantDownloads(revokedAssistantDownloads).catch((error: unknown) => {
             console.warn('[Browser] Revoked assistant download cancellation will be retried:', error);
-            this.scheduleAssistantDownloadCleanupRetry(revokedAssistantDownloads);
+            this.scheduleAssistantDownloadCleanupRetry(revokedAssistantDownloads, true);
           });
         }
         break;
@@ -15436,24 +15437,53 @@ export class BrowserManager {
     return Promise.all(cancellations).then(() => undefined);
   }
 
-  private scheduleAssistantDownloadCleanupRetry(downloads: Iterable<ActiveBrowserDownload> = []): void {
+  private isAssistantDownloadReadyForAutomaticCleanup(download: ActiveBrowserDownload): boolean {
+    const ownerId = download.assistantOwnerId;
+    if (ownerId === null || download.keepOpen) return false;
+    if (this.assistantRuns.generationIfActive(download.conversationId, ownerId) !== null) return false;
+    return !this.assistantContinuationLeases.has(assistantContinuationKey(download.conversationId, ownerId));
+  }
+
+  private scheduleAssistantDownloadCleanupRetry(
+    downloads: Iterable<ActiveBrowserDownload> = [],
+    requireInactiveOwner = false,
+  ): void {
     const active = new Set(this.activeDownloads?.values() ?? []);
-    const targets = (this.assistantDownloadCleanupRetryTargets ??= new Set());
+    const targets = (this.assistantDownloadCleanupRetryTargets ??= new Map());
     for (const download of downloads) {
-      if (active.has(download) && download.assistantOwnerId !== null && !download.keepOpen) targets.add(download);
+      const eligible =
+        active.has(download) &&
+        download.assistantOwnerId !== null &&
+        !download.keepOpen &&
+        (!requireInactiveOwner || this.isAssistantDownloadReadyForAutomaticCleanup(download));
+      if (!eligible) continue;
+      // A global authority revocation is stronger than an automatic-cleanup
+      // request if both happen to retain the same failed DownloadItem.
+      targets.set(download, (targets.get(download) ?? true) && requireInactiveOwner);
     }
-    for (const download of targets) {
-      if (!active.has(download) || download.assistantOwnerId === null || download.keepOpen) targets.delete(download);
+    for (const [download, inactiveOwnerRequired] of targets) {
+      if (
+        !active.has(download) ||
+        download.assistantOwnerId === null ||
+        download.keepOpen ||
+        (inactiveOwnerRequired && !this.isAssistantDownloadReadyForAutomaticCleanup(download))
+      ) {
+        targets.delete(download);
+      }
     }
     if (this.disposed || this.shuttingDown || this.assistantDownloadCleanupRetryTimer || targets.size === 0) return;
     this.assistantDownloadCleanupRetryTimer = setTimeout(() => {
       this.assistantDownloadCleanupRetryTimer = null;
       if (this.disposed || this.shuttingDown) return;
       const activeAtRetry = new Set(this.activeDownloads?.values() ?? []);
-      const retryTargets = [...targets].filter((download) => {
-        const stillRevoked = activeAtRetry.has(download) && download.assistantOwnerId !== null && !download.keepOpen;
+      const retryTargets = [...targets].flatMap(([download, inactiveOwnerRequired]) => {
+        const stillRevoked =
+          activeAtRetry.has(download) &&
+          download.assistantOwnerId !== null &&
+          !download.keepOpen &&
+          (!inactiveOwnerRequired || this.isAssistantDownloadReadyForAutomaticCleanup(download));
         if (!stillRevoked) targets.delete(download);
-        return stillRevoked;
+        return stillRevoked ? [download] : [];
       });
       if (retryTargets.length === 0) return;
       void this.cancelActiveAssistantDownloads(retryTargets).then(
