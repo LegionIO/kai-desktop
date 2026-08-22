@@ -85,7 +85,9 @@ import type { ExecutionMode } from '@/components/thread/ChatSettingsButton';
 import { app, type ConversationChange } from '@/lib/ipc-client';
 import { cn, generateId } from '@/lib/utils';
 import {
+  adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
+  createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
@@ -95,6 +97,7 @@ import {
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
+  type BrowserWorkspaceTransitionMarker,
   type WorkspaceObservationWait,
 } from '@/lib/conversation-selection';
 import { surfaceConversationCleanupWarnings } from '@/lib/conversation-delete-warnings';
@@ -712,8 +715,13 @@ function AppShell() {
   // unique generation for every navigation intent so an older attention click
   // cannot reopen Chat or replace a newer conversation/workspace choice.
   const navigationIntentGenerationRef = useRef(0);
+  // Unlike general view navigation, this advances only for intents that may
+  // replace the selected conversation. Workspace restoration must survive a
+  // switch to Tasks/Settings while still yielding to a newer chat choice.
+  const conversationSelectionIntentGenerationRef = useRef(0);
   const workspaceSelectionIntentGenerationRef = useRef(0);
   const browserAttentionIntentGenerationRef = useRef(0);
+  const browserWorkspaceTransitionsRef = useRef<Map<string, BrowserWorkspaceTransitionMarker>>(new Map());
   const setActiveView = useCallback<Dispatch<SetStateAction<AppView>>>((next) => {
     navigationIntentGenerationRef.current++;
     setActiveViewState(next);
@@ -721,13 +729,11 @@ function AppShell() {
   const recordWorkspaceNavigationIntent = useCallback(() => {
     workspaceSelectionIntentGenerationRef.current++;
     navigationIntentGenerationRef.current++;
+    conversationSelectionIntentGenerationRef.current++;
   }, []);
   const configuredWorkspaceIdRef = useRef<string | null>(null);
   const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
-  const browserWorkspaceTransitionsRef = useRef<
-    Map<string, { navigationGeneration: number; workspaceSelectionGeneration: number }>
-  >(new Map());
   const workspaceObservationWaitersRef = useRef<Map<string, Set<(observed: boolean) => void>>>(new Map());
   const createWorkspaceObservationWait = useCallback((workspaceId: string): WorkspaceObservationWait => {
     if (configuredWorkspaceIdRef.current === workspaceId && observedWorkspaceIdRef.current === workspaceId) {
@@ -801,14 +807,18 @@ function AppShell() {
       prevWorkspaceIdRef.current = activeWorkspaceId;
       return;
     }
-    if (prevWorkspaceIdRef.current === activeWorkspaceId) return;
-
     const browserTransitionKey = activeWorkspaceId ?? '';
     const browserTransition = browserWorkspaceTransitionsRef.current.get(browserTransitionKey);
     if (browserTransition) browserWorkspaceTransitionsRef.current.delete(browserTransitionKey);
+    // Consume markers even when a successful no-op/rollback was coalesced back
+    // to the workspace React already knows. Such a marker must never classify a
+    // later unrelated transition into this destination.
+    if (prevWorkspaceIdRef.current === activeWorkspaceId) return;
+
     const transition = resolveConversationWorkspaceTransition({
       previousWorkspaceId: prevWorkspaceIdRef.current,
       activeWorkspaceId,
+      currentConversationId: activeConversationIdRef.current,
       browserTransition,
       currentNavigationGeneration: navigationIntentGenerationRef.current,
       currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
@@ -822,10 +832,10 @@ function AppShell() {
     prevWorkspaceIdRef.current = transition.nextPreviousWorkspaceId;
 
     // Save the current conversation to the departing workspace
-    if (transition.departingWorkspaceId && activeConversationId) {
+    if (transition.departingWorkspaceId && transition.departingConversationId) {
       void app.workspaces.saveLastConversation({
         workspaceId: transition.departingWorkspaceId,
-        conversationId: activeConversationId,
+        conversationId: transition.departingConversationId,
       });
     }
 
@@ -835,7 +845,7 @@ function AppShell() {
     if (activeWorkspace?.lastActiveConversationId) {
       const restoredId = activeWorkspace.lastActiveConversationId;
       const restoringWorkspaceId = activeWorkspace.id;
-      const navigationGeneration = navigationIntentGenerationRef.current;
+      const selectionIntentGeneration = conversationSelectionIntentGenerationRef.current;
       const selectionSequence = ++activeSyncSeqRef.current;
       const selectionWhenStarted = activeConversationIdRef.current;
       void (async () => {
@@ -843,8 +853,8 @@ function AppShell() {
           isConversationWorkspaceRestorationCurrent({
             workspaceId: restoringWorkspaceId,
             currentWorkspaceId: prevWorkspaceIdRef.current,
-            navigationGeneration,
-            currentNavigationGeneration: navigationIntentGenerationRef.current,
+            selectionIntentGeneration,
+            currentSelectionIntentGeneration: conversationSelectionIntentGenerationRef.current,
             selectionSequence,
             currentSelectionSequence: activeSyncSeqRef.current,
             selectionWhenStarted,
@@ -1125,7 +1135,10 @@ function AppShell() {
 
   const handleDeleteConversation = useCallback(
     async (id: string, fallbackCandidateIds?: string[]): Promise<ConversationDeleteResult> => {
-      if (activeConversationIdRef.current === id) navigationIntentGenerationRef.current++;
+      if (activeConversationIdRef.current === id) {
+        navigationIntentGenerationRef.current++;
+        conversationSelectionIntentGenerationRef.current++;
+      }
       const selectionWhenDeleteStarted = activeConversationIdRef.current;
       let backendFallbackId: string | null = null;
       const allConversations = (await app.conversations.list()) as ConversationRecord[];
@@ -1212,6 +1225,7 @@ function AppShell() {
       const requested = new Set(requestedIds);
       if (activeConversationIdRef.current && requested.has(activeConversationIdRef.current)) {
         navigationIntentGenerationRef.current++;
+        conversationSelectionIntentGenerationRef.current++;
       }
       let excludedFromFallback = requested;
       const selectionWhenDeleteStarted = activeConversationIdRef.current;
@@ -1340,6 +1354,7 @@ function AppShell() {
   const handleSwitchConversation = useCallback(
     async (id: string, expectedCurrentId?: string | null, inheritedNavigationGeneration?: number): Promise<boolean> => {
       const navigationGeneration = inheritedNavigationGeneration ?? ++navigationIntentGenerationRef.current;
+      if (inheritedNavigationGeneration === undefined) conversationSelectionIntentGenerationRef.current++;
       if (navigationIntentGenerationRef.current !== navigationGeneration) return false;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
@@ -1395,6 +1410,7 @@ function AppShell() {
   const handleOpenBrowserConversation = useCallback(
     async (id: string): Promise<boolean> => {
       const selectionGeneration = ++navigationIntentGenerationRef.current;
+      conversationSelectionIntentGenerationRef.current++;
       const workspaceSelectionGeneration = workspaceSelectionIntentGenerationRef.current;
       const browserAttentionGeneration = ++browserAttentionIntentGenerationRef.current;
       const opened = await openBrowserConversationInWorkspace({
@@ -1415,16 +1431,53 @@ function AppShell() {
         setActiveWorkspace: async (workspaceId, expectedCurrentWorkspaceId, operation) => {
           const setActiveWorkspaceOnce = async (id: string | null, expectedCurrentId: string | null) => {
             const transitionKey = id ?? '';
-            const transition = { navigationGeneration: selectionGeneration, workspaceSelectionGeneration };
-            browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
+            const transition = createBrowserWorkspaceTransitionMarker({
+              navigationGeneration: selectionGeneration,
+              workspaceSelectionGeneration,
+              operation,
+              departingWorkspaceId: expectedCurrentId,
+              destinationWorkspaceId: id,
+              departingConversationId: activeConversationIdRef.current,
+            });
+            if (transition) browserWorkspaceTransitionsRef.current.set(transitionKey, transition);
             try {
               const result = await app.workspaces.setActive({ id, expectedCurrentId });
-              if (!result.ok && browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
+              if (
+                !result.ok &&
+                transition &&
+                browserWorkspaceTransitionsRef.current.get(transitionKey) === transition
+              ) {
+                browserWorkspaceTransitionsRef.current.delete(transitionKey);
+              }
+              if (result.ok && operation === 'rollback') {
+                // If navigate+rollback lands before React observes the
+                // intermediate workspace, neither workspace-ID effect can
+                // consume the forward marker. The rollback conclusively
+                // supersedes that marker for this Browser request.
+                const forwardKey = expectedCurrentId ?? '';
+                const forward = browserWorkspaceTransitionsRef.current.get(forwardKey);
+                if (
+                  forward?.operation === 'navigate' &&
+                  forward.navigationGeneration === selectionGeneration &&
+                  forward.workspaceSelectionGeneration === workspaceSelectionGeneration
+                ) {
+                  browserWorkspaceTransitionsRef.current.delete(forwardKey);
+                }
+              }
+              if (
+                result.ok &&
+                transition &&
+                configuredWorkspaceIdRef.current === id &&
+                observedWorkspaceIdRef.current === id &&
+                browserWorkspaceTransitionsRef.current.get(transitionKey) === transition
+              ) {
+                // The destination was already fully observed (a successful
+                // no-op/coalesced rollback), so no future effect can consume it.
                 browserWorkspaceTransitionsRef.current.delete(transitionKey);
               }
               return result;
             } catch (error) {
-              if (browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
+              if (transition && browserWorkspaceTransitionsRef.current.get(transitionKey) === transition) {
                 browserWorkspaceTransitionsRef.current.delete(transitionKey);
               }
               throw error;
@@ -1445,6 +1498,20 @@ function AppShell() {
           });
         },
         createWorkspaceObservationWait,
+        adoptActiveWorkspaceTransition: (workspaceId) => {
+          const transitionKey = workspaceId ?? '';
+          const transition = browserWorkspaceTransitionsRef.current.get(transitionKey);
+          const adopted = adoptBrowserWorkspaceTransitionMarker({
+            marker: transition,
+            activeWorkspaceId: workspaceId,
+            previousWorkspaceId: prevWorkspaceIdRef.current,
+            navigationGeneration: selectionGeneration,
+            currentWorkspaceSelectionGeneration: workspaceSelectionIntentGenerationRef.current,
+          });
+          if (adopted && adopted !== transition) {
+            browserWorkspaceTransitionsRef.current.set(transitionKey, adopted);
+          }
+        },
         switchConversation: (conversationId, expectedCurrentConversationId, navigationGeneration) =>
           handleSwitchConversation(conversationId, expectedCurrentConversationId, navigationGeneration),
       });
@@ -1456,6 +1523,7 @@ function AppShell() {
   const handleNewConversation = useCallback(
     async (expectedCurrentId?: string | null) => {
       navigationIntentGenerationRef.current++;
+      conversationSelectionIntentGenerationRef.current++;
       if (isMobile) setSidebarOpen(false);
       setPlanPanel(null);
       suppressStoreSync.current = true;

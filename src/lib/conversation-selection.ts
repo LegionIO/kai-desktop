@@ -64,7 +64,51 @@ export function commitLocalConversationSelection(
 export type BrowserWorkspaceTransitionMarker = {
   navigationGeneration: number;
   workspaceSelectionGeneration: number;
+  operation: 'navigate' | 'rollback';
+  departingWorkspaceId: string | null;
+  destinationWorkspaceId: string | null;
+  departingConversationId: string | null;
 };
+
+/** Rollbacks are ordinary cursor reconciliation, and a same-workspace set can
+ * never produce a workspace-ID effect. Neither operation may leave a marker
+ * for a later unrelated transition to consume. */
+export function createBrowserWorkspaceTransitionMarker(options: {
+  navigationGeneration: number;
+  workspaceSelectionGeneration: number;
+  operation: 'navigate' | 'rollback';
+  departingWorkspaceId: string | null;
+  destinationWorkspaceId: string | null;
+  departingConversationId: string | null;
+}): BrowserWorkspaceTransitionMarker | undefined {
+  if (options.operation === 'rollback' || options.departingWorkspaceId === options.destinationWorkspaceId) {
+    return undefined;
+  }
+  return options;
+}
+
+/** A newer Browser request may intentionally retain a workspace reached by an
+ * older request before React observes it. Transfer ownership of that pending
+ * transition while preserving the real departing workspace/conversation. */
+export function adoptBrowserWorkspaceTransitionMarker(options: {
+  marker?: BrowserWorkspaceTransitionMarker;
+  activeWorkspaceId: string;
+  previousWorkspaceId: string | null | undefined;
+  navigationGeneration: number;
+  currentWorkspaceSelectionGeneration: number;
+}): BrowserWorkspaceTransitionMarker | undefined {
+  const marker = options.marker;
+  if (
+    !marker ||
+    marker.operation !== 'navigate' ||
+    marker.destinationWorkspaceId !== options.activeWorkspaceId ||
+    marker.departingWorkspaceId !== options.previousWorkspaceId ||
+    marker.workspaceSelectionGeneration !== options.currentWorkspaceSelectionGeneration
+  ) {
+    return marker;
+  }
+  return { ...marker, navigationGeneration: options.navigationGeneration };
+}
 
 /** Decide whether an observed workspace change belongs to a Browser request
  * that has already lost navigation ownership. A stale transient must retain the
@@ -73,21 +117,34 @@ export type BrowserWorkspaceTransitionMarker = {
 export function resolveConversationWorkspaceTransition(options: {
   previousWorkspaceId: string | null;
   activeWorkspaceId: string | null;
+  currentConversationId: string | null;
   browserTransition?: BrowserWorkspaceTransitionMarker;
   currentNavigationGeneration: number;
   currentWorkspaceSelectionGeneration: number;
 }): {
   staleBrowserTransition: boolean;
   departingWorkspaceId: string | null;
+  departingConversationId: string | null;
   nextPreviousWorkspaceId: string | null;
 } {
-  const staleBrowserTransition =
+  const markerDescribesTransition =
     options.browserTransition !== undefined &&
+    options.browserTransition.departingWorkspaceId === options.previousWorkspaceId &&
+    options.browserTransition.destinationWorkspaceId === options.activeWorkspaceId &&
+    options.browserTransition.workspaceSelectionGeneration === options.currentWorkspaceSelectionGeneration;
+  const staleBrowserTransition =
+    markerDescribesTransition &&
+    options.browserTransition?.operation === 'navigate' &&
     options.browserTransition.navigationGeneration !== options.currentNavigationGeneration &&
     options.browserTransition.workspaceSelectionGeneration === options.currentWorkspaceSelectionGeneration;
   return {
     staleBrowserTransition,
-    departingWorkspaceId: options.previousWorkspaceId,
+    departingWorkspaceId: markerDescribesTransition
+      ? (options.browserTransition?.departingWorkspaceId ?? null)
+      : options.previousWorkspaceId,
+    departingConversationId: markerDescribesTransition
+      ? (options.browserTransition?.departingConversationId ?? null)
+      : options.currentConversationId,
     nextPreviousWorkspaceId: staleBrowserTransition ? options.previousWorkspaceId : options.activeWorkspaceId,
   };
 }
@@ -99,8 +156,8 @@ export function resolveConversationWorkspaceTransition(options: {
 export function isConversationWorkspaceRestorationCurrent(options: {
   workspaceId: string;
   currentWorkspaceId: string | null | undefined;
-  navigationGeneration: number;
-  currentNavigationGeneration: number;
+  selectionIntentGeneration: number;
+  currentSelectionIntentGeneration: number;
   selectionSequence: number;
   currentSelectionSequence: number;
   selectionWhenStarted: string | null;
@@ -108,7 +165,7 @@ export function isConversationWorkspaceRestorationCurrent(options: {
 }): boolean {
   return (
     options.currentWorkspaceId === options.workspaceId &&
-    options.currentNavigationGeneration === options.navigationGeneration &&
+    options.currentSelectionIntentGeneration === options.selectionIntentGeneration &&
     options.currentSelectionSequence === options.selectionSequence &&
     options.currentSelection === options.selectionWhenStarted
   );
@@ -205,6 +262,7 @@ export async function openBrowserConversationInWorkspace(options: {
     operation: 'navigate' | 'rollback',
   ) => Promise<boolean>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
+  adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
   switchConversation: (
     conversationId: string,
     expectedCurrentConversationId: string | null,
@@ -234,6 +292,7 @@ export async function openBrowserConversationInWorkspace(options: {
     options.getActiveConversationId() === options.conversationId &&
     (!conversation.workspaceId || conversation.workspaceId === activeWorkspaceAfterLookup)
   ) {
+    if (conversation.workspaceId) options.adoptActiveWorkspaceTransition?.(conversation.workspaceId);
     return true;
   }
   if (!selectionIsCurrent()) return false;

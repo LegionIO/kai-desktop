@@ -8,7 +8,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
+  adoptBrowserWorkspaceTransitionMarker,
   commitLocalConversationSelection,
+  createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
@@ -25,8 +27,8 @@ describe('isConversationWorkspaceRestorationCurrent', () => {
   const current = {
     workspaceId: 'workspace-b',
     currentWorkspaceId: 'workspace-b',
-    navigationGeneration: 3,
-    currentNavigationGeneration: 3,
+    selectionIntentGeneration: 3,
+    currentSelectionIntentGeneration: 3,
     selectionSequence: 4,
     currentSelectionSequence: 4,
     selectionWhenStarted: 'conv-a',
@@ -36,7 +38,7 @@ describe('isConversationWorkspaceRestorationCurrent', () => {
   it('accepts only an unchanged workspace and selection attempt', () => {
     expect(isConversationWorkspaceRestorationCurrent(current)).toBe(true);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentWorkspaceId: 'workspace-c' })).toBe(false);
-    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentNavigationGeneration: 4 })).toBe(false);
+    expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelectionIntentGeneration: 4 })).toBe(false);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelectionSequence: 5 })).toBe(false);
     expect(isConversationWorkspaceRestorationCurrent({ ...current, currentSelection: 'conv-user-choice' })).toBe(false);
   });
@@ -47,7 +49,15 @@ describe('resolveConversationWorkspaceTransition', () => {
     const stale = resolveConversationWorkspaceTransition({
       previousWorkspaceId: 'workspace-a',
       activeWorkspaceId: 'workspace-b',
-      browserTransition: { navigationGeneration: 1, workspaceSelectionGeneration: 7 },
+      currentConversationId: 'chat-a',
+      browserTransition: {
+        navigationGeneration: 1,
+        workspaceSelectionGeneration: 7,
+        operation: 'navigate',
+        departingWorkspaceId: 'workspace-a',
+        destinationWorkspaceId: 'workspace-b',
+        departingConversationId: 'chat-a',
+      },
       currentNavigationGeneration: 2,
       currentWorkspaceSelectionGeneration: 7,
     });
@@ -55,20 +65,80 @@ describe('resolveConversationWorkspaceTransition', () => {
     expect(stale).toEqual({
       staleBrowserTransition: true,
       departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
       nextPreviousWorkspaceId: 'workspace-a',
     });
 
     const next = resolveConversationWorkspaceTransition({
       previousWorkspaceId: stale.nextPreviousWorkspaceId,
       activeWorkspaceId: 'workspace-c',
+      currentConversationId: 'chat-b',
       currentNavigationGeneration: 2,
       currentWorkspaceSelectionGeneration: 7,
     });
     expect(next).toEqual({
       staleBrowserTransition: false,
       departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-b',
       nextPreviousWorkspaceId: 'workspace-c',
     });
+  });
+
+  it('lets a newer Browser request adopt a pending switch without losing the departing cursor', () => {
+    const pending = createBrowserWorkspaceTransitionMarker({
+      navigationGeneration: 1,
+      workspaceSelectionGeneration: 7,
+      operation: 'navigate',
+      departingWorkspaceId: 'workspace-a',
+      destinationWorkspaceId: 'workspace-b',
+      departingConversationId: 'chat-a',
+    });
+    const adopted = adoptBrowserWorkspaceTransitionMarker({
+      marker: pending,
+      activeWorkspaceId: 'workspace-b',
+      previousWorkspaceId: 'workspace-a',
+      navigationGeneration: 2,
+      currentWorkspaceSelectionGeneration: 7,
+    });
+
+    expect(
+      resolveConversationWorkspaceTransition({
+        previousWorkspaceId: 'workspace-a',
+        activeWorkspaceId: 'workspace-b',
+        currentConversationId: 'chat-b',
+        browserTransition: adopted,
+        currentNavigationGeneration: 2,
+        currentWorkspaceSelectionGeneration: 7,
+      }),
+    ).toEqual({
+      staleBrowserTransition: false,
+      departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
+      nextPreviousWorkspaceId: 'workspace-b',
+    });
+  });
+
+  it('does not create markers for same-workspace operations or rollbacks', () => {
+    expect(
+      createBrowserWorkspaceTransitionMarker({
+        navigationGeneration: 1,
+        workspaceSelectionGeneration: 2,
+        operation: 'navigate',
+        departingWorkspaceId: 'workspace-a',
+        destinationWorkspaceId: 'workspace-a',
+        departingConversationId: 'chat-a',
+      }),
+    ).toBeUndefined();
+    expect(
+      createBrowserWorkspaceTransitionMarker({
+        navigationGeneration: 1,
+        workspaceSelectionGeneration: 2,
+        operation: 'rollback',
+        departingWorkspaceId: 'workspace-b',
+        destinationWorkspaceId: 'workspace-a',
+        departingConversationId: 'chat-b',
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -217,6 +287,38 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ).resolves.toBe(true);
 
     expect(switchConversation).toHaveBeenCalledWith('chat-browser', 'chat-backend', 1);
+  });
+
+  it('adopts a pending workspace transition when the target is already selected', async () => {
+    const adoptActiveWorkspaceTransition = vi.fn();
+    const setActiveWorkspace = vi.fn(async () => true);
+    const switchConversation = vi.fn(async () => true);
+
+    await expect(
+      openBrowserConversationInWorkspace({
+        conversationId: 'chat-b',
+        selectionGeneration: 2,
+        getConversation: async () => ({ workspaceId: 'workspace-b' }),
+        getActiveConversationId: () => 'chat-b',
+        getBackendActiveConversationId: async () => 'chat-b',
+        getSelectionGeneration: () => 2,
+        getActiveWorkspaceId: () => 'workspace-b',
+        getKnownWorkspaceIds: () => ['workspace-a', 'workspace-b'],
+        saveLastConversation: async () => undefined,
+        getWorkspaceSelectionGeneration: () => 1,
+        workspaceSelectionGeneration: 1,
+        getBrowserAttentionGeneration: () => 2,
+        browserAttentionGeneration: 2,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        adoptActiveWorkspaceTransition,
+        switchConversation,
+      }),
+    ).resolves.toBe(true);
+
+    expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
+    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(switchConversation).not.toHaveBeenCalled();
   });
 
   it('switches workspaces when Browser attention targets the already-selected conversation', async () => {
