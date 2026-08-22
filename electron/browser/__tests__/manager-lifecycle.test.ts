@@ -23,6 +23,7 @@ const electronMocks = vi.hoisted(() => ({
     toPNG: () => buffer,
   })),
   screenGetAllDisplays: vi.fn(() => [{ scaleFactor: 1 }]),
+  showOpenDialog: vi.fn(),
   showSaveDialog: vi.fn(),
   webContentsView: vi.fn(),
 }));
@@ -39,7 +40,7 @@ vi.mock('electron', () => ({
     }
   },
   clipboard: { clear: vi.fn(), readText: vi.fn(() => ''), writeText: vi.fn() },
-  dialog: { showSaveDialog: electronMocks.showSaveDialog },
+  dialog: { showOpenDialog: electronMocks.showOpenDialog, showSaveDialog: electronMocks.showSaveDialog },
   ipcMain: {
     off: electronMocks.ipcOff,
     on: electronMocks.ipcOn,
@@ -165,6 +166,7 @@ function managerWithoutConstructor(properties: Record<string, unknown>): Instanc
       restrictedBackgroundScopes: new Set<string>(),
       pendingCleanupQuarantineUnreadable: false,
       menuPreviewCapture: null,
+      mountGeneration: 0,
       assistantTargetTabs: new Map<string, string>(),
       assistantDialogProtectionRestores: new Map(),
       assistantControlledOrigins: new Map<string, Set<string>>(),
@@ -604,6 +606,7 @@ describe('browser manager renderer lifecycle', () => {
       toPNG: () => buffer,
     }));
     electronMocks.screenGetAllDisplays.mockReset().mockReturnValue([{ scaleFactor: 1 }]);
+    electronMocks.showOpenDialog.mockReset();
     electronMocks.showSaveDialog.mockReset();
     electronMocks.webContentsView.mockReset();
   });
@@ -2248,6 +2251,45 @@ describe('browser manager renderer lifecycle', () => {
     });
 
     expect(manager.dispatchApplicationMenuCommand(contents as never, 'reload')).toBe(true);
+  });
+
+  it('does not open a bookmark-import dialog after its Browser panel authority expires', async () => {
+    const activityGate = deferred<void>();
+    const manager = managerWithoutConstructor({
+      chromeFocusConversationId: 'chat-1',
+      withScopeActivity: async (_scopeKey: string, operation: () => Promise<unknown>) => {
+        await activityGate.promise;
+        return operation();
+      },
+    });
+
+    const importing = manager.importBookmarks('chat-1');
+    invokePrivate(manager, 'invalidatePanelAuthority', 'chat-1');
+    activityGate.resolve();
+
+    await expect(importing).resolves.toEqual({ imported: 0, canceled: true });
+    expect(electronMocks.showOpenDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not open a bookmark-export dialog after its Browser panel authority expires', async () => {
+    const activityGate = deferred<void>();
+    const listBookmarks = vi.fn(() => []);
+    const manager = managerWithoutConstructor({
+      chromeFocusConversationId: 'chat-1',
+      storeForScope: () => ({ listBookmarks }),
+      withScopeActivity: async (_scopeKey: string, operation: () => Promise<unknown>) => {
+        await activityGate.promise;
+        return operation();
+      },
+    });
+
+    const exporting = manager.exportBookmarks('chat-1');
+    invokePrivate(manager, 'invalidatePanelAuthority', 'chat-1');
+    activityGate.resolve();
+
+    await expect(exporting).resolves.toEqual({ exported: 0, canceled: true });
+    expect(listBookmarks).toHaveBeenCalledOnce();
+    expect(electronMocks.showSaveDialog).not.toHaveBeenCalled();
   });
 
   it('broadcasts global bookmark mutations to every known conversation', () => {
@@ -18940,6 +18982,87 @@ describe('browser manager renderer lifecycle', () => {
 
     expect(ensureView).toHaveBeenCalledOnce();
     expect(tab.view).toBe(replacementView);
+  });
+
+  it('does not restore a tab after a newer mount supersedes preview cleanup', async () => {
+    const previewDrain = deferred<void>();
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view: {
+        setBounds: vi.fn(),
+        setVisible: vi.fn(),
+        webContents: { isDestroyed: () => false },
+      },
+    };
+    const ensureView = vi.fn(async () => tab.view);
+    const prepareTabForUserPresentation = vi.fn(() => null);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachActiveView: vi.fn(),
+      emitPendingPrompts: vi.fn(),
+      ensureView,
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged: vi.fn(),
+      preemptMenuPreviewForTab: vi.fn(async () => previewDrain.promise),
+      prepareTabForUserPresentation,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const staleMount = manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 });
+    await Promise.resolve();
+    await manager.mount('chat-2', { x: 20, y: 30, width: 320, height: 220 });
+    previewDrain.resolve();
+    await staleMount;
+
+    expect(ensureView).not.toHaveBeenCalled();
+    expect(prepareTabForUserPresentation).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'mountedConversationId')).toBe('chat-2');
+  });
+
+  it('does not present a restored view after the panel unmounts during loading', async () => {
+    const viewReady = deferred<void>();
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', reloadRequired: false },
+      scriptTainted: false,
+      view: null,
+    };
+    const attachActiveView = vi.fn();
+    const prepareTabForUserPresentation = vi.fn(() => null);
+    const manager = managerWithoutConstructor({
+      activeTabs: new Map([['chat-1', tab.shell.id]]),
+      attachActiveView,
+      emitPendingPrompts: vi.fn(),
+      ensureView: vi.fn(() => viewReady.promise),
+      getConfig: () => ({ browser: { enabled: true } }),
+      getWindow: () =>
+        visibleHostWindow({
+          getContentBounds: () => ({ width: 1_000, height: 800 }),
+        }),
+      mountedBounds: null,
+      mountedConversationId: null,
+      notifyPanelStateChanged: vi.fn(),
+      prepareTabForUserPresentation,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    const staleMount = manager.mount('chat-1', { x: 10, y: 20, width: 300, height: 200 });
+    await Promise.resolve();
+    expect(attachActiveView).toHaveBeenCalledOnce();
+    await manager.mount('chat-1', null);
+    attachActiveView.mockClear();
+    viewReady.resolve();
+    await staleMount;
+
+    expect(prepareTabForUserPresentation).not.toHaveBeenCalled();
+    expect(attachActiveView).not.toHaveBeenCalled();
+    expect(Reflect.get(manager, 'mountedConversationId')).toBeNull();
   });
 
   it('records presentation intent without mutating a background AI viewport', async () => {

@@ -150,6 +150,7 @@ export function resolveConversationWorkspaceTransition(options: {
   const staleBrowserTransition =
     markerDescribesTransition &&
     options.browserTransition?.operation === 'navigate' &&
+    options.browserTransition.suppressArrivingWorkspaceRestoration !== true &&
     options.browserTransition.navigationGeneration !== options.currentNavigationGeneration &&
     // A newer Browser-attention request inherits a workspace mutation that has
     // already committed. The older request can no longer roll it back, so the
@@ -215,6 +216,58 @@ export async function rollbackUnavailableWorkspaceRestoration(options: {
   return result.ok && options.isCurrent();
 }
 
+export type ActiveConversationCasResult = {
+  ok: boolean;
+  error?: 'active-conversation-changed' | 'conversation-not-found' | 'conversation-unavailable';
+  activeConversationId?: string | null;
+};
+
+const WORKSPACE_RESTORATION_RETRY_DELAYS_MS = [25, 75, 150] as const;
+
+/** A strict conversation read can fail transiently before the selection CAS is
+ * attempted. Retry only that temporary failure, remain bound to the original
+ * renderer intent, and stop after a small deterministic backoff budget. */
+export async function setActiveConversationForWorkspaceRestoration(options: {
+  conversationId: string;
+  expectedCurrentConversationId: string | null;
+  isCurrent: () => boolean;
+  setActiveId: (
+    conversationId: string,
+    expectedCurrentConversationId: string | null,
+  ) => Promise<ActiveConversationCasResult>;
+  waitForRetry?: (delayMs: number) => Promise<void>;
+}): Promise<ActiveConversationCasResult | null> {
+  const waitForRetry =
+    options.waitForRetry ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      }));
+  for (let attempt = 0; ; attempt += 1) {
+    if (!options.isCurrent()) return null;
+    const result = await options.setActiveId(options.conversationId, options.expectedCurrentConversationId);
+    if (!options.isCurrent()) return null;
+    if (result.error !== 'conversation-unavailable') return result;
+    const delayMs = WORKSPACE_RESTORATION_RETRY_DELAYS_MS[attempt];
+    if (delayMs === undefined) return result;
+    await waitForRetry(delayMs);
+  }
+}
+
+/** A failed workspace mutation may request restoration only while it remains
+ * the newest navigation intent and the renderer is still in its source scope. */
+export function shouldRetryWorkspaceConversationRestoration(options: {
+  workspaceId: string | null;
+  currentWorkspaceId: string | null;
+  navigationGeneration: number;
+  currentNavigationGeneration: number;
+}): boolean {
+  return (
+    options.workspaceId === options.currentWorkspaceId &&
+    options.navigationGeneration === options.currentNavigationGeneration
+  );
+}
+
 type ConversationFallbackCandidate = {
   id: string;
   workspaceId?: string | null;
@@ -263,6 +316,12 @@ export type ActiveWorkspaceCasResult = {
   activeWorkspaceLastConversationId?: string | null;
 };
 
+export type BrowserWorkspaceSwitchResult = {
+  ok: boolean;
+  /** Authoritative workspace replaced by the successful compare-and-set. */
+  previousWorkspaceId?: string | null;
+};
+
 export type WorkspaceLastConversationCasResult = {
   ok: boolean;
   error?: 'workspace-not-found' | 'last-conversation-changed';
@@ -291,7 +350,7 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
     departingConversationId: string | null,
   ) => Promise<ActiveWorkspaceCasResult>;
   isCurrent: () => boolean;
-}): Promise<boolean> {
+}): Promise<BrowserWorkspaceSwitchResult> {
   let expectedCurrentWorkspaceId = options.expectedCurrentWorkspaceId;
   let departingConversationId = options.departingConversationId;
   for (let attempt = 0; attempt < MAX_BROWSER_WORKSPACE_CAS_ATTEMPTS; attempt += 1) {
@@ -300,17 +359,17 @@ export async function setActiveBrowserWorkspaceWithRebase(options: {
       expectedCurrentWorkspaceId,
       departingConversationId,
     );
-    if (result.ok) return true;
+    if (result.ok) return { ok: true, previousWorkspaceId: expectedCurrentWorkspaceId };
     if (
       !options.isCurrent() ||
       result.activeWorkspaceId === undefined ||
       result.activeWorkspaceLastConversationId === undefined
     )
-      return false;
+      return { ok: false };
     expectedCurrentWorkspaceId = result.activeWorkspaceId;
     departingConversationId = result.activeWorkspaceLastConversationId;
   }
-  return false;
+  return { ok: false };
 }
 
 export async function openBrowserConversationInWorkspace(options: {
@@ -331,7 +390,7 @@ export async function openBrowserConversationInWorkspace(options: {
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
-  ) => Promise<boolean>;
+  ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   adoptActiveWorkspaceTransition?: (workspaceId: string) => void;
   switchConversation: (
@@ -363,12 +422,6 @@ export async function openBrowserConversationInWorkspace(options: {
   if (!requestOwnsNavigation) return false;
   if (conversation.workspaceId && conversation.workspaceId === activeWorkspaceAfterLookup) {
     options.adoptActiveWorkspaceTransition?.(conversation.workspaceId);
-  }
-  if (
-    options.getActiveConversationId() === options.conversationId &&
-    (!conversation.workspaceId || conversation.workspaceId === activeWorkspaceAfterLookup)
-  ) {
-    return true;
   }
   if (!selectionIsCurrent()) return false;
   const activeWorkspaceAtPreparation = activeWorkspaceAfterLookup;
@@ -412,7 +465,7 @@ export async function prepareConversationWorkspaceSwitch(options: {
     workspaceId: string | null,
     expectedCurrentWorkspaceId: string | null,
     operation: 'navigate' | 'rollback',
-  ) => Promise<boolean>;
+  ) => Promise<boolean | BrowserWorkspaceSwitchResult>;
   createWorkspaceObservationWait: (workspaceId: string) => WorkspaceObservationWait;
   isCurrent?: () => boolean;
   isCurrentAfterSwitch?: () => boolean;
@@ -433,32 +486,41 @@ export async function prepareConversationWorkspaceSwitch(options: {
     });
   };
   try {
-    if (targetWorkspaceId !== options.activeWorkspaceId) {
-      if (options.isCurrent?.() === false) return false;
-      destinationUpdate = await options.saveLastConversation({
-        workspaceId: targetWorkspaceId,
-        conversationId: options.conversationId,
-      });
-      if (destinationUpdate && !destinationUpdate.ok) return false;
-      if (options.isCurrent && !options.isCurrent()) return false;
-      const switched = await options.setActiveWorkspace(
-        targetWorkspaceId,
-        options.activeWorkspaceId ?? null,
-        'navigate',
-      );
-      if (!switched) return false;
-      if (options.isCurrentAfterSwitch && !options.isCurrentAfterSwitch()) {
-        if (options.canRollbackStaleSwitch?.()) {
-          await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId, 'rollback');
-        }
-        return false;
+    // The renderer's config can lag another window's workspace mutation. Always
+    // write the destination cursor transactionally and perform the authoritative
+    // workspace CAS, even when the cached workspace already equals the target.
+    if (options.isCurrent?.() === false) return false;
+    destinationUpdate = await options.saveLastConversation({
+      workspaceId: targetWorkspaceId,
+      conversationId: options.conversationId,
+    });
+    if (destinationUpdate && !destinationUpdate.ok) return false;
+    if (options.isCurrent && !options.isCurrent()) return false;
+    const switchResult = await options.setActiveWorkspace(
+      targetWorkspaceId,
+      options.activeWorkspaceId ?? null,
+      'navigate',
+    );
+    const switched = typeof switchResult === 'boolean' ? switchResult : switchResult.ok;
+    if (!switched) return false;
+    const previousWorkspaceId =
+      typeof switchResult === 'boolean'
+        ? (options.activeWorkspaceId ?? null)
+        : switchResult.previousWorkspaceId === undefined
+          ? (options.activeWorkspaceId ?? null)
+          : switchResult.previousWorkspaceId;
+    const switchedWorkspace = previousWorkspaceId !== targetWorkspaceId;
+    if (options.isCurrentAfterSwitch && !options.isCurrentAfterSwitch()) {
+      if (switchedWorkspace && options.canRollbackStaleSwitch?.()) {
+        await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
       }
+      return false;
     }
     const observed = await observation.promise;
     if (!observed) return false;
-    if (targetWorkspaceId !== options.activeWorkspaceId && options.isCurrentAfterSwitch?.() === false) {
-      if (options.canRollbackStaleSwitch?.()) {
-        await options.setActiveWorkspace(options.activeWorkspaceId ?? null, targetWorkspaceId, 'rollback');
+    if (options.isCurrentAfterSwitch?.() === false) {
+      if (switchedWorkspace && options.canRollbackStaleSwitch?.()) {
+        await options.setActiveWorkspace(previousWorkspaceId, targetWorkspaceId, 'rollback');
       }
       return false;
     }
@@ -469,11 +531,6 @@ export async function prepareConversationWorkspaceSwitch(options: {
     if (!committed) await restoreDestination();
   }
 }
-
-type ActiveConversationCasResult = {
-  ok: boolean;
-  activeConversationId?: string | null;
-};
 
 /** Resolve a surviving delete fallback against fresh backend state. Browser
  * profile cleanup can keep the delete IPC pending long enough for another

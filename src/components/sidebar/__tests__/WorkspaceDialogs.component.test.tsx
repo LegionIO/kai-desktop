@@ -29,7 +29,7 @@ describe('workspace mutation dialogs', () => {
         create,
       },
     });
-    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationIntent = vi.fn(() => 13);
     const onWorkspaceNavigationFailure = vi.fn();
 
     render(
@@ -46,7 +46,7 @@ describe('workspace mutation dialogs', () => {
 
     expect(create).toHaveBeenCalledWith({ name: 'New workspace', directory: '/work/new' });
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
-    expect(onWorkspaceNavigationFailure).toHaveBeenCalledOnce();
+    expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith(13);
     expect(await screen.findByText('Create failed')).toBeInTheDocument();
   });
 
@@ -54,7 +54,7 @@ describe('workspace mutation dialogs', () => {
     const user = userEvent.setup();
     const deleteWorkspace = vi.fn(async () => undefined);
     installAppBridgeStub({ workspaces: { delete: deleteWorkspace } });
-    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationIntent = vi.fn(() => 17);
     const onWorkspaceNavigationFailure = vi.fn();
 
     render(
@@ -82,7 +82,7 @@ describe('workspace mutation dialogs', () => {
       throw new Error('Delete failed');
     });
     installAppBridgeStub({ workspaces: { delete: deleteWorkspace } });
-    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationIntent = vi.fn(() => 19);
     const onWorkspaceNavigationFailure = vi.fn();
 
     render(
@@ -100,7 +100,7 @@ describe('workspace mutation dialogs', () => {
     await user.click(screen.getByRole('button', { name: 'Delete Workspace' }));
 
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
-    expect(onWorkspaceNavigationFailure).toHaveBeenCalledOnce();
+    expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith(19);
     expect(await screen.findByText('Delete failed')).toBeInTheDocument();
   });
 });

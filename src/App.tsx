@@ -94,10 +94,12 @@ import {
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
+  setActiveConversationForWorkspaceRestoration,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
+  shouldRetryWorkspaceConversationRestoration,
   type BrowserWorkspaceTransitionMarker,
   type WorkspaceObservationWait,
 } from '@/lib/conversation-selection';
@@ -729,19 +731,31 @@ function AppShell() {
     navigationIntentGenerationRef.current++;
     setActiveViewState(next);
   }, []);
-  const recordWorkspaceNavigationIntent = useCallback(() => {
+  const recordWorkspaceNavigationIntent = useCallback((): number => {
     workspaceSelectionIntentGenerationRef.current++;
     navigationIntentGenerationRef.current++;
     conversationSelectionIntentGenerationRef.current++;
+    return navigationIntentGenerationRef.current;
   }, []);
-  const retryWorkspaceConversationRestoration = useCallback((workspaceId: string | null) => {
-    // A concurrent successful workspace mutation will run the normal
-    // workspace-change effect. Retry only when the failed request left us in
-    // the workspace whose in-flight restoration it invalidated.
-    if (configuredWorkspaceIdRef.current === workspaceId) {
-      setWorkspaceRestorationRetryGeneration((generation) => generation + 1);
-    }
-  }, []);
+  const retryWorkspaceConversationRestoration = useCallback(
+    (workspaceId: string | null, navigationGeneration: number) => {
+      // A concurrent successful workspace mutation will run the normal
+      // workspace-change effect. Retry only when the failed request left us in
+      // the workspace whose in-flight restoration it invalidated, and only while
+      // no newer view/chat/workspace intent has superseded that failed request.
+      if (
+        shouldRetryWorkspaceConversationRestoration({
+          workspaceId,
+          currentWorkspaceId: configuredWorkspaceIdRef.current,
+          navigationGeneration,
+          currentNavigationGeneration: navigationIntentGenerationRef.current,
+        })
+      ) {
+        setWorkspaceRestorationRetryGeneration((generation) => generation + 1);
+      }
+    },
+    [],
+  );
   const configuredWorkspaceIdRef = useRef<string | null>(null);
   const knownWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const observedWorkspaceIdRef = useRef<string | null | undefined>(undefined);
@@ -888,8 +902,15 @@ function AppShell() {
         // before the renderer-side sequence guard observes it.
         const backendSelectionWhenStarted = await app.conversations.getActiveId();
         if (!isCurrent()) return;
-        const activation = await app.conversations.setActiveId(restoredId, backendSelectionWhenStarted);
+        const activation = await setActiveConversationForWorkspaceRestoration({
+          conversationId: restoredId,
+          expectedCurrentConversationId: backendSelectionWhenStarted,
+          isCurrent,
+          setActiveId: (conversationId, expectedCurrentConversationId) =>
+            app.conversations.setActiveId(conversationId, expectedCurrentConversationId),
+        });
         if (!isCurrent()) return;
+        if (!activation) return;
         if (!activation.ok) {
           if (activation.error === 'conversation-not-found') {
             await app.workspaces.saveLastConversation({

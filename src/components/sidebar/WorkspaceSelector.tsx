@@ -69,8 +69,8 @@ interface WorkspaceSelectorProps {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   activeWorkspace: Workspace | null;
-  onWorkspaceNavigationIntent: () => void;
-  onWorkspaceNavigationFailure: (workspaceId: string | null) => void;
+  onWorkspaceNavigationIntent: () => number;
+  onWorkspaceNavigationFailure: (workspaceId: string | null, navigationGeneration: number) => void;
 }
 
 export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
@@ -91,12 +91,12 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
     // generation here would cancel an in-flight last-conversation restoration,
     // while the unchanged workspace id gives the effect no chance to restart it.
     if (workspaceId === activeWorkspaceId) return;
-    onWorkspaceNavigationIntent();
+    const navigationGeneration = onWorkspaceNavigationIntent();
     try {
       const result = await app.workspaces.setActive({ id: workspaceId, expectedCurrentId: activeWorkspaceId });
-      if (!result.ok) onWorkspaceNavigationFailure(activeWorkspaceId);
+      if (!result.ok) onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
     } catch {
-      onWorkspaceNavigationFailure(activeWorkspaceId);
+      onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration);
     }
   };
 
@@ -135,7 +135,9 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={createOpen}
         onOpenChange={setCreateOpen}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
-        onWorkspaceNavigationFailure={() => onWorkspaceNavigationFailure(activeWorkspaceId)}
+        onWorkspaceNavigationFailure={(navigationGeneration) =>
+          onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration)
+        }
       />
       <DeleteWorkspaceDialog
         workspace={deleteTarget}
@@ -143,7 +145,9 @@ export const WorkspaceSelector: FC<WorkspaceSelectorProps> = ({
         open={deleteOpen}
         onOpenChange={handleDeleteOpenChange}
         onWorkspaceNavigationIntent={onWorkspaceNavigationIntent}
-        onWorkspaceNavigationFailure={() => onWorkspaceNavigationFailure(activeWorkspaceId)}
+        onWorkspaceNavigationFailure={(navigationGeneration) =>
+          onWorkspaceNavigationFailure(activeWorkspaceId, navigationGeneration)
+        }
       />
     </>
   );

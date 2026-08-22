@@ -1514,6 +1514,9 @@ export class BrowserManager {
    * without recreating authenticated DOM state or requiring a mounted panel. */
   private detachedHostViews = new Set<WebContentsView>();
   private closingHostWindow: BrowserWindow | null = null;
+  /** Every mount/unmount request supersedes async presentation work started by
+   * an older request, including another request for the same conversation. */
+  private mountGeneration = 0;
   private mountedConversationId: string | null = null;
   private mountedBounds: BrowserBounds | null = null;
   private disposed = false;
@@ -5173,6 +5176,14 @@ export class BrowserManager {
     return this.isTargetViewPresented(tab, contents) && this.isNativeBrowserPageFocused(contents);
   }
 
+  private hasBrowserChromeNativeDialogAuthority(conversationId: string, panelAuthorityGeneration: number): boolean {
+    return (
+      panelAuthorityGeneration === this.panelAuthorityGeneration(conversationId) &&
+      this.chromeFocusConversationId === conversationId &&
+      this.isHostWindowInteractive()
+    );
+  }
+
   /** Acquire manager ownership of the target debugger until the returned
    * one-shot release is called. All manager CDP users share this lease set so a
    * panel mount may restore viewport metrics concurrently without detaching an
@@ -7893,6 +7904,7 @@ export class BrowserManager {
   }
 
   async mount(conversationId: string, bounds: BrowserBounds | null): Promise<void> {
+    const mountGeneration = (this.mountGeneration = (this.mountGeneration ?? 0) + 1);
     if (!this.config().enabled) {
       const mountedConversationId = this.mountedConversationId;
       if (mountedConversationId) {
@@ -7978,6 +7990,11 @@ export class BrowserManager {
       this.notifyPanelStateChanged(conversationId);
       return;
     }
+    const mountIsCurrent = (): boolean =>
+      this.mountGeneration === mountGeneration &&
+      this.mountedConversationId === conversationId &&
+      this.activeTabs.get(conversationId) === active &&
+      this.tabs.get(active) === tab;
     // A menu preview is opportunistic and never changes renderer lifecycle.
     // Preempt its short queue task before ensureView captures the same target;
     // any uncancellable native image drain remains independently tracked.
@@ -7986,17 +8003,21 @@ export class BrowserManager {
       'Browser menu preview was cancelled because the user opened this tab.',
     );
     if (previewPreemption) await previewPreemption;
+    if (!mountIsCurrent()) return;
     // Attach whatever ensureView created synchronously, then attach again after
     // any asynchronous cleanup/restoration finished.
     const viewReady = this.ensureView(tab);
     if (tab.view && !tab.view.webContents.isDestroyed()) {
       const presentationTransition = this.prepareTabForUserPresentation(tab);
       if (presentationTransition) await presentationTransition;
+      if (!mountIsCurrent()) return;
     }
     this.attachActiveView(conversationId);
     await viewReady;
+    if (!mountIsCurrent()) return;
     const presentationTransition = this.prepareTabForUserPresentation(tab);
     if (presentationTransition) await presentationTransition;
+    if (!mountIsCurrent()) return;
     this.attachActiveView(conversationId);
     this.notifyPanelStateChanged(conversationId);
   }
@@ -14939,7 +14960,12 @@ export class BrowserManager {
 
   async importBookmarks(conversationId: string): Promise<{ imported: number; canceled?: boolean }> {
     const scopeKey = this.scopeKey(conversationId);
+    const nativeDialogPanelGeneration = this.panelAuthorityGeneration(conversationId);
     return this.withScopeActivity(scopeKey, async () => {
+      this.assertHostRendererOperationCurrent();
+      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+        return { imported: 0, canceled: true };
+      }
       const win = this.getWindow();
       const options: Electron.OpenDialogOptions = {
         title: 'Import bookmarks',
@@ -14949,6 +14975,9 @@ export class BrowserManager {
       const selected =
         win && !win.isDestroyed() ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
       this.assertHostRendererOperationCurrent();
+      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+        return { imported: 0, canceled: true };
+      }
       if (selected.canceled || !selected.filePaths[0]) return { imported: 0, canceled: true };
       const filePath = selected.filePaths[0];
       const html = readBoundedBookmarksHtmlFileSync(filePath);
@@ -14961,8 +14990,13 @@ export class BrowserManager {
 
   async exportBookmarks(conversationId: string): Promise<{ exported: number; canceled?: boolean; filePath?: string }> {
     const scopeKey = this.scopeKey(conversationId);
+    const nativeDialogPanelGeneration = this.panelAuthorityGeneration(conversationId);
     return this.withScopeActivity(scopeKey, async () => {
       const bookmarks = this.storeForScope(scopeKey).listBookmarks();
+      this.assertHostRendererOperationCurrent();
+      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+        return { exported: 0, canceled: true };
+      }
       const win = this.getWindow();
       const options = {
         title: 'Export bookmarks',
@@ -14972,6 +15006,9 @@ export class BrowserManager {
       const selected =
         win && !win.isDestroyed() ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
       this.assertHostRendererOperationCurrent();
+      if (!this.hasBrowserChromeNativeDialogAuthority(conversationId, nativeDialogPanelGeneration)) {
+        return { exported: 0, canceled: true };
+      }
       if (selected.canceled || !selected.filePath) return { exported: 0, canceled: true };
       atomicWriteFileSync(selected.filePath, renderBookmarksHtml(bookmarks), {
         mode: 0o600,

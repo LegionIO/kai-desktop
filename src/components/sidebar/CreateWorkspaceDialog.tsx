@@ -6,8 +6,8 @@ import { app } from '@/lib/ipc-client';
 interface CreateWorkspaceDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onWorkspaceNavigationIntent: () => void;
-  onWorkspaceNavigationFailure: () => void;
+  onWorkspaceNavigationIntent: () => number;
+  onWorkspaceNavigationFailure: (navigationGeneration: number) => void;
 }
 
 export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
@@ -36,7 +36,7 @@ export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
     if (!name.trim() || !directory) return;
     setIsCreating(true);
     setError(null);
-    onWorkspaceNavigationIntent();
+    const navigationGeneration = onWorkspaceNavigationIntent();
     try {
       await app.workspaces.create({ name: name.trim(), directory });
       onOpenChange(false);
@@ -44,7 +44,7 @@ export const CreateWorkspaceDialog: FC<CreateWorkspaceDialogProps> = ({
       setName('');
       setDirectory('');
     } catch (err) {
-      onWorkspaceNavigationFailure();
+      onWorkspaceNavigationFailure(navigationGeneration);
       setError(err instanceof Error ? err.message : 'Failed to create workspace');
     } finally {
       setIsCreating(false);

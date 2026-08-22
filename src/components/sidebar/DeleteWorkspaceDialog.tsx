@@ -9,8 +9,8 @@ interface DeleteWorkspaceDialogProps {
   activeWorkspaceId: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onWorkspaceNavigationIntent: () => void;
-  onWorkspaceNavigationFailure: () => void;
+  onWorkspaceNavigationIntent: () => number;
+  onWorkspaceNavigationFailure: (navigationGeneration: number) => void;
 }
 
 export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
@@ -32,12 +32,12 @@ export const DeleteWorkspaceDialog: FC<DeleteWorkspaceDialogProps> = ({
     setIsDeleting(true);
     setError(null);
     const deletingActiveWorkspace = workspace.id === activeWorkspaceId;
-    if (deletingActiveWorkspace) onWorkspaceNavigationIntent();
+    const navigationGeneration = deletingActiveWorkspace ? onWorkspaceNavigationIntent() : null;
     try {
       await app.workspaces.delete({ id: workspace.id });
       onOpenChange(false);
     } catch (err) {
-      if (deletingActiveWorkspace) onWorkspaceNavigationFailure();
+      if (navigationGeneration !== null) onWorkspaceNavigationFailure(navigationGeneration);
       setError(err instanceof Error ? err.message : 'Failed to delete workspace');
     } finally {
       setIsDeleting(false);

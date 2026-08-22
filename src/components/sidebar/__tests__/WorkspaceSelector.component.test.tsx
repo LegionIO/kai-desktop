@@ -13,7 +13,7 @@ describe('WorkspaceSelector', () => {
         workspaces={[]}
         activeWorkspaceId={null}
         activeWorkspace={null}
-        onWorkspaceNavigationIntent={() => undefined}
+        onWorkspaceNavigationIntent={() => 1}
         onWorkspaceNavigationFailure={() => undefined}
       />,
     );
@@ -27,7 +27,7 @@ describe('WorkspaceSelector', () => {
     const user = userEvent.setup();
     const setActive = vi.fn(async () => ({ ok: true, activeWorkspaceId: 'workspace-a' }));
     installAppBridgeStub({ workspaces: { setActive } });
-    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationIntent = vi.fn(() => 7);
     const workspace = {
       id: 'workspace-a',
       name: 'Workspace A',
@@ -63,7 +63,7 @@ describe('WorkspaceSelector', () => {
       activeWorkspaceId: 'workspace-a',
     }));
     installAppBridgeStub({ workspaces: { setActive } });
-    const onWorkspaceNavigationIntent = vi.fn();
+    const onWorkspaceNavigationIntent = vi.fn(() => 11);
     const onWorkspaceNavigationFailure = vi.fn();
     const workspaceA = {
       id: 'workspace-a',
@@ -97,6 +97,6 @@ describe('WorkspaceSelector', () => {
 
     expect(onWorkspaceNavigationIntent).toHaveBeenCalledOnce();
     expect(setActive).toHaveBeenCalledWith({ id: 'workspace-b', expectedCurrentId: 'workspace-a' });
-    expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith('workspace-a');
+    expect(onWorkspaceNavigationFailure).toHaveBeenCalledWith('workspace-a', 11);
   });
 });

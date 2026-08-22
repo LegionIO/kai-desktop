@@ -18,10 +18,12 @@ import {
   resolveConversationWorkspaceTransition,
   rollbackUnavailableWorkspaceRestoration,
   selectConversationDeleteFallback,
+  setActiveConversationForWorkspaceRestoration,
   setActiveBrowserWorkspaceWithRebase,
   shouldAdoptBroadcastActiveId,
   shouldApplyConversationDeleteFallback,
   shouldClearSelectionForNullActiveBroadcast,
+  shouldRetryWorkspaceConversationRestoration,
 } from '../conversation-selection';
 
 describe('isConversationWorkspaceRestorationCurrent', () => {
@@ -156,6 +158,35 @@ describe('resolveConversationWorkspaceTransition', () => {
     });
   });
 
+  it('does not classify an adopted transition as rollback-pending after newer user navigation', () => {
+    expect(
+      resolveConversationWorkspaceTransition({
+        previousWorkspaceId: 'workspace-a',
+        activeWorkspaceId: 'workspace-b',
+        currentConversationId: 'chat-user-choice',
+        browserTransition: {
+          navigationGeneration: 2,
+          browserAttentionGeneration: 2,
+          workspaceSelectionGeneration: 7,
+          suppressArrivingWorkspaceRestoration: true,
+          operation: 'navigate',
+          departingWorkspaceId: 'workspace-a',
+          destinationWorkspaceId: 'workspace-b',
+          departingConversationId: 'chat-a',
+        },
+        currentNavigationGeneration: 3,
+        currentBrowserAttentionGeneration: 2,
+        currentWorkspaceSelectionGeneration: 7,
+      }),
+    ).toEqual({
+      staleBrowserTransition: false,
+      suppressArrivingWorkspaceRestoration: true,
+      departingWorkspaceId: 'workspace-a',
+      departingConversationId: 'chat-a',
+      nextPreviousWorkspaceId: 'workspace-b',
+    });
+  });
+
   it('does not let an older Browser request downgrade a newer transition marker', () => {
     const newer = createBrowserWorkspaceTransitionMarker({
       navigationGeneration: 4,
@@ -237,6 +268,82 @@ describe('rollbackUnavailableWorkspaceRestoration', () => {
   });
 });
 
+describe('setActiveConversationForWorkspaceRestoration', () => {
+  it('retries transient unavailable reads within a bounded budget', async () => {
+    const setActiveId = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, error: 'conversation-unavailable' })
+      .mockResolvedValueOnce({ ok: false, error: 'conversation-unavailable' })
+      .mockResolvedValueOnce({ ok: true });
+    const waitForRetry = vi.fn(async () => undefined);
+
+    await expect(
+      setActiveConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        expectedCurrentConversationId: 'chat-a',
+        isCurrent: () => true,
+        setActiveId,
+        waitForRetry,
+      }),
+    ).resolves.toEqual({ ok: true });
+
+    expect(setActiveId).toHaveBeenCalledTimes(3);
+    expect(setActiveId).toHaveBeenNthCalledWith(3, 'chat-b', 'chat-a');
+    expect(waitForRetry.mock.calls).toEqual([[25], [75]]);
+  });
+
+  it('stops retrying as soon as a newer selection intent wins', async () => {
+    let current = true;
+    const setActiveId = vi.fn(async () => ({ ok: false, error: 'conversation-unavailable' as const }));
+
+    await expect(
+      setActiveConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        expectedCurrentConversationId: 'chat-a',
+        isCurrent: () => current,
+        setActiveId,
+        waitForRetry: async () => {
+          current = false;
+        },
+      }),
+    ).resolves.toBeNull();
+
+    expect(setActiveId).toHaveBeenCalledOnce();
+  });
+
+  it('returns the last unavailable result after exhausting its retry budget', async () => {
+    const unavailable = { ok: false, error: 'conversation-unavailable' as const };
+    const setActiveId = vi.fn(async () => unavailable);
+
+    await expect(
+      setActiveConversationForWorkspaceRestoration({
+        conversationId: 'chat-b',
+        expectedCurrentConversationId: 'chat-a',
+        isCurrent: () => true,
+        setActiveId,
+        waitForRetry: async () => undefined,
+      }),
+    ).resolves.toBe(unavailable);
+
+    expect(setActiveId).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('shouldRetryWorkspaceConversationRestoration', () => {
+  it('requires both the original workspace and navigation generation', () => {
+    const current = {
+      workspaceId: 'workspace-a',
+      currentWorkspaceId: 'workspace-a',
+      navigationGeneration: 4,
+      currentNavigationGeneration: 4,
+    };
+
+    expect(shouldRetryWorkspaceConversationRestoration(current)).toBe(true);
+    expect(shouldRetryWorkspaceConversationRestoration({ ...current, currentNavigationGeneration: 5 })).toBe(false);
+    expect(shouldRetryWorkspaceConversationRestoration({ ...current, currentWorkspaceId: 'workspace-b' })).toBe(false);
+  });
+});
+
 describe('filterConversationDeleteFallbackCandidates', () => {
   const conversations = [
     { id: 'visible', workspaceId: 'workspace-a', archived: false, messageCount: 1 },
@@ -284,7 +391,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         setActiveWorkspace,
         isCurrent: () => true,
       }),
-    ).resolves.toBe(true);
+    ).resolves.toEqual({ ok: true, previousWorkspaceId: 'workspace-authoritative' });
 
     expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-browser', 'workspace-stale', 'chat-stale');
     expect(setActiveWorkspace).toHaveBeenNthCalledWith(
@@ -311,7 +418,7 @@ describe('setActiveBrowserWorkspaceWithRebase', () => {
         setActiveWorkspace,
         isCurrent: () => false,
       }),
-    ).resolves.toBe(false);
+    ).resolves.toEqual({ ok: false });
 
     expect(setActiveWorkspace).toHaveBeenCalledOnce();
   });
@@ -360,8 +467,8 @@ describe('prepareConversationWorkspaceSwitch', () => {
     resolveConversation({ workspaceId: 'workspace-b' });
 
     await expect(opening).resolves.toBe(true);
-    expect(saveLastConversation).not.toHaveBeenCalled();
-    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-b', conversationId: 'chat-b' });
+    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
     expect(switchConversation).toHaveBeenCalledWith('chat-b', 'chat-a', selectionGeneration);
     expect(cancelObservation).toHaveBeenCalledOnce();
   });
@@ -421,7 +528,7 @@ describe('prepareConversationWorkspaceSwitch', () => {
     ).resolves.toBe(true);
 
     expect(adoptActiveWorkspaceTransition).toHaveBeenCalledWith('workspace-b');
-    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
     expect(switchConversation).not.toHaveBeenCalled();
   });
 
@@ -808,12 +915,37 @@ describe('prepareConversationWorkspaceSwitch', () => {
 
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(saveLastConversation).not.toHaveBeenCalled();
-    expect(setActiveWorkspace).not.toHaveBeenCalled();
+    expect(saveLastConversation).toHaveBeenCalledWith({ workspaceId: 'workspace-b', conversationId: 'chat-b' });
+    expect(setActiveWorkspace).toHaveBeenCalledWith('workspace-b', 'workspace-b', 'navigate');
 
     resolveObservation(true);
     await expect(preparation).resolves.toBe(true);
     expect(cancelObservation).toHaveBeenCalledOnce();
+  });
+
+  it('rolls a stale authoritative rebase back to the workspace actually replaced', async () => {
+    const setActiveWorkspace = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, previousWorkspaceId: 'workspace-authoritative' })
+      .mockResolvedValueOnce(true);
+
+    await expect(
+      prepareConversationWorkspaceSwitch({
+        conversationId: 'chat-a',
+        conversationWorkspaceId: 'workspace-a',
+        activeWorkspaceId: 'workspace-a',
+        knownWorkspaceIds: ['workspace-a', 'workspace-authoritative'],
+        saveLastConversation: async () => undefined,
+        setActiveWorkspace,
+        createWorkspaceObservationWait: () => ({ promise: Promise.resolve(true), cancel: vi.fn() }),
+        isCurrent: () => true,
+        isCurrentAfterSwitch: () => false,
+        canRollbackStaleSwitch: () => true,
+      }),
+    ).resolves.toBe(false);
+
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(1, 'workspace-a', 'workspace-a', 'navigate');
+    expect(setActiveWorkspace).toHaveBeenNthCalledWith(2, 'workspace-authoritative', 'workspace-a', 'rollback');
   });
 
   it('waits for the departing-workspace effect before the caller selects the destination chat', async () => {
