@@ -1,4 +1,4 @@
-import { app, session, type BrowserWindow, type Session } from 'electron';
+import { app, session, type BrowserWindow } from 'electron';
 import type { AppConfig } from '../config/schema.js';
 import { conversationExistenceState } from '../ipc/conversation-store.js';
 import { BrowserManager } from './manager.js';
@@ -94,7 +94,8 @@ type PreparedBrowserConversationRemoval = {
   scopeKey: string;
   finish: () => void;
   managerRemoval?: Promise<void>;
-  scopedSession?: Session;
+  headlessProfileCleanup?: boolean;
+  pendingCleanupMarkerInstalled?: boolean;
   preparationError?: unknown;
 };
 
@@ -117,13 +118,19 @@ function prepareBrowserConversationRemoval(
       return { conversationId, scopeKey, finish, managerRemoval };
     }
     if (hasStoredBrowserScopeData(appHome, app.getPath('sessionData'), scopeKey)) {
-      const scopedSession = session.fromPartition(browserPartitionForScopeKey(scopeKey));
-      const requestFilter = { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] };
-      // Installing the deny-all hook is the headless equivalent of destroying
-      // a live view: service workers and pooled connections cannot reach the
-      // network while this profile waits behind earlier sequential clears.
-      scopedSession.webRequest.onBeforeRequest(requestFilter, (_details, callback) => callback({ cancel: true }));
-      return { conversationId, scopeKey, finish, scopedSession };
+      // Quarantine every deleted profile durably before the bulk caller awaits
+      // its first clear. Do not instantiate every persistent Electron Session
+      // here: those native objects are heavyweight and a large clear-all would
+      // otherwise retain an unbounded set of them at once. The in-flight fence
+      // also prevents a manager promoted during cleanup from opening this chat.
+      markPendingBrowserCleanupScopeKey(appHome, scopeKey);
+      return {
+        conversationId,
+        scopeKey,
+        finish,
+        headlessProfileCleanup: true,
+        pendingCleanupMarkerInstalled: true,
+      };
     }
     return { conversationId, scopeKey, finish };
   } catch (preparationError) {
@@ -135,12 +142,31 @@ async function completeBrowserConversationRemoval(
   appHome: string,
   prepared: PreparedBrowserConversationRemoval,
 ): Promise<void> {
-  const { conversationId, scopeKey, finish, managerRemoval, scopedSession, preparationError } = prepared;
+  const {
+    conversationId,
+    scopeKey,
+    finish,
+    managerRemoval,
+    headlessProfileCleanup,
+    pendingCleanupMarkerInstalled,
+    preparationError,
+  } = prepared;
+  let pendingCleanupMarkerNeedsRestore = pendingCleanupMarkerInstalled !== true;
   try {
     if (preparationError) throw preparationError;
     if (managerRemoval) {
       await managerRemoval;
-    } else if (scopedSession) {
+    } else if (headlessProfileCleanup && manager) {
+      // A GUI manager may be promoted while an earlier bulk entry is clearing.
+      // Let it own this profile's Session and request-policy lifecycle instead of
+      // installing a second headless hook on the same persistent partition.
+      await manager.removeConversation(conversationId);
+    } else if (headlessProfileCleanup) {
+      const scopedSession = session.fromPartition(browserPartitionForScopeKey(scopeKey));
+      const requestFilter = { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] };
+      // Materialize only the profile currently being cleared, then install its
+      // fail-closed guard before any worker or connection shutdown can yield.
+      scopedSession.webRequest.onBeforeRequest(requestFilter, (_details, callback) => callback({ cancel: true }));
       let cleanupSucceeded = false;
       try {
         // A headless profile can still own service workers and pooled sockets.
@@ -189,26 +215,32 @@ async function completeBrowserConversationRemoval(
         // background state in this persistent partition. Keep the deny-all
         // request hook installed until a later retry proves the profile clear
         // completed; removing it here would restore network access fail-open.
-        if (cleanupSucceeded && !manager) {
+        if (cleanupSucceeded && (!manager || !manager.managesSession(scopeKey, scopedSession))) {
           scopedSession.webRequest.onBeforeRequest(null);
         }
         // A GUI promotion may initialize BrowserManager while this headless
-        // clear is awaiting Chromium. In that case its wireSession call either
-        // already replaced this deny-all listener or will replace it when the
-        // profile is next used. Do not clear the shared Session listener here:
-        // Electron supports only one onBeforeRequest listener, so doing so
-        // would silently remove the manager's newly installed AI policy.
+        // clear is awaiting Chromium. Preserve the listener only if that manager
+        // adopted this exact Session and replaced it with its full request
+        // policy; otherwise the headless deny hook has no remaining owner and
+        // must be removed so the Session can be reclaimed.
       }
     }
     removeBrowserScreenshotsForConversation(appHome, conversationId);
+    // clearPendingBrowserCleanupScopeKey removes the exact sidecar before it
+    // validates/migrates legacy metadata. If that validation fails, restore the
+    // sidecar in the catch path so this profile remains explicitly retryable.
+    pendingCleanupMarkerNeedsRestore = true;
     if (!clearPendingBrowserCleanupScopeKey(appHome, scopeKey)) {
       throw new Error('Pending Browser-profile cleanup metadata remains unreadable; cleanup stays quarantined.');
     }
+    pendingCleanupMarkerNeedsRestore = false;
   } catch (error) {
-    try {
-      markPendingBrowserCleanupScopeKey(appHome, scopeKey);
-    } catch (markerError) {
-      console.warn('[Browser] Failed to retain pending conversation-profile cleanup:', scopeKey, markerError);
+    if (pendingCleanupMarkerNeedsRestore) {
+      try {
+        markPendingBrowserCleanupScopeKey(appHome, scopeKey);
+      } catch (markerError) {
+        console.warn('[Browser] Failed to retain pending conversation-profile cleanup:', scopeKey, markerError);
+      }
     }
     throw error;
   } finally {
@@ -231,8 +263,10 @@ export async function removeBrowserConversationsData(
   conversationIds: Iterable<string>,
 ): Promise<string[]> {
   // Preparation is synchronous up to the manager's first await. Consequently
-  // every target is fenced and every live view is destroyed before any one
-  // profile can wait on downloads, workers, Chromium, or persistent storage.
+  // every target is fenced, every live view is destroyed, and every headless
+  // profile has a durable quarantine marker before any one profile can wait on
+  // downloads, workers, Chromium, or persistent storage. Headless Sessions are
+  // then materialized one at a time by the sequential completion loop.
   const removals = [...new Set(conversationIds)].map((conversationId) =>
     prepareBrowserConversationRemoval(appHome, conversationId),
   );

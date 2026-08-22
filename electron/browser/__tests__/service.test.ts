@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   managerDispose: vi.fn(),
   managerShutdown: vi.fn<() => Promise<void>>(async () => undefined),
   managerFenceConversation: vi.fn(),
+  managerManagesSession: vi.fn(() => false),
   managerRemoveConversation: vi.fn<(conversationId: string) => Promise<void>>(async () => undefined),
 }));
 
@@ -58,6 +59,7 @@ vi.mock('../manager.js', () => ({
     dispose = mocks.managerDispose;
     shutdown = mocks.managerShutdown;
     fenceRemovedConversation = mocks.managerFenceConversation;
+    managesSession = mocks.managerManagesSession;
     removeConversation = mocks.managerRemoveConversation;
   },
 }));
@@ -101,6 +103,7 @@ describe('headless browser profile cleanup', () => {
     mocks.profileExists.mockReturnValue(true);
     mocks.pendingCleanupClear.mockReturnValue(true);
     mocks.pendingCleanupMark.mockReturnValue(true);
+    mocks.managerManagesSession.mockReturnValue(false);
     mocks.managerRemoveConversation.mockReset();
     mocks.managerRemoveConversation.mockResolvedValue(undefined);
   });
@@ -148,7 +151,7 @@ describe('headless browser profile cleanup', () => {
     );
   });
 
-  it('does not remove a BrowserManager request guard when GUI promotion races headless cleanup', async () => {
+  it('releases a headless request guard when a promoted manager did not adopt its session', async () => {
     let finishStorageClear!: () => void;
     mocks.clearStorageData.mockReturnValueOnce(
       new Promise<undefined>((resolve) => {
@@ -168,6 +171,32 @@ describe('headless browser profile cleanup', () => {
     await cleanup;
 
     expect(mocks.managerFenceConversation).toHaveBeenCalledWith('conversation-123');
+    expect(mocks.managerManagesSession).toHaveBeenCalledOnce();
+    expect(mocks.onBeforeRequest).toHaveBeenLastCalledWith(null);
+    await shutdownBrowserManager();
+  });
+
+  it('does not remove a promoted BrowserManager request guard after it adopts the cleanup session', async () => {
+    let finishStorageClear!: () => void;
+    mocks.clearStorageData.mockReturnValueOnce(
+      new Promise<undefined>((resolve) => {
+        finishStorageClear = () => resolve(undefined);
+      }),
+    );
+    mocks.managerManagesSession.mockReturnValue(true);
+    const cleanup = removeBrowserConversationData('/tmp/kai-home', 'conversation-123');
+    await vi.waitFor(() => expect(mocks.clearStorageData).toHaveBeenCalledOnce());
+
+    initializeBrowserManager(
+      '/tmp/kai-home',
+      () => ({}) as never,
+      () => null,
+      '/tmp/browser-page.cjs',
+    );
+    finishStorageClear();
+    await cleanup;
+
+    expect(mocks.managerManagesSession).toHaveBeenCalledOnce();
     expect(mocks.onBeforeRequest).toHaveBeenCalledOnce();
     expect(mocks.onBeforeRequest).not.toHaveBeenCalledWith(null);
     await shutdownBrowserManager();
@@ -238,7 +267,7 @@ describe('headless browser profile cleanup', () => {
     expect(maxActive).toBe(1);
   });
 
-  it('quarantines every headless profile before the first bulk clear can wait', async () => {
+  it('durably quarantines every headless profile while materializing one session at a time', async () => {
     let finishFirstClear!: () => void;
     mocks.clearStorageData
       .mockImplementationOnce(
@@ -252,13 +281,18 @@ describe('headless browser profile cleanup', () => {
     const cleanup = removeBrowserConversationsData('/tmp/kai-home', ['deleted-a', 'deleted-b']);
     await vi.waitFor(() => expect(mocks.clearStorageData).toHaveBeenCalledOnce());
 
-    expect(mocks.fromPartition).toHaveBeenCalledTimes(2);
-    const denyHookOrders = mocks.onBeforeRequest.mock.invocationCallOrder.slice(0, 2);
-    expect(denyHookOrders).toHaveLength(2);
-    expect(denyHookOrders.every((order) => order < mocks.clearStorageData.mock.invocationCallOrder[0])).toBe(true);
+    expect(mocks.pendingCleanupMark).toHaveBeenCalledTimes(2);
+    expect(
+      mocks.pendingCleanupMark.mock.invocationCallOrder.every(
+        (order) => order < mocks.clearStorageData.mock.invocationCallOrder[0],
+      ),
+    ).toBe(true);
+    expect(mocks.fromPartition).toHaveBeenCalledOnce();
+    expect(mocks.onBeforeRequest).toHaveBeenCalledTimes(1);
 
     finishFirstClear();
     await expect(cleanup).resolves.toEqual([]);
+    expect(mocks.fromPartition).toHaveBeenCalledTimes(2);
     expect(mocks.clearStorageData).toHaveBeenCalledTimes(2);
   });
 

@@ -24,6 +24,18 @@ export function shouldAdoptBroadcastActiveId(
   return mySelection == null || mySelection === broadcastActiveId;
 }
 
+/** A bare active-id broadcast carries no conversation-record update. Ignore it
+ * when it already matches this renderer's selection: setActiveId emits this
+ * notification before the initiating IPC promise resolves, and treating that
+ * acknowledgement as a fresh async refresh would invalidate the very local
+ * selection transaction that caused it. */
+export function isRedundantActiveConversationBroadcast(
+  mySelection: string | null,
+  change: { kind: 'upsert' | 'delete' | 'reset' | 'active'; activeConversationId?: string | null },
+): boolean {
+  return change.kind === 'active' && mySelection !== null && change.activeConversationId === mySelection;
+}
+
 /** A null global active-id is not enough to clear this window's independent
  * selection. Another client can make chat B globally active while this window
  * remains on chat A, then delete B. That delete broadcasts null even though A

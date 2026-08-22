@@ -14,6 +14,7 @@ import {
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
+  isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   prepareConversationWorkspaceSwitch,
@@ -2295,6 +2296,38 @@ describe('shouldAdoptBroadcastActiveId', () => {
   it('does NOT adopt a null active-id here (null is handled by a separate branch)', () => {
     expect(shouldAdoptBroadcastActiveId('conv-a', null)).toBe(false);
     expect(shouldAdoptBroadcastActiveId(null, null)).toBe(false);
+  });
+});
+
+describe('isRedundantActiveConversationBroadcast', () => {
+  it('ignores a matching bare active-id acknowledgement', () => {
+    expect(
+      isRedundantActiveConversationBroadcast('conv-a', {
+        kind: 'active',
+        activeConversationId: 'conv-a',
+      }),
+    ).toBe(true);
+  });
+
+  it('does not hide record updates, initial selection, or a different active id', () => {
+    expect(
+      isRedundantActiveConversationBroadcast('conv-a', {
+        kind: 'upsert',
+        activeConversationId: 'conv-a',
+      }),
+    ).toBe(false);
+    expect(
+      isRedundantActiveConversationBroadcast(null, {
+        kind: 'active',
+        activeConversationId: 'conv-a',
+      }),
+    ).toBe(false);
+    expect(
+      isRedundantActiveConversationBroadcast('conv-a', {
+        kind: 'active',
+        activeConversationId: 'conv-b',
+      }),
+    ).toBe(false);
   });
 });
 

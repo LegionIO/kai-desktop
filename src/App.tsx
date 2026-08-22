@@ -91,6 +91,7 @@ import {
   createBrowserWorkspaceTransitionMarker,
   filterConversationDeleteFallbackCandidates,
   getConversationForWorkspaceRestoration,
+  isRedundantActiveConversationBroadcast,
   isConversationWorkspaceRestorationCurrent,
   openBrowserConversationInWorkspace,
   resolveConversationWorkspaceTransition,
@@ -1064,6 +1065,13 @@ function AppShell() {
     const unsubscribe = app.conversations.onChanged((raw) => {
       const change = raw as ConversationChange;
       const activeId = change.activeConversationId ?? null;
+      if (isRedundantActiveConversationBroadcast(activeConversationIdRef.current, change)) {
+        // A pure active-id event has no record changes to hydrate. In particular,
+        // this is the synchronous acknowledgement sent by our own setActiveId
+        // call; consuming it would advance activeSyncSeqRef before that call's
+        // promise resumes and make a successful Browser-attention switch fail.
+        return;
+      }
       // We only need the active conversation's summary here. If the changed
       // record IS the active one, use it directly; otherwise re-fetch just that
       // one (cheap, single-file) so the title/hasMessages stay correct.

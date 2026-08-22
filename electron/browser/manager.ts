@@ -2465,6 +2465,14 @@ export class BrowserManager {
     return this.browserEnabled;
   }
 
+  /** Whether this manager currently owns the request-policy listener installed
+   * on an exact persistent Session. Headless profile cleanup uses this to avoid
+   * either leaking its deny-all hook after GUI promotion or removing a listener
+   * that the promoted manager has already replaced with its full policy. */
+  managesSession(scopeKey: string, scopedSession: Session): boolean {
+    return this.wiredSessionsByScope?.get(scopeKey) === scopedSession;
+  }
+
   assertEnabled(): void {
     if (!this.isEnabled()) throw new Error('The in-app browser is disabled in Settings.');
   }
@@ -7206,12 +7214,26 @@ export class BrowserManager {
         tab.shell.muted = contents.isAudioMuted();
         break;
       }
-      case 'keep-open':
+      case 'keep-open': {
         tab.shell.keepOpen = source === 'assistant' ? true : !tab.shell.keepOpen;
+        const revokedAssistantDownloads: ActiveBrowserDownload[] = [];
         for (const download of this.activeDownloads.values()) {
-          if (download.tabId === tab.shell.id) download.keepOpen = tab.shell.keepOpen;
+          if (download.tabId !== tab.shell.id) continue;
+          download.keepOpen = tab.shell.keepOpen;
+          if (!download.keepOpen && download.assistantOwnerId !== null) revokedAssistantDownloads.push(download);
+        }
+        if (revokedAssistantDownloads.length > 0) {
+          // A run that ended while this tab was retained will not cross another
+          // cleanup boundary. Revoke its active downloads immediately when the
+          // user returns the tab to automatic cleanup, and keep retry ownership
+          // if Chromium does not acknowledge cancellation promptly.
+          void this.cancelActiveAssistantDownloads(revokedAssistantDownloads).catch((error: unknown) => {
+            console.warn('[Browser] Revoked assistant download cancellation will be retried:', error);
+            this.scheduleAssistantDownloadCleanupRetry(revokedAssistantDownloads);
+          });
         }
         break;
+      }
       case 'close-others':
         for (const id of [...(this.tabOrder.get(conversationId) ?? [])]) {
           if (id !== tabId) {

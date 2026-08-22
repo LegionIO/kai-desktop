@@ -1432,6 +1432,59 @@ describe('browser manager renderer lifecycle', () => {
     expect(download.keepOpen).toBe(true);
   });
 
+  it('cancels retained assistant downloads when the user returns a tab to automatic cleanup', async () => {
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true },
+    };
+    const cancel = vi.fn(async () => undefined);
+    const download = {
+      tabId: tab.shell.id,
+      keepOpen: true,
+      assistantOwnerId: 'completed-run',
+      cancel,
+    };
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      emitTabs: vi.fn(),
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    await invokePrivate(manager, 'commandTabWithinOperation', tab, 'keep-open', 'user');
+
+    expect(tab.shell.keepOpen).toBe(false);
+    expect(download.keepOpen).toBe(false);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('retains retry ownership when automatic-cleanup download cancellation fails', async () => {
+    const tab = {
+      shell: { id: 'tab-1', conversationId: 'chat-1', keepOpen: true },
+    };
+    const download = {
+      tabId: tab.shell.id,
+      keepOpen: true,
+      assistantOwnerId: 'completed-run',
+      cancel: vi.fn(async () => {
+        throw new Error('download still progressing');
+      }),
+    };
+    const scheduleAssistantDownloadCleanupRetry = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const manager = managerWithoutConstructor({
+      activeDownloads: new Map([[{}, download]]),
+      emitTabs: vi.fn(),
+      scheduleAssistantDownloadCleanupRetry,
+      tabs: new Map([[tab.shell.id, tab]]),
+    });
+
+    try {
+      await invokePrivate(manager, 'commandTabWithinOperation', tab, 'keep-open', 'user');
+      await vi.waitFor(() => expect(scheduleAssistantDownloadCleanupRetry).toHaveBeenCalledWith([download]));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('runs an assistant keep-open tab command without opening the Browser panel', async () => {
     const emit = vi.fn();
     const commandTabWithinOperation = vi.fn(async () => undefined);
